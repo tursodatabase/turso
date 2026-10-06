@@ -1,11 +1,10 @@
 use crate::functions::validate_pg_input;
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
+    native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Table},
-    Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
-    Result, Value, VirtualTable,
+    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -137,11 +136,7 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
-        for vtab in pg_catalog_virtual_tables() {
-            schema.add_virtual_table(vtab)?;
-        }
-        Ok(())
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
@@ -287,45 +282,8 @@ impl PgClassTable {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl InternalVirtualTable for PgClassTable {
-    fn name(&self) -> String {
-        "pg_class".to_string()
-    }
-
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgClassCursor::new(conn))))
-    }
-
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        _order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        // Create constraint usages for each constraint
-        let constraint_usages = constraints
-            .iter()
-            .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None, // We'll handle filtering ourselves
-                omit: false,
-            })
-            .collect();
-
-        Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
-            order_by_consumed: false,
-            estimated_cost: 1000.0,
-            estimated_rows: 100,
-            constraint_usages,
-        })
-    }
-
-    fn sql(&self) -> String {
+    fn schema() -> String {
         // PostgreSQL pg_class columns (simplified subset)
         "CREATE TABLE pg_class (
             oid INTEGER,
@@ -366,7 +324,39 @@ impl InternalVirtualTable for PgClassTable {
     }
 }
 
-struct PgClassCursor {
+impl VirtualTable for PgClassTable {
+    type Cursor = PgClassCursor;
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgClassCursor::new(conn))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        // Create constraint usages for each constraint
+        let constraint_usages = constraints
+            .iter()
+            .map(|_constraint| turso_ext::ConstraintUsage {
+                argv_index: None, // We'll handle filtering ourselves
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 100,
+            constraint_usages,
+        })
+    }
+}
+
+pub struct PgClassCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -490,37 +480,37 @@ impl PgClassCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgClassCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgClassCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         // Reset cursor and load data
         self.current_row = 0;
         self.rows.clear();
         self.load_from_sqlite_master()?;
 
         // Return true if we have any rows
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -533,18 +523,23 @@ impl PgNamespaceTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_namespace (
+            oid INTEGER,
+            nspname TEXT,
+            nspowner INTEGER,
+            nspacl TEXT
+        )"
+        .to_string()
+    }
 }
 
-impl InternalVirtualTable for PgNamespaceTable {
-    fn name(&self) -> String {
-        "pg_namespace".to_string()
-    }
+impl VirtualTable for PgNamespaceTable {
+    type Cursor = PgNamespaceCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgNamespaceCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgNamespaceCursor::new(conn))
     }
 
     fn best_index(
@@ -569,19 +564,9 @@ impl InternalVirtualTable for PgNamespaceTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_namespace (
-            oid INTEGER,
-            nspname TEXT,
-            nspowner INTEGER,
-            nspacl TEXT
-        )"
-        .to_string()
-    }
 }
 
-struct PgNamespaceCursor {
+pub struct PgNamespaceCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -635,34 +620,34 @@ impl PgNamespaceCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgNamespaceCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgNamespaceCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.rows.clear();
         self.load_namespaces()?;
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -675,44 +660,8 @@ impl PgAttributeTable {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl InternalVirtualTable for PgAttributeTable {
-    fn name(&self) -> String {
-        "pg_attribute".to_string()
-    }
-
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAttributeCursor::new(conn))))
-    }
-
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        _order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        let constraint_usages = constraints
-            .iter()
-            .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None, // We'll handle filtering ourselves
-                omit: false,
-            })
-            .collect();
-
-        Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
-            order_by_consumed: false,
-            estimated_cost: 1000.0,
-            estimated_rows: 1000,
-            constraint_usages,
-        })
-    }
-
-    fn sql(&self) -> String {
+    fn schema() -> String {
         "CREATE TABLE pg_attribute (
             attrelid INTEGER,
             attname TEXT,
@@ -744,7 +693,38 @@ impl InternalVirtualTable for PgAttributeTable {
     }
 }
 
-struct PgAttributeCursor {
+impl VirtualTable for PgAttributeTable {
+    type Cursor = PgAttributeCursor;
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgAttributeCursor::new(conn))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_constraint| turso_ext::ConstraintUsage {
+                argv_index: None, // We'll handle filtering ourselves
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1000.0,
+            estimated_rows: 1000,
+            constraint_usages,
+        })
+    }
+}
+
+pub struct PgAttributeCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -811,34 +791,34 @@ impl PgAttributeCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgAttributeCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgAttributeCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.rows.clear();
         self.load_attributes()?;
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -872,21 +852,35 @@ impl PgRolesTable {
             Value::Null,                // rolconfig
         ]]
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_roles (
+            oid INTEGER,
+            rolname TEXT,
+            rolsuper INTEGER,
+            rolinherit INTEGER,
+            rolcreaterole INTEGER,
+            rolcreatedb INTEGER,
+            rolcanlogin INTEGER,
+            rolreplication INTEGER,
+            rolconnlimit INTEGER,
+            rolpassword TEXT,
+            rolvaliduntil TEXT,
+            rolbypassrls INTEGER,
+            rolconfig TEXT
+        )"
+        .to_string()
+    }
 }
 
-impl InternalVirtualTable for PgRolesTable {
-    fn name(&self) -> String {
-        "pg_roles".to_string()
-    }
+impl VirtualTable for PgRolesTable {
+    type Cursor = PgRolesCursor;
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgRolesCursor {
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgRolesCursor {
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -911,59 +905,40 @@ impl InternalVirtualTable for PgRolesTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_roles (
-            oid INTEGER,
-            rolname TEXT,
-            rolsuper INTEGER,
-            rolinherit INTEGER,
-            rolcreaterole INTEGER,
-            rolcreatedb INTEGER,
-            rolcanlogin INTEGER,
-            rolreplication INTEGER,
-            rolconnlimit INTEGER,
-            rolpassword TEXT,
-            rolvaliduntil TEXT,
-            rolbypassrls INTEGER,
-            rolconfig TEXT
-        )"
-        .to_string()
-    }
 }
 
-struct PgRolesCursor {
+pub struct PgRolesCursor {
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
-impl InternalVirtualTableCursor for PgRolesCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgRolesCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.rows = PgRolesTable::roles();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -976,47 +951,8 @@ impl PgProcTable {
     fn new() -> Self {
         Self
     }
-}
 
-impl InternalVirtualTable for PgProcTable {
-    fn name(&self) -> String {
-        "pg_proc".to_string()
-    }
-
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgProcCursor {
-            conn,
-            rows: Vec::new(),
-            current_row: 0,
-        })))
-    }
-
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        _order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        let constraint_usages = constraints
-            .iter()
-            .map(|_| turso_ext::ConstraintUsage {
-                argv_index: None,
-                omit: false,
-            })
-            .collect();
-        Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
-            order_by_consumed: false,
-            estimated_cost: 100.0,
-            estimated_rows: 100,
-            constraint_usages,
-        })
-    }
-
-    fn sql(&self) -> String {
+    fn schema() -> String {
         "CREATE TABLE pg_proc (
             oid INTEGER,
             proname TEXT,
@@ -1049,6 +985,40 @@ impl InternalVirtualTable for PgProcTable {
             proacl TEXT
         )"
         .to_string()
+    }
+}
+
+impl VirtualTable for PgProcTable {
+    type Cursor = PgProcCursor;
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgProcCursor {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 100.0,
+            estimated_rows: 100,
+            constraint_usages,
+        })
     }
 }
 
@@ -1148,33 +1118,33 @@ impl PgProcCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgProcCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgProcCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_functions();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -1186,6 +1156,28 @@ struct PgDatabaseTable;
 impl PgDatabaseTable {
     fn new() -> Self {
         Self
+    }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_database (
+            oid INTEGER,
+            datname TEXT,
+            datdba INTEGER,
+            encoding INTEGER,
+            datlocprovider TEXT,
+            datistemplate INTEGER,
+            datallowconn INTEGER,
+            datconnlimit INTEGER,
+            datfrozenxid INTEGER,
+            datminmxid INTEGER,
+            dattablespace INTEGER,
+            datcollate TEXT,
+            datctype TEXT,
+            daticulocale TEXT,
+            daticurules TEXT,
+            datacl TEXT
+        )"
+        .to_string()
     }
 }
 
@@ -1199,20 +1191,15 @@ pub(crate) fn db_name_from_path(path: &str) -> String {
         .to_string()
 }
 
-impl InternalVirtualTable for PgDatabaseTable {
-    fn name(&self) -> String {
-        "pg_database".to_string()
-    }
+impl VirtualTable for PgDatabaseTable {
+    type Cursor = PgDatabaseCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgDatabaseCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgDatabaseCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -1236,28 +1223,6 @@ impl InternalVirtualTable for PgDatabaseTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_database (
-            oid INTEGER,
-            datname TEXT,
-            datdba INTEGER,
-            encoding INTEGER,
-            datlocprovider TEXT,
-            datistemplate INTEGER,
-            datallowconn INTEGER,
-            datconnlimit INTEGER,
-            datfrozenxid INTEGER,
-            datminmxid INTEGER,
-            dattablespace INTEGER,
-            datcollate TEXT,
-            datctype TEXT,
-            daticulocale TEXT,
-            daticurules TEXT,
-            datacl TEXT
-        )"
-        .to_string()
-    }
 }
 
 struct PgDatabaseCursor {
@@ -1266,30 +1231,30 @@ struct PgDatabaseCursor {
     current_row: usize,
 }
 
-impl InternalVirtualTableCursor for PgDatabaseCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgDatabaseCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         let db_name = db_name_from_path(self.conn.db_file_path());
         self.rows = vec![vec![
@@ -1310,7 +1275,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
             Value::Null,                      // daticurules
             Value::Null,                      // datacl
         ]];
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -1340,21 +1305,26 @@ impl PgAmTable {
             ],
         ]
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_am (
+            oid INTEGER,
+            amname TEXT,
+            amhandler TEXT,
+            amtype TEXT
+        )"
+        .to_string()
+    }
 }
 
-impl InternalVirtualTable for PgAmTable {
-    fn name(&self) -> String {
-        "pg_am".to_string()
-    }
+impl VirtualTable for PgAmTable {
+    type Cursor = PgAmCursor;
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAmCursor {
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgAmCursor {
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -1379,71 +1349,71 @@ impl InternalVirtualTable for PgAmTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_am (
-            oid INTEGER,
-            amname TEXT,
-            amhandler TEXT,
-            amtype TEXT
-        )"
-        .to_string()
-    }
 }
 
-struct PgAmCursor {
+pub struct PgAmCursor {
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
-impl InternalVirtualTableCursor for PgAmCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgAmCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.rows = PgAmTable::rows();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
 /// Generic empty PG catalog table — always returns no rows.
 /// Used for catalog tables psql queries but we don't yet need real data for.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EmptyPgCatalogTable {
-    name: String,
     create_sql: String,
 }
 
-impl InternalVirtualTable for EmptyPgCatalogTable {
-    fn name(&self) -> String {
-        self.name.clone()
+impl VirtualTableModule for EmptyPgCatalogTable {
+    type Table = Self;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok(self.create_sql.clone())
     }
 
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(EmptyPgCatalogCursor)))
+    fn create(&self, _args: &[Value]) -> Result<Self::Table> {
+        Ok(self.clone())
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+impl VirtualTable for EmptyPgCatalogTable {
+    type Cursor = EmptyPgCatalogCursor;
+
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(EmptyPgCatalogCursor)
     }
 
     fn best_index(
@@ -1467,48 +1437,28 @@ impl InternalVirtualTable for EmptyPgCatalogTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        self.create_sql.clone()
-    }
 }
 
 struct EmptyPgCatalogCursor;
 
-impl InternalVirtualTableCursor for EmptyPgCatalogCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
-        Ok(false)
+impl VirtualTableCursor for EmptyPgCatalogCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        Ok(IOResult::Done(false))
     }
     fn rowid(&self) -> i64 {
         0
     }
-    fn column(&self, _column: usize) -> Result<Value, LimboError> {
-        Ok(Value::Null)
+    fn column(&mut self, _column: usize) -> turso_core::types::IOResultOr<Value> {
+        Ok(IOResult::Done(Value::Null))
     }
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
-        Ok(false)
+    ) -> turso_core::types::IOResultOr<bool> {
+        Ok(IOResult::Done(false))
     }
-}
-
-fn empty_catalog_table(name: &str, create_sql: &str) -> Arc<VirtualTable> {
-    let table = EmptyPgCatalogTable {
-        name: name.to_string(),
-        create_sql: create_sql.to_string(),
-    };
-    Arc::new(
-        VirtualTable::new_internal(
-            name.to_string(),
-            table.sql(),
-            VTabKind::VirtualTable,
-            Arc::new(RwLock::new(table)),
-        )
-        .unwrap_or_else(|_| panic!("{name} virtual table creation should not fail")),
-    )
 }
 
 /// Virtual table implementation for pg_tables
@@ -1520,18 +1470,27 @@ impl PgTablesTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_tables (
+            schemaname TEXT,
+            tablename TEXT,
+            tableowner TEXT,
+            tablespace TEXT,
+            hasindexes INTEGER,
+            hasrules INTEGER,
+            hastriggers INTEGER,
+            rowsecurity INTEGER
+        )"
+        .to_string()
+    }
 }
 
-impl InternalVirtualTable for PgTablesTable {
-    fn name(&self) -> String {
-        "pg_tables".to_string()
-    }
+impl VirtualTable for PgTablesTable {
+    type Cursor = PgTablesCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgTablesCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgTablesCursor::new(conn))
     }
 
     fn best_index(
@@ -1556,23 +1515,9 @@ impl InternalVirtualTable for PgTablesTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_tables (
-            schemaname TEXT,
-            tablename TEXT,
-            tableowner TEXT,
-            tablespace TEXT,
-            hasindexes INTEGER,
-            hasrules INTEGER,
-            hastriggers INTEGER,
-            rowsecurity INTEGER
-        )"
-        .to_string()
-    }
 }
 
-struct PgTablesCursor {
+pub struct PgTablesCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -1608,34 +1553,34 @@ impl PgTablesCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgTablesCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgTablesCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.rows.clear();
         self.load_tables()?;
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -1946,22 +1891,21 @@ impl PgTypeTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        PG_TYPE_SQL.to_string()
+    }
 }
 
-impl InternalVirtualTable for PgTypeTable {
-    fn name(&self) -> String {
-        "pg_type".to_string()
-    }
+impl VirtualTable for PgTypeTable {
+    type Cursor = PgTypeCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgTypeCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgTypeCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -1985,13 +1929,9 @@ impl InternalVirtualTable for PgTypeTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        PG_TYPE_SQL.to_string()
-    }
 }
 
-struct PgTypeCursor {
+pub struct PgTypeCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2110,33 +2050,33 @@ impl PgTypeCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgTypeCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgTypeCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_types();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -2153,22 +2093,21 @@ impl PgIndexTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        PG_INDEX_SQL.to_string()
+    }
 }
 
-impl InternalVirtualTable for PgIndexTable {
-    fn name(&self) -> String {
-        "pg_index".to_string()
-    }
+impl VirtualTable for PgIndexTable {
+    type Cursor = PgIndexCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgIndexCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgIndexCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -2192,13 +2131,9 @@ impl InternalVirtualTable for PgIndexTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        PG_INDEX_SQL.to_string()
-    }
 }
 
-struct PgIndexCursor {
+pub struct PgIndexCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2287,33 +2222,33 @@ impl PgIndexCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgIndexCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgIndexCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_indexes();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -2330,22 +2265,21 @@ impl PgConstraintTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        PG_CONSTRAINT_SQL.to_string()
+    }
 }
 
-impl InternalVirtualTable for PgConstraintTable {
-    fn name(&self) -> String {
-        "pg_constraint".to_string()
-    }
+impl VirtualTable for PgConstraintTable {
+    type Cursor = PgConstraintCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgConstraintCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgConstraintCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -2369,13 +2303,9 @@ impl InternalVirtualTable for PgConstraintTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        PG_CONSTRAINT_SQL.to_string()
-    }
 }
 
-struct PgConstraintCursor {
+pub struct PgConstraintCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2649,33 +2579,33 @@ impl PgConstraintCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgConstraintCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgConstraintCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_constraints();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -2693,22 +2623,21 @@ impl PgAttrdefTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        PG_ATTRDEF_SQL.to_string()
+    }
 }
 
-impl InternalVirtualTable for PgAttrdefTable {
-    fn name(&self) -> String {
-        "pg_attrdef".to_string()
-    }
+impl VirtualTable for PgAttrdefTable {
+    type Cursor = PgAttrdefCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgAttrdefCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgAttrdefCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -2732,13 +2661,9 @@ impl InternalVirtualTable for PgAttrdefTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        PG_ATTRDEF_SQL.to_string()
-    }
 }
 
-struct PgAttrdefCursor {
+pub struct PgAttrdefCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2778,33 +2703,33 @@ impl PgAttrdefCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgAttrdefCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgAttrdefCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_defaults();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
@@ -2817,22 +2742,34 @@ impl PgSequencesTable {
     pub fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_sequences (
+            schemaname TEXT,
+            sequencename TEXT,
+            sequenceowner TEXT,
+            data_type TEXT,
+            start_value INTEGER,
+            min_value INTEGER,
+            max_value INTEGER,
+            increment_by INTEGER,
+            cycle INTEGER,
+            cache_size INTEGER,
+            last_value INTEGER
+        )"
+        .to_string()
+    }
 }
 
-impl InternalVirtualTable for PgSequencesTable {
-    fn name(&self) -> String {
-        "pg_sequences".to_string()
-    }
+impl VirtualTable for PgSequencesTable {
+    type Cursor = PgSequencesCursor;
 
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgSequencesCursor {
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgSequencesCursor {
             conn,
             rows: Vec::new(),
             current_row: 0,
-        })))
+        })
     }
 
     fn best_index(
@@ -2857,26 +2794,9 @@ impl InternalVirtualTable for PgSequencesTable {
             constraint_usages,
         })
     }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_sequences (
-            schemaname TEXT,
-            sequencename TEXT,
-            sequenceowner TEXT,
-            data_type TEXT,
-            start_value INTEGER,
-            min_value INTEGER,
-            max_value INTEGER,
-            increment_by INTEGER,
-            cycle INTEGER,
-            cache_size INTEGER,
-            last_value INTEGER
-        )"
-        .to_string()
-    }
 }
 
-struct PgSequencesCursor {
+pub struct PgSequencesCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2915,203 +2835,247 @@ impl PgSequencesCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgSequencesCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgSequencesCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
+        Ok(IOResult::Done(self.current_row < self.rows.len()))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.current_row = 0;
         self.load_sequences();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
-/// Create PostgreSQL system catalog virtual tables
-pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
-    vec![
-        // pg_class virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_class".to_string(),
-                PgClassTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgClassTable::new())),
-            )
-            .expect("pg_class virtual table creation should not fail"),
-        ),
-        // pg_namespace virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_namespace".to_string(),
-                PgNamespaceTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgNamespaceTable::new())),
-            )
-            .expect("pg_namespace virtual table creation should not fail"),
-        ),
-        // pg_attribute virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_attribute".to_string(),
-                PgAttributeTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgAttributeTable::new())),
-            )
-            .expect("pg_attribute virtual table creation should not fail"),
-        ),
-        // pg_roles virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_roles".to_string(),
-                PgRolesTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgRolesTable::new())),
-            )
-            .expect("pg_roles virtual table creation should not fail"),
-        ),
-        // pg_am virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_am".to_string(),
-                PgAmTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgAmTable::new())),
-            )
-            .expect("pg_am virtual table creation should not fail"),
-        ),
-        // pg_proc virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_proc".to_string(),
-                PgProcTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgProcTable::new())),
-            )
-            .expect("pg_proc virtual table creation should not fail"),
-        ),
-        // pg_database virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_database".to_string(),
-                PgDatabaseTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgDatabaseTable::new())),
-            )
-            .expect("pg_database virtual table creation should not fail"),
-        ),
-        // pg_tables virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_tables".to_string(),
-                PgTablesTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgTablesTable::new())),
-            )
-            .expect("pg_tables virtual table creation should not fail"),
-        ),
-        // pg_get_tabledef virtual table (custom extension for getting PostgreSQL DDL)
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_get_tabledef".to_string(),
-                PgGetTableDefTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgGetTableDefTable::new())),
-            )
-            .expect("pg_get_tabledef virtual table creation should not fail"),
-        ),
-        // Empty stub tables for psql \d command compatibility
-        empty_catalog_table("pg_policy", "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)"),
-        empty_catalog_table("pg_trigger", "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)"),
-        // pg_index virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_index".to_string(),
-                PG_INDEX_SQL.to_string(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgIndexTable::new())),
-            )
-            .expect("pg_index virtual table creation should not fail"),
-        ),
-        // pg_constraint virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_constraint".to_string(),
-                PG_CONSTRAINT_SQL.to_string(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgConstraintTable::new())),
-            )
-            .expect("pg_constraint virtual table creation should not fail"),
-        ),
-        empty_catalog_table("pg_statistic_ext", "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT)"),
-        empty_catalog_table("pg_inherits", "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)"),
-        empty_catalog_table("pg_rewrite", "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)"),
-        empty_catalog_table("pg_foreign_table", "CREATE TABLE pg_foreign_table (ftrelid INTEGER, ftserver INTEGER, ftoptions TEXT)"),
-        empty_catalog_table("pg_partitioned_table", "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT)"),
-        // pg_type virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_type".to_string(),
-                PG_TYPE_SQL.to_string(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgTypeTable::new())),
-            )
-            .expect("pg_type virtual table creation should not fail"),
-        ),
-        empty_catalog_table("pg_collation", "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)"),
-        // pg_attrdef virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_attrdef".to_string(),
-                PG_ATTRDEF_SQL.to_string(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgAttrdefTable::new())),
-            )
-            .expect("pg_attrdef virtual table creation should not fail"),
-        ),
-        empty_catalog_table("pg_description", "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)"),
-        empty_catalog_table("pg_publication", "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)"),
-        empty_catalog_table("pg_publication_namespace", "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)"),
-        empty_catalog_table("pg_publication_rel", "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)"),
-        // pg_input_error_info table-valued function
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_input_error_info".to_string(),
-                PgInputErrorInfoTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgInputErrorInfoTable::new())),
-            )
-            .expect("pg_input_error_info virtual table creation should not fail"),
-        ),
-        // pg_sequences virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_sequences".to_string(),
-                PgSequencesTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgSequencesTable::new())),
-            )
-            .expect("pg_sequences virtual table creation should not fail"),
-        ),
-    ]
+pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
+    options = options.native_module(
+        "pg_class",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgClassTable::schema,
+            create: PgClassTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_namespace",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgNamespaceTable::schema,
+            create: PgNamespaceTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_attribute",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgAttributeTable::schema,
+            create: PgAttributeTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_roles",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgRolesTable::schema,
+            create: PgRolesTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_am",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgAmTable::schema,
+            create: PgAmTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_proc",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgProcTable::schema,
+            create: PgProcTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_database",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgDatabaseTable::schema,
+            create: PgDatabaseTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_tables",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgTablesTable::schema,
+            create: PgTablesTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_get_tabledef",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgGetTableDefTable::schema,
+            create: PgGetTableDefTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_index",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgIndexTable::schema,
+            create: PgIndexTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_constraint",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgConstraintTable::schema,
+            create: PgConstraintTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_type",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgTypeTable::schema,
+            create: PgTypeTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_attrdef",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgAttrdefTable::schema,
+            create: PgAttrdefTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_input_error_info",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgInputErrorInfoTable::schema,
+            create: PgInputErrorInfoTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_sequences",
+        VTabKind::TableValuedFunction,
+        CatalogModule {
+            schema: PgSequencesTable::schema,
+            create: PgSequencesTable::new,
+        },
+    );
+    options = options.native_module(
+        "pg_policy",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)".to_string() },
+    );
+    options = options.native_module(
+        "pg_trigger",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_statistic_ext",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_inherits",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
+    );
+    options = options.native_module(
+        "pg_rewrite",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_foreign_table",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql:
+                "CREATE TABLE pg_foreign_table (ftrelid INTEGER, ftserver INTEGER, ftoptions TEXT)"
+                    .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_partitioned_table",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_collation",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_description",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
+    );
+    options = options.native_module(
+        "pg_publication",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)".to_string() },
+    );
+    options = options.native_module(
+        "pg_publication_namespace",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)".to_string() },
+    );
+    options = options.native_module(
+        "pg_publication_rel",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
+    );
+    options
+}
+
+#[derive(Debug)]
+struct CatalogModule<T> {
+    schema: fn() -> String,
+    create: fn() -> T,
+}
+
+impl<T> VirtualTableModule for CatalogModule<T>
+where
+    T: VirtualTable + 'static,
+{
+    type Table = T;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok((self.schema)())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self::Table> {
+        Ok((self.create)())
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
 }
 
 /// Table-valued function: `pg_input_error_info(input TEXT, type TEXT)`
@@ -3125,6 +3089,18 @@ struct PgInputErrorInfoTable;
 impl PgInputErrorInfoTable {
     fn new() -> Self {
         Self
+    }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_input_error_info (
+            message TEXT,
+            detail TEXT,
+            hint TEXT,
+            sql_error_code TEXT,
+            input TEXT HIDDEN,
+            type_name TEXT HIDDEN
+        )"
+        .to_string()
     }
 }
 
@@ -3142,42 +3118,42 @@ impl PgInputErrorInfoCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgInputErrorInfoCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.returned = true;
-        Ok(false)
+        Ok(IOResult::Done(false))
     }
 
     fn rowid(&self) -> i64 {
         0
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         match &self.row {
-            Some(row) if column < 4 => Ok(row[column].clone()),
-            _ => Ok(Value::Null),
+            Some(row) if column < 4 => Ok(IOResult::Done(row[column].clone())),
+            _ => Ok(IOResult::Done(Value::Null)),
         }
     }
 
     fn filter(
         &mut self,
         args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
+    ) -> turso_core::types::IOResultOr<bool> {
         self.returned = false;
 
         if args.len() < 2 {
             // Not enough arguments — return one row of NULLs
             self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
-            return Ok(true);
+            return Ok(IOResult::Done(true));
         }
 
         let input = match &args[0] {
             Value::Text(t) => t.as_str().to_string(),
             Value::Null => {
                 self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
-                return Ok(true);
+                return Ok(IOResult::Done(true));
             }
             v => v.to_string(),
         };
@@ -3186,7 +3162,7 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
             Value::Text(t) => t.as_str().to_string(),
             _ => {
                 self.row = Some([Value::Null, Value::Null, Value::Null, Value::Null]);
-                return Ok(true);
+                return Ok(IOResult::Done(true));
             }
         };
 
@@ -3200,32 +3176,15 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
             None => [Value::Null, Value::Null, Value::Null, Value::Null],
         });
 
-        Ok(true)
+        Ok(IOResult::Done(true))
     }
 }
 
-impl InternalVirtualTable for PgInputErrorInfoTable {
-    fn name(&self) -> String {
-        "pg_input_error_info".to_string()
-    }
+impl VirtualTable for PgInputErrorInfoTable {
+    type Cursor = PgInputErrorInfoCursor;
 
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_input_error_info (
-            message TEXT,
-            detail TEXT,
-            hint TEXT,
-            sql_error_code TEXT,
-            input TEXT HIDDEN,
-            type_name TEXT HIDDEN
-        )"
-        .to_string()
-    }
-
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgInputErrorInfoCursor::new())))
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgInputErrorInfoCursor::new())
     }
 
     fn best_index(
@@ -3289,10 +3248,21 @@ impl PgGetTableDefTable {
     fn new() -> Self {
         Self
     }
+
+    fn schema() -> String {
+        "CREATE TABLE pg_get_tabledef (
+            schema_name TEXT,
+            table_name TEXT,
+            ddl TEXT
+        )"
+        .to_string()
+    }
 }
 
 struct PgGetTableDefCursor {
     conn: Arc<Connection>,
+    statement: Option<Statement>,
+    sql_map: HashMap<String, String>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
     row_count: usize,
@@ -3302,16 +3272,15 @@ impl PgGetTableDefCursor {
     fn new(conn: Arc<Connection>) -> Self {
         Self {
             conn,
+            statement: None,
+            sql_map: HashMap::default(),
             rows: Vec::new(),
             current_row: 0,
             row_count: 0,
         }
     }
 
-    fn load_table_defs(&mut self) -> Result<(), LimboError> {
-        // Query sqlite_master for all table SQL, keyed by name
-        let sql_map = self.load_sqlite_master_sql()?;
-
+    fn load_table_defs(&mut self) {
         let schema = self.conn.current_schema();
         self.rows.clear();
 
@@ -3329,7 +3298,7 @@ impl PgGetTableDefCursor {
                 continue;
             };
 
-            let postgres_ddl = match sql_map.get(table_name) {
+            let postgres_ddl = match self.sql_map.get(table_name) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
                     .map(str::to_string)
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
@@ -3342,23 +3311,6 @@ impl PgGetTableDefCursor {
                 Value::Text(postgres_ddl.into()),
             ]);
         }
-
-        Ok(())
-    }
-
-    /// Read all table SQL strings from sqlite_master into a map.
-    fn load_sqlite_master_sql(&self) -> Result<HashMap<String, String>, LimboError> {
-        let mut map = HashMap::default();
-        let mut stmt = self
-            .conn
-            .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?;
-        let rows = stmt.run_collect_rows()?;
-        for row in rows {
-            if let (Some(Value::Text(name)), Some(Value::Text(sql))) = (row.first(), row.get(1)) {
-                map.insert(name.as_str().to_string(), sql.as_str().to_string());
-            }
-        }
-        Ok(map)
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
@@ -3395,56 +3347,68 @@ impl PgGetTableDefCursor {
     }
 }
 
-impl InternalVirtualTableCursor for PgGetTableDefCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
+impl VirtualTableCursor for PgGetTableDefCursor {
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
         self.current_row += 1;
-        Ok(self.current_row < self.row_count)
+        Ok(IOResult::Done(self.current_row < self.row_count))
     }
 
     fn rowid(&self) -> i64 {
         self.current_row as i64
     }
 
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
         if self.current_row < self.rows.len() && column < 3 {
-            Ok(self.rows[self.current_row][column].clone())
+            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
         } else {
-            Ok(Value::Null)
+            Ok(IOResult::Done(Value::Null))
         }
     }
 
     fn filter(
         &mut self,
         _args: &[Value],
-        _idx_str: Option<String>,
+        _idx_str: Option<&str>,
         _idx_num: i32,
-    ) -> Result<bool, LimboError> {
-        self.current_row = 0;
-        self.load_table_defs()?;
+    ) -> turso_core::types::IOResultOr<bool> {
+        if self.statement.is_none() {
+            self.statement = Some(
+                self.conn
+                    .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?,
+            );
+            self.sql_map.clear();
+            self.rows.clear();
+            self.current_row = 0;
+            self.row_count = 0;
+        }
+        let sql_map = &mut self.sql_map;
+        if let IOResult::IO(completions) = self
+            .statement
+            .as_mut()
+            .unwrap()
+            .run_with_row_callback_nonblock(|row| {
+                if let (Value::Text(name), Value::Text(sql)) = (row.get_value(0), row.get_value(1))
+                {
+                    sql_map.insert(name.as_str().to_string(), sql.as_str().to_string());
+                }
+                Ok(())
+            })?
+        {
+            return Ok(IOResult::IO(completions));
+        }
+        self.statement = None;
+        self.load_table_defs();
+        self.sql_map.clear();
         self.row_count = self.rows.len();
-        Ok(!self.rows.is_empty())
+        Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
 
-impl InternalVirtualTable for PgGetTableDefTable {
-    fn name(&self) -> String {
-        "pg_get_tabledef".to_string()
-    }
+impl VirtualTable for PgGetTableDefTable {
+    type Cursor = PgGetTableDefCursor;
 
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_get_tabledef (
-            schema_name TEXT,
-            table_name TEXT,
-            ddl TEXT
-        )"
-        .to_string()
-    }
-
-    fn open(
-        &self,
-        conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgGetTableDefCursor::new(conn))))
+    fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgGetTableDefCursor::new(conn))
     }
 
     fn best_index(
@@ -3618,6 +3582,204 @@ mod tests {
     use super::*;
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
+
+    #[test]
+    fn catalogs_registered_at_open_survive_schema_refresh() {
+        let catalog_names = [
+            "pg_class",
+            "pg_namespace",
+            "pg_attribute",
+            "pg_roles",
+            "pg_am",
+            "pg_proc",
+            "pg_database",
+            "pg_tables",
+            "pg_get_tabledef",
+            "pg_index",
+            "pg_constraint",
+            "pg_type",
+            "pg_attrdef",
+            "pg_input_error_info",
+            "pg_sequences",
+            "pg_policy",
+            "pg_trigger",
+            "pg_statistic_ext",
+            "pg_inherits",
+            "pg_rewrite",
+            "pg_foreign_table",
+            "pg_partitioned_table",
+            "pg_collation",
+            "pg_description",
+            "pg_publication",
+            "pg_publication_namespace",
+            "pg_publication_rel",
+        ];
+        for mvcc in [false, true] {
+            let db = crate::session::open_database_with_io(
+                Arc::new(turso_core::MemoryIO::new()),
+                "catalog.db",
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            if mvcc {
+                conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+            }
+            for name in catalog_names {
+                assert!(
+                    matches!(
+                        conn.current_schema().get_table(name).as_deref(),
+                        Some(Table::Virtual(_))
+                    ),
+                    "{name}"
+                );
+            }
+            let mut namespaces = conn
+                .prepare("SELECT nspname FROM pg_namespace() ORDER BY nspname")
+                .unwrap();
+            assert_eq!(
+                namespaces.run_collect_rows().unwrap(),
+                vec![
+                    vec![Value::build_text("information_schema")],
+                    vec![Value::build_text("pg_catalog")],
+                    vec![Value::build_text("public")],
+                ]
+            );
+            let mut tables = conn
+                .prepare("SELECT relname FROM pg_class WHERE relname = 'second_connection'")
+                .unwrap();
+            assert!(tables.run_collect_rows().unwrap().is_empty());
+            let other = db.connect().unwrap();
+            other
+                .execute("CREATE TABLE second_connection (v INT)")
+                .unwrap();
+            tables.reset().unwrap();
+            assert_eq!(
+                tables.run_collect_rows().unwrap(),
+                vec![vec![Value::build_text("second_connection")]]
+            );
+            conn.force_reparse_schema().unwrap();
+            for name in catalog_names {
+                assert!(
+                    matches!(
+                        conn.current_schema().get_table(name).as_deref(),
+                        Some(Table::Virtual(_))
+                    ),
+                    "{name}"
+                );
+            }
+            let mut error_info = conn
+                .prepare("SELECT sql_error_code FROM pg_input_error_info('abc', 'integer')")
+                .unwrap();
+            assert_eq!(
+                error_info.run_collect_rows().unwrap(),
+                vec![vec![Value::build_text("22P02")]]
+            );
+            conn.execute("CREATE TABLE namespace_counts (n INT)")
+                .unwrap();
+            conn.execute("CREATE TRIGGER catalog_check AFTER INSERT ON second_connection BEGIN INSERT INTO namespace_counts SELECT COUNT(*) FROM pg_namespace LEFT JOIN pg_policy ON 1; END").unwrap();
+            conn.execute("INSERT INTO second_connection VALUES (7)")
+                .unwrap();
+            let mut counts = conn.prepare("SELECT n FROM namespace_counts").unwrap();
+            assert_eq!(
+                counts.run_collect_rows().unwrap(),
+                vec![vec![Value::from_i64(3)]]
+            );
+        }
+    }
+
+    #[test]
+    fn table_definitions_resume_after_io_and_statement_reset() {
+        use turso_core::{MemoryYieldIO, IO};
+
+        let io = Arc::new(MemoryYieldIO::new());
+        let db = crate::session::open_database_with_io(
+            io.clone(),
+            "tabledefs.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let mut expected = Vec::new();
+        for i in 0..12 {
+            let name = format!("catalog_{i:02}");
+            let sql = format!(
+                "CREATE TABLE {name} (item TEXT DEFAULT '{}', n INT DEFAULT {i})",
+                "x".repeat(2048 + i * 31)
+            );
+            conn.execute(&sql).unwrap();
+            expected.push(vec![
+                Value::build_text("public"),
+                Value::build_text(name),
+                Value::build_text(sql),
+            ]);
+        }
+
+        conn.execute("BEGIN").unwrap();
+        conn.get_pager().clear_page_cache(false);
+        let mut cursor = PgGetTableDefTable::new().open(conn.clone()).unwrap();
+        let mut yields = 0;
+        loop {
+            match cursor.filter(&[], None, 0).unwrap() {
+                IOResult::IO(completions) => {
+                    yields += 1;
+                    assert!(!completions.finished());
+                    io.step().unwrap();
+                    assert!(completions.finished());
+                }
+                IOResult::Done(has_rows) => {
+                    assert!(has_rows);
+                    break;
+                }
+            }
+        }
+        assert!(yields > 1, "schema scan should yield on multiple pages");
+        cursor.rows.sort_by_key(|row| row[1].to_string());
+        assert_eq!(cursor.rows, expected);
+        drop(cursor);
+        conn.execute("ROLLBACK").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT schema_name, table_name, ddl FROM pg_get_tabledef ORDER BY table_name")
+            .unwrap();
+        conn.get_pager().clear_page_cache(false);
+        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+        stmt.reset().unwrap();
+        conn.get_pager().clear_page_cache(false);
+        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
+        let mut rows = Vec::new();
+        let mut statement_yields = 0;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    statement_yields += 1;
+                    let completions = stmt
+                        .take_io_completions()
+                        .expect("catalog I/O must reach its caller");
+                    io.step().unwrap();
+                    assert!(completions.finished());
+                }
+                StepResult::Row => rows.push(
+                    stmt.row()
+                        .unwrap()
+                        .get_values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                StepResult::Done => break,
+                other => panic!("unexpected catalog step: {other:?}"),
+            }
+        }
+        assert!(statement_yields > 1);
+        assert_eq!(rows, expected);
+        stmt.reset().unwrap();
+        assert_eq!(stmt.run_collect_rows().unwrap(), expected);
+        conn.execute("CREATE TABLE after_catalog (v INT)").unwrap();
+    }
 
     #[test]
 
