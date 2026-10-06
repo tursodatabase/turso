@@ -131,6 +131,11 @@ pub fn translate(
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
+    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
+    if check_privileges {
+        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
+    }
+
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {

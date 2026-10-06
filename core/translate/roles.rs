@@ -1,15 +1,154 @@
-//! Bytecode for role statements.
+//! Bytecode for role statements, and the privilege checks that run when a
+//! statement is prepared.
+//!
+//! Privileges are checked when a statement is prepared, against the role that
+//! is current at that time. Changing the role makes prepared statements
+//! prepare again, so a statement always runs with the privileges of the
+//! current role.
+//!
+//! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
+//! has no privileges on any database object. It may still run statements that
+//! touch no database object, such as `SELECT 1`, and switch roles.
 
 use std::sync::Arc;
 
+use turso_parser::ast;
+
 use crate::schema::BTreeTable;
+use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
+
+const MAIN_SCHEMA_NAME: &str = "main";
+
+/// Fails if the current role may not run `stmt` at all.
+pub fn check_statement_privileges(
+    stmt: &ast::Stmt,
+    resolver: &Resolver,
+    connection: &Connection,
+) -> Result<()> {
+    if resolver
+        .schema()
+        .roles
+        .is_superuser(connection.current_role())
+    {
+        return Ok(());
+    }
+    let denial = match stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::SetRole { .. } => return Ok(()),
+        ast::Stmt::CreateTable {
+            temporary: true, ..
+        }
+        | ast::Stmt::CreateView {
+            temporary: true, ..
+        }
+        | ast::Stmt::CreateTrigger {
+            temporary: true, ..
+        } => PermissionDenied::privilege(
+            Action::CreateTemporary,
+            Object::Database(MAIN_SCHEMA_NAME.to_string()),
+        ),
+        ast::Stmt::CreateTable { tbl_name, .. } => create_in_schema_denial(tbl_name),
+        ast::Stmt::CreateView { view_name, .. }
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
+        ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
+        ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::CreateType { .. } | ast::Stmt::CreateDomain { .. } => {
+            PermissionDenied::privilege(
+                Action::Create,
+                Object::Schema(MAIN_SCHEMA_NAME.to_string()),
+            )
+        }
+        ast::Stmt::CreateIndex { tbl_name, .. } => {
+            PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
+        }
+        ast::Stmt::CreateTrigger { tbl_name, .. } => PermissionDenied::privilege(
+            Action::CreateTrigger,
+            Object::Table(tbl_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::AlterTable(alter) => PermissionDenied::owner(
+            Action::Alter,
+            Object::Table(alter.name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropTable { tbl_name, .. } => PermissionDenied::owner(
+            Action::Drop,
+            Object::Table(tbl_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropIndex { idx_name, .. } => PermissionDenied::owner(
+            Action::Drop,
+            Object::Index(idx_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropView { view_name, .. } => PermissionDenied::owner(
+            Action::Drop,
+            Object::View(view_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropTrigger { trigger_name, .. } => PermissionDenied::owner(
+            Action::Drop,
+            Object::Trigger(trigger_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::DropType { type_name, .. } => {
+            PermissionDenied::owner(Action::Drop, Object::Type(type_name.to_string()))
+        }
+        ast::Stmt::DropDomain { domain_name, .. } => {
+            PermissionDenied::owner(Action::Drop, Object::Type(domain_name.to_string()))
+        }
+        ast::Stmt::DropSequence { seq_name, .. } => PermissionDenied::owner(
+            Action::Drop,
+            Object::Sequence(seq_name.name.as_str().to_string()),
+        ),
+        ast::Stmt::CreateRole { role_name } => {
+            PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
+        }
+        ast::Stmt::Pragma {
+            name,
+            body: Some(_),
+        } => PermissionDenied::privilege(
+            Action::Write,
+            Object::Setting(name.name.as_str().to_string()),
+        ),
+        ast::Stmt::Pragma { name, body: None } => PermissionDenied::privilege(
+            Action::Read,
+            Object::Setting(name.name.as_str().to_string()),
+        ),
+        ast::Stmt::Analyze { .. } => database_denial(Action::Analyze),
+        ast::Stmt::Vacuum { .. } => database_denial(Action::Vacuum),
+        ast::Stmt::Reindex { .. } => database_denial(Action::Reindex),
+        ast::Stmt::Optimize { .. } => database_denial(Action::Optimize),
+        ast::Stmt::Attach { .. } => database_denial(Action::Attach),
+        ast::Stmt::Detach { .. } => database_denial(Action::Detach),
+    };
+    Err(permission_denied(denial))
+}
+
+fn create_in_schema_denial(name: &ast::QualifiedName) -> PermissionDenied {
+    let schema = name
+        .db_name
+        .as_ref()
+        .map_or(MAIN_SCHEMA_NAME, |db_name| db_name.as_str());
+    PermissionDenied::privilege(Action::Create, Object::Schema(schema.to_string()))
+}
+
+fn database_denial(action: Action) -> PermissionDenied {
+    PermissionDenied::privilege(action, Object::Database(MAIN_SCHEMA_NAME.to_string()))
+}
+
+fn permission_denied(denial: PermissionDenied) -> LimboError {
+    LimboError::PermissionDenied(Box::new(denial))
+}
 
 /// Switches the connection to `role_name`, or back to the session role when
 /// `role_name` is `None`. The role is looked up when the statement runs. The
@@ -156,8 +295,11 @@ mod tests {
 
     use turso_parser::ast;
 
+    use crate::security::permission::{Action, Object, PermissionDenied};
     use crate::security::roles::RoleId;
-    use crate::{Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
+    use crate::{
+        Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect, IO,
+    };
 
     #[test]
     fn create_role_adds_the_role_to_the_catalog() {
@@ -255,6 +397,36 @@ mod tests {
     }
 
     #[test]
+    fn role_without_privileges_cannot_create_objects() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let create_table = conn.execute("CREATE TABLE t (x)").unwrap_err();
+        let create_role_error = create_role(&conn, "bob").unwrap_err();
+
+        assert_eq!(
+            denial(create_table),
+            PermissionDenied::privilege(Action::Create, Object::Schema("main".to_string()))
+        );
+        assert_eq!(
+            denial(create_role_error),
+            PermissionDenied::privilege(Action::Create, Object::Role("bob".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_can_run_statements_without_objects() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("SELECT 1").unwrap();
+        reset_role(&conn).unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+    }
+
+    #[test]
     fn interrupted_set_role_keeps_the_current_role() {
         for interrupt_at_step in 1.. {
             let conn = open_connection();
@@ -320,6 +492,13 @@ mod tests {
                 "interrupted at step {interrupt_at_step}, the role is still in the catalog"
             );
             create_role(&conn, "alice").unwrap();
+        }
+    }
+
+    fn denial(error: LimboError) -> PermissionDenied {
+        match error {
+            LimboError::PermissionDenied(denial) => *denial,
+            other => panic!("expected a permission error, got: {other}"),
         }
     }
 
