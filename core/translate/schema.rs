@@ -2708,6 +2708,11 @@ pub fn translate_create_type(
     if is_base_type {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
+    if has_reserved_type_prefix(&normalized_name) {
+        bail_parse_error!(
+            "cannot create type \"{normalized_name}\": names that start with \"pg_\" are reserved for built-in types"
+        );
+    }
 
     // Check if type already exists
     if resolver
@@ -2858,6 +2863,11 @@ pub fn translate_create_domain(
     if is_base_type {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
+    if has_reserved_type_prefix(&normalized_name) {
+        bail_parse_error!(
+            "cannot create domain \"{normalized_name}\": names that start with \"pg_\" are reserved for built-in types"
+        );
+    }
 
     // Check if type/domain already exists
     if resolver
@@ -2920,6 +2930,12 @@ pub fn translate_create_domain(
     };
 
     persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Built-in types for the PostgreSQL frontend use the prefix `pg_`.
+fn has_reserved_type_prefix(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pg_"))
 }
 
 pub fn translate_drop_type(

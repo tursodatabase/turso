@@ -1870,3 +1870,24 @@ test pg-storage-table-must-be-strict {
 expect error {
     PGSTORAGE table t must be STRICT
 }
+
+test create-type-with-reserved-pg-prefix {
+    CREATE TYPE pg_date(value text) BASE text;
+}
+expect error {
+    names that start with "pg_" are reserved for built-in types
+}
+
+test create-domain-with-reserved-pg-prefix {
+    CREATE DOMAIN PG_Money AS INTEGER;
+}
+expect error {
+    names that start with "pg_" are reserved for built-in types
+}
+
+test create-type-with-built-in-name {
+    CREATE TYPE uuid(value text) BASE text;
+}
+expect error {
+    type uuid already exists
+}

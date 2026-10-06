@@ -181,3 +181,19 @@ fn alter_column_type_is_refused_and_keeps_the_table(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(rows(&conn, "SELECT id, i, ts FROM ac"), ["1|7|hello"]);
 }
+
+#[turso_macros::test]
+fn pg_prefix_is_reserved_for_built_in_types(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE TYPE pg_mood AS ENUM ('a', 'b')",
+        "CREATE DOMAIN pg_posint AS integer CHECK (VALUE > 0)",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("names that start with \"pg_\" are reserved for built-in types"),
+            "{sql}: {err}"
+        );
+    }
+}
