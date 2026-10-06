@@ -219,4 +219,27 @@ impl TempDatabase {
     pub fn connect_postgres(&self) -> Connection {
         Connection::new(self.connect_limbo())
     }
+
+    /// Closes the database and opens the same file again.
+    #[allow(dead_code)]
+    pub fn reopen(self) -> TempDatabase {
+        let TempDatabase { path, io, db } = self;
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "close every connection before reopening, or the cached database is reused"
+        );
+        drop(db);
+        let opts = turso_core::DatabaseOpts::new()
+            .with_encryption(true)
+            .with_custom_types(true);
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        TempDatabase { path, io, db }
+    }
 }

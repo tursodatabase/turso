@@ -10,3 +10,95 @@ test bootstrap-superuser-is-postgres {
 expect {
     postgres
 }
+
+test create-role-named-postgres-fails {
+    CREATE ROLE postgres;
+}
+expect error {
+    role "postgres" already exists
+}
+
+test create-role-is-listed-in-pg-roles {
+    CREATE ROLE cr_listed;
+    SELECT rolname FROM pg_roles WHERE rolname = 'cr_listed';
+}
+expect {
+    cr_listed
+}
+
+test create-role-is-not-superuser-and-cannot-log-in {
+    CREATE ROLE cr_defaults;
+    SELECT count(*) FROM pg_roles
+    WHERE rolname = 'cr_defaults' AND NOT rolsuper AND NOT rolcanlogin;
+}
+expect {
+    1
+}
+
+test create-role-lowercases-unquoted-name {
+    CREATE ROLE CR_Unquoted;
+    SELECT rolname FROM pg_roles WHERE rolname = 'cr_unquoted';
+}
+expect {
+    cr_unquoted
+}
+
+test create-role-keeps-case-of-quoted-name {
+    CREATE ROLE "CR_Quoted";
+    SELECT rolname FROM pg_roles WHERE rolname = 'CR_Quoted';
+}
+expect {
+    CR_Quoted
+}
+
+test create-role-names-differing-only-in-case-are-different-roles {
+    CREATE ROLE "cr_case";
+    CREATE ROLE "CR_CASE";
+    SELECT rolname FROM pg_roles WHERE lower(rolname) = 'cr_case' ORDER BY rolname;
+}
+expect {
+    CR_CASE
+    cr_case
+}
+
+test create-role-twice-fails {
+    CREATE ROLE cr_twice;
+    CREATE ROLE cr_twice;
+}
+expect error {
+    role "cr_twice" already exists
+}
+
+test create-role-with-pg-prefix-fails {
+    CREATE ROLE pg_cr_reserved;
+}
+expect error {
+    role name "pg_cr_reserved" is reserved
+}
+
+test create-role-named-public-fails {
+    CREATE ROLE public;
+}
+expect error {
+    role name "public" is reserved
+}
+
+test create-role-rolled-back-is-not-listed {
+    BEGIN;
+    CREATE ROLE cr_rolled_back;
+    ROLLBACK;
+    SELECT count(*) FROM pg_roles WHERE rolname = 'cr_rolled_back';
+}
+expect {
+    0
+}
+
+test create-role-committed-is-listed {
+    BEGIN;
+    CREATE ROLE cr_committed;
+    COMMIT;
+    SELECT rolname FROM pg_roles WHERE rolname = 'cr_committed';
+}
+expect {
+    cr_committed
+}

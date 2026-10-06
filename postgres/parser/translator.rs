@@ -166,6 +166,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -4212,6 +4213,46 @@ struct PgForeignKey {
     ref_columns: Vec<String>,
     on_delete: Option<String>,
     on_update: Option<String>,
+}
+
+fn translate_create_role(
+    stmt: &pg_query::protobuf::CreateRoleStmt,
+) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::RoleStmtType;
+
+    match RoleStmtType::try_from(stmt.stmt_type) {
+        Ok(RoleStmtType::RolestmtRole) => {}
+        Ok(RoleStmtType::RolestmtUser) => {
+            return Err(ParseError::ParseError(
+                "CREATE USER is not supported".to_string(),
+            ))
+        }
+        Ok(RoleStmtType::RolestmtGroup) => {
+            return Err(ParseError::ParseError(
+                "CREATE GROUP is not supported".to_string(),
+            ))
+        }
+        _ => {
+            return Err(ParseError::ParseError(format!(
+                "unknown CREATE ROLE statement type: {}",
+                stmt.stmt_type
+            )))
+        }
+    }
+    if !stmt.options.is_empty() {
+        return Err(ParseError::ParseError(
+            "CREATE ROLE options are not supported".to_string(),
+        ));
+    }
+    if stmt.role.starts_with("pg_") {
+        return Err(ParseError::ParseError(format!(
+            "role name \"{}\" is reserved",
+            stmt.role
+        )));
+    }
+    Ok(ast::Stmt::CreateRole {
+        role_name: stmt.role.clone(),
+    })
 }
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
