@@ -406,6 +406,147 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
 }
 
 #[test]
+fn native_module_creation_borrows_original_argument_buffers() {
+    for schema_only in [true, false] {
+        let args = vec![
+            Value::Null,
+            Value::from_i64(-7),
+            Value::from_f64(2.5),
+            Value::from_text("λ, native\0argument".to_string()),
+            Value::from_slice(&[0, 17, 255]).unwrap(),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+            "argument_module",
+            VTabKind::VirtualTable,
+            ArgumentsModule {
+                expected: args.clone(),
+                addresses: Some((
+                    args[3].to_text().unwrap().as_ptr() as usize,
+                    args[4].as_blob().as_ptr() as usize,
+                )),
+                calls: calls.clone(),
+            },
+        ));
+        if schema_only {
+            let module = conn.syms.read().vtab_modules["argument_module"].clone();
+            assert_eq!(
+                module.implementation.create_schema(args).unwrap(),
+                "CREATE TABLE x(value INTEGER)"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            let table = crate::vtab::VirtualTable::table(
+                Some("arguments"),
+                "argument_module",
+                args,
+                &conn.syms.read(),
+            )
+            .unwrap();
+            assert_eq!(table.columns.len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            table.destroy().unwrap();
+        }
+    }
+}
+
+#[test]
+fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "argument_module",
+        VTabKind::VirtualTable,
+        ArgumentsModule {
+            expected: vec![
+                Value::from_text("alpha"),
+                Value::from_text("73"),
+                Value::from_text("-4.25"),
+            ],
+            addresses: None,
+            calls: calls.clone(),
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE arguments USING argument_module(alpha, 73, -4.25)")
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let mut schema = crate::schema::Schema::new();
+    schema
+        .handle_schema_row(
+            "table",
+            "reloaded",
+            "reloaded",
+            0,
+            Some("CREATE VIRTUAL TABLE reloaded USING argument_module(alpha, 73, -4.25)"),
+            &conn.syms.read(),
+            &mut vec![],
+            &mut crate::HashMap::default(),
+            &mut crate::HashMap::default(),
+            &mut crate::HashMap::default(),
+            &mut crate::HashMap::default(),
+            &|_| None,
+            &SqliteDialect,
+        )
+        .unwrap();
+    assert!(matches!(
+        schema.get_table("reloaded").unwrap().as_ref(),
+        crate::schema::Table::Virtual(_)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+#[test]
+fn c_module_creation_converts_core_arguments_at_the_callback() {
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let api = unsafe { conn._build_turso_ext() };
+    let code = unsafe { CArgumentsModule::register_CArgumentsModule(&api) };
+    unsafe { conn._free_extension_ctx(api) };
+    assert_eq!(code, ResultCode::OK);
+    for schema_only in [true, false] {
+        for valid in [true, false] {
+            let args = vec![
+                Value::Null,
+                Value::from_i64(-7),
+                Value::from_f64(if valid { 2.5 } else { -2.5 }),
+                Value::from_text("λ, native\0argument".to_string()),
+                Value::from_slice(&[0, 17, 255]).unwrap(),
+            ];
+            if schema_only {
+                let module = conn.syms.read().vtab_modules["c_arguments_module"].clone();
+                let result = module.implementation.create_schema(args);
+                if valid {
+                    assert_eq!(result.unwrap(), "CREATE TABLE x(value INTEGER)");
+                } else {
+                    assert!(matches!(result, Err(LimboError::ExtensionError(_))));
+                }
+            } else {
+                let result = crate::vtab::VirtualTable::table(
+                    Some("arguments"),
+                    "c_arguments_module",
+                    args,
+                    &conn.syms.read(),
+                );
+                if valid {
+                    let table = result.unwrap();
+                    let mut cursor = table.open(conn.clone()).unwrap();
+                    assert!(matches!(
+                        cursor.filter(0, None, 0, crate::alloc::Vec::new()).unwrap(),
+                        IOResult::Done(true)
+                    ));
+                    let IOResult::Done(value) = cursor.column(0).unwrap() else {
+                        panic!("C column callback yielded");
+                    };
+                    assert_eq!(value, Value::from_i64(-7));
+                    drop(cursor);
+                    table.destroy().unwrap();
+                } else {
+                    assert!(matches!(result, Err(LimboError::ExtensionError(_))));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)]));
@@ -1108,6 +1249,44 @@ impl Aggregate for WeightedAccumulator {
 }
 
 #[derive(Debug)]
+struct ArgumentsModule {
+    expected: Vec<Value>,
+    addresses: Option<(usize, usize)>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl VirtualTableModule for ArgumentsModule {
+    type Table = RowsTable;
+
+    fn schema(&self, args: &[Value]) -> Result<String> {
+        self.check_args(args);
+        Ok("CREATE TABLE x(value INTEGER)".into())
+    }
+
+    fn create(&self, args: &[Value]) -> Result<Self::Table> {
+        self.check_args(args);
+        Ok(RowsTable {
+            queue: Arc::new(Mutex::new(Vec::new())),
+            rows: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+            before: None,
+        })
+    }
+}
+
+impl ArgumentsModule {
+    fn check_args(&self, args: &[Value]) {
+        assert_eq!(args, self.expected);
+        if let Some((text, blob)) = self.addresses {
+            assert_eq!(args[3].to_text().unwrap().as_ptr() as usize, text);
+            assert_eq!(args[4].as_blob().as_ptr() as usize, blob);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
 struct RowsModule {
     queue: Arc<Mutex<Vec<Completion>>>,
     rows: Arc<Mutex<Vec<(i64, i64)>>>,
@@ -1312,6 +1491,34 @@ fn integer(value: &Value) -> i64 {
         panic!("expected integer, got {value:?}");
     };
     *value
+}
+
+#[derive(turso_ext::VTabModuleDerive)]
+struct CArgumentsModule;
+
+impl VTabModule for CArgumentsModule {
+    type Table = CStoreTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "c_arguments_module";
+
+    fn create(args: &[turso_ext::Value]) -> std::result::Result<(String, Self::Table), ResultCode> {
+        if args.len() != 5
+            || args[0].value_type() != turso_ext::ValueType::Null
+            || args[1].to_integer() != Some(-7)
+            || args[2].to_float() != Some(2.5)
+            || args[3].to_text() != Some("λ, native\0argument")
+            || args[4].to_blob().as_deref() != Some(&[0, 17, 255])
+        {
+            return Err(ResultCode::InvalidArgs);
+        }
+        Ok((
+            "CREATE TABLE x(value INTEGER)".into(),
+            CStoreTable {
+                rows: vec![args[1].to_integer().unwrap()],
+                before: None,
+            },
+        ))
+    }
 }
 
 #[derive(turso_ext::VTabModuleDerive)]
