@@ -66,6 +66,7 @@ struct FileShadow {
     durable: Vec<u8>,
     /// Writes/truncates issued since the last fsync, in submission order.
     unsynced: Vec<UnsyncedOp>,
+    syncs: usize,
 }
 
 impl FileShadow {
@@ -73,6 +74,14 @@ impl FileShadow {
         for op in self.unsynced.drain(..) {
             op.apply(&mut self.durable);
         }
+    }
+
+    fn page_cache_image(&self) -> Vec<u8> {
+        let mut image = self.durable.clone();
+        for op in &self.unsynced {
+            op.apply(&mut image);
+        }
+        image
     }
 }
 
@@ -191,6 +200,25 @@ impl UnreliableIo {
             .unwrap()
             .get(path)
             .is_some_and(|shadow| !shadow.lock().unwrap().unsynced.is_empty())
+    }
+
+    pub fn sync_count(&self, path: &str) -> usize {
+        self.state
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map_or(0, |shadow| shadow.lock().unwrap().syncs)
+    }
+
+    pub fn page_cache_files(&self) -> HashMap<String, Vec<u8>> {
+        self.state
+            .files
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, shadow)| (path.clone(), shadow.lock().unwrap().page_cache_image()))
+            .collect()
     }
 }
 
@@ -329,7 +357,11 @@ impl File for UnreliableFile {
                 *snapshot = Some(self.state.build_crash_snapshot(&self.path));
             }
         }
-        self.shadow.lock().unwrap().promote_all();
+        {
+            let mut shadow = self.shadow.lock().unwrap();
+            shadow.syncs += 1;
+            shadow.promote_all();
+        }
         self.inner.sync(c, sync_type)
     }
 

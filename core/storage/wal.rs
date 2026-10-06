@@ -715,6 +715,8 @@ pub trait Wal: Debug + Send + Sync {
 
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion>;
 
+    fn prepare_wal_finish_without_sync(&self);
+
     /// Prepare a batch of WAL frames for durable commit/append to the log.
     fn prepare_frames(
         &self,
@@ -804,13 +806,14 @@ pub trait Wal: Debug + Send + Sync {
     /// This should't be used with regular WAL mode.
     fn update_max_frame(&self);
 
-    /// Truncate WAL file to zero and sync it. This is called AFTER the DB file has been
-    /// synced during TRUNCATE checkpoint mode, ensuring data durability.
+    /// Truncate WAL file to zero and sync it, unless `sync_mode` is OFF. This is called
+    /// AFTER the DB file has been synced during TRUNCATE checkpoint mode, ensuring data durability.
     /// The result parameter is used to track I/O progress (wal_truncate_sent, wal_sync_sent).
     fn truncate_wal(
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        sync_mode: SyncMode,
     ) -> IOResultOr<()>;
 
     /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
@@ -4490,6 +4493,10 @@ impl Wal for WalFile {
         Ok(c)
     }
 
+    fn prepare_wal_finish_without_sync(&self) {
+        self.coordination.mark_initialized();
+    }
+
     /// Prepares a batch of dirty pages as WAL frames without modifying WAL state.
     ///
     /// This is the first phase of a three-phase commit protocol:
@@ -4803,8 +4810,9 @@ impl Wal for WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        sync_mode: SyncMode,
     ) -> IOResultOr<()> {
-        self.truncate_log(result, sync_type)
+        self.truncate_log(result, sync_type, sync_mode)
     }
 }
 
@@ -5356,12 +5364,14 @@ impl WalFile {
         Ok(())
     }
 
-    /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
+    /// Truncate WAL file to zero and sync it, unless `sync_mode` is OFF. Called by pager
+    /// AFTER DB file is synced.
     #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        sync_mode: SyncMode,
     ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
@@ -5381,7 +5391,7 @@ impl WalFile {
             result.wal_max_frame = 0;
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
-        } else if !result.wal_sync_sent {
+        } else if !result.wal_sync_sent && sync_mode != SyncMode::Off {
             let c = file.sync(
                 Completion::new_sync(move |res| {
                     if let Err(err) = res {

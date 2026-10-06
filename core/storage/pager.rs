@@ -1228,7 +1228,7 @@ impl Page {
 enum CommitState {
     /// Prepare WAL header for commit if needed
     PrepareWal,
-    /// Sync WAL header after prepare
+    /// Sync WAL header after prepare, unless sync_mode is OFF
     PrepareWalSync,
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
@@ -4553,6 +4553,11 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
+                    if sync_mode == SyncMode::Off {
+                        wal.prepare_wal_finish_without_sync();
+                        self.commit_info.write().state = CommitState::GetDbSize;
+                        continue;
+                    }
                     let c = wal.prepare_wal_finish(self.get_sync_type())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
@@ -5347,23 +5352,13 @@ impl Pager {
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {
                     // Truncate WAL file after DB is safely synced - this ensures data durability.
                     // If crash occurred after WAL truncate but before DB sync, data would be lost.
-                    let need_wal_truncate = {
-                        let state = self.checkpoint_state.read();
-                        turso_assert!(
-                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
-                            "mode should be truncate in CheckpointPhase::TruncateWalFile"
-                        );
-                        let result = state.result.as_ref().expect("result should be set");
-                        !result.wal_truncate_sent || !result.wal_sync_sent
-                    };
-
-                    if !need_wal_truncate {
-                        self.checkpoint_state.write().phase =
-                            CheckpointPhase::Finalize { clear_page_cache };
-                        continue;
-                    }
-
-                    // Call WAL truncate
+                    turso_assert!(
+                        matches!(
+                            self.checkpoint_state.read().mode,
+                            Some(CheckpointMode::Truncate { .. })
+                        ),
+                        "mode should be truncate in CheckpointPhase::TruncateWalFile"
+                    );
                     return_if_io!(wal.truncate_wal(
                         self.checkpoint_state
                             .write()
@@ -5371,7 +5366,10 @@ impl Pager {
                             .as_mut()
                             .expect("result should be set"),
                         self.get_sync_type(),
+                        sync_mode,
                     ));
+                    self.checkpoint_state.write().phase =
+                        CheckpointPhase::Finalize { clear_page_cache };
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();

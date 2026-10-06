@@ -1,8 +1,9 @@
 use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::{Connection, Database, LimboError, PlatformIO, Result, SqliteDialect};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -347,4 +348,44 @@ fn test_wal_write_lock_released_on_conn_drop() {
     conn2
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
+}
+
+#[test]
+fn test_synchronous_off_does_not_fsync_the_wal() -> anyhow::Result<()> {
+    let db_path_sim = "synchronous-off-does-not-fsync-the-wal.db";
+    let wal_path_sim = format!("{db_path_sim}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file(io.clone(), db_path_sim, Arc::new(SqliteDialect))?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=OFF")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("INSERT INTO t VALUES (2)")?;
+    conn.execute("PRAGMA wal_checkpoint(RESTART)")?;
+    conn.execute("INSERT INTO t VALUES (3)")?;
+
+    assert_eq!(
+        io.sync_count(&wal_path_sim),
+        0,
+        "synchronous=OFF must not fsync the WAL header or the truncated WAL"
+    );
+
+    let files = io.page_cache_files();
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    std::fs::write(&db_path, &files[db_path_sim])?;
+    std::fs::write(dir.path().join("recovered.db-wal"), &files[&wal_path_sim])?;
+    let recovered_db = Database::open_file(
+        Arc::new(PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect()?;
+    assert_eq!(
+        execute_and_get_ints(&recovered, "SELECT x FROM t ORDER BY x")?,
+        vec![1, 2, 3],
+        "a process crash under synchronous=OFF lost committed rows"
+    );
+    Ok(())
 }
