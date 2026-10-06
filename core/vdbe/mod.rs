@@ -3199,6 +3199,7 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
+                        connection.get_wal_autocheckpoint(),
                         connection.get_sync_mode_for_database(db_id)?,
                         connection.get_data_sync_retry(),
                     ) {

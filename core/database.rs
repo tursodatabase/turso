@@ -39,8 +39,8 @@ use crate::{
     sync::{
         self,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize,
-            Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8,
+            AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
     },
@@ -2552,6 +2552,7 @@ impl Database {
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
+            wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
             #[cfg(feature = "conn_raw_api")]

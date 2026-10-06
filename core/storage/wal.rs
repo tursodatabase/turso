@@ -744,7 +744,7 @@ pub trait Wal: Debug + Send + Sync {
     /// all changes were stored locally.
     fn finish_append_frames_commit(&self) -> Result<()>;
 
-    fn should_checkpoint(&self) -> bool;
+    fn should_checkpoint(&self, checkpoint_threshold: u32) -> bool;
     /// Checkpoint the WAL into the database file.
     /// `sync_mode` controls the WAL durability barrier: unless it is
     /// [SyncMode::Off], the WAL is fsynced before any frame is backfilled so
@@ -2804,7 +2804,6 @@ pub struct WalFile {
     write_lock_held: AtomicBool,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
-    checkpoint_threshold: usize,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
     max_frame_read_lock_index: AtomicUsize,
@@ -2843,7 +2842,6 @@ impl fmt::Debug for WalFile {
             .field("syncing", &self.syncing.load(Ordering::Relaxed))
             .field("page_size", &self.page_size())
             .field("ongoing_checkpoint", &*self.ongoing_checkpoint.read())
-            .field("checkpoint_threshold", &self.checkpoint_threshold)
             .field("max_frame_read_lock_index", &self.max_frame_read_lock_index)
             .field("max_frame", &self.max_frame)
             .field("min_frame", &self.min_frame)
@@ -4116,9 +4114,12 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn should_checkpoint(&self) -> bool {
+    fn should_checkpoint(&self, checkpoint_threshold: u32) -> bool {
+        if checkpoint_threshold == 0 {
+            return false;
+        }
         let snapshot = self.load_coordination_snapshot();
-        snapshot.max_frame as usize > self.checkpoint_threshold + snapshot.nbackfills as usize
+        snapshot.max_frame > u64::from(checkpoint_threshold) + snapshot.nbackfills
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4862,7 +4863,6 @@ impl WalFile {
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
             }),
-            checkpoint_threshold: 1000,
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
