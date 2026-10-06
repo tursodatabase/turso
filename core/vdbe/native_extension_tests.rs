@@ -742,7 +742,7 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         let conn = connection(
             OpenOptions::new(Arc::new(SqliteDialect))
                 .native_module("restricted_rows", kind, module.clone())
-                .native_module("allowed_rows", kind, InnocuousModule(module)),
+                .native_module("allowed_rows", kind, TriggerReadableModule(module)),
         );
         if kind == VTabKind::VirtualTable {
             conn.execute("CREATE VIRTUAL TABLE restricted USING restricted_rows")
@@ -759,7 +759,7 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
-            assert_eq!(table.innocuous, expected, "{name}");
+            assert_eq!(table.allows_reads_in_triggers, expected, "{name}");
         }
     }
 }
@@ -770,7 +770,7 @@ fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
-        InnocuousModule(RowsModule {
+        TriggerReadableModule(RowsModule {
             queue: queue.clone(),
             rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9)])),
             events: Arc::new(Mutex::new(Vec::new())),
@@ -1487,9 +1487,9 @@ impl ArgumentsModule {
 }
 
 #[derive(Debug)]
-struct InnocuousModule<M>(M);
+struct TriggerReadableModule<M>(M);
 
-impl<M: VirtualTableModule> VirtualTableModule for InnocuousModule<M> {
+impl<M: VirtualTableModule> VirtualTableModule for TriggerReadableModule<M> {
     type Table = M::Table;
 
     fn schema(&self, args: &[Value]) -> Result<String> {
@@ -1500,7 +1500,7 @@ impl<M: VirtualTableModule> VirtualTableModule for InnocuousModule<M> {
         self.0.create(args)
     }
 
-    fn innocuous(&self) -> bool {
+    fn allows_reads_in_triggers(&self) -> bool {
         true
     }
 }
