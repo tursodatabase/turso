@@ -21,7 +21,7 @@ pub const POSTGRES_TABLE_MARKER: &str = "/* turso_frontend:postgres */";
 /// The SQL of a `sqlite_schema` table row.
 pub enum StoredTableSql<'a> {
     /// Turso SQL, which the SQLite parser reads.
-    Canonical(&'a str),
+    Canonical(std::borrow::Cow<'a, str>),
     /// PostgreSQL DDL that an older PostgreSQL frontend stored after
     /// [`POSTGRES_TABLE_MARKER`].
     Postgres(&'a str),
@@ -29,22 +29,35 @@ pub enum StoredTableSql<'a> {
 
 pub fn decode_stored_table_sql(sql: &str) -> StoredTableSql<'_> {
     let Some(payload) = sql.strip_prefix(POSTGRES_TABLE_MARKER) else {
-        return StoredTableSql::Canonical(sql);
+        return StoredTableSql::Canonical(std::borrow::Cow::Borrowed(sql));
     };
     let payload = payload.trim_start();
     // ALTER TABLE ... RENAME of older versions stored the marker before
-    // canonical STRICT SQL. PostgreSQL DDL has no STRICT option.
-    let renamed_by_older_version = matches!(
-        sqlite::parse_table_sql_ast(payload),
+    // canonical STRICT SQL. PostgreSQL DDL has no STRICT option. The marker
+    // shows that the table is a table of the PostgreSQL frontend.
+    match sqlite::parse_table_sql_ast(payload) {
         Ok(turso_parser::ast::Stmt::CreateTable {
-            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { ref options, .. },
+            tbl_name,
+            body:
+                turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    mut options,
+                },
             ..
-        }) if options.contains_strict()
-    );
-    if renamed_by_older_version {
-        StoredTableSql::Canonical(payload)
-    } else {
-        StoredTableSql::Postgres(payload)
+        }) if options.contains_strict() => {
+            options.pg_storage = true;
+            let body = turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                options,
+            };
+            StoredTableSql::Canonical(std::borrow::Cow::Owned(format!(
+                "CREATE TABLE {} {body}",
+                tbl_name.name.as_ident()
+            )))
+        }
+        _ => StoredTableSql::Postgres(payload),
     }
 }
 

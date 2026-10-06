@@ -280,7 +280,8 @@ fn vacuum_stores_base_tables_as_canonical_sql() {
 }
 
 /// RENAME of the base tursopg stored the marker before canonical STRICT SQL;
-/// the base tursopg cannot open such a file.
+/// the base tursopg cannot open such a file. The marker shows that the table
+/// is a PostgreSQL table, so the next ALTER stores it with PGSTORAGE.
 #[test]
 fn renamed_table_of_base_file_loads() {
     let dir = copy_fixtures(&["pg_v1_renamed.db"]);
@@ -304,6 +305,81 @@ fn renamed_table_of_base_file_loads() {
     assert_eq!(
         core_rows(&sqlite, "SELECT id, ts, n, note FROM r2 ORDER BY id"),
         expected
+    );
+    drop(sqlite);
+
+    let db = open(path.clone(), false);
+    let conn = db.connect_postgres();
+    conn.execute("ALTER TABLE r2 ADD COLUMN z text").unwrap();
+    drop(conn);
+    let db = db.reopen();
+    let core = db.connect_limbo();
+    assert_eq!(
+        core_rows(&core, "SELECT sql FROM sqlite_schema WHERE name = 'r2'"),
+        [
+            "CREATE TABLE r2 (id bigint PRIMARY KEY, ts timestamp, n numeric(10, 2), \
+          note TEXT DEFAULT 'x', z TEXT) STRICT, PGSTORAGE"
+        ]
+    );
+    assert_eq!(
+        core_rows(&core, "SELECT id, ts, n, note, z FROM r2 ORDER BY id"),
+        [
+            "1|2024-01-01 10:00:00|2.50|first|NULL",
+            "2|2024-01-02 00:00:00|3.00|x|NULL"
+        ]
+    );
+}
+
+/// RENAME of the base tursopg also printed a DEFAULT function call without
+/// parentheses, which the SQLite parser refuses. The base cannot open the
+/// file at all.
+#[test]
+fn renamed_table_with_function_defaults_of_base_file_loads() {
+    let dir = copy_fixtures(&["pg_v1_renamed_serial.db"]);
+    let path = dir.path().join("pg_v1_renamed_serial.db");
+    let db = open(path.clone(), false);
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO rs2 (a) VALUES ('second')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, ts, flag, a FROM rs2 WHERE id = 1"),
+        ["1|2024-01-01 10:00:00|0|first"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT id, ts IS NOT NULL, flag, a FROM rs2 WHERE id > 1"
+        ),
+        ["2|1|0|second"]
+    );
+    drop(conn);
+    drop(db);
+
+    let Err(err) = open_with_sqlite_dialect(&path) else {
+        panic!("the SQLite dialect must refuse the row");
+    };
+    assert!(
+        err.to_string()
+            .contains("created by the PostgreSQL frontend"),
+        "{err}"
+    );
+
+    let db = open(path.clone(), false);
+    let conn = db.connect_postgres();
+    conn.execute("ALTER TABLE rs2 ADD COLUMN z text").unwrap();
+    drop(conn);
+    drop(db);
+    let sqlite = open_with_sqlite_dialect(&path).unwrap().connect().unwrap();
+    assert_eq!(
+        core_rows(&sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'rs2'"),
+        [
+            "CREATE TABLE rs2 (id INTEGER PRIMARY KEY DEFAULT (nextval ('rs_id_seq')), \
+          ts timestamp DEFAULT (now ()), flag boolean DEFAULT 0, a TEXT, z TEXT) STRICT, PGSTORAGE"
+        ]
+    );
+    assert_eq!(
+        core_rows(&sqlite, "SELECT id, a, z FROM rs2 ORDER BY id"),
+        ["1|first|NULL", "2|second|NULL"]
     );
 }
 

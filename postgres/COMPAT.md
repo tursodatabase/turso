@@ -367,6 +367,13 @@ tursopg and tursodb refuse a table with the `PGSTORAGE` option ("unknown
 table option"). Thus a file is a one-way upgrade: after the first CREATE TABLE
 or ALTER TABLE of this version, older versions cannot open it.
 
+Tables of older versions: ADD COLUMN and DROP COLUMN of older versions stored
+a table as Turso SQL without the marker. Nothing shows that such a table is a
+table of the PostgreSQL frontend, so it does not get the `PGSTORAGE` option.
+RENAME of older versions stored the marker before Turso SQL. tursopg reads
+such a table, also when a DEFAULT calls a function, and the table gets the
+`PGSTORAGE` option at its next ALTER TABLE.
+
 tursopg attaches the schema files next to the database at start. A schema
 file that does not attach, for example because its tables use a type that
 the database does not define, gives a warning on stderr.

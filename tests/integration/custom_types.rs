@@ -619,9 +619,10 @@ mod tests {
     }
 
     /// RENAME of older versions of the PostgreSQL frontend stored the marker
-    /// before canonical STRICT SQL.
+    /// before canonical STRICT SQL. The marker shows that the table is a
+    /// table of the PostgreSQL frontend.
     #[test]
-    fn test_marker_before_canonical_sql_loads_as_canonical_sql() {
+    fn test_marker_before_canonical_sql_loads_as_pg_storage_table() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("pg_marker_rename.db");
         write_table_sql(
@@ -629,9 +630,9 @@ mod tests {
             "/* turso_frontend:postgres */ CREATE TABLE t (id bigint PRIMARY KEY, n numeric (10, 2)) STRICT",
         );
         let Err(err) = open_file(&path, false) else {
-            panic!("a table with custom types needs custom types");
+            panic!("a table of the PostgreSQL frontend needs custom types");
         };
-        assert_that!(err.to_string()).contains("column t.id has type \"bigint\"");
+        assert_that!(err.to_string()).contains("table t was created by the PostgreSQL frontend");
 
         let db = open_file(&path, true).unwrap();
         let conn = db.connect().unwrap();

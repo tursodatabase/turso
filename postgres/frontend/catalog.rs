@@ -51,13 +51,9 @@ impl Dialect for PostgresDialect {
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         match decode_stored_table_sql(sql) {
-            StoredTableSql::Canonical(sql) => BTreeTable::from_sql(sql, root_page),
+            StoredTableSql::Canonical(sql) => BTreeTable::from_sql(&sql, root_page),
             StoredTableSql::Postgres(ddl) => {
-                let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
-                    translate_stored_table(ddl)?
-                else {
-                    unreachable!("translate_stored_table returns CREATE TABLE");
-                };
+                let (tbl_name, body) = translate_stored_table(ddl)?;
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
             }
         }
@@ -65,22 +61,28 @@ impl Dialect for PostgresDialect {
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
         match decode_stored_table_sql(sql) {
-            StoredTableSql::Canonical(sql) => turso_core::dialect::sqlite::parse_table_sql_ast(sql),
-            StoredTableSql::Postgres(ddl) => translate_stored_table(ddl),
+            StoredTableSql::Canonical(sql) => {
+                turso_core::dialect::sqlite::parse_table_sql_ast(&sql)
+            }
+            StoredTableSql::Postgres(ddl) => {
+                let (tbl_name, body) = translate_stored_table(ddl)?;
+                Ok(turso_parser::ast::Stmt::CreateTable {
+                    temporary: false,
+                    if_not_exists: false,
+                    tbl_name,
+                    body,
+                })
+            }
         }
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         match decode_stored_table_sql(sql) {
             StoredTableSql::Canonical(sql) => {
-                turso_core::dialect::sqlite::table_sql_for_replay(sql)
+                turso_core::dialect::sqlite::table_sql_for_replay(&sql)
             }
             StoredTableSql::Postgres(ddl) => {
-                let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
-                    translate_stored_table(ddl)?
-                else {
-                    unreachable!("translate_stored_table returns CREATE TABLE");
-                };
+                let (tbl_name, body) = translate_stored_table(ddl)?;
                 turso_core::dialect::sqlite::format_table_sql(&tbl_name, &body)
             }
         }
@@ -153,14 +155,31 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 
 /// Translate the PostgreSQL DDL that an older Turso stored for a table, with
 /// the type mapping of that version.
-fn translate_stored_table(ddl: &str) -> Result<turso_parser::ast::Stmt> {
-    let parse_result =
-        turso_pg_parser::parse(ddl).map_err(|e| LimboError::ParseError(e.to_string()))?;
+///
+/// ALTER TABLE ... RENAME of older versions stored canonical STRICT SQL
+/// after the marker, and printed a DEFAULT function call without
+/// parentheses (`DEFAULT nextval ('t_id_seq')`), which the SQLite parser
+/// refuses. Without the STRICT option, that text is PostgreSQL DDL of the
+/// same table.
+fn translate_stored_table(
+    ddl: &str,
+) -> Result<(
+    turso_parser::ast::QualifiedName,
+    turso_parser::ast::CreateTableBody,
+)> {
+    let parse_result = match turso_pg_parser::parse(ddl) {
+        Ok(parse_result) => parse_result,
+        Err(e) => match ddl.trim_end().strip_suffix(" STRICT") {
+            Some(renamed_by_older_version) => turso_pg_parser::parse(renamed_by_older_version)
+                .map_err(|e| LimboError::ParseError(e.to_string()))?,
+            None => return Err(LimboError::ParseError(e.to_string())),
+        },
+    };
     let stmt = turso_pg_parser::translator::PostgreSQLTranslator::for_stored_table()
         .translate(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     match stmt {
-        stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
+        turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => Ok((tbl_name, body)),
         _ => Err(LimboError::ParseError(
             "expected CREATE TABLE statement".to_string(),
         )),
@@ -3310,9 +3329,9 @@ impl PgGetTableDefCursor {
             {
                 Some(StoredTableSql::Postgres(ddl)) => ddl.to_string(),
                 Some(StoredTableSql::Canonical(sql)) if btree_table.is_pg_storage => {
-                    pg_storage_table_ddl(sql)?
+                    pg_storage_table_ddl(&sql)?
                 }
-                Some(StoredTableSql::Canonical(sql)) => self.convert_to_postgres_ddl(sql),
+                Some(StoredTableSql::Canonical(sql)) => self.convert_to_postgres_ddl(&sql),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
 
