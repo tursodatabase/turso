@@ -4038,8 +4038,19 @@ pub struct RowidAllocator {
     max_rowid: AtomicI64,
     /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
-    btree_last: AtomicI64,
-    btree_last_known: AtomicBool,
+    btree_last: Mutex<Option<BtreeLast>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BtreeLast {
+    pub(crate) read_mark: WalPos,
+    pub(crate) rowid: Option<i64>,
+}
+
+impl BtreeLast {
+    pub(crate) fn may_hold(&self, rowid: i64) -> bool {
+        self.rowid.is_some_and(|last| rowid <= last)
+    }
 }
 
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
@@ -10242,8 +10253,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     lock: TursoRwLock::new(),
                     max_rowid: AtomicI64::new(0),
                     initialized: AtomicBool::new(false),
-                    btree_last: AtomicI64::new(0),
-                    btree_last_known: AtomicBool::new(false),
+                    btree_last: Mutex::new(None),
                 })
             })
             .clone()
@@ -10389,34 +10399,12 @@ impl RowidAllocator {
         }
     }
 
-    pub fn btree_last(&self) -> Option<i64> {
-        self.btree_last_known
-            .load(Ordering::SeqCst)
-            .then(|| self.btree_last.load(Ordering::SeqCst))
+    pub(crate) fn btree_last(&self, read_mark: WalPos) -> Option<BtreeLast> {
+        (*self.btree_last.lock()).filter(|last| last.read_mark == read_mark)
     }
 
-    pub fn record_btree_last(&self, rowid: Option<i64>) {
-        if let Some(rowid) = rowid {
-            let _ = self
-                .btree_last
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                    (rowid > cur).then_some(rowid)
-                });
-        }
-        self.btree_last_known.store(true, Ordering::SeqCst);
-    }
-
-    pub fn rowid_ceiling_rules_out(&self, rowid: i64) -> bool {
-        //   btree=-5 inserted=0          btree=5 inserted=200
-        //   -5  -3   0   3               1   5  100  200  201
-        //   [search every probe]         [search]      [skip]
-        matches!(self.rowid_ceiling(), Some(ceiling) if ceiling > 0 && rowid > ceiling)
-    }
-
-    fn rowid_ceiling(&self) -> Option<i64> {
-        let btree = self.btree_last()?;
-        // The getter stays None until NewRowid. Explicit inserts still move the counter.
-        Some(btree.max(self.max_rowid.load(Ordering::SeqCst)))
+    pub(crate) fn record_btree_last(&self, last: BtreeLast) {
+        *self.btree_last.lock() = Some(last);
     }
 
     pub fn is_uninitialized(&self) -> bool {
