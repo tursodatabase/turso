@@ -1659,6 +1659,11 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
+    /// Switch the connection to the named role, or back to the session role
+    /// when `role_name` is `None`
+    SetRole {
+        role_name: Option<String>,
+    },
     /// Add a role to the in-memory role catalog after its row was inserted
     AddRole {
         db: usize,
@@ -2312,6 +2317,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::SetRole => execute::op_set_role,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,

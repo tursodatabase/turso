@@ -1985,6 +1985,18 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
+            Insn::SetRole { role_name } => (
+                "SetRole",
+                0,
+                0,
+                0,
+                Value::build_text(role_name.clone().unwrap_or_default()),
+                0,
+                match role_name {
+                    Some(role_name) => format!("set role {role_name}"),
+                    None => "reset role".to_string(),
+                },
+            ),
             Insn::AddRole {
                 db,
                 id_reg,

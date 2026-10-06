@@ -693,6 +693,17 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some("ROLE"))?;
                 s.append(TK_ID, Some(role_name))
             }
+            Self::SetRole { role_name } => match role_name {
+                Some(role_name) => {
+                    s.append(TK_SET, None)?;
+                    s.append(TK_ID, Some("ROLE"))?;
+                    s.append(TK_ID, Some(role_name))
+                }
+                None => {
+                    s.append(TK_ID, Some("RESET"))?;
+                    s.append(TK_ID, Some("ROLE"))
+                }
+            },
             Self::CreateType {
                 if_not_exists,
                 type_name,

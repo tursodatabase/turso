@@ -11,6 +11,16 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
 
+/// Switches the connection to `role_name`, or back to the session role when
+/// `role_name` is `None`. The role is looked up when the statement runs. The
+/// read transaction makes the statement prepare again if another connection
+/// changed the roles since it was prepared.
+pub fn translate_set_role(role_name: Option<String>, program: &mut ProgramBuilder) -> Result<()> {
+    program.begin_read_operation()?;
+    program.emit_insn(Insn::SetRole { role_name });
+    Ok(())
+}
+
 /// Creates a role that is not a superuser and cannot log in.
 pub fn translate_create_role(
     role_name: &str,
@@ -146,6 +156,7 @@ mod tests {
 
     use turso_parser::ast;
 
+    use crate::security::roles::RoleId;
     use crate::{Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
 
     #[test]
@@ -171,6 +182,73 @@ mod tests {
             error.to_string().contains("role \"alice\" already exists"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn set_role_switches_the_current_role_and_reset_role_switches_back() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        let alice = conn.role_catalog().get_by_name("alice").unwrap().id;
+
+        set_role(&conn, "alice").unwrap();
+        assert_eq!(conn.current_role(), alice);
+        assert_eq!(conn.session_role(), RoleId::SUPERUSER);
+
+        reset_role(&conn).unwrap();
+        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
+    }
+
+    #[test]
+    fn set_role_to_a_missing_role_fails() {
+        let conn = open_connection();
+
+        let error = set_role(&conn, "nobody").unwrap_err();
+
+        assert_eq!(error.to_string(), "role \"nobody\" does not exist");
+        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
+    }
+
+    #[test]
+    fn set_role_inside_a_transaction_fails() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        conn.execute("BEGIN").unwrap();
+
+        let error = set_role(&conn, "alice").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "SET ROLE inside a transaction block is not supported"
+        );
+        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
+    }
+
+    #[test]
+    fn interrupted_set_role_keeps_the_current_role() {
+        for interrupt_at_step in 1.. {
+            let conn = open_connection();
+            create_role(&conn, "alice").unwrap();
+            let steps = Arc::new(AtomicU64::new(0));
+            let steps_in_handler = steps.clone();
+            conn.set_progress_handler(
+                1,
+                Some(Box::new(move || {
+                    steps_in_handler.fetch_add(1, Ordering::SeqCst) + 1 == interrupt_at_step
+                })),
+            );
+            let result = set_role(&conn, "alice");
+            conn.set_progress_handler(0, None);
+            if result.is_ok() {
+                assert!(interrupt_at_step > 1, "the statement was never interrupted");
+                return;
+            }
+
+            assert_eq!(
+                conn.current_role(),
+                RoleId::SUPERUSER,
+                "interrupted at step {interrupt_at_step}, the role changed"
+            );
+        }
     }
 
     #[test]
@@ -223,6 +301,20 @@ mod tests {
         )
         .unwrap();
         db.connect().unwrap()
+    }
+
+    fn set_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
+        let set_role = ast::Cmd::Stmt(ast::Stmt::SetRole {
+            role_name: Some(name.to_string()),
+        });
+        conn.prepare_translated_cmd(set_role, &format!("SET ROLE {name}"))?
+            .run_ignore_rows()
+    }
+
+    fn reset_role(conn: &Arc<Connection>) -> crate::Result<()> {
+        let reset_role = ast::Cmd::Stmt(ast::Stmt::SetRole { role_name: None });
+        conn.prepare_translated_cmd(reset_role, "RESET ROLE")?
+            .run_ignore_rows()
     }
 
     fn create_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {

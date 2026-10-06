@@ -55,6 +55,9 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// The current role lacks the privilege that the statement needs.
+    #[error("{0}")]
+    PermissionDenied(String),
     #[error("{0}")]
     Constraint(String),
     #[error("{0}")]
@@ -178,6 +181,7 @@ impl LimboError {
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
+            Self::PermissionDenied(_) => 23,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,

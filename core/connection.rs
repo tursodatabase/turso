@@ -2,7 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::security::roles::{RoleCatalog, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
+use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -569,6 +569,10 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
 }
@@ -3892,6 +3896,25 @@ impl Connection {
     pub fn role_catalog(&self) -> Arc<RoleCatalog> {
         self.maybe_update_schema();
         self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
+    }
+
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub(crate) fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

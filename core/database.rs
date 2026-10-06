@@ -2650,6 +2650,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            session_role: crate::security::roles::RoleId::SUPERUSER,
+            current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections
