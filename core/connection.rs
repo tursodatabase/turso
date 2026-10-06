@@ -1676,7 +1676,6 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        self.check_reparsed_column_types(&inner.fresh)?;
                         inner.phase = ReparsePhase::RefreshStats {
                             stats: Default::default(),
                         };
@@ -1698,14 +1697,12 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
-                            self.check_reparsed_column_types(&inner.fresh)?;
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
                         }
                         Err(e) => {
                             tracing::warn!("Failed to load custom types: {}", e);
-                            self.check_reparsed_column_types(&inner.fresh)?;
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
@@ -1722,6 +1719,11 @@ impl Connection {
                         unreachable!("state is Building");
                     };
                     let fresh = inner.fresh;
+                    if let Err(e) = self.check_reparsed_column_types(&fresh) {
+                        let schema = self.db.schema.lock().clone();
+                        *self.schema.write() = schema;
+                        return Err(Box::new(e));
+                    }
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,

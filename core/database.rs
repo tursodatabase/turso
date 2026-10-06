@@ -1147,6 +1147,9 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                if db.opts.opened_by_attach && !options.db_opts.opened_by_attach {
+                    db.check_own_column_types()?;
+                }
                 return Ok(Some(db));
             }
         }
@@ -1717,8 +1720,7 @@ impl Database {
                             .as_ref()
                             .expect("db must be initialized in Init phase");
                         if !db.opts.opened_by_attach {
-                            let schema = db.schema.lock().clone();
-                            schema.check_column_types_resolve(&schema)?;
+                            db.check_own_column_types()?;
                         }
                     }
 
@@ -1736,6 +1738,17 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// The tables of a database that ATTACH opened use the types of the main
+    /// database, and ATTACH checks them against those types. An open as the
+    /// main database checks them against the types of the database itself.
+    fn check_own_column_types(&self) -> Result<()> {
+        if !self.experimental_custom_types_enabled() {
+            return Ok(());
+        }
+        let schema = self.schema.lock().clone();
+        schema.check_column_types_resolve(&schema)
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.

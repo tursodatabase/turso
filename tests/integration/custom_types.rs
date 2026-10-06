@@ -544,7 +544,9 @@ mod tests {
             io,
             path.to_str().unwrap(),
             turso_core::OpenFlags::Create,
-            turso_core::DatabaseOpts::new().with_custom_types(custom_types),
+            turso_core::DatabaseOpts::new()
+                .with_custom_types(custom_types)
+                .with_attach(true),
             None,
             std::sync::Arc::new(turso_core::SqliteDialect),
         )
@@ -804,5 +806,141 @@ mod tests {
             .err()
             .display_string()
             .contains("PGSTORAGE table p needs custom types");
+    }
+
+    /// A reparse finds a column type that does not resolve. The connection
+    /// refuses the new schema and keeps the schema that it had.
+    #[test]
+    fn test_reparse_refuses_column_types_that_do_not_resolve() {
+        for (setup, change) in [
+            (
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+                 CREATE DOMAIN d AS cents;
+                 CREATE TABLE x(id INTEGER PRIMARY KEY, a d) STRICT;",
+                "UPDATE __turso_internal_types SET sql = 'CREATE DOMAIN d AS pg_later_type' WHERE name = 'd'",
+            ),
+            (
+                "CREATE TABLE x(id INTEGER PRIMARY KEY, a INTEGER) STRICT;",
+                "UPDATE sqlite_schema SET sql = 'CREATE TABLE x (id INTEGER PRIMARY KEY, a pg_later_type) STRICT' WHERE name = 'x'",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("reparse.db");
+            let db = open_file(&path, true).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(setup).unwrap();
+            conn.execute("INSERT INTO x VALUES (1, 5)").unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.start_nested();
+            conn.execute(change).unwrap();
+            conn.end_nested();
+            conn.execute("COMMIT").unwrap();
+
+            let Err(err) = conn.force_reparse_schema_without_publish() else {
+                panic!("the reparse must fail: {change}");
+            };
+            assert_that!(err.to_string()).contains("which this database does not define");
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM x");
+            assert_eq!(rows, vec![(1, 5)], "{change}");
+        }
+    }
+
+    /// The values of an attached table were encoded with the type definition
+    /// of the attached file, but its tables use the types of the main
+    /// database.
+    #[test]
+    fn test_attach_refuses_a_type_that_the_main_database_defines_differently() {
+        let temp_dir = TempDir::new().unwrap();
+        let attached = temp_dir.path().join("attached.db");
+        create_file(
+            &attached,
+            false,
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+             CREATE DOMAIN d AS cents;
+             CREATE TABLE t(c cents, e d) STRICT;
+             INSERT INTO t VALUES (7, 8);",
+        );
+        let attach = format!("ATTACH '{}' AS a", attached.display());
+        for (main_types, error) in [
+            (
+                "CREATE TYPE cents BASE integer ENCODE value * 1000 DECODE value / 1000;
+                 CREATE DOMAIN d AS cents;",
+                "column t.c uses type \"cents\", which the attached database and the main database define differently",
+            ),
+            (
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+                 CREATE DOMAIN d AS integer;",
+                "column t.e uses type \"d\", which the attached database and the main database define differently",
+            ),
+        ] {
+            let main = temp_dir.path().join("main.db");
+            create_file(&main, false, main_types);
+            let db = open_file(&main, true).unwrap();
+            let conn = db.connect().unwrap();
+            assert_that!(conn.execute(&attach))
+                .err()
+                .display_string()
+                .contains(error);
+            conn.close().unwrap();
+            drop(db);
+            std::fs::remove_file(&main).unwrap();
+            let _ = std::fs::remove_file(main.with_extension("db-wal"));
+        }
+
+        let main = temp_dir.path().join("same.db");
+        create_file(
+            &main,
+            false,
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+             CREATE DOMAIN d AS cents;",
+        );
+        let db = open_file(&main, true).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(&attach).unwrap();
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT c, e FROM a.t");
+        assert_eq!(rows, vec![(7, 8)]);
+    }
+
+    /// A table of a database that ATTACH opened uses the types of the main
+    /// database. An open of the same file as the main database must check
+    /// the types again, also when the open gets the instance that ATTACH
+    /// opened.
+    #[test]
+    fn test_open_as_main_checks_the_types_of_a_database_that_attach_opened() {
+        let temp_dir = TempDir::new().unwrap();
+        let main = temp_dir.path().join("main.db");
+        let attached = temp_dir.path().join("attached.db");
+        let db = open_file(&main, true).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE DOMAIN d AS INTEGER CHECK (value > 0)")
+            .unwrap();
+        conn.execute(format!("ATTACH '{}' AS a", attached.display()))
+            .unwrap();
+        conn.execute("CREATE TABLE a.t(id INTEGER PRIMARY KEY, x d) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO a.t VALUES (1, 5)").unwrap();
+
+        let Err(err) = open_file(&attached, true) else {
+            panic!("the file has no type d");
+        };
+        assert_that!(err.to_string())
+            .contains("column t.x has type \"d\", which this database does not define");
+    }
+
+    #[test]
+    fn test_attach_without_custom_types_refuses_pg_storage_tables() {
+        let temp_dir = TempDir::new().unwrap();
+        let attached = temp_dir.path().join("attached.db");
+        create_file(
+            &attached,
+            false,
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, a TEXT) STRICT, PGSTORAGE;",
+        );
+        let db = open_file(&temp_dir.path().join("main.db"), false).unwrap();
+        let conn = db.connect().unwrap();
+        assert_that!(conn.execute(format!("ATTACH '{}' AS a", attached.display())))
+            .err()
+            .display_string()
+            .contains("table p was created by the PostgreSQL frontend");
     }
 }

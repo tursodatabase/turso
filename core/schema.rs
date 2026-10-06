@@ -1133,7 +1133,10 @@ impl Schema {
     /// cannot read the values of such a column: the type is missing, or a
     /// later version added it. `types` is the schema whose types the tables
     /// use: the main schema, also for the tables of an attached database.
-    pub fn check_column_types_resolve(&self, types: &Schema) -> Result<()> {
+    /// An attached database that stores its own definition of such a type
+    /// must store the definition of the main schema, because its values were
+    /// encoded with its own definition.
+    pub(crate) fn check_column_types_resolve(&self, types: &Schema) -> Result<()> {
         for table in self.tables.values() {
             let Some(table) = table.btree() else {
                 continue;
@@ -1142,17 +1145,41 @@ impl Schema {
                 continue;
             }
             for column in table.columns() {
+                let column_name = column.name.as_deref().unwrap_or_default();
                 if !types.type_resolves_to_primitive(&column.ty_str) {
                     return Err(LimboError::ParseError(format!(
-                        "column {}.{} has type \"{}\", which this database does not define: the type is missing, or a later version of Turso created the table",
-                        table.name,
-                        column.name.as_deref().unwrap_or_default(),
-                        column.ty_str
+                        "column {}.{column_name} has type \"{}\", which this database does not define: the type is missing, or a later version of Turso created the table. Open the database with the version of Turso that created it",
+                        table.name, column.ty_str
+                    )));
+                }
+                if let Some(type_name) = self.type_defined_differently(types, &column.ty_str) {
+                    return Err(LimboError::ParseError(format!(
+                        "column {}.{column_name} uses type \"{type_name}\", which the attached database and the main database define differently: attach the database to a main database with the same type definition",
+                        table.name
                     )));
                 }
             }
         }
         Ok(())
+    }
+
+    /// The first user type in the type chain of `type_name` whose definition
+    /// in this schema is not the definition in `types`.
+    fn type_defined_differently(&self, types: &Schema, type_name: &str) -> Option<String> {
+        let Ok(Some(resolved)) = self.resolve_type_unchecked(type_name) else {
+            return None;
+        };
+        resolved
+            .chain
+            .iter()
+            .filter(|own| !own.is_builtin)
+            .find(|own| {
+                types
+                    .type_registry
+                    .get(&own.name.to_lowercase())
+                    .is_none_or(|other| other.sql != own.sql)
+            })
+            .map(|own| own.name.clone())
     }
 
     fn type_resolves_to_primitive(&self, type_name: &str) -> bool {
