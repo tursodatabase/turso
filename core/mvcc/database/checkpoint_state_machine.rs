@@ -3346,9 +3346,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
             }
             BuildLocalSchemaViewState::Done => {
                 self.finalized = true;
+                let tvfs = MvStore::<Clock, A>::capture_table_valued_functions(
+                    &self.connection.schema.read(),
+                );
                 let schema =
                     self.mvstore
-                        .build_schema_from_rows(&self.connection, &self.rows, &[])?;
+                        .build_schema_from_rows(&self.connection, &self.rows, &tvfs)?;
                 Ok(TransitionResult::Done(schema))
             }
         }

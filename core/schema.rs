@@ -1338,6 +1338,18 @@ impl Schema {
             .cloned()
     }
 
+    pub(crate) fn copy_table_valued_functions(&mut self, source: &Schema) {
+        for (name, table) in &source.tables {
+            if matches!(table.as_ref(), Table::Virtual(vtab)
+                if vtab.kind == turso_ext::VTabKind::TableValuedFunction)
+            {
+                self.tables
+                    .entry(name.clone())
+                    .or_insert_with(|| table.clone());
+            }
+        }
+    }
+
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);

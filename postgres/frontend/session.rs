@@ -65,12 +65,10 @@ pub fn open_database_with_io(
     turso_core::Database::open(
         io,
         path,
-        catalog::register_catalog_modules(
-            turso_core::OpenOptions::new(Arc::new(PostgresDialect))
-                .storage(db_file)
-                .flags(flags)
-                .db_opts(opts),
-        ),
+        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+            .storage(db_file)
+            .flags(flags)
+            .db_opts(opts),
     )
 }
 

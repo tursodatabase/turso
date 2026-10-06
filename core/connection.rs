@@ -189,9 +189,6 @@ pub struct ReparseSchemaInner {
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
     fresh: Schema,
-    /// Built-in table-valued functions captured from the old schema; rehydrated
-    /// after the sqlite_schema scan since they don't survive re-parsing.
-    tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
@@ -655,6 +652,7 @@ impl Connection {
         )
         .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
 
@@ -1074,45 +1072,35 @@ impl Connection {
             ));
         }
 
-        let needs_nested_guard = origin.needs_nested_guard();
-        if needs_nested_guard {
-            self.start_nested();
-        }
-        let result = (|| {
-            let sql = sql.as_ref();
-            tracing::debug!("Preparing: {}", sql);
+        let _scope = origin.enter(self);
+        let sql = sql.as_ref();
+        tracing::debug!("Preparing: {}", sql);
 
-            let (cmd, byte_offset_end) = {
-                crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
-            };
-            let cmd = match cmd {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
-            };
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
-            let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+        let (cmd, byte_offset_end) = {
+            crate::stack::trace_stack!("parse");
+            self.parse_sql(sql)?
+        };
+        let cmd = match cmd {
+            Some(cmd) => cmd,
+            None => {
+                return Err(LimboError::InvalidArgument(
+                    "The supplied SQL string contains no statements".to_string(),
+                ));
+            }
+        };
+        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+            .unwrap()
+            .trim();
+        let prepare_options = PrepareOptions::default();
+        let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
 
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                byte_offset_end,
-                origin,
-                needs_nested_guard,
-            ))
-        })();
-        if result.is_err() && needs_nested_guard {
-            self.end_nested();
-        }
-        result
+        Ok(Statement::new_with_origin(
+            program,
+            pager,
+            mode,
+            byte_offset_end,
+            origin,
+        ))
     }
 
     /// Prepare an already-translated statement while keeping the original
@@ -1169,25 +1157,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let needs_nested_guard = origin.needs_nested_guard();
-        if needs_nested_guard {
-            self.start_nested();
-        }
-        let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                0,
-                origin,
-                needs_nested_guard,
-            ))
-        })();
-        if result.is_err() && needs_nested_guard {
-            self.end_nested();
-        }
-        result
+        let _scope = origin.enter(self);
+        let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+        Ok(Statement::new_with_origin(program, pager, mode, 0, origin))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -1451,23 +1423,7 @@ impl Connection {
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
-        // Capture built-in table-valued functions (e.g. generate_series, json_each)
-        // before dropping the old schema. These are registered programmatically and
-        // don't survive re-parsing from sqlite_schema alone.
-        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        fresh.copy_table_valued_functions(&self.schema.read());
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1490,7 +1446,6 @@ impl Connection {
         Ok(ReparseSchemaInner {
             _guard: guard,
             fresh,
-            tvfs,
             preserved_sequences,
             phase: ReparsePhase::ParseSchema {
                 parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
@@ -1526,14 +1481,6 @@ impl Connection {
                         &attached_resolver,
                         self.db.dialect().as_ref(),
                     ));
-
-                    // Rehydrate built-in table-valued functions captured at init.
-                    for vtab in &inner.tvfs {
-                        let normalized = crate::util::normalize_ident(&vtab.name);
-                        inner.fresh.tables.entry(normalized).or_insert_with(|| {
-                            Arc::new(crate::schema::Table::Virtual(vtab.clone()))
-                        });
-                    }
 
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::PopulateSequences {

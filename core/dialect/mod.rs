@@ -120,6 +120,10 @@ pub trait Dialect: Send + Sync + 'static {
         enable_custom_types: bool,
     ) -> crate::Result<()>;
 
+    fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
+        options
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect

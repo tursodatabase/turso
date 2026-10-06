@@ -139,6 +139,10 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
     }
 
+    fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
+        register_catalog_modules(options)
+    }
+
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         if crate::functions::resolve_scalar(name, arg_count) {
             return Ok(Some(Func::Dialect(name.to_string())));
@@ -3779,6 +3783,240 @@ mod tests {
         stmt.reset().unwrap();
         assert_eq!(stmt.run_collect_rows().unwrap(), expected);
         conn.execute("CREATE TABLE after_catalog (v INT)").unwrap();
+    }
+
+    #[test]
+    fn suspended_catalog_does_not_change_sibling_writer_accounting() {
+        use turso_core::IO;
+
+        let io = Arc::new(turso_core::MemoryYieldIO::new());
+        let db = crate::session::open_database_with_io(
+            io.clone(),
+            "suspended-catalog.db",
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE writes (v INT)").unwrap();
+        for i in 0..8 {
+            conn.execute(format!(
+                "CREATE TABLE catalog_{i} (v TEXT DEFAULT '{}')",
+                "x".repeat(4096)
+            ))
+            .unwrap();
+        }
+        let mut catalog = conn
+            .prepare("SELECT table_name FROM pg_get_tabledef")
+            .unwrap();
+        conn.get_pager().clear_page_cache(false);
+        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
+        assert!(matches!(catalog.step().unwrap(), StepResult::IO));
+        assert!(!conn.is_nested_stmt());
+
+        let mut writer = conn
+            .prepare("INSERT INTO writes VALUES (7) RETURNING v")
+            .unwrap();
+        loop {
+            match writer.step().unwrap() {
+                StepResult::IO => io.step().unwrap(),
+                StepResult::Row => break,
+                other => panic!("unexpected writer step: {other:?}"),
+            }
+        }
+        assert_eq!(writer.row().unwrap().get_value(0), &Value::from_i64(7));
+        let mut sibling = conn.prepare("INSERT INTO writes SELECT 9").unwrap();
+        let result = loop {
+            match sibling.step() {
+                Ok(StepResult::IO) => io.step().unwrap(),
+                result => break result,
+            }
+        };
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::StatementsInProgress(
+                    "cannot start a write statement"
+                ))
+            ),
+            "unexpected sibling result: {result:?}"
+        );
+        drop(sibling);
+        catalog.reset().unwrap();
+        assert!(!conn.is_nested_stmt());
+        writer.run_ignore_rows().unwrap();
+        drop(writer);
+        conn.execute("INSERT INTO writes VALUES (11)").unwrap();
+        let observer = db.connect().unwrap();
+        assert_eq!(
+            observer
+                .prepare("SELECT v FROM writes ORDER BY v")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(7)], vec![Value::from_i64(11)]]
+        );
+    }
+
+    #[test]
+    fn catalog_view_columns_survive_schema_refresh() {
+        let expected = ["oid", "nspname", "nspowner", "nspacl"]
+            .map(Value::build_text)
+            .map(|value| vec![value])
+            .to_vec();
+        let columns = |conn: &Arc<Connection>| {
+            conn.prepare("SELECT name FROM pragma_table_info('catalog_names') ORDER BY cid")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let dir = tempdir().unwrap();
+        for mvcc in [false, true] {
+            let path = dir.path().join(format!("catalog-view-{mvcc}.db"));
+            let io = Arc::new(PlatformIO::new().unwrap());
+            let opts = crate::DatabaseOpts::new()
+                .with_views(true)
+                .with_experimental_mvcc_passive_checkpoint(true);
+            {
+                let db = crate::session::open_database_with_io(
+                    io.clone(),
+                    path.to_str().unwrap(),
+                    crate::OpenFlags::default(),
+                    opts,
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                if mvcc {
+                    conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+                }
+                conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
+                    .unwrap();
+                conn.execute("CREATE VIEW catalog_join AS WITH namespaces AS (SELECT * FROM pg_namespace) SELECT namespaces.nspname FROM namespaces JOIN pg_namespace USING (oid)").unwrap();
+                assert_eq!(columns(&conn), expected);
+                conn.force_reparse_schema().unwrap();
+                assert_eq!(columns(&conn), expected);
+            }
+            let db = crate::session::open_database_with_io(
+                io,
+                path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                opts,
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(columns(&conn), expected);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.force_reparse_schema().unwrap();
+            assert_eq!(columns(&conn), expected);
+            assert_eq!(
+                conn.prepare("SELECT nspname FROM catalog_join ORDER BY nspname")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![
+                    vec![Value::build_text("information_schema")],
+                    vec![Value::build_text("pg_catalog")],
+                    vec![Value::build_text("public")],
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn catalogs_available_in_secondary_databases() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let output_path = dir.path().join("vacuum.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let opts = crate::DatabaseOpts::new()
+            .with_attach(true)
+            .with_vacuum(true)
+            .with_views(true);
+        let db = crate::session::open_database_with_io(
+            io.clone(),
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
+        conn.execute("CREATE TABLE aux.counts (n INT)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT COUNT(*) FROM aux.pg_namespace")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(4)]]
+        );
+        conn.execute("CREATE TRIGGER aux.catalog_check AFTER INSERT ON data BEGIN INSERT INTO counts SELECT COUNT(*) FROM pg_namespace; END").unwrap();
+        conn.execute("INSERT INTO aux.data VALUES (5)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT n FROM aux.counts")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(4)]]
+        );
+        let attached = crate::session::open_database_with_io(
+            io.clone(),
+            attached_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        assert_eq!(
+            attached
+                .connect()
+                .unwrap()
+                .prepare("SELECT COUNT(*) FROM pg_namespace")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(3)]]
+        );
+        for temp_store in ["MEMORY", "FILE"] {
+            let temp_conn = db.connect().unwrap();
+            temp_conn
+                .execute(format!("PRAGMA temp_store = {temp_store}"))
+                .unwrap();
+            temp_conn.execute("BEGIN").unwrap();
+            temp_conn
+                .execute("CREATE TEMP TABLE temp_data (v INT)")
+                .unwrap();
+            temp_conn.execute("ROLLBACK").unwrap();
+            assert_eq!(
+                temp_conn
+                    .prepare("SELECT COUNT(*) FROM temp.pg_namespace")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::from_i64(3)]]
+            );
+        }
+        conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
+            .unwrap();
+        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
+            .unwrap();
+        let output = crate::session::open_database_with_io(
+            io,
+            output_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .connect()
+                .unwrap()
+                .prepare("SELECT COUNT(*) FROM catalog_names")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(3)]]
+        );
     }
 
     #[test]
