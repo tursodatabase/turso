@@ -560,6 +560,34 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// The MVCC log recovery builds a new schema. The user types must be in
+    /// it, also a type that only the log has.
+    #[test]
+    fn test_custom_types_survive_mvcc_log_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_mvcc_log.db");
+        create_file(
+            &path,
+            true,
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, a cents) STRICT;
+             INSERT INTO t VALUES (1, 5);",
+        );
+        assert!(path.with_extension("db-log").metadata().unwrap().len() > 0);
+
+        for (insert, expected) in [
+            ("INSERT INTO t VALUES (2, 7)", vec![(1, 5), (2, 7)]),
+            ("SELECT 1", vec![(1, 5), (2, 7)]),
+        ] {
+            let db = open_file(&path, true).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(insert).unwrap();
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM t ORDER BY id");
+            assert_eq!(rows, expected);
+            conn.close().unwrap();
+        }
+    }
+
     #[test]
     fn test_pg_storage_option_survives_alter_table_and_reopen() {
         for mvcc in [false, true] {
