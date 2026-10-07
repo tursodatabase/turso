@@ -94,10 +94,15 @@ pub(super) fn open_in_seek_source_cursor(
 ) -> Result<CursorID> {
     match source {
         InSeekSource::LiteralList { values, affinity } => {
-            let label_once_end = program.allocate_label();
-            program.emit_insn(Insn::Once {
-                target_pc_when_reentered: label_once_end,
-            });
+            let label_once_end = if values.iter().all(|value| value.is_constant(resolver)) {
+                let label_once_end = program.allocate_label();
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: label_once_end,
+                });
+                Some(label_once_end)
+            } else {
+                None
+            };
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
@@ -154,7 +159,9 @@ pub(super) fn open_in_seek_source_cursor(
                     flags: IdxInsertFlags::new().no_op_duplicate(),
                 });
             }
-            program.preassign_label_to_next_insn(label_once_end);
+            if let Some(label_once_end) = label_once_end {
+                program.preassign_label_to_next_insn(label_once_end);
+            }
             Ok(eph_cursor)
         }
         InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
