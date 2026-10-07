@@ -334,3 +334,15 @@ test index-of-fourteen-columns-refuses-a-duplicate-key {
 }
 expect error {
 }
+
+@cross-check-integrity
+test partial-index-where-can-use-date-of-a-column-and-of-a-date-literal {
+    CREATE TABLE t(a TEXT, b TEXT);
+    INSERT INTO t VALUES ('2024-06-01', '2024-01-01 10:00:00'), ('2023-01-01', '2024-01-01');
+    CREATE INDEX t_after_b ON t(a) WHERE a > date(b);
+    CREATE INDEX t_after_2024 ON t(a) WHERE a > date('2024-01-01');
+    SELECT a FROM t WHERE a > date(b);
+}
+expect {
+    2024-06-01
+}

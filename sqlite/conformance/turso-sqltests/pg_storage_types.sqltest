@@ -2120,6 +2120,22 @@ expect error {
     non-deterministic functions prohibited in WHERE clause of CREATE INDEX
 }
 
+test partial-index-refuses-date-of-now {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX t_future ON t(a) WHERE a > date('now');
+}
+expect error {
+    non-deterministic functions prohibited in WHERE clause of CREATE INDEX
+}
+
+test partial-index-refuses-an-aggregate-as-an-aggregate {
+    CREATE TABLE t(a INTEGER);
+    CREATE INDEX t_many ON t(a) WHERE count(a) > 1;
+}
+expect error {
+    cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX
+}
+
 @requires strict "uses STRICT tables"
 test expression-index-on-a-cast-of-an-older-date-column-keeps-its-keys {
     CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;

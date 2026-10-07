@@ -7008,12 +7008,14 @@ impl Index {
             else {
                 return Err(OTHER_TABLES);
             };
-            if !func.is_deterministic() {
-                Err(NON_DETERMINISTIC)
-            } else if !is_deterministic_schema_function_call(&func, args, columns) {
+            if matches!(func, Func::Agg(_) | Func::Window(_)) {
+                Err(OTHER_TABLES)
+            } else if is_deterministic_schema_function_call(&func, args, columns) {
+                Ok(())
+            } else if func.is_deterministic() {
                 Err(READS_THE_CLOCK)
             } else {
-                Ok(())
+                Err(NON_DETERMINISTIC)
             }
         };
 
