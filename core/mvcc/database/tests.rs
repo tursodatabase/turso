@@ -11369,7 +11369,6 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
             .filter(|entry| entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
             .count()
     };
-    let index_maps_before = db.mvcc_store.index_rows.len();
     let index_slots_before = index_slots();
     let table_slots_before = table_slots();
 
@@ -11380,7 +11379,6 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
         conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
         assert_eq!(index_slots(), index_slots_before + 100);
         conn.execute("ROLLBACK").unwrap();
-        assert_eq!(db.mvcc_store.index_rows.len(), index_maps_before);
         assert_eq!(index_slots(), index_slots_before);
     }
 
@@ -11398,8 +11396,71 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
 
     // A committed CREATE INDEX keeps its rows.
     conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
-    assert_eq!(db.mvcc_store.index_rows.len(), index_maps_before + 1);
     assert_eq!(index_slots(), index_slots_before + 100);
+}
+
+#[test]
+fn rollback_of_created_index_keeps_open_reader_valid() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let mut read = conn
+        .prepare("SELECT id FROM t INDEXED BY idx_v ORDER BY v")
+        .unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    conn.execute("ROLLBACK").unwrap();
+
+    // Each rolled-back CREATE INDEX frees and reallocates per-index maps, so a
+    // reader pointing into a freed map would see memory reused by a new one.
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    assert!(matches!(read.step().unwrap(), StepResult::Done));
+}
+
+#[test]
+fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 'v1'), (2, 'v2'), (3, 'v3')")
+        .unwrap();
+    let mut insert = conn
+        .prepare("INSERT OR ROLLBACK INTO u VALUES (1000, 'v2')")
+        .unwrap();
+    assert!(insert.step().is_err());
+
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    insert.reset().unwrap();
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.

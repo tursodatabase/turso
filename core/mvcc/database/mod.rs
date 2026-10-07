@@ -7136,13 +7136,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
     }
 
-    /// Removes the row maps of a table or index created by a transaction that rolled back.
+    /// Removes the slots of a table or index created by a transaction that rolled back.
     /// Writers retry when their slot is unlinked, and no other transaction can write to an
-    /// object that only existed in the aborted transaction's schema.
+    /// object that only existed in the aborted transaction's schema. The index's own map
+    /// stays in `index_rows`: open cursors iterate it through `static_iterator_hack!`, which
+    /// is only sound while that map lives as long as the store.
     fn drop_created_btree(&self, table_id: MVTableId) {
         if let Some(index) = self.index_rows.get(&table_id) {
             self.bump_index_rows_epoch();
-            index.remove();
+            for entry in index.value().iter() {
+                entry.remove();
+            }
         }
         let start = RowID::new(table_id, RowKey::Int(i64::MIN));
         let end = RowID::new(table_id, RowKey::Int(i64::MAX));
