@@ -213,7 +213,18 @@ impl Constraint {
     /// Composes the `usable`/`table_col_pos` gates with the affinity check
     /// against the column at `table_col_pos` in `columns`.
     pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
-        if !self.usable || self.index_use != IndexUse::Plain {
+        self.index_use == IndexUse::Plain && self.can_drive_seek_on_column(columns)
+    }
+
+    /// An automatic index stores the values that the table stores, so a seek
+    /// key function finds the rows in it as in a persistent index.
+    fn can_drive_automatic_index_seek(&self, columns: &[Column]) -> bool {
+        matches!(self.index_use, IndexUse::Plain | IndexUse::KeyFunction(_))
+            && self.can_drive_seek_on_column(columns)
+    }
+
+    fn can_drive_seek_on_column(&self, columns: &[Column]) -> bool {
+        if !self.usable {
             return false;
         }
         let Some(pos) = self.table_col_pos else {
@@ -298,7 +309,7 @@ pub(super) fn automatic_index_terms(
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| term.can_drive_automatic_index_seek(columns))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -306,7 +317,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| term.can_drive_automatic_index_seek(columns))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {

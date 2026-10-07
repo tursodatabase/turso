@@ -91,7 +91,8 @@ expect error {}
 
 # Indexes on timestamp, date, bigint and uuid columns give range searches and
 # an order, like indexes on int columns. A numeric equal test calls the
-# numeric `=` function, so a hash join cannot run it.
+# numeric `=` function, so a hash join cannot run it, but an automatic index
+# can find the rows.
 
 setup typed_columns {
     CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, day date, note text);
@@ -143,10 +144,55 @@ expect {
 }
 
 @setup typed_columns
-test explain-numeric-join-is-not-a-hash-join {
+test explain-numeric-join-searches-an-automatic-index {
     EXPLAIN SELECT count(*) FROM pa JOIN pb ON pa.n = pb.m;
 }
 expect {
     1|0|0|SCAN pa
-    2|0|0|SCAN pb
+    2|0|0|SEARCH pb USING COVERING INDEX ephemeral_pb_t2 (m=?)
+}
+
+@setup typed_columns
+test numeric-join-across-scales-with-an-automatic-index-finds-every-pair {
+    SELECT count(*) FROM pa JOIN pb ON pa.n = pb.m;
+}
+expect {
+    200
+}
+
+setup temporal_join {
+    CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, d date, n numeric(10,2));
+    INSERT INTO ev VALUES (1, '2024-01-01 10:00', '2024-01-01', 1.5), (2, '2024-01-01 10:00', '2024-01-02', 2.5), (3, '2024-01-02', '2024-01-02', 1.5);
+}
+
+@setup temporal_join
+test explain-timestamp-self-join-searches-an-automatic-index {
+    EXPLAIN SELECT count(*) FROM ev a JOIN ev b ON a.ts = b.ts;
+}
+expect {
+    1|0|0|SCAN ev AS a
+    2|0|0|SEARCH b USING COVERING INDEX ephemeral_ev_t2 (ts=?)
+}
+
+@setup temporal_join
+test explain-numeric-self-join-searches-an-automatic-index {
+    EXPLAIN SELECT count(*) FROM ev a JOIN ev b ON a.n = b.n;
+}
+expect {
+    1|0|0|SCAN ev AS a
+    2|0|0|SEARCH b USING COVERING INDEX ephemeral_ev_t2 (n=?)
+}
+
+@setup temporal_join
+test temporal-and-numeric-self-joins-give-the-rows-of-a-text-comparison {
+    SELECT count(*) FROM ev a JOIN ev b ON a.ts = b.ts;
+    SELECT count(*) FROM ev a JOIN ev b ON a.ts::text = b.ts::text;
+    SELECT count(*) FROM ev a JOIN ev b ON a.d = b.d AND a.n = b.n;
+    SELECT count(*) FROM ev a JOIN ev b ON a.d::text = b.d::text AND a.n::text = b.n::text;
+}
+expect {
+    5
+    5
+    3
+    3
 }

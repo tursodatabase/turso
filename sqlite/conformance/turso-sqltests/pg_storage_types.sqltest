@@ -1554,3 +1554,45 @@ expect {
     ok
     ok
 }
+
+setup unindexed {
+    CREATE TABLE ue(id INTEGER PRIMARY KEY, ts pg_timestamp, d pg_date, t pg_time, n pg_numeric(10,2), m pg_numeric(12,4)) STRICT, PGSTORAGE;
+    INSERT INTO ue VALUES (1, '2024-01-01 00:00:00', '2024-01-01', '10:00', 12.5, 12.5);
+    INSERT INTO ue VALUES (2, '2024-01-01 00:00:00', '2024-01-01', '11:00', 1.5, '1.5000');
+    INSERT INTO ue VALUES (3, '2024-01-02 10:30:00.25', '2024-01-05', '09:00', '-0.01', 7);
+    INSERT INTO ue VALUES (4, NULL, NULL, NULL, NULL, NULL);
+}
+
+@requires strict "uses STRICT tables"
+@setup unindexed
+test temporal-and-numeric-joins-use-an-automatic-index {
+    EXPLAIN QUERY PLAN SELECT count(*) FROM ue a JOIN ue b ON a.ts = b.ts;
+    EXPLAIN QUERY PLAN SELECT count(*) FROM ue a JOIN ue b ON a.n = b.m;
+}
+expect {
+    1|0|0|SCAN ue AS a
+    2|0|0|SEARCH b USING COVERING INDEX ephemeral_ue_t2 (ts=?)
+    1|0|0|SCAN ue AS a
+    2|0|0|SEARCH b USING COVERING INDEX ephemeral_ue_t2 (m=?)
+}
+
+@requires strict "uses STRICT tables"
+@setup unindexed
+test joins-with-an-automatic-index-give-the-rows-of-a-scan {
+    SELECT group_concat(pair) FROM (SELECT a.id || '-' || b.id AS pair FROM ue a JOIN ue b ON a.ts = b.ts ORDER BY a.id, b.id);
+    SELECT count(*) FROM ue a JOIN ue b ON a.ts = b.ts;
+    SELECT count(*) FROM ue a JOIN ue b ON CAST(a.ts AS TEXT) = CAST(b.ts AS TEXT);
+    SELECT count(*) FROM ue a JOIN ue b ON a.d = b.d AND b.t > a.t;
+    SELECT count(*) FROM ue a JOIN ue b ON CAST(a.d AS TEXT) = CAST(b.d AS TEXT) AND CAST(b.t AS TEXT) > CAST(a.t AS TEXT);
+    SELECT count(*) FROM ue a JOIN ue b ON a.n = b.m;
+    SELECT count(*) FROM ue a JOIN ue b ON a.n + 0 = b.m + 0;
+}
+expect {
+    1-1,1-2,2-1,2-2,3-3
+    5
+    5
+    1
+    1
+    2
+    2
+}
