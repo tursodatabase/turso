@@ -9976,76 +9976,58 @@ pub fn op_function(
                 )?);
             }
             JsonFunc::JsonRemove => {
-                if let Ok(json) = json_remove(
+                let json = json_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbRemove => {
-                if let Ok(json) = jsonb_remove(
+                let json = jsonb_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_replace(
+                let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_replace(
+                let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_insert(
+                let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_insert(
+                let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonPretty => {
                 let json_value = &state.registers[*start_reg];
