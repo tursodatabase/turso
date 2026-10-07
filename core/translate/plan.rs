@@ -3088,6 +3088,40 @@ pub(super) fn query_output_columns(
     Ok(columns)
 }
 
+fn subquery_output_columns(
+    plan: &Plan,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
+    let mut columns = query_output_columns(plan, explicit_columns)?;
+    make_column_names_unique(&mut columns);
+    Ok(columns)
+}
+
+fn make_column_names_unique(columns: &mut [Column]) {
+    let mut used_names: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    for column in columns {
+        let Some(name) = column.name.clone() else {
+            continue;
+        };
+        let base_name = strip_numbered_suffix(&name);
+        let mut candidate = name.clone();
+        let mut count = 0;
+        while !used_names.insert(candidate.to_lowercase()) {
+            count += 1;
+            candidate = format!("{base_name}:{count}");
+        }
+        column.name = Some(candidate);
+    }
+}
+
+fn strip_numbered_suffix(name: &str) -> &str {
+    let without_digits = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    match without_digits.strip_suffix(':') {
+        Some(base_name) if !base_name.is_empty() => base_name,
+        _ => name,
+    }
+}
+
 impl JoinedTable {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
@@ -3116,42 +3150,12 @@ impl JoinedTable {
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
     ) -> Result<Self> {
-        let mut columns = plan
-            .result_columns
-            .iter()
-            .map(|rc| {
-                let affinity = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
-                let col_type = affinity.to_type();
-                let mut column = Column::new(
-                    rc.name(&plan.table_references).map(String::from),
-                    col_type.to_string(),
-                    None,
-                    None,
-                    col_type,
-                    None,
-                    ColDef::default(),
-                );
-                column.override_affinity(affinity);
-                column
-            })
-            .try_collect::<alloc::Vec<_>>()?;
-
-        for (i, column) in columns.iter_mut().enumerate() {
-            if super::expr::expr_is_array(
-                &plan.result_columns[i].expr,
-                Some(&plan.table_references),
-            ) {
-                column.set_array_dimensions(1);
-            }
-            column.set_collation(get_collseq_from_expr(
-                &plan.result_columns[i].expr,
-                &plan.table_references,
-            )?);
-        }
+        let plan = Plan::Select(Box::new(plan));
+        let columns = subquery_output_columns(&plan, None)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(Plan::Select(Box::new(plan))),
+            plan: Box::new(plan),
             columns,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
@@ -3188,7 +3192,7 @@ impl JoinedTable {
         cte_id: Option<usize>,
         materialize_hint: bool,
     ) -> Result<Self> {
-        let columns = query_output_columns(&plan, explicit_columns)?;
+        let columns = subquery_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3229,7 +3233,7 @@ impl JoinedTable {
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
-        let mut columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = subquery_output_columns(query, explicit_columns)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

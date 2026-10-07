@@ -2641,3 +2641,32 @@ matrix right-and-full-join-key-affinity-and-collation {
     SELECT l.rowid, r.rowid FROM $l AS l $j $r AS r ON l.k = r.k $c
      ORDER BY l.rowid NULLS FIRST, r.rowid NULLS FIRST;
 }
+
+@cross-check-integrity
+test using-joins-only-the-first-of-two-subquery-columns-with-the-same-name {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b REAL, c);
+    INSERT INTO t VALUES (1, NULL, 'x');
+
+    SELECT q."a:1" FROM (SELECT a, a FROM t) AS q;
+    SELECT * FROM (SELECT a, a FROM t WHERE 0) AS q FULL JOIN t AS z USING (a);
+    SELECT * FROM (SELECT a, a FROM t WHERE 0) AS q RIGHT JOIN t AS z USING (a);
+    SELECT q.* FROM (SELECT a, a FROM t WHERE 0) AS q FULL JOIN t AS z USING (a);
+    WITH q AS (SELECT * FROM t JOIN t AS w ON 1)
+    SELECT * FROM q NATURAL FULL JOIN t AS z ORDER BY 4;
+    CREATE TABLE n1(c0 INT);
+    CREATE TABLE n2(c0 BLOB);
+    CREATE TABLE n3(c0 BLOB);
+    CREATE TABLE n4(c4 BLOB);
+    INSERT INTO n1 VALUES (0);
+    INSERT INTO n3 VALUES ('0');
+    SELECT * FROM (n1 NATURAL LEFT JOIN n2 NATURAL JOIN n3) AS g FULL JOIN n4 ON true;
+}
+expect {
+    1
+    1|||x
+    1|||x
+    1|
+    1||x|||
+    1||x|1||x
+    0|
+}

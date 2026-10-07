@@ -214,7 +214,7 @@ set test_files {
   e_reindex            fail
   e_resolve            fail
   e_select             fail
-  e_select2            fail
+  e_select2            pass
   e_totalchanges       fail
   e_update             fail
   e_uri                fail
