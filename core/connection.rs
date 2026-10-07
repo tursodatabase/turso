@@ -433,6 +433,7 @@ pub struct Connection {
     /// never cleared, so the statement paths that visit the non-main pagers
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
+    pub(super) readonly: bool,
     pub(super) query_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
@@ -2452,7 +2453,7 @@ impl Connection {
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
-            && !self.db.is_readonly()
+            && !self.is_readonly(crate::MAIN_DB_ID)
             && !is_memory_db
             && should_checkpoint_on_close
         {
@@ -2748,7 +2749,7 @@ impl Connection {
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         match index {
-            crate::MAIN_DB_ID => self.db.is_readonly(),
+            crate::MAIN_DB_ID => self.readonly || self.db.is_readonly(),
             crate::TEMP_DB_ID => self
                 .temp
                 .database
@@ -3525,7 +3526,8 @@ impl Connection {
                     } else {
                         self.db.io.clone()
                     };
-                    let main_db_flags = self.db.open_flags;
+                    let mut main_db_flags = self.db.open_flags;
+                    main_db_flags.set(OpenFlags::ReadOnly, self.is_readonly(crate::MAIN_DB_ID));
                     let (db, encryption_opts) = Self::from_uri_attached(
                         path,
                         db_opts,

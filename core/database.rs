@@ -484,6 +484,14 @@ enum StatsRefresh {
     Deferred,
 }
 
+/// Options for [`Database::connect_with_options`].
+#[derive(Default)]
+pub struct ConnectOptions {
+    pub flags: OpenFlags,
+    pub encryption_key: Option<EncryptionKey>,
+    pub page_codec: Option<Arc<dyn PageCodec>>,
+}
+
 /// Resumable state for [`Database::connect_async`]. Create one per
 /// connect and pass it to every call until `IOResult::Done`.
 #[derive(Default)]
@@ -633,6 +641,7 @@ pub struct Database<
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
+    readonly_requested_at_open: bool,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
     pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
@@ -782,6 +791,7 @@ impl Database {
             dialect,
             io: io.clone(),
             open_flags: flags,
+            readonly_requested_at_open: flags.contains(OpenFlags::ReadOnly),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -1031,12 +1041,23 @@ impl Database {
         Ok(())
     }
 
+    fn check_registry_access_mode(db: &Database, requested: OpenFlags) -> Result<()> {
+        if db.readonly_requested_at_open && !requested.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(format!(
+                "database '{}' is already open read-only in this process; cannot open it read-write",
+                db.path
+            )));
+        }
+        Ok(())
+    }
+
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
     fn lookup_in_registry(
         path: &str,
+        flags: OpenFlags,
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
@@ -1069,6 +1090,7 @@ impl Database {
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
+        Self::check_registry_access_mode(&db, flags)?;
 
         Ok(Some(db))
     }
@@ -1132,6 +1154,7 @@ impl Database {
         if use_registry {
             if let Some(db) = Self::lookup_in_registry(
                 path,
+                options.flags,
                 &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
@@ -1303,6 +1326,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_access_mode(&db, flags)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1566,6 +1590,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
+                        false,
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1699,6 +1724,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
+                                false,
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -2363,7 +2389,7 @@ impl Database {
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
+                self._connect(true, None, None, None, false, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2380,7 +2406,36 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None, StatsRefresh::Blocking)
+        self._connect(false, None, None, None, false, StatsRefresh::Blocking)
+    }
+
+    /// Connect in the access mode given by `flags`. Only `OpenFlags::ReadOnly`
+    /// is used: a read-only connection cannot write even if the shared
+    /// `Database` was opened read-write by another caller.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_flags(self: &Arc<Database>, flags: OpenFlags) -> Result<Arc<Connection>> {
+        self.connect_with_options(ConnectOptions {
+            flags,
+            ..Default::default()
+        })
+    }
+
+    /// Connect with an access mode, an encryption key and an external page
+    /// codec at once. See [`Self::connect_with_flags`],
+    /// [`Self::connect_with_encryption`] and [`Self::connect_with_page_codec`].
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_options(
+        self: &Arc<Database>,
+        options: ConnectOptions,
+    ) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            options.encryption_key,
+            options.page_codec,
+            options.flags.contains(OpenFlags::ReadOnly),
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Connect with an encryption key.
@@ -2390,7 +2445,14 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            encryption_key,
+            None,
+            false,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Connect with an external page codec.
@@ -2402,7 +2464,14 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            None,
+            Some(page_codec),
+            false,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2444,8 +2513,14 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
-                let conn =
-                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
+                let conn = self._connect(
+                    false,
+                    None,
+                    encryption_key,
+                    None,
+                    false,
+                    StatsRefresh::Deferred,
+                )?;
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -2468,6 +2543,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
+        readonly: bool,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2501,6 +2577,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            readonly,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2523,6 +2600,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            false,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2536,6 +2614,7 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        readonly: bool,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
@@ -2564,6 +2643,7 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             has_non_main_pagers: AtomicBool::new(false),
+            readonly,
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),

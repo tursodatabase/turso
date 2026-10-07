@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, ConnectOptions, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -1075,18 +1075,17 @@ impl TursoDatabase {
             ));
         };
 
-        let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect_with_page_codec(page_codec.clone())?
-        } else {
-            // Parse encryption key if configured - needed for connect_with_encryption
-            // which sets up encryption context before reading pages.
-            let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
+        let encryption_key = match (&self.config.page_codec, &self.config.encryption) {
+            (None, Some(encryption_opts)) => {
                 Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
-            } else {
-                None
-            };
-            db.connect_with_encryption(encryption_key)?
+            }
+            _ => None,
         };
+        let connection = db.connect_with_options(ConnectOptions {
+            flags: self.config.open_flags,
+            encryption_key,
+            page_codec: self.config.page_codec.clone(),
+        })?;
 
         Ok(TursoConnection::new(&self.config, connection))
     }

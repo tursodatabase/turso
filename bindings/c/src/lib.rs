@@ -723,6 +723,11 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     };
 
     let use_shared_memory = use_memory && cache_shared;
+    let connect_flags = if use_memory {
+        turso_core::OpenFlags::default()
+    } else {
+        file_open_flags
+    };
 
     let (io, db) = if use_shared_memory {
         match turso_core::Database::open_shared_memory(&effective_filename, Arc::new(SqliteDialect))
@@ -770,7 +775,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect() {
+    match db.connect_with_flags(connect_flags) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
@@ -982,7 +987,7 @@ pub unsafe extern "C" fn sqlite3_db_readonly(
         return -1;
     }
     let inner = (*db).inner.lock().unwrap();
-    inner._db.is_readonly() as ffi::c_int
+    inner.conn.is_readonly(turso_core::MAIN_DB_ID) as ffi::c_int
 }
 
 #[no_mangle]
