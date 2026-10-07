@@ -1,3 +1,5 @@
+mod drop_table_backing_btree;
+
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
 
 fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
