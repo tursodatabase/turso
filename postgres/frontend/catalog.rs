@@ -142,18 +142,11 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(options)
+        register_catalog_modules(crate::functions::register_functions(options))
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        if crate::functions::resolve_scalar(name, arg_count) {
-            return Ok(Some(Func::Dialect(name.to_string())));
-        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
-    }
-
-    fn exec_scalar_function(&self, conn: &Connection, name: &str, args: &[Value]) -> Result<Value> {
-        crate::functions::exec_scalar(conn, name, args)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -711,24 +704,25 @@ impl SnapshotRows for PgProcTable {
         }
 
         // Extension functions
-        for (name, is_agg, argc, _deterministic) in conn.get_syms_functions() {
+        for (name, is_agg, argc, deterministic) in conn.get_syms_functions() {
             let prokind = if is_agg { "a" } else { "f" };
+            let provolatile = if deterministic { "i" } else { "v" };
 
             rows.push(vec![
-                Value::from_i64(oid),         // oid
-                Value::build_text(name),      // proname
-                Value::from_i64(2200),        // pronamespace (public)
-                Value::from_i64(10),          // proowner
-                Value::from_i64(13),          // prolang (C)
-                Value::from_f64(1.0),         // procost
-                Value::from_f64(0.0),         // prorows
-                Value::from_i64(0),           // provariadic
-                Value::build_text(prokind),   // prokind
-                Value::from_i64(0),           // prosecdef
-                Value::from_i64(0),           // proleakproof
-                Value::from_i64(0),           // proisstrict
-                Value::from_i64(0),           // proretset
-                Value::build_text("v"),       // provolatile (volatile)
+                Value::from_i64(oid),       // oid
+                Value::build_text(name),    // proname
+                Value::from_i64(2200),      // pronamespace (public)
+                Value::from_i64(10),        // proowner
+                Value::from_i64(13),        // prolang (C)
+                Value::from_f64(1.0),       // procost
+                Value::from_f64(0.0),       // prorows
+                Value::from_i64(0),         // provariadic
+                Value::build_text(prokind), // prokind
+                Value::from_i64(0),         // prosecdef
+                Value::from_i64(0),         // proleakproof
+                Value::from_i64(0),         // proisstrict
+                Value::from_i64(0),         // proretset
+                Value::build_text(provolatile),
                 Value::build_text("u"),       // proparallel
                 Value::from_i64(argc as i64), // pronargs
                 Value::from_i64(0),           // pronargdefaults

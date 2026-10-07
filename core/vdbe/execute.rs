@@ -11366,6 +11366,7 @@ pub fn op_function(
                 state,
                 f.func.call_scalar(
                     &mut state.extension_state,
+                    &program.connection,
                     &state.registers[*start_reg..*start_reg + arg_count],
                 )
             );

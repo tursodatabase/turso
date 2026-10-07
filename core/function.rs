@@ -99,7 +99,7 @@ pub enum ExtFunc {
         context_owner: Arc<ExternalContext>,
     },
     NativeScalar {
-        argc: i32,
+        arity: crate::native_ext::FunctionArity,
         deterministic: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
@@ -141,16 +141,20 @@ impl ExtFunc {
     }
 
     pub fn matches_arg_count(&self, arg_count: usize) -> bool {
-        let argc = self.arg_count();
-        argc < 0 || argc as usize == arg_count
-    }
-
-    pub fn arg_count(&self) -> i32 {
         match self {
+            Self::NativeScalar { arity, .. } => arity.accepts(arg_count),
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
-            | Self::NativeScalar { argc, .. }
-            | Self::NativeAggregate { argc, .. } => *argc,
+            | Self::NativeAggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+        }
+    }
+
+    pub fn arg_counts(&self) -> Vec<i32> {
+        match self {
+            Self::NativeScalar { arity, .. } => arity.arg_counts(),
+            Self::Scalar { argc, .. }
+            | Self::Aggregate { argc, .. }
+            | Self::NativeAggregate { argc, .. } => vec![*argc],
         }
     }
 

@@ -1,17 +1,17 @@
 use super::ExtensionState;
-use crate::alloc::TryClone;
+use crate::sync::Arc;
 use crate::types::{AggContext, IOResultOr};
-use crate::{IOResult, Register, Result, Value};
+use crate::{Connection, IOResult, LimboError, Register, Result, Value};
 use std::fmt::Debug;
 
 pub trait ScalarFunction: Debug + Send + Sync {
     type Call: ScalarCall + 'static;
 
-    fn create_call(&self, args: Vec<Value>) -> Result<Self::Call>;
+    fn create_call(&self) -> Result<Self::Call>;
 }
 
 pub trait ScalarCall: Send + Sync {
-    fn step(&mut self) -> IOResultOr<Value>;
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value>;
 }
 
 pub trait AggregateFunction: Debug + Send + Sync {
@@ -26,31 +26,28 @@ pub trait Aggregate: Debug + Send + Sync {
 }
 
 pub trait ScalarFactory: Debug + Send + Sync {
-    fn create_call(&self, args: Vec<Value>) -> Result<Box<dyn ScalarCall>>;
+    fn create_call(&self) -> Result<Box<dyn ScalarCall>>;
 }
 
 impl<F: ScalarFunction> ScalarFactory for F {
-    fn create_call(&self, args: Vec<Value>) -> Result<Box<dyn ScalarCall>> {
-        Ok(Box::new(ScalarFunction::create_call(self, args)?))
+    fn create_call(&self) -> Result<Box<dyn ScalarCall>> {
+        Ok(Box::new(ScalarFunction::create_call(self)?))
     }
 }
 
 pub(crate) fn step_scalar(
     state: &mut ExtensionState,
     factory: &dyn ScalarFactory,
+    connection: &Arc<Connection>,
     args: &[Register],
 ) -> IOResultOr<Value> {
     if matches!(state, ExtensionState::None) {
-        let args = args
-            .iter()
-            .map(|arg| arg.get_value().try_clone())
-            .collect::<Result<Vec<_>, _>>()?;
-        *state = ExtensionState::ScalarCall(factory.create_call(args)?);
+        *state = ExtensionState::ScalarCall(factory.create_call()?);
     }
     let ExtensionState::ScalarCall(call) = state else {
         unreachable!("scalar instruction requires scalar call state");
     };
-    let result = call.step();
+    let result = call.step(connection, args);
     if !matches!(result, Ok(IOResult::IO(_))) {
         *state = ExtensionState::None;
     }
@@ -118,5 +115,49 @@ impl AggregateState {
 impl PartialEq for AggregateState {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.as_ref(), other.0.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionArity {
+    Exact(usize),
+    OneOf(&'static [usize]),
+    Variadic,
+}
+
+impl FunctionArity {
+    pub fn accepts(self, count: usize) -> bool {
+        match self {
+            Self::Exact(expected) => count == expected,
+            Self::OneOf(counts) => counts.contains(&count),
+            Self::Variadic => true,
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        let valid = match self {
+            Self::Exact(count) => i32::try_from(count).is_ok(),
+            Self::OneOf(counts) => {
+                !counts.is_empty() && counts.iter().all(|count| i32::try_from(*count).is_ok())
+            }
+            Self::Variadic => true,
+        };
+        if !valid {
+            return Err(LimboError::InvalidArgument(
+                "function argument counts must be nonempty and fit in i32".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn arg_counts(self) -> Vec<i32> {
+        match self {
+            Self::Exact(count) => vec![i32::try_from(count).expect("validated argument count")],
+            Self::OneOf(counts) => counts
+                .iter()
+                .map(|count| i32::try_from(*count).expect("validated argument count"))
+                .collect(),
+            Self::Variadic => vec![-1],
+        }
     }
 }
