@@ -85,8 +85,8 @@ pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
 pub(crate) use binary::expr_is_array;
-pub(super) use binding::find_unqualified_column;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{

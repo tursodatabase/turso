@@ -3,7 +3,10 @@ use crate::numeric::StrToF64;
 use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{BitSet, JoinedTable};
+use crate::translate::plan::{
+    left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources, BitSet,
+    ColumnLookup, JoinInfo, JoinType, JoinedTable,
+};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
@@ -1902,6 +1905,8 @@ pub fn validate_select_for_views(
 struct ViewSource {
     qualifiers: Vec<String>,
     columns: Vec<ViewColumn>,
+    /// The join that added this source. The first source has no join.
+    join_info: Option<JoinInfo>,
 }
 
 fn append_view_column_schema(
@@ -1941,6 +1946,7 @@ fn view_source_from_select_table(
                     return Ok(ViewSource {
                         qualifiers,
                         columns: append_view_column_schema(cte.clone(), tables),
+                        join_info: None,
                     });
                 }
             }
@@ -1951,23 +1957,28 @@ fn view_source_from_select_table(
                 db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let columns = schema
-                .get_table(&table_name)
-                .map(|table| {
-                    table
-                        .columns()
-                        .iter()
-                        .cloned()
-                        .map(|column| ViewColumn {
-                            table_index,
-                            column,
-                        })
-                        .collect()
+            let table = schema.get_table(&table_name);
+            let view = table
+                .is_none()
+                .then(|| schema.get_view(&table_name))
+                .flatten();
+            let source_columns: &[Column] = match (&table, &view) {
+                (Some(table), _) => table.columns(),
+                (None, Some(view)) => &view.columns,
+                (None, None) => &[],
+            };
+            let columns = source_columns
+                .iter()
+                .cloned()
+                .map(|column| ViewColumn {
+                    table_index,
+                    column,
                 })
-                .unwrap_or_default();
+                .collect();
             Ok(ViewSource {
                 qualifiers,
                 columns,
+                join_info: None,
             })
         }
         ast::SelectTable::Select(select, alias) => {
@@ -1978,6 +1989,7 @@ fn view_source_from_select_table(
                     .map(|a| vec![normalize_ident(a.name().as_str())])
                     .unwrap_or_default(),
                 columns: append_view_column_schema(derived, tables),
+                join_info: None,
             })
         }
         ast::SelectTable::Sub(from, alias) => {
@@ -1988,6 +2000,7 @@ fn view_source_from_select_table(
                     .map(|a| vec![normalize_ident(a.name().as_str())])
                     .unwrap_or_default(),
                 columns: expand_view_star(&sources),
+                join_info: None,
             })
         }
         ast::SelectTable::TableCall(name, _, alias) => {
@@ -2019,6 +2032,7 @@ fn view_source_from_select_table(
             Ok(ViewSource {
                 qualifiers,
                 columns,
+                join_info: None,
             })
         }
     }
@@ -2043,20 +2057,22 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
     }
 }
 
+/// Collect view sources and validate their NATURAL and USING clauses.
+///
+/// Stored view metadata must use the same join-column rules as normal name binding.
 fn view_sources_from_clause(
     from: &ast::FromClause,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
-) -> Result<Vec<(ViewSource, Vec<String>)>> {
+) -> Result<Vec<ViewSource>> {
     let first = view_source_from_select_table(&from.select, schema, ctes, tables)?;
-    let mut visible_names: Vec<String> = first
-        .columns
+    let mut sources = vec![first];
+    // SQLite enables strict USING checks for the full list when any join keeps right rows.
+    let has_right_or_full_join = from
+        .joins
         .iter()
-        .filter_map(view_column_name)
-        .map(ToOwned::to_owned)
-        .collect();
-    let mut sources = vec![(first, Vec::new())];
+        .any(|join| JoinType::from_join_operator(&join.operator).keeps_right_rows());
 
     for join in &from.joins {
         let right = view_source_from_select_table(&join.table, schema, ctes, tables)?;
@@ -2071,34 +2087,36 @@ fn view_sources_from_clause(
                     "a NATURAL join may not have an ON or USING clause".to_string(),
                 ));
             }
-            right
+            let mut merged = Vec::new();
+            for right_name in right
                 .columns
                 .iter()
                 .filter(|column| !column.column.hidden())
                 .filter_map(view_column_name)
-                .filter(|right_name| {
-                    sources
-                        .iter()
-                        .flat_map(|(source, _)| &source.columns)
-                        .filter(|column| !column.column.hidden())
-                        .filter_map(view_column_name)
-                        .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
-                })
-                .map(normalize_ident)
-                .collect()
+            {
+                if has_left_view_using_column(&sources, right_name, true, has_right_or_full_join)? {
+                    merged.push(normalize_ident(right_name));
+                }
+            }
+            merged
         } else if let Some(ast::JoinConstraint::Using(names)) = &join.constraint {
             let mut merged = Vec::with_capacity(names.len());
             for name in names {
                 let normalized = normalize_ident(name.as_str());
-                let in_left = visible_names
-                    .iter()
-                    .any(|column| column.eq_ignore_ascii_case(&normalized));
+                // SQLite checks the new right source first. This order controls the error text.
                 let in_right = right
                     .columns
                     .iter()
                     .filter_map(view_column_name)
                     .any(|column| column.eq_ignore_ascii_case(&normalized));
-                if !in_left || !in_right {
+                if !in_right
+                    || !has_left_view_using_column(
+                        &sources,
+                        name.as_str(),
+                        false,
+                        has_right_or_full_join,
+                    )?
+                {
                     return Err(LimboError::ParseError(format!(
                         "cannot join using column {} - column not present in both tables",
                         name.as_str()
@@ -2111,37 +2129,138 @@ fn view_sources_from_clause(
             Vec::new()
         };
 
-        visible_names.extend(
-            right
-                .columns
-                .iter()
-                .filter_map(view_column_name)
-                .filter(|name| {
-                    !merged
-                        .iter()
-                        .any(|merged_name| merged_name.eq_ignore_ascii_case(name))
-                })
-                .map(ToOwned::to_owned),
-        );
-        sources.push((right, merged));
+        sources.push(ViewSource {
+            join_info: Some(JoinInfo {
+                join_type: JoinType::from_join_operator(&join.operator),
+                using: merged.into_iter().map(ast::Name::exact).collect(),
+                no_reorder: matches!(
+                    join.operator,
+                    ast::JoinOperator::TypedJoin(Some(join_type))
+                        if join_type.contains(ast::JoinType::CROSS)
+                ),
+            }),
+            ..right
+        });
     }
     Ok(sources)
 }
 
-fn expand_view_star(sources: &[(ViewSource, Vec<String>)]) -> Vec<ViewColumn> {
-    sources
-        .iter()
-        .flat_map(|(source, merged)| {
-            source.columns.iter().filter(|column| {
-                !view_column_name(column).is_some_and(|name| {
-                    merged
-                        .iter()
-                        .any(|merged_name| merged_name.eq_ignore_ascii_case(name))
-                })
+/// Return true if a source on the left side of a join has this USING column.
+/// The rules are the planner's; see [left_using_column_sources].
+fn has_left_view_using_column(
+    sources: &[ViewSource],
+    column_name: &str,
+    ignore_hidden_columns: bool,
+    has_right_or_full_join: bool,
+) -> Result<bool> {
+    let found = left_using_column_sources(
+        sources,
+        column_name,
+        has_right_or_full_join,
+        |source| source.join_info.as_ref(),
+        |source| {
+            // NATURAL ignores hidden columns, but an explicit USING clause can name one.
+            source.columns.iter().position(|column| {
+                (!ignore_hidden_columns || !column.column.hidden())
+                    && view_column_name(column)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
             })
-        })
-        .map(view_output_column)
-        .collect()
+        },
+    )?;
+    Ok(!found.is_empty())
+}
+
+/// Expand a view's bare star with SQLite's visible join-column shape.
+///
+/// USING hides the right copy. A later RIGHT or FULL JOIN can change the
+/// metadata source of the one visible copy.
+fn expand_view_star(sources: &[ViewSource]) -> Vec<ViewColumn> {
+    let mut columns = Vec::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        for source_column in &source.columns {
+            let is_right_using_copy = view_column_name(source_column).is_some_and(|name| {
+                source
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.merges_column(name))
+            });
+            if !is_right_using_copy {
+                columns.push(view_star_column(sources, source_index, source_column));
+            }
+        }
+    }
+    columns
+}
+
+/// Return the metadata source for one `*` or `table.*` column.
+///
+/// SQLite binds this column as an unqualified name when a later USING clause
+/// merges it and a later RIGHT or FULL JOIN exists.
+fn view_star_column(
+    sources: &[ViewSource],
+    source_index: usize,
+    source_column: &ViewColumn,
+) -> ViewColumn {
+    let Some(column_name) = view_column_name(source_column) else {
+        return view_output_column(source_column);
+    };
+    if star_column_uses_merged_value(
+        sources[source_index + 1..]
+            .iter()
+            .filter_map(|source| source.join_info.as_ref()),
+        column_name,
+    ) {
+        return resolve_view_column(sources, column_name)
+            .expect("source_column itself has this name");
+    }
+    view_output_column(source_column)
+}
+
+/// Resolve metadata for an unqualified view column with the same rules as
+/// query binding; see [unqualified_column_sources]. A merged FULL JOIN USING
+/// column takes its declared type and collation from its first source.
+///
+/// SQLite accepts a view whose column name is ambiguous, so this uses the
+/// first copy instead of failing.
+fn resolve_view_column(sources: &[ViewSource], column_name: &str) -> Option<ViewColumn> {
+    let found = unqualified_column_sources(
+        sources,
+        column_name,
+        |source| source.join_info.as_ref(),
+        |source| match source.columns.iter().position(|column| {
+            view_column_name(column)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(column_name))
+        }) {
+            Some(column_index) => ColumnLookup::Found(column_index),
+            None => ColumnLookup::Missing,
+        },
+    );
+    let &(source_index, column_index) = found.sources.first()?;
+    let first_column = &sources[source_index].columns[column_index];
+    if found.sources.len() == 1 {
+        return Some(view_output_column(first_column));
+    }
+    Some(view_merged_column(first_column))
+}
+
+/// Metadata for a FULL JOIN USING column that more than one source supplies.
+///
+/// The column is a merged value, not a plain column, so SQLite 3.50 reports
+/// no declared type for it. It still takes the first source's affinity.
+/// (SQLite 3.53 instead names the type after that affinity, such as INT.)
+fn view_merged_column(first_column: &ViewColumn) -> ViewColumn {
+    ViewColumn {
+        table_index: first_column.table_index,
+        column: Column::new(
+            first_column.column.name.clone(),
+            String::new(),
+            None,
+            None,
+            first_column.column.affinity().to_type(),
+            first_column.column.collation_opt(),
+            ColDef::default(),
+        ),
+    }
 }
 
 fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<String, usize>) {
@@ -2200,26 +2319,23 @@ fn extract_view_columns_inner(
                 let source_column = match expr.as_ref() {
                     ast::Expr::Qualified(qualifier, column_name) => sources
                         .iter()
-                        .find(|(source, _)| {
+                        .find(|source| {
                             source
                                 .qualifiers
                                 .iter()
                                 .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
                         })
-                        .and_then(|(source, _)| {
+                        .and_then(|source| {
                             source.columns.iter().find(|column| {
                                 view_column_name(column).is_some_and(|candidate| {
                                     candidate.eq_ignore_ascii_case(column_name.as_str())
                                 })
                             })
-                        }),
-                    ast::Expr::Id(column_name) => sources.iter().find_map(|(source, _)| {
-                        source.columns.iter().find(|column| {
-                            view_column_name(column).is_some_and(|candidate| {
-                                candidate.eq_ignore_ascii_case(column_name.as_str())
-                            })
                         })
-                    }),
+                        .map(view_output_column),
+                    ast::Expr::Id(column_name) => {
+                        resolve_view_column(&sources, column_name.as_str())
+                    }
                     _ => None,
                 };
                 let name = alias
@@ -2228,13 +2344,10 @@ fn extract_view_columns_inner(
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column =
-                    source_column
-                        .map(view_output_column)
-                        .unwrap_or_else(|| ViewColumn {
-                            table_index: usize::MAX,
-                            column: Column::new_default_text(None, "TEXT".to_string(), None),
-                        });
+                let mut column = source_column.unwrap_or_else(|| ViewColumn {
+                    table_index: usize::MAX,
+                    column: Column::new_default_text(None, "TEXT".to_string(), None),
+                });
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2258,13 +2371,14 @@ fn extract_view_columns_inner(
             }
             ast::ResultColumn::TableStar(table_ref) => {
                 let qualifier = normalize_ident(table_ref.as_str());
-                if let Some((source, _)) = sources.iter().find(|(source, _)| {
+                if let Some(source_index) = sources.iter().position(|source| {
                     source
                         .qualifiers
                         .iter()
                         .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
                 }) {
-                    for mut column in source.columns.iter().map(view_output_column) {
+                    for source_column in &sources[source_index].columns {
+                        let mut column = view_star_column(&sources, source_index, source_column);
                         deduplicate_view_column_name(&mut column, &mut column_name_counts);
                         columns.push(column);
                     }
@@ -2280,7 +2394,8 @@ fn extract_view_columns_inner(
 ///
 /// Bare-star expansion follows the join's visible row shape: columns merged
 /// by NATURAL or USING appear once, while `table.*` still includes every
-/// column from that particular source.
+/// column from that particular source. A later RIGHT or FULL JOIN can change
+/// which source supplies a merged column.
 pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,

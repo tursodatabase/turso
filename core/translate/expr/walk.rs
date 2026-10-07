@@ -111,6 +111,11 @@ where
                             stack.push(WalkItem::Expr(filter_clause));
                         }
                     }
+                    ast::Expr::MergedColumn(columns) => {
+                        for column in columns.iter().rev() {
+                            stack.push(WalkItem::Expr(column));
+                        }
+                    }
                     ast::Expr::InList { lhs, rhs, .. } => {
                         for expr in rhs.iter().rev() {
                             stack.push(WalkItem::Expr(expr));
@@ -439,6 +444,11 @@ where
                         }
                         if let Some(filter_clause) = &mut filter_over.filter_clause {
                             stack.push(WalkItem::Expr(filter_clause));
+                        }
+                    }
+                    ast::Expr::MergedColumn(columns) => {
+                        for column in columns.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(column));
                         }
                     }
                     ast::Expr::InList { lhs, rhs, .. } => {

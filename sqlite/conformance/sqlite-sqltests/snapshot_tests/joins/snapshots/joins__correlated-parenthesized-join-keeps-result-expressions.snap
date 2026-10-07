@@ -40,7 +40,7 @@ addr  opcode                p1  p2  p3  p4        p5  comment
    8      Rewind             3  32   0             0  Rewind table nested_prune_right
    9        Once            18   0   0             0  goto 18
   10        OpenAutoindex    2   0   0             0  cursor=2
-  11        Rewind           1  12   0             0  Rewind table nested_prune_left
+  11        Rewind           1  18   0             0  Rewind table nested_prune_left
   12          ColumnRange    1   0  11  2          0  r[11..12]=nested_prune_left.id..value
   13          RowId          1  13   0             0  r[13]=nested_prune_left.rowid
   14          MakeRecord    11   3  14             0  r[14]=mkrec(r[11..13]); for ephemeral_nested_prune_left_t4

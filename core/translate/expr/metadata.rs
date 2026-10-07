@@ -293,7 +293,7 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    if !referenced_tables.outer_join_may_null_extend(table.internal_id) {
+    if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
         return Ok(true);
     }

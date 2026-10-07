@@ -1,0 +1,80 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          c.customer_id,
+          c.name,
+          o.order_id,
+          o.order_date,
+          o.total_amount
+      FROM
+          customers c
+      RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+      ORDER BY c.customer_id;
+info:
+  statement_type: SELECT
+  tables:
+  - c.customer_id
+  - customers
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN customers AS c
+|--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?)
+|--RIGHT-JOIN o
+|  `--SCAN orders AS o
+`--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode                p1  p2  p3  p4              p5  comment
+   0      Init               0  46   0                   0  Start at 46
+   1      SorterOpen         0   1   0  k(1,B)           0  cursor=0
+   2      OpenRead           1   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
+   3      OpenRead           3   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
+   4      OpenRead           4   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0
+   5      Null               0   8   0                   0  r[8]=NULL
+   6      OpenEphemeral      2   0   0                   0  cursor=2 is_table=false
+   7      Rewind             1  30   0                   0  Rewind table customers
+   8        RowId            1   9   0                   0  r[9]=customers.rowid
+   9        IsNull           9  28   0                   0  if (r[9]==NULL) goto 28
+  10        SeekGE           4  28   9                   0  key=[9..9]
+  11          IdxGT          4  28   9                   0  key=[9..9]
+  12          DeferredSeek   4   3   0                   0
+  13          RowId          3   7   0                   0  r[7]=orders.rowid
+  14          Found          2  18   7                   0  if found goto 18
+  15          MakeRecord     7   1  10                   0  r[10]=mkrec(r[7..7])
+  16          IdxInsert      2  10   7                   0  key=r[10]
+  17          FilterAdd      2   7   1                   0  bloom_filter_add(r[7..8])
+  18          BeginSubrtn    8   0   0                   0  r[8]=NULL
+  19          RowId          1  11   0                   0  r[11]=customers.rowid
+  20          Column         1   1  12                   0  r[12]=customers.name
+  21          RowId          3  13   0                   0  r[13]=orders.rowid
+  22          Column         3   2  14                   0  r[14]=orders.order_date
+  23          Column         3   4  15                   0  r[15]=orders.total_amount
+  24          MakeRecord    11   5   6                   0  r[6]=mkrec(r[11..15])
+  25          SorterInsert   0   6   0  0                0  key=r[6]
+  26        Return           8   0   1                   0
+  27      Next               4  11   0                   0
+  28    Return               8   0   1                   0
+  29  Next                   1   8   0                   1
+  30  NullRow                1   0   0                   0  Set cursor 1 to a (pseudo) NULL row
+  31  NullRow                4   0   0                   0  Set cursor 4 to a (pseudo) NULL row
+  32  OpenRead               3   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
+  33  Rewind                 3  39   0                   0  Rewind table orders
+  34    RowId                3   7   0                   0  r[7]=orders.rowid
+  35    Filter               2  37   7                   1  if !bloom_filter(r[7..8]) goto 37
+  36    Found                2  38   7                   0  if found goto 38
+  37    Gosub                8  19   0                   0
+  38  Next                   3  34   0                   1
+  39  OpenPseudo             5   6   5                   0  5 columns in r[6]
+  40  SorterSort             0  45   0                   0
+  41    SorterData           0   6   5                   0  r[6]=data
+  42    ColumnRange          5   0   1  5                0  r[1..5]=pseudo.column 0..column 4
+  43    ResultRow            1   5   0                   0  output=r[1..5]
+  44  SorterNext             0  41   0                   0
+  45  Halt                   0   0   0                   0
+  46  Transaction            0   1  10                   0  iDb=0 tx_mode=Read
+  47  Goto                   0   1   0                   0
