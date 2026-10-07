@@ -174,3 +174,16 @@ test array-nested-case-display {
 expect {
     {1,2}
 }
+
+# The loop that DECODEs each element jumps back to its start. A constant of
+# the same SELECT moves to the end of the program, and the jump must still
+# go to the start of the loop.
+test array-of-custom-type-next-to-a-constant-column {
+    CREATE TYPE ci_const(value text) BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE TABLE cc1 (id INTEGER PRIMARY KEY, vals ci_const[]) STRICT;
+    INSERT INTO cc1 VALUES (1, '{"Hello","World"}');
+    SELECT 'x', vals FROM cc1;
+}
+expect {
+    x|{hello,world}
+}
