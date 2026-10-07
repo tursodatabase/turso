@@ -1,0 +1,51 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# A join seeks the index of t once per row of o. After the seek for 2 finds a
+# row, the next seek for 3 must still find the row added to 3 after the
+# checkpoint.
+test mvcc-repeated-index-seeks-find-rows-added-after-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, v INTEGER);
+    CREATE INDEX ia ON t(a);
+    CREATE TABLE o(k);
+    INSERT INTO t(id, a) VALUES (15, 2), (24, 3), (52, 3);
+    INSERT INTO o VALUES (2), (3);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t(id, a) VALUES (48, 3);
+    SELECT o.k, t.id FROM o JOIN t ON t.a = o.k ORDER BY 1, 2;
+    UPDATE t SET v = 1 WHERE id IN (SELECT t.id FROM o JOIN t ON t.a = o.k);
+    SELECT count(*) FROM t WHERE v = 1;
+    DELETE FROM t WHERE id IN (SELECT t.id FROM o JOIN t ON t.a = o.k);
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0|0|0
+    2|15
+    3|24
+    3|48
+    3|52
+    4
+    0
+}
+
+# A semi-join leaves the inner index cursor on its first match. The next outer
+# row seeks the same key and must start at the first row of that key again,
+# not at the row the cursor was left on.
+test mvcc-repeated-index-seeks-start-at-first-row-of-key {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX ia ON t(a);
+    CREATE TABLE o(k, m);
+    INSERT INTO t VALUES (24, 3), (48, 3), (52, 3);
+    INSERT INTO o VALUES (3, 48), (3, 24), (3, 52), (3, 24);
+    SELECT o.rowid FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.k AND t.id + 0 = o.m) ORDER BY 1;
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+}

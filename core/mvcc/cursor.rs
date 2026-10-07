@@ -170,24 +170,24 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
     }
 }
 
-fn current_pos_matches_seek_key(
+fn current_pos_is_only_row_of_seek_key(
     current_row_id: &RowKey,
     seek_key: &SeekKey<'_>,
     mv_cursor_type: &MvccCursorType,
 ) -> Result<bool> {
-    Ok(match (current_row_id, seek_key) {
-        (RowKey::Int(current), SeekKey::TableRowId(target)) => *current == *target,
-        (RowKey::Record(current), SeekKey::IndexKey(target)) => {
-            let MvccCursorType::Index(index_info) = mv_cursor_type else {
-                return Ok(false);
-            };
-            let key_info: Vec<_> = index_info
-                .key_info
-                .iter()
-                .take(target.column_count())
-                .cloned()
-                .collect();
-            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+    Ok(match (current_row_id, seek_key, mv_cursor_type) {
+        (RowKey::Int(current), SeekKey::TableRowId(target), MvccCursorType::Table) => {
+            *current == *target
+        }
+        (RowKey::Record(current), SeekKey::IndexKey(target), MvccCursorType::Index(index_info))
+            if index_info.has_rowid && target.column_count() == index_info.num_cols =>
+        {
+            compare_immutable(
+                target.get_values()?,
+                current.key.get_values()?,
+                &index_info.key_info,
+            )
+            .is_eq()
         }
         _ => false,
     })
@@ -1566,6 +1566,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // Skip the seek and short-circuit to SeekResult::Found if the following are true:
         //
         // - the seek is eq_only
+        // - the seek key matches at most one row (a table rowid, or every index column plus the
+        //   rowid), so the current row is the first and only match
         // - the cursor is already correctly positioned on a visible version
         //
         // This is because in the situation where the following are true:
@@ -1595,7 +1597,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 row_id, in_btree, ..
             } = &self.current_pos
             {
-                if current_pos_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)? {
+                if current_pos_is_only_row_of_seek_key(
+                    &row_id.row_id,
+                    &seek_key,
+                    &self.mv_cursor_type,
+                )? {
                     let maybe_index_id = match &self.mv_cursor_type {
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
