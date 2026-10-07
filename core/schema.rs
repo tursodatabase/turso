@@ -5918,7 +5918,18 @@ fn create_table_with_rowid_alias_types(
                                 );
                             }
                         }
-                        unique_sets.remove(j);
+                        let duplicate = unique_sets.remove(j);
+                        let kept = &mut unique_sets[i];
+                        let same_sort_orders = kept
+                            .columns
+                            .iter()
+                            .zip(duplicate.columns.iter())
+                            .all(|(a, b)| a.sort_order == b.sort_order);
+                        if duplicate.is_primary_key && same_sort_orders {
+                            kept.is_primary_key = true;
+                            kept.conflict_clause =
+                                kept.conflict_clause.or(duplicate.conflict_clause);
+                        }
                     } else {
                         j += 1;
                     }
