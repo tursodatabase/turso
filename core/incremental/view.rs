@@ -468,16 +468,15 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
-
-                // Store the alias mapping if there is an alias
+                let resolved_name = table.name.clone();
+                qualified_names.insert(resolved_name.clone(), qualified_name);
                 if let Some(alias_enum) = alias {
                     aliases.insert(
                         alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
+                        resolved_name.clone(),
                     );
                 }
+                table_map.insert(resolved_name, table);
             } else {
                 return Err(LimboError::ParseError(format!(
                     "Table '{table_name}' not found in schema"
