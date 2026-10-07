@@ -209,6 +209,18 @@ snapshot-eqp not-in-subquery {
     );
 }
 
+# A value missing from the IN list checks only the first list row for NULL,
+# not the whole list once per outer row.
+@setup schema
+snapshot in-subquery-miss-checks-only-the-first-row-for-null {
+    SELECT count(*) FROM products WHERE stock IN (SELECT parent_id FROM categories);
+}
+
+@setup schema
+snapshot not-in-subquery-miss-checks-only-the-first-row-for-null {
+    SELECT count(*) FROM products WHERE stock NOT IN (SELECT parent_id FROM categories);
+}
+
 # =============================================================================
 # CORRELATED SUBQUERIES
 # =============================================================================
