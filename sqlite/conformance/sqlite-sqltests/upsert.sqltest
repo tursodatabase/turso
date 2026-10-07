@@ -929,3 +929,19 @@ expect {
     11
     ok
 }
+
+@cross-check-integrity
+test upsert-excluded-rowid-alias-not-supplied {
+    CREATE TABLE posts (id INTEGER PRIMARY KEY, uuid TEXT UNIQUE, title TEXT);
+    INSERT INTO posts (uuid, title) VALUES ('u1', 'first');
+    INSERT INTO posts (uuid, title) VALUES ('u1', 'x')
+      ON CONFLICT (uuid) DO UPDATE SET title = excluded.id;
+    SELECT * FROM posts;
+    INSERT INTO posts (uuid, title) VALUES ('u1', 'updated')
+      ON CONFLICT (uuid) DO UPDATE SET id = excluded.id, title = excluded.title;
+    SELECT * FROM posts;
+}
+expect {
+    1|u1|2
+    2|u1|updated
+}
