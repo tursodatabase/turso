@@ -3140,11 +3140,18 @@ fn declares_operator_function(td: &Arc<TypeDef>) -> bool {
 fn decode_returns_stored_value(td: &TypeDef) -> bool {
     match td.decode() {
         None => true,
-        Some(ast::Expr::Id(name)) => name.as_str().eq_ignore_ascii_case("value"),
+        Some(decode) if decode_is_identity(decode) => true,
         // The ENCODE of the built-in boolean stores only 0 and 1, and its DECODE
         // returns both unchanged.
         Some(_) => td.is_builtin && td.name == "boolean",
     }
+}
+
+/// True when a DECODE gives the stored value unchanged: it is the name
+/// `value`. The case of the name counts, because the translation of the
+/// DECODE finds the register of `value` by the exact name.
+pub(crate) fn decode_is_identity(decode: &ast::Expr) -> bool {
+    matches!(decode, ast::Expr::Id(name) if name.as_str() == "value")
 }
 
 fn builtin_seek_key_function(td: &TypeDef) -> Option<SeekKeyFunction> {

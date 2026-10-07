@@ -1191,3 +1191,22 @@ expect {
     1|2025-05-05 10:00:00
     2025-05-05 10:00:00
 }
+
+# DECODE VALUE is not the name `value` of the stored value: it gives the
+# text 'VALUE'. So an index on the stored values cannot answer a comparison.
+test decode-of-upper-case-name-same-rows-with-and-without-index {
+    CREATE TYPE t_upper(value integer) BASE integer ENCODE value DECODE VALUE OPERATOR '<';
+    CREATE TABLE y(id INTEGER PRIMARY KEY, b t_upper) STRICT;
+    CREATE INDEX y_b ON y(b);
+    INSERT INTO y VALUES (1, 6), (2, 7);
+    SELECT 'idx-eq', id FROM y WHERE b = 6 ORDER BY id;
+    SELECT 'noidx-eq', id FROM y NOT INDEXED WHERE b = 6 ORDER BY id;
+    SELECT 'idx-range', id FROM y WHERE b > 6 ORDER BY id;
+    SELECT 'noidx-range', id FROM y NOT INDEXED WHERE b > 6 ORDER BY id;
+}
+expect {
+    idx-range|1
+    idx-range|2
+    noidx-range|1
+    noidx-range|2
+}
