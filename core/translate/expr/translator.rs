@@ -280,28 +280,13 @@ fn copy_cached_expr_reg(
                 if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
                 {
                     if let Some(col) = table.get_column_at(*column) {
-                        if let Some(type_def) = resolver
-                            .schema()
-                            .get_type_def(&col.ty_str, table.is_strict())
-                        {
-                            if let Some(decode_expr) = type_def.decode() {
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_register,
-                                    target_pc: skip_label,
-                                });
-                                emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    target_register,
-                                    target_register,
-                                    col,
-                                    type_def,
-                                    resolver,
-                                )?;
-                                program.preassign_label_to_next_insn(skip_label);
-                            }
-                        }
+                        emit_column_decode_in_place(
+                            program,
+                            target_register,
+                            col,
+                            table.is_strict(),
+                            resolver,
+                        )?;
                     }
                 }
             }

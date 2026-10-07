@@ -728,11 +728,7 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() || !(reads_every_column || read_columns.contains(&i)) {
             continue;
         }
-        let decodes = resolver
-            .schema()
-            .resolve_type(&col.ty_str, is_strict)?
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
-        if decodes {
+        if column_decodes(col, is_strict, resolver)? {
             let src_reg = column_regs[i];
             let tmp = program.alloc_register();
             emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
@@ -819,35 +815,35 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
-    // Array columns: pass through raw record blob. ArrayDecode is emitted
-    // at display time (ResultRow) so that functions/subscripts see raw blobs.
+    emit_column_decode_in_place(program, dest_reg, column, is_strict, resolver)
+}
+
+/// Emits the DECODE expressions of the type chain of `column` on `reg`, the
+/// parent type first, and skips them when the value is NULL. An array column
+/// keeps its record blob: ArrayDecode is emitted at display time (ResultRow)
+/// so that functions and subscripts see raw blobs.
+pub(crate) fn emit_column_decode_in_place(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Result<()> {
     if column.is_array() {
         return Ok(());
     }
-    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(
-                    program,
-                    decode_expr,
-                    dest_reg,
-                    dest_reg,
-                    column,
-                    td,
-                    resolver,
-                )?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+    let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) else {
+        return Ok(());
+    };
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    for (td, decode_expr) in chain_decodes(&resolved) {
+        emit_type_expr(program, decode_expr, reg, reg, column, td, resolver)?;
     }
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -994,38 +990,48 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
-            if let Some(type_def) = type_def {
-                if let Some(decode_expr) = type_def.decode() {
-                    let src = source_regs(i);
-                    let decoded_reg = program.alloc_register();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: src,
-                        dst_reg: decoded_reg,
-                        extra_amount: 0,
-                    });
-                    let skip_label = program.allocate_label();
-                    program.emit_insn(Insn::IsNull {
-                        reg: decoded_reg,
-                        target_pc: skip_label,
-                    });
-                    emit_type_expr(
-                        program,
-                        decode_expr,
-                        decoded_reg,
-                        decoded_reg,
-                        col,
-                        type_def,
-                        resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(skip_label);
-                    return Ok(decoded_reg);
-                }
+            if !column_decodes(col, is_strict, resolver)? {
+                return Ok(source_regs(i));
             }
-            Ok(source_regs(i))
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                source_regs(i),
+                decoded_reg,
+                col,
+                is_strict,
+                resolver,
+            )?;
+            Ok(decoded_reg)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+/// True when a read of `column` runs a DECODE of its type chain, so the
+/// value that it shows can differ from the stored value.
+pub(crate) fn column_decodes(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Result<bool> {
+    if column.is_array() {
+        return Ok(false);
+    }
+    Ok(resolver
+        .schema()
+        .resolve_type(&column.ty_str, is_strict)?
+        .is_some_and(|resolved| chain_decodes(&resolved).next().is_some()))
+}
+
+/// The DECODE expressions of a type chain in the order that they run: the
+/// parent type first.
+fn chain_decodes(resolved: &ResolvedType) -> impl Iterator<Item = (&Arc<TypeDef>, &ast::Expr)> {
+    resolved
+        .chain
+        .iter()
+        .rev()
+        .filter_map(|td| td.decode().map(|decode_expr| (td, decode_expr)))
 }
 
 /// A comparison of a column of a `pg_` date or time type with a literal that

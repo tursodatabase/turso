@@ -1628,3 +1628,57 @@ expect {
     2|5|7
     3|5|7
 }
+
+@requires strict "uses STRICT tables"
+test domain-column-decodes-through-hash-join {
+    CREATE TYPE ci_hj(value text) BASE text ENCODE upper(value) DECODE lower(value) OPERATOR '<';
+    CREATE DOMAIN dci_hj AS ci_hj;
+    CREATE DOMAIN dts_hj AS pg_timestamp;
+    CREATE TABLE a_hj(id INTEGER PRIMARY KEY, k INTEGER, v dci_hj, w ci_hj, t dts_hj, ts pg_timestamp[]) STRICT, PGSTORAGE;
+    CREATE TABLE b_hj(id INTEGER PRIMARY KEY, k INTEGER) STRICT;
+    INSERT INTO a_hj VALUES (1, 1, 'Hello', 'Hello', '2024-01-02 03:04:05', '{"2024-01-02 03:04:05"}');
+    INSERT INTO b_hj VALUES (1, 1);
+    EXPLAIN QUERY PLAN SELECT a_hj.v FROM a_hj JOIN b_hj ON a_hj.k = b_hj.k;
+    SELECT v, w, t, ts FROM a_hj;
+    SELECT a_hj.v, a_hj.w, a_hj.t, a_hj.ts FROM a_hj JOIN b_hj ON a_hj.k = b_hj.k;
+}
+expect {
+    1|0|0|HASH JOIN b_hj
+    2|0|0|SCAN a_hj
+    hello|hello|2024-01-02 03:04:05|{"2024-01-02 03:04:05"}
+    hello|hello|2024-01-02 03:04:05|{"2024-01-02 03:04:05"}
+}
+
+@requires strict "uses STRICT tables"
+test domain-column-decodes-in-trigger-new-and-old {
+    CREATE TYPE ci_tr(value text) BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE DOMAIN dci_tr AS ci_tr;
+    CREATE DOMAIN dts_tr AS pg_timestamp;
+    CREATE TABLE a_tr(id INTEGER PRIMARY KEY, v dci_tr, t dts_tr) STRICT, PGSTORAGE;
+    CREATE TABLE log_tr(what TEXT, x TEXT, y TEXT);
+    CREATE TRIGGER a_tr_ins AFTER INSERT ON a_tr BEGIN INSERT INTO log_tr VALUES ('new', NEW.v, NEW.t); END;
+    CREATE TRIGGER a_tr_upd AFTER UPDATE ON a_tr BEGIN INSERT INTO log_tr VALUES ('old', OLD.v, OLD.t), ('new', NEW.v, NEW.t); END;
+    CREATE TRIGGER a_tr_del AFTER DELETE ON a_tr BEGIN INSERT INTO log_tr VALUES ('old', OLD.v, OLD.t); END;
+    INSERT INTO a_tr VALUES (1, 'Hello', '2024-01-02 03:04:05');
+    UPDATE a_tr SET v = 'World', t = '2025-06-07 08:09:10' WHERE id = 1;
+    DELETE FROM a_tr WHERE id = 1;
+    SELECT what, x, y FROM log_tr ORDER BY rowid;
+}
+expect {
+    new|hello|2024-01-02 03:04:05
+    old|hello|2024-01-02 03:04:05
+    new|world|2025-06-07 08:09:10
+    old|world|2025-06-07 08:09:10
+}
+
+@requires strict "uses STRICT tables"
+test domain-not-null-checks-the-value-that-the-column-shows {
+    CREATE TYPE nullish_nn(value text) BASE text ENCODE value DECODE NULLIF(value, 'x');
+    CREATE DOMAIN dn_nn AS nullish_nn;
+    CREATE TABLE g_nn(id INTEGER PRIMARY KEY, b dn_nn NOT NULL) STRICT;
+    INSERT INTO g_nn VALUES (1, 'y');
+    INSERT INTO g_nn VALUES (2, 'x');
+}
+expect error {
+    NOT NULL constraint failed: g_nn.b
+}

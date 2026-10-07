@@ -92,9 +92,9 @@ pub(crate) use columns::{column_encodes_stored_value, emit_stored_column};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
-    comparison_calls_type_function, computes_like_index_keys, emit_dml_expr_index_value,
-    emit_trigger_decode_registers, emit_type_expr, emit_user_facing_column_value, IndexExprKind,
-    NumericComparisons,
+    column_decodes, comparison_calls_type_function, computes_like_index_keys,
+    emit_column_decode_in_place, emit_dml_expr_index_value, emit_trigger_decode_registers,
+    emit_type_expr, emit_user_facing_column_value, IndexExprKind, NumericComparisons,
 };
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
