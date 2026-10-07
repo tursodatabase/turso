@@ -73,3 +73,16 @@ test default-in-where-errors {
 }
 expect error {
 }
+
+test default-keyword-of-an-integer-rowid-alias-gives-the-next-rowid {
+    CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT 5, v TEXT);
+    INSERT INTO t (v) VALUES ('x');
+    INSERT INTO t VALUES (DEFAULT, 'y');
+    INSERT INTO t (id, v) VALUES (DEFAULT, 'z');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|x
+    2|y
+    3|z
+}

@@ -977,3 +977,21 @@ fn new_index_on_a_wide_numeric_refuses_keys_that_queries_compute_in_another_way(
     conn.execute("DELETE FROM q WHERE id > 0").unwrap();
     assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
 }
+
+/// The base gave ids from the rowid and did not advance the sequence of a
+/// serial PRIMARY KEY, so DEFAULT of such a key gives the next rowid, as an
+/// omitted key does.
+#[test]
+fn default_of_a_serial_primary_key_of_base_file_gives_the_next_rowid() {
+    let dir = copy_fixtures(&["pg_v1_renamed_serial.db"]);
+    let db = open(dir.path().join("pg_v1_renamed_serial.db"), false);
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO rs2 VALUES (DEFAULT, '2024-02-02 10:00:00', true, 'second')")
+        .unwrap();
+    conn.execute("INSERT INTO rs2 (id, a) VALUES (DEFAULT, 'third')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, a FROM rs2 ORDER BY id"),
+        ["1|first", "2|second", "3|third"]
+    );
+}

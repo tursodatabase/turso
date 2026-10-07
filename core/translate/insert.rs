@@ -2024,6 +2024,9 @@ fn resolve_defaults_in_row(
             })
         };
         *expr = match col {
+            Some(col) if col.is_rowid_alias() && !col.is_pg_int_rowid_alias() => {
+                Box::new(ast::Expr::Literal(ast::Literal::Null))
+            }
             Some(col) => col.default.clone().unwrap_or_else(|| {
                 if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
                     if let Some(default_expr) = resolved.default_expr() {
