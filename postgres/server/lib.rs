@@ -658,6 +658,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE ROLE") {
+        Tag::new("CREATE ROLE")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -691,6 +693,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -763,6 +767,16 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_role_has_its_own_command_tag() {
+        assert_eq!(command_tag("CREATE ROLE alice", 0), Tag::new("CREATE ROLE"));
+    }
+
+    #[test]
+    fn reset_has_its_own_command_tag() {
+        assert_eq!(command_tag("RESET ROLE", 0), Tag::new("RESET"));
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {

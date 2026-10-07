@@ -33,6 +33,7 @@ pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
 pub(crate) mod result_row;
+pub(crate) mod roles;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
@@ -130,6 +131,12 @@ pub fn translate(
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
+    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root)
+        && !connection.schema_reparse_in_progress();
+    if check_privileges {
+        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
+    }
+
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
@@ -146,6 +153,10 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+
+    if check_privileges {
+        roles::check_storage_access(&program, &resolver, &connection)?;
+    }
 
     program.build(connection, change_cnt_on, input)
 }
@@ -173,6 +184,7 @@ pub fn translate_inner(
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::CreateRole { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -358,6 +370,10 @@ pub fn translate_inner(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::SetRole { role_name } => roles::translate_set_role(role_name, program)?,
+        ast::Stmt::CreateRole { role_name } => {
+            roles::translate_create_role(&role_name, resolver, program)?
+        }
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -534,6 +550,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::SetRole { .. } => "set_role",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",

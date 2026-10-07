@@ -3,7 +3,8 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
-    schema::{BTreeTable, Schema, Table},
+    schema::{BTreeTable, Schema, Table, TURSO_INTERNAL_PREFIX},
+    security::roles::{Role, RoleId, SUPERUSER_NAME},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
 };
@@ -202,13 +203,14 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
         .filter(|(name, table)| {
             // Skip system tables
             if name.starts_with("sqlite_")
+                || name.starts_with(TURSO_INTERNAL_PREFIX)
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
@@ -290,6 +292,10 @@ impl PgClassTable {
 }
 
 impl InternalVirtualTable for PgClassTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_class".to_string()
     }
@@ -536,6 +542,10 @@ impl PgNamespaceTable {
 }
 
 impl InternalVirtualTable for PgNamespaceTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_namespace".to_string()
     }
@@ -678,6 +688,10 @@ impl PgAttributeTable {
 }
 
 impl InternalVirtualTable for PgAttributeTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_attribute".to_string()
     }
@@ -842,9 +856,20 @@ impl InternalVirtualTableCursor for PgAttributeCursor {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    if id == RoleId::SUPERUSER {
+        SUPERUSER_OID
+    } else {
+        USER_ROLE_OID_START + id.get()
+    }
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 pub struct PgRolesTable;
 
@@ -853,37 +878,45 @@ impl PgRolesTable {
         Self
     }
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
-    fn roles() -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+    fn roles(conn: &Connection) -> Vec<Vec<Value>> {
+        conn.role_catalog().iter().map(role_row).collect()
     }
 }
 
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    vec![
+        Value::from_i64(role_oid(role.id)),     // oid
+        Value::build_text(role.name.clone()),   // rolname
+        superuser.clone(),                      // rolsuper
+        Value::from_i64(1),                     // rolinherit
+        superuser.clone(),                      // rolcreaterole
+        superuser.clone(),                      // rolcreatedb
+        Value::from_i64(role.can_login as i64), // rolcanlogin
+        superuser.clone(),                      // rolreplication
+        Value::from_i64(-1),                    // rolconnlimit (-1 = no limit)
+        Value::Null,                            // rolpassword (never exposed)
+        Value::Null,                            // rolvaliduntil
+        superuser,                              // rolbypassrls
+        Value::Null,                            // rolconfig
+    ]
+}
+
 impl InternalVirtualTable for PgRolesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_roles".to_string()
     }
 
     fn open(
         &self,
-        _conn: Arc<Connection>,
+        conn: Arc<Connection>,
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         Ok(Arc::new(RwLock::new(PgRolesCursor {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         })))
@@ -933,6 +966,7 @@ impl InternalVirtualTable for PgRolesTable {
 }
 
 struct PgRolesCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -962,7 +996,7 @@ impl InternalVirtualTableCursor for PgRolesCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        self.rows = PgRolesTable::roles();
+        self.rows = PgRolesTable::roles(&self.conn);
         Ok(!self.rows.is_empty())
     }
 }
@@ -979,6 +1013,10 @@ impl PgProcTable {
 }
 
 impl InternalVirtualTable for PgProcTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_proc".to_string()
     }
@@ -1200,6 +1238,10 @@ pub(crate) fn db_name_from_path(path: &str) -> String {
 }
 
 impl InternalVirtualTable for PgDatabaseTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_database".to_string()
     }
@@ -1343,6 +1385,10 @@ impl PgAmTable {
 }
 
 impl InternalVirtualTable for PgAmTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_am".to_string()
     }
@@ -1435,6 +1481,10 @@ struct EmptyPgCatalogTable {
 }
 
 impl InternalVirtualTable for EmptyPgCatalogTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -1523,6 +1573,10 @@ impl PgTablesTable {
 }
 
 impl InternalVirtualTable for PgTablesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_tables".to_string()
     }
@@ -1595,7 +1649,7 @@ impl PgTablesCursor {
             self.rows.push(vec![
                 Value::Text("public".into()),           // schemaname
                 Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
+                Value::Text(SUPERUSER_NAME.into()),     // tableowner
                 Value::Null,                            // tablespace
                 Value::from_i64(0),                     // hasindexes
                 Value::from_i64(0),                     // hasrules
@@ -1949,6 +2003,10 @@ impl PgTypeTable {
 }
 
 impl InternalVirtualTable for PgTypeTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_type".to_string()
     }
@@ -2156,6 +2214,10 @@ impl PgIndexTable {
 }
 
 impl InternalVirtualTable for PgIndexTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_index".to_string()
     }
@@ -2333,6 +2395,10 @@ impl PgConstraintTable {
 }
 
 impl InternalVirtualTable for PgConstraintTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_constraint".to_string()
     }
@@ -2696,6 +2762,10 @@ impl PgAttrdefTable {
 }
 
 impl InternalVirtualTable for PgAttrdefTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_attrdef".to_string()
     }
@@ -2820,6 +2890,10 @@ impl PgSequencesTable {
 }
 
 impl InternalVirtualTable for PgSequencesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_sequences".to_string()
     }
@@ -2893,14 +2967,19 @@ impl PgSequencesCursor {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = self
-                    .conn
-                    .get_sequence_currval(&seq_name)
-                    .unwrap_or(seq.start_value);
+                let last_value = if self.conn.current_role_is_superuser() {
+                    Value::from_i64(
+                        self.conn
+                            .get_sequence_currval(&seq_name)
+                            .unwrap_or(seq.start_value),
+                    )
+                } else {
+                    Value::Null
+                };
                 self.rows.push(vec![
                     Value::build_text("public"),           // schemaname
                     Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
+                    Value::build_text(SUPERUSER_NAME),     // sequenceowner
                     Value::build_text("bigint"),           // data_type
                     Value::from_i64(seq.start_value),      // start_value
                     Value::from_i64(seq.min_value),        // min_value
@@ -2908,7 +2987,7 @@ impl PgSequencesCursor {
                     Value::from_i64(seq.increment_by),     // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    last_value,         // last_value
                 ]);
             }
         }
@@ -3205,6 +3284,10 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
 }
 
 impl InternalVirtualTable for PgInputErrorInfoTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_input_error_info".to_string()
     }
@@ -3427,6 +3510,10 @@ impl InternalVirtualTableCursor for PgGetTableDefCursor {
 }
 
 impl InternalVirtualTable for PgGetTableDefTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_get_tabledef".to_string()
     }

@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::security::roles::{RoleCatalog, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -53,6 +54,7 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
+use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[cfg(host_shared_wal)]
@@ -332,7 +334,7 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 }
 
 /// Phase tracking for async database opening
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
@@ -342,6 +344,10 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    /// Reads the roles table into the role catalog. Runs after MVCC
+    /// bootstrap, because before it an MVCC database has no table roots and
+    /// has not replayed its logical log.
+    LoadingRoles,
     Done,
 }
 
@@ -523,6 +529,10 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
+    /// The roles table scan of `LoadingRoles` and the rows read so far, held
+    /// across yields.
+    roles_stmt: Option<Box<Statement>>,
+    role_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -546,6 +556,8 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
+            roles_stmt: None,
+            role_rows: Vec::new(),
         }
     }
 }
@@ -1710,6 +1722,40 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    state.phase = OpenDbAsyncPhase::LoadingRoles;
+                }
+
+                OpenDbAsyncPhase::LoadingRoles => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.roles_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_roles_table = schema.get_btree_table(ROLES_TABLE_NAME).is_some();
+                        *conn.schema.write() = schema;
+                        if has_roles_table {
+                            state.roles_stmt = Some(Box::new(conn.prepare(SELECT_ROLES_SQL)?));
+                        }
+                    }
+                    if let Some(stmt) = state.roles_stmt.as_mut() {
+                        let rows = &mut state.role_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.roles_stmt = None;
+                        let roles = Arc::new(RoleCatalog::from_rows(&state.role_rows)?);
+                        db.with_schema_mut(|schema| {
+                            schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2616,6 +2662,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            session_role: crate::security::roles::RoleId::SUPERUSER,
+            current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections
@@ -3599,6 +3647,196 @@ mod database_tests {
         DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
         OpenOptions, PlatformIO, SqliteDialect, IO,
     };
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn open_yields_for_io_while_loading_roles() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryYieldIO::new());
+        let path = "roles.db";
+        {
+            let (db, _) = open_and_watch_phase(&io, path, super::OpenDbAsyncPhase::LoadingRoles);
+            let conn = db.connect().unwrap();
+            let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+                role_name: "alice".to_string(),
+            });
+            let mut stmt = conn
+                .prepare_translated_cmd(create_role, "CREATE ROLE alice")
+                .unwrap();
+            stmt.run_ignore_rows().unwrap();
+            drop(stmt);
+            conn.close().unwrap();
+        }
+
+        let (db, yielded_while_loading_roles) =
+            open_and_watch_phase(&io, path, super::OpenDbAsyncPhase::LoadingRoles);
+
+        assert!(yielded_while_loading_roles);
+        assert!(db.schema.lock().roles.get_by_name("alice").is_some());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn roles_in_the_mvcc_log_are_loaded_on_open() {
+        roles_are_loaded_on_mvcc_open(false);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn checkpointed_mvcc_roles_are_loaded_on_open() {
+        roles_are_loaded_on_mvcc_open(true);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn roles_are_reloaded_after_vacuum() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("roles.db");
+        let db = Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+            role_name: "alice".to_string(),
+        });
+        conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+
+        conn.execute("VACUUM").unwrap();
+
+        assert!(conn.role_catalog().get_by_name("alice").is_some());
+        assert!(db
+            .connect()
+            .unwrap()
+            .role_catalog()
+            .get_by_name("alice")
+            .is_some());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn roles_are_loaded_on_open_when_the_schema_cookie_is_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("roles.db");
+        let path = path.to_str().unwrap();
+        let open = || {
+            Database::open_file_with_flags(
+                Arc::new(PlatformIO::new().unwrap()),
+                path,
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap()
+        };
+        {
+            let conn = open().connect().unwrap();
+            let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+                role_name: "alice".to_string(),
+            });
+            conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(40)).unwrap();
+        std::io::Write::write_all(&mut file, &0u32.to_be_bytes()).unwrap();
+        drop(file);
+
+        let db = open();
+
+        assert!(db
+            .connect()
+            .unwrap()
+            .role_catalog()
+            .get_by_name("alice")
+            .is_some());
+    }
+
+    #[cfg(feature = "fs")]
+    fn roles_are_loaded_on_mvcc_open(checkpoint: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("roles.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path,
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+                role_name: "alice".to_string(),
+            });
+            conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+            if checkpoint {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+
+        assert!(db
+            .connect()
+            .unwrap()
+            .role_catalog()
+            .get_by_name("alice")
+            .is_some());
+    }
+
+    /// Opens `path` and returns whether the open yielded for IO while in
+    /// `phase`.
+    #[cfg(feature = "io_memory_yield")]
+    fn open_and_watch_phase(
+        io: &Arc<dyn IO>,
+        path: &str,
+        phase: super::OpenDbAsyncPhase,
+    ) -> (Arc<Database>, bool) {
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(Arc::new(DatabaseFile::new(file)))
+            .flags(OpenFlags::Create);
+        let mut state = OpenDbAsyncState::new();
+        let mut yielded_in_phase = false;
+        loop {
+            match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+                IOResult::Done(db) => return (db, yielded_in_phase),
+                IOResult::IO(completion) => {
+                    yielded_in_phase |= state.phase == phase;
+                    completion.wait(&**io).unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {

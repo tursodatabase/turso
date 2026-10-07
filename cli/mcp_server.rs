@@ -80,6 +80,7 @@ impl StmtClass {
             | Stmt::CreateVirtualTable(_)
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
+            | Stmt::CreateRole { .. }
             | Stmt::CreateSequence { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
@@ -92,6 +93,7 @@ impl StmtClass {
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
             | Stmt::Commit { .. }
+            | Stmt::SetRole { .. }
             | Stmt::Detach { .. }
             | Stmt::Pragma { .. }
             | Stmt::Reindex { .. }

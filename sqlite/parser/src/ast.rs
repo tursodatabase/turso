@@ -200,6 +200,16 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
+    },
+    /// `SET ROLE`, or `RESET ROLE` when `role_name` is `None`
+    SetRole {
+        /// role name
+        role_name: Option<String>,
+    },
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`

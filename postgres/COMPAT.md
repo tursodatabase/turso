@@ -69,7 +69,7 @@ Basics not enumerated by the official feature matrix.
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
+`pg_database`, `pg_roles` (built-in `postgres` superuser and roles from `CREATE ROLE`), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
@@ -192,7 +192,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
-| SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
+| SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
@@ -386,7 +386,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET ROLE`, `RESET ROLE`; roles that are not superusers have no privileges until ownership and `GRANT` exist; `pg_roles` lists the built-in `postgres` superuser and created roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |

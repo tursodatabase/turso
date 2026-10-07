@@ -2,6 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -241,6 +242,11 @@ enum ReparsePhase {
     LoadTypes {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
+    },
+    /// Loading roles from the roles table into the role catalog.
+    LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
     },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
@@ -563,6 +569,10 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
 }
@@ -1640,9 +1650,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.load_roles_phase(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1661,17 +1669,27 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.load_roles_phase(&inner.fresh)?;
                         }
                         Err(e) => {
                             tracing::warn!("Failed to load custom types: {}", e);
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.load_roles_phase(&inner.fresh)?;
                         }
                     }
+                }
+                ReparsePhase::LoadRoles { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "roles must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.roles = Arc::new(RoleCatalog::from_rows(rows)?);
+                    inner.phase = ReparsePhase::RefreshStats {
+                        stats: Default::default(),
+                    };
                 }
                 ReparsePhase::RefreshStats { stats } => {
                     // Best-effort load stats if sqlite_stat1 is present.
@@ -1695,6 +1713,27 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the roles table into `fresh`, or the
+    /// stats refresh phase if the database has no roles table. The fresh
+    /// schema is installed first, because the current schema may not contain
+    /// the roles table yet.
+    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh.tables.contains_key(ROLES_TABLE_NAME) {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare(SELECT_ROLES_SQL)?;
+        Ok(ReparsePhase::LoadRoles {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -3840,6 +3879,33 @@ impl Connection {
 
     pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
         &self.attached_databases
+    }
+
+    /// Returns the roles of the main database as seen by this connection.
+    /// Outside a transaction, this includes roles that other connections
+    /// committed.
+    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
+        self.maybe_update_schema();
+        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
+    }
+
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub(crate) fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

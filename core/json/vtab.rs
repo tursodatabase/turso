@@ -65,6 +65,10 @@ const COL_JSON: usize = 8;
 const COL_ROOT: usize = 9;
 
 impl InternalVirtualTable for JsonVirtualTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         self.traversal_mode.function_name().to_owned()
     }

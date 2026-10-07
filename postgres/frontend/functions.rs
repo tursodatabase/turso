@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use turso_core::schema::{Schema, Table};
+use turso_core::schema::Table;
+use turso_core::security::roles::RoleId;
 use turso_core::{Connection, LimboError, Result, Value};
 use turso_parser::ast::RefAct;
 
@@ -23,7 +23,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
-        "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "version" | "current_database" | "current_schema" | "current_user" | "session_user"
+        | "pg_backend_pid" => &[0],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -38,7 +39,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         _ => String::new(),
     };
     match name {
-        "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
+        "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(conn, int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
         }
@@ -63,6 +64,8 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // pg_catalog presents every user object under the hardcoded "public"
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
+        "current_user" => Ok(role_name(conn, conn.current_role())),
+        "session_user" => Ok(role_name(conn, conn.session_role())),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
@@ -84,8 +87,22 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
     }
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn role_name(conn: &Connection, role: RoleId) -> Value {
+    let roles = conn.role_catalog();
+    let role = roles
+        .get(role)
+        .expect("the role of a connection is in its role catalog");
+    Value::build_text(role.name.clone())
+}
+
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
+    let name = conn
+        .role_catalog()
+        .iter()
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
+        .unwrap_or_else(|| format!("unknown (OID={oid})"));
+    Value::build_text(name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
@@ -251,25 +268,6 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
     }
 }
 
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
-    tables
-}
-
 fn ref_act_to_char(act: &RefAct) -> &'static str {
     match act {
         RefAct::NoAction => "a",
@@ -292,7 +290,7 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 
 fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
+    let tables = crate::catalog::user_tables_sorted(&schema);
     let num_tables = tables.len() as i64;
 
     let mut next_index_oid = USER_TABLE_OID_START + num_tables;
@@ -372,7 +370,7 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
 fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
+    let tables = crate::catalog::user_tables_sorted(&schema);
     let num_tables = tables.len() as i64;
 
     let mut index_oid = USER_TABLE_OID_START + num_tables;

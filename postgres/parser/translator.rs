@@ -166,6 +166,8 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
+            NodeRef::VariableSetStmt(set) if set.name == "role" => translate_set_role(set)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -2325,13 +2327,30 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
-                        | SqlValueFunctionOp::SvfopSessionUser
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
-                    ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
-                    }
+                    ) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
+                    Ok(SqlValueFunctionOp::SvfopSessionUser) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("session_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
@@ -4214,6 +4233,88 @@ struct PgForeignKey {
     on_update: Option<String>,
 }
 
+fn translate_set_role(stmt: &pg_query::protobuf::VariableSetStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::VariableSetKind;
+
+    if stmt.is_local {
+        return Err(ParseError::ParseError(
+            "SET LOCAL ROLE is not supported".to_string(),
+        ));
+    }
+    let role_name = match VariableSetKind::try_from(stmt.kind) {
+        Ok(VariableSetKind::VarReset | VariableSetKind::VarSetDefault) => None,
+        Ok(VariableSetKind::VarSetValue) => {
+            let [arg] = stmt.args.as_slice() else {
+                return Err(ParseError::ParseError(
+                    "SET ROLE takes one role name".to_string(),
+                ));
+            };
+            let role_name = role_name_arg(arg)
+                .ok_or_else(|| ParseError::ParseError("SET ROLE takes a role name".to_string()))?;
+            (role_name != "none").then_some(role_name)
+        }
+        _ => {
+            return Err(ParseError::ParseError(
+                "unsupported form of SET ROLE".to_string(),
+            ))
+        }
+    };
+    Ok(ast::Stmt::SetRole { role_name })
+}
+
+fn role_name_arg(arg: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+
+    match &arg.node {
+        Some(Node::AConst(a_const)) => match &a_const.val {
+            Some(Val::Sval(name)) => Some(name.sval.clone()),
+            _ => None,
+        },
+        Some(Node::String(name)) => Some(name.sval.clone()),
+        _ => None,
+    }
+}
+
+fn translate_create_role(
+    stmt: &pg_query::protobuf::CreateRoleStmt,
+) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::RoleStmtType;
+
+    match RoleStmtType::try_from(stmt.stmt_type) {
+        Ok(RoleStmtType::RolestmtRole) => {}
+        Ok(RoleStmtType::RolestmtUser) => {
+            return Err(ParseError::ParseError(
+                "CREATE USER is not supported".to_string(),
+            ))
+        }
+        Ok(RoleStmtType::RolestmtGroup) => {
+            return Err(ParseError::ParseError(
+                "CREATE GROUP is not supported".to_string(),
+            ))
+        }
+        _ => {
+            return Err(ParseError::ParseError(format!(
+                "unknown CREATE ROLE statement type: {}",
+                stmt.stmt_type
+            )))
+        }
+    }
+    if !stmt.options.is_empty() {
+        return Err(ParseError::ParseError(
+            "CREATE ROLE options are not supported".to_string(),
+        ));
+    }
+    if stmt.role.starts_with("pg_") {
+        return Err(ParseError::ParseError(format!(
+            "role name \"{}\" is reserved",
+            stmt.role
+        )));
+    }
+    Ok(ast::Stmt::CreateRole {
+        role_name: stmt.role.clone(),
+    })
+}
+
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
 fn translate_create_enum(
@@ -4581,7 +4682,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     };
 
     // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
+    if set_stmt.kind != 1 || set_stmt.name == "role" {
         return None;
     }
 

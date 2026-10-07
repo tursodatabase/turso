@@ -4262,7 +4262,13 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
-    halt(program, state, pager, *err_code, &desc, *on_error)
+    let result = halt(program, state, pager, *err_code, &desc, *on_error);
+    if matches!(result, Ok(InsnFunctionStepResult::Done)) {
+        if let Some(role) = state.role_to_set.take() {
+            program.connection.set_current_role(role);
+        }
+    }
+    result
 }
 
 pub fn op_halt_if_null(
@@ -10194,6 +10200,12 @@ pub fn op_function(
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
                 program.connection.find_sequence(&seq_name)?;
+                if !program.connection.current_role_is_superuser() {
+                    return Err(crate::LimboError::PermissionDenied(format!(
+                        "permission denied for sequence {seq_name}"
+                    ))
+                    .into());
+                }
                 match program.connection.get_sequence_currval(&seq_name) {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
@@ -10517,6 +10529,12 @@ pub fn op_function(
                 if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
+                if !program.connection.current_role_is_superuser() {
+                    return Err(LimboError::PermissionDenied(
+                        "permission denied for function load_extension".to_string(),
+                    )
+                    .into());
+                }
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
@@ -10829,6 +10847,12 @@ pub fn op_function(
                         (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
                     };
                 program.connection.find_sequence(sequence_name)?;
+                if !program.connection.current_role_is_superuser() {
+                    return Err(LimboError::PermissionDenied(format!(
+                        "permission denied for sequence {sequence_name}"
+                    ))
+                    .into());
+                }
                 let watermark = program
                     .connection
                     .mv_store_for_db(db_id)
@@ -14353,6 +14377,78 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_role(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AddRole {
+            db,
+            id_reg,
+            name,
+            superuser,
+            can_login,
+        },
+        insn
+    );
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
+        return Err(LimboError::InternalError(format!(
+            "AddRole: role rowid register r[{id_reg}] does not hold an integer"
+        ))
+        .into());
+    };
+    let role = crate::security::roles::Role {
+        id: crate::security::roles::RoleId::from_rowid(*rowid),
+        name: name.clone(),
+        superuser: *superuser,
+        can_login: *can_login,
+    };
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| Arc::make_mut(&mut schema.roles).add(role))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_set_role(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SetRole { role_name }, insn);
+    let conn = &program.connection;
+    if !conn.get_auto_commit() {
+        return Err(LimboError::SqlError(
+            "SET ROLE inside a transaction block is not supported".to_string(),
+        )
+        .into());
+    }
+    let roles = conn.role_catalog();
+    let role = match role_name {
+        Some(role_name) => {
+            let Some(role) = roles.get_by_name(role_name) else {
+                return Err(
+                    LimboError::SqlError(format!("role \"{role_name}\" does not exist")).into(),
+                );
+            };
+            if !roles.can_set_role(conn.session_role(), role.id) {
+                return Err(LimboError::PermissionDenied(format!(
+                    "permission denied to set role \"{role_name}\""
+                ))
+                .into());
+            }
+            role.id
+        }
+        None => conn.session_role(),
+    };
+    state.role_to_set = Some(role);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

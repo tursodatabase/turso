@@ -264,11 +264,20 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            format!(
+                "permission denied for database {}",
+                catalog::db_name_from_path(pg_conn.conn.db_file_path())
+            )
+        })?;
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            format!("must be owner of schema {}", stmt.name.to_lowercase())
+        })?;
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
@@ -282,6 +291,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            "permission denied to COPY from a file".to_string()
+        })?;
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
@@ -289,6 +301,16 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     Ok(None)
+}
+
+/// Statements that the frontend runs itself, outside the privilege checks of
+/// core, are allowed only for a superuser.
+fn require_superuser(conn: &Connection, denial: impl FnOnce() -> String) -> Result<()> {
+    if conn.role_catalog().is_superuser(conn.current_role()) {
+        Ok(())
+    } else {
+        Err(LimboError::PermissionDenied(denial()))
+    }
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

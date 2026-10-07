@@ -100,6 +100,7 @@ impl Trigger {
     }
 }
 
+use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -763,6 +764,7 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    pub roles: Arc<RoleCatalog>,
 }
 
 impl Default for Schema {
@@ -905,6 +907,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            roles: Arc::new(RoleCatalog::new()),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -2847,6 +2850,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            roles: self.roles.clone(),
         })
     }
 }
@@ -6319,6 +6323,18 @@ impl Index {
 mod tests {
     use super::*;
     use crate::alloc::vec;
+
+    #[test]
+    fn schema_starts_with_the_superuser_role_and_clones_keep_its_roles() {
+        let schema = Schema::new();
+
+        let clone = schema.try_clone().unwrap();
+
+        assert!(schema
+            .roles
+            .is_superuser(crate::security::roles::RoleId::SUPERUSER));
+        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
+    }
 
     #[test]
     fn test_column_definition_flag_conversion() {
