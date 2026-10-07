@@ -1005,3 +1005,104 @@ pub(crate) fn emit_trigger_decode_registers(
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
 }
+
+/// A comparison of a column of a `pg_` date or time type with a literal that
+/// is the text of a stored value. The stored integers have the order of the
+/// texts, so the comparison reads the stored integer and does not DECODE it.
+pub(super) struct StoredTemporalComparison<'a> {
+    column: &'a ast::Expr,
+    op: ast::Operator,
+    key: i64,
+}
+
+pub(super) fn stored_temporal_comparison<'a>(
+    e1: &'a ast::Expr,
+    op: &ast::Operator,
+    e2: &'a ast::Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Option<StoredTemporalComparison<'a>> {
+    let (column, literal, op) = match (e1, e2) {
+        (ast::Expr::Column { .. }, ast::Expr::Literal(ast::Literal::String(text))) => {
+            (e1, text, *op)
+        }
+        (ast::Expr::Literal(ast::Literal::String(text)), ast::Expr::Column { .. }) => {
+            (e2, text, operator_with_swapped_operands(op)?)
+        }
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        ast::Operator::Equals
+            | ast::Operator::NotEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+    ) || resolver.resolve_cached_expr_reg(column).is_some()
+    {
+        return None;
+    }
+    let (table_column, is_strict) = operand_column(column, Some(referenced_tables), None)?;
+    if table_column.is_virtual_generated() || table_column.collation() != CollationSeq::Binary {
+        return None;
+    }
+    let kind = resolver
+        .schema()
+        .get_type_def(&table_column.ty_str, is_strict)?
+        .pg_storage_type()?
+        .temporal()?;
+    let key =
+        crate::functions::pg_types::parse_canonical_temporal(kind, &sanitize_string(literal))?;
+    Some(StoredTemporalComparison { column, op, key })
+}
+
+fn operator_with_swapped_operands(op: &ast::Operator) -> Option<ast::Operator> {
+    Some(match op {
+        ast::Operator::Less => ast::Operator::Greater,
+        ast::Operator::LessEquals => ast::Operator::GreaterEquals,
+        ast::Operator::Greater => ast::Operator::Less,
+        ast::Operator::GreaterEquals => ast::Operator::LessEquals,
+        ast::Operator::Equals | ast::Operator::NotEquals => *op,
+        _ => return None,
+    })
+}
+
+pub(super) fn emit_stored_temporal_comparison(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    comparison: &StoredTemporalComparison,
+    condition_metadata: ConditionMetadata,
+    resolver: &Resolver,
+) -> Result<()> {
+    let stored_reg = program.alloc_register();
+    let decodes = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(true);
+    let translated = translate_expr(
+        program,
+        Some(referenced_tables),
+        comparison.column,
+        stored_reg,
+        resolver,
+    );
+    program.flags.set_suppress_custom_type_decode(decodes);
+    translated?;
+    program.reset_collation();
+    let key_reg = program.alloc_register();
+    program.emit_int(comparison.key, key_reg);
+    program.mark_last_insn_constant();
+    let integer = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+    let result_reg = program.alloc_register();
+    emit_binary_condition_insn(
+        program,
+        &comparison.op,
+        stored_reg,
+        key_reg,
+        result_reg,
+        &integer,
+        &integer,
+        Some(referenced_tables),
+        condition_metadata,
+        Some(resolver),
+    )
+}

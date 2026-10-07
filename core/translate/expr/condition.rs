@@ -481,7 +481,17 @@ fn translate_leaf_condition_expr(
         ast::Expr::Binary(e1, op, e2) => {
             // Check if either operand has a custom type with a matching operator
             let decoded_self_table = resolver.decoded_self_table();
-            if let Some(resolved) = find_custom_type_operator(
+            if let Some(comparison) =
+                stored_temporal_comparison(e1, op, e2, referenced_tables, resolver)
+            {
+                emit_stored_temporal_comparison(
+                    program,
+                    referenced_tables,
+                    &comparison,
+                    condition_metadata,
+                    resolver,
+                )?;
+            } else if let Some(resolved) = find_custom_type_operator(
                 e1,
                 e2,
                 op,
