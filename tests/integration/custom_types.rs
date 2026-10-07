@@ -776,31 +776,6 @@ mod tests {
         assert_eq!(rows, vec![(1, "2.50".to_string())]);
     }
 
-    /// Run `sql` with SQLite on a file that Turso wrote. SQLite expects an
-    /// automatic index for the PRIMARY KEY of the types table, which Turso
-    /// does not create, so the table SQL has no PRIMARY KEY during the edit.
-    fn edit_with_sqlite(path: &std::path::Path, sql: &str) {
-        const TYPES_TABLE_SQL: &str =
-            "CREATE TABLE __turso_internal_types(name TEXT PRIMARY KEY, sql TEXT)";
-        let set_types_table_sql = |sql: &str| {
-            format!("UPDATE sqlite_master SET sql = '{sql}' WHERE name = '__turso_internal_types';")
-        };
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch(&format!(
-                "PRAGMA writable_schema = ON; {}",
-                set_types_table_sql("CREATE TABLE __turso_internal_types(name TEXT, sql TEXT)")
-            ))
-            .unwrap();
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch(&format!(
-                "PRAGMA writable_schema = ON; {sql}; {}",
-                set_types_table_sql(TYPES_TABLE_SQL)
-            ))
-            .unwrap();
-    }
-
     /// A column type that does not resolve to a primitive type: the stored
     /// values have no meaning for this binary.
     #[test]
@@ -828,7 +803,7 @@ mod tests {
                  CREATE TABLE x(id INTEGER PRIMARY KEY, a d) STRICT;
                  INSERT INTO x VALUES (1, 5);",
             );
-            edit_with_sqlite(&path, change);
+            edit_schema(&path, change);
             let Err(err) = open_file(&path, true) else {
                 panic!("the open must fail: {change}");
             };
@@ -848,7 +823,7 @@ mod tests {
              CREATE DOMAIN z_used AS INTEGER CHECK (value > 0);
              CREATE TABLE x(id INTEGER PRIMARY KEY, a z_used) STRICT;",
         );
-        edit_with_sqlite(
+        edit_schema(
             &path,
             "UPDATE __turso_internal_types SET sql = 'CREATE DOMAIN a_unused AS' WHERE name = 'a_unused'",
         );
@@ -858,6 +833,16 @@ mod tests {
             .err()
             .display_string()
             .contains("CHECK constraint failed");
+    }
+
+    fn edit_schema(path: &std::path::Path, sql: &str) {
+        let db = open_file(path, true).unwrap();
+        let conn = db.connect().unwrap();
+        conn.start_nested();
+        let stmt = conn.prepare(sql);
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+        conn.close().unwrap();
     }
 
     #[test]

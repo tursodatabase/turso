@@ -89,30 +89,33 @@ fn test_integrity_check_strict_custom_types() {
     }
 
     // Without custom types the stored values have no meaning, so the open
-    // fails. Write a value of the wrong type with SQLite instead, while the
-    // table SQL is not STRICT.
-    let sqlite = rusqlite::Connection::open(&path).unwrap();
-    sqlite
-        .execute_batch(
-            "PRAGMA writable_schema = ON;
-             UPDATE sqlite_master SET sql = 'CREATE TABLE t(amount)' WHERE name = 't';",
-        )
-        .unwrap();
-    drop(sqlite);
-    let sqlite = rusqlite::Connection::open(&path).unwrap();
-    sqlite
-        .execute_batch(
-            "UPDATE t SET amount = 'abc';
-             PRAGMA writable_schema = ON;
-             UPDATE sqlite_master SET sql = 'CREATE TABLE t (amount cents) STRICT' WHERE name = 't';",
-        )
-        .unwrap();
-    drop(sqlite);
+    // fails. Write a value of the wrong type while the table SQL is not STRICT.
+    store_table_sql(&path, opts, "CREATE TABLE t(amount)");
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("UPDATE t SET amount = 'abc'").unwrap();
+        conn.close().unwrap();
+    }
+    store_table_sql(&path, opts, "CREATE TABLE t (amount cents) STRICT");
 
     let db = TempDatabase::new_with_existent_with_opts(&path, opts);
     let conn = db.connect_limbo();
     assert_eq!(run_integrity_check(&conn), "non-INTEGER value in t.amount");
     assert_eq!(run_quick_check(&conn), "non-INTEGER value in t.amount");
+    conn.close().unwrap();
+}
+
+fn store_table_sql(path: &std::path::Path, opts: turso_core::DatabaseOpts, sql: &str) {
+    let db = TempDatabase::new_with_existent_with_opts(path, opts);
+    let conn = db.connect_limbo();
+    conn.start_nested();
+    let stmt = conn.prepare(format!(
+        "UPDATE sqlite_schema SET sql = '{}' WHERE name = 't'",
+        sql.replace('\'', "''")
+    ));
+    conn.end_nested();
+    stmt.unwrap().run_ignore_rows().unwrap();
     conn.close().unwrap();
 }
 
