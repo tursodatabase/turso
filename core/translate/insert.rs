@@ -1915,24 +1915,13 @@ fn emit_notnulls(
         // a DECODE expression, decode the encoded value into a temp register
         // and check the *decoded* value. This prevents "ghost NULLs" where
         // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let check_reg = if crate::translate::expr::column_decodes(
+        let check_reg = crate::translate::expr::emit_decoded_column_register(
+            program,
+            column_mapping.register,
             column_mapping.column,
             ctx.table.is_strict,
             resolver,
-        )? {
-            let decoded_reg = program.alloc_register();
-            crate::translate::expr::emit_user_facing_column_value(
-                program,
-                column_mapping.register,
-                decoded_reg,
-                column_mapping.column,
-                ctx.table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            column_mapping.register
-        };
+        )?;
 
         // For IGNORE, skip to the next row if NULL
         if on_ignore {

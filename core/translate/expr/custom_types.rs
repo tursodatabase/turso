@@ -728,12 +728,8 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() || !(reads_every_column || read_columns.contains(&i)) {
             continue;
         }
-        if column_decodes(col, is_strict, resolver)? {
-            let src_reg = column_regs[i];
-            let tmp = program.alloc_register();
-            emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-            column_regs[i] = tmp;
-        }
+        column_regs[i] =
+            emit_decoded_column_register(program, column_regs[i], col, is_strict, resolver)?;
     }
 
     let pairs = columns.iter().zip(column_regs.iter().copied());
@@ -798,8 +794,8 @@ impl IndexExprKind {
 /// expects to see.
 ///
 /// Every code path that surfaces a stored column value to the user — SELECT,
-/// RETURNING, trigger OLD/NEW — should go through this function so decode
-/// logic lives in one place.
+/// RETURNING, trigger OLD/NEW — goes through this function or
+/// `emit_decoded_column_register`, so decode logic lives in one place.
 pub(crate) fn emit_user_facing_column_value(
     program: &mut ProgramBuilder,
     source_reg: usize,
@@ -829,26 +825,10 @@ pub(crate) fn emit_column_decode_in_place(
     is_strict: bool,
     resolver: &Resolver,
 ) -> Result<()> {
-    if column.is_array() {
-        return Ok(());
-    }
-    let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) else {
+    let Some(resolved) = resolve_scalar_column_type(column, is_strict, resolver)? else {
         return Ok(());
     };
-    let decodes: smallvec::SmallVec<[_; 2]> = chain_decodes(&resolved).collect();
-    if decodes.is_empty() {
-        return Ok(());
-    }
-    let skip_label = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: skip_label,
-    });
-    for (td, decode_expr) in decodes {
-        emit_type_expr(program, decode_expr, reg, reg, column, td, resolver)?;
-    }
-    program.preassign_label_to_next_insn(skip_label);
-    Ok(())
+    emit_chain_decodes(program, reg, column, &resolved, resolver)
 }
 
 /// Emit domain constraint checks for CAST(expr AS domain).
@@ -993,39 +973,73 @@ pub(crate) fn emit_trigger_decode_registers(
     columns
         .iter()
         .enumerate()
-        .map(|(i, col)| -> Result<usize> {
-            if !column_decodes(col, is_strict, resolver)? {
-                return Ok(source_regs(i));
-            }
-            let decoded_reg = program.alloc_register();
-            emit_user_facing_column_value(
-                program,
-                source_regs(i),
-                decoded_reg,
-                col,
-                is_strict,
-                resolver,
-            )?;
-            Ok(decoded_reg)
+        .map(|(i, col)| {
+            emit_decoded_column_register(program, source_regs(i), col, is_strict, resolver)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
 }
 
-/// True when a read of `column` runs a DECODE of its type chain, so the
-/// value that it shows can differ from the stored value.
-pub(crate) fn column_decodes(
+/// The register with the value that a read of `column` shows: `source_reg`
+/// when no DECODE of the type chain changes the stored value, else a new
+/// register with the decoded value.
+pub(crate) fn emit_decoded_column_register(
+    program: &mut ProgramBuilder,
+    source_reg: usize,
     column: &Column,
     is_strict: bool,
     resolver: &Resolver,
-) -> Result<bool> {
-    if column.is_array() {
-        return Ok(false);
+) -> Result<usize> {
+    let Some(resolved) = resolve_scalar_column_type(column, is_strict, resolver)? else {
+        return Ok(source_reg);
+    };
+    if chain_decodes(&resolved).next().is_none() {
+        return Ok(source_reg);
     }
-    Ok(resolver
-        .schema()
-        .resolve_type(&column.ty_str, is_strict)?
-        .is_some_and(|resolved| chain_decodes(&resolved).next().is_some()))
+    let decoded_reg = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: source_reg,
+        dst_reg: decoded_reg,
+        extra_amount: 0,
+    });
+    emit_chain_decodes(program, decoded_reg, column, &resolved, resolver)?;
+    Ok(decoded_reg)
+}
+
+/// An array column keeps its record blob: ArrayDecode is emitted at display
+/// time (ResultRow) so that functions and subscripts see raw blobs.
+fn resolve_scalar_column_type(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    if column.is_array() {
+        return Ok(None);
+    }
+    resolver.schema().resolve_type(&column.ty_str, is_strict)
+}
+
+fn emit_chain_decodes(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    column: &Column,
+    resolved: &ResolvedType,
+    resolver: &Resolver,
+) -> Result<()> {
+    let decodes: smallvec::SmallVec<[_; 2]> = chain_decodes(resolved).collect();
+    if decodes.is_empty() {
+        return Ok(());
+    }
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    for (td, decode_expr) in decodes {
+        emit_type_expr(program, decode_expr, reg, reg, column, td, resolver)?;
+    }
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
 }
 
 /// The DECODE expressions of a type chain in the order that they run: the
