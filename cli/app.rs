@@ -2026,7 +2026,18 @@ impl Limbo {
         match v {
             Value::Null => out.write_all(b"NULL"),
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
-            Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
+            Value::Numeric(Numeric::Float(f)) => {
+                let value = f64::from(*f);
+                if value.is_infinite() {
+                    out.write_all(if value.is_sign_negative() {
+                        b"-9.0e+999".as_slice()
+                    } else {
+                        b"9.0e+999".as_slice()
+                    })
+                } else {
+                    out.write_all(format!("{value:?}").as_bytes())
+                }
+            }
             Value::Text(s) => {
                 out.write_all(b"'")?;
                 let bytes = s.value.as_bytes();
@@ -2419,6 +2430,51 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_core::NonNan;
+
+    fn dumped(value: &Value) -> String {
+        let mut out = Vec::new();
+        Limbo::write_sql_value_from_value(&mut out, value).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn real(value: f64) -> Value {
+        Value::Numeric(Numeric::Float(NonNan::new(value).unwrap()))
+    }
+
+    #[test]
+    fn test_dump_real_keeps_decimal_point() {
+        assert_eq!(dumped(&real(5.0)), "5.0");
+        assert_eq!(dumped(&real(-7.0)), "-7.0");
+        assert_eq!(dumped(&real(0.0)), "0.0");
+        assert_eq!(dumped(&real(2.5)), "2.5");
+        assert_eq!(dumped(&real(1e20)), "1e20");
+        assert_eq!(dumped(&Value::Numeric(Numeric::Integer(5))), "5");
+    }
+
+    #[test]
+    fn test_dump_real_round_trips() {
+        for value in [
+            7.761117632285041e178,
+            1.0e-300,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            355.0 / 113.0,
+        ] {
+            let text = dumped(&real(value));
+            assert_eq!(
+                text.parse::<f64>().unwrap().to_bits(),
+                value.to_bits(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dump_real_infinite() {
+        assert_eq!(dumped(&real(f64::INFINITY)), "9.0e+999");
+        assert_eq!(dumped(&real(f64::NEG_INFINITY)), "-9.0e+999");
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
