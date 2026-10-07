@@ -3077,7 +3077,7 @@ fn builtin_type(name: &str) -> Option<Arc<TypeDef>> {
 fn refuse_table_that_needs_custom_types(table: &BTreeTable) -> Result<()> {
     if table.is_pg_storage {
         return Err(LimboError::ParseError(format!(
-            "table {} was created by the PostgreSQL frontend: open the database with tursopg or enable custom types",
+            "table {} has the table option PGSTORAGE, which needs custom types: enable custom types or open the database with tursopg",
             table.name
         )));
     }

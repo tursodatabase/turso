@@ -767,7 +767,7 @@ mod tests {
         let Err(err) = open_file(&path, false) else {
             panic!("a table of the PostgreSQL frontend needs custom types");
         };
-        assert_that!(err.to_string()).contains("table t was created by the PostgreSQL frontend");
+        assert_that!(err.to_string()).contains("table t has the table option PGSTORAGE");
 
         let db = open_file(&path, true).unwrap();
         let conn = db.connect().unwrap();
@@ -909,7 +909,7 @@ mod tests {
             for (sql, error) in [
                 (
                     "CREATE TABLE p(id INTEGER PRIMARY KEY, a TEXT) STRICT, PGSTORAGE",
-                    "table p was created by the PostgreSQL frontend",
+                    "table p has the table option PGSTORAGE",
                 ),
                 (
                     "CREATE TABLE u(id INTEGER PRIMARY KEY, b uuid) STRICT",
@@ -1077,7 +1077,7 @@ mod tests {
         assert_that!(conn.execute(format!("ATTACH '{}' AS a", attached.display())))
             .err()
             .display_string()
-            .contains("table p was created by the PostgreSQL frontend");
+            .contains("table p has the table option PGSTORAGE");
     }
 
     /// A column whose types DECODE only to the stored value reads like a
