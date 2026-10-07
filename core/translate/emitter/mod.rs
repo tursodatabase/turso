@@ -447,7 +447,7 @@ impl<'a> Resolver<'a> {
     pub(crate) fn with_index_expression<T>(&self, f: impl FnOnce() -> T) -> T {
         let previous = self
             .numeric_comparisons
-            .replace(NumericComparisons::OfIndexKeys);
+            .replace(NumericComparisons::AsOlderVersions);
         let result = f();
         self.numeric_comparisons.set(previous);
         result

@@ -793,3 +793,98 @@ fn casts_compare_with_the_text_of_base_file_columns() {
         assert_eq!(rows(&conn, sql), expected, "{sql}");
     }
 }
+
+#[test]
+fn covering_numeric_expression_indexes_of_base_file_give_the_rows_of_a_scan() {
+    let dir = copy_fixtures(&["pg_v1_numeric_comparison_index.db"]);
+    let db = open(dir.path().join("pg_v1_numeric_comparison_index.db"), false);
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO p VALUES (4, 'd', 1, 10, 20)")
+        .unwrap();
+    for (sql, expected) in [
+        ("SELECT max(price - cost > 0) FROM p", vec!["1"]),
+        (
+            "SELECT id, price - cost > 0 FROM p ORDER BY price - cost > 0, id",
+            vec!["1|0", "4|0", "2|1", "3|1"],
+        ),
+        (
+            "SELECT price = 1.005 FROM p ORDER BY price = 1.005",
+            vec!["0", "0", "0", "0"],
+        ),
+        (
+            "SELECT DISTINCT price * 2 > 15 FROM p ORDER BY 1",
+            vec!["0", "1"],
+        ),
+        (
+            "SELECT price - cost > 0, count(*) FROM p GROUP BY price - cost > 0",
+            vec!["0|2", "1|2"],
+        ),
+    ] {
+        assert_eq!(rows(&conn, sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn covering_numeric_expression_indexes_of_sqlite_dialect_base_file_give_the_rows_of_a_scan() {
+    let file = "sqlite_v1_numeric_comparison_index.db";
+    let dir = copy_fixtures(&[file]);
+    let db = open_with_sqlite_dialect(&dir.path().join(file)).unwrap();
+    let conn = db.connect().unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT val > -1 FROM v ORDER BY val > -1",
+            vec!["0", "1", "1"],
+        ),
+        (
+            "SELECT val + other > 4, count(*) FROM v GROUP BY val + other > 4",
+            vec!["0|1", "1|2"],
+        ),
+        ("SELECT min(val > -1), max(val > -1) FROM v", vec!["0|1"]),
+    ] {
+        assert_eq!(core_rows(&conn, sql), expected, "{sql}");
+        let not_indexed = sql.replacen("FROM v", "FROM v NOT INDEXED", 1);
+        assert_eq!(core_rows(&conn, &not_indexed), expected, "{not_indexed}");
+    }
+}
+
+/// The new tables store numeric(p,s) with p above 18 with the type of older
+/// versions. Index keys compute their comparisons with the rules of older
+/// versions, so an index whose keys differ from the values of queries is
+/// refused.
+#[test]
+fn new_index_on_a_wide_numeric_refuses_keys_that_queries_compute_in_another_way() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE q (id int PRIMARY KEY, a numeric(30,2), b numeric(30,2), name text)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO q VALUES (1, 5, 10, 'a'), (2, 50, 10, 'a'), (3, -5, 0, 'a')")
+        .unwrap();
+    for sql in [
+        "CREATE INDEX q_margin ON q ((a - b > 0))",
+        "CREATE INDEX q_negative ON q ((a > -1))",
+        "CREATE UNIQUE INDEX q_positive ON q (name) WHERE a > -1",
+        "CREATE INDEX q_frac ON q (id) WHERE a = 1.005",
+    ] {
+        let err = conn.execute(sql).unwrap_err().to_string();
+        assert!(
+            err.contains("with the numeric rules of older versions"),
+            "{sql}: {err}"
+        );
+    }
+    conn.execute("CREATE INDEX q_big ON q (id) WHERE a > 1")
+        .unwrap();
+    conn.execute("CREATE INDEX q_shift ON q ((a + -1))")
+        .unwrap();
+    conn.execute("INSERT INTO q VALUES (4, -1.5, 0, 'b'), (5, 2, 0, 'b')")
+        .unwrap();
+    conn.execute("UPDATE q SET a = a").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id FROM q WHERE a > 1 ORDER BY id"),
+        ["1", "2", "5"]
+    );
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+    conn.execute("DELETE FROM q WHERE id > 0").unwrap();
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+}

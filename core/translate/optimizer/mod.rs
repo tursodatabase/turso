@@ -23,7 +23,8 @@ use crate::{
     },
     translate::{
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+            computes_like_index_keys, expr_references_any_subquery, expr_references_outer_query,
+            expression_can_fail_on_input,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -2035,6 +2036,7 @@ fn optimize_table_access_with_custom_modules(
 /// table cursor entirely. Recording them upfront lets both the cost model
 /// and covering checks reuse the same facts.
 fn register_index_expression_usages_for_plan(
+    schema: &Schema,
     table_references: &mut TableReferences,
     result_columns: &[ResultSetColumn],
     order_by: &[(
@@ -2047,24 +2049,17 @@ fn register_index_expression_usages_for_plan(
 ) {
     table_references.reset_expression_index_usages();
 
-    for rc in result_columns {
-        table_references.register_expression_index_usage(&rc.expr);
-    }
-    for (expr, _, _) in order_by {
-        table_references.register_expression_index_usage(expr);
-    }
-    for where_term in where_clause {
-        table_references.register_expression_index_usage(&where_term.expr);
-    }
-
-    if let Some(group_by) = group_by {
-        for expr in &group_by.exprs {
+    let having = group_by.and_then(|group_by| group_by.having.as_deref());
+    let exprs = result_columns
+        .iter()
+        .map(|rc| &rc.expr)
+        .chain(order_by.iter().map(|(expr, _, _)| expr.as_ref()))
+        .chain(where_clause.iter().map(|where_term| &where_term.expr))
+        .chain(group_by.iter().flat_map(|group_by| group_by.exprs.iter()))
+        .chain(having.into_iter().flatten());
+    for expr in exprs {
+        if computes_like_index_keys(expr, Some(table_references), schema, None) {
             table_references.register_expression_index_usage(expr);
-        }
-        if let Some(having) = &group_by.having {
-            for expr in having {
-                table_references.register_expression_index_usage(expr);
-            }
         }
     }
 }
@@ -2483,6 +2478,7 @@ fn find_table_access_plan(
 
     if has_expression_idx_or_partial_idx {
         register_index_expression_usages_for_plan(
+            schema,
             table_references,
             result_columns,
             order_by.as_slice(),

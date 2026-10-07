@@ -423,6 +423,24 @@ expect {
     2|2024-01-05|00:00:00|2024-03-02 00:00:00
 }
 
+test index-on-a-negative-literal-expression-of-a-wide-numeric-keeps-its-keys {
+    CREATE TABLE t (id int PRIMARY KEY, a numeric(30,2));
+    INSERT INTO t VALUES (1, -1.5), (2, 5);
+    CREATE INDEX t_shift ON t ((a + -1));
+    INSERT INTO t VALUES (3, -0.5), (4, 0);
+    UPDATE t SET a = a;
+    SELECT id, a + -1 FROM t ORDER BY id;
+    DELETE FROM t WHERE id > 0;
+    SELECT count(*) FROM t;
+}
+expect {
+    1|-2.50
+    2|4.00
+    3|-1.50
+    4|-1.00
+    0
+}
+
 test date-with-a-year-of-one-or-two-digits-is-refused {
     SELECT '24-01-15'::date;
 }

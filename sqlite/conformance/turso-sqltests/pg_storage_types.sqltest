@@ -1414,3 +1414,70 @@ expect {
     2
     ok
 }
+
+@requires strict "uses STRICT tables"
+test new-v1-numeric-index-refuses-a-comparison-that-older-versions-compute-in-another-way {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(30,2)) STRICT;
+    CREATE INDEX x_negative ON x((val > -1));
+}
+expect error {
+    cannot create index x_negative: index keys compute
+}
+
+@requires strict "uses STRICT tables"
+test new-v1-numeric-partial-index-refuses-a-literal-with-more-digits-than-the-scale {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(30,2)) STRICT;
+    CREATE INDEX x_frac ON x(id) WHERE val = 1.005;
+}
+expect error {
+    cannot create index x_frac
+}
+
+@requires strict "uses STRICT tables"
+test new-v1-numeric-partial-index-refuses-a-comparison-with-arithmetic {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, a numeric(30,2), b numeric(30,2)) STRICT;
+    CREATE INDEX x_margin ON x((a - b > 0));
+}
+expect error {
+    cannot create index x_margin
+}
+
+@requires strict "uses STRICT tables"
+test new-v1-numeric-index-with-an-exact-literal-gives-the-rows-of-a-scan {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(30,2)) STRICT;
+    INSERT INTO x VALUES (1, -5), (2, 5), (3, 50), (4, 1.5);
+    CREATE INDEX x_positive ON x(id) WHERE val > 1;
+    CREATE INDEX x_half ON x((val = '1.50'));
+    CREATE INDEX x_above_minus_two ON x(id) WHERE val > '-2';
+    INSERT INTO x VALUES (5, -2), (6, 1.5);
+    SELECT group_concat(id) FROM (SELECT id FROM x WHERE val > 1 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM x NOT INDEXED WHERE val > 1 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM x WHERE val = '1.50' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM x WHERE val > '-2' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM x NOT INDEXED WHERE val > '-2' ORDER BY id);
+    PRAGMA integrity_check;
+}
+expect {
+    2,3,4,6
+    2,3,4,6
+    4,6
+    2,3,4,6
+    2,3,4,6
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test negative-literal-in-an-index-expression-gives-the-same-keys-to-create-index-and-dml {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(30,2)) STRICT;
+    INSERT INTO x VALUES (1, -1.5), (2, 5);
+    CREATE INDEX x_shift ON x((val + -1));
+    INSERT INTO x VALUES (3, -0.5);
+    PRAGMA integrity_check;
+    UPDATE x SET val = val;
+    DELETE FROM x WHERE id > 0;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+    ok
+}

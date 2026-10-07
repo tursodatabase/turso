@@ -180,11 +180,24 @@ is an error only when a row gets to the comparison. A range seek can also
 skip the bound that is not a number, as in `n > 'abc' AND n <= -1000`.
 
 An expression index and the WHERE clause of a partial index on a numeric
-column of an older table, or of a numeric without a precision of at most 18,
+column of an older table, or of a numeric with a precision above 18,
 compare with the rules of older versions, because older versions built the
 existing indexes with them: a literal is rounded to the scale of the column,
 and other operands compare with the standard rules. The planner does not use
-such an index for a query, so queries give the rows of PostgreSQL.
+such an index for a query when the two rules can give different results,
+so queries give the rows of PostgreSQL. For the same reason, CREATE INDEX
+refuses a new index whose expression or WHERE clause on such a column
+compares with a negative literal, a literal with more fraction digits than
+the scale, another column or arithmetic ("with the numeric rules of older
+versions"). PostgreSQL accepts these indexes. A comparison with a literal
+that the column stores exactly, as in `price > 1`, is accepted.
+
+Older versions computed the keys of some numeric expression indexes and
+partial indexes in a different way for the rows that INSERT added after
+CREATE INDEX, so a DELETE or an UPDATE of such a row can fail with "IdxDelete:
+no matching index entry". To repair such an index, drop it and create it
+again. CREATE INDEX refuses an expression whose keys depend on the rules of
+older versions, as the previous paragraph says: such an index stays dropped.
 
 A timestamp, timestamptz, date or time column of a new table compares a
 text operand that looks like a number as a number: `d < '2024'` finds no row.

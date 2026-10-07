@@ -12,8 +12,9 @@ use crate::translate::{
         OperationMode, Resolver,
     },
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, computes_like_index_keys, emit_stored_column,
+        translate_condition_expr, translate_expr, unwrap_parens, walk_expr, walk_expr_mut,
+        BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -94,14 +95,14 @@ pub fn translate_create_index(
         if_not_exists,
         idx_name,
         tbl_name,
-        columns,
-        where_clause,
         with_clause,
         using,
+        ..
     } = stmt
     else {
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
+    let (columns, where_clause) = stored_index_keys(&sql)?;
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
@@ -233,6 +234,9 @@ pub fn translate_create_index(
                 .expect("where expr has to exist in order to fail")
         );
     }
+    if !connection.is_nested_stmt() {
+        refuse_numeric_keys_unlike_queries(&idx, &tbl, resolver)?;
+    }
 
     let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
@@ -307,6 +311,69 @@ pub fn translate_create_index(
     });
 
     Ok(())
+}
+
+/// Later statements read the index from the SQL that the schema stores, so
+/// CREATE INDEX computes the keys from that SQL too. A frontend can give an
+/// AST that this SQL does not give again, for example a negative literal.
+fn stored_index_keys(sql: &str) -> crate::Result<(Vec<SortedColumn>, Option<Box<Expr>>)> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    match parser.next_cmd() {
+        Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateIndex {
+            columns,
+            where_clause,
+            ..
+        }))) => Ok((columns, where_clause)),
+        other => Err(LimboError::InternalError(format!(
+            "the stored SQL of CREATE INDEX does not parse back: {sql}: {other:?}"
+        ))),
+    }
+}
+
+/// The keys of an index compare `numeric` values with the rules of older
+/// versions, and queries compare them as decimals. A new index must not
+/// depend on the difference: a query would read other rows or values with
+/// the index than without it.
+fn refuse_numeric_keys_unlike_queries(
+    idx: &Index,
+    tbl: &BTreeTable,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    for expr in index_expressions(idx) {
+        let mut bound = expr.clone();
+        bind_table_columns(&mut bound, tbl);
+        if !computes_like_index_keys(&bound, None, resolver.schema(), Some(tbl)) {
+            bail_parse_error!(
+                "cannot create index {}: index keys compute {expr} with the numeric rules of older versions, and queries compute it with other rules",
+                idx.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn index_expressions(idx: &Index) -> impl Iterator<Item = &Expr> {
+    idx.columns
+        .iter()
+        .filter_map(|column| column.expr.as_deref())
+        .chain(idx.where_clause.as_deref())
+}
+
+fn bind_table_columns(expr: &mut Expr, tbl: &BTreeTable) {
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> crate::Result<WalkControl> {
+        if let Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) = e {
+            if let Some((column, col)) = tbl.get_column(&normalize_ident(name.as_str())) {
+                *e = Expr::Column {
+                    database: None,
+                    table: ast::TableInternalId::SELF_TABLE,
+                    column,
+                    is_rowid_alias: col.is_rowid_alias(),
+                };
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("the walk callback returns no error");
 }
 
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.

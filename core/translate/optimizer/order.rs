@@ -4,6 +4,7 @@ use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
+        expr::computes_like_index_keys,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
@@ -783,6 +784,7 @@ fn target_matches_order_column(
     target_col: &ColumnOrder,
     idx_col: IndexOrderColumn<'_>,
     table_ref: &JoinedTable,
+    schema: &Schema,
 ) -> bool {
     if target_col.table_id != table_ref.internal_id {
         return false;
@@ -791,6 +793,10 @@ fn target_matches_order_column(
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
+            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
+            if !computes_like_index_keys(target_expr, Some(&refs), schema, None) {
+                return false;
+            }
             if exprs_are_equivalent(target_expr, idx_expr) {
                 return true;
             }
@@ -798,7 +804,6 @@ fn target_matches_order_column(
             // was stored in the schema. A query may write the same expression in
             // a slightly different but equivalent way, so normalize before the
             // final comparison.
-            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
             let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
             exprs_are_equivalent(&normalized, idx_expr)
         }
@@ -1006,7 +1011,7 @@ fn index_columns_order_consumed<'a>(
                 })
         });
         if eq_prefix_usable {
-            if target_matches_order_column(target_col, idx_col, table_ref) {
+            if target_matches_order_column(target_col, idx_col, table_ref, schema) {
                 if target_col.collation != idx_col.collation.unwrap_or_default() {
                     break;
                 }
@@ -1016,7 +1021,7 @@ fn index_columns_order_consumed<'a>(
             continue;
         }
 
-        if !target_matches_order_column(target_col, idx_col, table_ref) {
+        if !target_matches_order_column(target_col, idx_col, table_ref, schema) {
             break;
         }
 

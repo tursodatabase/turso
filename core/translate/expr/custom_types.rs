@@ -239,18 +239,129 @@ pub(crate) fn comparison_calls_type_function(
     .is_some()
 }
 
+/// The keys of indexes compare `numeric` values with the rules of older
+/// versions. An index key is the value that a query computes for its
+/// expression only when both rules give the same result for every operator
+/// of the expression.
+pub(crate) fn computes_like_index_keys(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    schema: &Schema,
+    decoded_self_table: Option<&BTreeTable>,
+) -> bool {
+    let same_operator = |lhs: &ast::Expr, op: &ast::Operator, rhs: &ast::Expr| {
+        let resolve = |rules| {
+            find_custom_type_operator(
+                lhs,
+                rhs,
+                op,
+                referenced_tables,
+                schema,
+                decoded_self_table,
+                rules,
+            )
+        };
+        match (
+            resolve(NumericComparisons::Decimal),
+            resolve(NumericComparisons::AsOlderVersions),
+        ) {
+            (None, None) => true,
+            (Some(decimal), Some(older)) => {
+                decimal.func_name == older.func_name
+                    && decimal.swap_args == older.swap_args
+                    && decimal.negate == older.negate
+                    && match (&decimal.encode_info, &older.encode_info) {
+                        (None, None) | (Some(_), Some(_)) => true,
+                        (None, Some(encode)) => {
+                            let literal = match encode.which {
+                                EncodeArg::First => lhs,
+                                EncodeArg::Second => rhs,
+                            };
+                            numeric_encode_keeps_value(literal, &encode.column)
+                        }
+                        (Some(_), None) => false,
+                    }
+            }
+            _ => false,
+        }
+    };
+    let mut same = true;
+    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        same = same
+            && match expr {
+                ast::Expr::Binary(lhs, op, rhs) => same_operator(lhs, op, rhs),
+                ast::Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    same_operator(lhs, &ast::Operator::GreaterEquals, start)
+                        && same_operator(lhs, &ast::Operator::LessEquals, end)
+                }
+                _ => true,
+            };
+        Ok(if same {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    })
+    .expect("the walk callback returns no error");
+    same
+}
+
+/// Older versions ENCODE a literal before they compare it with a `numeric`
+/// column. The comparison gives the same result as a comparison of decimals
+/// when the ENCODE keeps the value of the literal.
+fn numeric_encode_keeps_value(literal: &ast::Expr, column: &Column) -> bool {
+    let [precision, scale] = column.ty_params.as_slice() else {
+        return false;
+    };
+    let (Some(precision), Some(scale)) = (
+        crate::schema::integer_literal(precision),
+        crate::schema::integer_literal(scale),
+    ) else {
+        return false;
+    };
+    let text = match literal {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => match text.parse::<i64>() {
+            Ok(integer) => integer.to_string(),
+            Err(_) => match text.parse::<f64>() {
+                Ok(real) => real.to_string(),
+                Err(_) => return false,
+            },
+        },
+        ast::Expr::Literal(ast::Literal::String(text)) => text.trim_matches('\'').to_string(),
+        _ => return false,
+    };
+    let unsigned = text.strip_prefix('-').unwrap_or(&text);
+    let is_plain_decimal = match unsigned.split_once('.') {
+        Some((whole, fraction)) => is_digits(whole) && is_digits(fraction),
+        None => is_digits(unsigned),
+    };
+    if !is_plain_decimal {
+        return false;
+    }
+    let Ok(value) = <bigdecimal::BigDecimal as std::str::FromStr>::from_str(&text) else {
+        return false;
+    };
+    crate::numeric::decimal::validate_precision_scale(&value, precision, scale)
+        .is_ok_and(|encoded| encoded == value)
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// How a comparison with a value of the built-in `numeric` type reads the
 /// other operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NumericComparisons {
-    /// As a decimal value, as PostgreSQL does.
     Decimal,
     /// As older versions did: a literal is ENCODEd, and any other operand
     /// compares with the standard rules. Older versions computed the keys
     /// and the WHERE clauses of indexes with these rules, so the keys of an
     /// index must use them. `pg_numeric` is newer and always compares
     /// decimals.
-    OfIndexKeys,
+    AsOlderVersions,
 }
 
 /// Find a custom type operator function for a binary expression.
