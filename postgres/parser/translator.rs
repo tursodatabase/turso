@@ -341,8 +341,18 @@ impl PostgreSQLTranslator {
                         _ => {}
                     }
                 }
+                Node::TableLikeClause(_) => {
+                    return Err(ParseError::ParseError(
+                        "CREATE TABLE ... (LIKE ...) is not supported".into(),
+                    ));
+                }
                 _ => {}
             }
+        }
+        if columns.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE TABLE with no columns is not yet supported".into(),
+            ));
         }
 
         let stmt = ast::Stmt::CreateTable {
@@ -6948,6 +6958,33 @@ mod tests {
             err.to_string().contains("not supported"),
             "expected unsupported error, got: {err}"
         );
+    }
+
+    #[test]
+    fn create_table_like_and_tables_without_columns_are_not_supported() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, error) in [
+            (
+                "CREATE TABLE copy (LIKE src)",
+                "CREATE TABLE ... (LIKE ...) is not supported",
+            ),
+            (
+                "CREATE TABLE copy (LIKE src INCLUDING ALL)",
+                "CREATE TABLE ... (LIKE ...) is not supported",
+            ),
+            (
+                "CREATE TABLE copy (extra int, LIKE src)",
+                "CREATE TABLE ... (LIKE ...) is not supported",
+            ),
+            (
+                "CREATE TABLE empty (CHECK (true))",
+                "CREATE TABLE with no columns is not yet supported",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert!(err.to_string().contains(error), "{sql}: {err}");
+        }
     }
 
     #[test]
