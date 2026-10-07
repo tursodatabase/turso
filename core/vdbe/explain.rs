@@ -700,7 +700,7 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!(
-                    "if cursor {} record is not short of field {} goto {}",
+                    "if cursor {} record is not too short for field {} goto {}",
                     cursor_id, column, target_pc.as_debug_int()
                 ),
             ),

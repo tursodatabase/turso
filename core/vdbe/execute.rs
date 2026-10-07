@@ -2587,7 +2587,14 @@ pub fn op_column_has_field(
                 && return_if_io!(state, cursor.record())
                     .is_some_and(|record| record.column_count() <= *column)
         }
-        _ => false,
+        Cursor::NullRow => false,
+        other @ (Cursor::IndexMethod(_)
+        | Cursor::Pseudo(_)
+        | Cursor::Sorter(_)
+        | Cursor::Virtual(_)
+        | Cursor::MaterializedView(_)) => {
+            unreachable!("ColumnHasField reads only table b-tree cursors, not {other:?}")
+        }
     };
 
     if record_is_short {
