@@ -1664,6 +1664,7 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     tx_entry: Option<TxEntry<'static, A>>,
     mvcc_store: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
+    owns_connection_tx: bool,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
     /// Threaded through so that `finish_committed_tx` can clear the matching
     /// connection-level mv_tx slot atomically with `remove_tx`.
@@ -1736,11 +1737,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock, A>,
         tx_id: TxID,
         mvcc_store: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
+        owns_connection_tx: bool,
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
@@ -1785,6 +1788,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             tx_entry,
             mvcc_store,
             connection,
+            owns_connection_tx,
             db_id,
             commit_coordinator,
             pager,
@@ -1881,10 +1885,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.db_id,
                 );
             }
-            self.end_read_tx_for_db();
-            if self.db_id == crate::MAIN_DB_ID {
-                self.connection
-                    .set_tx_state(crate::connection::TransactionState::None);
+            if self.owns_connection_tx {
+                self.end_read_tx_for_db();
+                if self.db_id == crate::MAIN_DB_ID {
+                    self.connection
+                        .set_tx_state(crate::connection::TransactionState::None);
+                }
             }
         }
 
@@ -7011,11 +7017,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         connection: &Arc<Connection>,
         db_id: usize,
     ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
+        self.commit_state_machine(tx_id, connection, db_id, true)
+    }
+
+    pub fn commit_inner_tx(
+        self: &Arc<Self>,
+        tx_id: TxID,
+        connection: &Arc<Connection>,
+        db_id: usize,
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
+        self.commit_state_machine(tx_id, connection, db_id, false)
+    }
+
+    fn commit_state_machine(
+        self: &Arc<Self>,
+        tx_id: TxID,
+        connection: &Arc<Connection>,
+        db_id: usize,
+        owns_connection_tx: bool,
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
             self.clone(),
             connection.clone(),
+            owns_connection_tx,
             db_id,
             self.commit_coordinator.clone(),
             self.global_header.clone(),

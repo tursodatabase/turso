@@ -14899,7 +14899,7 @@ pub fn op_sequence_commit_inner_tx(
                 .into());
             }
         };
-        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+        state.sequence_inner_commit = Some(mv_store.commit_inner_tx(inner_tx_id, &conn, *db)?);
     }
 
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
