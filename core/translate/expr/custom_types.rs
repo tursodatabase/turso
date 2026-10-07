@@ -392,7 +392,6 @@ pub(super) fn find_custom_type_operator(
     numeric_comparisons: NumericComparisons,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let reads_user_value = |type_def: &TypeDef| reads_user_value(type_def, op, numeric_comparisons);
     let lhs_info = expr_custom_type_info(e1, referenced_tables, schema, decoded_self_table);
     let rhs_info = expr_custom_type_info(e2, referenced_tables, schema, decoded_self_table);
 
@@ -413,10 +412,12 @@ pub(super) fn find_custom_type_operator(
             return operator_of(&lhs.type_def, None);
         }
         // A decimal reads a column of another number type as a user value.
-        if reads_user_value(&lhs.type_def) && is_number_type(&rhs.type_def) {
+        if reads_user_value(&lhs.type_def, op, numeric_comparisons) && is_number_type(&rhs.type_def)
+        {
             return operator_of(&lhs.type_def, None);
         }
-        if reads_user_value(&rhs.type_def) && is_number_type(&lhs.type_def) {
+        if reads_user_value(&rhs.type_def, op, numeric_comparisons) && is_number_type(&lhs.type_def)
+        {
             return operator_of(&rhs.type_def, None);
         }
         // Different custom types: fall through to standard operator.
@@ -433,15 +434,18 @@ pub(super) fn find_custom_type_operator(
         };
         if let Some(lit_type) = literal_type_name(other) {
             if literal_compatible_with_value_type(lit_type, column.type_def.value_input_type()) {
-                let encode_info =
-                    literal_encode_info(column, which, reads_user_value(&column.type_def));
+                let encode_info = literal_encode_info(
+                    column,
+                    which,
+                    reads_user_value(&column.type_def, op, numeric_comparisons),
+                );
                 if let Some(resolved) = operator_of(&column.type_def, encode_info) {
                     return Some(resolved);
                 }
             }
         }
         // Case 3: a decimal column reads the other operand as a user value.
-        if reads_user_value(&column.type_def)
+        if reads_user_value(&column.type_def, op, numeric_comparisons)
             && is_user_value(other, referenced_tables, decoded_self_table)
         {
             return operator_of(&column.type_def, None);
@@ -526,10 +530,6 @@ fn is_comparison(op: &ast::Operator) -> bool {
             | ast::Operator::Equals
             | ast::Operator::NotEquals
     )
-}
-
-fn is_numeric_v1(type_def: &TypeDef) -> bool {
-    type_def.is_builtin && type_def.name == "numeric"
 }
 
 fn is_number_type(type_def: &TypeDef) -> bool {
@@ -652,7 +652,7 @@ fn decimal_value(
             type_name:
                 Some(ast::Type {
                     name,
-                    size: Some(ast::TypeSize::TypeSize(..)),
+                    size: Some(size),
                     ..
                 }),
             ..
@@ -660,7 +660,7 @@ fn decimal_value(
             let type_def = schema.get_type_def_unchecked(name)?;
             if type_def.pg_storage_type() == Some(PgStorageType::Numeric) {
                 Some(Decimal::PgNumeric)
-            } else if is_numeric_v1(type_def) {
+            } else if is_numeric_v1(type_def) && matches!(size, ast::TypeSize::TypeSize(..)) {
                 Some(Decimal::Numeric)
             } else {
                 None
@@ -668,6 +668,10 @@ fn decimal_value(
         }
         _ => None,
     }
+}
+
+fn is_numeric_v1(type_def: &TypeDef) -> bool {
+    type_def.is_builtin && type_def.name == "numeric"
 }
 
 /// The operator functions of a built-in type of the PostgreSQL frontend read
@@ -678,9 +682,9 @@ fn decimal_value(
 fn literal_encode_info(
     column: &ExprCustomTypeInfo,
     which: EncodeArg,
-    reads_user_value: bool,
+    operator_reads_user_value: bool,
 ) -> Option<OperatorEncodeInfo> {
-    if column.type_def.is_pg_storage_type() || reads_user_value {
+    if column.type_def.is_pg_storage_type() || operator_reads_user_value {
         return None;
     }
     Some(OperatorEncodeInfo {

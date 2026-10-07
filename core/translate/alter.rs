@@ -1603,8 +1603,8 @@ pub fn translate_alter_table(
                 // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
                 let reads_clock_at_every_read = resolved_type
                     .as_ref()
-                    .and_then(|resolved| resolved.pg_storage_type()?.temporal())
-                    .is_some()
+                    .and_then(|resolved| resolved.pg_storage_type())
+                    .is_some_and(crate::schema::PgStorageType::is_date_or_time)
                     && effective_default.is_some_and(crate::schema::is_pg_clock_word);
                 let needs_nondeterministic_check = reads_clock_at_every_read
                     || column.default.as_ref().is_some_and(|default| {

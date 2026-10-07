@@ -978,6 +978,24 @@ fn new_index_on_a_wide_numeric_refuses_keys_that_queries_compute_in_another_way(
     assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
 }
 
+/// A timestamptz value is stored in UTC and Turso has no time zone setting,
+/// so its cast to time gives the same value in every session. PostgreSQL
+/// refuses this cast in an index because its result depends on TimeZone.
+#[test]
+fn index_on_a_cast_of_timestamptz_to_time_keeps_its_keys() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id int PRIMARY KEY, tz timestamptz)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_time ON t ((tz::time))")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, '2024-01-01 10:00+02'), (2, '2024-01-02')")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    assert_eq!(rows(&conn, "SELECT id, tz::time FROM t"), ["2|00:00:00"]);
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+}
+
 /// The base gave ids from the rowid and did not advance the sequence of a
 /// serial PRIMARY KEY, so DEFAULT of such a key gives the next rowid, as an
 /// omitted key does.

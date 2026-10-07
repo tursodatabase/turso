@@ -409,18 +409,18 @@ expect error {}
 
 test index-on-a-cast-of-a-temporal-column-keeps-its-keys {
     CREATE DOMAIN recent AS timestamp CHECK (VALUE > '2020-01-01');
-    CREATE TABLE t (id int PRIMARY KEY, ts timestamp, tz timestamptz, r recent);
+    CREATE TABLE t (id int PRIMARY KEY, ts timestamp, r recent);
     CREATE INDEX t_day ON t ((ts::date));
-    CREATE INDEX t_time ON t ((tz::time));
+    CREATE INDEX t_time ON t ((ts::time));
     CREATE INDEX t_r ON t ((r::date::timestamp));
     CREATE INDEX t_late ON t (id) WHERE ts::time > '12:00';
-    INSERT INTO t VALUES (1, '2024-01-01 13:00', '2024-01-01 10:00+02', '2024-03-01 10:00'), (2, '2024-01-02 09:00', '2024-01-02', '2024-03-02');
+    INSERT INTO t VALUES (1, '2024-01-01 13:00', '2024-03-01 10:00'), (2, '2024-01-02 09:00', '2024-03-02');
     DELETE FROM t WHERE id = 1;
     UPDATE t SET ts = '2024-01-05 14:00' WHERE id = 2;
-    SELECT id, ts::date, tz::time, r::date::timestamp FROM t;
+    SELECT id, ts::date, ts::time, r::date::timestamp FROM t;
 }
 expect {
-    2|2024-01-05|00:00:00|2024-03-02 00:00:00
+    2|2024-01-05|14:00:00|2024-03-02 00:00:00
 }
 
 test index-on-a-negative-literal-expression-of-a-wide-numeric-keeps-its-keys {

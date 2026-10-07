@@ -1006,9 +1006,9 @@ pub(crate) fn validate_numeric_type_parameters(
     let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
         return Ok(());
     };
-    let max_precision = match (type_def.is_builtin, type_def.name.as_str()) {
-        (true, "numeric") => i64::MAX,
-        (true, "pg_numeric") => PgStorageType::MAX_NUMERIC_PRECISION,
+    let max_precision = match type_def.pg_storage_type() {
+        Some(PgStorageType::Numeric) => crate::functions::pg_types::MAX_NUMERIC_PRECISION,
+        _ if type_def.is_builtin && type_def.name == "numeric" => i64::MAX,
         _ => return Ok(()),
     };
     let [precision, scale] = params else {

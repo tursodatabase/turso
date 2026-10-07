@@ -174,7 +174,7 @@ impl ResultSetColumn {
                 .and_then(|(_, table)| {
                     schema.column_pg_storage_type(table.get_column_at(*column)?, table.is_strict())
                 })
-                .is_some_and(PgStorageType::stores_another_value);
+                .is_some_and(PgStorageType::stores_integer_for_text);
             if shows_text {
                 return "TEXT";
             }

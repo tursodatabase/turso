@@ -1624,7 +1624,7 @@ fn pg_storage_expression_type_info(
         }
         Expr::FunctionCall { name, args, .. } if args.len() == 1 => {
             let pg_type = PgStorageType::from_type_name(name.as_str())
-                .filter(|pg_type| pg_type.temporal().is_some())?;
+                .filter(|pg_type| pg_type.is_date_or_time())?;
             return Some(pg_storage_type_info(
                 pg_type.type_name().to_string(),
                 pg_type,
@@ -1686,7 +1686,7 @@ fn resolved_type_info(
         ColumnTypeKind::Custom
     };
     let pg_storage_type = resolved.pg_storage_type();
-    let base_type = if pg_storage_type.is_some_and(|pg_type| pg_type.stores_another_value()) {
+    let base_type = if pg_storage_type.is_some_and(|pg_type| pg_type.stores_integer_for_text()) {
         "TEXT".to_string()
     } else {
         resolved.primitive.to_uppercase()
@@ -1708,7 +1708,7 @@ fn pg_storage_type_info(
         declared_name,
         array_dimensions: 0,
         base_type: Some(
-            if pg_type.stores_another_value() {
+            if pg_type.stores_integer_for_text() {
                 "TEXT"
             } else {
                 "INTEGER"
@@ -1810,7 +1810,7 @@ fn infer_expression_primitive(
                 .and_then(|(_, table)| {
                     schema.column_pg_storage_type(table.get_column_at(*column)?, table.is_strict())
                 })
-                .is_some_and(crate::schema::PgStorageType::stores_another_value) =>
+                .is_some_and(crate::schema::PgStorageType::stores_integer_for_text) =>
         {
             Some("TEXT")
         }

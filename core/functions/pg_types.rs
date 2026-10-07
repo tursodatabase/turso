@@ -374,7 +374,6 @@ fn special_word(kind: PgTemporal, text: &str) -> Option<std::result::Result<i64,
     })
 }
 
-/// The words that PostgreSQL reads as a time from the clock.
 pub(crate) const CLOCK_WORDS: [&str; 4] = ["now", "today", "tomorrow", "yesterday"];
 
 pub(crate) fn is_clock_word(text: &str) -> bool {

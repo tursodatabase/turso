@@ -129,12 +129,12 @@ pub(crate) fn exec_numeric_seek_key(
 ) -> Result<Value> {
     let Value::Numeric(Numeric::Integer(precision)) = precision else {
         return Err(LimboError::Constraint(
-            "numeric_encode: precision must be an integer".to_string(),
+            "numeric_seek_key: precision must be an integer".to_string(),
         ));
     };
     let Value::Numeric(Numeric::Integer(scale)) = scale else {
         return Err(LimboError::Constraint(
-            "numeric_encode: scale must be an integer".to_string(),
+            "numeric_seek_key: scale must be an integer".to_string(),
         ));
     };
     if matches!(operand, Value::Null) {

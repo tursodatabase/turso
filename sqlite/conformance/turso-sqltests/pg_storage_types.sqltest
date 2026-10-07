@@ -225,6 +225,27 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test foreign-key-compares-the-scale-of-pg-numeric-as-a-number {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p2(a pg_numeric(5,2) PRIMARY KEY) STRICT, PGSTORAGE;
+    CREATE TABLE c2(b pg_numeric(5,02) REFERENCES p2(a)) STRICT, PGSTORAGE;
+    INSERT INTO p2 VALUES (1.5);
+    INSERT INTO c2 VALUES (1.5);
+    SELECT b FROM c2;
+}
+expect {
+    1.50
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-pg-numeric-with-a-precision-only-has-the-scale-zero {
+    SELECT CAST(1.5 AS pg_numeric(10)), CAST('-2.5' AS pg_numeric(3)), CAST(1.5 AS pg_numeric(10)) = 2;
+}
+expect {
+    2|-3|1
+}
+
+@requires strict "uses STRICT tables"
 @setup amounts
 test numeric-rounds-half-away-from-zero-and-keeps-the-scale {
     SELECT id, n, m FROM pa JOIN pb USING (id) ORDER BY id;

@@ -148,6 +148,10 @@ New tables store some types as integers, with the built-in types
 - Domains use the same types as columns, except that a domain over
   numeric(p,s) stores a float.
 - Array element types and timetz keep the older mapping.
+- In the SQLite dialect, `CAST(x AS pg_int4)` and `CAST(x AS pg_int8)` are a
+  cast to INTEGER: `1.7` gives 1 and `'abc'` gives 0. PostgreSQL rounds and
+  refuses text that is not an integer. The PostgreSQL frontend does not use
+  these casts. `CAST(x AS pg_numeric(p))` has the scale 0, as in PostgreSQL.
 
 Tables of older versions keep their types: timestamps keep milliseconds,
 and numeric truncates to the scale. A user type of an older version can have
@@ -170,9 +174,11 @@ not a label finds no row instead of an error. A numeric column compares as
 a decimal with a literal, a negative literal, a parameter, an expression, a
 number column and the result of numeric arithmetic, as in PostgreSQL. With a
 text column, both values become floats, which keep 15 significant digits.
-`CASE n WHEN ...`, `NULLIF`, `greatest`, `least` and an IN list on numeric
-arithmetic, such as `n * 2 IN (14, 3)`, compare the text of the numeric value,
-not the decimal. Arithmetic of a numeric column of a new table with these
+`CASE n WHEN ...`, `NULLIF`, `greatest`, `least`, `coalesce(n, 0)`, `+n`
+and an IN list on numeric arithmetic, such as `n * 2 IN (14, 3)`, compare the
+text of the numeric value, not the decimal. UNION, INTERSECT and EXCEPT of
+numeric columns with different scales compare the text too, so `1.50` and
+`1.5000` are two rows. Arithmetic of a numeric column of a new table with these
 operands gives a decimal, but `-n` gives a float. An index on the column gives
 the same rows as a scan. Some errors depend on the plan: text that is not a
 number, as in `n = 'abc'`, is an error with an index, but without an index it
@@ -226,7 +232,11 @@ functions, so they refuse such SQL. As in PostgreSQL, an index expression or
 the WHERE clause of a partial index cannot cast a text column to these
 types, because the value `'now'` gives a different result at each
 evaluation. A cast of a timestamp, timestamptz, date or time column is
-accepted. A cast to a domain, such as `'2024-01-01'::recent`, does not apply
+accepted. Also `tz::time` of a timestamptz column is accepted in an index:
+Turso stores timestamptz in UTC and has no TimeZone setting, so the result
+does not change. PostgreSQL refuses it, because the result depends on
+TimeZone. The WHERE clause of a partial index cannot use `CURRENT_DATE`,
+`CURRENT_TIME` or `CURRENT_TIMESTAMP`, as in PostgreSQL. A cast to a domain, such as `'2024-01-01'::recent`, does not apply
 the domain: it gives a number.
 
 A CHECK constraint and the CHECK of a domain read the value that a column

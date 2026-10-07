@@ -572,7 +572,7 @@ impl ResolvedType {
 
     pub(crate) fn check_reads_decoded_value(&self) -> bool {
         self.pg_storage_type()
-            .is_some_and(PgStorageType::stores_another_value)
+            .is_some_and(PgStorageType::stores_integer_for_text)
     }
 
     /// Every type of the chain stores the value that it shows and has no
@@ -610,8 +610,6 @@ impl PgStorageType {
         Self::Time,
         Self::Numeric,
     ];
-
-    pub const MAX_NUMERIC_PRECISION: i64 = crate::functions::pg_types::MAX_NUMERIC_PRECISION;
 
     pub fn from_type_name(name: &str) -> Option<Self> {
         Self::ALL
@@ -655,12 +653,10 @@ impl PgStorageType {
         }
     }
 
-    pub fn stores_another_value(self) -> bool {
+    pub(crate) fn stores_integer_for_text(self) -> bool {
         !matches!(self, Self::Int4 | Self::Int8)
     }
 
-    /// A single-column PRIMARY KEY of the type in a table with the PGSTORAGE
-    /// option is a rowid alias.
     pub fn is_rowid_alias_type(self) -> bool {
         matches!(self, Self::Int4 | Self::Int8)
     }
@@ -963,16 +959,6 @@ impl Default for Schema {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn builtin_type(name: &str) -> Option<Arc<TypeDef>> {
-    static BUILTIN_TYPES: crate::sync::LazyLock<HashMap<String, Arc<TypeDef>>> =
-        crate::sync::LazyLock::new(|| {
-            let mut registry = HashMap::default();
-            bootstrap_builtin_types(&mut registry).expect("the built-in type definitions parse");
-            registry
-        });
-    BUILTIN_TYPES.get(name).cloned()
 }
 
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
@@ -2972,12 +2958,14 @@ impl Schema {
         let Some(pg_type) = self
             .resolve_column_type(column, table.is_strict)
             .and_then(|resolved| resolved.pg_storage_type())
-            .filter(|pg_type| pg_type.stores_another_value())
+            .filter(|pg_type| pg_type.stores_integer_for_text())
         else {
             return StoredForm::OfItsType;
         };
         let scale = match pg_type {
-            PgStorageType::Numeric => column.ty_params.get(1).map(|scale| scale.to_string()),
+            PgStorageType::Numeric => column.ty_params.get(1).map(|scale| {
+                integer_literal(scale).expect("the scale of pg_numeric is an integer")
+            }),
             _ => None,
         };
         StoredForm::Integer { pg_type, scale }
@@ -3056,6 +3044,16 @@ impl Schema {
 
         None
     }
+}
+
+fn builtin_type(name: &str) -> Option<Arc<TypeDef>> {
+    static BUILTIN_TYPES: crate::sync::LazyLock<HashMap<String, Arc<TypeDef>>> =
+        crate::sync::LazyLock::new(|| {
+            let mut registry = HashMap::default();
+            bootstrap_builtin_types(&mut registry).expect("the built-in type definitions parse");
+            registry
+        });
+    BUILTIN_TYPES.get(name).cloned()
 }
 
 /// Without custom types, the stored values of these tables have no
@@ -3164,7 +3162,7 @@ enum StoredForm {
     OfItsType,
     Integer {
         pg_type: PgStorageType,
-        scale: Option<String>,
+        scale: Option<i64>,
     },
 }
 
@@ -3175,10 +3173,7 @@ impl StoredForm {
             Self::Integer {
                 pg_type: PgStorageType::Numeric,
                 scale,
-            } => format!(
-                "decimals as integers with scale {}",
-                scale.as_deref().unwrap_or("0")
-            ),
+            } => format!("decimals as integers with scale {}", scale.unwrap_or(0)),
             Self::Integer { pg_type, .. } => {
                 format!("{} values as integers", pg_type.postgres_name())
             }

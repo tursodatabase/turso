@@ -820,7 +820,7 @@ fn translate_cast_expr(
             let type_def = resolved.leaf();
             if let Some(pg_type) = type_def
                 .pg_storage_type()
-                .filter(|pg_type| *pg_type != PgStorageType::Numeric || ty_params.len() == 2)
+                .filter(|pg_type| *pg_type != PgStorageType::Numeric || !ty_params.is_empty())
             {
                 emit_pg_storage_cast(
                     program,
@@ -889,25 +889,51 @@ fn emit_pg_storage_cast(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(cast_function) = pg_type.temporal_cast_function() {
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: reg,
-            dest: reg,
-            func: FuncCtx {
-                func: Func::Scalar(cast_function),
-                arg_count: 1,
-            },
-        });
-        return Ok(());
+    match pg_type {
+        PgStorageType::Int4 | PgStorageType::Int8 => {
+            program.emit_insn(Insn::Cast {
+                reg,
+                affinity: Affinity::Integer,
+            });
+            Ok(())
+        }
+        PgStorageType::Timestamp
+        | PgStorageType::Timestamptz
+        | PgStorageType::Date
+        | PgStorageType::Time => {
+            let cast_function = pg_type
+                .temporal_cast_function()
+                .expect("a date or time type has a cast function");
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: reg,
+                dest: reg,
+                func: FuncCtx {
+                    func: Func::Scalar(cast_function),
+                    arg_count: 1,
+                },
+            });
+            Ok(())
+        }
+        PgStorageType::Numeric => emit_pg_numeric_cast(program, type_def, ty_params, reg, resolver),
     }
-    if pg_type != PgStorageType::Numeric {
-        program.emit_insn(Insn::Cast {
-            reg,
-            affinity: Affinity::Integer,
-        });
-        return Ok(());
-    }
+}
+
+/// A cast to `pg_numeric(p)` has the scale 0, as in PostgreSQL.
+fn emit_pg_numeric_cast(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    ty_params: &[Box<ast::Expr>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ty_params = match ty_params {
+        [precision] => vec![
+            precision.clone(),
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+        ],
+        _ => ty_params.to_vec(),
+    };
     let mut cast_col = Column::new(
         None,
         type_def.name.clone(),
@@ -917,7 +943,7 @@ fn emit_pg_storage_cast(
         None,
         ColDef::default(),
     );
-    cast_col.ty_params = ty_params.to_vec();
+    cast_col.ty_params = ty_params;
     let resolved = ResolvedType {
         primitive: type_def.base().to_string(),
         chain: vec![Arc::new(type_def.clone())],
