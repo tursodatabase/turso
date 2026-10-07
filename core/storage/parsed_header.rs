@@ -1,23 +1,10 @@
-//! The serial types and value positions of the record under a b-tree cursor.
-
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::types::get_serial_type_size;
 use crate::vdbe::{decode_serial_type_into_register, read_serial_type, Register};
 use crate::{turso_assert, turso_debug_assert, LimboError, Result};
 
-/// The most columns whose serial types and value positions [`ParsedHeader`]
-/// keeps. A read of a later column walks the header from the last kept one.
+/// A read of a later column walks the header from the last kept one.
 const MAX_PARSED_COLUMNS: usize = 64;
-
-/// What a read of one column of the row under a cursor found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColumnPresence {
-    /// The cursor is on no row or on a null row.
-    NoRow,
-    /// The record is too short to have the column (ALTER TABLE ADD COLUMN).
-    Missing,
-    Present,
-}
 
 /// The serial types and value positions of the record under a b-tree
 /// cursor, parsed from its header up to the highest column read so far, so
@@ -26,8 +13,8 @@ pub(crate) enum ColumnPresence {
 /// Positions count from the start of the payload, so they hold for the
 /// payload on the page and for a copy of it.
 pub(crate) struct ParsedHeader {
-    /// Size of the record header, which is where the value of column 0
-    /// starts. 0 when nothing is parsed for the row under the cursor.
+    /// Where the value of column 0 starts. 0 when nothing is parsed for the
+    /// row under the cursor.
     header_size: u32,
     payload_size: u32,
     /// Number of columns whose serial type and value position are known.
@@ -35,7 +22,6 @@ pub(crate) struct ParsedHeader {
     /// Position of the serial type of column `count` in the header.
     next_type_pos: u32,
     serial_types: [u64; MAX_PARSED_COLUMNS],
-    /// `value_starts[i]` is where the value of column `i` starts, and
     /// `value_starts[count]` is where the value of column `count - 1` ends.
     value_starts: [u32; MAX_PARSED_COLUMNS + 1],
 }
@@ -57,18 +43,19 @@ impl ParsedHeader {
         self.header_size = 0;
     }
 
+    /// False when the record is too short to have `column`.
     #[inline(always)]
     pub(crate) fn read_column_into(
         &mut self,
         payload: &[u8],
         column: usize,
         dest: &mut Register,
-    ) -> Result<ColumnPresence> {
+    ) -> Result<bool> {
         let Some((serial_type, value_start)) = self.locate(payload, column)? else {
-            return Ok(ColumnPresence::Missing);
+            return Ok(false);
         };
         decode_serial_type_into_register(serial_type, &mut &payload[value_start..], dest)?;
-        Ok(ColumnPresence::Present)
+        Ok(true)
     }
 
     /// Reads the columns from `start` on into `dests`, and returns how many
@@ -80,10 +67,11 @@ impl ParsedHeader {
         start: usize,
         dests: &mut [Register],
     ) -> Result<usize> {
-        if self.locate(payload, start)?.is_none() {
-            return Ok(0);
-        }
-        let parsed_end = (self.count as usize).clamp(start, start + dests.len());
+        self.start_if_needed(payload)?;
+        let end = start + dests.len();
+        self.parse_columns_before(payload, end)?;
+        let count = self.count as usize;
+        let parsed_end = count.clamp(start, end);
         for (column, dest) in (start..parsed_end).zip(dests.iter_mut()) {
             let serial_type = self.serial_types[column];
             let value_start = self.value_starts[column] as usize;
@@ -95,7 +83,7 @@ impl ParsedHeader {
             decode_serial_type_into_register(serial_type, &mut &payload[value_start..], dest)?;
         }
         let mut read = parsed_end - start;
-        if read == dests.len() {
+        if read == dests.len() || count < MAX_PARSED_COLUMNS {
             return Ok(read);
         }
         let Some((type_pos, value_start)) = self.walk_from_parsed_end(payload, parsed_end)? else {
@@ -114,21 +102,43 @@ impl ParsedHeader {
         Ok(read)
     }
 
-    pub(crate) fn column_presence(
-        &mut self,
-        payload: &[u8],
-        column: usize,
-    ) -> Result<ColumnPresence> {
-        Ok(match self.locate(payload, column)? {
-            Some(_) => ColumnPresence::Present,
-            None => ColumnPresence::Missing,
-        })
+    /// False when the record is too short to have `column`.
+    pub(crate) fn has_column(&mut self, payload: &[u8], column: usize) -> Result<bool> {
+        Ok(self.locate(payload, column)?.is_some())
     }
 
     /// The serial type and value position of `column`, or None when the
     /// record is too short to have it.
     #[inline(always)]
     fn locate(&mut self, payload: &[u8], column: usize) -> Result<Option<(u64, usize)>> {
+        self.start_if_needed(payload)?;
+        if column >= self.count as usize {
+            self.parse_columns_before(payload, column + 1)?;
+        }
+        let location = if column < self.count as usize {
+            Some((
+                self.serial_types[column],
+                self.value_starts[column] as usize,
+            ))
+        } else if (self.count as usize) < MAX_PARSED_COLUMNS {
+            None
+        } else if let Some((type_pos, value_start)) = self.walk_from_parsed_end(payload, column)? {
+            let serial_type = read_serial_type(&mut &payload[type_pos..self.header_size as usize])?;
+            checked_value_end(value_start, serial_type, payload.len())?;
+            Some((serial_type, value_start))
+        } else {
+            None
+        };
+        turso_debug_assert!(
+            matches!(locate_by_walk(payload, column), Ok(walked) if walked == location),
+            "the parsed header disagrees with a walk of the record header",
+            { "column": column }
+        );
+        Ok(location)
+    }
+
+    #[inline(always)]
+    fn start_if_needed(&mut self, payload: &[u8]) -> Result<()> {
         if self.header_size == 0 {
             self.start(payload)?;
         }
@@ -137,20 +147,7 @@ impl ParsedHeader {
             "the parsed header belongs to another row",
             { "parsed_payload_size": self.payload_size, "payload_size": payload.len() }
         );
-        let location = if column < self.count as usize {
-            Some((
-                self.serial_types[column],
-                self.value_starts[column] as usize,
-            ))
-        } else {
-            self.parse_through(payload, column)?
-        };
-        turso_debug_assert!(
-            matches!(locate_by_walk(payload, column), Ok(walked) if walked == location),
-            "the parsed header disagrees with a walk of the record header",
-            { "column": column }
-        );
-        Ok(location)
+        Ok(())
     }
 
     fn start(&mut self, payload: &[u8]) -> Result<()> {
@@ -169,19 +166,20 @@ impl ParsedHeader {
         Ok(())
     }
 
-    /// Parses serial types until `column` is known or the header ends. The
-    /// entries are written before `count` grows, so an error in a corrupt
-    /// header leaves the known columns as they were.
-    fn parse_through(&mut self, payload: &[u8], column: usize) -> Result<Option<(u64, usize)>> {
+    /// Parses serial types until the columns before `end` are known, the
+    /// arrays are full or the header ends. The entries are written before
+    /// `count` grows, so an error in a corrupt header leaves the known
+    /// columns as they were.
+    fn parse_columns_before(&mut self, payload: &[u8], end: usize) -> Result<()> {
         let header_size = self.header_size as usize;
-        let parse_end = column.min(MAX_PARSED_COLUMNS - 1) + 1;
+        let end = end.min(MAX_PARSED_COLUMNS);
         let mut count = self.count as usize;
         let mut type_pos = self.next_type_pos as usize;
         let mut value_start = self.value_starts[count] as usize;
-        while count < parse_end && type_pos < header_size {
+        while count < end && type_pos < header_size {
             let mut header = &payload[type_pos..header_size];
             let serial_type = read_serial_type(&mut header)?;
-            let value_end = value_end(value_start, serial_type, payload.len())?;
+            let value_end = checked_value_end(value_start, serial_type, payload.len())?;
             self.serial_types[count] = serial_type;
             self.value_starts[count + 1] = value_end as u32;
             count += 1;
@@ -190,21 +188,7 @@ impl ParsedHeader {
         }
         self.count = count as u32;
         self.next_type_pos = type_pos as u32;
-        if column < count {
-            return Ok(Some((
-                self.serial_types[column],
-                self.value_starts[column] as usize,
-            )));
-        }
-        if count < MAX_PARSED_COLUMNS {
-            return Ok(None);
-        }
-        let Some((type_pos, value_start)) = self.walk_from_parsed_end(payload, column)? else {
-            return Ok(None);
-        };
-        let serial_type = read_serial_type(&mut &payload[type_pos..header_size])?;
-        value_end(value_start, serial_type, payload.len())?;
-        Ok(Some((serial_type, value_start)))
+        Ok(())
     }
 
     /// The positions of the serial type and the value of `column`, found by a
@@ -225,22 +209,13 @@ impl ParsedHeader {
                 return Ok(None);
             }
             let serial_type = read_serial_type(&mut header)?;
-            value_start = value_end(value_start, serial_type, payload.len())?;
+            value_start = checked_value_end(value_start, serial_type, payload.len())?;
         }
         if header.is_empty() {
             return Ok(None);
         }
         Ok(Some((header_size - header.len(), value_start)))
     }
-}
-
-fn value_end(value_start: usize, serial_type: u64, payload_size: usize) -> Result<usize> {
-    value_start
-        .checked_add(get_serial_type_size(serial_type)?)
-        .filter(|end| *end <= payload_size)
-        .ok_or_else(|| {
-            LimboError::Corrupt("Data section too small for indicated serial type size".into())
-        })
 }
 
 /// The serial type and value position of `column` found by a walk of the
@@ -258,7 +233,7 @@ fn locate_by_walk(payload: &[u8], column: usize) -> Result<Option<(u64, usize)>>
     let mut current = 0;
     while type_pos < header_size {
         let (serial_type, type_len) = read_varint(&payload[type_pos..header_size])?;
-        let value_end = value_end(value_start, serial_type, payload.len())?;
+        let value_end = checked_value_end(value_start, serial_type, payload.len())?;
         if current == column {
             return Ok(Some((serial_type, value_start)));
         }
@@ -267,6 +242,15 @@ fn locate_by_walk(payload: &[u8], column: usize) -> Result<Option<(u64, usize)>>
         current += 1;
     }
     Ok(None)
+}
+
+fn checked_value_end(value_start: usize, serial_type: u64, payload_size: usize) -> Result<usize> {
+    value_start
+        .checked_add(get_serial_type_size(serial_type)?)
+        .filter(|end| *end <= payload_size)
+        .ok_or_else(|| {
+            LimboError::Corrupt("Data section too small for indicated serial type size".into())
+        })
 }
 
 #[cfg(test)]
@@ -286,11 +270,8 @@ mod tests {
 
     fn read(header: &mut ParsedHeader, payload: &[u8], column: usize) -> Result<Option<Value>> {
         let mut dest = Register::Value(Value::Null);
-        Ok(match header.read_column_into(payload, column, &mut dest)? {
-            ColumnPresence::Present => Some(dest.get_value().clone()),
-            ColumnPresence::Missing => None,
-            ColumnPresence::NoRow => unreachable!("a payload always has a row"),
-        })
+        let has_column = header.read_column_into(payload, column, &mut dest)?;
+        Ok(has_column.then(|| dest.get_value().clone()))
     }
 
     fn read_range(
@@ -393,27 +374,36 @@ mod tests {
     fn presence_of_a_column_follows_the_length_of_the_record() {
         let short = record(&[Value::from_i64(1), Value::build_text("a")]);
         let mut header = ParsedHeader::new();
-        for (column, presence) in [
-            (1, ColumnPresence::Present),
-            (2, ColumnPresence::Missing),
-            (0, ColumnPresence::Present),
-            (70, ColumnPresence::Missing),
-        ] {
+        for (column, has_column) in [(1, true), (2, false), (0, true), (70, false)] {
             assert_eq!(
-                header.column_presence(short.get_payload(), column).unwrap(),
-                presence
+                header.has_column(short.get_payload(), column).unwrap(),
+                has_column
             );
         }
         let values: Vec<Value> = (0..70).map(Value::from_i64).collect();
         let wide = record(&values);
         header.forget();
+        assert!(header.has_column(wide.get_payload(), 69).unwrap());
+        assert!(!header.has_column(wide.get_payload(), 70).unwrap());
+    }
+
+    #[test]
+    fn a_range_past_the_kept_columns_walks_the_header_once() {
+        let values: Vec<Value> = (0..MAX_PARSED_COLUMNS as i64 + 40)
+            .map(|i| Value::build_text("v".repeat(i as usize)))
+            .collect();
+        let record = record(&values);
+        let payload = record.get_payload();
+        let mut header = ParsedHeader::new();
+        let start = MAX_PARSED_COLUMNS + 10;
         assert_eq!(
-            header.column_presence(wide.get_payload(), 69).unwrap(),
-            ColumnPresence::Present
+            read_range(&mut header, payload, start, 50),
+            values[start..].to_vec()
         );
+        assert_eq!(header.count as usize, MAX_PARSED_COLUMNS);
         assert_eq!(
-            header.column_presence(wide.get_payload(), 70).unwrap(),
-            ColumnPresence::Missing
+            read_range(&mut header, payload, 3, 4),
+            values[3..7].to_vec()
         );
     }
 
@@ -470,6 +460,27 @@ mod tests {
             Some(Value::from_i64(1))
         );
         assert!(read(&mut header, &payload, 1).is_err());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the parsed header disagrees with a walk of the record header")]
+    fn a_payload_of_the_same_size_without_forget_panics() {
+        let first = record(&[
+            Value::from_i64(5),
+            Value::build_text("x"),
+            Value::from_i64(30),
+        ]);
+        let second = record(&[
+            Value::build_text("y"),
+            Value::from_i64(33),
+            Value::build_text("z"),
+        ]);
+        assert_eq!(first.get_payload().len(), second.get_payload().len());
+        assert_ne!(first.get_payload()[..4], second.get_payload()[..4]);
+        let mut header = ParsedHeader::new();
+        read(&mut header, first.get_payload(), 1).unwrap();
+        let _ = read(&mut header, second.get_payload(), 1);
     }
 
     #[test]

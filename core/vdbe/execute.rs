@@ -18,8 +18,8 @@ use crate::schema::{
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState,
-    PageCategory,
+    integrity_check, ColumnPresence, CursorStep, CursorTrait, IntegrityCheckError,
+    IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
@@ -27,7 +27,6 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
     default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
 };
-use crate::storage::parsed_header::ColumnPresence;
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
