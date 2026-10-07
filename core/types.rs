@@ -4798,6 +4798,17 @@ mod tests {
             Value::Blob(vec![0]),
             Value::Blob(vec![b'a']),
         ];
+        let long_pool = [
+            Value::build_text("a".repeat(58)),
+            Value::build_text("a".repeat(59)),
+            Value::build_text("A".repeat(59)),
+            Value::build_text(format!("{} ", "a".repeat(58))),
+            Value::build_text("b".repeat(120)),
+            Value::build_text("é".repeat(150)),
+            Value::Blob(vec![b'a'; 58]),
+            Value::Blob(vec![0; 59]),
+            Value::Blob(vec![7; 300]),
+        ];
         let sort_orders = [SortOrder::Asc, SortOrder::Desc];
         let collations = [
             CollationSeq::Binary,
@@ -4812,18 +4823,36 @@ mod tests {
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(13);
         let mut pick = |len: usize| rng.next_u64() as usize % len;
+        let mut cases_with_two_byte_header_size = 0;
+        let mut cases_with_two_byte_first_serial_type = 0;
+        let mut cases_that_compare_past_field_13 = 0;
 
         for case in 0..50_000 {
-            let lhs_len = 1 + pick(6);
+            let long_record = pick(4) == 0;
+            let lhs_len = if long_record {
+                20 + pick(80)
+            } else {
+                1 + pick(6)
+            };
+            let pools: &[&[Value]] = if long_record {
+                &[&pool, &long_pool]
+            } else {
+                &[&pool]
+            };
             let lhs: Vec<Value> = (0..lhs_len)
-                .map(|_| pool[pick(pool.len())].clone())
+                .map(|_| {
+                    let pool = pools[pick(pools.len())];
+                    pool[pick(pool.len())].clone()
+                })
                 .collect();
             let rhs_len = pick(lhs_len + 2);
+            let equal_prefix = pick(lhs_len + 1);
             let rhs: Vec<Value> = (0..rhs_len)
                 .map(|i| {
-                    if i < lhs_len && pick(2) == 0 {
+                    if i < equal_prefix || (i < lhs_len && pick(2) == 0) {
                         lhs[i].clone()
                     } else {
+                        let pool = pools[pick(pools.len())];
                         pool[pick(pool.len())].clone()
                     }
                 })
@@ -4836,17 +4865,15 @@ mod tests {
                     nulls_order: nulls_orders[pick(3)],
                 })
                 .collect();
-            let num_cols = if pick(2) == 0 {
-                key_count
-            } else {
-                14 + pick(4)
-            };
             let index_info =
-                IndexInfo::new(key_info.iter().copied(), false, num_cols, false).unwrap();
+                IndexInfo::new(key_info.iter().copied(), false, key_count, false).unwrap();
             let tie_breaker = tie_breakers[pick(3)];
 
             let mut expected = tie_breaker;
-            for ((l, r), key) in lhs.iter().zip(&rhs).zip(&key_info) {
+            for (field, ((l, r), key)) in lhs.iter().zip(&rhs).zip(&key_info).enumerate() {
+                if field > 13 {
+                    cases_that_compare_past_field_13 += 1;
+                }
                 let comparison = cmp_in_column(&l.as_value_ref(), &r.as_value_ref(), key);
                 if comparison.is_ne() {
                     expected = comparison;
@@ -4856,6 +4883,10 @@ mod tests {
 
             let record = create_record(lhs.clone());
             let payload = record.get_payload();
+            let (_, header_size_len) = read_varint(payload).unwrap();
+            let (_, first_serial_type_len) = read_varint(&payload[header_size_len..]).unwrap();
+            cases_with_two_byte_header_size += usize::from(header_size_len > 1);
+            cases_with_two_byte_first_serial_type += usize::from(first_serial_type_len > 1);
             let rhs_refs: Vec<ValueRef> = rhs.iter().map(Value::as_ref).collect();
             let context = format!("case {case}: {lhs:?} {rhs:?} {key_info:?} {tie_breaker:?}");
             let compare = |comparer: RecordCompare| {
@@ -4881,6 +4912,9 @@ mod tests {
                 assert_eq!(compare(RecordCompare::String), expected, "{context}");
             }
         }
+        assert!(cases_with_two_byte_header_size > 1000);
+        assert!(cases_with_two_byte_first_serial_type > 1000);
+        assert!(cases_that_compare_past_field_13 > 1000);
     }
 
     #[test]
@@ -4904,6 +4938,66 @@ mod tests {
             assert!(
                 matches!(result, Err(LimboError::Corrupt(_))),
                 "{comparer:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_record_with_bytes_after_its_header_compares_no_field() {
+        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::Binary]);
+        let payload = [1u8, 5];
+        for (comparer, first) in [
+            (RecordCompare::Generic, ValueRef::from_i64(7)),
+            (
+                RecordCompare::Int { rhs_first_value: 7 },
+                ValueRef::from_i64(7),
+            ),
+            (
+                RecordCompare::String,
+                ValueRef::Text(TextRef::new("a", TextSubtype::Text)),
+            ),
+        ] {
+            let result = comparer
+                .compare_payload(&payload, [first], &index_info, std::cmp::Ordering::Greater)
+                .unwrap();
+            assert_eq!(result, std::cmp::Ordering::Greater, "{comparer:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_past_the_payload_is_corrupt_for_every_comparator() {
+        let index_info =
+            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::Binary; 2]);
+        let first_int_then_short_int = [3u8, 1, 4, 7, 0];
+        let first_text_then_short_int = [3u8, 15, 4, b'a', 0];
+        let short_first_int = [2u8, 4, 0, 0];
+        let int = ValueRef::from_i64(7);
+        let text = ValueRef::Text(TextRef::new("a", TextSubtype::Text));
+        for (comparer, payload, first) in [
+            (RecordCompare::Generic, &first_int_then_short_int[..], int),
+            (RecordCompare::Generic, &first_text_then_short_int[..], text),
+            (RecordCompare::Generic, &short_first_int[..], int),
+            (
+                RecordCompare::Int { rhs_first_value: 7 },
+                &first_int_then_short_int[..],
+                int,
+            ),
+            (
+                RecordCompare::Int { rhs_first_value: 7 },
+                &short_first_int[..],
+                int,
+            ),
+            (RecordCompare::String, &first_text_then_short_int[..], text),
+        ] {
+            let result = comparer.compare_payload(
+                payload,
+                [first, ValueRef::from_i64(9)],
+                &index_info,
+                std::cmp::Ordering::Equal,
+            );
+            assert!(
+                matches!(result, Err(LimboError::Corrupt(_))),
+                "{comparer:?} {payload:?}: {result:?}"
             );
         }
     }
