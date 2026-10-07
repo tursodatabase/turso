@@ -1187,12 +1187,6 @@ pub(super) fn emit_stored_temporal_comparison(
     )
 }
 
-/// A comparison of a `pg_numeric` column with a literal, a negative literal
-/// or a parameter. The column stores the value times 10^scale, so the
-/// comparison reads the stored integer and compares it with an integer key
-/// of the operand, computed once. When the operand is NULL or not a number
-/// the key is NULL, and the decimal comparison runs: it gives NULL or
-/// raises its error at the same row as before.
 pub(super) struct StoredNumericComparison<'a> {
     e1: &'a ast::Expr,
     e2: &'a ast::Expr,
@@ -1228,7 +1222,11 @@ pub(super) fn stored_numeric_comparison<'a>(
     if table_column.is_virtual_generated() || pg_type != PgStorageType::Numeric {
         return None;
     }
-    let scale = crate::schema::integer_literal(table_column.ty_params.get(1)?)?;
+    let scale = table_column
+        .ty_params
+        .get(1)
+        .and_then(|scale| crate::schema::integer_literal(scale))
+        .expect("a pg_numeric column has a precision and a scale");
     let decoded_self_table = resolver.decoded_self_table();
     let decimal = find_custom_type_operator(
         e1,
@@ -1289,7 +1287,7 @@ pub(super) fn emit_stored_numeric_comparison(
         resolver,
     )?;
     program.emit_int(
-        crate::functions::seek_key::scan_comparison_key(&comparison.op) as i64,
+        crate::functions::seek_key::scan_key_side(&comparison.op) as i64,
         args + 1,
     );
     program.emit_int(comparison.scale, args + 2);
@@ -1333,7 +1331,6 @@ pub(super) fn emit_stored_numeric_comparison(
     Ok(())
 }
 
-/// The stored value of a column of a `pg_` type, without its DECODE.
 fn translate_stored_column(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,

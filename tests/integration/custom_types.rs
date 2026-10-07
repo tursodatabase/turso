@@ -534,10 +534,6 @@ mod tests {
         }
     }
 
-    /// A seek on an index of a `pg_` date, time or numeric column reads
-    /// exactly the rows of the comparison, so the loop neither DECODEs the
-    /// column nor compares it again. A `uuid` range keeps its comparison,
-    /// because its keys for text that is not a canonical uuid keep more rows.
     #[test]
     fn test_seek_on_pg_type_index_does_not_compare_the_rows_again() {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
@@ -611,11 +607,6 @@ mod tests {
         assert_eq!(rows, vec![(1,)]);
     }
 
-    /// A WHERE term that compares a `pg_numeric` column with a parameter
-    /// compares the stored integers with an integer key of the parameter.
-    /// The key is computed once for each run, so each run with new values
-    /// gives the rows of the decimal comparison, which an expression still
-    /// uses.
     #[test]
     fn test_pg_numeric_scan_with_parameter_gives_the_rows_of_the_decimals() {
         use turso_core::Value;

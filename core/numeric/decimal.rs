@@ -132,14 +132,10 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     Ok(BigDecimal::new(bigint, scale))
 }
 
-/// `numeric_lt`: whether `lhs` is below `rhs` as a decimal, or NULL when
-/// one of them is NULL.
 pub(crate) fn exec_numeric_lt(lhs: &Value, rhs: &Value) -> crate::Result<Value> {
     compare_as_decimals(lhs, rhs, |lhs, rhs| lhs < rhs)
 }
 
-/// `numeric_eq`: whether `lhs` equals `rhs` as a decimal, or NULL when one
-/// of them is NULL.
 pub(crate) fn exec_numeric_eq(lhs: &Value, rhs: &Value) -> crate::Result<Value> {
     compare_as_decimals(lhs, rhs, |lhs, rhs| lhs == rhs)
 }

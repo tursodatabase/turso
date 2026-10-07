@@ -18671,8 +18671,13 @@ pub fn op_hash_grace_advance_partition(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[cfg(test)]
+pub(crate) fn apply_affinity_char_in_test(target: &mut Register, affinity: Affinity) -> bool {
+    apply_affinity_char(target, affinity)
+}
+
 #[inline(always)]
-pub(crate) fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
         let settled = match affinity {

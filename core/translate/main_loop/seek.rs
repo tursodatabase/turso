@@ -1,6 +1,6 @@
 use super::*;
 use crate::function::{Func, FuncCtx, ScalarFunc};
-use crate::functions::seek_key::{exact_bound_key, NoSeekKey};
+use crate::functions::seek_key::{exact_bound_key_side, KeySide};
 use crate::schema::{IndexUse, SeekKeyFunction};
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
@@ -473,19 +473,19 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         affinities: affinity.aff_mask().to_string(),
                     });
                 }
-                let no_key = if is_equality {
-                    NoSeekKey::Null
+                let side = if is_equality {
+                    KeySide::Equal
                 } else if function.gives_exact_bounds() {
-                    exact_bound_key(seek_key.op, index.columns[pos].order)
+                    exact_bound_key_side(seek_key.op, index.columns[pos].order)
                 } else {
                     match (range_end, index.columns[pos].order) {
                         (StoredRangeEnd::Low, SortOrder::Asc)
-                        | (StoredRangeEnd::High, SortOrder::Desc) => NoSeekKey::Below,
+                        | (StoredRangeEnd::High, SortOrder::Desc) => KeySide::Below,
                         (StoredRangeEnd::High, SortOrder::Asc)
-                        | (StoredRangeEnd::Low, SortOrder::Desc) => NoSeekKey::Above,
+                        | (StoredRangeEnd::Low, SortOrder::Desc) => KeySide::Above,
                     }
                 };
-                self.program.emit_int(no_key as i64, operand_reg + 1);
+                self.program.emit_int(side as i64, operand_reg + 1);
                 let mut arg_count = 2;
                 if function == SeekKeyFunction::PgNumeric {
                     let column = &self.table.columns()[index.columns[pos].pos_in_table];

@@ -5,6 +5,7 @@ use crate::functions::pg_types::{
 use crate::numeric::decimal::value_to_bigdecimal;
 use crate::types::{SeekOp, Value};
 use crate::{turso_assert_eq, LimboError, Numeric, Result};
+use bigdecimal::BigDecimal;
 use turso_parser::ast::{self, SortOrder};
 
 const UUID_TEXT_LEN: usize = 36;
@@ -15,124 +16,103 @@ const KEY_ABOVE_EVERY_UUID: [u8; 17] = [0xff; 17];
 const KEY_EQUAL_TO_NO_NUMERIC: i64 = i64::MAX;
 const _: () = assert!(KEY_EQUAL_TO_NO_NUMERIC as i128 >= NUMERIC_STORED_LIMIT);
 
-/// What a seek key function gives when no stored value shows the operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NoSeekKey {
-    /// NULL: no row is equal to the operand.
-    Null = 0,
-    /// A key below the operand. The `pg_` types give the last stored value
-    /// below the operand, and `uuid` gives a key below every stored value.
+pub(crate) enum KeySide {
+    Equal = 0,
     Below = -1,
-    /// A key above the operand. The `pg_` types give the first stored value
-    /// above the operand, and `uuid` gives a key above every stored value.
     Above = 1,
 }
 
-/// The key that a scan compares the stored integers of a `pg_numeric`
-/// column with for `column <op> operand`, in the stored order: the key of
-/// a bound for a range operator, and NULL for `=` and `!=`.
-pub(crate) fn scan_comparison_key(op: &ast::Operator) -> NoSeekKey {
+pub(crate) fn scan_key_side(op: &ast::Operator) -> KeySide {
     match op {
-        ast::Operator::Equals | ast::Operator::NotEquals => NoSeekKey::Null,
-        ast::Operator::Greater => exact_bound_key(SeekOp::GT, SortOrder::Asc),
+        ast::Operator::Equals | ast::Operator::NotEquals => KeySide::Equal,
+        ast::Operator::Greater => exact_bound_key_side(SeekOp::GT, SortOrder::Asc),
         ast::Operator::GreaterEquals => {
-            exact_bound_key(SeekOp::GE { eq_only: false }, SortOrder::Asc)
+            exact_bound_key_side(SeekOp::GE { eq_only: false }, SortOrder::Asc)
         }
-        ast::Operator::Less => exact_bound_key(SeekOp::LT, SortOrder::Asc),
-        ast::Operator::LessEquals => exact_bound_key(SeekOp::LE { eq_only: false }, SortOrder::Asc),
+        ast::Operator::Less => exact_bound_key_side(SeekOp::LT, SortOrder::Asc),
+        ast::Operator::LessEquals => {
+            exact_bound_key_side(SeekOp::LE { eq_only: false }, SortOrder::Asc)
+        }
         other => unreachable!("{other:?} is not a comparison of a pg_numeric scan"),
     }
 }
 
-/// The key of a range bound of a `pg_` type that gives exactly the rows of
-/// the comparison. `op` is the seek or the stop of the bound in the order of
-/// the index. `GT` and `LE` put the key with the entries before the bound,
-/// and `GE` and `LT` put it with the entries after the bound. In stored
-/// order, a key with the lower values must be the last stored value below
-/// the operand, and a key with the higher values the first stored value
-/// above it. A DESC index stores the higher values first.
-pub(crate) fn exact_bound_key(op: SeekOp, order: SortOrder) -> NoSeekKey {
+// In the order of the index, GT and LE take the key before the bound, GE and LT the key after it.
+pub(crate) fn exact_bound_key_side(op: SeekOp, order: SortOrder) -> KeySide {
     let key_is_before_bound = matches!(op, SeekOp::GT | SeekOp::LE { .. });
     match (key_is_before_bound, order) {
-        (true, SortOrder::Asc) | (false, SortOrder::Desc) => NoSeekKey::Below,
-        (false, SortOrder::Asc) | (true, SortOrder::Desc) => NoSeekKey::Above,
+        (true, SortOrder::Asc) | (false, SortOrder::Desc) => KeySide::Below,
+        (false, SortOrder::Asc) | (true, SortOrder::Desc) => KeySide::Above,
     }
 }
 
-pub(crate) fn exec_uuid_seek_key(value: &Value, no_key: &Value) -> Result<Value> {
+pub(crate) fn exec_uuid_seek_key(value: &Value, side: &Value) -> Result<Value> {
     if let Value::Text(text) = value {
         if let Some(bytes) = canonical_uuid_bytes(text.as_str().as_bytes()) {
             return Ok(Value::from_slice(&bytes)?);
         }
     }
-    let Value::Numeric(Numeric::Integer(no_key)) = no_key else {
-        unreachable!("the seek passes an integer for the missing key, got {no_key:?}");
-    };
-    Ok(match *no_key {
-        n if n == NoSeekKey::Below as i64 => Value::from_i64(KEY_BELOW_EVERY_UUID),
-        n if n == NoSeekKey::Above as i64 => Value::from_slice(&KEY_ABOVE_EVERY_UUID)?,
-        n => {
-            turso_assert_eq!(n, NoSeekKey::Null as i64);
-            Value::Null
-        }
+    Ok(match read_key_side(side) {
+        KeySide::Below => Value::from_i64(KEY_BELOW_EVERY_UUID),
+        KeySide::Above => Value::from_slice(&KEY_ABOVE_EVERY_UUID)?,
+        KeySide::Equal => Value::Null,
     })
 }
 
 pub(crate) fn exec_pg_temporal_seek_key(
     kind: PgTemporal,
     operand: &Value,
-    no_key: &Value,
+    side: &Value,
 ) -> Result<Value> {
-    let bound = seek_bound(no_key);
+    let side = read_key_side(side);
     let (first, last) = kind.stored_range();
     let key = match operand {
         Value::Null => None,
         Value::Text(text) => match parse_canonical_temporal(kind, text.as_str()) {
             Some(stored) => Some(stored),
-            None => match bound {
-                NoSeekKey::Null => None,
-                NoSeekKey::Below => Some(last_stored_below(kind, text.as_str().as_bytes())),
-                NoSeekKey::Above => Some(first_stored_above(kind, text.as_str().as_bytes())),
+            None => match side {
+                KeySide::Equal => None,
+                KeySide::Below => Some(last_stored_below(kind, text.as_str().as_bytes())),
+                KeySide::Above => Some(first_stored_above(kind, text.as_str().as_bytes())),
             },
         },
-        Value::Numeric(_) => match bound {
-            NoSeekKey::Null => None,
-            NoSeekKey::Below => Some(i64::MIN),
-            NoSeekKey::Above => Some(first),
+        Value::Numeric(_) => match side {
+            KeySide::Equal => None,
+            KeySide::Below => Some(i64::MIN),
+            KeySide::Above => Some(first),
         },
-        Value::Blob(_) => match bound {
-            NoSeekKey::Null => None,
-            NoSeekKey::Below => Some(last),
-            NoSeekKey::Above => Some(i64::MAX),
+        Value::Blob(_) => match side {
+            KeySide::Equal => None,
+            KeySide::Below => Some(last),
+            KeySide::Above => Some(i64::MAX),
         },
     };
     Ok(key.map_or(Value::Null, Value::from_i64))
 }
 
-/// The key that a scan compares the stored integer of a `pg_numeric`
-/// column with, in place of `numeric_lt` or `numeric_eq` with the operand.
-/// `no_key` comes from [scan_comparison_key]. For `=` and `!=`, an operand
-/// that no stored value equals gets a key outside the stored values. NULL
-/// when the operand is NULL or not a number: the scan then compares the
-/// decimals, which gives NULL or raises the error.
 pub(crate) fn exec_pg_numeric_compare_key(
     operand: &Value,
-    no_key: &Value,
+    side: &Value,
     scale: &Value,
 ) -> Result<Value> {
-    if matches!(operand, Value::Null) || value_to_bigdecimal(operand).is_err() {
+    let scale = numeric_type_parameter("scale", scale)?;
+    check_numeric_scale(scale)?;
+    let side = read_key_side(side);
+    let Ok(decimal) = value_to_bigdecimal(operand) else {
         return Ok(Value::Null);
-    }
-    let key = exec_pg_numeric_seek_key(operand, no_key, scale)?;
-    Ok(match (key, seek_bound(no_key)) {
-        (Value::Null, NoSeekKey::Null) => Value::from_i64(KEY_EQUAL_TO_NO_NUMERIC),
-        (key, _) => key,
-    })
+    };
+    let key = match (numeric_key(&decimal, side, scale), side) {
+        (Some(key), _) => key,
+        (None, KeySide::Equal) => KEY_EQUAL_TO_NO_NUMERIC,
+        (None, side) => unreachable!("a number always has a key on the side {side:?}"),
+    };
+    Ok(Value::from_i64(key))
 }
 
 pub(crate) fn exec_pg_numeric_seek_key(
     operand: &Value,
-    no_key: &Value,
+    side: &Value,
     scale: &Value,
 ) -> Result<Value> {
     let scale = numeric_type_parameter("scale", scale)?;
@@ -140,17 +120,21 @@ pub(crate) fn exec_pg_numeric_seek_key(
     if matches!(operand, Value::Null) {
         return Ok(Value::Null);
     }
-    let bound = seek_bound(no_key);
+    let side = read_key_side(side);
     let decimal = value_to_bigdecimal(operand)?;
-    let above_every_value = match bound {
-        NoSeekKey::Null => None,
-        NoSeekKey::Below | NoSeekKey::Above => Some(i64::MAX),
+    Ok(numeric_key(&decimal, side, scale).map_or(Value::Null, Value::from_i64))
+}
+
+fn numeric_key(decimal: &BigDecimal, side: KeySide, scale: i64) -> Option<i64> {
+    let above_every_value = match side {
+        KeySide::Equal => None,
+        KeySide::Below | KeySide::Above => Some(i64::MAX),
     };
-    let below_every_value = match bound {
-        NoSeekKey::Null => None,
-        NoSeekKey::Below | NoSeekKey::Above => Some(i64::MIN),
+    let below_every_value = match side {
+        KeySide::Equal => None,
+        KeySide::Below | KeySide::Above => Some(i64::MIN),
     };
-    let key = match scale_decimal(&decimal, scale) {
+    match scale_decimal(decimal, scale) {
         ScaledDecimal::Above => above_every_value,
         ScaledDecimal::Below => below_every_value,
         ScaledDecimal::InRange { truncated, .. } if truncated >= NUMERIC_STORED_LIMIT => {
@@ -165,14 +149,13 @@ pub(crate) fn exec_pg_numeric_seek_key(
         } => Some(truncated as i64),
         ScaledDecimal::InRange { truncated, .. } => {
             let floor = truncated as i64 - i64::from(decimal.sign() == num_bigint::Sign::Minus);
-            match bound {
-                NoSeekKey::Null => None,
-                NoSeekKey::Below => Some(floor),
-                NoSeekKey::Above => Some(floor + 1),
+            match side {
+                KeySide::Equal => None,
+                KeySide::Below => Some(floor),
+                KeySide::Above => Some(floor + 1),
             }
         }
-    };
-    Ok(key.map_or(Value::Null, Value::from_i64))
+    }
 }
 
 /// The key of an equality seek on the `numeric` type: the stored blob of the
@@ -209,16 +192,16 @@ pub(crate) fn exec_numeric_seek_key(
     )
 }
 
-fn seek_bound(no_key: &Value) -> NoSeekKey {
-    let Value::Numeric(Numeric::Integer(no_key)) = no_key else {
-        unreachable!("the seek passes an integer for the missing key, got {no_key:?}");
+fn read_key_side(side: &Value) -> KeySide {
+    let Value::Numeric(Numeric::Integer(side)) = side else {
+        unreachable!("the seek passes an integer for the key side, got {side:?}");
     };
-    match *no_key {
-        n if n == NoSeekKey::Below as i64 => NoSeekKey::Below,
-        n if n == NoSeekKey::Above as i64 => NoSeekKey::Above,
+    match *side {
+        n if n == KeySide::Below as i64 => KeySide::Below,
+        n if n == KeySide::Above as i64 => KeySide::Above,
         n => {
-            turso_assert_eq!(n, NoSeekKey::Null as i64);
-            NoSeekKey::Null
+            turso_assert_eq!(n, KeySide::Equal as i64);
+            KeySide::Equal
         }
     }
 }
@@ -298,15 +281,15 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::types::compare_immutable_single;
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::execute::apply_affinity_char;
+    use crate::vdbe::execute::apply_affinity_char_in_test;
     use crate::vdbe::Register;
     use either::Either;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use std::cmp::Ordering;
 
-    fn no_key(no_key: NoSeekKey) -> Value {
-        Value::from_i64(no_key as i64)
+    fn side_value(side: KeySide) -> Value {
+        Value::from_i64(side as i64)
     }
 
     fn uuid_text(bytes: &[u8; 16]) -> String {
@@ -361,12 +344,12 @@ mod tests {
         for _ in 0..20_000 {
             let stored: [u8; 16] = rng.random();
             let operand = random_operand(&mut rng, &stored);
-            let equal_key = exec_uuid_seek_key(&operand, &no_key(NoSeekKey::Null)).unwrap();
+            let equal_key = exec_uuid_seek_key(&operand, &side_value(KeySide::Equal)).unwrap();
             let decoded_cmp = compare_decoded_with_operand(&stored, &operand);
             if matches!(equal_key, Value::Null) {
                 assert_ne!(decoded_cmp, Ordering::Equal, "{operand:?}");
-                let below = exec_uuid_seek_key(&operand, &no_key(NoSeekKey::Below)).unwrap();
-                let above = exec_uuid_seek_key(&operand, &no_key(NoSeekKey::Above)).unwrap();
+                let below = exec_uuid_seek_key(&operand, &side_value(KeySide::Below)).unwrap();
+                let above = exec_uuid_seek_key(&operand, &side_value(KeySide::Above)).unwrap();
                 assert_eq!(compare_stored_with_key(&stored, &below), Ordering::Greater);
                 assert_eq!(compare_stored_with_key(&stored, &above), Ordering::Less);
                 continue;
@@ -383,7 +366,7 @@ mod tests {
     fn seek_key_accepts_only_canonical_text() {
         let canonical = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
         let key =
-            exec_uuid_seek_key(&Value::build_text(canonical), &no_key(NoSeekKey::Null)).unwrap();
+            exec_uuid_seek_key(&Value::build_text(canonical), &side_value(KeySide::Equal)).unwrap();
         assert!(matches!(key, Value::Blob(ref b) if b.len() == 16));
         for operand in [
             Value::build_text(canonical.to_uppercase()),
@@ -395,7 +378,7 @@ mod tests {
             Value::from_i64(5),
             Value::Null,
         ] {
-            let key = exec_uuid_seek_key(&operand, &no_key(NoSeekKey::Null)).unwrap();
+            let key = exec_uuid_seek_key(&operand, &side_value(KeySide::Equal)).unwrap();
             assert!(matches!(key, Value::Null), "{operand:?}");
         }
     }
@@ -485,11 +468,13 @@ mod tests {
                 let near = rng.random_range(first..=last);
                 let operand = temporal_operand(&mut rng, kind, near);
                 let key = |bound| {
-                    integer_key(&exec_pg_temporal_seek_key(kind, &operand, &no_key(bound)).unwrap())
+                    integer_key(
+                        &exec_pg_temporal_seek_key(kind, &operand, &side_value(bound)).unwrap(),
+                    )
                 };
-                let equal = key(NoSeekKey::Null);
-                let lower = key(NoSeekKey::Below).unwrap();
-                let upper = key(NoSeekKey::Above).unwrap();
+                let equal = key(KeySide::Equal);
+                let lower = key(KeySide::Below).unwrap();
+                let upper = key(KeySide::Above).unwrap();
                 let mut samples: Vec<i64> = (0..50)
                     .map(|_| (near + rng.random_range(-100_000..100_000)).clamp(first, last))
                     .collect();
@@ -515,7 +500,7 @@ mod tests {
         let lower = exec_pg_temporal_seek_key(
             PgTemporal::Timestamp,
             &Value::build_text("2024-01-01"),
-            &no_key(NoSeekKey::Below),
+            &side_value(KeySide::Below),
         )
         .unwrap();
         let midnight = crate::functions::pg_types::exec_pg_temporal_encode(
@@ -563,12 +548,12 @@ mod tests {
             let scale_value = Value::from_i64(scale);
             let key = |bound| {
                 integer_key(
-                    &exec_pg_numeric_seek_key(&operand, &no_key(bound), &scale_value).unwrap(),
+                    &exec_pg_numeric_seek_key(&operand, &side_value(bound), &scale_value).unwrap(),
                 )
             };
-            let equal = key(NoSeekKey::Null);
-            let lower = key(NoSeekKey::Below).unwrap();
-            let upper = key(NoSeekKey::Above).unwrap();
+            let equal = key(KeySide::Equal);
+            let lower = key(KeySide::Below).unwrap();
+            let upper = key(KeySide::Above).unwrap();
             let mut samples: Vec<i64> = (0..30)
                 .map(|_| {
                     near.saturating_add(rng.random_range(-1000..1000))
@@ -631,7 +616,7 @@ mod tests {
     fn numeric_seek_key_raises_like_the_scan() {
         let message = exec_pg_numeric_seek_key(
             &Value::build_text("12.5abc"),
-            &no_key(NoSeekKey::Null),
+            &side_value(KeySide::Equal),
             &Value::from_i64(2),
         )
         .unwrap_err()
@@ -643,14 +628,16 @@ mod tests {
     fn numeric_seek_keys_refuse_type_parameters_that_are_not_integers() {
         let operand = Value::from_i64(1);
         let message =
-            exec_pg_numeric_seek_key(&operand, &no_key(NoSeekKey::Null), &Value::from_f64(2.5))
+            exec_pg_numeric_seek_key(&operand, &side_value(KeySide::Equal), &Value::from_f64(2.5))
                 .unwrap_err()
                 .to_string();
         assert!(message.contains("scale must be an integer"), "{message}");
-        assert!(
-            exec_pg_numeric_seek_key(&operand, &no_key(NoSeekKey::Null), &Value::from_i64(30))
-                .is_err()
-        );
+        assert!(exec_pg_numeric_seek_key(
+            &operand,
+            &side_value(KeySide::Equal),
+            &Value::from_i64(30)
+        )
+        .is_err());
         let message = exec_numeric_seek_key(&operand, &Value::from_i64(10), &Value::from_f64(2.5))
             .unwrap_err()
             .to_string();
@@ -700,8 +687,12 @@ mod tests {
                         comparison,
                         |side| {
                             integer_key(
-                                &exec_pg_temporal_seek_key(key_kind, &seek_operand, &no_key(side))
-                                    .unwrap(),
+                                &exec_pg_temporal_seek_key(
+                                    key_kind,
+                                    &seek_operand,
+                                    &side_value(side),
+                                )
+                                .unwrap(),
                             )
                         },
                         &stored_values,
@@ -756,12 +747,10 @@ mod tests {
 
     fn after_affinity(value: &Value, affinity: Affinity) -> Value {
         let mut register = Register::Value(value.clone());
-        apply_affinity_char(&mut register, affinity);
+        apply_affinity_char_in_test(&mut register, affinity);
         register.get_value().clone()
     }
 
-    /// The comparison of a scan: the column shows its DECODEd text, and both
-    /// operands are converted with the affinity of the comparison.
     fn temporal_scan_order(
         kind: PgTemporal,
         stored: i64,
@@ -788,24 +777,13 @@ mod tests {
     fn numeric_seek_reads_exactly_the_rows_of_the_scan() {
         let mut rng = ChaCha8Rng::seed_from_u64(37);
         for _ in 0..4_000 {
-            let precision = rng.random_range(1..=18);
-            let scale = rng.random_range(0..=precision);
-            let limit = 10i64.pow(precision as u32) - 1;
-            let near = match rng.random_range(0..4) {
-                0 => rng.random_range(-1000..1000).clamp(-limit, limit),
-                1 => [limit, -limit, 0][rng.random_range(0..3)],
-                _ => rng.random_range(-limit..=limit),
-            };
-            let operand = numeric_test_operand(&mut rng, near, scale);
+            let NumericTestCase {
+                precision,
+                scale,
+                operand,
+                stored_values,
+            } = numeric_test_case(&mut rng);
             let scale_value = Value::from_i64(scale);
-            let mut stored_values: Vec<i64> = (0..30)
-                .map(|_| {
-                    let distance = 10i64.pow(rng.random_range(0..precision as u32));
-                    near.saturating_add(rng.random_range(-distance..=distance))
-                        .clamp(-limit, limit)
-                })
-                .collect();
-            stored_values.extend([-limit, limit, 0, near]);
             let decoded: Vec<Value> = stored_values
                 .iter()
                 .map(|&stored| {
@@ -817,7 +795,8 @@ mod tests {
                 })
                 .collect();
             let key_error =
-                exec_pg_numeric_seek_key(&operand, &no_key(NoSeekKey::Null), &scale_value).is_err();
+                exec_pg_numeric_seek_key(&operand, &side_value(KeySide::Equal), &scale_value)
+                    .is_err();
             for comparison in COMPARISONS {
                 let scan: Vec<Result<bool>> = decoded
                     .iter()
@@ -842,7 +821,7 @@ mod tests {
                     comparison,
                     |side| {
                         integer_key(
-                            &exec_pg_numeric_seek_key(&operand, &no_key(side), &scale_value)
+                            &exec_pg_numeric_seek_key(&operand, &side_value(side), &scale_value)
                                 .unwrap(),
                         )
                     },
@@ -851,6 +830,84 @@ mod tests {
                     &format!("{operand:?} at numeric({precision}, {scale})"),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn numeric_scan_key_compares_like_the_decimals() {
+        let mut rng = ChaCha8Rng::seed_from_u64(41);
+        for _ in 0..4_000 {
+            let NumericTestCase {
+                precision,
+                scale,
+                operand,
+                stored_values,
+            } = numeric_test_case(&mut rng);
+            let scale_value = Value::from_i64(scale);
+            for comparison in SCAN_COMPARISONS {
+                let side = side_value(scan_key_side(&comparison.operator()));
+                let key = exec_pg_numeric_compare_key(&operand, &side, &scale_value).unwrap();
+                let Value::Numeric(Numeric::Integer(key)) = key else {
+                    assert_eq!(key, Value::Null, "{operand:?}");
+                    assert!(
+                        value_to_bigdecimal(&operand).is_err(),
+                        "{operand:?} is a number but has no key"
+                    );
+                    continue;
+                };
+                for &stored in &stored_values {
+                    let decoded = crate::functions::pg_types::exec_pg_numeric_decode(
+                        &Value::from_i64(stored),
+                        &scale_value,
+                    )
+                    .unwrap();
+                    let decimal = numeric_scan(comparison, &decoded, &operand).unwrap();
+                    assert_eq!(
+                        comparison.holds(stored.cmp(&key)),
+                        decimal,
+                        "{decoded:?} {comparison:?} {operand:?} at numeric({precision}, {scale}): key {key}"
+                    );
+                }
+            }
+        }
+        for comparison in SCAN_COMPARISONS {
+            let side = side_value(scan_key_side(&comparison.operator()));
+            let key =
+                exec_pg_numeric_compare_key(&Value::Null, &side, &Value::from_i64(2)).unwrap();
+            assert_eq!(key, Value::Null);
+        }
+    }
+
+    struct NumericTestCase {
+        precision: i64,
+        scale: i64,
+        operand: Value,
+        stored_values: Vec<i64>,
+    }
+
+    fn numeric_test_case(rng: &mut ChaCha8Rng) -> NumericTestCase {
+        let precision = rng.random_range(1..=18);
+        let scale = rng.random_range(0..=precision);
+        let limit = 10i64.pow(precision as u32) - 1;
+        let near = match rng.random_range(0..4) {
+            0 => rng.random_range(-1000..1000).clamp(-limit, limit),
+            1 => [limit, -limit, 0][rng.random_range(0..3)],
+            _ => rng.random_range(-limit..=limit),
+        };
+        let operand = numeric_test_operand(rng, near, scale);
+        let mut stored_values: Vec<i64> = (0..30)
+            .map(|_| {
+                let distance = 10i64.pow(rng.random_range(0..precision as u32));
+                near.saturating_add(rng.random_range(-distance..=distance))
+                    .clamp(-limit, limit)
+            })
+            .collect();
+        stored_values.extend([-limit, limit, 0, near]);
+        NumericTestCase {
+            precision,
+            scale,
+            operand,
+            stored_values,
         }
     }
 
@@ -873,9 +930,6 @@ mod tests {
         }
     }
 
-    /// The comparison of a scan: `numeric_lt` and `numeric_eq` read the
-    /// DECODEd column and the operand as decimals. The other operators are
-    /// derived from them as `find_operator_function` derives them.
     fn numeric_scan(comparison: Comparison, decoded: &Value, operand: &Value) -> Result<bool> {
         use crate::numeric::decimal::{exec_numeric_eq, exec_numeric_lt};
         let is_true = |value: Value| Ok(value == Value::from_i64(1));
@@ -889,82 +943,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn numeric_scan_key_compares_like_the_decimals() {
-        let mut rng = ChaCha8Rng::seed_from_u64(41);
-        for _ in 0..4_000 {
-            let precision = rng.random_range(1..=18);
-            let scale = rng.random_range(0..=precision);
-            let limit = 10i64.pow(precision as u32) - 1;
-            let near = match rng.random_range(0..4) {
-                0 => rng.random_range(-1000..1000).clamp(-limit, limit),
-                1 => [limit, -limit, 0][rng.random_range(0..3)],
-                _ => rng.random_range(-limit..=limit),
-            };
-            let operand = numeric_test_operand(&mut rng, near, scale);
-            let scale_value = Value::from_i64(scale);
-            let mut stored_values: Vec<i64> = (0..30)
-                .map(|_| {
-                    let distance = 10i64.pow(rng.random_range(0..precision as u32));
-                    near.saturating_add(rng.random_range(-distance..=distance))
-                        .clamp(-limit, limit)
-                })
-                .collect();
-            stored_values.extend([-limit, limit, 0, near]);
-            for comparison in SCAN_COMPARISONS {
-                let mode = no_key(scan_comparison_key(&comparison.operator()));
-                let key = exec_pg_numeric_compare_key(&operand, &mode, &scale_value).unwrap();
-                let Value::Numeric(Numeric::Integer(key)) = key else {
-                    assert_eq!(key, Value::Null, "{operand:?}");
-                    assert!(
-                        value_to_bigdecimal(&operand).is_err(),
-                        "{operand:?} is a number but has no key"
-                    );
-                    continue;
-                };
-                for &stored in &stored_values {
-                    let decoded = crate::functions::pg_types::exec_pg_numeric_decode(
-                        &Value::from_i64(stored),
-                        &scale_value,
-                    )
-                    .unwrap();
-                    let decimal = numeric_scan(comparison, &decoded, &operand).unwrap();
-                    assert_eq!(
-                        comparison.holds(stored.cmp(&key)),
-                        decimal,
-                        "{decoded:?} {comparison:?} {operand:?} at scale {scale}: key {key}"
-                    );
-                }
-            }
-        }
-        for comparison in SCAN_COMPARISONS {
-            let mode = no_key(scan_comparison_key(&comparison.operator()));
-            let key =
-                exec_pg_numeric_compare_key(&Value::Null, &mode, &Value::from_i64(2)).unwrap();
-            assert_eq!(key, Value::Null);
-        }
-    }
-
-    /// For every loop that can read an index for `column <comparison>
-    /// operand`, the rows that the seek reads must be exactly the rows for
-    /// which `scan` is true: no row in the bounds fails the comparison, and
-    /// no row outside the bounds passes it.
     fn assert_seek_reads_the_rows_of_the_scan(
         comparison: Comparison,
-        key: impl Fn(NoSeekKey) -> Option<i64>,
+        key: impl Fn(KeySide) -> Option<i64>,
         stored_values: &[i64],
         scan: impl Fn(i64) -> bool,
         context: &str,
     ) {
         let loops: Vec<SeekLoop> = match comparison {
-            Comparison::Eq => vec![SeekLoop::Equality(key(NoSeekKey::Null))],
+            Comparison::Eq => vec![SeekLoop::Equality(key(KeySide::Equal))],
             _ => [false, true]
                 .into_iter()
                 .flat_map(|backwards| [(backwards, SortOrder::Asc), (backwards, SortOrder::Desc)])
                 .map(|(backwards, order)| {
                     let bound = loop_bound(comparison, backwards, order);
                     let side = match bound {
-                        LoopBound::Seek(op) | LoopBound::Stop(op) => exact_bound_key(op, order),
+                        LoopBound::Seek(op) | LoopBound::Stop(op) => {
+                            exact_bound_key_side(op, order)
+                        }
                     };
                     SeekLoop::Range {
                         bound,
@@ -1047,9 +1043,6 @@ mod tests {
         Stop(SeekOp),
     }
 
-    /// The seek or the stop that `build_seek_def` gives the bound of a range
-    /// comparison `column <op> operand`, for the direction of the loop and the
-    /// order of the index.
     fn loop_bound(comparison: Comparison, backwards: bool, order: SortOrder) -> LoopBound {
         let ge = SeekOp::GE { eq_only: false };
         let le = SeekOp::LE { eq_only: false };
@@ -1073,26 +1066,6 @@ mod tests {
         }
     }
 
-    /// Whether the loop of the seek reads the row with the stored value. The
-    /// loop reads the entries that pass the operation of the seek, and ends
-    /// at the first entry that passes the operation of the stop.
-    fn loop_reads(bound: LoopBound, order: SortOrder, stored: i64, key: i64) -> bool {
-        let in_index_order = match order {
-            SortOrder::Asc => stored.cmp(&key),
-            SortOrder::Desc => key.cmp(&stored),
-        };
-        let passes = |op: SeekOp| match op {
-            SeekOp::GT => in_index_order.is_gt(),
-            SeekOp::GE { .. } => in_index_order.is_ge(),
-            SeekOp::LT => in_index_order.is_lt(),
-            SeekOp::LE { .. } => in_index_order.is_le(),
-        };
-        match bound {
-            LoopBound::Seek(op) => passes(op),
-            LoopBound::Stop(op) => !passes(op),
-        }
-    }
-
     #[derive(Debug, Clone, Copy)]
     enum SeekLoop {
         Equality(Option<i64>),
@@ -1109,6 +1082,23 @@ mod tests {
                 Self::Equality(key) => key == Some(stored),
                 Self::Range { bound, order, key } => loop_reads(bound, order, stored, key),
             }
+        }
+    }
+
+    fn loop_reads(bound: LoopBound, order: SortOrder, stored: i64, key: i64) -> bool {
+        let in_index_order = match order {
+            SortOrder::Asc => stored.cmp(&key),
+            SortOrder::Desc => key.cmp(&stored),
+        };
+        let passes = |op: SeekOp| match op {
+            SeekOp::GT => in_index_order.is_gt(),
+            SeekOp::GE { .. } => in_index_order.is_ge(),
+            SeekOp::LT => in_index_order.is_lt(),
+            SeekOp::LE { .. } => in_index_order.is_le(),
+        };
+        match bound {
+            LoopBound::Seek(op) => passes(op),
+            LoopBound::Stop(op) => !passes(op),
         }
     }
 }
