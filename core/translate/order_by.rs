@@ -421,7 +421,10 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
+                    if let Some(decode_expr) = type_def
+                        .decode()
+                        .filter(|decode_expr| !crate::schema::decode_is_identity(decode_expr))
+                    {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,

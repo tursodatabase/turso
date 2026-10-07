@@ -383,16 +383,21 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
         };
         // The write registers hold stored (encoded) values. Produce the
         // user-facing value in a fresh register so RETURNING shows decoded
-        // results — this is a no-op for regular columns.
-        let decoded_reg = program.alloc_register();
-        emit_user_facing_column_value(
-            program,
-            raw_reg,
-            decoded_reg,
-            column,
-            table.table.is_strict(),
-            resolver,
-        )?;
+        // results.
+        let decoded_reg = if column_decodes(column, table.table.is_strict(), resolver)? {
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                raw_reg,
+                decoded_reg,
+                column,
+                table.table.is_strict(),
+                resolver,
+            )?;
+            decoded_reg
+        } else {
+            raw_reg
+        };
         let expr = Expr::Column {
             database: None,
             table: table.internal_id,

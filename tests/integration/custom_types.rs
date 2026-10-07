@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::common::{ExecRows, TempDatabase};
+    use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
     use asserting::prelude::*;
     use tempfile::TempDir;
 
@@ -943,5 +943,62 @@ mod tests {
             .err()
             .display_string()
             .contains("table p was created by the PostgreSQL frontend");
+    }
+
+    /// A column whose types DECODE only to the stored value reads like a
+    /// column of its base type: no IsNull and no DECODE after its Column, so
+    /// consecutive reads fuse into one ColumnRange.
+    #[test]
+    fn test_identity_decode_columns_fuse_into_column_range() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE DOMAIN dint AS integer").unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, v varchar(5), j json, d dint) STRICT",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE p(id pg_int4 PRIMARY KEY, a pg_int8, n pg_int4, s text) STRICT, PGSTORAGE",
+        )
+        .unwrap();
+        conn.execute(r#"INSERT INTO t VALUES (1, 5, 'abc', '{"k":1}', 7)"#)
+            .unwrap();
+        conn.execute("INSERT INTO p VALUES (1, 9000000000, -3, 'x')")
+            .unwrap();
+
+        for (sql, columns) in [
+            ("SELECT b, v, j, d FROM t", 4),
+            ("SELECT a, n, s FROM p", 3),
+        ] {
+            let program = limbo_exec_rows(&conn, &format!("EXPLAIN {sql}"));
+            let opcodes: Vec<String> = program
+                .iter()
+                .map(|insn| match &insn[1] {
+                    rusqlite::types::Value::Text(opcode) => opcode.clone(),
+                    other => panic!("opcode is text: {other:?}"),
+                })
+                .collect();
+            assert!(
+                !opcodes.iter().any(|op| op == "IsNull"),
+                "{sql}: {opcodes:?}"
+            );
+            let ranges: Vec<_> = program
+                .iter()
+                .zip(&opcodes)
+                .filter(|(_, opcode)| *opcode == "ColumnRange")
+                .map(|(insn, _)| insn[5].clone())
+                .collect();
+            assert_eq!(
+                ranges,
+                vec![rusqlite::types::Value::Integer(columns)],
+                "{sql}: {opcodes:?}"
+            );
+        }
+
+        let rows: Vec<(i64, String, String, i64)> = conn.exec_rows("SELECT b, v, j, d FROM t");
+        assert_eq!(rows, vec![(5, "abc".into(), r#"{"k":1}"#.into(), 7)]);
+        let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT a, n, s FROM p");
+        assert_eq!(rows, vec![(9_000_000_000, -3, "x".into())]);
     }
 }

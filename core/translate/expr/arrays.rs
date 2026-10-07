@@ -306,29 +306,7 @@ pub(crate) fn emit_custom_type_decode_columns(
             continue;
         }
 
-        let type_name = &col.ty_str;
-        if type_name.is_empty() {
-            continue;
-        }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
-            continue;
-        };
-
-        // Skip NULL values: jump over decode if NULL
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_column_decode_in_place(program, reg, col, true, resolver)?;
     }
     Ok(())
 }

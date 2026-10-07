@@ -835,12 +835,16 @@ pub(crate) fn emit_column_decode_in_place(
     let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) else {
         return Ok(());
     };
+    let decodes: smallvec::SmallVec<[_; 2]> = chain_decodes(&resolved).collect();
+    if decodes.is_empty() {
+        return Ok(());
+    }
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
         reg,
         target_pc: skip_label,
     });
-    for (td, decode_expr) in chain_decodes(&resolved) {
+    for (td, decode_expr) in decodes {
         emit_type_expr(program, decode_expr, reg, reg, column, td, resolver)?;
     }
     program.preassign_label_to_next_insn(skip_label);
@@ -1025,13 +1029,16 @@ pub(crate) fn column_decodes(
 }
 
 /// The DECODE expressions of a type chain in the order that they run: the
-/// parent type first.
+/// parent type first. A DECODE that gives the stored value unchanged is
+/// left out, so a read of such a column is a plain Column that can be
+/// fused into a ColumnRange.
 fn chain_decodes(resolved: &ResolvedType) -> impl Iterator<Item = (&Arc<TypeDef>, &ast::Expr)> {
     resolved
         .chain
         .iter()
         .rev()
         .filter_map(|td| td.decode().map(|decode_expr| (td, decode_expr)))
+        .filter(|(_, decode_expr)| !crate::schema::decode_is_identity(decode_expr))
 }
 
 /// A comparison of a column of a `pg_` date or time type with a literal that
