@@ -285,6 +285,10 @@ fn make_sort_comparator(
                     (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
+                    (
+                        ValueRef::Numeric(Numeric::Integer(a)),
+                        ValueRef::Numeric(Numeric::Integer(b)),
+                    ) => a.cmp(b),
                     _ => {
                         // Decode from ValueRef to Value for value_to_bigdecimal
                         let a_val = a.to_owned()?;

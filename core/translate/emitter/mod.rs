@@ -2386,8 +2386,15 @@ pub(crate) fn emit_check_constraints<'a>(
     }
 
     let table_name = table.name.as_str();
+    let read_columns = columns_that_checks_read(check_constraints);
     let column_mappings = column_mappings
         .map(|(col_name, register)| {
+            let is_read = read_columns
+                .as_ref()
+                .is_none_or(|read_columns| read_columns.contains(&normalize_ident(col_name)));
+            if !is_read {
+                return Ok((col_name, register));
+            }
             emit_value_that_check_reads(program, resolver, table, col_name, register)
                 .map(|register| (col_name, register))
         })
@@ -2477,6 +2484,35 @@ pub(crate) fn emit_check_constraints<'a>(
     resolver.expr_to_reg_cache_enabled = false;
 
     result
+}
+
+/// The names of the columns that the CHECK constraints read, or `None` when
+/// an expression reads a column in another form.
+fn columns_that_checks_read(
+    check_constraints: &[CheckConstraint],
+) -> Option<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    let mut every_column = false;
+    for check in check_constraints {
+        walk_expr(
+            &check.expr,
+            &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                match expr {
+                    ast::Expr::Id(name)
+                    | ast::Expr::Name(name)
+                    | ast::Expr::Qualified(_, name)
+                    | ast::Expr::DoublyQualified(_, _, name) => {
+                        names.insert(normalize_ident(name.as_str()));
+                    }
+                    ast::Expr::Column { .. } => every_column = true,
+                    _ => {}
+                }
+                Ok(WalkControl::Continue)
+            },
+        )
+        .expect("the walk callback returns no error");
+    }
+    (!every_column).then_some(names)
 }
 
 /// A CHECK reads the value that a column shows. The registers hold stored

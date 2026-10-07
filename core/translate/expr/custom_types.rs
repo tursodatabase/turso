@@ -715,9 +715,13 @@ pub(crate) fn emit_dml_expr_index_value(
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
+    let read_columns = self_table_columns_read_by(&expr);
+    let reads_every_column = read_columns
+        .iter()
+        .any(|&i| columns[i].is_virtual_generated());
     let is_strict = table.is_strict;
     for (i, col) in columns.iter().enumerate() {
-        if col.is_rowid_alias() {
+        if col.is_rowid_alias() || !(reads_every_column || read_columns.contains(&i)) {
             continue;
         }
         let decodes = resolver
@@ -749,6 +753,20 @@ pub(crate) fn emit_dml_expr_index_value(
             resolver.with_self_table_context(program, Some(&ctx), translate)
         }
     })
+}
+
+fn self_table_columns_read_by(expr: &ast::Expr) -> std::collections::HashSet<usize> {
+    let mut columns = std::collections::HashSet::new();
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table, column, .. } = expr {
+            if table.is_self_table() {
+                columns.insert(*column);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("the walk callback returns no error");
+    columns
 }
 
 /// Where the expression of an index comes from. CREATE INDEX and DELETE
