@@ -656,6 +656,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        if self.db.tx_should_abort(self.tx_id) {
+            return Err(LimboError::CommitDependencyAborted.into());
+        }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -701,6 +704,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 if !found {
                     let Some(row) = self.eq_seek_row.as_ref().filter(|row| row.id == *row_id)
                     else {
+                        if self.db.tx_should_abort(self.tx_id) {
+                            return Err(LimboError::CommitDependencyAborted.into());
+                        }
                         return Ok(IOResult::Done(None));
                     };
                     record.invalidate();
