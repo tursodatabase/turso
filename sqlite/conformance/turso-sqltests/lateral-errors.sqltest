@@ -1,0 +1,310 @@
+@database :memory:
+
+# LATERAL statements that PostgreSQL 16 also rejects, and a few edge
+# cases that it accepts. The error messages are the messages of Turso.
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    CREATE TABLE t3(c INT, e TEXT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z');
+    INSERT INTO t3 VALUES (10, 'k'), (20, 'l');
+}
+
+@setup data
+test lateral-first-cannot-read-a-table-on-its-right {
+    SELECT * FROM LATERAL (SELECT t1.a) AS s, t1;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test lateral-cannot-read-a-table-after-it-in-a-comma-list {
+    SELECT * FROM t1, LATERAL (SELECT t2.c) AS s, t2;
+}
+expect error {
+    no such table: t2
+}
+
+@setup data
+test lateral-cannot-read-a-table-joined-after-it {
+    SELECT * FROM t1 JOIN LATERAL (SELECT t2.c) AS s ON true JOIN t2 ON t2.a = t1.a;
+}
+expect error {
+    no such table: t2
+}
+
+@setup data
+test lateral-cannot-read-a-later-lateral {
+    SELECT * FROM t1, LATERAL (SELECT u.v AS w) AS s, LATERAL (SELECT 1 AS v) AS u;
+}
+expect error {
+    no such table: u
+}
+
+@setup data
+test lateral-cannot-read-its-own-alias {
+    SELECT * FROM t1, LATERAL (SELECT s.x AS x) AS s;
+}
+expect error {
+    no such table: s
+}
+
+@setup data
+test lateral-in-a-where-subquery-cannot-read-a-later-table {
+    SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c = t3.c) AS s, t3;
+}
+expect error {
+    no such table: t3
+}
+
+@setup data
+test nested-lateral-cannot-read-a-table-on-the-right-of-the-outer-lateral {
+    SELECT * FROM t1, LATERAL (SELECT u.v FROM LATERAL (SELECT t3.c AS v) AS u) AS s, t3;
+}
+expect error {
+    no such table: t3
+}
+
+@setup data
+test lateral-cannot-read-a-table-name-hidden-by-an-alias {
+    SELECT * FROM t1 AS x, LATERAL (SELECT t1.a AS v) AS s;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test lateral-cannot-read-an-unknown-column-of-the-left-table {
+    SELECT * FROM t1, LATERAL (SELECT t1.z AS v) AS s;
+}
+expect error {
+    no such column: t1\.z
+}
+
+@setup data
+test lateral-cannot-read-an-unknown-table {
+    SELECT * FROM t1, LATERAL (SELECT t9.a AS v) AS s;
+}
+expect error {
+    no such table: t9
+}
+
+@setup data
+test lateral-ambiguous-unqualified-column {
+    SELECT * FROM t1, t2, LATERAL (SELECT a AS v) AS s;
+}
+expect error {
+    ambiguous column name: a
+}
+
+@setup data
+test right-join-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT t1.a AS v) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup data
+test right-outer-join-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 RIGHT OUTER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup data
+test full-join-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 FULL JOIN LATERAL (SELECT t1.a AS v) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup data
+test full-outer-join-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 FULL OUTER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup data
+test right-join-lateral-cannot-read-the-left-table-in-a-nested-subquery {
+    SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT (SELECT t1.a) AS v) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1": the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup data
+test sum-of-only-left-columns-is-not-allowed {
+    SELECT * FROM t1, LATERAL (SELECT sum(t1.a) AS v) AS s;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+@setup data
+test count-of-only-left-columns-is-not-allowed {
+    SELECT * FROM t1, LATERAL (SELECT count(t1.a) AS v FROM t2) AS s;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+@setup data
+test max-of-only-left-columns-is-not-allowed {
+    SELECT * FROM t1, LATERAL (SELECT max(t1.b) AS v FROM t2 WHERE t2.a = t1.a) AS s;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+@setup data
+test aggregate-of-left-columns-in-having-is-not-allowed {
+    SELECT * FROM t1, LATERAL (SELECT count(*) AS n FROM t2 HAVING sum(t1.a) > 0) AS s;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+@setup data
+test aggregate-of-left-columns-in-left-join-lateral-is-not-allowed {
+    SELECT * FROM t1 LEFT JOIN LATERAL (SELECT min(t1.a) AS v) AS s ON true;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+@setup data
+test aggregate-in-where-of-lateral-is-not-allowed {
+    SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE count(*) > 1) AS s;
+}
+expect error {
+    misuse of aggregate function count\(\*\)
+}
+
+@setup data
+test subquery-without-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1, (SELECT t1.a AS v) AS s;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test joined-subquery-without-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test left-joined-subquery-without-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1 LEFT JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test subquery-without-lateral-cannot-read-an-earlier-lateral {
+    SELECT * FROM t1, LATERAL (SELECT t1.a AS v) AS x, (SELECT x.v AS w) AS y;
+}
+expect error {
+    no such table: x
+}
+
+@setup data
+test values-without-lateral-cannot-read-the-left-table {
+    SELECT * FROM t1, (VALUES (t1.a)) AS s;
+}
+expect error {
+    no such table: t1
+}
+
+@setup data
+test lateral-before-a-table-name-is-a-syntax-error {
+    SELECT * FROM t1, LATERAL t2;
+}
+expect error {
+    no such table: LATERAL
+}
+
+@setup data
+test lateral-without-a-subquery-is-a-syntax-error {
+    SELECT * FROM t1, LATERAL;
+}
+expect error {
+    no such table: LATERAL
+}
+
+@setup data
+test lateral-before-a-select-without-parentheses-is-a-syntax-error {
+    SELECT * FROM t1, LATERAL SELECT 1;
+}
+expect error {
+    near "SELECT": syntax error
+}
+
+@setup data
+test on-clause-cannot-read-a-later-lateral {
+    SELECT * FROM t1 JOIN t2 ON t2.c = s.v, LATERAL (SELECT t1.a * 10 AS v) AS s;
+}
+expect error {
+    no such table: s
+}
+
+@setup data
+test lateral-alias-is-not-visible-inside-its-own-on-clause-subquery {
+    SELECT * FROM t1 JOIN LATERAL (SELECT t1.a AS v) AS s ON s.v = (SELECT s.v + 0);
+}
+expect {
+    1|p|1
+    2|q|2
+    3|r|3
+}
+
+@setup data
+test right-join-lateral-without-a-left-reference {
+    SELECT t1.a, s.v FROM t1 RIGHT JOIN LATERAL (SELECT 5 AS v) AS s ON t1.a > 1 ORDER BY 1;
+}
+expect {
+    2|5
+    3|5
+}
+
+@setup data
+test right-join-lateral-without-a-left-reference-and-no-match {
+    SELECT t1.a, s.v FROM t1 RIGHT JOIN LATERAL (SELECT 5 AS v UNION ALL SELECT 6) AS s ON t1.a * 3 = s.v ORDER BY 2;
+}
+expect {
+    |5
+    2|6
+}
+
+@setup data
+test aggregate-of-inner-and-left-columns-is-allowed {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT sum(t2.c + t1.a) AS v FROM t2) AS s ORDER BY 1;
+}
+expect {
+    1|63
+    2|66
+    3|69
+}
+
+@setup data
+test count-star-in-lateral-with-left-reference-in-where {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|0
+}

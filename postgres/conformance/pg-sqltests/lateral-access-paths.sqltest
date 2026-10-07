@@ -1,0 +1,2809 @@
+@database :memory:
+
+# Access paths of the tables on both sides of a LATERAL subquery: rowid
+# and index seeks, covering and multi-column indexes, IN lists, OR terms,
+# range scans, and larger tables where the planner picks hash joins and
+# automatic indexes inside the subquery.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, d TEXT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, c INT, e TEXT);
+    INSERT INTO t1 VALUES (1, 1, 50, 'p'), (2, 2, 40, 'q'), (3, 2, 30, 'r'), (4, 3, 20, 's'), (5, 4, 10, 't'), (6, 5, 60, 'u');
+    INSERT INTO t2 VALUES (1, 1, 10, 'k'), (2, 2, 20, 'l'), (3, 2, 30, 'm'), (4, 3, 40, 'n'), (5, 3, 45, 'o'), (6, 6, 60, 'p'), (7, 1, 15, 'q'), (8, 2, 25, 'r');
+}
+
+setup t1-a {
+    CREATE INDEX t1_a ON t1(a);
+}
+
+setup t1-b {
+    CREATE INDEX t1_b ON t1(b);
+}
+
+setup t1-a-b {
+    CREATE INDEX t1_a_b ON t1(a, b);
+}
+
+setup t1-a-b-d {
+    CREATE INDEX t1_a_b_d ON t1(a, b, d);
+}
+
+setup t2-a {
+    CREATE INDEX t2_a ON t2(a);
+}
+
+setup t2-a-c {
+    CREATE INDEX t2_a_c ON t2(a, c);
+}
+
+setup t2-c {
+    CREATE INDEX t2_c ON t2(c);
+}
+
+setup t2-unique-c {
+    CREATE UNIQUE INDEX t2_c_unique ON t2(c);
+}
+
+setup large {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE TABLE q(id INTEGER PRIMARY KEY, x INT, z INT);
+    WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO p SELECT n, n % 10, (n * 7) % 31 FROM c;
+    WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO q SELECT n, (n * 3) % 10, (n * 11) % 31 FROM c;
+    WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 40)
+    INSERT INTO o SELECT n, n % 12, (n * 5) % 17 FROM c;
+}
+
+setup large-indexes {
+    CREATE INDEX p_x ON p(x);
+    CREATE INDEX p_y ON p(y);
+    CREATE INDEX q_x ON q(x);
+    CREATE INDEX q_z ON q(z);
+    CREATE INDEX o_a ON o(a);
+}
+
+@setup data
+test left-rowid-equality {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.id = 3 ORDER BY 2;
+}
+expect {
+    3|20
+    3|25
+    3|30
+}
+
+@setup data
+test left-rowid-in-list {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.id IN (1, 4, 9) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    4|40
+    4|45
+}
+
+@setup data
+test left-rowid-range {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.id BETWEEN 2 AND 4 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+test left-rowid-range-desc {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.id > 3 ORDER BY t1.id DESC;
+}
+expect {
+    6|0
+    5|0
+    4|2
+}
+
+@setup data
+test left-rowid-read-inside-lateral {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.id = t1.id + 1) AS s ORDER BY 1;
+}
+expect {
+    1|l
+    2|m
+    3|n
+    4|o
+    5|p
+    6|q
+}
+
+@setup data
+test left-equality-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+}
+
+@setup data
+@setup t1-a
+test left-equality-on-a-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+}
+
+@setup data
+@setup t1-a-b
+test left-equality-on-a-index-on-a-b {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+}
+
+@setup data
+@setup t1-a-b-d
+test left-equality-on-a-covering-index {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+}
+
+@setup data
+test left-equality-on-a-lateral-reads-uncovered-column {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.d || e AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 3 ORDER BY 1, 2;
+}
+expect {
+    4|sn
+    4|so
+}
+
+@setup data
+@setup t1-a
+test left-equality-on-a-lateral-reads-uncovered-column-index-on-a {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.d || e AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 3 ORDER BY 1, 2;
+}
+expect {
+    4|sn
+    4|so
+}
+
+@setup data
+@setup t1-a-b
+test left-equality-on-a-lateral-reads-uncovered-column-index-on-a-b {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.d || e AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 3 ORDER BY 1, 2;
+}
+expect {
+    4|sn
+    4|so
+}
+
+@setup data
+@setup t1-a-b-d
+test left-equality-on-a-lateral-reads-uncovered-column-covering-index {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.d || e AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 3 ORDER BY 1, 2;
+}
+expect {
+    4|sn
+    4|so
+}
+
+@setup data
+test left-equality-on-a-lateral-reads-rowid {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.id * 100 + count(*) AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 2;
+}
+expect {
+    2|203
+    2|303
+}
+
+@setup data
+@setup t1-a
+test left-equality-on-a-lateral-reads-rowid-index-on-a {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.id * 100 + count(*) AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 2;
+}
+expect {
+    2|203
+    2|303
+}
+
+@setup data
+@setup t1-a-b
+test left-equality-on-a-lateral-reads-rowid-index-on-a-b {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.id * 100 + count(*) AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 2;
+}
+expect {
+    2|203
+    2|303
+}
+
+@setup data
+@setup t1-a-b-d
+test left-equality-on-a-lateral-reads-rowid-covering-index {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.id * 100 + count(*) AS v FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2 ORDER BY 2;
+}
+expect {
+    2|203
+    2|303
+}
+
+@setup data
+test left-in-list-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (1, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a
+test left-in-list-on-a-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (1, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a-b
+test left-in-list-on-a-index-on-a-b {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (1, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a-b-d
+test left-in-list-on-a-covering-index {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (1, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    4|40
+    4|45
+}
+
+@setup data
+test left-in-subquery-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (SELECT a FROM t2 WHERE c > 40) ORDER BY 1, 2;
+}
+expect {
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a
+test left-in-subquery-on-a-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (SELECT a FROM t2 WHERE c > 40) ORDER BY 1, 2;
+}
+expect {
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a-b
+test left-in-subquery-on-a-index-on-a-b {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (SELECT a FROM t2 WHERE c > 40) ORDER BY 1, 2;
+}
+expect {
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a-b-d
+test left-in-subquery-on-a-covering-index {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a IN (SELECT a FROM t2 WHERE c > 40) ORDER BY 1, 2;
+}
+expect {
+    4|40
+    4|45
+}
+
+@setup data
+test left-range-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a > 2 ORDER BY 1;
+}
+expect {
+    4|7
+    5|7
+    6|7
+}
+
+@setup data
+@setup t1-a
+test left-range-on-a-index-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a > 2 ORDER BY 1;
+}
+expect {
+    4|7
+    5|7
+    6|7
+}
+
+@setup data
+@setup t1-a-b
+test left-range-on-a-index-on-a-b {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a > 2 ORDER BY 1;
+}
+expect {
+    4|7
+    5|7
+    6|7
+}
+
+@setup data
+@setup t1-a-b-d
+test left-range-on-a-covering-index {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a > 2 ORDER BY 1;
+}
+expect {
+    4|7
+    5|7
+    6|7
+}
+
+@setup data
+test left-between-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a BETWEEN 2 AND 3 ORDER BY 1;
+}
+expect {
+    2|5
+    3|5
+    4|7
+}
+
+@setup data
+@setup t1-a
+test left-between-on-a-index-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a BETWEEN 2 AND 3 ORDER BY 1;
+}
+expect {
+    2|5
+    3|5
+    4|7
+}
+
+@setup data
+@setup t1-a-b
+test left-between-on-a-index-on-a-b {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a BETWEEN 2 AND 3 ORDER BY 1;
+}
+expect {
+    2|5
+    3|5
+    4|7
+}
+
+@setup data
+@setup t1-a-b-d
+test left-between-on-a-covering-index {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a BETWEEN 2 AND 3 ORDER BY 1;
+}
+expect {
+    2|5
+    3|5
+    4|7
+}
+
+@setup data
+test left-two-column-equality-and-range {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    2|n
+}
+
+@setup data
+@setup t1-a
+test left-two-column-equality-and-range-index-on-a {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    2|n
+}
+
+@setup data
+@setup t1-a-b
+test left-two-column-equality-and-range-index-on-a-b {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    2|n
+}
+
+@setup data
+@setup t1-a-b-d
+test left-two-column-equality-and-range-covering-index {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    2|n
+}
+
+@setup data
+test left-two-column-equality {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b = 30 ORDER BY 1, 2;
+}
+expect {
+    3|m
+}
+
+@setup data
+@setup t1-a
+test left-two-column-equality-index-on-a {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b = 30 ORDER BY 1, 2;
+}
+expect {
+    3|m
+}
+
+@setup data
+@setup t1-a-b
+test left-two-column-equality-index-on-a-b {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b = 30 ORDER BY 1, 2;
+}
+expect {
+    3|m
+}
+
+@setup data
+@setup t1-a-b-d
+test left-two-column-equality-covering-index {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s WHERE t1.a = 2 AND t1.b = 30 ORDER BY 1, 2;
+}
+expect {
+    3|m
+}
+
+@setup data
+test left-order-by-a-desc {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a DESC, t1.b DESC;
+}
+expect {
+    5|60|0
+    4|10|0
+    3|20|2
+    2|40|3
+    2|30|3
+    1|50|2
+}
+
+@setup data
+@setup t1-a
+test left-order-by-a-desc-index-on-a {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a DESC, t1.b DESC;
+}
+expect {
+    5|60|0
+    4|10|0
+    3|20|2
+    2|40|3
+    2|30|3
+    1|50|2
+}
+
+@setup data
+@setup t1-a-b
+test left-order-by-a-desc-index-on-a-b {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a DESC, t1.b DESC;
+}
+expect {
+    5|60|0
+    4|10|0
+    3|20|2
+    2|40|3
+    2|30|3
+    1|50|2
+}
+
+@setup data
+@setup t1-a-b-d
+test left-order-by-a-desc-covering-index {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a DESC, t1.b DESC;
+}
+expect {
+    5|60|0
+    4|10|0
+    3|20|2
+    2|40|3
+    2|30|3
+    1|50|2
+}
+
+@setup data
+test left-order-by-a-limit {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, t1.b LIMIT 3;
+}
+expect {
+    1|50|2
+    2|30|3
+    2|40|3
+}
+
+@setup data
+@setup t1-a
+test left-order-by-a-limit-index-on-a {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, t1.b LIMIT 3;
+}
+expect {
+    1|50|2
+    2|30|3
+    2|40|3
+}
+
+@setup data
+@setup t1-a-b
+test left-order-by-a-limit-index-on-a-b {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, t1.b LIMIT 3;
+}
+expect {
+    1|50|2
+    2|30|3
+    2|40|3
+}
+
+@setup data
+@setup t1-a-b-d
+test left-order-by-a-limit-covering-index {
+    SELECT t1.a, t1.b, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, t1.b LIMIT 3;
+}
+expect {
+    1|50|2
+    2|30|3
+    2|40|3
+}
+
+@setup data
+test left-min-of-a {
+    SELECT min(t1.a), max(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+}
+expect {
+    1|45
+}
+
+@setup data
+@setup t1-a
+test left-min-of-a-index-on-a {
+    SELECT min(t1.a), max(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+}
+expect {
+    1|45
+}
+
+@setup data
+@setup t1-a-b
+test left-min-of-a-index-on-a-b {
+    SELECT min(t1.a), max(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+}
+expect {
+    1|45
+}
+
+@setup data
+@setup t1-a-b-d
+test left-min-of-a-covering-index {
+    SELECT min(t1.a), max(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+}
+expect {
+    1|45
+}
+
+@setup data
+test left-covering-columns-only {
+    SELECT t1.a, t1.b, s.v FROM t1, LATERAL (SELECT t1.a * 1000 + t1.b AS v) AS s WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|30|2030
+    2|40|2040
+    3|20|3020
+    4|10|4010
+    5|60|5060
+}
+
+@setup data
+@setup t1-a
+test left-covering-columns-only-index-on-a {
+    SELECT t1.a, t1.b, s.v FROM t1, LATERAL (SELECT t1.a * 1000 + t1.b AS v) AS s WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|30|2030
+    2|40|2040
+    3|20|3020
+    4|10|4010
+    5|60|5060
+}
+
+@setup data
+@setup t1-a-b
+test left-covering-columns-only-index-on-a-b {
+    SELECT t1.a, t1.b, s.v FROM t1, LATERAL (SELECT t1.a * 1000 + t1.b AS v) AS s WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|30|2030
+    2|40|2040
+    3|20|3020
+    4|10|4010
+    5|60|5060
+}
+
+@setup data
+@setup t1-a-b-d
+test left-covering-columns-only-covering-index {
+    SELECT t1.a, t1.b, s.v FROM t1, LATERAL (SELECT t1.a * 1000 + t1.b AS v) AS s WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|30|2030
+    2|40|2040
+    3|20|3020
+    4|10|4010
+    5|60|5060
+}
+
+@setup data
+test left-or-over-two-indexed-columns {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 1 OR t1.b = 20 ORDER BY 1;
+}
+expect {
+    1|2
+    4|2
+}
+
+@setup data
+@setup t1-a
+@setup t1-b
+test left-or-over-two-indexed-columns-with-indexes {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 1 OR t1.b = 20 ORDER BY 1;
+}
+expect {
+    1|2
+    4|2
+}
+
+@setup data
+test left-or-over-two-indexed-columns-reads-both {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.a * 100 + t1.b + count(*) AS v FROM t2 WHERE t2.c >= t1.b) AS s WHERE t1.a = 4 OR t1.b = 40 ORDER BY 1;
+}
+expect {
+    2|243
+    5|418
+}
+
+@setup data
+@setup t1-a
+@setup t1-b
+test left-or-over-two-indexed-columns-reads-both-with-indexes {
+    SELECT t1.id, s.v FROM t1, LATERAL (SELECT t1.a * 100 + t1.b + count(*) AS v FROM t2 WHERE t2.c >= t1.b) AS s WHERE t1.a = 4 OR t1.b = 40 ORDER BY 1;
+}
+expect {
+    2|243
+    5|418
+}
+
+@setup data
+test left-or-of-in-and-range {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.id = t1.id) AS s WHERE t1.a IN (1, 5) OR t1.b < 25 ORDER BY 1;
+}
+expect {
+    1|k
+    4|n
+    5|o
+    6|p
+}
+
+@setup data
+@setup t1-a
+@setup t1-b
+test left-or-of-in-and-range-with-indexes {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.id = t1.id) AS s WHERE t1.a IN (1, 5) OR t1.b < 25 ORDER BY 1;
+}
+expect {
+    1|k
+    4|n
+    5|o
+    6|p
+}
+
+@setup data
+test left-index-on-b-range {
+    SELECT t1.b, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c BETWEEN t1.b - 5 AND t1.b + 5) AS s WHERE t1.b >= 30 ORDER BY 1, 2;
+}
+expect {
+    30|25
+    30|30
+    40|40
+    40|45
+    50|45
+    60|60
+}
+
+@setup data
+@setup t1-b
+test left-index-on-b-range-index-on-b {
+    SELECT t1.b, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c BETWEEN t1.b - 5 AND t1.b + 5) AS s WHERE t1.b >= 30 ORDER BY 1, 2;
+}
+expect {
+    30|25
+    30|30
+    40|40
+    40|45
+    50|45
+    60|60
+}
+
+@setup data
+test inner-equality-on-outer-column {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+@setup t2-a
+test inner-equality-on-outer-column-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+@setup t2-a-c
+test inner-equality-on-outer-column-index-on-a-c {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+test inner-equality-and-range-on-outer-columns {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b - 25) AS s ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+@setup t2-a
+test inner-equality-and-range-on-outer-columns-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b - 25) AS s ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+@setup t2-a-c
+test inner-equality-and-range-on-outer-columns-index-on-a-c {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b - 25) AS s ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+test inner-covering-index-order-by-limit {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|15
+    2|30
+    3|30
+    4|45
+}
+
+@setup data
+@setup t2-a
+test inner-covering-index-order-by-limit-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|15
+    2|30
+    3|30
+    4|45
+}
+
+@setup data
+@setup t2-a-c
+test inner-covering-index-order-by-limit-index-on-a-c {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|15
+    2|30
+    3|30
+    4|45
+}
+
+@setup data
+test inner-min-with-index {
+    SELECT t1.id, s.m FROM t1, LATERAL (SELECT min(c) AS m FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|20
+    4|40
+    5|
+    6|
+}
+
+@setup data
+@setup t2-a
+test inner-min-with-index-index-on-a {
+    SELECT t1.id, s.m FROM t1, LATERAL (SELECT min(c) AS m FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|20
+    4|40
+    5|
+    6|
+}
+
+@setup data
+@setup t2-a-c
+test inner-min-with-index-index-on-a-c {
+    SELECT t1.id, s.m FROM t1, LATERAL (SELECT min(c) AS m FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|20
+    4|40
+    5|
+    6|
+}
+
+@setup data
+test inner-in-list-of-outer-values {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, t1.a + 1)) AS s WHERE t1.id < 4 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    1|20
+    1|25
+    1|30
+    2|20
+    2|25
+    2|30
+    2|40
+    2|45
+    3|20
+    3|25
+    3|30
+    3|40
+    3|45
+}
+
+@setup data
+@setup t2-a
+test inner-in-list-of-outer-values-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, t1.a + 1)) AS s WHERE t1.id < 4 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    1|20
+    1|25
+    1|30
+    2|20
+    2|25
+    2|30
+    2|40
+    2|45
+    3|20
+    3|25
+    3|30
+    3|40
+    3|45
+}
+
+@setup data
+@setup t2-a-c
+test inner-in-list-of-outer-values-index-on-a-c {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, t1.a + 1)) AS s WHERE t1.id < 4 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|15
+    1|20
+    1|25
+    1|30
+    2|20
+    2|25
+    2|30
+    2|40
+    2|45
+    3|20
+    3|25
+    3|30
+    3|40
+    3|45
+}
+
+@setup data
+test inner-in-list-and-range {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, 6) AND t2.c >= 20) AS s ORDER BY 1, 2;
+}
+expect {
+    1|60
+    2|20
+    2|25
+    2|30
+    2|60
+    3|20
+    3|25
+    3|30
+    3|60
+    4|40
+    4|45
+    4|60
+    5|60
+    6|60
+}
+
+@setup data
+@setup t2-a
+test inner-in-list-and-range-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, 6) AND t2.c >= 20) AS s ORDER BY 1, 2;
+}
+expect {
+    1|60
+    2|20
+    2|25
+    2|30
+    2|60
+    3|20
+    3|25
+    3|30
+    3|60
+    4|40
+    4|45
+    4|60
+    5|60
+    6|60
+}
+
+@setup data
+@setup t2-a-c
+test inner-in-list-and-range-index-on-a-c {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, 6) AND t2.c >= 20) AS s ORDER BY 1, 2;
+}
+expect {
+    1|60
+    2|20
+    2|25
+    2|30
+    2|60
+    3|20
+    3|25
+    3|30
+    3|60
+    4|40
+    4|45
+    4|60
+    5|60
+    6|60
+}
+
+@setup data
+test inner-range-on-outer-column {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a > t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|6
+    2|3
+    3|3
+    4|1
+    5|1
+    6|1
+}
+
+@setup data
+@setup t2-a
+test inner-range-on-outer-column-index-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a > t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|6
+    2|3
+    3|3
+    4|1
+    5|1
+    6|1
+}
+
+@setup data
+@setup t2-a-c
+test inner-range-on-outer-column-index-on-a-c {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a > t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|6
+    2|3
+    3|3
+    4|1
+    5|1
+    6|1
+}
+
+@setup data
+test inner-range-between-outer-columns {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a BETWEEN t1.a - 1 AND t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|5
+    3|5
+    4|5
+    5|2
+    6|0
+}
+
+@setup data
+@setup t2-a
+test inner-range-between-outer-columns-index-on-a {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a BETWEEN t1.a - 1 AND t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|5
+    3|5
+    4|5
+    5|2
+    6|0
+}
+
+@setup data
+@setup t2-a-c
+test inner-range-between-outer-columns-index-on-a-c {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a BETWEEN t1.a - 1 AND t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|5
+    3|5
+    4|5
+    5|2
+    6|0
+}
+
+@setup data
+test inner-or-on-outer-columns {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a OR t2.c = t1.b) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|3
+    4|3
+    5|1
+    6|1
+}
+
+@setup data
+@setup t2-a
+@setup t2-c
+test inner-or-on-outer-columns-with-indexes {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a OR t2.c = t1.b) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|3
+    4|3
+    5|1
+    6|1
+}
+
+@setup data
+test inner-rowid-equality-on-outer-column {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.id = t1.a * 2) AS s ORDER BY 1;
+}
+expect {
+    1|l
+    2|n
+    3|n
+    4|p
+    5|r
+}
+
+@setup data
+test inner-rowid-range-on-outer-column {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.id > t1.id AND t2.id <= t1.id + 2) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|2
+    3|2
+    4|2
+    5|2
+    6|2
+}
+
+@setup data
+test inner-rowid-in-list-on-outer-column {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.id IN (t1.id, t1.id + 2)) AS s ORDER BY 1, 2;
+}
+expect {
+    1|k
+    1|m
+    2|l
+    2|n
+    3|m
+    3|o
+    4|n
+    4|p
+    5|o
+    5|q
+    6|p
+    6|r
+}
+
+@setup data
+test inner-unique-index-equality {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s ORDER BY 1;
+}
+expect {
+    2|n
+    3|m
+    4|l
+    5|k
+    6|p
+}
+
+@setup data
+@setup t2-unique-c
+test inner-unique-index-equality-with-unique-index {
+    SELECT t1.id, s.e FROM t1, LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s ORDER BY 1;
+}
+expect {
+    2|n
+    3|m
+    4|l
+    5|k
+    6|p
+}
+
+@setup data
+test inner-unique-index-left-join {
+    SELECT t1.id, s.e FROM t1 LEFT JOIN LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|n
+    3|m
+    4|l
+    5|k
+    6|p
+}
+
+@setup data
+@setup t2-unique-c
+test inner-unique-index-left-join-with-unique-index {
+    SELECT t1.id, s.e FROM t1 LEFT JOIN LATERAL (SELECT e FROM t2 WHERE t2.c = t1.b) AS s ON true ORDER BY 1;
+}
+expect {
+    1|
+    2|n
+    3|m
+    4|l
+    5|k
+    6|p
+}
+
+@setup data
+test both-sides-indexed {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c >= t1.b - 20) AS s WHERE t1.a IN (2, 3) ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+@setup t1-a
+@setup t2-a-c
+test both-sides-indexed-with-indexes {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c >= t1.b - 20) AS s WHERE t1.a IN (2, 3) ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|20
+    3|25
+    3|30
+    4|40
+    4|45
+}
+
+@setup data
+test both-sides-indexed-left-join {
+    SELECT t1.id, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b) AS s ON true WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|
+    3|
+    4|40
+    4|45
+    5|
+    6|
+}
+
+@setup data
+@setup t1-a
+@setup t2-a-c
+test both-sides-indexed-left-join-with-indexes {
+    SELECT t1.id, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b) AS s ON true WHERE t1.a >= 2 ORDER BY 1, 2;
+}
+expect {
+    2|
+    3|
+    4|40
+    4|45
+    5|
+    6|
+}
+
+@setup data
+test inner-self-join-with-index {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 AS x JOIN t2 AS y ON y.a = x.a WHERE x.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|9
+    3|9
+    4|4
+    5|0
+    6|0
+}
+
+@setup data
+@setup t2-a
+test inner-self-join-with-index-with-index {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 AS x JOIN t2 AS y ON y.a = x.a WHERE x.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|9
+    3|9
+    4|4
+    5|0
+    6|0
+}
+
+@setup data
+test inner-join-of-left-table-again {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t1 AS x JOIN t2 ON t2.a = x.a WHERE x.b > t1.b) AS s ORDER BY 1;
+}
+expect {
+    1|0
+    2|2
+    3|5
+    4|8
+    5|10
+    6|0
+}
+
+@setup data
+@setup t1-b
+@setup t2-a
+test inner-join-of-left-table-again-with-indexes {
+    SELECT t1.id, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t1 AS x JOIN t2 ON t2.a = x.a WHERE x.b > t1.b) AS s ORDER BY 1;
+}
+expect {
+    1|0
+    2|2
+    3|5
+    4|8
+    5|10
+    6|0
+}
+
+@setup data
+test table-after-lateral-joined-on-lateral-column {
+    SELECT t1.id, s.c, t2.e FROM t1, LATERAL (SELECT max(c) AS c FROM t2 WHERE t2.a = t1.a) AS s JOIN t2 ON t2.c = s.c ORDER BY 1;
+}
+expect {
+    1|15|q
+    2|30|m
+    3|30|m
+    4|45|o
+}
+
+@setup data
+@setup t2-c
+test table-after-lateral-joined-on-lateral-column-with-index {
+    SELECT t1.id, s.c, t2.e FROM t1, LATERAL (SELECT max(c) AS c FROM t2 WHERE t2.a = t1.a) AS s JOIN t2 ON t2.c = s.c ORDER BY 1;
+}
+expect {
+    1|15|q
+    2|30|m
+    3|30|m
+    4|45|o
+}
+
+@setup data
+@setup t2-unique-c
+test table-after-lateral-joined-on-lateral-column-with-unique-index {
+    SELECT t1.id, s.c, t2.e FROM t1, LATERAL (SELECT max(c) AS c FROM t2 WHERE t2.a = t1.a) AS s JOIN t2 ON t2.c = s.c ORDER BY 1;
+}
+expect {
+    1|15|q
+    2|30|m
+    3|30|m
+    4|45|o
+}
+
+@setup data
+test table-after-lateral-left-joined-on-lateral-column {
+    SELECT t1.id, s.c, t2.e FROM t1, LATERAL (SELECT t1.b - 10 AS c) AS s LEFT JOIN t2 ON t2.c = s.c ORDER BY 1;
+}
+expect {
+    1|40|n
+    2|30|m
+    3|20|l
+    4|10|k
+    5|0|
+    6|50|
+}
+
+@setup data
+@setup t2-c
+test table-after-lateral-left-joined-on-lateral-column-with-index {
+    SELECT t1.id, s.c, t2.e FROM t1, LATERAL (SELECT t1.b - 10 AS c) AS s LEFT JOIN t2 ON t2.c = s.c ORDER BY 1;
+}
+expect {
+    1|40|n
+    2|30|m
+    3|20|l
+    4|10|k
+    5|0|
+    6|50|
+}
+
+@setup data
+test table-before-lateral-filtered-by-lateral-column {
+    SELECT t1.id, t2.e, s.v FROM t1, t2, LATERAL (SELECT t1.b + 5 AS v) AS s WHERE t2.c = s.v ORDER BY 1;
+}
+expect {
+    2|o|45
+    4|r|25
+    5|q|15
+}
+
+@setup data
+@setup t2-c
+test table-before-lateral-filtered-by-lateral-column-with-index {
+    SELECT t1.id, t2.e, s.v FROM t1, t2, LATERAL (SELECT t1.b + 5 AS v) AS s WHERE t2.c = s.v ORDER BY 1;
+}
+expect {
+    2|o|45
+    4|r|25
+    5|q|15
+}
+
+@setup data
+@setup t2-unique-c
+test table-before-lateral-filtered-by-lateral-column-with-unique-index {
+    SELECT t1.id, t2.e, s.v FROM t1, t2, LATERAL (SELECT t1.b + 5 AS v) AS s WHERE t2.c = s.v ORDER BY 1;
+}
+expect {
+    2|o|45
+    4|r|25
+    5|q|15
+}
+
+@setup data
+test table-before-lateral-filtered-by-lateral-column-range {
+    SELECT t1.id, count(*) FROM t1, t2, LATERAL (SELECT t1.b AS v) AS s WHERE t2.c > s.v GROUP BY t1.id ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|5
+    5|7
+}
+
+@setup data
+@setup t2-c
+test table-before-lateral-filtered-by-lateral-column-range-with-index {
+    SELECT t1.id, count(*) FROM t1, t2, LATERAL (SELECT t1.b AS v) AS s WHERE t2.c > s.v GROUP BY t1.id ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|5
+    5|7
+}
+
+@setup data
+test lateral-reads-a-table-listed-after-a-filtered-table {
+    SELECT t2.id, t1.id, s.v FROM t2, t1, LATERAL (SELECT t1.d || t2.e AS v) AS s WHERE t2.a = t1.a AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    1|1|pk
+    2|2|ql
+    3|2|qm
+    7|1|pq
+    8|2|qr
+}
+
+@setup data
+@setup t1-a
+@setup t2-a
+test lateral-reads-a-table-listed-after-a-filtered-table-with-indexes {
+    SELECT t2.id, t1.id, s.v FROM t2, t1, LATERAL (SELECT t1.d || t2.e AS v) AS s WHERE t2.a = t1.a AND t1.b > 35 ORDER BY 1, 2;
+}
+expect {
+    1|1|pk
+    2|2|ql
+    3|2|qm
+    7|1|pq
+    8|2|qr
+}
+
+@setup data
+test left-table-filtered-by-a-lateral-of-a-later-table {
+    SELECT t2.id, s.v, t1.id FROM t2, LATERAL (SELECT t2.c + 10 AS v) AS s, t1 WHERE t1.b = s.v ORDER BY 1, 3;
+}
+expect {
+    1|20|4
+    2|30|3
+    3|40|2
+    4|50|1
+}
+
+@setup data
+@setup t1-b
+test left-table-filtered-by-a-lateral-of-a-later-table-with-index {
+    SELECT t2.id, s.v, t1.id FROM t2, LATERAL (SELECT t2.c + 10 AS v) AS s, t1 WHERE t1.b = s.v ORDER BY 1, 3;
+}
+expect {
+    1|20|4
+    2|30|3
+    3|40|2
+    4|50|1
+}
+
+@setup data
+test lateral-and-index-seek-on-the-left-table-with-filter-on-lateral {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE s.c = t1.a * 10 AND t1.a IN (1, 2, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+@setup data
+@setup t1-a
+test lateral-and-index-seek-on-the-left-table-with-filter-on-lateral-index-on-a {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE s.c = t1.a * 10 AND t1.a IN (1, 2, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+@setup data
+@setup t1-a-b
+test lateral-and-index-seek-on-the-left-table-with-filter-on-lateral-index-on-a-b {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE s.c = t1.a * 10 AND t1.a IN (1, 2, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+@setup data
+@setup t1-a-b-d
+test lateral-and-index-seek-on-the-left-table-with-filter-on-lateral-covering-index {
+    SELECT t1.id, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE s.c = t1.a * 10 AND t1.a IN (1, 2, 3) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+@setup data
+test left-join-lateral-anti-join {
+    SELECT t1.id FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NULL ORDER BY 1;
+}
+expect {
+    5
+    6
+}
+
+@setup data
+@setup t2-a
+test left-join-lateral-anti-join-index-on-a {
+    SELECT t1.id FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NULL ORDER BY 1;
+}
+expect {
+    5
+    6
+}
+
+@setup data
+@setup t2-a-c
+test left-join-lateral-anti-join-index-on-a-c {
+    SELECT t1.id FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true WHERE s.c IS NULL ORDER BY 1;
+}
+expect {
+    5
+    6
+}
+
+@setup data
+test left-join-lateral-anti-join-with-left-index {
+    SELECT t1.id FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b) AS s ON true WHERE s.c IS NULL AND t1.a >= 2 ORDER BY 1;
+}
+expect {
+    2
+    3
+    5
+    6
+}
+
+@setup data
+@setup t1-a
+@setup t2-a-c
+test left-join-lateral-anti-join-with-left-index-with-indexes {
+    SELECT t1.id FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a AND t2.c > t1.b) AS s ON true WHERE s.c IS NULL AND t1.a >= 2 ORDER BY 1;
+}
+expect {
+    2
+    3
+    5
+    6
+}
+
+@setup data
+test order-by-left-index-with-limit-and-lateral-rows {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, s.c LIMIT 4;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|20
+}
+
+@setup data
+@setup t1-a
+test order-by-left-index-with-limit-and-lateral-rows-index-on-a {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, s.c LIMIT 4;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|20
+}
+
+@setup data
+@setup t1-a-b
+test order-by-left-index-with-limit-and-lateral-rows-index-on-a-b {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, s.c LIMIT 4;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|20
+}
+
+@setup data
+@setup t1-a-b-d
+test order-by-left-index-with-limit-and-lateral-rows-covering-index {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY t1.a, s.c LIMIT 4;
+}
+expect {
+    1|10
+    1|15
+    2|20
+    2|20
+}
+
+@setup data
+test order-by-lateral-column-with-left-index {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a >= 2 ORDER BY s.c DESC, t1.a LIMIT 5;
+}
+expect {
+    3|45
+    4|45
+    5|45
+    3|40
+    4|40
+}
+
+@setup data
+@setup t1-a
+test order-by-lateral-column-with-left-index-index-on-a {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a >= 2 ORDER BY s.c DESC, t1.a LIMIT 5;
+}
+expect {
+    3|45
+    4|45
+    5|45
+    3|40
+    4|40
+}
+
+@setup data
+@setup t1-a-b
+test order-by-lateral-column-with-left-index-index-on-a-b {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a >= 2 ORDER BY s.c DESC, t1.a LIMIT 5;
+}
+expect {
+    3|45
+    4|45
+    5|45
+    3|40
+    4|40
+}
+
+@setup data
+@setup t1-a-b-d
+test order-by-lateral-column-with-left-index-covering-index {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a >= 2 ORDER BY s.c DESC, t1.a LIMIT 5;
+}
+expect {
+    3|45
+    4|45
+    5|45
+    3|40
+    4|40
+}
+
+@setup data
+test group-by-left-indexed-column-over-lateral {
+    SELECT t1.a, count(*), sum(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s GROUP BY t1.a ORDER BY 1;
+}
+expect {
+    1|2|25
+    2|6|150
+    3|2|85
+}
+
+@setup data
+@setup t1-a
+test group-by-left-indexed-column-over-lateral-index-on-a {
+    SELECT t1.a, count(*), sum(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s GROUP BY t1.a ORDER BY 1;
+}
+expect {
+    1|2|25
+    2|6|150
+    3|2|85
+}
+
+@setup data
+@setup t1-a-b
+test group-by-left-indexed-column-over-lateral-index-on-a-b {
+    SELECT t1.a, count(*), sum(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s GROUP BY t1.a ORDER BY 1;
+}
+expect {
+    1|2|25
+    2|6|150
+    3|2|85
+}
+
+@setup data
+@setup t1-a-b-d
+test group-by-left-indexed-column-over-lateral-covering-index {
+    SELECT t1.a, count(*), sum(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s GROUP BY t1.a ORDER BY 1;
+}
+expect {
+    1|2|25
+    2|6|150
+    3|2|85
+}
+
+@setup data
+test distinct-left-indexed-column-over-lateral {
+    SELECT DISTINCT t1.a FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup data
+@setup t1-a
+test distinct-left-indexed-column-over-lateral-index-on-a {
+    SELECT DISTINCT t1.a FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup data
+@setup t1-a-b
+test distinct-left-indexed-column-over-lateral-index-on-a-b {
+    SELECT DISTINCT t1.a FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup data
+@setup t1-a-b-d
+test distinct-left-indexed-column-over-lateral-covering-index {
+    SELECT DISTINCT t1.a FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup large
+test large-join-filter-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-join-filter-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+test large-join-filter-on-both-tables-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a AND p.x = o.b % 10) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+    9|29
+    10|0
+    11|0
+    12|29
+}
+
+@setup large
+@setup large-indexes
+test large-join-filter-on-both-tables-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a AND p.x = o.b % 10) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+    9|29
+    10|0
+    11|0
+    12|29
+}
+
+@setup large
+test large-join-condition-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z AND q.x = o.a) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-join-condition-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z AND q.x = o.a) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+test large-join-select-list-reads-outer {
+    SELECT o.id, s.total FROM o, LATERAL (SELECT sum(p.x + q.x + o.a) AS total FROM p JOIN q ON p.y = q.z WHERE p.id <= 50) AS s WHERE o.id <= 5 ORDER BY 1;
+}
+expect {
+    1|4840
+    2|5324
+    3|5808
+    4|6292
+    5|6776
+}
+
+@setup large
+@setup large-indexes
+test large-join-select-list-reads-outer-with-indexes {
+    SELECT o.id, s.total FROM o, LATERAL (SELECT sum(p.x + q.x + o.a) AS total FROM p JOIN q ON p.y = q.z WHERE p.id <= 50) AS s WHERE o.id <= 5 ORDER BY 1;
+}
+expect {
+    1|4840
+    2|5324
+    3|5808
+    4|6292
+    5|6776
+}
+
+@setup large
+test large-join-in-list-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x IN (o.a, o.b)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|580
+    2|291
+    3|290
+    4|580
+    5|580
+    6|290
+    7|581
+    8|580
+    9|290
+    10|0
+    11|290
+    12|581
+}
+
+@setup large
+@setup large-indexes
+test large-join-in-list-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x IN (o.a, o.b)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|580
+    2|291
+    3|290
+    4|580
+    5|580
+    6|290
+    7|581
+    8|580
+    9|290
+    10|0
+    11|290
+    12|581
+}
+
+@setup large
+test large-join-range-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE p.id < o.id * 5) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|39
+    2|87
+    3|135
+    4|184
+    5|233
+    6|281
+    7|329
+    8|377
+    9|426
+    10|475
+    11|523
+    12|571
+}
+
+@setup large
+@setup large-indexes
+test large-join-range-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE p.id < o.id * 5) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|39
+    2|87
+    3|135
+    4|184
+    5|233
+    6|281
+    7|329
+    8|377
+    9|426
+    10|475
+    11|523
+    12|571
+}
+
+@setup large
+test large-join-on-two-columns-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.x = q.x AND p.y = q.z WHERE p.x = o.a % 10) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+    9|29
+    10|30
+    11|29
+    12|30
+}
+
+@setup large
+@setup large-indexes
+test large-join-on-two-columns-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.x = q.x AND p.y = q.z WHERE p.x = o.a % 10) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+    9|29
+    10|30
+    11|29
+    12|30
+}
+
+@setup large
+test large-three-table-join-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z JOIN p AS r ON r.x = q.x WHERE r.y = o.b AND p.x = 3) AS s WHERE o.id <= 10 ORDER BY 1;
+}
+expect {
+    1|290
+    2|261
+    3|290
+    4|261
+    5|290
+    6|261
+    7|290
+    8|261
+    9|290
+    10|290
+}
+
+@setup large
+@setup large-indexes
+test large-three-table-join-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z JOIN p AS r ON r.x = q.x WHERE r.y = o.b AND p.x = 3) AS s WHERE o.id <= 10 ORDER BY 1;
+}
+expect {
+    1|290
+    2|261
+    3|290
+    4|261
+    5|290
+    6|261
+    7|290
+    8|261
+    9|290
+    10|290
+}
+
+@setup large
+test large-left-join-inside-reads-outer {
+    SELECT o.id, s.n, s.k FROM o, LATERAL (SELECT count(*) AS n, count(q.id) AS k FROM p LEFT JOIN q ON q.z = p.y AND q.x = o.a WHERE p.x = 1) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|30|29
+    2|30|29
+    3|30|29
+    4|30|29
+    5|30|29
+    6|30|29
+    7|30|29
+    8|30|29
+    9|30|29
+    10|30|0
+    11|30|0
+    12|30|29
+}
+
+@setup large
+@setup large-indexes
+test large-left-join-inside-reads-outer-with-indexes {
+    SELECT o.id, s.n, s.k FROM o, LATERAL (SELECT count(*) AS n, count(q.id) AS k FROM p LEFT JOIN q ON q.z = p.y AND q.x = o.a WHERE p.x = 1) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|30|29
+    2|30|29
+    3|30|29
+    4|30|29
+    5|30|29
+    6|30|29
+    7|30|29
+    8|30|29
+    9|30|29
+    10|30|0
+    11|30|0
+    12|30|29
+}
+
+@setup large
+test large-left-join-lateral-with-join-inside {
+    SELECT o.id, s.n FROM o LEFT JOIN LATERAL (SELECT p.id AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a AND p.x = o.b ORDER BY p.id LIMIT 1) AS s ON true WHERE o.id <= 20 ORDER BY 1;
+}
+expect {
+    1|5
+    2|
+    3|
+    4|3
+    5|8
+    6|
+    7|1
+    8|6
+    9|
+    10|
+    11|
+    12|9
+    13|
+    14|2
+    15|7
+    16|
+    17|10
+    18|5
+    19|
+    20|
+}
+
+@setup large
+@setup large-indexes
+test large-left-join-lateral-with-join-inside-with-indexes {
+    SELECT o.id, s.n FROM o LEFT JOIN LATERAL (SELECT p.id AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a AND p.x = o.b ORDER BY p.id LIMIT 1) AS s ON true WHERE o.id <= 20 ORDER BY 1;
+}
+expect {
+    1|5
+    2|
+    3|
+    4|3
+    5|8
+    6|
+    7|1
+    8|6
+    9|
+    10|
+    11|
+    12|9
+    13|
+    14|2
+    15|7
+    16|
+    17|10
+    18|5
+    19|
+    20|
+}
+
+@setup large
+test large-join-with-group-by-reads-outer {
+    SELECT o.id, s.x, s.n FROM o, LATERAL (SELECT p.x, count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a GROUP BY p.x ORDER BY count(*) DESC, p.x LIMIT 1) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|0|29
+    2|5|30
+    3|0|29
+    4|0|29
+    5|0|29
+    6|0|29
+    7|4|30
+    8|0|29
+    9|0|29
+    12|0|30
+}
+
+@setup large
+@setup large-indexes
+test large-join-with-group-by-reads-outer-with-indexes {
+    SELECT o.id, s.x, s.n FROM o, LATERAL (SELECT p.x, count(*) AS n FROM p JOIN q ON p.y = q.z WHERE q.x = o.a GROUP BY p.x ORDER BY count(*) DESC, p.x LIMIT 1) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|0|29
+    2|5|30
+    3|0|29
+    4|0|29
+    5|0|29
+    6|0|29
+    7|4|30
+    8|0|29
+    9|0|29
+    12|0|30
+}
+
+@setup large
+test large-join-distinct-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM (SELECT DISTINCT p.y FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) AS u) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|30
+    2|30
+    3|30
+    4|30
+    5|30
+    6|30
+    7|30
+    8|30
+    9|30
+    10|0
+    11|0
+    12|30
+}
+
+@setup large
+@setup large-indexes
+test large-join-distinct-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM (SELECT DISTINCT p.y FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) AS u) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|30
+    2|30
+    3|30
+    4|30
+    5|30
+    6|30
+    7|30
+    8|30
+    9|30
+    10|0
+    11|0
+    12|30
+}
+
+@setup large
+test large-join-exists-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE EXISTS (SELECT 1 FROM q WHERE q.z = p.y AND q.x = o.a)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-join-exists-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE EXISTS (SELECT 1 FROM q WHERE q.z = p.y AND q.x = o.a)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+test large-join-in-subquery-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE p.y IN (SELECT q.z FROM q WHERE q.x = o.a)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-join-in-subquery-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE p.y IN (SELECT q.z FROM q WHERE q.x = o.a)) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|0
+    11|0
+    12|291
+}
+
+@setup large
+test large-outer-table-with-lateral-join {
+    SELECT count(*), sum(s.n) FROM p, LATERAL (SELECT count(*) AS n FROM q WHERE q.x = p.x AND q.z < p.y) AS s;
+}
+expect {
+    300|4360
+}
+
+@setup large
+@setup large-indexes
+test large-outer-table-with-lateral-join-with-indexes {
+    SELECT count(*), sum(s.n) FROM p, LATERAL (SELECT count(*) AS n FROM q WHERE q.x = p.x AND q.z < p.y) AS s;
+}
+expect {
+    300|4360
+}
+
+@setup large
+test large-outer-table-with-lateral-hash-join {
+    SELECT count(*), sum(s.n) FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE p.x = o.a % 10 AND q.x = o.b % 10) AS s;
+}
+expect {
+    40|1162
+}
+
+@setup large
+@setup large-indexes
+test large-outer-table-with-lateral-hash-join-with-indexes {
+    SELECT count(*), sum(s.n) FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN q ON p.y = q.z WHERE p.x = o.a % 10 AND q.x = o.b % 10) AS s;
+}
+expect {
+    40|1162
+}
+
+@setup large
+test large-outer-join-then-lateral {
+    SELECT count(*), sum(s.n) FROM o JOIN p ON p.x = o.a, LATERAL (SELECT count(*) AS n FROM q WHERE q.z = p.y) AS s;
+}
+expect {
+    1020|9870
+}
+
+@setup large
+@setup large-indexes
+test large-outer-join-then-lateral-with-indexes {
+    SELECT count(*), sum(s.n) FROM o JOIN p ON p.x = o.a, LATERAL (SELECT count(*) AS n FROM q WHERE q.z = p.y) AS s;
+}
+expect {
+    1020|9870
+}
+
+@setup large
+test large-lateral-then-join {
+    SELECT count(*), sum(q.id) FROM o, LATERAL (SELECT p.y FROM p WHERE p.x = o.a % 10 ORDER BY p.id LIMIT 2) AS s JOIN q ON q.z = s.y WHERE o.id <= 10;
+}
+expect {
+    193|28908
+}
+
+@setup large
+@setup large-indexes
+test large-lateral-then-join-with-indexes {
+    SELECT count(*), sum(q.id) FROM o, LATERAL (SELECT p.y FROM p WHERE p.x = o.a % 10 ORDER BY p.id LIMIT 2) AS s JOIN q ON q.z = s.y WHERE o.id <= 10;
+}
+expect {
+    193|28908
+}
+
+@setup large
+test large-lateral-top-n {
+    SELECT o.id, s.id FROM o, LATERAL (SELECT q.id FROM q WHERE q.x = o.a % 10 ORDER BY q.z DESC, q.id LIMIT 2) AS s WHERE o.id <= 6 ORDER BY 1, 2;
+}
+expect {
+    1|107
+    1|197
+    2|14
+    2|214
+    3|121
+    3|231
+    4|28
+    4|138
+    5|45
+    5|245
+    6|152
+    6|262
+}
+
+@setup large
+@setup large-indexes
+test large-lateral-top-n-with-indexes {
+    SELECT o.id, s.id FROM o, LATERAL (SELECT q.id FROM q WHERE q.x = o.a % 10 ORDER BY q.z DESC, q.id LIMIT 2) AS s WHERE o.id <= 6 ORDER BY 1, 2;
+}
+expect {
+    1|107
+    1|197
+    2|14
+    2|214
+    3|121
+    3|231
+    4|28
+    4|138
+    5|45
+    5|245
+    6|152
+    6|262
+}
+
+@setup large
+test large-left-join-lateral-empty-for-some-rows {
+    SELECT o.id, s.n FROM o LEFT JOIN LATERAL (SELECT p.id AS n FROM p WHERE p.x = o.a AND p.y = o.b) AS s ON true WHERE o.id <= 20 ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|231
+    2|152
+    3|73
+    4|244
+    5|165
+    6|86
+    7|257
+    8|178
+    9|99
+    10|
+    11|
+    12|50
+    13|281
+    14|142
+    15|63
+    16|294
+    17|155
+    18|76
+    19|
+    20|228
+}
+
+@setup large
+@setup large-indexes
+test large-left-join-lateral-empty-for-some-rows-with-indexes {
+    SELECT o.id, s.n FROM o LEFT JOIN LATERAL (SELECT p.id AS n FROM p WHERE p.x = o.a AND p.y = o.b) AS s ON true WHERE o.id <= 20 ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|231
+    2|152
+    3|73
+    4|244
+    5|165
+    6|86
+    7|257
+    8|178
+    9|99
+    10|
+    11|
+    12|50
+    13|281
+    14|142
+    15|63
+    16|294
+    17|155
+    18|76
+    19|
+    20|228
+}
+
+@setup large
+test large-materialized-cte-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (WITH m AS MATERIALIZED (SELECT y FROM p WHERE p.x = o.a % 10) SELECT count(*) AS n FROM m JOIN q ON q.z = m.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|290
+    3|290
+    4|291
+    5|291
+    6|290
+    7|290
+    8|290
+    9|290
+    10|291
+    11|290
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-materialized-cte-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (WITH m AS MATERIALIZED (SELECT y FROM p WHERE p.x = o.a % 10) SELECT count(*) AS n FROM m JOIN q ON q.z = m.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|290
+    3|290
+    4|291
+    5|291
+    6|290
+    7|290
+    8|290
+    9|290
+    10|291
+    11|290
+    12|291
+}
+
+@setup large
+test large-cte-used-twice-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (WITH m AS (SELECT y FROM p WHERE p.x = o.a % 10 AND p.id <= 100) SELECT count(*) AS n FROM m AS m1 JOIN m AS m2 ON m1.y = m2.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|10
+    2|10
+    3|10
+    4|10
+    5|10
+    6|10
+    7|10
+    8|10
+    9|10
+    10|10
+    11|10
+    12|10
+}
+
+@setup large
+@setup large-indexes
+test large-cte-used-twice-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (WITH m AS (SELECT y FROM p WHERE p.x = o.a % 10 AND p.id <= 100) SELECT count(*) AS n FROM m AS m1 JOIN m AS m2 ON m1.y = m2.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|10
+    2|10
+    3|10
+    4|10
+    5|10
+    6|10
+    7|10
+    8|10
+    9|10
+    10|10
+    11|10
+    12|10
+}
+
+@setup large
+test large-subquery-build-side-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN (SELECT z FROM q WHERE q.x = o.a % 10) AS u ON u.z = p.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|291
+    11|290
+    12|291
+}
+
+@setup large
+@setup large-indexes
+test large-subquery-build-side-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM p JOIN (SELECT z FROM q WHERE q.x = o.a % 10) AS u ON u.z = p.y) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|290
+    5|290
+    6|290
+    7|291
+    8|290
+    9|290
+    10|291
+    11|290
+    12|291
+}
+
+@setup large
+test large-union-inside-reads-outer {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM (SELECT y FROM p WHERE p.x = o.a % 10 UNION SELECT z FROM q WHERE q.x = o.b % 10) AS u) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|31
+    2|31
+    3|31
+    4|31
+    5|31
+    6|31
+    7|31
+    8|31
+    9|31
+    10|31
+    11|31
+    12|31
+}
+
+@setup large
+@setup large-indexes
+test large-union-inside-reads-outer-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT count(*) AS n FROM (SELECT y FROM p WHERE p.x = o.a % 10 UNION SELECT z FROM q WHERE q.x = o.b % 10) AS u) AS s WHERE o.id <= 12 ORDER BY 1;
+}
+expect {
+    1|31
+    2|31
+    3|31
+    4|31
+    5|31
+    6|31
+    7|31
+    8|31
+    9|31
+    10|31
+    11|31
+    12|31
+}
+
+@setup large
+test large-nested-lateral-with-joins {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT sum(u.k) AS n FROM p, LATERAL (SELECT count(*) AS k FROM q WHERE q.z = p.y AND q.x = o.a % 10) AS u WHERE p.x = o.b % 10) AS s WHERE o.id <= 8 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+}
+
+@setup large
+@setup large-indexes
+test large-nested-lateral-with-joins-with-indexes {
+    SELECT o.id, s.n FROM o, LATERAL (SELECT sum(u.k) AS n FROM p, LATERAL (SELECT count(*) AS k FROM q WHERE q.z = p.y AND q.x = o.a % 10) AS u WHERE p.x = o.b % 10) AS s WHERE o.id <= 8 ORDER BY 1;
+}
+expect {
+    1|29
+    2|29
+    3|29
+    4|29
+    5|29
+    6|29
+    7|29
+    8|29
+}
+
+@setup large
+test large-window-inside-reads-outer {
+    SELECT o.id, s.id, s.r FROM o, LATERAL (SELECT q.id, row_number() OVER (ORDER BY q.z, q.id) AS r FROM q WHERE q.x = o.a % 10) AS s WHERE o.id <= 3 AND s.r <= 2 ORDER BY 1, 3;
+}
+expect {
+    1|217|1
+    1|17|2
+    2|124|1
+    2|234|2
+    3|31|1
+    3|141|2
+}
+
+@setup large
+@setup large-indexes
+test large-window-inside-reads-outer-with-indexes {
+    SELECT o.id, s.id, s.r FROM o, LATERAL (SELECT q.id, row_number() OVER (ORDER BY q.z, q.id) AS r FROM q WHERE q.x = o.a % 10) AS s WHERE o.id <= 3 AND s.r <= 2 ORDER BY 1, 3;
+}
+expect {
+    1|217|1
+    1|17|2
+    2|124|1
+    2|234|2
+    3|31|1
+    3|141|2
+}
+
+@setup large
+test large-group-by-outside-of-lateral {
+    SELECT o.a, count(*), sum(s.n) FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE p.x = o.a % 10 AND p.y > o.b) AS s GROUP BY o.a ORDER BY 1;
+}
+expect {
+    0|3|70
+    1|4|76
+    2|4|92
+    3|4|72
+    4|4|84
+    5|3|70
+    6|3|58
+    7|3|75
+    8|3|59
+    9|3|61
+    10|3|66
+    11|3|65
+}
+
+@setup large
+@setup large-indexes
+test large-group-by-outside-of-lateral-with-indexes {
+    SELECT o.a, count(*), sum(s.n) FROM o, LATERAL (SELECT count(*) AS n FROM p WHERE p.x = o.a % 10 AND p.y > o.b) AS s GROUP BY o.a ORDER BY 1;
+}
+expect {
+    0|3|70
+    1|4|76
+    2|4|92
+    3|4|72
+    4|4|84
+    5|3|70
+    6|3|58
+    7|3|75
+    8|3|59
+    9|3|61
+    10|3|66
+    11|3|65
+}
