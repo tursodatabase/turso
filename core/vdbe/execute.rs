@@ -27,6 +27,7 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
     default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
 };
+use crate::storage::parsed_header::ColumnPresence;
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
@@ -2193,17 +2194,16 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    match return_if_io!(
+        state,
+        cursor.read_column_into(column, &mut state.registers[dest])
+    ) {
+        ColumnPresence::Present => {}
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
-        state.registers[dest].set_null();
-        return Ok(InsnFunctionStepResult::Step);
-    };
-    match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
-        Some(result) => result?,
-        None => {
+        ColumnPresence::NoRow => state.registers[dest].set_null(),
+        ColumnPresence::Missing => {
             branches::mark_unlikely();
-            // The record has fewer columns than expected.
             apply_column_default(default, &mut state.registers[dest])?;
         }
     }
@@ -2407,14 +2407,15 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some(filled) = return_if_io!(
+        state,
+        cursor.read_columns_into(start_column, &mut state.registers[dest..dest + count])
+    ) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }
         return Ok(InsnFunctionStepResult::Step);
     };
-    let filled = ValueIterator::new(payload)?
-        .decode_into_registers_after(start_column, &mut state.registers[dest..dest + count])?;
     if filled < count {
         branches::mark_unlikely();
         // The record has fewer columns than expected.

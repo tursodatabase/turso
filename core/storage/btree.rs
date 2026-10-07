@@ -20,6 +20,7 @@ use crate::{
     schema::{BTreeTable, Index},
     storage::{
         pager::{BtreePageAllocMode, Pager},
+        parsed_header::{ColumnPresence, ParsedHeader},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
@@ -908,6 +909,10 @@ pub struct BTreeCursor {
     /// wherever the reusable record is invalidated and before every write
     /// through the cursor, because it holds an offset into the page.
     noted_payload: NotedPayload,
+    /// The serial types and value positions of the record under the cursor,
+    /// for the column reads of the current row. Forgotten together with
+    /// `noted_payload`, see [`BTreeCursor::forget_current_row_layout`].
+    parsed_header: ParsedHeader,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -989,6 +994,15 @@ pub struct BTreeCursor {
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
+}
+
+/// Where the payload of the row under a cursor is.
+#[derive(Clone, Copy)]
+enum CurrentPayload {
+    /// On the page under the cursor.
+    OnPage(&'static [u8]),
+    /// In the cursor's record, because the payload has overflow pages.
+    Copied,
 }
 
 /// See [`BTreeCursor::noted_payload`]. A payload is never empty (its header
@@ -1229,6 +1243,7 @@ impl BTreeCursor {
             },
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
+            parsed_header: ParsedHeader::new(),
             index_info,
             count: 0,
             context: None,
@@ -6434,7 +6449,7 @@ impl BTreeCursor {
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_current_row_layout();
         // The tree is about to change under this cursor (that is the only reason a
         // position ever gets saved), so cached payload offsets and overflow page
         // numbers must not survive: blob I/O through them would touch relocated or
@@ -6659,6 +6674,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
+        self.forget_current_row_layout();
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
@@ -6727,6 +6743,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> IOResultOr<()> {
+        self.forget_current_row_layout();
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
@@ -6741,6 +6758,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
+        self.forget_current_row_layout();
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
@@ -6810,6 +6828,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.forget_current_row_layout();
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6828,6 +6847,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
+        self.forget_current_row_layout();
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6882,51 +6902,19 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
+        let Some(payload) = return_if_io!(self.current_payload()) else {
             return Ok(IOResult::Done(None));
-        }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
-
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+        };
+        Ok(IOResult::Done(Some(payload_bytes(
+            payload,
+            &self.reusable_immutable_record,
+        ))))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_current_row_layout();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -6934,6 +6922,7 @@ impl CursorTrait for BTreeCursor {
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
         }
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -6951,7 +6940,7 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_current_row_layout();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -6980,11 +6969,11 @@ impl CursorTrait for BTreeCursor {
                     ) {
                         if return_if_io!(self.rowid()).is_none() {
                             self.state = CursorState::None;
-                            return Ok(IOResult::Done(()));
+                            break;
                         }
                     } else if !self.has_record() {
                         self.state = CursorState::None;
-                        return Ok(IOResult::Done(()));
+                        break;
                     }
 
                     self.state = CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey);
@@ -7296,14 +7285,14 @@ impl CursorTrait for BTreeCursor {
                             // except we need to retreat, so that the next call to BTreeCursor::next() lands at the next record (because we deleted the current one)
                             self.stack.retreat();
                             self.state = CursorState::None;
-                            return Ok(IOResult::Done(()));
+                            break;
                         }
                     }
                 }
                 DeleteState::PostInteriorNodeReplacement => {
                     return_if_io!(self.get_next_record());
                     self.state = CursorState::None;
-                    return Ok(IOResult::Done(()));
+                    break;
                 }
 
                 DeleteState::Balancing {
@@ -7322,10 +7311,12 @@ impl CursorTrait for BTreeCursor {
                     // a row when deleting rows in a loop.
                     self.skip_advance = true;
                     self.state = CursorState::None;
-                    return Ok(IOResult::Done(()));
+                    break;
                 }
             }
         }
+        self.invalidate_record();
+        Ok(IOResult::Done(()))
     }
 
     #[inline(always)]
@@ -7360,6 +7351,7 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> IOResultOr<u64> {
+        self.forget_current_row_layout();
         // First entry only — destroy_btree_contents yields IO and resumes
         // through this method, so guard with the same state==None gate it
         // uses for its own state machine. Every page in this btree is about
@@ -7374,7 +7366,9 @@ impl CursorTrait for BTreeCursor {
             // reallocated to an unrelated page after a refill).
             self.move_to_right_state.1 = None;
         }
-        self.destroy_btree_contents(true)
+        let cleared = return_if_io!(self.destroy_btree_contents(true));
+        self.has_record = false;
+        Ok(IOResult::Done(cleared))
     }
 
     /// Destroys the entire B-Tree, including the root page.
@@ -7385,14 +7379,16 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
+        self.forget_current_row_layout();
         // See clear_btree for the state==None gate rationale.
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
         }
-        let destroyed = self.destroy_btree_contents(false)?;
+        return_if_io!(self.destroy_btree_contents(false));
+        self.has_record = false;
         //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
         //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
-        Ok(destroyed.map(|_| None))
+        Ok(IOResult::Done(None))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
@@ -7400,6 +7396,7 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize> {
+        self.forget_current_row_layout();
         let mut mem_page;
         let mut contents;
 
@@ -7558,11 +7555,13 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn set_root_page(&mut self, root_page: i64) {
+        self.forget_current_row_layout();
         self.root_page = root_page;
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> IOResultOr<()> {
+        self.forget_current_row_layout();
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
@@ -7598,7 +7597,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn invalidate_record(&mut self) {
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_current_row_layout();
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
@@ -7623,7 +7622,7 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
         self.has_record = false;
-        self.noted_payload = NotedPayload::NONE;
+        self.forget_current_row_layout();
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
         self.blob_cache.reset();
@@ -7766,6 +7765,7 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        self.forget_current_row_layout();
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
@@ -7837,8 +7837,93 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// Reads column `column` of the row under the cursor into `dest`.
+    #[inline(always)]
+    pub(crate) fn read_column_into(
+        &mut self,
+        column: usize,
+        dest: &mut Register,
+    ) -> IOResultOr<ColumnPresence> {
+        let Some(payload) = return_if_io!(self.current_payload()) else {
+            return Ok(IOResult::Done(ColumnPresence::NoRow));
+        };
+        let payload = payload_bytes(payload, &self.reusable_immutable_record);
+        let presence = self.parsed_header.read_column_into(payload, column, dest)?;
+        Ok(IOResult::Done(presence))
+    }
+
+    /// Reads the columns of the row under the cursor from `start` on into
+    /// `dests`. None when the cursor is on no row, else how many of the
+    /// columns the record has.
+    #[inline(always)]
+    pub(crate) fn read_columns_into(
+        &mut self,
+        start: usize,
+        dests: &mut [Register],
+    ) -> IOResultOr<Option<usize>> {
+        let Some(payload) = return_if_io!(self.current_payload()) else {
+            return Ok(IOResult::Done(None));
+        };
+        let payload = payload_bytes(payload, &self.reusable_immutable_record);
+        let read = self
+            .parsed_header
+            .read_columns_into(payload, start, dests)?;
+        Ok(IOResult::Done(Some(read)))
+    }
+
+    /// Where the payload of the row under the cursor is. None when the
+    /// cursor is on no row or on a null row.
+    #[inline(always)]
+    fn current_payload(&mut self) -> IOResultOr<Option<CurrentPayload>> {
+        if self.needs_restore() {
+            return restore_then_current_payload(self);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    turso_debug_assert!(
+                        self.noted_payload_is_current_cell(),
+                        "the noted payload is not the payload of the cell under the cursor"
+                    );
+                    return Ok(IOResult::Done(Some(CurrentPayload::OnPage(payload))));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(CurrentPayload::OnPage(payload))));
+        }
+        return self.current_payload_general();
+
+        #[inline(never)]
+        fn restore_then_current_payload(
+            cursor: &mut BTreeCursor,
+        ) -> IOResultOr<Option<CurrentPayload>> {
+            return_if_io!(cursor.restore_context());
+            cursor.current_payload()
+        }
+    }
+
     #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+    fn current_payload_general(&mut self) -> IOResultOr<Option<CurrentPayload>> {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
@@ -7849,10 +7934,29 @@ impl BTreeCursor {
                 start: payload_start as u32,
                 size: payload.len() as u32,
             };
-            return Ok(IOResult::Done(Some(payload)));
+            return Ok(IOResult::Done(Some(CurrentPayload::OnPage(payload))));
         }
         let record = return_if_io!(self.record());
-        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+        Ok(IOResult::Done(record.map(|_| CurrentPayload::Copied)))
+    }
+
+    fn noted_payload_is_current_cell(&self) -> bool {
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index() as usize;
+        matches!(
+            contents.cell_read_payload_at(cell_idx, self.payload_limits),
+            Ok((payload, start, _, None))
+                if start == self.noted_payload.start as usize
+                    && payload.len() == self.noted_payload.size as usize
+        )
+    }
+
+    /// Forgets where the payload of the row under the cursor is and how its
+    /// header parses. Called wherever the row under the cursor can change.
+    #[inline(always)]
+    fn forget_current_row_layout(&mut self) {
+        self.noted_payload = NotedPayload::NONE;
+        self.parsed_header.forget();
     }
 
     /// True when the next cell is on the same leaf page and no resumable
@@ -7897,6 +8001,16 @@ impl BTreeCursor {
             || !self.has_record
             || self.read_overflow_state.is_some()
             || self.iteration_pending_descent.is_some()
+    }
+}
+
+fn payload_bytes(payload: CurrentPayload, record: &Option<ImmutableRecord>) -> &[u8] {
+    match payload {
+        CurrentPayload::OnPage(bytes) => bytes,
+        CurrentPayload::Copied => record
+            .as_ref()
+            .expect("a copied payload is in the cursor's record")
+            .get_payload(),
     }
 }
 
@@ -14391,7 +14505,7 @@ mod tests {
         /// Boxed cursor pinned to its heap location for the duration of the
         /// test — register_cursor stores raw pointers, so the cursor must
         /// not be moved after registration.
-        fn make_registered_cursor(
+        pub(super) fn make_registered_cursor(
             pager: &Arc<Pager>,
             root_page: i64,
             num_columns: usize,
@@ -14770,6 +14884,326 @@ mod tests {
                 Some(5),
                 "peer must observe its saved rowid after a left-of-it peer insert"
             );
+        }
+    }
+
+    /// Column reads through the parsed header of a cursor after every kind of
+    /// change of the row under it.
+    mod column_reads {
+        use super::save_all_cursors::make_registered_cursor;
+        use super::*;
+        use crate::storage::parsed_header::ColumnPresence;
+        use test_log::test;
+
+        fn row(rowid: i64, text: &str) -> Vec<Value> {
+            vec![
+                Value::from_i64(rowid),
+                Value::build_text(text.to_string()),
+                Value::from_i64(rowid * 10),
+            ]
+        }
+
+        fn write_row(cursor: &mut BTreeCursor, pager: &Arc<Pager>, rowid: i64, values: &[Value]) {
+            let record = ImmutableRecord::from_values(values, values.len()).unwrap();
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(rowid, Some(&record))),
+                pager.deref(),
+            )
+            .unwrap();
+        }
+
+        fn read_column(cursor: &mut BTreeCursor, pager: &Pager, column: usize) -> Option<Value> {
+            let mut dest = Register::Value(Value::Null);
+            match run_until_done(|| cursor.read_column_into(column, &mut dest), pager).unwrap() {
+                ColumnPresence::Present => Some(dest.get_value().clone()),
+                ColumnPresence::NoRow => None,
+                ColumnPresence::Missing => panic!("column {column} is missing"),
+            }
+        }
+
+        fn read_columns(
+            cursor: &mut BTreeCursor,
+            pager: &Pager,
+            start: usize,
+        ) -> Option<Vec<Value>> {
+            let mut dests = vec![Register::Value(Value::Null); 3 - start];
+            let read =
+                run_until_done(|| cursor.read_columns_into(start, &mut dests), pager).unwrap()?;
+            Some(
+                dests[..read]
+                    .iter()
+                    .map(|r| r.get_value().clone())
+                    .collect(),
+            )
+        }
+
+        /// Reads the columns out of order, and then checks them against the
+        /// row whose rowid the cursor reports. The rowid read comes last
+        /// because it notes where the payload is.
+        fn assert_reads_row_under_cursor(
+            cursor: &mut BTreeCursor,
+            pager: &Pager,
+            rows: &HashMap<i64, Vec<Value>>,
+        ) {
+            let columns = [2, 0, 1].map(|column| read_column(cursor, pager, column));
+            let range = read_columns(cursor, pager, 1);
+            match run_until_done(|| cursor.rowid(), pager).unwrap() {
+                Some(rowid) => {
+                    let expected = &rows[&rowid];
+                    for (column, read) in [2, 0, 1].into_iter().zip(columns) {
+                        assert_eq!(
+                            read.as_ref(),
+                            Some(&expected[column]),
+                            "column {column} of row {rowid}"
+                        );
+                    }
+                    assert_eq!(range.as_deref(), Some(&expected[1..]));
+                }
+                None => assert_eq!(columns, [None, None, None]),
+            }
+        }
+
+        /// Rows 1 to 5, and rows 10 to 17 that fill half of the page, so that
+        /// an overwrite or a delete of a small row does not balance the page.
+        fn rows_one_to_five(
+            cursor: &mut BTreeCursor,
+            pager: &Arc<Pager>,
+        ) -> HashMap<i64, Vec<Value>> {
+            let mut rows = HashMap::default();
+            for rowid in 1..=5 {
+                let values = row(rowid, &format!("row {rowid}"));
+                write_row(cursor, pager, rowid, &values);
+                rows.insert(rowid, values);
+            }
+            for rowid in 10..=17 {
+                let values = row(rowid, &"f".repeat(250));
+                write_row(cursor, pager, rowid, &values);
+                rows.insert(rowid, values);
+            }
+            rows
+        }
+
+        /// Rows with the same payload size as `row(3, "x")` but other serial
+        /// types, so that an overwrite keeps the cell in place.
+        fn same_size_other_types() -> Vec<Value> {
+            vec![
+                Value::build_text("y"),
+                Value::from_i64(33),
+                Value::build_text("z"),
+            ]
+        }
+
+        #[test]
+        fn peer_overwrites_and_deletes_change_what_a_cursor_reads() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 3);
+            let mut reader = make_registered_cursor(&pager, root_page, 3);
+            let mut rows = rows_one_to_five(&mut writer, &pager);
+            run_until_done(
+                || reader.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_reads_row_under_cursor(&mut reader, &pager, &rows);
+
+            let overwrites = [
+                row(3, "a text that is much longer than the text before"),
+                row(3, "x"),
+                same_size_other_types(),
+            ];
+            for values in overwrites {
+                read_column(&mut reader, &pager, 2);
+                write_row(&mut writer, &pager, 3, &values);
+                rows.insert(3, values);
+                assert_reads_row_under_cursor(&mut reader, &pager, &rows);
+            }
+
+            read_column(&mut reader, &pager, 2);
+            run_until_done(
+                || writer.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            rows.remove(&3);
+            assert_reads_row_under_cursor(&mut reader, &pager, &rows);
+            run_until_done(|| reader.next(), pager.deref()).unwrap();
+            assert_reads_row_under_cursor(&mut reader, &pager, &rows);
+        }
+
+        #[test]
+        fn own_overwrites_and_deletes_change_what_the_cursor_reads() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = make_registered_cursor(&pager, root_page, 3);
+            let mut rows = rows_one_to_five(&mut cursor, &pager);
+            let overwrites = [
+                row(3, "a text that is much longer than the text before"),
+                row(3, "x"),
+                same_size_other_types(),
+            ];
+            for values in overwrites {
+                run_until_done(
+                    || cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                    pager.deref(),
+                )
+                .unwrap();
+                assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+                write_row(&mut cursor, &pager, 3, &values);
+                rows.insert(3, values);
+                assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            }
+
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+            rows.remove(&3);
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+
+            run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+            run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+            rows.remove(&1);
+            run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+            assert_eq!(
+                read_column(&mut cursor, &pager, 2),
+                Some(Value::from_i64(20))
+            );
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+        }
+
+        #[test]
+        fn index_insert_of_an_overflow_key_reads_the_inserted_key() {
+            use crate::storage::pager::CreateBTreeFlags;
+            let (pager, _, _db, _conn) = empty_btree();
+            let index_root_page = pager
+                .io
+                .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+                .unwrap() as i64;
+            let index_def = Index {
+                name: "column_reads_index".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(vec!["key"]),
+                table_name: "column_reads".to_string(),
+                root_page: index_root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: false,
+                index_method: None,
+                on_conflict: None,
+            };
+            let mut cursor =
+                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
+            let key = |first: u8| {
+                let mut bytes = crate::alloc::vec![first; 3000];
+                bytes[1] = 0;
+                let values = [Value::Blob(bytes)];
+                ImmutableRecord::from_values(&values, values.len()).unwrap()
+            };
+            for first in [1u8, 3, 2] {
+                let record = key(first);
+                run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: false },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+            }
+            let Some(Value::Blob(read)) = read_column(&mut cursor, &pager, 0) else {
+                panic!("the cursor is on the inserted key");
+            };
+            assert_eq!(read.len(), 3000);
+            assert_eq!(read[0], 2, "the key under the cursor after its insert");
+        }
+
+        #[test]
+        fn overflow_rows_null_flag_and_moves() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = make_registered_cursor(&pager, root_page, 3);
+            let mut rows = HashMap::default();
+            for (rowid, text) in [
+                (1, "o".repeat(6000)),
+                (2, "small".to_string()),
+                (3, "p".repeat(7000)),
+            ] {
+                let values = row(rowid, &text);
+                write_row(&mut cursor, &pager, rowid, &values);
+                rows.insert(rowid, values);
+            }
+            run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+            for _ in 0..3 {
+                assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+            }
+            run_until_done(|| cursor.last(), pager.deref()).unwrap();
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            run_until_done(|| cursor.prev(), pager.deref()).unwrap();
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+
+            cursor.set_null_flag(true);
+            assert_eq!(read_column(&mut cursor, &pager, 2), None);
+            assert_eq!(read_columns(&mut cursor, &pager, 0), None);
+            cursor.set_null_flag(false);
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+        }
+
+        #[test]
+        fn seek_end_then_append_reads_the_new_row() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = make_registered_cursor(&pager, root_page, 3);
+            let mut rows = rows_one_to_five(&mut cursor, &pager);
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            run_until_done(|| cursor.seek_end(), pager.deref()).unwrap();
+            let values = row(6, "appended");
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(6, Some(&record))),
+                pager.deref(),
+            )
+            .unwrap();
+            rows.insert(6, values);
+            assert_eq!(
+                run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+                Some(6)
+            );
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+        }
+
+        #[test]
+        fn clear_btree_leaves_no_row_to_read() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut cursor = make_registered_cursor(&pager, root_page, 3);
+            let rows = rows_one_to_five(&mut cursor, &pager);
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            run_until_done(|| cursor.clear_btree(), pager.deref()).unwrap();
+            assert_eq!(read_column(&mut cursor, &pager, 2), None);
+            assert_eq!(read_columns(&mut cursor, &pager, 0), None);
         }
     }
 

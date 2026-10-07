@@ -3939,7 +3939,7 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
-fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
+pub(crate) fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
     let bytes = *header;
     if let Some((first, rest)) = bytes.split_first() {
         if *first < 0x80 {
@@ -3974,7 +3974,7 @@ fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
 /// and moves `data` past it.
 #[inline(always)]
-fn decode_serial_type_into_register(
+pub(crate) fn decode_serial_type_into_register(
     serial_type: u64,
     data: &mut &[u8],
     dest: &mut Register,
