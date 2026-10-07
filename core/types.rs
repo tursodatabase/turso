@@ -4710,6 +4710,140 @@ mod tests {
         }
     }
 
+    /// Every comparator gives the result of a compare of each field with
+    /// cmp_in_column (the rule of MVCC and of compare_immutable_iter), up to
+    /// the shortest of the record, the key and the KeyInfo list, and else the
+    /// tie breaker.
+    #[test]
+    fn compare_payload_matches_a_compare_of_each_field() {
+        use rand_chacha::{
+            rand_core::{RngCore, SeedableRng},
+            ChaCha8Rng,
+        };
+        use turso_parser::ast::NullsOrder;
+
+        let pool = [
+            Value::Null,
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(-1),
+            Value::from_i64(127),
+            Value::from_i64(-128),
+            Value::from_i64(128),
+            Value::from_i64(32767),
+            Value::from_i64(-32768),
+            Value::from_i64(32768),
+            Value::from_i64(8_388_607),
+            Value::from_i64(-8_388_608),
+            Value::from_i64(2_147_483_647),
+            Value::from_i64(-2_147_483_648),
+            Value::from_i64(2_147_483_648),
+            Value::from_i64(140_737_488_355_327),
+            Value::from_i64(-140_737_488_355_328),
+            Value::from_i64(i64::MAX),
+            Value::from_i64(i64::MIN),
+            Value::from_f64(5.0),
+            Value::from_f64(-0.0),
+            Value::from_f64(0.5),
+            Value::from_f64(1.0),
+            Value::from_f64(9.223_372_036_854_776e18),
+            Value::from_f64(-9.223_372_036_854_776e18),
+            Value::build_text(""),
+            Value::build_text("a"),
+            Value::build_text("A"),
+            Value::build_text("a "),
+            Value::build_text("b"),
+            Value::build_text("é"),
+            Value::build_text("Éa"),
+            Value::Blob(vec![]),
+            Value::Blob(vec![0]),
+            Value::Blob(vec![b'a']),
+        ];
+        let sort_orders = [SortOrder::Asc, SortOrder::Desc];
+        let collations = [
+            CollationSeq::Binary,
+            CollationSeq::NoCase,
+            CollationSeq::Rtrim,
+        ];
+        let nulls_orders = [None, Some(NullsOrder::First), Some(NullsOrder::Last)];
+        let tie_breakers = [
+            std::cmp::Ordering::Less,
+            std::cmp::Ordering::Equal,
+            std::cmp::Ordering::Greater,
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(13);
+        let mut pick = |len: usize| rng.next_u64() as usize % len;
+
+        for case in 0..50_000 {
+            let lhs_len = 1 + pick(6);
+            let lhs: Vec<Value> = (0..lhs_len)
+                .map(|_| pool[pick(pool.len())].clone())
+                .collect();
+            let rhs_len = pick(lhs_len + 2);
+            let rhs: Vec<Value> = (0..rhs_len)
+                .map(|i| {
+                    if i < lhs_len && pick(2) == 0 {
+                        lhs[i].clone()
+                    } else {
+                        pool[pick(pool.len())].clone()
+                    }
+                })
+                .collect();
+            let key_count = 1 + pick(lhs_len + 1);
+            let key_info: Vec<KeyInfo> = (0..key_count)
+                .map(|_| KeyInfo {
+                    sort_order: sort_orders[pick(2)],
+                    collation: collations[pick(3)],
+                    nulls_order: nulls_orders[pick(3)],
+                })
+                .collect();
+            let num_cols = if pick(2) == 0 {
+                key_count
+            } else {
+                14 + pick(4)
+            };
+            let index_info =
+                IndexInfo::new(key_info.iter().copied(), false, num_cols, false).unwrap();
+            let tie_breaker = tie_breakers[pick(3)];
+
+            let mut expected = tie_breaker;
+            for ((l, r), key) in lhs.iter().zip(&rhs).zip(&key_info) {
+                let comparison = cmp_in_column(&l.as_value_ref(), &r.as_value_ref(), key);
+                if comparison.is_ne() {
+                    expected = comparison;
+                    break;
+                }
+            }
+
+            let record = create_record(lhs.clone());
+            let payload = record.get_payload();
+            let rhs_refs: Vec<ValueRef> = rhs.iter().map(Value::as_ref).collect();
+            let context = format!("case {case}: {lhs:?} {rhs:?} {key_info:?} {tie_breaker:?}");
+            let compare = |comparer: RecordCompare| {
+                comparer
+                    .compare_payload(payload, &rhs_refs, &index_info, tie_breaker)
+                    .unwrap()
+            };
+            assert_eq!(
+                compare_record(payload, rhs_refs.iter(), &index_info, tie_breaker).unwrap(),
+                expected,
+                "{context}"
+            );
+            assert_eq!(compare(RecordCompare::Generic), expected, "{context}");
+            if let Some(ValueRef::Numeric(Numeric::Integer(first))) = rhs_refs.first() {
+                let comparer = RecordCompare::Int {
+                    rhs_first_value: *first,
+                };
+                assert_eq!(compare(comparer), expected, "{context}");
+            }
+            if matches!(rhs_refs.first(), Some(ValueRef::Text(_)))
+                && key_info[0].collation == CollationSeq::Binary
+            {
+                assert_eq!(compare(RecordCompare::String), expected, "{context}");
+            }
+        }
+    }
+
     #[test]
     fn test_skip_parameter() {
         let index_info = create_index_info(
