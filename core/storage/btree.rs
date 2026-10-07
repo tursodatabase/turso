@@ -7871,6 +7871,17 @@ impl BTreeCursor {
         Ok(IOResult::Done(Some(read)))
     }
 
+    /// Whether the record under the cursor has `column`, without a copy of
+    /// the record.
+    pub(crate) fn column_presence(&mut self, column: usize) -> IOResultOr<ColumnPresence> {
+        let Some(payload) = return_if_io!(self.current_payload()) else {
+            return Ok(IOResult::Done(ColumnPresence::NoRow));
+        };
+        let payload = payload_bytes(payload, &self.reusable_immutable_record);
+        let presence = self.parsed_header.column_presence(payload, column)?;
+        Ok(IOResult::Done(presence))
+    }
+
     /// Where the payload of the row under the cursor is. None when the
     /// cursor is on no row or on a null row.
     #[inline(always)]
@@ -15159,8 +15170,30 @@ mod tests {
             cursor.set_null_flag(true);
             assert_eq!(read_column(&mut cursor, &pager, 2), None);
             assert_eq!(read_columns(&mut cursor, &pager, 0), None);
+            assert_eq!(
+                column_presence(&mut cursor, &pager, 2),
+                ColumnPresence::NoRow
+            );
             cursor.set_null_flag(false);
             assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+            run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+            assert_eq!(
+                column_presence(&mut cursor, &pager, 2),
+                ColumnPresence::Present
+            );
+            assert_eq!(
+                column_presence(&mut cursor, &pager, 3),
+                ColumnPresence::Missing
+            );
+            assert_reads_row_under_cursor(&mut cursor, &pager, &rows);
+        }
+
+        fn column_presence(
+            cursor: &mut BTreeCursor,
+            pager: &Pager,
+            column: usize,
+        ) -> ColumnPresence {
+            run_until_done(|| cursor.column_presence(column), pager).unwrap()
         }
 
         #[test]

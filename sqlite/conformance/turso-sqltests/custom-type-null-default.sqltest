@@ -163,3 +163,18 @@ expect {
     0||1
     ||1
 }
+
+test custom-type-default-short-record-with-overflow-payload {
+    CREATE TYPE cents_ov BASE integer ENCODE (value * 100) DECODE (value / 100);
+    CREATE TABLE t_ov(id INTEGER PRIMARY KEY, big TEXT) STRICT;
+    INSERT INTO t_ov VALUES (1, printf('%.6000c', 'x'));
+    INSERT INTO t_ov VALUES (2, 'small');
+    ALTER TABLE t_ov ADD COLUMN amount cents_ov DEFAULT 7;
+    INSERT INTO t_ov VALUES (3, printf('%.7000c', 'y'), 9);
+    SELECT id, length(big), amount, amount IS NULL FROM t_ov ORDER BY id;
+}
+expect {
+    1|6000|7|0
+    2|5|7|0
+    3|7000|9|0
+}

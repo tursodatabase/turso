@@ -2557,7 +2557,7 @@ fn op_column_range_fetch_other(
 }
 
 pub fn op_column_has_field(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -2573,31 +2573,20 @@ pub fn op_column_has_field(
     if !target_pc.is_offset() {
         return Err(unresolved_branch_target(*target_pc));
     }
+    turso_assert!(
+        state.deferred_seeks[*cursor_id].is_none(),
+        "the Column before ColumnHasField does the deferred seek",
+        { "cursor_id": *cursor_id }
+    );
 
-    let (_, cursor_type) = program
-        .cursor_ref
-        .get(*cursor_id)
-        .expect("cursor_id should exist in cursor_ref");
-
-    let record_is_short = match cursor_type {
-        CursorType::BTreeTable(_)
-        | CursorType::BTreeIndex(_)
-        | CursorType::MaterializedView(_, _) => {
-            let cursor_ref =
-                must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
-            if matches!(cursor_ref, Cursor::NullRow) {
-                false
-            } else {
-                let cursor = cursor_ref.as_btree_mut();
-                if cursor.get_null_flag() {
-                    false
-                } else {
-                    match return_if_io!(state, cursor.record()) {
-                        Some(record) => record.column_count() <= *column,
-                        None => false,
-                    }
-                }
-            }
+    let record_is_short = match get_cursor!(state, *cursor_id) {
+        Cursor::BTree(cursor, ..) => {
+            return_if_io!(state, cursor.column_presence(*column)) == ColumnPresence::Missing
+        }
+        Cursor::Dyn(cursor, ..) => {
+            !cursor.get_null_flag()
+                && return_if_io!(state, cursor.record())
+                    .is_some_and(|record| record.column_count() <= *column)
         }
         _ => false,
     };

@@ -114,6 +114,17 @@ impl ParsedHeader {
         Ok(read)
     }
 
+    pub(crate) fn column_presence(
+        &mut self,
+        payload: &[u8],
+        column: usize,
+    ) -> Result<ColumnPresence> {
+        Ok(match self.locate(payload, column)? {
+            Some(_) => ColumnPresence::Present,
+            None => ColumnPresence::Missing,
+        })
+    }
+
     /// The serial type and value position of `column`, or None when the
     /// record is too short to have it.
     #[inline(always)]
@@ -375,6 +386,34 @@ mod tests {
         assert_eq!(
             read_range(&mut header, payload, last, 3),
             vec![values[last].clone()]
+        );
+    }
+
+    #[test]
+    fn presence_of_a_column_follows_the_length_of_the_record() {
+        let short = record(&[Value::from_i64(1), Value::build_text("a")]);
+        let mut header = ParsedHeader::new();
+        for (column, presence) in [
+            (1, ColumnPresence::Present),
+            (2, ColumnPresence::Missing),
+            (0, ColumnPresence::Present),
+            (70, ColumnPresence::Missing),
+        ] {
+            assert_eq!(
+                header.column_presence(short.get_payload(), column).unwrap(),
+                presence
+            );
+        }
+        let values: Vec<Value> = (0..70).map(Value::from_i64).collect();
+        let wide = record(&values);
+        header.forget();
+        assert_eq!(
+            header.column_presence(wide.get_payload(), 69).unwrap(),
+            ColumnPresence::Present
+        );
+        assert_eq!(
+            header.column_presence(wide.get_payload(), 70).unwrap(),
+            ColumnPresence::Missing
         );
     }
 
