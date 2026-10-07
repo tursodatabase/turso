@@ -800,6 +800,10 @@ pub enum Insn {
     /// bytecode that computes the encoded default dynamically, without
     /// restricting what expressions ENCODE (or future non-constant defaults)
     /// may contain.
+    ///
+    /// It falls through only when the cursor is on a record that is too short
+    /// to have the field. A null row and a cursor with no row jump, so the
+    /// NULL that `Column` wrote stays, as in SQLite's OP_Column.
     ColumnHasField {
         cursor_id: CursorID,
         column: usize,

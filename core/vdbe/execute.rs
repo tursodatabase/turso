@@ -2578,7 +2578,7 @@ pub fn op_column_has_field(
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
 
-    let has_field = match cursor_type {
+    let record_is_short = match cursor_type {
         CursorType::BTreeTable(_)
         | CursorType::BTreeIndex(_)
         | CursorType::MaterializedView(_, _) => {
@@ -2592,20 +2592,19 @@ pub fn op_column_has_field(
                     false
                 } else {
                     match return_if_io!(state, cursor.record()) {
-                        Some(record) => record.column_count() > *column,
+                        Some(record) => record.column_count() <= *column,
                         None => false,
                     }
                 }
             }
         }
-        // Non-btree cursors always "have" all fields
-        _ => true,
+        _ => false,
     };
 
-    if has_field {
-        state.pc = target_pc.as_offset_int();
-    } else {
+    if record_is_short {
         state.pc += 1;
+    } else {
+        state.pc = target_pc.as_offset_int();
     }
     Ok(InsnFunctionStepResult::Step)
 }

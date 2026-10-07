@@ -2168,9 +2168,10 @@ impl ProgramBuilder {
         }
     }
 
-    /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
-    /// cursor's record has a field at the given logical column index.
-    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    /// Emit a ColumnHasField instruction that falls through only if the
+    /// cursor's record is too short to have the field at the given logical
+    /// column index (ALTER TABLE ADD COLUMN), and jumps to `target_pc` in
+    /// every other case, a null row included.
     pub fn emit_column_has_field(
         &mut self,
         cursor_id: CursorID,

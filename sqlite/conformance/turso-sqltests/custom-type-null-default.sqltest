@@ -111,3 +111,55 @@ expect {
     2|after_alter||1
     3|with_val|hello|0
 }
+
+test custom-type-default-left-join-hash-join-no-match-is-null {
+    CREATE TYPE cents_hj BASE integer ENCODE (value * 100) DECODE (value / 100);
+    CREATE TABLE a_hj(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE b_hj(id INTEGER PRIMARY KEY, aid INTEGER, amount cents_hj DEFAULT 7) STRICT;
+    INSERT INTO a_hj VALUES (1), (2);
+    INSERT INTO b_hj(id, aid, amount) VALUES (10, 1, 5);
+    SELECT a_hj.id, b_hj.amount, b_hj.amount IS NULL FROM a_hj LEFT JOIN b_hj ON b_hj.aid = a_hj.id ORDER BY a_hj.id;
+}
+expect {
+    1|5|0
+    2||1
+}
+
+test custom-type-default-left-join-nested-loop-no-match-is-null {
+    CREATE TYPE cents_nl BASE integer ENCODE (value * 100) DECODE (value / 100);
+    CREATE TABLE a_nl(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE b_nl(id INTEGER PRIMARY KEY, aid INTEGER, amount cents_nl DEFAULT 7) STRICT;
+    INSERT INTO a_nl VALUES (1), (2);
+    INSERT INTO b_nl(id, aid, amount) VALUES (10, 1, 5);
+    SELECT a_nl.id, b_nl.amount, b_nl.amount IS NULL FROM a_nl LEFT JOIN b_nl ON b_nl.id = a_nl.id + 9 ORDER BY a_nl.id;
+}
+expect {
+    1|5|0
+    2||1
+}
+
+test custom-type-default-left-join-short-record {
+    CREATE TYPE cents_sr BASE integer ENCODE (value * 100) DECODE (value / 100);
+    CREATE TABLE a_sr(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE b_sr(id INTEGER PRIMARY KEY, aid INTEGER) STRICT;
+    INSERT INTO a_sr VALUES (1), (2);
+    INSERT INTO b_sr VALUES (10, 1);
+    ALTER TABLE b_sr ADD COLUMN amount cents_sr DEFAULT 7;
+    SELECT a_sr.id, b_sr.amount, b_sr.amount IS NULL FROM a_sr LEFT JOIN b_sr ON b_sr.id = a_sr.id + 9 ORDER BY a_sr.id;
+}
+expect {
+    1|7|0
+    2||1
+}
+
+test custom-type-default-aggregate-on-empty-table-is-null {
+    CREATE TYPE cents_ag BASE integer ENCODE (value * 100) DECODE (value / 100);
+    CREATE TABLE b_ag(id INTEGER PRIMARY KEY, aid INTEGER, amount cents_ag DEFAULT 7) STRICT;
+    SELECT count(*), amount, amount IS NULL FROM b_ag;
+    INSERT INTO b_ag VALUES (1, 1, 5);
+    SELECT max(id), amount, amount IS NULL FROM b_ag WHERE aid = 3;
+}
+expect {
+    0||1
+    ||1
+}

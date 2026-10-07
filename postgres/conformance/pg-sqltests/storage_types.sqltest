@@ -496,3 +496,17 @@ test add-column-refuses-a-default-that-the-type-refuses {
     ALTER TABLE a ADD COLUMN t time DEFAULT '25:00';
 }
 expect error {}
+
+test left-join-without-match-shows-null-not-the-default {
+    CREATE TABLE a (id bigint PRIMARY KEY);
+    CREATE TABLE b (id bigint PRIMARY KEY, aid bigint, ts timestamp DEFAULT '2001-02-03 04:05:06');
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1, '2024-01-01 00:00:00');
+    SELECT a.id, b.ts FROM a LEFT JOIN b ON b.aid = a.id ORDER BY a.id;
+    SELECT a.id FROM a LEFT JOIN b ON b.aid = a.id WHERE b.ts IS NULL;
+}
+expect {
+    1|2024-01-01 00:00:00
+    2|
+    2
+}
