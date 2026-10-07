@@ -3148,10 +3148,17 @@ fn decode_returns_stored_value(td: &TypeDef) -> bool {
 }
 
 /// True when a DECODE gives the stored value unchanged: it is the name
-/// `value`. The case of the name counts, because the translation of the
-/// DECODE finds the register of `value` by the exact name.
+/// `value`, in parentheses or not. The case of the name counts, because the
+/// translation of the DECODE finds the register of `value` by the exact name.
 pub(crate) fn decode_is_identity(decode: &ast::Expr) -> bool {
-    matches!(decode, ast::Expr::Id(name) if name.as_str() == "value")
+    match decode {
+        ast::Expr::Id(name) => name.as_str() == "value",
+        ast::Expr::Parenthesized(exprs) => match exprs.as_slice() {
+            [expr] => decode_is_identity(expr),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn builtin_seek_key_function(td: &TypeDef) -> Option<SeekKeyFunction> {

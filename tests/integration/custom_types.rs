@@ -954,21 +954,23 @@ mod tests {
         let db = TempDatabase::builder().with_opts(opts).build();
         let conn = db.connect_limbo();
         conn.execute("CREATE DOMAIN dint AS integer").unwrap();
+        conn.execute("CREATE TYPE keeps BASE integer ENCODE (value + 0) DECODE (value)")
+            .unwrap();
         conn.execute(
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, v varchar(5), j json, d dint) STRICT",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, v varchar(5), j json, d dint, k keeps) STRICT",
         )
         .unwrap();
         conn.execute(
             "CREATE TABLE p(id pg_int4 PRIMARY KEY, a pg_int8, n pg_int4, s text) STRICT, PGSTORAGE",
         )
         .unwrap();
-        conn.execute(r#"INSERT INTO t VALUES (1, 5, 'abc', '{"k":1}', 7)"#)
+        conn.execute(r#"INSERT INTO t VALUES (1, 5, 'abc', '{"k":1}', 7, 8)"#)
             .unwrap();
         conn.execute("INSERT INTO p VALUES (1, 9000000000, -3, 'x')")
             .unwrap();
 
         for (sql, columns) in [
-            ("SELECT b, v, j, d FROM t", 4),
+            ("SELECT b, v, j, d, k FROM t", 5),
             ("SELECT a, n, s FROM p", 3),
         ] {
             let program = limbo_exec_rows(&conn, &format!("EXPLAIN {sql}"));
@@ -996,8 +998,9 @@ mod tests {
             );
         }
 
-        let rows: Vec<(i64, String, String, i64)> = conn.exec_rows("SELECT b, v, j, d FROM t");
-        assert_eq!(rows, vec![(5, "abc".into(), r#"{"k":1}"#.into(), 7)]);
+        let rows: Vec<(i64, String, String, i64, i64)> =
+            conn.exec_rows("SELECT b, v, j, d, k FROM t");
+        assert_eq!(rows, vec![(5, "abc".into(), r#"{"k":1}"#.into(), 7, 8)]);
         let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT a, n, s FROM p");
         assert_eq!(rows, vec![(9_000_000_000, -3, "x".into())]);
     }

@@ -1193,7 +1193,8 @@ expect {
 }
 
 # DECODE VALUE is not the name `value` of the stored value: it gives the
-# text 'VALUE'. So an index on the stored values cannot answer a comparison.
+# text 'VALUE'. So a seek in an index of the stored values gives other rows
+# than a scan.
 test decode-of-upper-case-name-same-rows-with-and-without-index {
     CREATE TYPE t_upper(value integer) BASE integer ENCODE value DECODE VALUE OPERATOR '<';
     CREATE TABLE y(id INTEGER PRIMARY KEY, b t_upper) STRICT;
@@ -1209,4 +1210,48 @@ expect {
     idx-range|2
     noidx-range|1
     noidx-range|2
+}
+
+# DECODE (value) in parentheses gives the stored value unchanged, as
+# DECODE value does. So a seek in the index gives the rows of a scan.
+@requires strict "uses STRICT tables"
+test decode-of-value-in-parentheses-uses-index {
+    CREATE TYPE t_paren BASE integer ENCODE (value + 0) DECODE (value) OPERATOR '<';
+    CREATE TABLE z(id INTEGER PRIMARY KEY, b t_paren) STRICT;
+    CREATE INDEX z_b ON z(b);
+    EXPLAIN QUERY PLAN SELECT id FROM z WHERE b = 6;
+}
+expect {
+    1|0|0|SEARCH z USING COVERING INDEX z_b (b=?)
+}
+
+@requires strict "uses STRICT tables"
+test decode-of-value-in-parentheses-same-rows-with-and-without-index {
+    CREATE TYPE t_paren BASE integer ENCODE (value + 0) DECODE (value) OPERATOR '<';
+    CREATE TABLE z(id INTEGER PRIMARY KEY, b t_paren) STRICT;
+    CREATE INDEX z_b ON z(b);
+    INSERT INTO z VALUES (1, 6), (2, 7), (3, NULL);
+    SELECT 'idx-eq', id FROM z WHERE b = 6 ORDER BY id;
+    SELECT 'noidx-eq', id FROM z NOT INDEXED WHERE b = 6 ORDER BY id;
+    SELECT 'idx-range', id FROM z WHERE b > 6 ORDER BY id;
+    SELECT 'noidx-range', id FROM z NOT INDEXED WHERE b > 6 ORDER BY id;
+}
+expect {
+    idx-eq|1
+    noidx-eq|1
+    idx-range|2
+    noidx-range|2
+}
+
+# A virtual generated column stores no value, so a type that DECODEs to
+# another value is refused. DECODE (value) gives the computed value.
+@requires strict "uses STRICT tables"
+test generated-column-of-type-with-decode-of-value-in-parentheses {
+    CREATE TYPE t_paren BASE integer ENCODE (value + 0) DECODE (value);
+    CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b t_paren GENERATED ALWAYS AS (a * 2) VIRTUAL) STRICT;
+    INSERT INTO g(id, a) VALUES (1, 4);
+    SELECT id, a, b FROM g;
+}
+expect {
+    1|4|8
 }
