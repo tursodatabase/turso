@@ -3365,7 +3365,7 @@ fn mark_seek_constraints_consumed(
         ] {
             let Some(pos) = pos else { continue };
             let constraint = &constraints[pos];
-            if constraint.index_use != IndexUse::Plain {
+            if !constraint.index_use.seek_gives_comparison_rows() {
                 continue;
             }
             let where_term = &mut where_clause[constraint.where_clause_pos.0];

@@ -29,6 +29,36 @@ setup amounts {
     INSERT INTO pb SELECT id, n FROM pa;
 }
 
+# Rows next to bounds that are not the text of a stored value: 10:30:00.250
+# is between the rows 1 and 2, and 1.005 is between 1.00 and 1.01. The
+# columns ts, d, t and n have ASC indexes, and tsd, dd, td and nd have DESC
+# indexes with the same values. The rows 4 and 5 hold the first and the last
+# stored value of each type.
+setup bounds {
+    CREATE TABLE bnd(id INTEGER PRIMARY KEY, ts pg_timestamp, tsd pg_timestamp, d pg_date, dd pg_date, t pg_time, td pg_time, n pg_numeric(10,2), nd pg_numeric(10,2)) STRICT, PGSTORAGE;
+    CREATE INDEX bnd_ts ON bnd(ts);
+    CREATE INDEX bnd_tsd ON bnd(tsd DESC);
+    CREATE INDEX bnd_d ON bnd(d);
+    CREATE INDEX bnd_dd ON bnd(dd DESC);
+    CREATE INDEX bnd_t ON bnd(t);
+    CREATE INDEX bnd_td ON bnd(td DESC);
+    CREATE INDEX bnd_n ON bnd(n);
+    CREATE INDEX bnd_nd ON bnd(nd DESC);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (1, '2024-01-01 10:30:00.25', '2024-01-01', '10:30:00.25', 1.00);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (2, '2024-01-01 10:30:00.250001', '2024-01-02', '10:30:00.250001', 1.01);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (3, '2024-01-01 10:30:00.249999', '2023-12-31', '10:30:00.249999', 0.99);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (4, '0001-01-01 00:00:00', '0001-01-01', '00:00:00', -99999999.99);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (5, '9999-12-31 23:59:59.999999', '9999-12-31', '24:00:00', 99999999.99);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (6, NULL, NULL, NULL, NULL);
+    INSERT INTO bnd(id, ts, d, t, n) VALUES (7, '2024-01-01 00:00:00', '2024-01-10', '10:30:00', -1.01);
+    UPDATE bnd SET tsd = ts, dd = d, td = t, nd = n;
+    CREATE TABLE mc(id INTEGER PRIMARY KEY, day pg_date, at pg_timestamp, amount pg_numeric(10,2)) STRICT, PGSTORAGE;
+    CREATE INDEX mc_day_at ON mc(day, at DESC);
+    CREATE INDEX mc_amount_day ON mc(amount, day);
+    INSERT INTO mc VALUES (1, '2024-01-01', '2024-01-01 10:00:00', 1.00), (2, '2024-01-01', '2024-01-01 10:00:00.5', 1.00), (3, '2024-01-01', '2024-01-01 09:59:59.999999', 1.00);
+    INSERT INTO mc VALUES (4, '2024-01-02', '2024-01-02 10:00:00', 1.00), (5, '2024-01-01', NULL, 2.50), (6, NULL, '2024-01-01 10:00:00', NULL), (7, '2023-12-31', '2023-12-31 23:59:59', 1.00);
+}
+
 @requires strict "uses STRICT tables"
 @setup events
 test temporal-columns-show-postgresql-text {
@@ -212,6 +242,426 @@ test timestamp-join-with-text-column-same-rows-with-and-without-index {
 expect {
     a1,c2
     a1,c2
+}
+
+# A seek on a pg_ date, time or numeric index reads exactly the rows of the
+# comparison, so the WHERE term is not evaluated again. Each comparison runs
+# on the ASC index forwards and backwards, on the DESC index forwards and
+# backwards, and without an index.
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-bounds-search-the-indexes {
+    EXPLAIN QUERY PLAN SELECT id FROM bnd WHERE ts >= '2024-01-01 10:30:00.250';
+    EXPLAIN QUERY PLAN SELECT id FROM bnd WHERE n <= 1.005;
+    EXPLAIN QUERY PLAN SELECT id FROM mc WHERE amount = 1 AND day > '2024-01-01 ';
+}
+expect {
+    1|0|0|SEARCH bnd USING COVERING INDEX bnd_ts (ts>=?)
+    1|0|0|SEARCH bnd USING COVERING INDEX bnd_n (n<=?)
+    1|0|0|SEARCH mc USING COVERING INDEX mc_amount_day (amount=? AND day>?)
+}
+
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-timestamp-bounds-give-the-rows-of-the-scan {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= '2024-01-01 10:30:00.250' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= '2024-01-01 10:30:00.250' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts >= '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts > '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts > '2024-01-01 10:30:00.250' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd > '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd > '2024-01-01 10:30:00.250' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts > '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts <= '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts <= '2024-01-01 10:30:00.250' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd <= '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd <= '2024-01-01 10:30:00.250' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts <= '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts < '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts < '2024-01-01 10:30:00.250' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd < '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd < '2024-01-01 10:30:00.250' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts < '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts BETWEEN '2024-01-01 10:30:00.25' AND '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts BETWEEN '2024-01-01 10:30:00.25' AND '2024-01-01 10:30:00.250' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd BETWEEN '2024-01-01 10:30:00.25' AND '2024-01-01 10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd BETWEEN '2024-01-01 10:30:00.25' AND '2024-01-01 10:30:00.250' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts BETWEEN '2024-01-01 10:30:00.25' AND '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts = '2024-01-01 10:30:00.25');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts = '2024-01-01 10:30:00.25' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd = '2024-01-01 10:30:00.25');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd = '2024-01-01 10:30:00.25' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts = '2024-01-01 10:30:00.25' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts <= 4);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts <= 4 ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd <= 4);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd <= 4 ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts <= 4 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= x'00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= x'00' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= x'00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= x'00' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts >= x'00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts > -1.5);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts > -1.5 ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd > -1.5);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd > -1.5 ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts > -1.5 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts < 'a');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts < 'a' ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd < 'a');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd < 'a' ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts < 'a' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= NULL);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE ts >= NULL ORDER BY ts DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= NULL);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE tsd >= NULL ORDER BY tsd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE ts >= NULL ORDER BY id);
+}
+expect {
+    2|2,5
+    2|5,2
+    2|5,2
+    2|2,5
+    2|2,5
+    2|2,5
+    2|5,2
+    2|5,2
+    2|2,5
+    2|2,5
+    4|4,7,3,1
+    4|1,3,7,4
+    4|1,3,7,4
+    4|4,7,3,1
+    4|1,3,4,7
+    4|4,7,3,1
+    4|1,3,7,4
+    4|1,3,7,4
+    4|4,7,3,1
+    4|1,3,4,7
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    6|4,7,3,1,2,5
+    6|5,2,1,3,7,4
+    6|5,2,1,3,7,4
+    6|4,7,3,1,2,5
+    6|1,2,3,4,5,7
+    6|4,7,3,1,2,5
+    6|5,2,1,3,7,4
+    6|5,2,1,3,7,4
+    6|4,7,3,1,2,5
+    6|1,2,3,4,5,7
+    0|
+    0|
+    0|
+    0|
+    0|
+}
+
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-date-bounds-give-the-rows-of-the-scan {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d >= '2024-01-01 ');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d >= '2024-01-01 ' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd >= '2024-01-01 ');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd >= '2024-01-01 ' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d >= '2024-01-01 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d < '2024-01-01 ');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d < '2024-01-01 ' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd < '2024-01-01 ');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd < '2024-01-01 ' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d < '2024-01-01 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d > '2024-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d > '2024-01-01' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd > '2024-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd > '2024-01-01' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d > '2024-01-01' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d <= '2024-01-0');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d <= '2024-01-0' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd <= '2024-01-0');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd <= '2024-01-0' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d <= '2024-01-0' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d = '2024-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d = '2024-01-01' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd = '2024-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd = '2024-01-01' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d = '2024-01-01' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d >= 20240101);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d >= 20240101 ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd >= 20240101);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd >= 20240101 ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d >= 20240101 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d < x'00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE d < x'00' ORDER BY d DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd < x'00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE dd < x'00' ORDER BY dd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE d < x'00' ORDER BY id);
+}
+expect {
+    3|2,7,5
+    3|5,7,2
+    3|5,7,2
+    3|2,7,5
+    3|2,5,7
+    3|4,3,1
+    3|1,3,4
+    3|1,3,4
+    3|4,3,1
+    3|1,3,4
+    3|2,7,5
+    3|5,7,2
+    3|5,7,2
+    3|2,7,5
+    3|2,5,7
+    2|4,3
+    2|3,4
+    2|3,4
+    2|4,3
+    2|3,4
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    6|4,3,1,2,7,5
+    6|5,7,2,1,3,4
+    6|5,7,2,1,3,4
+    6|4,3,1,2,7,5
+    6|1,2,3,4,5,7
+    6|4,3,1,2,7,5
+    6|5,7,2,1,3,4
+    6|5,7,2,1,3,4
+    6|4,3,1,2,7,5
+    6|1,2,3,4,5,7
+}
+
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-time-bounds-give-the-rows-of-the-scan {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t >= '10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t >= '10:30:00.250' ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td >= '10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td >= '10:30:00.250' ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t >= '10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t <= '10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t <= '10:30:00.250' ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td <= '10:30:00.250');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td <= '10:30:00.250' ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t <= '10:30:00.250' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t > '10:30:00.25');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t > '10:30:00.25' ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td > '10:30:00.25');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td > '10:30:00.25' ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t > '10:30:00.25' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t < '24:00:00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t < '24:00:00' ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td < '24:00:00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td < '24:00:00' ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t < '24:00:00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t >= '24');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t >= '24' ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td >= '24');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td >= '24' ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t >= '24' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t <= 0);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE t <= 0 ORDER BY t DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td <= 0);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE td <= 0 ORDER BY td);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE t <= 0 ORDER BY id);
+}
+expect {
+    2|2,5
+    2|5,2
+    2|5,2
+    2|2,5
+    2|2,5
+    4|4,7,3,1
+    4|1,3,7,4
+    4|1,3,7,4
+    4|4,7,3,1
+    4|1,3,4,7
+    2|2,5
+    2|5,2
+    2|5,2
+    2|2,5
+    2|2,5
+    5|4,7,3,1,2
+    5|2,1,3,7,4
+    5|2,1,3,7,4
+    5|4,7,3,1,2
+    5|1,2,3,4,7
+    6|4,7,3,1,2,5
+    6|5,2,1,3,7,4
+    6|5,2,1,3,7,4
+    6|4,7,3,1,2,5
+    6|1,2,3,4,5,7
+    0|
+    0|
+    0|
+    0|
+    0|
+}
+
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-numeric-bounds-give-the-rows-of-the-scan {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 1.005 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 1.005 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n <= 1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n <= 1.005 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd <= 1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd <= 1.005 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n > -1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n > -1.005 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd > -1.005);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd > -1.005 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n < '-1.005');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n < '-1.005' ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd < '-1.005');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd < '-1.005' ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < '-1.005' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 1e300);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 1e300 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 1e300);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 1e300 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n <= -1e300);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n <= -1e300 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd <= -1e300);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd <= -1e300 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 99999999.99);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n >= 99999999.99 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 99999999.99);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd >= 99999999.99 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n = '1.00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n = '1.00' ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd = '1.00');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd = '1.00' ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n BETWEEN -1.01 AND 0.995);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n BETWEEN -1.01 AND 0.995 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd BETWEEN -1.01 AND 0.995);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd BETWEEN -1.01 AND 0.995 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n BETWEEN -1.01 AND 0.995 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n > -99999999.995);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE n > -99999999.995 ORDER BY n DESC);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd > -99999999.995);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd WHERE nd > -99999999.995 ORDER BY nd);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > -99999999.995 ORDER BY id);
+}
+expect {
+    2|2,5
+    2|5,2
+    2|5,2
+    2|2,5
+    2|2,5
+    4|4,7,3,1
+    4|1,3,7,4
+    4|1,3,7,4
+    4|4,7,3,1
+    4|1,3,4,7
+    4|3,1,2,5
+    4|5,2,1,3
+    4|5,2,1,3
+    4|3,1,2,5
+    4|1,2,3,5
+    2|4,7
+    2|7,4
+    2|7,4
+    2|4,7
+    2|4,7
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    1|5
+    1|5
+    1|5
+    1|5
+    1|5
+    1|1
+    1|1
+    1|1
+    1|1
+    1|1
+    2|7,3
+    2|3,7
+    2|3,7
+    2|7,3
+    2|3,7
+    6|4,7,3,1,2,5
+    6|5,2,1,3,7,4
+    6|5,2,1,3,7,4
+    6|4,7,3,1,2,5
+    6|1,2,3,4,5,7
+}
+
+@requires strict "uses STRICT tables"
+@setup bounds
+test pg-bounds-after-an-equality-prefix-give-the-rows-of-the-scan {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE day = '2024-01-01' AND at >= '2024-01-01 10:00:00.0');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE day = '2024-01-01' AND at >= '2024-01-01 10:00:00.0' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE day = '2024-01-01' AND at < '2024-01-01 10:00:00.0' ORDER BY at);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE day = '2024-01-01' AND at < '2024-01-01 10:00:00.0' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE day = '2024-01-01' AND at <= '2024-01-01 10:00:00.0');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE day = '2024-01-01' AND at <= '2024-01-01 10:00:00.0' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE day = '2024-01-1' AND at > '2000-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE day = '2024-01-1' AND at > '2000-01-01' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE amount = 1 AND day > '2024-01-01 ');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE amount = 1 AND day > '2024-01-01 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE amount = '1' AND day <= '2024-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE amount = '1' AND day <= '2024-01-01' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc WHERE amount = 1.001 AND day > '2023-01-01');
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM mc NOT INDEXED WHERE amount = 1.001 AND day > '2023-01-01' ORDER BY id);
+}
+expect {
+    1|2
+    1|2
+    2|3,1
+    2|1,3
+    2|1,3
+    2|1,3
+    0|
+    0|
+    1|4
+    1|4
+    4|7,1,2,3
+    4|1,2,3,7
+    0|
+    0|
 }
 
 @requires strict "uses STRICT tables"

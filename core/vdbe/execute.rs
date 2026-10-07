@@ -11254,21 +11254,14 @@ pub fn op_function(
             }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
                 check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
-                    _ => {
-                        let a = crate::numeric::decimal::value_to_bigdecimal(&lhs_val)?;
-                        let b = crate::numeric::decimal::value_to_bigdecimal(&rhs_val)?;
-                        let cmp_result = match scalar_func {
-                            ScalarFunc::NumericLt => a < b,
-                            ScalarFunc::NumericEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        state.registers[*dest].set_int(cmp_result as i64)
-                    }
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let result = match scalar_func {
+                    ScalarFunc::NumericLt => crate::numeric::decimal::exec_numeric_lt(lhs, rhs)?,
+                    ScalarFunc::NumericEq => crate::numeric::decimal::exec_numeric_eq(lhs, rhs)?,
+                    _ => unreachable!(),
                 };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::UuidSeekKey => {
                 check_arg_count!(arg_count, 2);
@@ -18671,7 +18664,7 @@ pub fn op_hash_grace_advance_partition(
 }
 
 #[inline(always)]
-fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+pub(crate) fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
         let settled = match affinity {

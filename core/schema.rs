@@ -235,6 +235,19 @@ pub(crate) enum IndexUse {
     Unusable,
 }
 
+impl IndexUse {
+    /// Whether a seek on the index finds exactly the rows for which the
+    /// comparison of the WHERE term is true, so the term is not evaluated
+    /// again.
+    pub(crate) fn seek_gives_comparison_rows(self) -> bool {
+        match self {
+            Self::Plain => true,
+            Self::KeyFunction(function) => function.gives_exact_bounds(),
+            Self::NumericEquality | Self::Unusable => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeekKeyFunction {
     Uuid,
@@ -245,6 +258,14 @@ pub(crate) enum SeekKeyFunction {
 }
 
 impl SeekKeyFunction {
+    /// Whether the keys of the function give exactly the rows that the
+    /// comparison gives, so that the seek can replace the WHERE term. A
+    /// `uuid` range bound of text that is not a canonical uuid gives a key
+    /// below or above every stored value, which keeps more rows.
+    pub(crate) fn gives_exact_bounds(self) -> bool {
+        !matches!(self, Self::Uuid)
+    }
+
     pub(crate) fn scalar_func(self) -> ScalarFunc {
         match self {
             Self::Uuid => ScalarFunc::UuidSeekKey,

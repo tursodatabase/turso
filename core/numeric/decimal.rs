@@ -132,6 +132,31 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     Ok(BigDecimal::new(bigint, scale))
 }
 
+/// `numeric_lt`: whether `lhs` is below `rhs` as a decimal, or NULL when
+/// one of them is NULL.
+pub(crate) fn exec_numeric_lt(lhs: &Value, rhs: &Value) -> crate::Result<Value> {
+    compare_as_decimals(lhs, rhs, |lhs, rhs| lhs < rhs)
+}
+
+/// `numeric_eq`: whether `lhs` equals `rhs` as a decimal, or NULL when one
+/// of them is NULL.
+pub(crate) fn exec_numeric_eq(lhs: &Value, rhs: &Value) -> crate::Result<Value> {
+    compare_as_decimals(lhs, rhs, |lhs, rhs| lhs == rhs)
+}
+
+fn compare_as_decimals(
+    lhs: &Value,
+    rhs: &Value,
+    holds: impl Fn(&BigDecimal, &BigDecimal) -> bool,
+) -> crate::Result<Value> {
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let lhs = value_to_bigdecimal(lhs)?;
+    let rhs = value_to_bigdecimal(rhs)?;
+    Ok(Value::from_i64(i64::from(holds(&lhs, &rhs))))
+}
+
 /// Parse a Value (text, int, float, or blob) into a BigDecimal.
 pub(crate) fn value_to_bigdecimal(val: &Value) -> crate::Result<BigDecimal> {
     use std::str::FromStr;

@@ -534,6 +534,83 @@ mod tests {
         }
     }
 
+    /// A seek on an index of a `pg_` date, time or numeric column reads
+    /// exactly the rows of the comparison, so the loop neither DECODEs the
+    /// column nor compares it again. A `uuid` range keeps its comparison,
+    /// because its keys for text that is not a canonical uuid keep more rows.
+    #[test]
+    fn test_seek_on_pg_type_index_does_not_compare_the_rows_again() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE ev(id INTEGER PRIMARY KEY, ts pg_timestamp, tz pg_timestamptz, d pg_date, t pg_time, n pg_numeric(10,2), u uuid) STRICT, PGSTORAGE",
+        )
+        .unwrap();
+        for column in ["ts", "tz", "d", "t", "n", "u"] {
+            conn.execute(format!("CREATE INDEX ev_{column} ON ev({column})"))
+                .unwrap();
+        }
+        conn.execute("CREATE INDEX ev_d_ts ON ev(d DESC, ts)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ev VALUES (1, '2024-01-01 10:00:00', '2024-01-01 10:00:00+02', '2024-01-01', '10:00:00', 1.5, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        )
+        .unwrap();
+
+        let comparison_opcodes = ["Eq", "Ne", "Lt", "Le", "Gt", "Ge", "If", "IfNot"];
+        let explain = |query: &str| -> Vec<(String, String)> {
+            limbo_exec_rows(&conn, &format!("EXPLAIN {query}"))
+                .into_iter()
+                .map(|insn| {
+                    let rusqlite::types::Value::Text(opcode) = &insn[1] else {
+                        panic!("the opcode is text: {insn:?}");
+                    };
+                    let p4 = match &insn[5] {
+                        rusqlite::types::Value::Text(p4) => p4.clone(),
+                        _ => String::new(),
+                    };
+                    (opcode.clone(), p4)
+                })
+                .collect()
+        };
+        for query in [
+            "SELECT id FROM ev WHERE ts >= '2024-01-01' AND ts < '2024-02-01'",
+            "SELECT id FROM ev WHERE tz > '2024-01-01 08:00:00'",
+            "SELECT id FROM ev WHERE d BETWEEN '2024-01-01' AND '2024-01-31'",
+            "SELECT id FROM ev WHERE t <= '10:00:00.5' ORDER BY t DESC",
+            "SELECT id FROM ev WHERE n > 1.005",
+            "SELECT id FROM ev WHERE n = -1.5",
+            "SELECT id FROM ev WHERE d = '2024-01-01' AND ts > '2024-01-01 09'",
+        ] {
+            let program = explain(query);
+            assert!(
+                program.iter().any(|(opcode, _)| opcode.starts_with("Seek")),
+                "{query} seeks: {program:?}"
+            );
+            assert!(
+                !program.iter().any(|(opcode, p4)| {
+                    comparison_opcodes.contains(&opcode.as_str())
+                        || p4.ends_with("_decode")
+                        || p4.starts_with("numeric_")
+                }),
+                "{query} compares the rows again: {program:?}"
+            );
+        }
+        let program = explain("SELECT id FROM ev WHERE u > 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'");
+        assert!(
+            program
+                .iter()
+                .any(|(opcode, _)| comparison_opcodes.contains(&opcode.as_str())),
+            "the uuid range keeps its comparison: {program:?}"
+        );
+
+        let rows: Vec<(i64,)> = conn.exec_rows(
+            "SELECT id FROM ev WHERE d = '2024-01-01' AND ts > '2024-01-01 09' AND n > 1.005 AND tz < '2024-01-01 08:00:00.1'",
+        );
+        assert_eq!(rows, vec![(1,)]);
+    }
+
     fn open_file(
         path: &std::path::Path,
         custom_types: bool,

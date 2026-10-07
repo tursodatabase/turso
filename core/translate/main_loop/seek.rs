@@ -1,6 +1,6 @@
 use super::*;
 use crate::function::{Func, FuncCtx, ScalarFunc};
-use crate::functions::seek_key::NoSeekKey;
+use crate::functions::seek_key::{exact_bound_key, NoSeekKey};
 use crate::schema::{IndexUse, SeekKeyFunction};
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
@@ -475,12 +475,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 }
                 let no_key = if is_equality {
                     NoSeekKey::Null
+                } else if function.gives_exact_bounds() {
+                    exact_bound_key(seek_key.op, index.columns[pos].order)
                 } else {
                     match (range_end, index.columns[pos].order) {
                         (StoredRangeEnd::Low, SortOrder::Asc)
-                        | (StoredRangeEnd::High, SortOrder::Desc) => NoSeekKey::BelowEveryValue,
+                        | (StoredRangeEnd::High, SortOrder::Desc) => NoSeekKey::Below,
                         (StoredRangeEnd::High, SortOrder::Asc)
-                        | (StoredRangeEnd::Low, SortOrder::Desc) => NoSeekKey::AboveEveryValue,
+                        | (StoredRangeEnd::Low, SortOrder::Desc) => NoSeekKey::Above,
                     }
                 };
                 self.program.emit_int(no_key as i64, operand_reg + 1);
