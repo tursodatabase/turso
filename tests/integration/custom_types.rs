@@ -611,6 +611,73 @@ mod tests {
         assert_eq!(rows, vec![(1,)]);
     }
 
+    /// A WHERE term that compares a `pg_numeric` column with a parameter
+    /// compares the stored integers with an integer key of the parameter.
+    /// The key is computed once for each run, so each run with new values
+    /// gives the rows of the decimal comparison, which an expression still
+    /// uses.
+    #[test]
+    fn test_pg_numeric_scan_with_parameter_gives_the_rows_of_the_decimals() {
+        use turso_core::Value;
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE pn(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pn VALUES (1, 1.00), (2, 1.01), (3, 0.99), (4, -99999999.99), (5, 99999999.99), (6, NULL), (7, -1.01), (8, 0)",
+        )
+        .unwrap();
+
+        let program = limbo_exec_rows(&conn, "EXPLAIN SELECT id FROM pn WHERE n > ?1");
+        assert!(
+            program.iter().any(|insn| insn[5]
+                == rusqlite::types::Value::Text("pg_numeric_compare_key".to_string())),
+            "{program:?}"
+        );
+
+        let operands = [
+            Value::from_i64(1),
+            Value::from_f64(1.005),
+            Value::from_f64(-1.005),
+            Value::build_text("1.00"),
+            Value::build_text(" -0.01 "),
+            Value::from_i64(i64::MAX),
+            Value::from_f64(-1e300),
+            Value::Null,
+        ];
+        let rows = |stmt: &mut turso_core::Statement, operand: &Value| {
+            stmt.reset().unwrap();
+            stmt.bind_at(1.try_into().unwrap(), operand.clone())
+                .unwrap();
+            stmt.run_collect_rows()
+        };
+        for op in ["=", "!=", "<", "<=", ">", ">="] {
+            let mut by_integers = conn
+                .prepare(format!(
+                    "SELECT group_concat(id) FROM (SELECT id FROM pn WHERE n {op} ?1 ORDER BY id)"
+                ))
+                .unwrap();
+            let mut by_decimals = conn
+                .prepare(format!(
+                    "SELECT group_concat(id) FROM (SELECT id FROM pn WHERE (n {op} ?1) + 0 ORDER BY id)"
+                ))
+                .unwrap();
+            for operand in &operands {
+                assert_eq!(
+                    rows(&mut by_integers, operand).unwrap(),
+                    rows(&mut by_decimals, operand).unwrap(),
+                    "n {op} {operand:?}"
+                );
+            }
+            let invalid = Value::build_text("12.5abc");
+            let error = rows(&mut by_integers, &invalid).unwrap_err().to_string();
+            assert!(error.contains("invalid numeric value"), "{error}");
+        }
+    }
+
     fn open_file(
         path: &std::path::Path,
         custom_types: bool,

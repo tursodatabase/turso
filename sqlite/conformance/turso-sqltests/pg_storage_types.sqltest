@@ -780,6 +780,254 @@ expect error {
 
 @requires strict "uses STRICT tables"
 @setup amounts
+test numeric-invalid-literal-raises-in-a-scan {
+    SELECT count(*) FROM pa NOT INDEXED WHERE n > '12.5abc';
+}
+expect error {
+    invalid numeric value: "12.5abc"
+}
+
+# The decimal comparison raises its error only for a row that has a value.
+@requires strict "uses STRICT tables"
+test numeric-invalid-literal-and-only-null-values-raise-no-error {
+    CREATE TABLE pn(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE;
+    INSERT INTO pn VALUES (1, NULL), (2, NULL);
+    SELECT count(*) FROM pn WHERE n > '12.5abc';
+    SELECT count(*) FROM pn WHERE n = 'abc' OR id = 2;
+}
+expect {
+    0
+    1
+}
+
+# A WHERE term compares the stored integers of a pg_numeric column with an
+# integer key of the operand. A comparison inside an expression compares the
+# decimals: both must give the same rows.
+@requires strict "uses STRICT tables"
+@setup bounds
+test numeric-where-compares-stored-integers-like-the-decimals {
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= 1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= -1.005 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= -1.005) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= '1.00' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= '1.00') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 1 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= 1) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= -1.01 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= -1.01) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= 1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= -1e300 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= -1e300) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= 99999999.99 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= 99999999.99) + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n = ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n = ' -0.00 ') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n != ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n != ' -0.00 ') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n < ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n < ' -0.00 ') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n <= ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n <= ' -0.00 ') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n > ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n > ' -0.00 ') + 0 ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE n >= ' -0.00 ' ORDER BY id);
+    SELECT count(*), group_concat(id) FROM (SELECT id FROM bnd NOT INDEXED WHERE (n >= ' -0.00 ') + 0 ORDER BY id);
+}
+expect {
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    4|1,3,4,7
+    4|1,3,4,7
+    4|1,3,4,7
+    4|1,3,4,7
+    2|2,5
+    2|2,5
+    2|2,5
+    2|2,5
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    2|4,7
+    2|4,7
+    2|4,7
+    2|4,7
+    4|1,2,3,5
+    4|1,2,3,5
+    4|1,2,3,5
+    4|1,2,3,5
+    1|1
+    1|1
+    5|2,3,4,5,7
+    5|2,3,4,5,7
+    3|3,4,7
+    3|3,4,7
+    4|1,3,4,7
+    4|1,3,4,7
+    2|2,5
+    2|2,5
+    3|1,2,5
+    3|1,2,5
+    1|1
+    1|1
+    5|2,3,4,5,7
+    5|2,3,4,5,7
+    3|3,4,7
+    3|3,4,7
+    4|1,3,4,7
+    4|1,3,4,7
+    2|2,5
+    2|2,5
+    3|1,2,5
+    3|1,2,5
+    1|7
+    1|7
+    5|1,2,3,4,5
+    5|1,2,3,4,5
+    1|4
+    1|4
+    2|4,7
+    2|4,7
+    4|1,2,3,5
+    4|1,2,3,5
+    5|1,2,3,5,7
+    5|1,2,3,5,7
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    0|
+    0|
+    0|
+    0|
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    0|
+    0|
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    1|5
+    1|5
+    5|1,2,3,4,7
+    5|1,2,3,4,7
+    5|1,2,3,4,7
+    5|1,2,3,4,7
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    0|
+    0|
+    1|5
+    1|5
+    0|
+    0|
+    6|1,2,3,4,5,7
+    6|1,2,3,4,5,7
+    2|4,7
+    2|4,7
+    2|4,7
+    2|4,7
+    4|1,2,3,5
+    4|1,2,3,5
+    4|1,2,3,5
+    4|1,2,3,5
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
 test numeric-arithmetic-reads-the-literal-as-a-value {
     SELECT n + 1, n * 1.1, n - n FROM pa WHERE id = 1;
 }

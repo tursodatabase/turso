@@ -923,6 +923,7 @@ pub enum ScalarFunc {
     PgDateSeekKey,
     PgTimeSeekKey,
     PgNumericSeekKey,
+    PgNumericCompareKey,
     NumericSeekKey,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
@@ -1063,6 +1064,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::PgDateSeekKey
             | ScalarFunc::PgTimeSeekKey
             | ScalarFunc::PgNumericSeekKey
+            | ScalarFunc::PgNumericCompareKey
             | ScalarFunc::NumericSeekKey
             | ScalarFunc::PgTimestampEncode
             | ScalarFunc::PgTimestamptzEncode
@@ -1238,6 +1240,7 @@ impl Display for ScalarFunc {
             Self::PgDateSeekKey => "pg_date_seek_key",
             Self::PgTimeSeekKey => "pg_time_seek_key",
             Self::PgNumericSeekKey => "pg_numeric_seek_key",
+            Self::PgNumericCompareKey => "pg_numeric_compare_key",
             Self::NumericSeekKey => "numeric_seek_key",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
@@ -1290,6 +1293,7 @@ impl ScalarFunc {
                 | Self::PgDateSeekKey
                 | Self::PgTimeSeekKey
                 | Self::PgNumericSeekKey
+                | Self::PgNumericCompareKey
                 | Self::NumericSeekKey
         )
     }
@@ -1374,6 +1378,7 @@ impl ScalarFunc {
             | Self::PgDateSeekKey
             | Self::PgTimeSeekKey
             | Self::PgNumericSeekKey
+            | Self::PgNumericCompareKey
             | Self::NumericSeekKey => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],

@@ -491,6 +491,16 @@ fn translate_leaf_condition_expr(
                     condition_metadata,
                     resolver,
                 )?;
+            } else if let Some(comparison) =
+                stored_numeric_comparison(e1, op, e2, referenced_tables, resolver)
+            {
+                emit_stored_numeric_comparison(
+                    program,
+                    referenced_tables,
+                    &comparison,
+                    condition_metadata,
+                    resolver,
+                )?;
             } else if let Some(resolved) = find_custom_type_operator(
                 e1,
                 e2,

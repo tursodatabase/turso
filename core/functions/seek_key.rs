@@ -5,13 +5,15 @@ use crate::functions::pg_types::{
 use crate::numeric::decimal::value_to_bigdecimal;
 use crate::types::{SeekOp, Value};
 use crate::{turso_assert_eq, LimboError, Numeric, Result};
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{self, SortOrder};
 
 const UUID_TEXT_LEN: usize = 36;
 const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
 // An integer sorts below every blob, and 17 bytes of 0xff sort above every 16-byte blob.
 const KEY_BELOW_EVERY_UUID: i64 = 0;
 const KEY_ABOVE_EVERY_UUID: [u8; 17] = [0xff; 17];
+const KEY_EQUAL_TO_NO_NUMERIC: i64 = i64::MAX;
+const _: () = assert!(KEY_EQUAL_TO_NO_NUMERIC as i128 >= NUMERIC_STORED_LIMIT);
 
 /// What a seek key function gives when no stored value shows the operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,22 @@ pub(crate) enum NoSeekKey {
     /// A key above the operand. The `pg_` types give the first stored value
     /// above the operand, and `uuid` gives a key above every stored value.
     Above = 1,
+}
+
+/// The key that a scan compares the stored integers of a `pg_numeric`
+/// column with for `column <op> operand`, in the stored order: the key of
+/// a bound for a range operator, and NULL for `=` and `!=`.
+pub(crate) fn scan_comparison_key(op: &ast::Operator) -> NoSeekKey {
+    match op {
+        ast::Operator::Equals | ast::Operator::NotEquals => NoSeekKey::Null,
+        ast::Operator::Greater => exact_bound_key(SeekOp::GT, SortOrder::Asc),
+        ast::Operator::GreaterEquals => {
+            exact_bound_key(SeekOp::GE { eq_only: false }, SortOrder::Asc)
+        }
+        ast::Operator::Less => exact_bound_key(SeekOp::LT, SortOrder::Asc),
+        ast::Operator::LessEquals => exact_bound_key(SeekOp::LE { eq_only: false }, SortOrder::Asc),
+        other => unreachable!("{other:?} is not a comparison of a pg_numeric scan"),
+    }
 }
 
 /// The key of a range bound of a `pg_` type that gives exactly the rows of
@@ -89,6 +107,27 @@ pub(crate) fn exec_pg_temporal_seek_key(
         },
     };
     Ok(key.map_or(Value::Null, Value::from_i64))
+}
+
+/// The key that a scan compares the stored integer of a `pg_numeric`
+/// column with, in place of `numeric_lt` or `numeric_eq` with the operand.
+/// `no_key` comes from [scan_comparison_key]. For `=` and `!=`, an operand
+/// that no stored value equals gets a key outside the stored values. NULL
+/// when the operand is NULL or not a number: the scan then compares the
+/// decimals, which gives NULL or raises the error.
+pub(crate) fn exec_pg_numeric_compare_key(
+    operand: &Value,
+    no_key: &Value,
+    scale: &Value,
+) -> Result<Value> {
+    if matches!(operand, Value::Null) || value_to_bigdecimal(operand).is_err() {
+        return Ok(Value::Null);
+    }
+    let key = exec_pg_numeric_seek_key(operand, no_key, scale)?;
+    Ok(match (key, seek_bound(no_key)) {
+        (Value::Null, NoSeekKey::Null) => Value::from_i64(KEY_EQUAL_TO_NO_NUMERIC),
+        (key, _) => key,
+    })
 }
 
 pub(crate) fn exec_pg_numeric_seek_key(
@@ -842,10 +881,67 @@ mod tests {
         let is_true = |value: Value| Ok(value == Value::from_i64(1));
         match comparison {
             Comparison::Eq => is_true(exec_numeric_eq(decoded, operand)?),
+            Comparison::Ne => is_true(exec_numeric_eq(decoded, operand)?).map(|eq| !eq),
             Comparison::Lt => is_true(exec_numeric_lt(decoded, operand)?),
             Comparison::Gt => is_true(exec_numeric_lt(operand, decoded)?),
             Comparison::Ge => is_true(exec_numeric_lt(decoded, operand)?).map(|lt| !lt),
             Comparison::Le => is_true(exec_numeric_lt(operand, decoded)?).map(|lt| !lt),
+        }
+    }
+
+    #[test]
+    fn numeric_scan_key_compares_like_the_decimals() {
+        let mut rng = ChaCha8Rng::seed_from_u64(41);
+        for _ in 0..4_000 {
+            let precision = rng.random_range(1..=18);
+            let scale = rng.random_range(0..=precision);
+            let limit = 10i64.pow(precision as u32) - 1;
+            let near = match rng.random_range(0..4) {
+                0 => rng.random_range(-1000..1000).clamp(-limit, limit),
+                1 => [limit, -limit, 0][rng.random_range(0..3)],
+                _ => rng.random_range(-limit..=limit),
+            };
+            let operand = numeric_test_operand(&mut rng, near, scale);
+            let scale_value = Value::from_i64(scale);
+            let mut stored_values: Vec<i64> = (0..30)
+                .map(|_| {
+                    let distance = 10i64.pow(rng.random_range(0..precision as u32));
+                    near.saturating_add(rng.random_range(-distance..=distance))
+                        .clamp(-limit, limit)
+                })
+                .collect();
+            stored_values.extend([-limit, limit, 0, near]);
+            for comparison in SCAN_COMPARISONS {
+                let mode = no_key(scan_comparison_key(&comparison.operator()));
+                let key = exec_pg_numeric_compare_key(&operand, &mode, &scale_value).unwrap();
+                let Value::Numeric(Numeric::Integer(key)) = key else {
+                    assert_eq!(key, Value::Null, "{operand:?}");
+                    assert!(
+                        value_to_bigdecimal(&operand).is_err(),
+                        "{operand:?} is a number but has no key"
+                    );
+                    continue;
+                };
+                for &stored in &stored_values {
+                    let decoded = crate::functions::pg_types::exec_pg_numeric_decode(
+                        &Value::from_i64(stored),
+                        &scale_value,
+                    )
+                    .unwrap();
+                    let decimal = numeric_scan(comparison, &decoded, &operand).unwrap();
+                    assert_eq!(
+                        comparison.holds(stored.cmp(&key)),
+                        decimal,
+                        "{decoded:?} {comparison:?} {operand:?} at scale {scale}: key {key}"
+                    );
+                }
+            }
+        }
+        for comparison in SCAN_COMPARISONS {
+            let mode = no_key(scan_comparison_key(&comparison.operator()));
+            let key =
+                exec_pg_numeric_compare_key(&Value::Null, &mode, &Value::from_i64(2)).unwrap();
+            assert_eq!(key, Value::Null);
         }
     }
 
@@ -897,6 +993,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum Comparison {
         Eq,
+        Ne,
         Lt,
         Le,
         Gt,
@@ -911,10 +1008,31 @@ mod tests {
         Comparison::Ge,
     ];
 
+    const SCAN_COMPARISONS: [Comparison; 6] = [
+        Comparison::Eq,
+        Comparison::Ne,
+        Comparison::Lt,
+        Comparison::Le,
+        Comparison::Gt,
+        Comparison::Ge,
+    ];
+
     impl Comparison {
+        fn operator(self) -> ast::Operator {
+            match self {
+                Self::Eq => ast::Operator::Equals,
+                Self::Ne => ast::Operator::NotEquals,
+                Self::Lt => ast::Operator::Less,
+                Self::Le => ast::Operator::LessEquals,
+                Self::Gt => ast::Operator::Greater,
+                Self::Ge => ast::Operator::GreaterEquals,
+            }
+        }
+
         fn holds(self, order: Ordering) -> bool {
             match self {
                 Self::Eq => order.is_eq(),
+                Self::Ne => order.is_ne(),
                 Self::Lt => order.is_lt(),
                 Self::Le => order.is_le(),
                 Self::Gt => order.is_gt(),
@@ -938,7 +1056,7 @@ mod tests {
         let is_lower_bound = match comparison {
             Comparison::Gt | Comparison::Ge => true,
             Comparison::Lt | Comparison::Le => false,
-            Comparison::Eq => unreachable!("an equality has no range bound"),
+            Comparison::Eq | Comparison::Ne => unreachable!("{comparison:?} has no range bound"),
         };
         let is_strict = matches!(comparison, Comparison::Gt | Comparison::Lt);
         let walks_up_the_stored_values = (order == SortOrder::Asc) != backwards;

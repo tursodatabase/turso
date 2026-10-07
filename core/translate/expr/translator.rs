@@ -2017,6 +2017,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::PgDateSeekKey
                 | ScalarFunc::PgTimeSeekKey
                 | ScalarFunc::PgNumericSeekKey
+                | ScalarFunc::PgNumericCompareKey
                 | ScalarFunc::NumericSeekKey => {
                     unreachable!("no function name resolves to {srf}")
                 }

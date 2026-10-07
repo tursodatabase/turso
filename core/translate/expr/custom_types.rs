@@ -1171,27 +1171,205 @@ pub(super) fn emit_stored_temporal_comparison(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    let stored_reg =
+        translate_stored_column(program, referenced_tables, comparison.column, resolver)?;
+    let key_reg = program.alloc_register();
+    program.emit_int(comparison.key, key_reg);
+    program.mark_last_insn_constant();
+    emit_integer_comparison(
+        program,
+        &comparison.op,
+        stored_reg,
+        key_reg,
+        referenced_tables,
+        condition_metadata,
+        resolver,
+    )
+}
+
+/// A comparison of a `pg_numeric` column with a literal, a negative literal
+/// or a parameter. The column stores the value times 10^scale, so the
+/// comparison reads the stored integer and compares it with an integer key
+/// of the operand, computed once. When the operand is NULL or not a number
+/// the key is NULL, and the decimal comparison runs: it gives NULL or
+/// raises its error at the same row as before.
+pub(super) struct StoredNumericComparison<'a> {
+    e1: &'a ast::Expr,
+    e2: &'a ast::Expr,
+    column: &'a ast::Expr,
+    operand: &'a ast::Expr,
+    op: ast::Operator,
+    scale: i64,
+    decimal: ResolvedOperator,
+}
+
+pub(super) fn stored_numeric_comparison<'a>(
+    e1: &'a ast::Expr,
+    op: &ast::Operator,
+    e2: &'a ast::Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Option<StoredNumericComparison<'a>> {
+    let (column, operand, column_op) = match (e1, e2) {
+        (ast::Expr::Column { .. }, _) if is_literal_or_parameter(e2) => (e1, e2, *op),
+        (_, ast::Expr::Column { .. }) if is_literal_or_parameter(e1) => {
+            (e2, e1, operator_with_swapped_operands(op)?)
+        }
+        _ => return None,
+    };
+    if !is_comparison(&column_op) || resolver.resolve_cached_expr_reg(column).is_some() {
+        return None;
+    }
+    let (table_column, is_strict) = operand_column(column, Some(referenced_tables), None)?;
+    let pg_type = resolver
+        .schema()
+        .get_type_def(&table_column.ty_str, is_strict)?
+        .pg_storage_type()?;
+    if table_column.is_virtual_generated() || pg_type != PgStorageType::Numeric {
+        return None;
+    }
+    let scale = crate::schema::integer_literal(table_column.ty_params.get(1)?)?;
+    let decoded_self_table = resolver.decoded_self_table();
+    let decimal = find_custom_type_operator(
+        e1,
+        e2,
+        op,
+        Some(referenced_tables),
+        resolver.schema(),
+        decoded_self_table.as_deref(),
+        resolver.numeric_comparisons(),
+    )?;
+    if decimal.encode_info.is_some()
+        || !matches!(decimal.func_name.as_str(), "numeric_lt" | "numeric_eq")
+    {
+        return None;
+    }
+    Some(StoredNumericComparison {
+        e1,
+        e2,
+        column,
+        operand,
+        op: column_op,
+        scale,
+        decimal,
+    })
+}
+
+fn is_literal_or_parameter(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(_) | ast::Literal::String(_))
+        | ast::Expr::Variable(_) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            matches!(inner.as_ref(), ast::Expr::Literal(ast::Literal::Numeric(_)))
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn emit_stored_numeric_comparison(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    comparison: &StoredNumericComparison,
+    condition_metadata: ConditionMetadata,
+    resolver: &Resolver,
+) -> Result<()> {
+    let stored_reg =
+        translate_stored_column(program, referenced_tables, comparison.column, resolver)?;
+    let key_reg = program.alloc_register();
+    let key_is_ready = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: key_is_ready,
+    });
+    let args = program.alloc_registers(3);
+    translate_expr(
+        program,
+        Some(referenced_tables),
+        comparison.operand,
+        args,
+        resolver,
+    )?;
+    program.emit_int(
+        crate::functions::seek_key::scan_comparison_key(&comparison.op) as i64,
+        args + 1,
+    );
+    program.emit_int(comparison.scale, args + 2);
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args,
+        dest: key_reg,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::PgNumericCompareKey),
+            arg_count: 3,
+        },
+    });
+    program.preassign_label_to_next_insn(key_is_ready);
+    let decimal_comparison = program.allocate_label();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: key_reg,
+        target_pc: decimal_comparison,
+    });
+    emit_integer_comparison(
+        program,
+        &comparison.op,
+        stored_reg,
+        key_reg,
+        referenced_tables,
+        condition_metadata,
+        resolver,
+    )?;
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(decimal_comparison);
+    let result_reg = emit_custom_type_operator(
+        program,
+        Some(referenced_tables),
+        comparison.e1,
+        comparison.e2,
+        &comparison.decimal,
+        resolver,
+    )?;
+    emit_cond_jump(program, condition_metadata, result_reg);
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+/// The stored value of a column of a `pg_` type, without its DECODE.
+fn translate_stored_column(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    column: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
     let stored_reg = program.alloc_register();
     let decodes = program.flags.suppress_custom_type_decode();
     program.flags.set_suppress_custom_type_decode(true);
     let translated = translate_expr(
         program,
         Some(referenced_tables),
-        comparison.column,
+        column,
         stored_reg,
         resolver,
     );
     program.flags.set_suppress_custom_type_decode(decodes);
     translated?;
     program.reset_collation();
-    let key_reg = program.alloc_register();
-    program.emit_int(comparison.key, key_reg);
-    program.mark_last_insn_constant();
+    Ok(stored_reg)
+}
+
+fn emit_integer_comparison(
+    program: &mut ProgramBuilder,
+    op: &ast::Operator,
+    stored_reg: usize,
+    key_reg: usize,
+    referenced_tables: &TableReferences,
+    condition_metadata: ConditionMetadata,
+    resolver: &Resolver,
+) -> Result<()> {
     let integer = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
     let result_reg = program.alloc_register();
     emit_binary_condition_insn(
         program,
-        &comparison.op,
+        op,
         stored_reg,
         key_reg,
         result_reg,
