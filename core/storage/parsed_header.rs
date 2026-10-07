@@ -150,9 +150,13 @@ impl ParsedHeader {
         Ok(())
     }
 
+    #[inline(always)]
     fn start(&mut self, payload: &[u8]) -> Result<()> {
         let payload_size = u32::try_from(payload.len()).map_err(|_| LimboError::TooBig)?;
-        let (header_size, first_type_pos) = read_varint(payload)?;
+        let (header_size, first_type_pos) = match payload.first() {
+            Some(&size) if size < 0x80 => (u64::from(size), 1),
+            _ => read_varint(payload)?,
+        };
         if header_size > u64::from(payload_size) || first_type_pos as u64 > header_size {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
@@ -167,12 +171,47 @@ impl ParsedHeader {
     }
 
     /// Parses serial types until the columns before `end` are known, the
-    /// arrays are full or the header ends. The entries are written before
-    /// `count` grows, so an error in a corrupt header leaves the known
+    /// arrays are full or the header ends. The value positions are checked
+    /// against the payload size once, after the loop; `count` grows only when
+    /// that check passes, so an error in a corrupt header leaves the known
     /// columns as they were.
+    #[inline(always)]
     fn parse_columns_before(&mut self, payload: &[u8], end: usize) -> Result<()> {
         let header_size = self.header_size as usize;
         let end = end.min(MAX_PARSED_COLUMNS);
+        let mut count = self.count as usize;
+        let mut type_pos = self.next_type_pos as usize;
+        let mut value_end = u64::from(self.value_starts[count]);
+        while count < end && type_pos < header_size {
+            let first_byte = payload[type_pos];
+            let serial_type = if first_byte < 0x80 {
+                type_pos += 1;
+                u64::from(first_byte)
+            } else {
+                let (serial_type, varint_len) = read_varint(&payload[type_pos..header_size])?;
+                type_pos += varint_len;
+                serial_type
+            };
+            value_end = value_end.saturating_add(value_size(serial_type));
+            self.serial_types[count] = serial_type;
+            self.value_starts[count + 1] = value_end as u32;
+            count += 1;
+        }
+        if value_end > payload.len() as u64 {
+            return self.parse_columns_checked(payload, end);
+        }
+        self.count = count as u32;
+        self.next_type_pos = type_pos as u32;
+        Ok(())
+    }
+
+    /// The same parse as `parse_columns_before`, with a check of each value
+    /// position, for a header that the fast parse found to be corrupt: it
+    /// keeps the columns before the first bad one and returns its error.
+    #[cold]
+    #[inline(never)]
+    fn parse_columns_checked(&mut self, payload: &[u8], end: usize) -> Result<()> {
+        let header_size = self.header_size as usize;
         let mut count = self.count as usize;
         let mut type_pos = self.next_type_pos as usize;
         let mut value_start = self.value_starts[count] as usize;
@@ -185,10 +224,10 @@ impl ParsedHeader {
             count += 1;
             type_pos = header_size - header.len();
             value_start = value_end;
+            self.count = count as u32;
+            self.next_type_pos = type_pos as u32;
         }
-        self.count = count as u32;
-        self.next_type_pos = type_pos as u32;
-        Ok(())
+        unreachable!("the fast parse found a value past the payload, but each value fits")
     }
 
     /// The positions of the serial type and the value of `column`, found by a
@@ -242,6 +281,18 @@ fn locate_by_walk(payload: &[u8], column: usize) -> Result<Option<(u64, usize)>>
         current += 1;
     }
     Ok(None)
+}
+
+/// The size of a value with `serial_type`. The reserved serial types 10 and
+/// 11 get u64::MAX, so the check of the parse after the loop fails for them.
+#[inline(always)]
+fn value_size(serial_type: u64) -> u64 {
+    const SIZES: [u64; 12] = [0, 1, 2, 3, 4, 6, 8, 8, 0, 0, u64::MAX, u64::MAX];
+    if serial_type >= 12 {
+        (serial_type - 12) / 2
+    } else {
+        SIZES[serial_type as usize]
+    }
 }
 
 fn checked_value_end(value_start: usize, serial_type: u64, payload_size: usize) -> Result<usize> {
