@@ -2010,17 +2010,7 @@ fn resolve_defaults_in_row(
             })
         };
         *expr = match col {
-            Some(col) if col.is_rowid_alias() && !col.is_pg_int_rowid_alias() => {
-                Box::new(ast::Expr::Literal(ast::Literal::Null))
-            }
-            Some(col) => col.default.clone().unwrap_or_else(|| {
-                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                    if let Some(default_expr) = resolved.default_expr() {
-                        return Box::new(default_expr.clone());
-                    }
-                }
-                Box::new(ast::Expr::Literal(ast::Literal::Null))
-            }),
+            Some(col) => default_value_of_column(col, resolver, is_strict),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
     }
@@ -2049,18 +2039,7 @@ fn bind_insert(
                 .columns()
                 .iter()
                 .filter(|c| !c.hidden() && !c.is_generated())
-                .map(|c| {
-                    c.default.clone().unwrap_or_else(|| {
-                        if let Ok(Some(resolved)) =
-                            resolver.schema().resolve_type(&c.ty_str, is_strict)
-                        {
-                            if let Some(default_expr) = resolved.default_expr() {
-                                return Box::new(default_expr.clone());
-                            }
-                        }
-                        Box::new(ast::Expr::Literal(ast::Literal::Null))
-                    })
-                })
+                .map(|c| default_value_of_column(c, resolver, is_strict))
                 .collect();
         }
         InsertBody::Select(select, upsert_opt) => {
@@ -2420,17 +2399,11 @@ fn init_source_emission<'a>(
                 .collect();
             let num_values = storable_columns.len();
             let is_strict = table.is_strict();
-            values.extend(storable_columns.iter().map(|c| {
-                c.default.clone().unwrap_or_else(|| {
-                    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&c.ty_str, is_strict)
-                    {
-                        if let Some(default_expr) = resolved.default_expr() {
-                            return Box::new(default_expr.clone());
-                        }
-                    }
-                    Box::new(ast::Expr::Literal(ast::Literal::Null))
-                })
-            }));
+            values.extend(
+                storable_columns
+                    .iter()
+                    .map(|c| default_value_of_column(c, resolver, is_strict)),
+            );
             (
                 num_values,
                 program.alloc_cursor_id_keyed(
@@ -2443,6 +2416,22 @@ fn init_source_emission<'a>(
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
     Ok(())
+}
+
+/// The value of DEFAULT for a column. An INTEGER rowid alias takes the next
+/// rowid, as in SQLite. The pg_int4 and pg_int8 keys keep their DEFAULT.
+fn default_value_of_column(column: &Column, resolver: &Resolver, is_strict: bool) -> Box<Expr> {
+    if column.is_rowid_alias() && !column.is_pg_int_rowid_alias() {
+        return Box::new(ast::Expr::Literal(ast::Literal::Null));
+    }
+    column.default.clone().unwrap_or_else(|| {
+        if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+            if let Some(default_expr) = resolved.default_expr() {
+                return Box::new(default_expr.clone());
+            }
+        }
+        Box::new(ast::Expr::Literal(ast::Literal::Null))
+    })
 }
 
 #[derive(Clone, Copy)]

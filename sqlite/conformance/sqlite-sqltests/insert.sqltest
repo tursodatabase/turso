@@ -2244,3 +2244,17 @@ expect {
     591505|updated
     591506|generated
 }
+
+@cross-check-integrity
+test insert-default-values-gives-the-next-rowid-to-an-integer-primary-key-with-default {
+    CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT 5, v DEFAULT 'd');
+    INSERT INTO t DEFAULT VALUES;
+    INSERT INTO t DEFAULT VALUES;
+    INSERT INTO t (v) VALUES ('x');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|d
+    2|d
+    3|x
+}
