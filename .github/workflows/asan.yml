@@ -1,0 +1,48 @@
+name: AddressSanitizer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-17
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-asan"
+          cache-on-failure: true
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install llvm-symbolizer
+        run: sudo apt-get update && sudo apt-get install -y llvm
+      - name: Test turso_core and core_tester with AddressSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0:allocator_may_return_null=1"
+        run: >-
+          cargo +nightly-2025-12-17 nextest run
+          --target x86_64-unknown-linux-gnu
+          -p turso_core -p core_tester
+          --all-features --locked --no-fail-fast
+          -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)'
+          --failure-output=final
