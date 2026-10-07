@@ -159,7 +159,13 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let expression_columns = if connection.is_nested_stmt() {
+        SchemaExprColumns::StoredSchema
+    } else {
+        SchemaExprColumns::Of(resolver.schema(), &tbl)
+    };
+    let columns =
+        resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver), expression_columns)?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -227,15 +233,15 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if let Err(reason) = idx.validate_where_expr(&table, resolver) {
-        crate::bail_parse_error!(
-            "Error: {reason} in WHERE clause of CREATE INDEX:\n {}",
-            where_clause
-                .as_ref()
-                .expect("where expr has to exist in order to fail")
-        );
-    }
     if !connection.is_nested_stmt() {
+        if let Err(reason) = idx.validate_where_expr(&table, resolver) {
+            crate::bail_parse_error!(
+                "Error: {reason} in WHERE clause of CREATE INDEX:\n {}",
+                where_clause
+                    .as_ref()
+                    .expect("where expr has to exist in order to fail")
+            );
+        }
         refuse_numeric_keys_unlike_queries(&idx, &tbl, resolver)?;
     }
     if !tbl.is_pg_storage
@@ -975,7 +981,7 @@ pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_resolver(table, cols, None)
+    resolve_sorted_columns_with_resolver(table, cols, None, SchemaExprColumns::StoredSchema)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -991,6 +997,7 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
+    expression_columns: SchemaExprColumns,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -1021,11 +1028,7 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        let columns = match resolver {
-            Some(resolver) => SchemaExprColumns::Of(resolver.schema(), table),
-            None => SchemaExprColumns::StoredSchema,
-        };
-        if let Err(reason) = validate_index_expression(unwrapped_expr, table, columns) {
+        if let Err(reason) = validate_index_expression(unwrapped_expr, table, expression_columns) {
             crate::bail_parse_error!(
                 "Error: invalid expression in CREATE INDEX: {}: {reason}",
                 sc.expr

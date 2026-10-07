@@ -2798,6 +2798,99 @@ fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// Older versions accepted CURRENT_TIMESTAMP in the WHERE of a partial index.
+/// VACUUM must copy such a stored index, as it copies the other stored SQL.
+#[turso_macros::test]
+fn test_vacuum_copies_partial_index_with_current_timestamp_of_older_file(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a TEXT, b INTEGER)")?;
+    conn.execute("CREATE INDEX t_future ON t(a) WHERE a > '2000'")?;
+    conn.execute("INSERT INTO t VALUES ('3000-01-01', 1), ('1000-01-01', 2)")?;
+    store_index_sql(
+        &conn,
+        "t_future",
+        "CREATE INDEX t_future ON t(a) WHERE a > CURRENT_TIMESTAMP",
+    )?;
+    drop(conn);
+    vacuum_and_vacuum_into_keep_rows_and_index_sql(
+        &tmp_db,
+        "SELECT a, b FROM t ORDER BY b",
+        &[("3000-01-01", 1), ("1000-01-01", 2)],
+        &[("t_future", "WHERE a > CURRENT_TIMESTAMP")],
+    )
+}
+
+/// Older versions accepted a cast to date in an index of a STRICT table.
+#[test]
+fn test_vacuum_copies_indexes_with_date_casts_of_older_file() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, txt TEXT) STRICT")?;
+    conn.execute("CREATE INDEX t_day ON t(txt)")?;
+    conn.execute("CREATE INDEX t_recent ON t(id) WHERE txt > '2000-01-01'")?;
+    conn.execute("INSERT INTO t VALUES (1, '2024-01-01'), (2, '1999-12-31')")?;
+    store_index_sql(&conn, "t_day", "CREATE INDEX t_day ON t(CAST(txt AS date))")?;
+    store_index_sql(
+        &conn,
+        "t_recent",
+        "CREATE INDEX t_recent ON t(id) WHERE CAST(txt AS date) > '2000-01-01'",
+    )?;
+    drop(conn);
+    vacuum_and_vacuum_into_keep_rows_and_index_sql(
+        &tmp_db,
+        "SELECT txt, id FROM t ORDER BY id",
+        &[("2024-01-01", 1), ("1999-12-31", 2)],
+        &[
+            ("t_day", "(CAST (txt AS date))"),
+            ("t_recent", "WHERE CAST (txt AS date) > '2000-01-01'"),
+        ],
+    )
+}
+
+fn store_index_sql(conn: &Arc<Connection>, index: &str, sql: &str) -> anyhow::Result<()> {
+    conn.start_nested();
+    let stmt = conn.prepare(format!(
+        "UPDATE sqlite_schema SET sql = '{}' WHERE name = '{index}'",
+        escape_sqlite_string_literal(sql)
+    ));
+    conn.end_nested();
+    stmt?.run_ignore_rows()?;
+    Ok(())
+}
+
+fn vacuum_and_vacuum_into_keep_rows_and_index_sql(
+    tmp_db: &TempDatabase,
+    rows_sql: &str,
+    expected_rows: &[(&str, i64)],
+    expected_index_sql: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    let db = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let conn = db.connect_limbo();
+    let copy_path = db.path.with_file_name("vacuum_into_copy.db");
+    conn.execute(format!("VACUUM INTO '{}'", copy_path.display()))?;
+    conn.execute("VACUUM")?;
+    let copy = TempDatabase::new_with_existent_with_opts(&copy_path, db.db_opts);
+    let expected_rows: Vec<(String, i64)> = expected_rows
+        .iter()
+        .map(|(text, number)| (text.to_string(), *number))
+        .collect();
+    for conn in [conn, copy.connect_limbo()] {
+        assert_eq!(run_integrity_check(&conn), "ok");
+        let rows: Vec<(String, i64)> = conn.exec_rows(rows_sql);
+        assert_eq!(rows, expected_rows);
+        for (index, sql) in expected_index_sql {
+            let copied: Vec<(String,)> = conn.exec_rows(&format!(
+                "SELECT sql FROM sqlite_schema WHERE name = '{index}'"
+            ));
+            assert!(copied[0].0.contains(sql), "{copied:?}");
+        }
+    }
+    Ok(())
+}
+
 /// Plain VACUUM must preserve CHECK-constrained tables and keep those
 /// constraints enforced after the rewrite.
 #[turso_macros::test(mvcc)]

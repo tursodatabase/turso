@@ -938,11 +938,15 @@ pub(crate) fn vacuum_target_build_step(
                 let entry_ordinal = state.indexes_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 // Backing-btree indexes for custom index methods were filtered
-                // out when indexes_to_create was built. The remaining CREATE
-                // INDEX statements are user-visible and can use ordinary prepare.
+                // out when indexes_to_create was built. The replay recreates a
+                // stored index, so it must not apply the checks for new user SQL,
+                // as for the CREATE TABLE replay.
+                state.target_conn.start_nested();
                 let target_stmt = state
                     .target_conn
-                    .prepare_engine_sql(&entry.sql, StatementOrigin::Root)?;
+                    .prepare_engine_sql(&entry.sql, StatementOrigin::Root);
+                state.target_conn.end_nested();
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
