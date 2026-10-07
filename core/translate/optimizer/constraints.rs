@@ -11,8 +11,9 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinOrigin, JoinedTable, NonFromClauseSubquery,
-            Plan, SubqueryState, TableReferences, WhereTerm, WhereTermOrigin,
+            is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
+            NonFromClauseSubquery, Plan, SubqueryState, TableReferences, WhereTerm,
+            WhereTermOrigin,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -542,7 +543,10 @@ pub(super) fn add_implied_column_equalities(
         else {
             continue;
         };
-        if left_table == right_table {
+        if left_table == right_table
+            || table_is_anti_joined(table_references, left_table)
+            || table_is_anti_joined(table_references, right_table)
+        {
             continue;
         }
 
@@ -632,6 +636,13 @@ fn plain_column(expr: &ast::Expr) -> Option<(TableInternalId, usize)> {
         return None;
     };
     Some((*table, *column))
+}
+
+fn table_is_anti_joined(table_references: &TableReferences, table: TableInternalId) -> bool {
+    table_references
+        .find_joined_table_by_internal_id(table)
+        .and_then(|table| table.join_info.as_ref())
+        .is_some_and(JoinInfo::is_anti)
 }
 
 fn find_or_add_equal_column(
