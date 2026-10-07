@@ -1,0 +1,105 @@
+@database :memory:
+
+# An INSERT into a table with a UNIQUE index probes the index with NoConflict
+# and then inserts the index entry with IdxInsert at the position the probe
+# left, without seeking again. These tests insert keys in a scattered order,
+# with keys long enough that leaves split often, so new entries land at the
+# start, middle, and end of leaves and next to divider cells. A misplaced
+# entry would fail the integrity check or be missed by the index lookup.
+
+@cross-check-integrity
+test unique-index-insert-scattered-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, key TEXT UNIQUE, payload TEXT);
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 2999)
+        INSERT INTO t
+        SELECT v, printf('key-%05d-%0180d', (v * 7919) % 3000, 0), 'p' FROM n;
+    SELECT count(*), count(DISTINCT key) FROM t;
+    SELECT count(*) FROM t AS a WHERE a.id = (SELECT b.id FROM t AS b WHERE b.key = a.key);
+}
+expect {
+    3000|3000
+    3000
+}
+
+@cross-check-integrity
+test unique-index-insert-one-row-per-statement {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, key TEXT UNIQUE);
+    INSERT INTO t VALUES (1, printf('m-%0150d', 5));
+    INSERT INTO t VALUES (2, printf('a-%0150d', 5));
+    INSERT INTO t VALUES (3, printf('z-%0150d', 5));
+    INSERT INTO t VALUES (4, printf('m-%0150d', 4));
+    INSERT INTO t VALUES (5, printf('m-%0150d', 6));
+    INSERT INTO t VALUES (6, printf('b-%0150d', 5));
+    INSERT INTO t VALUES (7, printf('y-%0150d', 5));
+    SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY key);
+    SELECT count(*) FROM t AS a WHERE a.id = (SELECT b.id FROM t AS b WHERE b.key = a.key);
+}
+expect {
+    2,6,4,1,5,7,3
+    7
+}
+
+@cross-check-integrity
+test unique-multi-column-index-insert-scattered-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, UNIQUE(a, b));
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 1999)
+        INSERT INTO t
+        SELECT v, ((v * 7919) % 2000) / 10, printf('%0150d', (v * 7919) % 10) FROM n;
+    SELECT count(*), count(DISTINCT a || '/' || b) FROM t;
+    SELECT count(*) FROM t AS x WHERE x.id = (SELECT y.id FROM t AS y WHERE y.a = x.a AND y.b = x.b);
+}
+expect {
+    2000|2000
+    2000
+}
+
+# A BEFORE trigger runs before the row's probe and an AFTER trigger runs after
+# the row's index insert. Both insert a key that sorts next to the row's key,
+# so they write to the same leaf the probe and the insert use.
+
+@cross-check-integrity
+test unique-index-insert-with-same-table-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, key TEXT UNIQUE);
+    CREATE TRIGGER before_insert BEFORE INSERT ON t WHEN NEW.id < 10000 BEGIN
+        INSERT INTO t VALUES (NEW.id + 10000, printf('%05d-b-%0150d', (NEW.id * 7919) % 600, 0));
+    END;
+    CREATE TRIGGER after_insert AFTER INSERT ON t WHEN NEW.id < 10000 BEGIN
+        INSERT INTO t VALUES (NEW.id + 20000, printf('%05d-a-%0150d', (NEW.id * 7919) % 600, 0));
+    END;
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 599)
+        INSERT INTO t SELECT v, printf('%05d-m-%0150d', (v * 7919) % 600, 0) FROM n;
+    SELECT count(*), count(DISTINCT key) FROM t;
+    SELECT count(*) FROM t AS a WHERE a.id = (SELECT b.id FROM t AS b WHERE b.key = a.key);
+    SELECT group_concat(substr(key, 1, 7), ',') FROM (SELECT key FROM t ORDER BY key LIMIT 6);
+}
+expect {
+    1800|1800
+    1800
+    00000-a,00000-b,00000-m,00001-a,00001-b,00001-m
+}
+
+@cross-check-integrity
+test unique-index-insert-duplicate-after-scattered-inserts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, key TEXT UNIQUE);
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 999)
+        INSERT INTO t SELECT v, printf('key-%05d-%0180d', (v * 7919) % 1000, 0) FROM n;
+    INSERT INTO t VALUES (5000, printf('key-%05d-%0180d', 517, 0));
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+@cross-check-integrity
+test unique-index-insert-null-keys-between-scattered-inserts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, key TEXT UNIQUE);
+    WITH RECURSIVE n(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 999)
+        INSERT INTO t
+        SELECT v, CASE WHEN v % 7 = 0 THEN NULL ELSE printf('key-%05d-%0180d', (v * 7919) % 1000, 0) END
+        FROM n;
+    SELECT count(*), count(key), count(DISTINCT key) FROM t;
+    SELECT count(*) FROM t AS a WHERE a.key IS NOT NULL AND a.id = (SELECT b.id FROM t AS b WHERE b.key = a.key);
+}
+expect {
+    1000|857|857
+    857
+}
