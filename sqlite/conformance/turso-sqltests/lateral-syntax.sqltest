@@ -1,0 +1,872 @@
+@database :memory:
+
+# Syntax forms of LATERAL subqueries in the FROM clause.
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z'), (3, 40, 'w'), (5, 50, 'v');
+}
+
+@setup data
+test comma-lateral-with-as-alias {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test comma-lateral-alias-without-as {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test comma-lateral-without-alias {
+    SELECT t1.a, c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lowercase-lateral-keyword {
+    select t1.a, s.c from t1, lateral (select c from t2 where t2.a = t1.a) as s order by 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test mixed-case-lateral-keyword {
+    SELECT t1.a, s.c FROM t1, LaTeRaL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test join-lateral-on-true {
+    SELECT t1.a, s.c FROM t1 JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test inner-join-lateral-on-true {
+    SELECT t1.a, s.c FROM t1 INNER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test join-lateral-on-condition-that-reads-both-sides {
+    SELECT t1.a, s.a, s.c FROM t1 JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.a >= t1.a) AS s ON s.a = t1.a + 1 ORDER BY 1, 2, 3;
+}
+expect {
+    1|2|20
+    1|2|30
+    2|3|40
+    4|5|50
+}
+
+@setup data
+test join-lateral-on-condition-that-reads-only-the-subquery {
+    SELECT t1.a, s.c FROM t1 JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON s.c > 20 ORDER BY 1, 2;
+}
+expect {
+    2|30
+    3|40
+}
+
+@setup data
+test join-lateral-on-condition-that-reads-only-the-left-table {
+    SELECT t1.a, s.c FROM t1 JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON t1.a > 1 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test join-lateral-on-false {
+    SELECT t1.a, s.c FROM t1 JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON false ORDER BY 1, 2;
+}
+expect {
+}
+
+@setup data
+test cross-join-lateral {
+    SELECT t1.a, s.c FROM t1 CROSS JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test left-join-lateral {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test left-outer-join-lateral {
+    SELECT t1.a, s.c FROM t1 LEFT OUTER JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test join-lateral-using {
+    SELECT t1.a, s.c FROM t1 JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.c > t1.a * 10) AS s USING (a) ORDER BY 1, 2;
+}
+expect {
+    2|30
+    3|40
+}
+
+@setup data
+test left-join-lateral-using {
+    SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.c > t1.a * 10) AS s USING (a) ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test join-lateral-using-select-star {
+    SELECT * FROM t1 JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.c > t1.a * 10) AS s USING (a) ORDER BY 1, 3;
+}
+expect {
+    2|q|30
+    3|r|40
+}
+
+@setup data
+test join-lateral-using-two-columns {
+    SELECT t1.a, t1.b, s.c FROM t1 JOIN LATERAL (SELECT a, b, a * 100 AS c FROM t1 AS x WHERE x.a <= t1.a) AS s USING (a, b) ORDER BY 1;
+}
+expect {
+    1|p|100
+    2|q|200
+    3|r|300
+    4|s|400
+}
+
+@setup data
+test natural-join-lateral {
+    SELECT * FROM t1 NATURAL JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.c >= t1.a * 10) AS s ORDER BY 1, 3;
+}
+expect {
+    1|p|10
+    2|q|20
+    2|q|30
+    3|r|40
+}
+
+@setup data
+test natural-left-join-lateral {
+    SELECT * FROM t1 NATURAL LEFT JOIN LATERAL (SELECT a, c FROM t2 WHERE t2.c > t1.a * 10) AS s ORDER BY 1, 3;
+}
+expect {
+    1|p|
+    2|q|30
+    3|r|40
+    4|s|
+}
+
+@setup data
+test natural-join-lateral-without-common-columns {
+    SELECT t1.a, s.v FROM t1 NATURAL JOIN LATERAL (SELECT t1.a + 1 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+}
+
+@setup data
+test lateral-as-the-only-from-item {
+    SELECT * FROM LATERAL (SELECT 1 AS x, 'k' AS y) AS s;
+}
+expect {
+    1|k
+}
+
+@setup data
+test lateral-as-the-first-from-item-before-a-table {
+    SELECT s.x, t1.a FROM LATERAL (SELECT 7 AS x) AS s, t1 ORDER BY 2;
+}
+expect {
+    7|1
+    7|2
+    7|3
+    7|4
+}
+
+@setup data
+test lateral-as-the-first-from-item-reads-a-table {
+    SELECT s.n FROM LATERAL (SELECT count(*) AS n FROM t2) AS s;
+}
+expect {
+    5
+}
+
+@setup data
+test lateral-as-the-first-from-item-then-a-lateral-that-reads-it {
+    SELECT s.x, u.y FROM LATERAL (SELECT 3 AS x) AS s, LATERAL (SELECT s.x * 2 AS y) AS u;
+}
+expect {
+    3|6
+}
+
+@setup data
+test lateral-before-a-join-with-on {
+    SELECT s.x, t1.a FROM LATERAL (SELECT 2 AS x) AS s JOIN t1 ON t1.a = s.x;
+}
+expect {
+    2|2
+}
+
+@setup data
+test newline-between-lateral-and-parenthesis {
+    SELECT t1.a, s.v FROM t1, LATERAL
+    (SELECT t1.a * 2 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+@setup data
+test block-comment-between-lateral-and-parenthesis {
+    SELECT t1.a, s.v FROM t1, LATERAL /* comment */ (SELECT t1.a * 2 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+@setup data
+test line-comment-between-lateral-and-parenthesis {
+    SELECT t1.a, s.v FROM t1, LATERAL -- comment
+    (SELECT t1.a * 2 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+@setup data
+test lateral-subquery-in-two-pairs-of-parentheses {
+    SELECT t1.a, s.v FROM t1, LATERAL ((SELECT t1.a * 3 AS v)) AS s ORDER BY 1;
+}
+expect {
+    1|3
+    2|6
+    3|9
+    4|12
+}
+
+@setup data
+test join-lateral-subquery-in-three-pairs-of-parentheses {
+    SELECT t1.a, s.v FROM t1 JOIN LATERAL (((SELECT t1.a * 3 AS v))) AS s ON true ORDER BY 1;
+}
+expect {
+    1|3
+    2|6
+    3|9
+    4|12
+}
+
+@setup data
+test tab-and-spaces-around-lateral {
+    SELECT t1.a, s.v FROM t1,	LATERAL	  (SELECT t1.a * 2 AS v)   AS   s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+@setup data
+test lateral-values-one-row {
+    SELECT t1.a, s.column1 FROM t1, LATERAL (VALUES (t1.a * 10)) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+}
+
+@setup data
+test lateral-values-several-rows-and-columns {
+    SELECT t1.a, s.column1, s.column2 FROM t1, LATERAL (VALUES (t1.a, t1.b), (t1.a + 10, 'k')) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1|p
+    1|11|k
+    2|2|q
+    2|12|k
+    3|3|r
+    3|13|k
+    4|4|s
+    4|14|k
+}
+
+@setup data
+test lateral-values-without-alias {
+    SELECT t1.a, column1 FROM t1, LATERAL (VALUES (t1.a + 1)) ORDER BY 1;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+}
+
+@setup data
+test join-lateral-values-on-condition {
+    SELECT t1.a, s.column1 FROM t1 JOIN LATERAL (VALUES (t1.a), (t1.a + 1), (t1.a + 2)) AS s ON s.column1 % 2 = 0 ORDER BY 1, 2;
+}
+expect {
+    1|2
+    2|2
+    2|4
+    3|4
+    4|4
+    4|6
+}
+
+@setup data
+test left-join-lateral-values-on-condition {
+    SELECT t1.a, s.column1 FROM t1 LEFT JOIN LATERAL (VALUES (t1.a), (t1.a * 2)) AS s ON s.column1 > 3 ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|4
+    3|6
+    4|4
+    4|8
+}
+
+@setup data
+test lateral-with-cte-inside {
+    SELECT t1.a, s.c FROM t1, LATERAL (WITH w AS (SELECT c FROM t2 WHERE t2.a = t1.a) SELECT c FROM w) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-with-two-ctes-inside {
+    SELECT t1.a, s.v
+    FROM t1, LATERAL (
+        WITH w1 AS (SELECT c FROM t2 WHERE t2.a = t1.a),
+             w2 AS (SELECT c + 1 AS v FROM w1)
+        SELECT v FROM w2
+    ) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|11
+    2|21
+    2|31
+    3|41
+}
+
+@setup data
+test lateral-with-recursive-cte-inside {
+    SELECT t1.a, s.n
+    FROM t1, LATERAL (
+        WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < t1.a)
+        SELECT n FROM r
+    ) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+    4|1
+    4|2
+    4|3
+    4|4
+}
+
+@setup data
+test lateral-union-all {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.a AS v UNION ALL SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|10
+    2|2
+    2|20
+    2|30
+    3|3
+    3|40
+    4|4
+}
+
+@setup data
+test lateral-union {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t2.a AS v FROM t2 WHERE t2.a <= t1.a UNION SELECT t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+    4|1
+    4|2
+    4|3
+    4|4
+}
+
+@setup data
+test lateral-intersect {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT a AS v FROM t2 INTERSECT SELECT a FROM t1 AS x WHERE x.a <= t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+    4|1
+    4|2
+    4|3
+}
+
+@setup data
+test lateral-except {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT a AS v FROM t2 EXCEPT SELECT t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|2
+    1|3
+    1|5
+    2|1
+    2|3
+    2|5
+    3|1
+    3|2
+    3|5
+    4|1
+    4|2
+    4|3
+    4|5
+}
+
+@setup data
+test lateral-compound-with-order-by-and-limit {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a = t1.a UNION ALL SELECT t1.a ORDER BY 1 DESC LIMIT 2) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|10
+    2|20
+    2|30
+    3|3
+    3|40
+    4|4
+}
+
+@setup data
+test lateral-compound-of-three-arms {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT t1.a AS v UNION ALL SELECT t1.a * 10 UNION ALL SELECT t1.a * 100) AS s WHERE t1.a < 3 ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|10
+    1|100
+    2|2
+    2|20
+    2|200
+}
+
+@setup data
+test lateral-subquery-alias-shadows-a-table-name {
+    SELECT t1.a, t2.v FROM t1, LATERAL (SELECT t1.a + 5 AS v) AS t2 ORDER BY 1;
+}
+expect {
+    1|6
+    2|7
+    3|8
+    4|9
+}
+
+@setup data
+test lateral-columns-have-names-from-the-select-list {
+    SELECT s.c, s.d FROM t1, LATERAL (SELECT c, d FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    10|x
+    20|y
+    30|z
+    40|w
+}
+
+@setup data
+test lateral-select-star-inside {
+    SELECT t1.a, s.* FROM t1, LATERAL (SELECT * FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 3;
+}
+expect {
+    1|1|10|x
+    2|2|20|y
+    2|2|30|z
+    3|3|40|w
+}
+
+@setup data
+test lateral-unqualified-outer-column {
+    SELECT t1.b, s.v FROM t1, LATERAL (SELECT b || '!' AS v) AS s ORDER BY 1;
+}
+expect {
+    p|p!
+    q|q!
+    r|r!
+    s|s!
+}
+
+@setup data
+test lateral-inner-column-hides-outer-column-with-the-same-name {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT a AS v FROM t2 WHERE c = 20) AS s ORDER BY 1, 2;
+}
+expect {
+    1|2
+    2|2
+    3|2
+    4|2
+}
+
+@setup data
+test lateral-reads-a-left-table-through-its-alias {
+    SELECT x.a, s.c FROM t1 AS x, LATERAL (SELECT c FROM t2 WHERE t2.a = x.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-reads-a-left-table-alias-without-as {
+    SELECT x.a, s.c FROM t1 x, LATERAL (SELECT c FROM t2 WHERE t2.a = x.a) s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test lateral-reads-the-same-table-as-the-left-item {
+    SELECT x.a, s.n FROM t1 AS x, LATERAL (SELECT count(*) AS n FROM t1 WHERE t1.a < x.a) AS s ORDER BY 1;
+}
+expect {
+    1|0
+    2|1
+    3|2
+    4|3
+}
+
+@setup data
+test lateral-keyword-then-select-with-many-columns {
+    SELECT t1.a, s.* FROM t1, LATERAL (SELECT t1.a + 1 AS p, t1.a + 2 AS q, t1.b AS r, 'k' AS z) AS s ORDER BY 1;
+}
+expect {
+    1|2|3|p|k
+    2|3|4|q|k
+    3|4|5|r|k
+    4|5|6|s|k
+}
+
+@setup data
+test lateral-in-select-with-where-group-order-limit {
+    SELECT t1.b, sum(s.c) AS total
+    FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s
+    WHERE t1.a < 4
+    GROUP BY t1.b
+    HAVING sum(s.c) > 10
+    ORDER BY total DESC
+    LIMIT 2;
+}
+expect {
+    q|50
+    r|40
+}
+
+test lateral-as-a-table-name {
+    CREATE TABLE lateral(a INT);
+    INSERT INTO lateral VALUES (1), (2);
+    SELECT a FROM lateral ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+test lateral-as-a-column-name {
+    CREATE TABLE t1(lateral INT);
+    INSERT INTO t1 VALUES (3), (4);
+    SELECT lateral FROM t1 ORDER BY lateral;
+}
+expect {
+    3
+    4
+}
+
+@setup data
+test lateral-as-a-column-alias {
+    SELECT a AS lateral FROM t1 ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup data
+test lateral-as-a-table-alias {
+    SELECT lateral.a FROM t1 AS lateral ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test lateral-table-joined-with-a-lateral-subquery {
+    CREATE TABLE lateral(a INT);
+    INSERT INTO lateral VALUES (1), (2);
+    SELECT lateral.a, s.v FROM lateral, LATERAL (SELECT lateral.a * 10 AS v) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+}
+
+@setup data
+test lateral-subquery-named-lateral {
+    SELECT t1.a, lateral.v FROM t1, LATERAL (SELECT t1.a + 1 AS v) AS lateral ORDER BY 1;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+}
+
+@setup data
+test lateral-column-alias-inside-lateral-subquery {
+    SELECT t1.a, s.lateral FROM t1, LATERAL (SELECT t1.a * 2 AS lateral) AS s ORDER BY 1;
+}
+expect {
+    1|2
+    2|4
+    3|6
+    4|8
+}
+
+@setup data
+test quoted-lateral-is-an-identifier {
+    SELECT "lateral".a FROM t1 AS "lateral" WHERE "lateral".a = 2;
+}
+expect {
+    2
+}
+
+@setup data
+test lateral-subquery-with-a-quoted-alias {
+    SELECT t1.a, "my s".v FROM t1, LATERAL (SELECT t1.a + 1 AS v) AS "my s" ORDER BY 1;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+}
+
+@setup data
+test two-lateral-subqueries-after-commas {
+    SELECT t1.a, s.v, u.w FROM t1, LATERAL (SELECT t1.a + 1 AS v) AS s, LATERAL (SELECT t1.a + 2 AS w) AS u ORDER BY 1;
+}
+expect {
+    1|2|3
+    2|3|4
+    3|4|5
+    4|5|6
+}
+
+@setup data
+test lateral-after-a-comma-then-join-lateral {
+    SELECT t1.a, s.v, u.w FROM t1, LATERAL (SELECT t1.a + 1 AS v) AS s JOIN LATERAL (SELECT s.v * 10 AS w) AS u ON true ORDER BY 1;
+}
+expect {
+    1|2|20
+    2|3|30
+    3|4|40
+    4|5|50
+}
+
+@setup data
+test join-lateral-then-cross-join-lateral-then-left-join-lateral {
+    SELECT t1.a, s.v, u.w, z.c
+    FROM t1
+    JOIN LATERAL (SELECT t1.a + 1 AS v) AS s ON true
+    CROSS JOIN LATERAL (SELECT s.v * 10 AS w) AS u
+    LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.c = u.w) AS z ON true
+    ORDER BY 1, 4;
+}
+expect {
+    1|2|20|20
+    2|3|30|30
+    3|4|40|40
+    4|5|50|50
+}
+
+@setup data
+test lateral-between-two-tables {
+    SELECT t1.a, s.v, t2.c FROM t1, LATERAL (SELECT t1.a * 10 AS v) AS s, t2 WHERE t2.c = s.v ORDER BY 1;
+}
+expect {
+    1|10|10
+    2|20|20
+    3|30|30
+    4|40|40
+}
+
+@setup data
+test lateral-with-a-table-join-inside-the-on-clause-chain {
+    SELECT t1.a, t2.c, s.v FROM t1 JOIN t2 ON t2.a = t1.a JOIN LATERAL (SELECT t2.c + t1.a AS v) AS s ON true ORDER BY 1, 2;
+}
+expect {
+    1|10|11
+    2|20|22
+    2|30|32
+    3|40|43
+}
+
+@setup data
+test lateral-subquery-without-from {
+    SELECT t1.a, s.x, s.y FROM t1, LATERAL (SELECT t1.a AS x, t1.b AS y) AS s ORDER BY 1;
+}
+expect {
+    1|1|p
+    2|2|q
+    3|3|r
+    4|4|s
+}
+
+@setup data
+test lateral-subquery-with-where-and-no-from {
+    SELECT t1.a, s.x FROM t1, LATERAL (SELECT t1.a AS x WHERE t1.a > 2) AS s ORDER BY 1;
+}
+expect {
+    3|3
+    4|4
+}
+
+@setup data
+test lateral-empty-subquery-removes-every-row {
+    SELECT t1.a FROM t1, LATERAL (SELECT 1 AS x WHERE false) AS s ORDER BY 1;
+}
+expect {
+}
+
+@setup data
+test lateral-subquery-with-distinct-keyword {
+    SELECT t1.a, s.a FROM t1, LATERAL (SELECT DISTINCT a FROM t2 WHERE t2.a <= t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+    4|1
+    4|2
+    4|3
+}
+
+@setup data
+test lateral-subquery-with-all-keyword {
+    SELECT t1.a, s.a FROM t1, LATERAL (SELECT ALL a FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|2
+    2|2
+    3|3
+}
