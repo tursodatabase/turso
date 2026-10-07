@@ -1709,3 +1709,195 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
 }
+
+fn next_id(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<i64>> {
+    loop {
+        match stmt.step()? {
+            StepResult::Row => return Ok(Some(stmt.row().unwrap().get::<i64>(0)?)),
+            StepResult::Done => return Ok(None),
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Yield => {}
+            other => anyhow::bail!("unexpected step result: {other:?}"),
+        }
+    }
+}
+
+fn remaining_ids(stmt: &mut turso_core::Statement) -> anyhow::Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    while let Some(id) = next_id(stmt)? {
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+fn three_row_table(conn: &Arc<turso_core::Connection>) {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+}
+
+/// A read that outlives its own transaction keeps returning its remaining rows.
+#[test]
+fn mvcc_read_continues_after_its_own_commit() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = tmp_db.connect_limbo();
+    three_row_table(&conn);
+
+    conn.execute("BEGIN").unwrap();
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    conn.execute("COMMIT").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// The same with the rows in the B-tree, which the read reaches through the
+/// shadow check instead of the version chains.
+#[test]
+fn mvcc_read_continues_after_its_own_commit_with_rows_in_the_btree() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = tmp_db.connect_limbo();
+    three_row_table(&conn);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    conn.execute("COMMIT").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// WAL mode keeps a read alive across its own COMMIT while a second connection
+/// holds an uncommitted row. MVCC stops the process here, which is #9619.
+#[test]
+fn wal_read_continues_after_its_own_commit_while_another_connection_writes() {
+    let tmp_db = TempDatabase::builder().build();
+    let reader = tmp_db.connect_limbo();
+    three_row_table(&reader);
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    let mut read = reader.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    reader.execute("COMMIT").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// The read survives its own COMMIT when the other transaction commits first.
+/// The row that other transaction added stays outside this read.
+#[test]
+fn mvcc_read_continues_when_the_other_transaction_commits_first() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let reader = tmp_db.connect_limbo();
+    three_row_table(&reader);
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    let mut read = reader.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    reader.execute("COMMIT").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// A read with no explicit transaction survives an uncommitted write from
+/// another connection.
+#[test]
+fn mvcc_autocommit_read_continues_while_another_connection_writes() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let reader = tmp_db.connect_limbo();
+    three_row_table(&reader);
+    let writer = tmp_db.connect_limbo();
+
+    let mut read = reader.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// A statement that never read a row starts from the first row, even when its
+/// transaction ended first.
+#[test]
+fn mvcc_read_starts_at_the_first_row_when_its_transaction_ended_first() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let reader = tmp_db.connect_limbo();
+    three_row_table(&reader);
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    let mut read = reader.prepare("SELECT id FROM t").unwrap();
+    reader.execute("COMMIT").unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![1, 2, 3]);
+}
+
+/// A reset after the transaction ends gives a statement that reads every row
+/// again.
+#[test]
+fn mvcc_statement_reset_works_after_its_own_commit() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let reader = tmp_db.connect_limbo();
+    three_row_table(&reader);
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    let mut read = reader.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    reader.execute("COMMIT").unwrap();
+    read.reset().unwrap();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![1, 2, 3]);
+}
+
+/// A statement that fails with OR ROLLBACK rolls back the transaction that the
+/// open read uses. The read keeps its remaining rows while the rows stay out of
+/// the B-tree. With a checkpoint first, the read stops the process, which is
+/// #9620.
+#[test]
+fn mvcc_failed_or_rollback_keeps_a_read_alive_without_a_checkpoint() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = tmp_db.connect_limbo();
+    three_row_table(&conn);
+    conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO other VALUES (6)").unwrap();
+    conn.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    assert_that!(conn.execute("INSERT OR ROLLBACK INTO other VALUES (6)")).is_err();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
+
+/// The same with the rows in the B-tree and no MVCC version over them.
+#[test]
+fn mvcc_failed_or_rollback_keeps_a_read_alive_without_a_version_over_the_btree() {
+    let tmp_db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = tmp_db.connect_limbo();
+    three_row_table(&conn);
+    conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO other VALUES (6)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert_that!(next_id(&mut read).unwrap()).is_equal_to(Some(1));
+    assert_that!(conn.execute("INSERT OR ROLLBACK INTO other VALUES (6)")).is_err();
+
+    assert_that!(remaining_ids(&mut read).unwrap()).is_equal_to(vec![2, 3]);
+}
