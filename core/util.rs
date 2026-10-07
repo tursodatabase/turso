@@ -1957,20 +1957,24 @@ fn view_source_from_select_table(
                 db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let columns = schema
-                .get_table(&table_name)
-                .map(|table| {
-                    table
-                        .columns()
-                        .iter()
-                        .cloned()
-                        .map(|column| ViewColumn {
-                            table_index,
-                            column,
-                        })
-                        .collect()
+            let table = schema.get_table(&table_name);
+            let view = table
+                .is_none()
+                .then(|| schema.get_view(&table_name))
+                .flatten();
+            let source_columns: &[Column] = match (&table, &view) {
+                (Some(table), _) => table.columns(),
+                (None, Some(view)) => &view.columns,
+                (None, None) => &[],
+            };
+            let columns = source_columns
+                .iter()
+                .cloned()
+                .map(|column| ViewColumn {
+                    table_index,
+                    column,
                 })
-                .unwrap_or_default();
+                .collect();
             Ok(ViewSource {
                 qualifiers,
                 columns,
