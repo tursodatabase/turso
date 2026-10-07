@@ -1904,6 +1904,35 @@ fn test_postgres_enum_label_with_spaces(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_enum_label_with_single_quote(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TYPE reply AS ENUM ('it''s', 'no')")
+        .unwrap();
+    conn.execute("CREATE TABLE replies (r reply)").unwrap();
+
+    conn.execute("INSERT INTO replies VALUES ('it''s')")
+        .unwrap();
+
+    let mut rows = conn.query("SELECT r FROM replies").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "it's");
+    drop(rows);
+
+    let result = conn.execute("INSERT INTO replies VALUES ('its')");
+    assert!(result.is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_enum_type_name_with_single_quote(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TYPE \"o'k\" AS ENUM ('a')").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_drop_type(db: TempDatabase) {
     let conn = db.connect_postgres();
 

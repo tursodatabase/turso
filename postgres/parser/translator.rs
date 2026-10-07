@@ -4257,10 +4257,18 @@ fn translate_create_enum(
     //        ELSE RAISE(ABORT, 'invalid input value for enum <name>') END
     let in_list: Vec<Box<ast::Expr>> = labels
         .iter()
-        .map(|l| Box::new(ast::Expr::Literal(ast::Literal::String(format!("'{l}'")))))
+        .map(|l| {
+            Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                l.replace('\'', "''")
+            ))))
+        })
         .collect();
 
-    let error_msg = format!("invalid input value for enum {type_name}");
+    let error_msg = format!(
+        "invalid input value for enum {}",
+        type_name.replace('\'', "''")
+    );
     let encode = ast::Expr::Case {
         base: None,
         when_then_pairs: vec![(
