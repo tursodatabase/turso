@@ -11463,6 +11463,66 @@ fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
     insert.reset().unwrap();
 }
 
+#[test]
+fn rollback_of_created_index_keeps_open_reader_valid_after_another_connection_commits() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE w(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE INDEX i ON t(b)").unwrap();
+    for i in 1..=50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    let mut read = conn
+        .prepare("SELECT b FROM t INDEXED BY i WHERE b > 0")
+        .unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    conn.execute("ROLLBACK").unwrap();
+
+    let other = db.db.connect().unwrap();
+    for i in 1..=500 {
+        other
+            .execute(format!("INSERT INTO w VALUES ({i}, 'x{i}')"))
+            .unwrap();
+    }
+
+    assert!(matches!(read.step().unwrap(), StepResult::Done));
+}
+
+#[test]
+fn insert_or_rollback_into_created_table_can_be_reset_after_another_connection_commits() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("CREATE TABLE w(a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    for i in 1..=50 {
+        conn.execute(format!("INSERT INTO u VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    let mut insert = conn
+        .prepare("INSERT OR ROLLBACK INTO u VALUES (1000, 'v7')")
+        .unwrap();
+    assert!(insert.step().is_err());
+
+    let other = db.db.connect().unwrap();
+    for i in 1..=500 {
+        other
+            .execute(format!("INSERT INTO w VALUES ({i}, 'x{i}')"))
+            .unwrap();
+    }
+
+    insert.reset().unwrap();
+}
+
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
 /// After a burst of versions is collected, the chain's capacity must be
 /// released down to a quarter of its previous value (deliberately not to fit)
