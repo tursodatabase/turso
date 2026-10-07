@@ -483,6 +483,13 @@ such a table, also when a DEFAULT calls a function, and the table gets the
 expressions of a table with the marker keep the casts of the older version:
 `x::date`, `x::time` and `x::timestamp` are a cast to TEXT there.
 
+A file gets an empty internal table with the `PGSTORAGE` option when it
+stores a domain or a type over a new `pg_` type, or a cast to one of these
+types outside a table with the option, for example in a view, a trigger, an
+index, a CHECK or a DEFAULT of the SQLite dialect. Older versions do not know
+these types and would read such a cast as a cast to NUMERIC, so they must
+refuse the file. The catalog does not show the internal tables.
+
 `pg_get_tabledef` shows the stored column types and DEFAULT expressions, not
 the text of the CREATE TABLE. For example, `real` and `numeric` show as
 `double precision`, `timetz` as `time`, `char(n)` and `varchar` as `text`,

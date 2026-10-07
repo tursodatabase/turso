@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
     dialect::{decode_stored_table_sql, refuse_older_postgres_frontend_rewrite, StoredTableSql},
-    schema::{BTreeTable, PgStorageType, Schema, Table},
+    schema::{BTreeTable, PgStorageType, Schema, Table, TURSO_INTERNAL_PREFIX},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
 };
@@ -205,6 +205,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
+                || name.starts_with(TURSO_INTERNAL_PREFIX)
             {
                 return false;
             }

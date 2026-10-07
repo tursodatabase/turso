@@ -25,6 +25,7 @@ use crate::{
             emit_stored_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
             walk_expr_mut, NoConstantOptReason, WalkControl,
         },
+        pg_storage_gate::{column_casts_to_pg_type, emit_pg_storage_gate},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -1672,6 +1673,10 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            if !btree.is_pg_storage && column_casts_to_pg_type(&col_def, resolver.schema()) {
+                emit_pg_storage_gate(program, resolver, database_id)?;
+            }
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -2103,6 +2108,13 @@ pub fn translate_alter_table(
                         "must have at least one non-generated column".to_string(),
                     ));
                 }
+            }
+
+            if !rename
+                && !btree.is_pg_storage
+                && column_casts_to_pg_type(&definition, resolver.schema())
+            {
+                emit_pg_storage_gate(program, resolver, database_id)?;
             }
 
             let altered_table = if let Some(replacement_column) = &replacement_column {

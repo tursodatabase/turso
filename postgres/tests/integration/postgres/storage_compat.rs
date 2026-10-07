@@ -847,6 +847,34 @@ fn covering_numeric_expression_indexes_of_sqlite_dialect_base_file_give_the_rows
     }
 }
 
+/// A file with a domain over a built-in type of the new tables gets a table
+/// with the PGSTORAGE option, which older versions refuse. The catalog does
+/// not show the table.
+#[test]
+fn domain_over_a_new_type_gets_a_pgstorage_table_that_the_catalog_hides() {
+    let dir = copy_fixtures(&[MAIN]);
+    let db = open(dir.path().join(MAIN), false);
+    let conn = db.connect_postgres();
+    let gate = "SELECT sql FROM sqlite_schema WHERE name = '__turso_internal_pg_storage'";
+    assert!(core_rows(conn.inner(), gate).is_empty());
+    conn.execute("CREATE DOMAIN dd AS timestamp").unwrap();
+    assert_eq!(
+        core_rows(conn.inner(), gate),
+        ["CREATE TABLE __turso_internal_pg_storage (x TEXT) STRICT, PGSTORAGE"]
+    );
+    assert!(rows(
+        &conn,
+        "SELECT tablename FROM pg_tables WHERE tablename LIKE '%turso%'"
+    )
+    .is_empty());
+    conn.execute("CREATE TABLE r (id integer PRIMARY KEY, v dd)")
+        .unwrap();
+    conn.execute("INSERT INTO r VALUES (1, '2024-01-01 10:00:00')")
+        .unwrap();
+    assert_eq!(rows(&conn, "SELECT * FROM r"), ["1|2024-01-01 10:00:00"]);
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+}
+
 /// The new tables store numeric(p,s) with p above 18 with the type of older
 /// versions. Index keys compute their comparisons with the rules of older
 /// versions, so an index whose keys differ from the values of queries is

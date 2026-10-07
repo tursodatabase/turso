@@ -1,5 +1,6 @@
 use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::translate::emitter::Resolver;
+use crate::translate::pg_storage_gate::{emit_pg_storage_gate, trigger_casts_to_pg_type};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
@@ -199,6 +200,12 @@ pub fn translate_create_trigger(
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
+
+    if !table.btree().is_some_and(|btree| btree.is_pg_storage)
+        && trigger_casts_to_pg_type(commands, when_clause, resolver.schema())
+    {
+        emit_pg_storage_gate(program, resolver, database_id)?;
+    }
 
     // Open cursor to sqlite_schema table (in the trigger's database)
     let table = resolver

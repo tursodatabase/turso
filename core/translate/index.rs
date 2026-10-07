@@ -17,6 +17,7 @@ use crate::translate::{
         BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
+    pg_storage_gate::{casts_to_pg_type, emit_pg_storage_gate},
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
@@ -236,6 +237,11 @@ pub fn translate_create_index(
     }
     if !connection.is_nested_stmt() {
         refuse_numeric_keys_unlike_queries(&idx, &tbl, resolver)?;
+    }
+    if !tbl.is_pg_storage
+        && index_expressions(&idx).any(|expr| casts_to_pg_type(expr, resolver.schema()))
+    {
+        emit_pg_storage_gate(program, resolver, database_id)?;
     }
 
     let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

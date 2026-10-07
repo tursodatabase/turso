@@ -4,6 +4,7 @@ use crate::schema::{
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::pg_storage_gate::{emit_pg_storage_gate, select_casts_to_pg_type};
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -92,6 +93,9 @@ pub fn translate_create_materialized_view(
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
+    if select_casts_to_pg_type(select_stmt, resolver.schema()) {
+        emit_pg_storage_gate(program, resolver, database_id)?;
+    }
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -378,6 +382,9 @@ pub fn translate_create_view(
 
     // Reconstruct the SQL string
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    if select_casts_to_pg_type(select_stmt, resolver.schema()) {
+        emit_pg_storage_gate(program, resolver, database_id)?;
+    }
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

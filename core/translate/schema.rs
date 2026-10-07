@@ -18,6 +18,9 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::pg_storage_gate::{
+    domain_needs_pg_storage, emit_pg_storage_gate, table_casts_to_pg_type, type_needs_pg_storage,
+};
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
@@ -1446,6 +1449,14 @@ pub fn translate_create_table(
     });
     program.preassign_label_to_next_insn(create_btree_label);
 
+    let has_pg_storage = matches!(
+        &body,
+        ast::CreateTableBody::ColumnsAndConstraints { options, .. } if options.pg_storage
+    );
+    if !has_pg_storage && table_casts_to_pg_type(&body, resolver.schema()) {
+        emit_pg_storage_gate(program, resolver, database_id)?;
+    }
+
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
@@ -2728,9 +2739,13 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
 fn persist_type_definition(
     normalized_name: String,
     sql: String,
+    needs_pg_storage: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    if needs_pg_storage {
+        emit_pg_storage_gate(program, resolver, MAIN_DB_ID)?;
+    }
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
@@ -2773,7 +2788,7 @@ fn persist_type_definition(
 
         // Parse schema to register the new table in-memory
         program.emit_insn(Insn::ParseSchema {
-            db: schema_cursor_id,
+            db: MAIN_DB_ID,
             where_clause: Some(format!(
                 "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
             )),
@@ -2877,8 +2892,9 @@ pub fn translate_create_type(
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
+    let needs_pg_storage = type_needs_pg_storage(body, resolver.schema());
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, needs_pg_storage, resolver, program)
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
@@ -3057,8 +3073,14 @@ pub fn translate_create_domain(
         }
         s
     };
+    let needs_pg_storage = domain_needs_pg_storage(
+        &base_normalized,
+        constraints,
+        default.as_deref(),
+        resolver.schema(),
+    );
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    persist_type_definition(normalized_name, sql, needs_pg_storage, resolver, program)
 }
 
 /// Built-in types for the PostgreSQL frontend use the prefix `pg_`.

@@ -28,6 +28,7 @@ pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
+pub(crate) mod pg_storage_gate;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;

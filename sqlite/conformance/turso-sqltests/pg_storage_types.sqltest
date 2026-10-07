@@ -1416,6 +1416,79 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test files-that-store-a-cast-to-a-pg-type-get-a-pgstorage-table {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, d date, t TEXT, out TEXT) STRICT;
+    CREATE INDEX r_plain ON r(t);
+    CREATE VIEW r_plain_view AS SELECT CAST(t AS date) FROM r;
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+    CREATE VIEW rv AS SELECT id, CAST(t AS pg_timestamp) AS ts FROM r;
+    SELECT sql FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+    CREATE TRIGGER rt AFTER INSERT ON r BEGIN UPDATE r SET out = CAST(NEW.t AS pg_date) WHERE id = NEW.id; END;
+    CREATE INDEX r_ts ON r(CAST(d AS pg_timestamp));
+    INSERT INTO r (id, d, t) VALUES (1, '2024-01-01', '2024-02-02 10:00');
+    SELECT id, ts, out FROM rv JOIN r USING (id);
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    CREATE TABLE __turso_internal_pg_storage (x TEXT) STRICT, PGSTORAGE
+    1|2024-02-02 10:00:00|2024-02-02
+    1
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test a-check-default-or-added-column-with-a-cast-to-a-pg-type-gets-a-pgstorage-table {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT CHECK (CAST(a AS pg_date) IS NOT NULL)) STRICT;
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test a-default-with-a-cast-to-a-pg-type-gets-a-pgstorage-table {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b TEXT DEFAULT (CAST('2024-01-01' AS pg_timestamp))) STRICT;
+    INSERT INTO c (id) VALUES (1);
+    SELECT b FROM c;
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+}
+expect {
+    2024-01-01 00:00:00
+    1
+}
+
+@requires strict "uses STRICT tables"
+test an-added-column-with-a-cast-to-a-pg-type-gets-a-pgstorage-table {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b TEXT) STRICT;
+    ALTER TABLE c ADD COLUMN d TEXT DEFAULT (CAST('2024-01-01' AS pg_date));
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test a-domain-over-a-pg-type-gets-a-pgstorage-table {
+    CREATE DOMAIN plain AS TEXT;
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+    CREATE DOMAIN stamp AS pg_timestamp;
+    SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_pg_storage';
+    CREATE TABLE s(id INTEGER PRIMARY KEY, ts stamp) STRICT, PGSTORAGE;
+    INSERT INTO s VALUES (1, '2024-01-01');
+    SELECT ts FROM s;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    2024-01-01 00:00:00
+    ok
+}
+
+@requires strict "uses STRICT tables"
 test new-v1-numeric-index-refuses-a-comparison-that-older-versions-compute-in-another-way {
     CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(30,2)) STRICT;
     CREATE INDEX x_negative ON x((val > -1));
