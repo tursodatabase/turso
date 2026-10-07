@@ -126,6 +126,16 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
+/// [normalize_ident] that borrows an identifier that has no ASCII
+/// upper-case letter, because its normalized form is the same text.
+pub fn normalize_ident_borrowed(identifier: &str) -> std::borrow::Cow<'_, str> {
+    if identifier.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(normalize_ident(identifier))
+    } else {
+        std::borrow::Cow::Borrowed(identifier)
+    }
+}
+
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
 pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
@@ -5088,6 +5098,28 @@ pub mod tests {
         // SQLite folds only ASCII; non-ASCII bytes pass through untouched.
         assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
         assert_eq!(normalize_ident("Foo_ΔΥΣ"), "foo_ΔΥΣ");
+    }
+
+    #[test]
+    fn test_normalize_ident_borrowed_gives_normalize_ident() {
+        for name in [
+            "foo",
+            "FOO",
+            "Foo_ΔΥΣ",
+            "ὈΔΥΣΣΕΎΣ",
+            "main.seq",
+            "Main.Seq",
+            "",
+            "a1_B2",
+        ] {
+            let borrowed = normalize_ident_borrowed(name);
+            assert_eq!(borrowed, normalize_ident(name), "{name}");
+            assert_eq!(
+                matches!(borrowed, std::borrow::Cow::Borrowed(_)),
+                name == normalize_ident(name),
+                "{name}"
+            );
+        }
     }
 
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {

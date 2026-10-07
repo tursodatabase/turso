@@ -14604,7 +14604,7 @@ pub fn op_sequence_compute_next(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceComputeNext: seq_name_reg must be text".to_string(),
@@ -14620,7 +14620,7 @@ pub fn op_sequence_compute_next(
     let bare_seq_name = seq_name
         .rsplit_once('.')
         .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
+        .unwrap_or(seq_name);
     let seq = program
         .connection
         .with_schema(*db, |s| s.get_sequence(bare_seq_name).cloned())
@@ -14714,7 +14714,7 @@ pub fn op_set_sequence_currval(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SetSequenceCurrval: seq_name_reg must be text".to_string(),
@@ -14731,7 +14731,7 @@ pub fn op_set_sequence_currval(
             )
         })?;
 
-    program.connection.set_sequence_currval(&seq_name, value);
+    program.connection.set_sequence_currval(seq_name, value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14758,7 +14758,7 @@ pub fn op_sequence_track_allocation(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
@@ -14775,13 +14775,12 @@ pub fn op_sequence_track_allocation(
             )
         })?;
 
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
-    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
-
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        let bare_seq_name = seq_name
+            .rsplit_once('.')
+            .map(|(_, n)| n)
+            .unwrap_or(seq_name);
+        let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
         let seq = program
             .connection
             .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())

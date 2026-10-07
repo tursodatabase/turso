@@ -3033,7 +3033,8 @@ impl Schema {
     }
 
     pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
-        self.sequences.get(&normalize_ident(name))
+        self.sequences
+            .get(crate::util::normalize_ident_borrowed(name).as_ref())
     }
 
     /// Remove a sequence and its backing table from the in-memory schema.

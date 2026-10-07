@@ -214,6 +214,22 @@ expect {
     2
 }
 
+test nextval-and-currval-fold-the-case-of-the-name {
+    CREATE SEQUENCE Case_Seq;
+    SELECT nextval('Case_Seq');
+    SELECT currval('case_seq');
+    SELECT nextval('CASE_SEQ');
+    SELECT currval('Case_Seq');
+    SELECT nextval('case_seq'), currval('CASE_seq');
+}
+expect {
+    1
+    1
+    2
+    2
+    3|3
+}
+
 test currval-without-nextval-errors {
     CREATE SEQUENCE cv_seq2;
     SELECT currval('cv_seq2');

@@ -4121,8 +4121,14 @@ impl Connection {
 
     /// Record that this connection has seen a value from the named sequence (for currval).
     pub fn set_sequence_currval(&self, name: &str, value: i64) {
-        let normalized = crate::util::normalize_ident(name);
-        self.sequence_currvals.write().insert(normalized, value);
+        let normalized = crate::util::normalize_ident_borrowed(name);
+        let mut currvals = self.sequence_currvals.write();
+        match currvals.get_mut(normalized.as_ref()) {
+            Some(currval) => *currval = value,
+            None => {
+                currvals.insert(normalized.into_owned(), value);
+            }
+        }
     }
 
     /// Get the last value returned by nextval/setval for the named sequence on this connection.
