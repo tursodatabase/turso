@@ -31,7 +31,7 @@ DROP TYPE removes the named custom type from the database. The type must exist u
 
 ### Restrictions
 
-A type cannot be dropped while any table column uses it. All columns of that type must be removed or the table must be dropped before the type can be dropped.
+A type cannot be dropped while any table column uses it. This includes the tables of attached databases, because an attached database can use the types of the main database. All columns of that type must be removed or the table must be dropped before the type can be dropped.
 
 ```sql
 CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;

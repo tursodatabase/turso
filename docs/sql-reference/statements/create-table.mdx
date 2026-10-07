@@ -13,7 +13,7 @@ Create a new table in the database with column definitions, data types, and cons
 ```sql
 CREATE TABLE [IF NOT EXISTS] [schema-name.]table-name (
     column-def [, column-def ...] [, table-constraint [, table-constraint ...]]
-) [STRICT];
+) [STRICT [, PGSTORAGE]];
 ```
 
 ### Column Definition
@@ -55,6 +55,7 @@ FOREIGN KEY (column-name [, column-name ...]) REFERENCES foreign-table [(column-
 | `schema-name` | The name of an attached database. Defaults to the main database if omitted. |
 | `table-name` | The name of the table to create. |
 | `STRICT` | Enables strict type checking on the table. See [STRICT Tables](#strict-tables). |
+| `PGSTORAGE` | Marks a STRICT table that stores the built-in types of the PostgreSQL frontend. See [PGSTORAGE Tables](#pgstorage-tables). |
 
 ## Column Definitions
 
@@ -382,6 +383,28 @@ CREATE TABLE events (
     tags TEXT[]
 ) STRICT;
 ```
+
+## PGSTORAGE Tables
+
+The PostgreSQL frontend (`tursopg`) writes new tables with the table option `PGSTORAGE` after `STRICT`:
+
+```sql
+CREATE TABLE events (
+    id pg_int8 PRIMARY KEY,
+    at pg_timestamp,
+    amount pg_numeric(10, 2)
+) STRICT, PGSTORAGE;
+```
+
+A `PGSTORAGE` table has these rules:
+
+- The table must be STRICT, and custom types must be enabled.
+- Only a `PGSTORAGE` table can have a column with one of the [types for PostgreSQL storage](/docs/sql-reference/statements/create-type#types-for-postgresql-storage), such as `pg_date` or `pg_int8`.
+- A single-column `PRIMARY KEY` of type `pg_int4` or `pg_int8` (not `DESC`) is a rowid alias. If an INSERT omits this column, the column gets its DEFAULT. If the column has no DEFAULT, or if the INSERT gives NULL, the INSERT fails with a NOT NULL error.
+
+<Warning>
+Older Turso versions and sqlite3 cannot open a database file that has a `PGSTORAGE` table. They refuse the schema with an error about an unknown table option. A Turso connection without custom types also refuses to open the file.
+</Warning>
 
 ## Unsupported Features
 

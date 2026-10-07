@@ -283,6 +283,36 @@ Turso provides the following built-in custom types in STRICT tables:
 The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
 </Info>
 
+### Types for PostgreSQL storage
+
+The PostgreSQL frontend (`tursopg`) uses these built-in types for the columns of new tables. A column can have one of these types only in a table with the [`PGSTORAGE` option](/docs/sql-reference/statements/create-table#pgstorage-tables).
+
+| Type | Base | Parameters | Stored value | Value that a query gets |
+|------|------|------------|--------------|-------------------------|
+| `pg_int4` | integer | -- | The integer. There is no range check. | The integer |
+| `pg_int8` | integer | -- | The integer | The integer |
+| `pg_date` | integer | -- | Days since 2000-01-01 | `YYYY-MM-DD` |
+| `pg_time` | integer | -- | Microseconds since midnight | `HH:MM:SS[.ffffff]` |
+| `pg_timestamp` | integer | -- | Microseconds since 2000-01-01 00:00:00 | `YYYY-MM-DD HH:MM:SS[.ffffff]` |
+| `pg_timestamptz` | integer | -- | Microseconds since 2000-01-01 00:00:00 UTC | `YYYY-MM-DD HH:MM:SS[.ffffff]` in UTC |
+| `pg_numeric(P,S)` | integer | `precision` (1 to 18), `scale` | The value multiplied by 10^S, rounded half away from zero | Text with exactly S fraction digits |
+
+The date and time types accept the years 0001 to 9999. They also accept the words `now`, `today`, `tomorrow` and `yesterday`. Turso reads the clock for each row that uses such a word.
+
+`CAST(x AS pg_date)` and the casts to the other types in this list are permitted in all statements. A cast gives the value that a query gets, not the stored integer.
+
+<Warning>
+A view, a trigger, an index, or a CHECK or DEFAULT of a table without `PGSTORAGE` can cast to one of these types. Turso then adds the internal table `__turso_internal_pg_storage` with the `PGSTORAGE` option to the database. After that, older Turso versions and sqlite3 cannot open the database file.
+</Warning>
+
+### Reserved type names
+
+Type names that start with `pg_` are reserved for built-in types. `CREATE TYPE` and `CREATE DOMAIN` refuse such a name. A database from an older version can have a user type with such a name. That user type keeps its meaning in that database, and it hides the built-in type with the same name.
+
+### Opening a database
+
+If a column of a STRICT table has a type that the database does not define, Turso refuses to open the database. The error names the table, the column and the type.
+
 ## Composite Types: STRUCT and UNION
 
 In addition to encode/decode custom types, CREATE TYPE supports two composite type forms: **STRUCT** (named product type) and **UNION** (discriminated union / tagged variant). Both store data as blobs on disk and require STRICT tables.

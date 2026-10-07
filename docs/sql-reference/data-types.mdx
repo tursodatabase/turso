@@ -145,6 +145,8 @@ Turso provides several built-in custom types available in STRICT tables:
 | `json` | TEXT | Validated JSON text |
 | `jsonb` | BLOB | JSON in binary format |
 
+The PostgreSQL frontend also uses the built-in types `pg_int4`, `pg_int8`, `pg_date`, `pg_time`, `pg_timestamp`, `pg_timestamptz` and `pg_numeric(P,S)`. Only a table with the `PGSTORAGE` option can use them in a column. See [Types for PostgreSQL storage](/docs/sql-reference/statements/create-type#types-for-postgresql-storage).
+
 ```sql
 CREATE TABLE events (
     id uuid PRIMARY KEY,
