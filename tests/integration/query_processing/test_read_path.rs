@@ -1158,3 +1158,94 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     assert_eq!(rows, expected);
     Ok(())
 }
+
+/// Separate Column reads of one row, out of order, must stay correct when
+/// the payload read yields IO: the cursor keeps the parsed record header of
+/// the row between the reads, and an IO yield happens before the header is
+/// parsed. Every other row has an overflow payload, so the reads alternate
+/// between the page and the copy of an overflow payload.
+#[test]
+fn test_out_of_order_column_reads_after_io_yield() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 6;
+    const BIG_LEN: i64 = 50_000;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "out-of-order-column-io-reentry.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+    let big_len = |i: i64| if i % 2 == 0 { BIG_LEN } else { 3 };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, printf('%0{}d', {i}), 'tail{i}', {}, 'end{i}')",
+                    big_len(i),
+                    i * 7
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    let db = open(io.clone())?;
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare("SELECT e, c, a, d, length(b), e FROM t")?;
+    let mut io_yields = 0usize;
+    let mut rows: Vec<(String, String, i64, i64, i64, String)> = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push((
+                    row.get::<&str>(0)?.to_string(),
+                    row.get::<&str>(1)?.to_string(),
+                    row.get::<i64>(2)?,
+                    row.get::<i64>(3)?,
+                    row.get::<i64>(4)?,
+                    row.get::<&str>(5)?.to_string(),
+                ));
+            }
+            StepResult::IO | StepResult::Yield => {
+                io_yields += 1;
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert!(
+        io_yields > 0,
+        "cold-cache overflow scan must yield IO so the column reads are re-entered"
+    );
+    let expected: Vec<(String, String, i64, i64, i64, String)> = (0..ROWS)
+        .map(|i| {
+            (
+                format!("end{i}"),
+                format!("tail{i}"),
+                i,
+                i * 7,
+                big_len(i),
+                format!("end{i}"),
+            )
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    Ok(())
+}
