@@ -477,6 +477,9 @@ or ALTER TABLE of this version, older versions cannot open it.
 Tables of older versions: ADD COLUMN and DROP COLUMN of older versions stored
 a table as Turso SQL without the marker. Nothing shows that such a table is a
 table of the PostgreSQL frontend, so it does not get the `PGSTORAGE` option.
+ADD COLUMN on such a table, or on another table without the option, uses the
+type mapping of the older versions: `integer` is INTEGER and `timestamp` is
+the older timestamp type, as in the other columns of the table.
 RENAME of older versions stored the marker before Turso SQL. tursopg reads
 such a table, also when a DEFAULT calls a function, and the table gets the
 `PGSTORAGE` option at its next ALTER TABLE. The CHECK and DEFAULT

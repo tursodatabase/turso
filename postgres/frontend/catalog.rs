@@ -23,6 +23,25 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
+    fn added_column_of_table_without_pg_storage(
+        &self,
+        input: &str,
+    ) -> Result<Option<turso_parser::ast::ColumnDefinition>> {
+        let Ok(parse_result) = turso_pg_parser::parse(input) else {
+            return Ok(None);
+        };
+        let stmt = turso_pg_parser::translator::PostgreSQLTranslator::for_stored_table()
+            .translate(&parse_result)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        match stmt {
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                body: turso_parser::ast::AlterTableBody::AddColumn(column),
+                ..
+            }) => Ok(Some(column)),
+            _ => Ok(None),
+        }
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot

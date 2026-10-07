@@ -1304,6 +1304,13 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            let col_def = match btree.is_pg_storage {
+                true => col_def,
+                false => connection
+                    .dialect()
+                    .added_column_of_table_without_pg_storage(input)?
+                    .unwrap_or(col_def),
+            };
             let is_generated = col_def
                 .constraints
                 .iter()

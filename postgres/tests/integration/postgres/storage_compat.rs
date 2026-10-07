@@ -847,6 +847,67 @@ fn covering_numeric_expression_indexes_of_sqlite_dialect_base_file_give_the_rows
     }
 }
 
+/// The base stored `added` and `dropped` without the marker and without
+/// PGSTORAGE after its ALTER TABLE, so a new column of these tables gets the
+/// types of the base version.
+#[test]
+fn add_column_to_base_tables_without_pgstorage_uses_the_types_of_the_base_version() {
+    for mvcc in [false, true] {
+        let dir = copy_fixtures(&[MAIN]);
+        let db = open(dir.path().join(MAIN), mvcc);
+        let conn = db.connect_postgres();
+        for table in ["added", "dropped"] {
+            for (column, pg_type) in [
+                ("c_int", "integer"),
+                ("c_big", "bigint"),
+                ("c_serial", "serial"),
+                ("c_ts", "timestamp"),
+                ("c_tz", "timestamptz"),
+                ("c_date", "date"),
+                ("c_time", "time"),
+                ("c_num", "numeric(10,2)"),
+            ] {
+                conn.execute(format!("ALTER TABLE {table} ADD COLUMN {column} {pg_type}"))
+                    .unwrap_or_else(|e| panic!("{table}.{column} {pg_type}: {e}"));
+            }
+        }
+        conn.execute(
+            "INSERT INTO dropped (id, keep, n, c_int, c_big, c_ts, c_tz, c_date, c_time, c_num) \
+             VALUES (2, 'x', 1, 5, 9000000000, '2024-01-01 10:00:00', '2024-01-01 10:00:00+02:00', \
+             '2024-02-02', '10:11:12', 3.14159)",
+        )
+        .unwrap();
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT id, c_int, c_big, c_ts, c_tz, c_date, c_time, c_num FROM dropped ORDER BY id"
+            ),
+            [
+                "1|NULL|NULL|NULL|NULL|NULL|NULL|NULL",
+                "2|5|9000000000|2024-01-01 10:00:00|2024-01-01 08:00:00|2024-02-02|10:11:12|3.14"
+            ],
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            core_rows(
+                conn.inner(),
+                "SELECT sql FROM sqlite_schema WHERE name = 'dropped'"
+            ),
+            [
+                "CREATE TABLE dropped (id INTEGER PRIMARY KEY, keep TEXT, n numeric(10, 2), \
+                 c_int INTEGER, c_big bigint, c_serial INTEGER, c_ts timestamp, c_tz timestamptz, \
+                 c_date date, c_time time, c_num numeric(10, 2)) STRICT"
+            ],
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            core_rows(conn.inner(), "PRAGMA integrity_check"),
+            ["ok"],
+            "mvcc={mvcc}"
+        );
+    }
+}
+
 /// A file with a domain over a built-in type of the new tables gets a table
 /// with the PGSTORAGE option, which older versions refuse. The catalog does
 /// not show the table.

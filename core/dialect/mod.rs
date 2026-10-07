@@ -166,6 +166,18 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
+    /// The column that `input`, an `ALTER TABLE ... ADD COLUMN` in the
+    /// frontend's dialect, adds to a table without the PGSTORAGE option. Such
+    /// a table stores the types of older versions, so a dialect whose newer
+    /// tables store other types translates the column again with the types
+    /// of older versions. The default keeps the translated column.
+    fn added_column_of_table_without_pg_storage(
+        &self,
+        _input: &str,
+    ) -> crate::Result<Option<turso_parser::ast::ColumnDefinition>> {
+        Ok(None)
+    }
+
     /// Install the dialect's catalog tables into a freshly constructed
     /// schema.
     ///
