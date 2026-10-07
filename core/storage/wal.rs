@@ -772,6 +772,8 @@ pub trait Wal: Debug + Send + Sync {
     fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
+    /// The epoch that pages read from this WAL are tagged with, see `Page::set_wal_tag`.
+    fn checkpoint_epoch(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
     /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
@@ -4221,6 +4223,10 @@ impl Wal for WalFile {
 
     fn get_checkpoint_seq(&self) -> u32 {
         self.load_coordination_snapshot().checkpoint_seq
+    }
+
+    fn checkpoint_epoch(&self) -> u32 {
+        self.coordination.checkpoint_epoch()
     }
 
     fn get_max_frame(&self) -> u64 {
