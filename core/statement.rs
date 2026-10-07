@@ -1518,6 +1518,9 @@ impl Statement {
         // The commit-state-machine, if any was in flight, is now dead:
         // the inner tx it was committing is gone.
         self.state.sequence_inner_commit = None;
+        if pending.db == crate::MAIN_DB_ID && pending.saved_outer.is_some() {
+            conn.set_tx_state(pending.saved_tx_state);
+        }
     }
 
     pub fn reset_best_effort(&mut self) {

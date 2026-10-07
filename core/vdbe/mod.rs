@@ -869,6 +869,7 @@ pub struct SequenceInnerTxState {
         crate::mvcc::database::TxID,
         crate::translate::emitter::TransactionMode,
     )>,
+    pub(crate) saved_tx_state: crate::connection::TransactionState,
 }
 
 pub struct ProgramState {

@@ -14797,6 +14797,7 @@ pub fn op_sequence_begin_inner_tx(
         db: *db,
         inner_tx_id,
         saved_outer: outer_tx,
+        saved_tx_state: conn.get_tx_state(),
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14865,6 +14866,11 @@ pub fn op_sequence_commit_inner_tx(
             .into());
         }
     };
+    let saved_tx_state = state
+        .sequence_inner_tx_pending
+        .as_ref()
+        .expect("wrapped sequence has pending inner transaction")
+        .saved_tx_state;
 
     // First entry for this opcode invocation: build the
     // CommitStateMachine. On subsequent re-entries (after a yielded
@@ -14893,6 +14899,9 @@ pub fn op_sequence_commit_inner_tx(
             state.sequence_inner_tx_pending = None;
             state.sequence_inner_retry_count = 0;
             conn.set_mv_tx_for_db(*db, saved_outer);
+            if *db == crate::MAIN_DB_ID && saved_outer.is_some() {
+                conn.set_tx_state(saved_tx_state);
+            }
             state.registers[*status_reg].set_value(Value::from_i64(SEQ_COMMIT_STATUS_OK));
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -14913,6 +14922,9 @@ pub fn op_sequence_commit_inner_tx(
             }
             state.sequence_inner_tx_pending = None;
             conn.set_mv_tx_for_db(*db, saved_outer);
+            if *db == crate::MAIN_DB_ID && saved_outer.is_some() {
+                conn.set_tx_state(saved_tx_state);
+            }
             // Bail out with Busy when the retry budget is exhausted.
             // Routing this through `Insn::Halt { err_code: SQLITE_BUSY }`
             // would land in `op_halt`'s constraint_error catch-all and be
@@ -14951,6 +14963,9 @@ pub fn op_sequence_commit_inner_tx(
             }
             state.sequence_inner_tx_pending = None;
             conn.set_mv_tx_for_db(*db, saved_outer);
+            if *db == crate::MAIN_DB_ID && saved_outer.is_some() {
+                conn.set_tx_state(saved_tx_state);
+            }
             Err(e)
         }
     }

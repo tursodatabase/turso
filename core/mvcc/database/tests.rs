@@ -16168,6 +16168,12 @@ fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
         Some(outer_mv_tx),
         "outer tx should survive sequence exhaustion"
     );
+    assert_eq!(
+        conn1.get_tx_state(),
+        crate::connection::TransactionState::Write {
+            schema_did_change: false
+        }
+    );
 
     // Now have a different connection commit a row in autocommit.
     conn2.execute("INSERT INTO kv VALUES ('k1', 'v1')").unwrap();
@@ -21264,6 +21270,85 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
     assert_eq!(
         b_retries, 0,
         "B's inner tx retried — same canary as A. See PR #7137."
+    );
+}
+
+#[test]
+fn test_sequence_inner_retry_preserves_outer_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    let outer_id = conn_a.get_mv_tx_id().unwrap();
+    let failure = FixedFailureInjector::new([(
+        CommitYieldPoint::CommitValidation.point(),
+        LimboError::WriteWriteConflict,
+    )]);
+    conn_a.set_failure_injector(Some(failure.clone()));
+    let values = get_rows(&conn_a, "SELECT nextval('s')");
+    conn_a.set_failure_injector(None);
+    assert!(failure.is_empty());
+    assert_eq!(values, vec![vec![Value::from_i64(1)]]);
+    assert!(conn_a.sequence_inner_retries() > 0);
+    assert_eq!(conn_a.get_mv_tx_id(), Some(outer_id));
+    assert!(!conn_a.get_auto_commit());
+    assert_eq!(
+        conn_a.get_tx_state(),
+        crate::connection::TransactionState::Write {
+            schema_did_change: false
+        }
+    );
+    conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+    assert_eq!(conn_a.get_mv_tx_id(), None);
+    assert_eq!(
+        get_rows(&setup, "SELECT id FROM t"),
+        vec![vec![Value::from_i64(42)]]
+    );
+}
+
+#[test]
+fn test_abandoned_sequence_inner_commit_preserves_outer_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let outer_id = conn.get_mv_tx_id().unwrap();
+    let injector = FixedYieldInjector::new([CommitYieldPoint::CommitValidation.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut next = conn.prepare("SELECT nextval('s')").unwrap();
+    for _ in 0..1000 {
+        match next.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if injector.is_empty() {
+                    break;
+                }
+                conn.pager.load().io.step().unwrap();
+            }
+            other => panic!("nextval completed before the inner commit: {other:?}"),
+        }
+    }
+    assert!(injector.is_empty());
+    conn.set_yield_injector(None);
+    drop(next);
+    assert_eq!(conn.get_mv_tx_id(), Some(outer_id));
+    assert_eq!(
+        conn.get_tx_state(),
+        crate::connection::TransactionState::Write {
+            schema_did_change: false
+        }
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(1)]]
     );
 }
 

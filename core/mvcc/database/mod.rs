@@ -3308,6 +3308,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
+                inject_transition_failure!(self, CommitYieldPoint::CommitValidation);
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
                 // Ref: Hekaton paper Section 3.2 - validation uses end_ts comparison
                 let tx = self
