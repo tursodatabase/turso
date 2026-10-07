@@ -974,10 +974,57 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| {
+            if col.is_array() {
+                return emit_decoded_array_register(program, source_regs(i), col, resolver);
+            }
             emit_decoded_column_register(program, source_regs(i), col, is_strict, resolver)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+/// NEW and OLD of a trigger give an array as a record blob of the values
+/// that its elements show, so a subscript, an array function and a copy
+/// into another array column see the values of the user.
+fn emit_decoded_array_register(
+    program: &mut ProgramBuilder,
+    source_reg: usize,
+    column: &Column,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if column.array_dimensions() != 1 {
+        return Ok(source_reg);
+    }
+    let Some(type_def) = resolver.schema().get_type_def_unchecked(&column.ty_str) else {
+        return Ok(source_reg);
+    };
+    let Some(decode_expr) = type_def
+        .decode()
+        .filter(|decode_expr| !crate::schema::decode_is_identity(decode_expr))
+    else {
+        return Ok(source_reg);
+    };
+    let decoded_reg = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: source_reg,
+        dst_reg: decoded_reg,
+        extra_amount: 0,
+    });
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: decoded_reg,
+        target_pc: skip_label,
+    });
+    super::arrays::emit_array_element_loop(
+        program,
+        decoded_reg,
+        decode_expr,
+        column,
+        type_def,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(decoded_reg)
 }
 
 /// The register with the value that a read of `column` shows: `source_reg`

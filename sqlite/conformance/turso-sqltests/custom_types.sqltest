@@ -1405,6 +1405,51 @@ expect {
     99.00
 }
 
+# NEW and OLD hold an array as a blob of the values that its elements show,
+# so a copy into another array column ENCODEs each element once.
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-array-of-custom-type-copies-into-array-column {
+    CREATE TYPE ci_trg(value text) BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tarr pg_timestamp[], iarr integer[], carr ci_trg[]) STRICT, PGSTORAGE;
+    CREATE TABLE log(op TEXT, t pg_timestamp[], i integer[], c ci_trg[]) STRICT, PGSTORAGE;
+    CREATE TRIGGER ti AFTER INSERT ON a BEGIN INSERT INTO log VALUES ('ins', NEW.tarr, NEW.iarr, NEW.carr); END;
+    CREATE TRIGGER tu AFTER UPDATE ON a BEGIN INSERT INTO log VALUES ('upd-old', OLD.tarr, OLD.iarr, OLD.carr); INSERT INTO log VALUES ('upd-new', NEW.tarr, NEW.iarr, NEW.carr); END;
+    CREATE TRIGGER td AFTER DELETE ON a BEGIN INSERT INTO log VALUES ('del', OLD.tarr, OLD.iarr, OLD.carr); END;
+    INSERT INTO a VALUES (1, '{"2024-01-02 03:04:05","2025-06-07 08:09:10"}', '{1,2}', '{"Hello","World"}');
+    INSERT INTO a VALUES (2, NULL, NULL, NULL);
+    UPDATE a SET tarr = '{"2026-01-01 00:00:00"}', iarr = '{3}', carr = '{"Third"}' WHERE id = 1;
+    DELETE FROM a WHERE id = 1;
+    SELECT op, t, i, c FROM log;
+}
+expect {
+    ins|{"2024-01-02 03:04:05","2025-06-07 08:09:10"}|{1,2}|{hello,world}
+    ins|||
+    upd-old|{"2024-01-02 03:04:05","2025-06-07 08:09:10"}|{1,2}|{hello,world}
+    upd-new|{"2026-01-01 00:00:00"}|{3}|{third}
+    del|{"2026-01-01 00:00:00"}|{3}|{third}
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-array-elements-of-custom-type-show-decoded-values {
+    CREATE TYPE ci_trg(value text) BASE text ENCODE upper(value) DECODE lower(value);
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tarr pg_timestamp[], iarr integer[], carr ci_trg[]) STRICT, PGSTORAGE;
+    CREATE TABLE elems(op TEXT, t1 ANY, n ANY, i1 ANY, c1 ANY) STRICT;
+    CREATE TRIGGER ti AFTER INSERT ON a BEGIN INSERT INTO elems VALUES ('ins', NEW.tarr[1], array_length(NEW.tarr), NEW.iarr[1], NEW.carr[2]); END;
+    CREATE TRIGGER tu AFTER UPDATE ON a BEGIN INSERT INTO elems VALUES ('upd', OLD.tarr[1], array_length(NEW.tarr), NEW.iarr[1], OLD.carr[1]); END;
+    CREATE TRIGGER td AFTER DELETE ON a BEGIN INSERT INTO elems VALUES ('del', OLD.tarr[1], array_length(OLD.tarr), OLD.iarr[1], OLD.carr[1]); END;
+    INSERT INTO a VALUES (1, '{"2024-01-02 03:04:05","2025-06-07 08:09:10"}', '{1,2}', '{"Hello","World"}');
+    UPDATE a SET tarr = '{"2026-01-01 00:00:00"}', iarr = '{3}', carr = '{"Third"}' WHERE id = 1;
+    DELETE FROM a WHERE id = 1;
+    SELECT op, t1, n, i1, c1 FROM elems;
+}
+expect {
+    ins|2024-01-02 03:04:05|2|1|world
+    upd|2024-01-02 03:04:05|1|3|hello
+    del|2026-01-01 00:00:00|1|3|third
+}
+
 @requires strict "uses STRICT tables"
 test typecheck-validates-base-type-insert {
     CREATE TYPE test_uint(value any) BASE text
