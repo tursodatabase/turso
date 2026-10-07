@@ -126,8 +126,6 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
-/// [normalize_ident] that borrows an identifier that has no ASCII
-/// upper-case letter, because its normalized form is the same text.
 pub fn normalize_ident_borrowed(identifier: &str) -> std::borrow::Cow<'_, str> {
     if identifier.bytes().any(|byte| byte.is_ascii_uppercase()) {
         std::borrow::Cow::Owned(normalize_ident(identifier))

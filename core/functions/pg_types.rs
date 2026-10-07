@@ -108,10 +108,6 @@ pub(crate) fn exec_pg_numeric_encode(
     }
 }
 
-/// `text` times 10^scale when the text is a plain decimal: an optional `-`,
-/// one to 18 digits, and a point with one to `scale` digits or no point.
-/// None for any other text, which the general parser reads. Both give the
-/// same value for a plain decimal, because it needs no rounding.
 fn scaled_plain_decimal(text: &[u8], scale: i64) -> Option<i128> {
     let (is_negative, unsigned) = match text {
         [b'-', unsigned @ ..] => (true, unsigned),
@@ -129,8 +125,8 @@ fn scaled_plain_decimal(text: &[u8], scale: i64) -> Option<i128> {
         Some(digits) if (1..=scale as usize).contains(&digits.len()) => digits,
         Some(_) => return None,
     };
-    let magnitude = i128::from(layout_number(whole)?) * 10i128.pow(scale as u32)
-        + i128::from(layout_number(fraction)?)
+    let magnitude = i128::from(parse_ascii_digits(whole)?) * 10i128.pow(scale as u32)
+        + i128::from(parse_ascii_digits(fraction)?)
             * 10i128.pow((scale as usize - fraction.len()) as u32);
     Some(if is_negative { -magnitude } else { magnitude })
 }
@@ -233,52 +229,34 @@ fn describe_value(value: &Value) -> String {
 }
 
 pub(crate) fn format_scaled_integer(stored: i64, scale: i64) -> String {
-    ScaledIntegerText::new(stored, scale).as_str().to_owned()
-}
-
-/// The text of a stored `pg_numeric` value with exactly `scale` fraction
-/// digits, written from the end of a buffer on the stack.
-struct ScaledIntegerText {
-    bytes: [u8; 24],
-    start: usize,
-}
-
-impl ScaledIntegerText {
-    fn new(stored: i64, scale: i64) -> Self {
-        turso_assert!((0..=MAX_NUMERIC_PRECISION).contains(&scale));
-        let mut text = Self {
-            bytes: [0; 24],
-            start: 24,
-        };
-        let mut magnitude = stored.unsigned_abs();
-        for _ in 0..scale {
-            text.push_front(b'0' + (magnitude % 10) as u8);
-            magnitude /= 10;
-        }
-        if scale > 0 {
-            text.push_front(b'.');
-        }
-        loop {
-            text.push_front(b'0' + (magnitude % 10) as u8);
-            magnitude /= 10;
-            if magnitude == 0 {
-                break;
-            }
-        }
-        if stored < 0 {
-            text.push_front(b'-');
-        }
-        text
+    turso_assert!((0..=MAX_NUMERIC_PRECISION).contains(&scale));
+    let mut bytes = [0u8; 24];
+    let mut start = bytes.len();
+    let mut push_front = |byte: u8| {
+        start -= 1;
+        bytes[start] = byte;
+    };
+    let mut magnitude = stored.unsigned_abs();
+    for _ in 0..scale {
+        push_front(b'0' + (magnitude % 10) as u8);
+        magnitude /= 10;
     }
-
-    fn push_front(&mut self, byte: u8) {
-        self.start -= 1;
-        self.bytes[self.start] = byte;
+    if scale > 0 {
+        push_front(b'.');
     }
-
-    fn as_str(&self) -> &str {
-        crate::types::validate_utf8(&self.bytes[self.start..]).expect("decimal text is ASCII")
+    loop {
+        push_front(b'0' + (magnitude % 10) as u8);
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
     }
+    if stored < 0 {
+        push_front(b'-');
+    }
+    crate::types::validate_utf8(&bytes[start..])
+        .expect("decimal text is ASCII")
+        .to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,11 +357,6 @@ fn parse_temporal(kind: PgTemporal, text: &str) -> Result<i64> {
     }
 }
 
-/// The stored value of text in the layout that DECODE gives:
-/// `YYYY-MM-DD`, `HH:MM:SS` with one to six fraction digits or none, or both
-/// with one space between them, and nothing around. None for any other
-/// text, which the general parser reads. Both give the same value for text
-/// in this layout.
 fn parse_decoded_layout(kind: PgTemporal, text: &[u8]) -> Option<i64> {
     match kind {
         PgTemporal::Date => layout_days(text),
@@ -405,9 +378,9 @@ fn layout_days(text: &[u8]) -> Option<i64> {
     let [y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1] = *text else {
         return None;
     };
-    let year = layout_number(&[y0, y1, y2, y3])?;
-    let month = layout_number(&[m0, m1])?;
-    let day = layout_number(&[d0, d1])?;
+    let year = parse_ascii_digits(&[y0, y1, y2, y3])?;
+    let month = parse_ascii_digits(&[m0, m1])?;
+    let day = parse_ascii_digits(&[d0, d1])?;
     if year < FIRST_YEAR
         || !(1..=12).contains(&month)
         || !(1..=days_in_month(year, month)).contains(&day)
@@ -422,16 +395,16 @@ fn layout_time_of_day(text: &[u8]) -> Option<i64> {
     let [h0, h1, b':', m0, m1, b':', s0, s1] = *clock else {
         return None;
     };
-    let hour = layout_number(&[h0, h1])?;
-    let minute = layout_number(&[m0, m1])?;
-    let second = layout_number(&[s0, s1])?;
+    let hour = parse_ascii_digits(&[h0, h1])?;
+    let minute = parse_ascii_digits(&[m0, m1])?;
+    let second = parse_ascii_digits(&[s0, s1])?;
     if hour > 24 || minute > 59 || second > 59 {
         return None;
     }
     let microsecond = match fraction {
         [] => 0,
         [b'.', digits @ ..] if (1..=6).contains(&digits.len()) => {
-            layout_number(digits)? * 10i64.pow(6 - digits.len() as u32)
+            parse_ascii_digits(digits)? * 10i64.pow(6 - digits.len() as u32)
         }
         _ => return None,
     };
@@ -442,7 +415,7 @@ fn layout_time_of_day(text: &[u8]) -> Option<i64> {
     (time_of_day <= MICROSECONDS_PER_DAY).then_some(time_of_day)
 }
 
-fn layout_number(digits: &[u8]) -> Option<i64> {
+fn parse_ascii_digits(digits: &[u8]) -> Option<i64> {
     digits.iter().try_fold(0i64, |value, &digit| {
         digit
             .is_ascii_digit()
@@ -1409,7 +1382,44 @@ mod tests {
         }
     }
 
-    /// DECODE as older versions wrote it, with core::fmt and a digit loop.
+    #[test]
+    fn decode_gives_the_text_of_older_versions() {
+        let mut rng = ChaCha8Rng::seed_from_u64(43);
+        for kind in [
+            PgTemporal::Timestamp,
+            PgTemporal::Timestamptz,
+            PgTemporal::Date,
+            PgTemporal::Time,
+        ] {
+            for stored in temporal_test_values(&mut rng, kind) {
+                let decoded = exec_pg_temporal_decode(kind, &Value::from_i64(stored)).unwrap();
+                assert_eq!(
+                    decoded,
+                    Value::build_text(temporal_text_of_older_versions(kind, stored)),
+                    "{kind:?} {stored}"
+                );
+            }
+        }
+        let limit = 999_999_999_999_999_999i64;
+        for _ in 0..50_000 {
+            let scale = rng.random_range(0..=18);
+            let stored = match rng.random_range(0..5) {
+                0 => rng.random_range(-limit..=limit),
+                1 => rng.random_range(-1000..1000),
+                2 => [limit, -limit, i64::MIN, i64::MAX, 0, -1][rng.random_range(0..6)],
+                3 => rng.random_range(-limit..=limit) / 10i64.pow(rng.random_range(0..18)),
+                _ => rng.random::<i64>(),
+            };
+            let decoded =
+                exec_pg_numeric_decode(&Value::from_i64(stored), &Value::from_i64(scale)).unwrap();
+            assert_eq!(
+                decoded,
+                Value::build_text(numeric_text_of_older_versions(stored, scale)),
+                "{stored} at scale {scale}"
+            );
+        }
+    }
+
     fn temporal_text_of_older_versions(kind: PgTemporal, stored: i64) -> String {
         let time_of_day = |microseconds: i64| {
             let mut text = format!(
@@ -1459,6 +1469,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn encode_of_decoded_layout_gives_the_value_of_the_general_parser() {
+        let mut rng = ChaCha8Rng::seed_from_u64(47);
+        for kind in [
+            PgTemporal::Timestamp,
+            PgTemporal::Timestamptz,
+            PgTemporal::Date,
+            PgTemporal::Time,
+        ] {
+            for stored in temporal_test_values(&mut rng, kind) {
+                assert_eq!(
+                    parse_decoded_layout(kind, decode(kind, stored).as_bytes()),
+                    Some(stored),
+                    "{kind:?} {stored}"
+                );
+                let text = temporal_test_text(&mut rng, kind, stored);
+                if let Some(fast) = parse_decoded_layout(kind, text.as_bytes()) {
+                    assert_eq!(
+                        parse_temporal_text(kind, &text).ok(),
+                        Some(fast),
+                        "{kind:?} {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
     fn temporal_test_values(rng: &mut ChaCha8Rng, kind: PgTemporal) -> Vec<i64> {
         let (first, last) = kind.stored_range();
         let unit = match kind {
@@ -1479,44 +1516,6 @@ mod tests {
         values.extend([first, first + 1, last - 1, last, 0, -1, 1]);
         values.retain(|value| (first..=last).contains(value));
         values
-    }
-
-    #[test]
-    fn decode_gives_the_text_of_older_versions() {
-        let mut rng = ChaCha8Rng::seed_from_u64(43);
-        for kind in [
-            PgTemporal::Timestamp,
-            PgTemporal::Timestamptz,
-            PgTemporal::Date,
-            PgTemporal::Time,
-        ] {
-            for stored in temporal_test_values(&mut rng, kind) {
-                let decoded = exec_pg_temporal_decode(kind, &Value::from_i64(stored)).unwrap();
-                assert_eq!(
-                    decoded,
-                    Value::build_text(temporal_text_of_older_versions(kind, stored)),
-                    "{kind:?} {stored}"
-                );
-            }
-        }
-        let limit = 999_999_999_999_999_999i64;
-        for _ in 0..50_000 {
-            let scale = rng.random_range(0..=18);
-            let stored = match rng.random_range(0..5) {
-                0 => rng.random_range(-limit..=limit),
-                1 => rng.random_range(-1000..1000),
-                2 => [limit, -limit, i64::MIN, i64::MAX, 0, -1][rng.random_range(0..6)],
-                3 => rng.random_range(-limit..=limit) / 10i64.pow(rng.random_range(0..18)),
-                _ => rng.random::<i64>(),
-            };
-            let decoded =
-                exec_pg_numeric_decode(&Value::from_i64(stored), &Value::from_i64(scale)).unwrap();
-            assert_eq!(
-                decoded,
-                Value::build_text(numeric_text_of_older_versions(stored, scale)),
-                "{stored} at scale {scale}"
-            );
-        }
     }
 
     fn temporal_test_text(rng: &mut ChaCha8Rng, kind: PgTemporal, stored: i64) -> String {
@@ -1567,27 +1566,26 @@ mod tests {
     }
 
     #[test]
-    fn encode_of_decoded_layout_gives_the_value_of_the_general_parser() {
-        let mut rng = ChaCha8Rng::seed_from_u64(47);
-        for kind in [
-            PgTemporal::Timestamp,
-            PgTemporal::Timestamptz,
-            PgTemporal::Date,
-            PgTemporal::Time,
-        ] {
-            for stored in temporal_test_values(&mut rng, kind) {
-                assert_eq!(
-                    parse_decoded_layout(kind, decode(kind, stored).as_bytes()),
-                    Some(stored),
-                    "{kind:?} {stored}"
-                );
-                let text = temporal_test_text(&mut rng, kind, stored);
-                if let Some(fast) = parse_decoded_layout(kind, text.as_bytes()) {
-                    assert_eq!(
-                        parse_temporal_text(kind, &text).ok(),
-                        Some(fast),
-                        "{kind:?} {text:?}"
-                    );
+    fn numeric_encode_of_plain_decimals_gives_the_value_of_the_general_parser() {
+        let mut rng = ChaCha8Rng::seed_from_u64(53);
+        for _ in 0..50_000 {
+            let precision = rng.random_range(1..=18);
+            let scale = rng.random_range(0..=precision);
+            let input = numeric_test_input(&mut rng, scale);
+            let parameters = (Value::from_i64(precision), Value::from_i64(scale));
+            let encoded = exec_pg_numeric_encode(&input, &parameters.0, &parameters.1);
+            let general = encode_numeric(&input, precision, scale);
+            match (encoded, general) {
+                (Ok(encoded), Ok(general)) => {
+                    assert_eq!(encoded, general, "{input:?} at ({precision}, {scale})")
+                }
+                (Err(encoded), Err(general)) => assert_eq!(
+                    encoded.to_string(),
+                    general.to_string(),
+                    "{input:?} at ({precision}, {scale})"
+                ),
+                (encoded, general) => {
+                    panic!("{input:?} at ({precision}, {scale}): {encoded:?} and {general:?}")
                 }
             }
         }
@@ -1626,32 +1624,6 @@ mod tests {
             11 => Value::from_i64([i64::MIN, i64::MAX, 0, -1][rng.random_range(0..4)]),
             12 => Value::from_f64(stored as f64 / 10f64.powi(scale as i32)),
             _ => Value::build_text(text.replacen('.', "", 1)),
-        }
-    }
-
-    #[test]
-    fn numeric_encode_of_plain_decimals_gives_the_value_of_the_general_parser() {
-        let mut rng = ChaCha8Rng::seed_from_u64(53);
-        for _ in 0..50_000 {
-            let precision = rng.random_range(1..=18);
-            let scale = rng.random_range(0..=precision);
-            let input = numeric_test_input(&mut rng, scale);
-            let parameters = (Value::from_i64(precision), Value::from_i64(scale));
-            let encoded = exec_pg_numeric_encode(&input, &parameters.0, &parameters.1);
-            let general = encode_numeric(&input, precision, scale);
-            match (encoded, general) {
-                (Ok(encoded), Ok(general)) => {
-                    assert_eq!(encoded, general, "{input:?} at ({precision}, {scale})")
-                }
-                (Err(encoded), Err(general)) => assert_eq!(
-                    encoded.to_string(),
-                    general.to_string(),
-                    "{input:?} at ({precision}, {scale})"
-                ),
-                (encoded, general) => {
-                    panic!("{input:?} at ({precision}, {scale}): {encoded:?} and {general:?}")
-                }
-            }
         }
     }
 }
