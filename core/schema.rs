@@ -6439,6 +6439,7 @@ pub struct Column {
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
+    collation: Option<CollationSeq>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6565,7 +6566,7 @@ impl Column {
         default: Option<Box<Expr>>,
         generated: Option<Box<Expr>>,
         ty: Type,
-        col: Option<CollationSeq>,
+        collation: Option<CollationSeq>,
         coldef: ColDef,
     ) -> Self {
         let generated_type = match generated {
@@ -6575,9 +6576,13 @@ impl Column {
             }
             None => GeneratedType::NotGenerated,
         };
+        assert_ne!(
+            collation,
+            Some(CollationSeq::Unset),
+            "Unset is not a column collation"
+        );
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
-            collation: col,
             coldef: &coldef,
         });
         if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
@@ -6595,6 +6600,7 @@ impl Column {
             generated_type,
             generated_always: false,
             info,
+            collation,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -6726,11 +6732,7 @@ impl Column {
 
     #[inline]
     pub fn collation_opt(&self) -> Option<CollationSeq> {
-        if self.has_explicit_collation() {
-            Some(self.collation())
-        } else {
-            None
-        }
+        self.collation
     }
 
     #[inline]
@@ -6803,15 +6805,16 @@ impl Column {
     }
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.info.collation()
-    }
-    #[inline]
-    pub fn has_explicit_collation(&self) -> bool {
-        self.info.has_explicit_collation()
+        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-        self.info.set_collation(c)
+        assert_ne!(
+            c,
+            Some(CollationSeq::Unset),
+            "Unset is not a column collation"
+        );
+        self.collation = c;
     }
     #[inline]
     pub fn primary_key(&self) -> bool {
@@ -7808,6 +7811,21 @@ mod tests {
         assert_eq!(column.collation(), CollationSeq::Binary);
         assert_eq!(column.collation_opt(), None);
         Ok(())
+    }
+
+    #[test]
+    fn test_column_keeps_locale_collation_with_large_id() {
+        let collation = CollationSeq::from_storage_bits(4096);
+        let column = Column::new(
+            Some("a".to_string()),
+            "TEXT".to_string(),
+            None,
+            None,
+            Type::Text,
+            Some(collation),
+            ColDef::default(),
+        );
+        assert_eq!(column.collation_opt(), Some(collation));
     }
 
     #[test]
@@ -9209,7 +9227,6 @@ mod tests {
 mod column_info {
     use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::CollationSeq;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -9218,18 +9235,16 @@ mod column_info {
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
 
-    // pack Type and Collation in the remaining bits
+    // pack Type in the remaining bits
     const TYPE_SHIFT: u32 = 5;
     const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // Bits 8-10: base type affinity. Column affinity will resolve to this
     // value only if it is > 0, else it uses ty_str.
-    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_SHIFT: u32 = TYPE_SHIFT + 3;
     const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    // Bits 11-13: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
@@ -9239,7 +9254,6 @@ mod column_info {
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
-        pub collation: Option<CollationSeq>,
         pub coldef: &'a ColDef,
     }
 
@@ -9249,9 +9263,6 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-            }
             if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
@@ -9354,30 +9365,6 @@ mod column_info {
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
             self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-        }
-
-        #[inline]
-        pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
-                CollationSeq::Binary
-            } else {
-                CollationSeq::from_storage_bits(v)
-            }
-        }
-
-        #[inline]
-        pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
-        }
-
-        #[inline]
-        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
-            }
         }
 
         #[inline]
