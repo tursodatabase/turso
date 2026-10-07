@@ -389,6 +389,27 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub fn fork_with_outer_column_cache(&self, table_references: &TableReferences) -> Resolver<'a> {
+        let mut resolver = self.fork();
+        if self.expr_to_reg_cache_enabled {
+            resolver.expr_to_reg_cache =
+                self.expr_to_reg_cache
+                    .iter()
+                    .filter(|entry| match entry.expr.as_ref() {
+                        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                            table_references.outer_query_refs().iter().any(|outer| {
+                                !outer.cte_definition_only && outer.internal_id == *table
+                            })
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+            resolver.expr_to_reg_cache_enabled = !resolver.expr_to_reg_cache.is_empty();
+        }
+        resolver
+    }
+
     pub fn require_custom_types(&self, feature: &str) -> crate::Result<()> {
         if !self.enable_custom_types {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);

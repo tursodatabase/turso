@@ -1155,6 +1155,7 @@ fn update_column_used_masks(
                 joined_table
                     .col_used_mask
                     .union_with(&child_outer_query_ref.col_used_mask)?;
+                joined_table.rowid_referenced |= child_outer_query_ref.rowid_referenced;
             }
             if let Some(outer_query_ref) = table_refs
                 .find_outer_query_ref_by_internal_id_mut(child_outer_query_ref.internal_id)
@@ -1162,6 +1163,7 @@ fn update_column_used_masks(
                 outer_query_ref
                     .col_used_mask
                     .union_with(&child_outer_query_ref.col_used_mask)?;
+                outer_query_ref.rowid_referenced |= child_outer_query_ref.rowid_referenced;
             }
         }
 
@@ -1729,7 +1731,9 @@ pub fn emit_from_clause_subquery(
                     limit_ctx: None,
                     reg_offset: None,
                     reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork(),
+                    resolver: t_ctx
+                        .resolver
+                        .fork_with_outer_column_cache(&select_plan.table_references),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
@@ -1746,10 +1750,9 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
-                emit_program_for_compound_select(program, &resolver, plan)?
+                emit_program_for_compound_select(program, &t_ctx.resolver, plan)?
                     .expect("compound CTE in coroutine mode must have result register")
             }
             Plan::RecursiveCte(recursive_cte) => {
@@ -1829,7 +1832,9 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx
+                    .resolver
+                    .fork_with_outer_column_cache(&select_plan.table_references),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1846,8 +1851,7 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
+            emit_program_for_compound_select(program, &t_ctx.resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
             unreachable!("recursive CTEs require table-backed materialization for indexed access")
@@ -1945,7 +1949,9 @@ fn emit_materialized_subquery_table(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx
+                    .resolver
+                    .fork_with_outer_column_cache(&select_plan.table_references),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1962,8 +1968,7 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
+            emit_program_for_compound_select(program, &t_ctx.resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
             super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;

@@ -1799,6 +1799,7 @@ fn generate_cascade_delete_stmt(
 ) -> ast::Stmt {
     ast::Stmt::Delete {
         with: None,
+        using: None,
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(child_cols, ctx))),
