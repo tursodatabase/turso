@@ -120,7 +120,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
-    SortOrder, TableInternalId, TypeOperator,
+    SortOrder, TableInternalId, TypeOperator, UnaryOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -5643,10 +5643,7 @@ fn create_table_with_rowid_alias_types(
                             notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
-                            default = Some(
-                                translate_ident_to_string_literal(expr)
-                                    .unwrap_or_else(|| expr.clone()),
-                            );
+                            default = Some(default_expr_as_stored_sql_loads_it(expr)?);
                         }
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
@@ -5962,6 +5959,26 @@ fn create_table_with_rowid_alias_types(
         table.has_rowid,
     );
     Ok(table)
+}
+
+/// The PostgreSQL translator gives a negative number as one literal. The
+/// SQLite parser reads its stored text as a minus on a positive literal.
+pub fn default_expr_as_stored_sql_loads_it(expr: &Expr) -> Result<Box<Expr>> {
+    let mut expr =
+        translate_ident_to_string_literal(expr).unwrap_or_else(|| Box::new(expr.clone()));
+    walk_expr_mut(&mut expr, &mut |e| {
+        if let Expr::Literal(Literal::Numeric(number)) = e {
+            if let Some(positive) = number.strip_prefix('-') {
+                *e = Expr::Unary(
+                    UnaryOperator::Negative,
+                    Box::new(Expr::Literal(Literal::Numeric(positive.to_string()))),
+                );
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(expr)
 }
 
 /// SQLite treats bare identifiers in DEFAULT clauses as string literals.
@@ -6328,9 +6345,7 @@ impl Column {
                 }
                 ast::ColumnConstraint::Unique(..) => coldef.flags.insert(ColDefFlags::Unique),
                 ast::ColumnConstraint::Default(expr) => {
-                    default.replace(
-                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
-                    );
+                    default.replace(default_expr_as_stored_sql_loads_it(expr)?);
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     let collation_seq = CollationSeq::new(collation_name.as_str())?;

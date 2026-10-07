@@ -1013,3 +1013,29 @@ fn default_of_a_serial_primary_key_of_base_file_gives_the_next_rowid() {
         ["1|first", "2|second", "3|third"]
     );
 }
+
+#[test]
+fn alter_table_keeps_negative_defaults_of_base_file() {
+    let dir = copy_fixtures(&["pg_v1_negative_default.db"]);
+    let path = dir.path().join("pg_v1_negative_default.db");
+    let db = open(path.clone(), false);
+    let conn = db.connect_postgres();
+    conn.execute("ALTER TABLE nd RENAME COLUMN note TO memo")
+        .unwrap();
+    conn.execute("ALTER TABLE nd ADD COLUMN b int DEFAULT -2")
+        .unwrap();
+    conn.execute("INSERT INTO nd (id, memo) VALUES (2, 'y')")
+        .unwrap();
+    let expected = ["1|-1|-1.50|x|-2", "2|-1|-1.50|y|-2"];
+    assert_eq!(
+        rows(&conn, "SELECT id, a, n, memo, b FROM nd ORDER BY id"),
+        expected
+    );
+    drop(conn);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        rows(&conn, "SELECT id, a, n, memo, b FROM nd ORDER BY id"),
+        expected
+    );
+}

@@ -15,9 +15,9 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{
-        collect_column_dependencies_of_expr, is_strict_primitive_type, BTreeTable, CheckConstraint,
-        Column, ColumnLayout, ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
+        collect_column_dependencies_of_expr, default_expr_as_stored_sql_loads_it,
+        is_strict_primitive_type, BTreeTable, CheckConstraint, Column, ColumnLayout, ForeignKey,
+        FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -1448,7 +1448,7 @@ pub fn translate_alter_table(
                     .resolve_type(&column.ty_str, btree.is_strict)
                 {
                     if let Some(type_default) = resolved.default_expr() {
-                        column.default = Some(Box::new(type_default.clone()));
+                        column.default = Some(default_expr_as_stored_sql_loads_it(type_default)?);
                     }
                 }
             }

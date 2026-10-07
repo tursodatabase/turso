@@ -167,3 +167,16 @@ test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
 expect error {}
+
+test table-negative-defaults {
+    CREATE TABLE nd (id int PRIMARY KEY, a int DEFAULT -1, b bigint DEFAULT -2, c smallint DEFAULT -3, d numeric(10,2) DEFAULT -1.5, e int DEFAULT (-1 + 3), note text);
+    INSERT INTO nd (id, note) VALUES (1, 'x');
+    ALTER TABLE nd ADD COLUMN f int DEFAULT -4;
+    ALTER TABLE nd RENAME COLUMN note TO memo;
+    INSERT INTO nd (id, memo) VALUES (2, 'y');
+    SELECT id, a, b, c, d, e, memo, f FROM nd ORDER BY id;
+}
+expect {
+    1|-1|-2|-3|-1.50|2|x|-4
+    2|-1|-2|-3|-1.50|2|y|-4
+}
