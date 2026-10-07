@@ -4883,17 +4883,24 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
     Ok(clone.to_string())
 }
 
+pub(crate) fn integer_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(ast::Literal::Numeric(digits)) => digits.parse().ok(),
+        Expr::Unary(ast::UnaryOperator::Negative, operand) => {
+            integer_literal(operand)?.checked_neg()
+        }
+        _ => None,
+    }
+}
+
 /// What a check of a schema expression (an index expression, the WHERE
 /// clause of a partial index, a generated column) knows about the columns
-/// that the expression reads.
+/// that the expression reads. `StoredSchema` is the schema of a file: the
+/// statement that created the expression checked it.
 #[derive(Clone, Copy)]
 pub(crate) enum SchemaExprColumns<'a> {
-    /// The columns of this table.
     Of(&'a Schema, &'a BTreeTable),
-    /// Nothing: only a literal operand passes the check.
-    Unknown,
-    /// The statement that created the expression checked it.
-    Checked,
+    StoredSchema,
 }
 
 pub(crate) fn is_deterministic_schema_function_call(
@@ -4911,35 +4918,64 @@ pub(crate) fn is_deterministic_schema_function_call(
             | ScalarFunc::StrfTime
             | ScalarFunc::TimeDiff,
         ) => is_deterministic_datetime_call(func, args),
-        Func::Scalar(scalar) if is_pg_temporal_function(scalar) => args
-            .iter()
-            .all(|arg| is_never_a_clock_word(arg.as_ref(), columns)),
+        Func::Scalar(scalar) if is_pg_temporal_function(scalar) => match columns {
+            SchemaExprColumns::Of(schema, table) => args
+                .iter()
+                .all(|arg| is_never_a_clock_word(arg.as_ref(), schema, table)),
+            SchemaExprColumns::StoredSchema => true,
+        },
         _ => func.is_deterministic(),
     }
 }
 
-/// A cast to a date or time type of the PostgreSQL frontend, or to a domain
-/// over one, reads the clock for a word like 'now'. In a schema expression
-/// its operand must never be such a word.
+pub(crate) const READS_THE_CLOCK: &str =
+    "a date or time function or cast can read the clock for a word like 'now'";
+
+/// A cast to a date or time type, or to a domain over one, reads the clock
+/// for a word like 'now'. In a schema expression its operand must never be
+/// such a word.
 pub(crate) fn is_deterministic_schema_cast(
     operand: &Expr,
     type_name: &ast::Type,
     columns: SchemaExprColumns,
 ) -> bool {
-    let reads_the_clock = match columns {
-        SchemaExprColumns::Of(schema, _) => schema
-            .resolve_type_unchecked(&type_name.name)
-            .ok()
-            .flatten()
-            .and_then(|resolved| resolved.pg_storage_type()?.temporal())
-            .is_some(),
-        SchemaExprColumns::Unknown | SchemaExprColumns::Checked => {
-            PgStorageType::from_type_name(&type_name.name)
-                .and_then(PgStorageType::temporal)
-                .is_some()
+    match columns {
+        SchemaExprColumns::Of(schema, table) => {
+            !type_reads_date_or_time(schema, &type_name.name)
+                || is_never_a_clock_word(operand, schema, table)
         }
-    };
-    !reads_the_clock || is_never_a_clock_word(operand, columns)
+        SchemaExprColumns::StoredSchema => true,
+    }
+}
+
+/// The value is never a word like 'now': a literal that is not such a word,
+/// a column of a date or time type, or the result of a cast to a date or time
+/// type.
+fn is_never_a_clock_word(expr: &Expr, schema: &Schema, table: &BTreeTable) -> bool {
+    match expr {
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            is_never_a_clock_word(&exprs[0], schema, table)
+        }
+        Expr::Literal(_) => !is_pg_clock_word(expr),
+        Expr::Id(name)
+        | Expr::Name(name)
+        | Expr::Qualified(_, name)
+        | Expr::DoublyQualified(_, _, name) => table
+            .get_column(&normalize_ident(name.as_str()))
+            .is_some_and(|(_, column)| {
+                table.is_strict && type_reads_date_or_time(schema, &column.ty_str)
+            }),
+        Expr::FunctionCall { name, args, .. } => {
+            Func::resolve_function(name.as_str(), args.len()).is_ok_and(|func| {
+                matches!(func, Some(Func::Scalar(scalar)) if is_pg_temporal_function(&scalar))
+            })
+        }
+        Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => type_reads_date_or_time(schema, &type_name.name),
+        _ => false,
+    }
 }
 
 fn is_pg_temporal_function(func: &ScalarFunc) -> bool {
@@ -4954,55 +4990,9 @@ fn is_pg_temporal_function(func: &ScalarFunc) -> bool {
         .any(|pg_type| pg_type.temporal_cast_function().as_ref() == Some(func))
 }
 
-/// The value is never a word like 'now': a literal that is not such a word,
-/// a column of a date or time type, or the result of a cast to a date or time
-/// type.
-fn is_never_a_clock_word(expr: &Expr, columns: SchemaExprColumns) -> bool {
-    match expr {
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_never_a_clock_word(&exprs[0], columns),
-        Expr::Literal(_) => !is_pg_clock_word(expr),
-        Expr::Id(name)
-        | Expr::Name(name)
-        | Expr::Qualified(_, name)
-        | Expr::DoublyQualified(_, _, name) => match columns {
-            SchemaExprColumns::Of(schema, table) => table
-                .get_column(&normalize_ident(name.as_str()))
-                .is_some_and(|(_, column)| column_shows_date_or_time(schema, table, column)),
-            SchemaExprColumns::Unknown => false,
-            SchemaExprColumns::Checked => true,
-        },
-        Expr::FunctionCall { name, args, .. }
-            if Func::resolve_function(name.as_str(), args.len()).is_ok_and(|func| {
-                matches!(func, Some(Func::Scalar(scalar)) if is_pg_temporal_function(&scalar))
-            }) =>
-        {
-            true
-        }
-        Expr::Cast {
-            type_name: Some(type_name),
-            ..
-        } if match columns {
-            SchemaExprColumns::Of(schema, _) => type_shows_date_or_time(schema, &type_name.name),
-            SchemaExprColumns::Unknown | SchemaExprColumns::Checked => {
-                PgStorageType::from_type_name(&type_name.name)
-                    .and_then(PgStorageType::temporal)
-                    .is_some()
-            }
-        } =>
-        {
-            true
-        }
-        _ => matches!(columns, SchemaExprColumns::Checked),
-    }
-}
-
-fn column_shows_date_or_time(schema: &Schema, table: &BTreeTable, column: &Column) -> bool {
-    table.is_strict && type_shows_date_or_time(schema, &column.ty_str)
-}
-
-/// The ENCODE of these built-in types stores canonical text or an integer,
-/// never a word like 'now'.
-fn type_shows_date_or_time(schema: &Schema, type_name: &str) -> bool {
+/// The ENCODE of these types reads a date or a time, and reads the clock for
+/// a word like 'now'. It stores canonical text or an integer, never the word.
+fn type_reads_date_or_time(schema: &Schema, type_name: &str) -> bool {
     schema
         .resolve_type_unchecked(type_name)
         .ok()
@@ -5010,8 +5000,7 @@ fn type_shows_date_or_time(schema: &Schema, type_name: &str) -> bool {
         .is_some_and(|resolved| {
             resolved.chain.iter().any(|td| {
                 td.pg_storage_type()
-                    .and_then(PgStorageType::temporal)
-                    .is_some()
+                    .is_some_and(PgStorageType::is_date_or_time)
                     || (td.is_builtin
                         && matches!(
                             td.name.as_str(),
@@ -5088,7 +5077,7 @@ fn string_literal_eq(value: &str, expected: &str) -> bool {
     value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
 
-pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
+pub(crate) fn validate_generated_expr(expr: &Expr, columns: SchemaExprColumns) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -5125,11 +5114,11 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !is_deterministic_schema_function_call(&func, args, SchemaExprColumns::Unknown) {
+            if !is_deterministic_schema_function_call(&func, args, columns) {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {
-                validate_generated_expr(arg)?;
+                validate_generated_expr(arg, columns)?;
             }
         }
 
@@ -5153,15 +5142,15 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
         }
 
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr(lhs, columns)?;
+            validate_generated_expr(rhs, columns)?;
         }
         Expr::Unary(_, inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, columns)?;
         }
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, columns)?;
             }
         }
         Expr::Case {
@@ -5171,51 +5160,52 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr(b)?;
+                validate_generated_expr(b, columns)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr(w)?;
-                validate_generated_expr(t)?;
+                validate_generated_expr(w, columns)?;
+                validate_generated_expr(t, columns)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, columns)?;
             }
         }
         Expr::Cast { expr, type_name } => {
-            if type_name.as_ref().is_some_and(|type_name| {
-                !is_deterministic_schema_cast(expr, type_name, SchemaExprColumns::Unknown)
-            }) {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            if type_name
+                .as_ref()
+                .is_some_and(|type_name| !is_deterministic_schema_cast(expr, type_name, columns))
+            {
+                bail_parse_error!("{READS_THE_CLOCK}: prohibited in generated columns");
             }
-            validate_generated_expr(expr)?;
+            validate_generated_expr(expr, columns)?;
         }
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr(lhs)?;
+            validate_generated_expr(lhs, columns)?;
             for e in rhs {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, columns)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(start)?;
-            validate_generated_expr(end)?;
+            validate_generated_expr(lhs, columns)?;
+            validate_generated_expr(start, columns)?;
+            validate_generated_expr(end, columns)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr(lhs, columns)?;
+            validate_generated_expr(rhs, columns)?;
             if let Some(e) = escape {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, columns)?;
             }
         }
         Expr::Collate(inner, _) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, columns)?;
         }
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, columns)?;
         }
         // CURRENT_TIME/DATE/TIMESTAMP parse as literals but evaluate to a
         // different value on every read; SQLite rejects them like any other
@@ -5226,9 +5216,61 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
         ) => {
             bail_parse_error!("non-deterministic functions prohibited in generated columns");
         }
+        Expr::Id(name) | Expr::Name(name) => {
+            if let SchemaExprColumns::Of(schema, table) = columns {
+                refuse_generated_read_of_stored_value(schema, table, name.as_str())?;
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// DML computes a generated column from the stored values of the row, and a
+/// read computes it from the values that the columns show.
+fn refuse_generated_read_of_stored_value(
+    schema: &Schema,
+    table: &BTreeTable,
+    name: &str,
+) -> Result<()> {
+    let Some((_, column)) = table.get_column(&normalize_ident(name)) else {
+        return Ok(());
+    };
+    let stores_integer_for_text = table.is_strict
+        && matches!(
+            schema.resolve_type_unchecked(&column.ty_str),
+            Ok(Some(resolved)) if resolved.check_reads_decoded_value()
+        );
+    if stores_integer_for_text {
+        bail_parse_error!(
+            "generated columns cannot read column {name}: a column of type {} stores a value that differs from the value that it shows",
+            column.ty_str
+        );
+    }
+    Ok(())
+}
+
+/// A read of a column DECODEs its stored value. A virtual generated column
+/// stores no value, so its type must show the value that the expression
+/// computes.
+pub(crate) fn validate_generated_column_type(
+    schema: &Schema,
+    column: &str,
+    type_name: &str,
+) -> Result<()> {
+    let Ok(Some(resolved)) = schema.resolve_type_unchecked(type_name) else {
+        return Ok(());
+    };
+    if resolved
+        .chain
+        .iter()
+        .all(|td| decode_returns_stored_value(td))
+    {
+        return Ok(());
+    }
+    bail_parse_error!(
+        "generated column {column} cannot have type \"{type_name}\": a column of this type shows a value that differs from the stored value"
+    )
 }
 
 /// Peel an optional `COLLATE` wrapper off a PRIMARY KEY / UNIQUE table
@@ -5533,7 +5575,7 @@ fn create_table_with_rowid_alias_types(
                             {
                                 bail_parse_error!("Stored generated columns are not supported");
                             }
-                            validate_generated_expr(expr)?;
+                            validate_generated_expr(expr, SchemaExprColumns::StoredSchema)?;
                             generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
@@ -6884,15 +6926,21 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(
+        &self,
+        table: &Table,
+        resolver: &Resolver,
+    ) -> Result<(), &'static str> {
+        const OTHER_TABLES: &str =
+            "cannot use aggregate, window functions or reference other tables";
+        const NON_DETERMINISTIC: &str = "non-deterministic functions prohibited";
         let Some(where_clause) = &self.where_clause else {
-            return true;
+            return Ok(());
         };
-        let btree = table.btree();
-        let columns = match btree.as_deref() {
-            Some(btree) => SchemaExprColumns::Of(resolver.schema(), btree),
-            None => SchemaExprColumns::Unknown,
+        let Some(btree) = table.btree() else {
+            return Err(OTHER_TABLES);
         };
+        let columns = SchemaExprColumns::Of(resolver.schema(), &btree);
 
         let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
@@ -6903,85 +6951,78 @@ impl Index {
             })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
-            let n = normalize_ident(name);
-            Func::resolve_function(&n, args.len()).is_ok_and(|f| {
-                f.is_some_and(|f| {
-                    f.is_deterministic() && is_deterministic_schema_function_call(&f, args, columns)
-                })
-            })
+        let function_call_error = |name: &ast::Name, args: &[Box<Expr>]| {
+            let Ok(Some(func)) =
+                Func::resolve_function(&normalize_ident(name.as_str()), args.len())
+            else {
+                return Err(OTHER_TABLES);
+            };
+            if !func.is_deterministic() {
+                Err(NON_DETERMINISTIC)
+            } else if !is_deterministic_schema_function_call(&func, args, columns) {
+                Err(READS_THE_CLOCK)
+            } else {
+                Ok(())
+            }
         };
 
-        let mut ok = true;
+        let mut result = Ok(());
         let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
             WalkControl,
         > {
-            if !ok {
+            if result.is_err() {
                 return Ok(WalkControl::SkipChildren);
             }
-            match e {
-                Expr::Literal(_) | Expr::RowId { .. } => {}
-                // Unqualified identifier: must be a column of the target table or ROWID
-                Expr::Id(n) => {
-                    let n = n.as_str();
-                    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
-                        ok = false;
-                    }
+            result = match e {
+                Expr::Literal(
+                    ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp,
+                ) => Err(NON_DETERMINISTIC),
+                Expr::Literal(_) | Expr::RowId { .. } => Ok(()),
+                Expr::Id(n)
+                    if !ROWID_STRS
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(n.as_str()))
+                        && !has_col(n.as_str()) =>
+                {
+                    Err(OTHER_TABLES)
                 }
-                // Qualified: qualifier must match this index's table; column must exist
-                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                        ok = false;
-                    }
+                Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col)
+                    if !is_tbl(ns.as_str()) || !has_col(col.as_str()) =>
+                {
+                    Err(OTHER_TABLES)
                 }
-                Expr::FunctionCall {
-                    name, filter_over, ..
+                Expr::FunctionCall { filter_over, .. }
+                | Expr::FunctionCallStar { filter_over, .. }
+                    if filter_over.over_clause.is_some() =>
+                {
+                    Err(OTHER_TABLES)
                 }
-                | Expr::FunctionCallStar {
-                    name, filter_over, ..
-                } => {
-                    // reject windowed
-                    if filter_over.over_clause.is_some() {
-                        ok = false;
-                    } else {
-                        let args = match e {
-                            Expr::FunctionCall { args, .. } => args.as_slice(),
-                            Expr::FunctionCallStar { .. } => &[],
-                            _ => unreachable!(),
-                        };
-                        // Reject non-deterministic functions. Function arguments can reference
-                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
-                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), args) {
-                            ok = false;
-                        }
-                    }
-                }
+                // Function arguments can reference columns of the indexed table (e.g.,
+                // LENGTH(t0.c0)), which the Expr::Id and Expr::Qualified cases check.
+                Expr::FunctionCall { name, args, .. } => function_call_error(name, args),
+                Expr::FunctionCallStar { name, .. } => function_call_error(name, &[]),
                 Expr::Cast {
                     expr,
                     type_name: Some(type_name),
-                } => {
-                    if !is_deterministic_schema_cast(expr, type_name, columns) {
-                        ok = false;
-                    }
+                } if !is_deterministic_schema_cast(expr, type_name, columns) => {
+                    Err(READS_THE_CLOCK)
                 }
-                // Explicitly disallowed constructs
                 Expr::Exists(_)
                 | Expr::InSelect { .. }
                 | Expr::Subquery(_)
                 | Expr::Raise { .. }
-                | Expr::Variable(_) => {
-                    ok = false;
-                }
-                _ => {}
-            }
-            Ok(if ok {
+                | Expr::Variable(_) => Err(OTHER_TABLES),
+                _ => Ok(()),
+            };
+            Ok(if result.is_ok() {
                 WalkControl::Continue
             } else {
                 WalkControl::SkipChildren
             })
         });
-        ok
+        result
     }
 
     /// Bind a copy of this index's WHERE clause against the given table references.

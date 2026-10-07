@@ -5,8 +5,9 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, is_strict_primitive_type, translate_ident_to_string_literal,
-    BTreeCharacteristics, BTreeTable, ColDef, Column, PgStorageType, SchemaObjectType, Table, Type,
+    create_table, integer_literal, is_strict_primitive_type, translate_ident_to_string_literal,
+    validate_generated_column_type, validate_generated_expr, BTreeCharacteristics, BTreeTable,
+    ColDef, Column, PgStorageType, SchemaExprColumns, SchemaObjectType, Table, Type,
     RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -923,6 +924,23 @@ fn validate(
         }
 
         let table = create_table(table_name, body, 0)?;
+        for column in columns {
+            for constraint in &column.constraints {
+                if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
+                    validate_generated_expr(
+                        expr,
+                        SchemaExprColumns::Of(resolver.schema(), &table),
+                    )?;
+                    if let (true, Some(col_type)) = (is_strict, &column.col_type) {
+                        validate_generated_column_type(
+                            resolver.schema(),
+                            &format!("{table_name}.{}", column.col_name),
+                            &col_type.name,
+                        )?;
+                    }
+                }
+            }
+        }
         if !table.has_rowid {
             if table.has_autoincrement {
                 bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -1018,16 +1036,6 @@ pub(crate) fn validate_numeric_type_parameters(
         );
     }
     Ok(())
-}
-
-fn integer_literal(expr: &ast::Expr) -> Option<i64> {
-    match expr {
-        ast::Expr::Literal(ast::Literal::Numeric(digits)) => digits.parse().ok(),
-        ast::Expr::Unary(ast::UnaryOperator::Negative, operand) => {
-            integer_literal(operand)?.checked_neg()
-        }
-        _ => None,
-    }
 }
 
 /// Schema information derived from a CTAS SELECT.

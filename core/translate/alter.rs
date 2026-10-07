@@ -1329,8 +1329,18 @@ pub fn translate_alter_table(
             if is_generated {
                 for c in &col_def.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
+                        crate::schema::validate_generated_expr(
+                            expr,
+                            crate::schema::SchemaExprColumns::Of(resolver.schema(), &btree),
+                        )?;
                     }
+                }
+                if let (true, Some(col_type)) = (btree.is_strict, &col_def.col_type) {
+                    crate::schema::validate_generated_column_type(
+                        resolver.schema(),
+                        &format!("{}.{}", btree.name, col_def.col_name),
+                        &col_type.name,
+                    )?;
                 }
             }
             let constraints = col_def.constraints.clone();
@@ -2067,8 +2077,18 @@ pub fn translate_alter_table(
 
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
+                        crate::schema::validate_generated_expr(
+                            expr,
+                            crate::schema::SchemaExprColumns::Of(resolver.schema(), &btree),
+                        )?;
                     }
+                }
+                if let (true, Some(col_type)) = (btree.is_strict, &definition.col_type) {
+                    crate::schema::validate_generated_column_type(
+                        resolver.schema(),
+                        &format!("{}.{}", btree.name, definition.col_name),
+                        &col_type.name,
+                    )?;
                 }
 
                 let non_generated_count = btree

@@ -24,7 +24,7 @@ use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEM
 use crate::{
     schema::{
         is_deterministic_schema_cast, is_deterministic_schema_function_call, BTreeTable, Index,
-        IndexColumn, PseudoCursorType, SchemaExprColumns, SchemaObjectType,
+        IndexColumn, PseudoCursorType, SchemaExprColumns, SchemaObjectType, READS_THE_CLOCK,
     },
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
@@ -225,13 +225,12 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if let Err(reason) = idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
-            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
+            "Error: {reason} in WHERE clause of CREATE INDEX:\n {}",
             where_clause
                 .as_ref()
                 .expect("where expr has to exist in order to fail")
-                .to_string()
         );
     }
 
@@ -951,10 +950,13 @@ fn resolve_sorted_columns_with_resolver(
         }
         let columns = match resolver {
             Some(resolver) => SchemaExprColumns::Of(resolver.schema(), table),
-            None => SchemaExprColumns::Checked,
+            None => SchemaExprColumns::StoredSchema,
         };
-        if !validate_index_expression(unwrapped_expr, table, columns) {
-            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+        if let Err(reason) = validate_index_expression(unwrapped_expr, table, columns) {
+            crate::bail_parse_error!(
+                "Error: invalid expression in CREATE INDEX: {}: {reason}",
+                sc.expr
+            );
         }
         resolved
             .push_within_capacity(IndexColumn {
@@ -1042,13 +1044,17 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable, columns: SchemaExprColumns) -> bool {
+fn validate_index_expression(
+    expr: &Expr,
+    table: &BTreeTable,
+    columns: SchemaExprColumns,
+) -> Result<(), &'static str> {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
     // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
     if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
+        return Err("no such column");
     }
 
     let tbl_norm = normalize_ident(table.name.as_str());
@@ -1060,19 +1066,13 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable, columns: SchemaExp
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
-    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
-        let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len()).is_ok_and(|f| {
-            f.is_some_and(|f| is_deterministic_schema_function_call(&f, args, columns))
-        })
-    };
 
-    let mut ok = true;
+    let mut result = Ok(());
     let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
-        if !ok {
+        if result.is_err() {
             return Ok(WalkControl::SkipChildren);
         }
-        match e {
+        result = match e {
             // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
             // Standalone string literals are handled by resolve_index_column() which interprets
             // them as column names (SQLite backwards compat quirk).
@@ -1080,67 +1080,61 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable, columns: SchemaExp
                 ast::Literal::CurrentDate
                 | ast::Literal::CurrentTime
                 | ast::Literal::CurrentTimestamp,
-            ) => {
-                ok = false;
+            ) => Err(NON_DETERMINISTIC_IN_INDEX),
+            Expr::Literal(_) | Expr::RowId { .. } => Ok(()),
+            Expr::Id(n) | Expr::Name(n) if !has_col(n.as_str()) => Err("no such column"),
+            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col)
+                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) =>
+            {
+                Err("index expressions may reference only columns of the table")
             }
-            Expr::Literal(_) | Expr::RowId { .. } => {}
-            // must be a column of the target table
-            Expr::Id(n) | Expr::Name(n) => {
-                if !has_col(n.as_str()) {
-                    ok = false;
-                }
+            Expr::FunctionCall { filter_over, .. } | Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.over_clause.is_some() =>
+            {
+                Err("window functions prohibited in index expressions")
             }
-            // Qualified: qualifier must match this index's table, column must exist
-            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
-                    ok = false;
-                }
-            }
-            Expr::FunctionCall {
-                name, filter_over, ..
-            }
-            | Expr::FunctionCallStar {
-                name, filter_over, ..
-            } => {
-                // reject windowed
-                if filter_over.over_clause.is_some() {
-                    ok = false;
-                } else {
-                    let argc = match e {
-                        Expr::FunctionCall { args, .. } => args.as_slice(),
-                        Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
-                        _ => unreachable!(),
-                    };
-                    if !is_deterministic_fn(name.as_str(), argc) {
-                        ok = false;
-                    }
-                }
-            }
+            Expr::FunctionCall { name, args, .. } => index_function_call_error(name, args, columns),
+            Expr::FunctionCallStar { name, .. } => index_function_call_error(name, &[], columns),
             Expr::Cast {
                 expr,
                 type_name: Some(type_name),
-            } => {
-                if !is_deterministic_schema_cast(expr, type_name, columns) {
-                    ok = false;
-                }
+            } if !is_deterministic_schema_cast(expr, type_name, columns) => Err(READS_THE_CLOCK),
+            Expr::Exists(_) | Expr::InSelect { .. } | Expr::Subquery(_) => {
+                Err("subqueries prohibited in index expressions")
             }
-            // Explicitly disallowed constructs
-            Expr::Exists(_)
-            | Expr::InSelect { .. }
-            | Expr::Subquery(_)
-            | Expr::Raise { .. }
-            | Expr::Variable(_) => {
-                ok = false;
+            Expr::Raise { .. } | Expr::Variable(_) => {
+                Err("parameters and RAISE prohibited in index expressions")
             }
-            _ => {}
-        }
-        Ok(if ok {
+            _ => Ok(()),
+        };
+        Ok(if result.is_ok() {
             WalkControl::Continue
         } else {
             WalkControl::SkipChildren
         })
     });
-    ok
+    result
+}
+
+const NON_DETERMINISTIC_IN_INDEX: &str =
+    "non-deterministic functions prohibited in index expressions";
+
+/// Why an index expression cannot call this function, if it cannot.
+fn index_function_call_error(
+    name: &ast::Name,
+    args: &[Box<Expr>],
+    columns: SchemaExprColumns,
+) -> Result<(), &'static str> {
+    let Ok(Some(func)) = Func::resolve_function(&normalize_ident(name.as_str()), args.len()) else {
+        return Err("no such function");
+    };
+    if is_deterministic_schema_function_call(&func, args, columns) {
+        Ok(())
+    } else if crate::function::Deterministic::is_deterministic(&func) {
+        Err(READS_THE_CLOCK)
+    } else {
+        Err(NON_DETERMINISTIC_IN_INDEX)
+    }
 }
 
 fn emit_index_column_value_from_cursor(
