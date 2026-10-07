@@ -142,7 +142,7 @@ pub fn emit_program_for_compound_select(
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
     let (query_destination, collection_cursor, collection_index) = if has_order_by {
-        let (cursor_id, index) = create_collection_index(program, &left[0].0, right_most)?;
+        let (cursor_id, index) = create_collection_index(program, left, right_most)?;
         let dest = QueryDestination::EphemeralIndex {
             cursor_id,
             index: index.clone(),
@@ -352,7 +352,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, left, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -412,7 +412,8 @@ fn emit_compound_select(
                 // this BEFORE we overwrite it with our own indexes for the intersection.
                 let intersect_destination = right_most.query_destination.clone();
 
-                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, left, plan, right_most)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -421,7 +422,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, plan, right_most)?;
+                    create_dedupe_index(program, left, plan, right_most)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -472,7 +473,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, left, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -556,6 +557,7 @@ fn emit_compound_select(
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
+    earlier_selects: &[(SelectPlan, CompoundOperator)],
     left_select: &SelectPlan,
     right_select: &SelectPlan,
 ) -> crate::Result<(usize, Arc<Index>)> {
@@ -572,22 +574,12 @@ fn create_dedupe_index(
             )
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
+    let selects = earlier_selects
+        .iter()
+        .map(|(select, _)| select)
+        .chain([left_select, right_select]);
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+        column.collation = compound_column_collation(selects.clone(), i)?;
     }
 
     let dedupe_index = Arc::new(Index {
@@ -608,6 +600,22 @@ fn create_dedupe_index(
         is_table: false,
     });
     Ok((cursor_id, dedupe_index))
+}
+
+fn compound_column_collation<'a>(
+    selects: impl Iterator<Item = &'a SelectPlan>,
+    column_idx: usize,
+) -> crate::Result<Option<crate::translate::collate::CollationSeq>> {
+    for select in selects {
+        let collation = get_collseq_from_expr(
+            &select.result_columns[column_idx].expr,
+            &select.table_references,
+        )?;
+        if collation.is_some() {
+            return Ok(collation);
+        }
+    }
+    Ok(None)
 }
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for
@@ -780,7 +788,7 @@ pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDe
 /// Uses `has_rowid=true` to allow duplicate entries (needed for UNION ALL).
 fn create_collection_index(
     program: &mut ProgramBuilder,
-    left_select: &SelectPlan,
+    left_selects: &[(SelectPlan, CompoundOperator)],
     right_select: &SelectPlan,
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut columns = right_select
@@ -800,21 +808,12 @@ fn create_collection_index(
             expr: None,
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
+    let selects = left_selects
+        .iter()
+        .map(|(select, _)| select)
+        .chain([right_select]);
     for (i, column) in columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+        column.collation = compound_column_collation(selects.clone(), i)?;
     }
 
     let index = Arc::new(Index {
