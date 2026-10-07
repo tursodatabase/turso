@@ -302,3 +302,35 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+# Indexes of 14 columns plus the rowid. A seek compares a text first column
+# or an integer first column, then the other 13 columns, one field at a time.
+@cross-check-integrity
+test index-of-fourteen-columns-gives-the-rows-of-a-scan {
+    CREATE TABLE w(c1 TEXT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT);
+    CREATE UNIQUE INDEX w_text ON w(c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14);
+    CREATE INDEX w_int ON w(c14 DESC, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c1);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 40)
+    INSERT INTO w SELECT 'k' || (x % 3), x % 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, x FROM s;
+    SELECT group_concat(c14) FROM (SELECT c14 FROM w WHERE c1 = 'k1' AND c2 = 0 AND c3 = 3 AND c4 = 4 AND c5 = 5 AND c6 = 6 AND c7 = 7 AND c8 = 8 AND c9 = 9 AND c10 = 10 AND c11 = 11 AND c12 = 12 AND c13 = 13 AND c14 > 20 ORDER BY c14);
+    SELECT group_concat(c14) FROM (SELECT c14 FROM w NOT INDEXED WHERE c1 = 'k1' AND c2 = 0 AND c3 = 3 AND c4 = 4 AND c5 = 5 AND c6 = 6 AND c7 = 7 AND c8 = 8 AND c9 = 9 AND c10 = 10 AND c11 = 11 AND c12 = 12 AND c13 = 13 AND c14 > 20 ORDER BY c14);
+    SELECT group_concat(c1 || ':' || c14) FROM (SELECT c1, c14 FROM w WHERE c14 BETWEEN 5 AND 9 AND c2 = 1 AND c3 = 3 ORDER BY c14 DESC);
+    SELECT group_concat(c1 || ':' || c14) FROM (SELECT c1, c14 FROM w NOT INDEXED WHERE c14 BETWEEN 5 AND 9 AND c2 = 1 AND c3 = 3 ORDER BY c14 DESC);
+}
+expect {
+    22,28,34,40
+    22,28,34,40
+    k0:9,k1:7,k2:5
+    k0:9,k1:7,k2:5
+}
+
+@cross-check-integrity
+test index-of-fourteen-columns-refuses-a-duplicate-key {
+    CREATE TABLE w(c1 TEXT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT, c9 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT);
+    CREATE UNIQUE INDEX w_text ON w(c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14);
+    INSERT INTO w VALUES ('k1', 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 4);
+    INSERT INTO w VALUES ('k1', 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 5);
+    INSERT INTO w VALUES ('k1', 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 4);
+}
+expect error {
+}

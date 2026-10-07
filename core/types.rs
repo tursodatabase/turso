@@ -2802,7 +2802,7 @@ impl RecordCompare {
                 compare_payload_string(left_payload, right_values, index_info, tie_breaker)
             }
             RecordCompare::Generic => {
-                compare_payload_generic(left_payload, right_values, index_info, 0, tie_breaker)
+                compare_payload_generic(left_payload, right_values, index_info, tie_breaker)
             }
         }
     }
@@ -2813,7 +2813,7 @@ where
     V: AsValueRef,
     I: ExactSizeIterator<Item = V>,
 {
-    if right_values.len() != 0 && index_info.num_cols <= 13 {
+    if right_values.len() != 0 {
         let val = right_values.peek().unwrap();
         match val.as_value_ref() {
             ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int {
@@ -2850,11 +2850,10 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// common case where:
 /// - (a) The first field of the unpacked record is an integer
 /// - (b) The serialized record's first field is also an integer
-/// - (c) The header size varint fits in a single byte and is ≤ 63 bytes
 ///
-/// The 63-byte header limit prevents buffer overreads and ensures safe direct
-/// memory access patterns. This optimization avoids generic parsing overhead
-/// by directly extracting and comparing integer values using known layouts.
+/// Every read is bounds-checked, so the number of fields does not matter.
+/// This optimization avoids generic parsing overhead by directly extracting
+/// and comparing integer values using known layouts.
 ///
 /// # Fast Path Conditions
 ///
@@ -2881,8 +2880,8 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 2. **Direct extraction**: Reads integer value using specialized decoder
 /// 3. **Native comparison**: Uses Rust's built-in `i64::cmp()` for speed
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
-/// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_payload_generic()` with `skip=1`
+/// 5. **Remaining fields**: If first field is equal, continues with
+///    `compare_fields_from()` after the first field
 #[inline(always)]
 fn compare_payload_int<V, I>(
     left_packed: &[u8],
@@ -2896,7 +2895,7 @@ where
     I: ExactSizeIterator<Item = V>,
 {
     if left_packed.len() < 2 {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     }
 
     let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
@@ -2909,12 +2908,16 @@ where
             left_packed.len()
         )));
     }
+    if offset_1st_serialtype >= header_size {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
+    }
 
-    let (first_serial_type, _) = read_varint(&left_packed[offset_1st_serialtype..])?;
+    let (first_serial_type, first_serial_type_len) =
+        read_varint(&left_packed[offset_1st_serialtype..])?;
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     }
 
     let data_start = header_size;
@@ -2924,22 +2927,22 @@ where
         SortOrder::Asc => lhs_int.cmp(&rhs_int),
         SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
     };
-    match comparison {
-        std::cmp::Ordering::Equal => {
-            // First fields equal, compare remaining fields if any
-            if right_unpacked.len() > 1 {
-                return compare_payload_generic(
-                    left_packed,
-                    right_unpacked,
-                    index_info,
-                    1,
-                    tie_breaker,
-                );
-            }
-            Ok(tie_breaker)
-        }
-        other => Ok(other),
+    if comparison.is_ne() {
+        return Ok(comparison);
     }
+    let mut remaining_values = right_unpacked;
+    remaining_values.next();
+    compare_fields_from(
+        left_packed,
+        RecordPosition {
+            header_pos: offset_1st_serialtype + first_serial_type_len,
+            header_end: header_size,
+            data_pos: data_start + get_serial_type_size(first_serial_type)?,
+        },
+        remaining_values,
+        &index_info.key_info[1..],
+        tie_breaker,
+    )
 }
 
 /// This function is an optimized version of `compare_payload_generic()` for the
@@ -2978,8 +2981,8 @@ where
 /// 2. **String comparison**: Uses collation if provided, binary otherwise
 /// 3. **Sort order**: Applies ascending/descending order to comparison result
 /// 4. **Length comparison**: If strings are equal, compares lengths
-/// 5. **Remaining fields**: If first field is equal and more fields exist,
-///    delegates to `compare_payload_generic()` with `skip=1`
+/// 5. **Remaining fields**: If first field is equal, continues with
+///    `compare_fields_from()` after the first field
 fn compare_payload_string<V, I>(
     left_packed: &[u8],
     right_unpacked: I,
@@ -2991,7 +2994,7 @@ where
     I: ExactSizeIterator<Item = V>,
 {
     if left_packed.len() < 2 {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     }
 
     let (header_size, offset_1st_serialtype) = read_varint(left_packed)?;
@@ -3004,18 +3007,22 @@ where
             left_packed.len()
         )));
     }
+    if offset_1st_serialtype >= header_size {
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
+    }
 
-    let (first_serial_type, _) = read_varint(&left_packed[offset_1st_serialtype..])?;
+    let (first_serial_type, first_serial_type_len) =
+        read_varint(&left_packed[offset_1st_serialtype..])?;
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     }
 
     let mut right_unpacked = right_unpacked.peekable();
 
     let ValueRef::Text(rhs_text) = right_unpacked.peek().unwrap().as_value_ref() else {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     };
 
     let string_len = (first_serial_type as usize - 13) / 2;
@@ -3027,7 +3034,7 @@ where
     let (lhs_value, _) = read_value(&left_packed[data_start..], serial_type)?;
 
     let ValueRef::Text(lhs_text) = lhs_value else {
-        return compare_payload_generic(left_packed, right_unpacked, index_info, 0, tie_breaker);
+        return compare_payload_generic(left_packed, right_unpacked, index_info, tie_breaker);
     };
 
     let collation = index_info.key_info[0].collation;
@@ -3049,16 +3056,18 @@ where
                 return Ok(adjusted);
             }
 
-            if right_unpacked.len() > 1 {
-                return compare_payload_generic(
-                    left_packed,
-                    right_unpacked,
-                    index_info,
-                    1,
-                    tie_breaker,
-                );
-            }
-            Ok(tie_breaker)
+            right_unpacked.next();
+            compare_fields_from(
+                left_packed,
+                RecordPosition {
+                    header_pos: offset_1st_serialtype + first_serial_type_len,
+                    header_end: header_size,
+                    data_pos: data_start + string_len,
+                },
+                right_unpacked,
+                &index_info.key_info[1..],
+                tie_breaker,
+            )
         }
         other => Ok(other),
     }
@@ -3080,15 +3089,7 @@ where
 /// * `left_packed` - The left-hand side record, as its serialized bytes
 /// * `right_unpacked` - The right-hand side record, as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
-/// * `skip` - Number of initial fields to skip (assumes caller verified equality)
 /// * `tie_breaker` - Result to return when all compared fields are equal
-///
-/// # Skipping Fields
-///
-/// If `skip` is non-zero, it is assumed that the caller has already determined
-/// that the first `skip` fields of the records are equal. This function will
-/// begin comparing at field index `skip`, skipping over the header and data
-/// portions of the already-verified fields.
 ///
 /// # Field Count Differences
 ///
@@ -3099,67 +3100,100 @@ fn compare_payload_generic<V, I>(
     left_packed: &[u8],
     right_unpacked: I,
     index_info: &IndexInfo,
-    skip: usize,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering>
 where
     V: AsValueRef,
-    I: ExactSizeIterator<Item = V>,
+    I: Iterator<Item = V>,
 {
     if left_packed.is_empty() {
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint(left_packed)?;
+    let (header_size, header_pos) = read_varint(left_packed)?;
     let header_end = header_size as usize;
-    turso_debug_assert!(header_end <= left_packed.len());
-
-    let mut data_pos = header_size as usize;
-
-    // Skip over `skip` number of fields
-    for _ in 0..skip {
-        if header_pos >= header_end {
-            break;
-        }
-
-        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
-        header_pos += bytes_read;
-
-        let serial_type = SerialType::try_from(serial_type_raw)?;
-        if !matches!(
-            serial_type.kind(),
-            SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 | SerialTypeKind::Null
-        ) {
-            data_pos += serial_type.size();
-        }
+    if header_end > left_packed.len() {
+        return Err(LimboError::Corrupt(format!(
+            "Record payload too short: claimed header size {} but payload only {} bytes",
+            header_end,
+            left_packed.len()
+        )));
     }
+    compare_fields_from(
+        left_packed,
+        RecordPosition {
+            header_pos,
+            header_end,
+            data_pos: header_end,
+        },
+        right_unpacked,
+        &index_info.key_info,
+        tie_breaker,
+    )
+}
 
-    let mut field_idx = skip;
-    let field_limit = right_unpacked.len().min(index_info.key_info.len());
+/// Where a walk of a serialized record is: the position of the next serial
+/// type, the end of the header, and the position of the next value.
+#[derive(Clone, Copy)]
+struct RecordPosition {
+    header_pos: usize,
+    header_end: usize,
+    data_pos: usize,
+}
 
-    // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    for rhs_value in right_unpacked.skip(skip) {
-        let rhs_value = &rhs_value.as_value_ref();
-        if field_idx >= field_limit || header_pos >= header_end {
+/// Compares the fields of `left_packed` from `position` on with
+/// `right_values`, each field with its `KeyInfo`. An integer field compared
+/// with an integer value skips the decode into a `ValueRef`.
+fn compare_fields_from<V, I>(
+    left_packed: &[u8],
+    mut position: RecordPosition,
+    right_values: I,
+    key_info: &[KeyInfo],
+    tie_breaker: std::cmp::Ordering,
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: Iterator<Item = V>,
+{
+    for (rhs_value, key_info) in right_values.zip(key_info) {
+        if position.header_pos >= position.header_end {
             break;
         }
-        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
-        header_pos += bytes_read;
+        let (serial_type_raw, bytes_read) = read_varint(&left_packed[position.header_pos..])?;
+        position.header_pos += bytes_read;
+        let rhs_value = &rhs_value.as_value_ref();
+
+        if let (1..=6 | 8 | 9, ValueRef::Numeric(Numeric::Integer(rhs_int))) =
+            (serial_type_raw, rhs_value)
+        {
+            let lhs_int = read_integer(
+                value_bytes(left_packed, position.data_pos)?,
+                serial_type_raw as u8,
+            )?;
+            position.data_pos += get_serial_type_size(serial_type_raw)?;
+            let comparison = lhs_int.cmp(rhs_int);
+            if comparison.is_ne() {
+                return Ok(match key_info.sort_order {
+                    SortOrder::Asc => comparison,
+                    SortOrder::Desc => comparison.reverse(),
+                });
+            }
+            continue;
+        }
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
-
         let lhs_value = match serial_type.kind() {
             SerialTypeKind::ConstInt0 => ValueRef::Numeric(Numeric::Integer(0)),
             SerialTypeKind::ConstInt1 => ValueRef::Numeric(Numeric::Integer(1)),
             SerialTypeKind::Null => ValueRef::Null,
             _ => {
-                let (value, field_size) = read_value(&left_packed[data_pos..], serial_type)?;
-                data_pos += field_size;
+                let (value, field_size) =
+                    read_value(value_bytes(left_packed, position.data_pos)?, serial_type)?;
+                position.data_pos += field_size;
                 value
             }
         };
 
-        let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
             (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
                 key_info.collation.compare_strings(lhs_text, rhs_text)
@@ -3168,15 +3202,21 @@ where
         };
 
         let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
-
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
-
-        field_idx += 1;
     }
 
     Ok(tie_breaker)
+}
+
+fn value_bytes(left_packed: &[u8], data_pos: usize) -> Result<&[u8]> {
+    left_packed.get(data_pos..).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "Record value starts at {data_pos} past the payload of {} bytes",
+            left_packed.len()
+        ))
+    })
 }
 
 const I8_LOW: i64 = -128;
@@ -4303,7 +4343,6 @@ mod tests {
             serialized.get_payload(),
             unpacked_values.iter(),
             index_info,
-            0,
             tie_breaker,
         )
         .unwrap();
@@ -4845,7 +4884,32 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_parameter() {
+    fn a_header_size_past_the_payload_is_corrupt_for_every_comparator() {
+        let index_info =
+            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::Binary; 2]);
+        let payload = [9u8, 1, 1, 7];
+        for (comparer, first) in [
+            (RecordCompare::Generic, ValueRef::from_i64(7)),
+            (
+                RecordCompare::Int { rhs_first_value: 7 },
+                ValueRef::from_i64(7),
+            ),
+            (
+                RecordCompare::String,
+                ValueRef::Text(TextRef::new("a", TextSubtype::Text)),
+            ),
+        ] {
+            let result =
+                comparer.compare_payload(&payload, [first], &index_info, std::cmp::Ordering::Equal);
+            assert!(
+                matches!(result, Err(LimboError::Corrupt(_))),
+                "{comparer:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_fields_from_starts_at_the_given_field() {
         let index_info = create_index_info(
             3,
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
@@ -4853,37 +4917,50 @@ mod tests {
         );
 
         let serialized = create_record(vec![
-            Value::from_i64(1),
-            Value::from_i64(2),
-            Value::from_i64(3),
+            Value::from_i64(10),
+            Value::from_i64(20),
+            Value::from_i64(30),
         ]);
+        let payload = serialized.get_payload();
         let unpacked = [
-            ValueRef::from_i64(1),
+            ValueRef::from_i64(10),
             ValueRef::from_i64(99),
-            ValueRef::from_i64(3),
+            ValueRef::from_i64(30),
         ];
 
         let tie_breaker = std::cmp::Ordering::Equal;
-        let result_skip_0 = compare_payload_generic(
-            serialized.get_payload(),
-            unpacked.iter(),
-            &index_info,
-            0,
+        let from_start =
+            compare_payload_generic(payload, unpacked.iter(), &index_info, tie_breaker).unwrap();
+        let header_size = payload[0] as usize;
+        let after_first_field = RecordPosition {
+            header_pos: 2,
+            header_end: header_size,
+            data_pos: header_size + 1,
+        };
+        let from_second_field = compare_fields_from(
+            payload,
+            after_first_field,
+            unpacked[1..].iter(),
+            &index_info.key_info[1..],
             tie_breaker,
         )
         .unwrap();
-        let result_skip_1 = compare_payload_generic(
-            serialized.get_payload(),
-            unpacked.iter(),
-            &index_info,
-            1,
-            tie_breaker,
+        let from_third_field = compare_fields_from(
+            payload,
+            RecordPosition {
+                header_pos: 3,
+                data_pos: header_size + 2,
+                ..after_first_field
+            },
+            unpacked[2..].iter(),
+            &index_info.key_info[2..],
+            std::cmp::Ordering::Greater,
         )
         .unwrap();
 
-        assert_eq!(result_skip_0, std::cmp::Ordering::Less);
-
-        assert_eq!(result_skip_1, std::cmp::Ordering::Less);
+        assert_eq!(from_start, std::cmp::Ordering::Less);
+        assert_eq!(from_second_field, std::cmp::Ordering::Less);
+        assert_eq!(from_third_field, std::cmp::Ordering::Greater);
     }
 
     #[test]
@@ -4920,7 +4997,7 @@ mod tests {
         let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).try_collect().unwrap();
         assert!(matches!(
             find_compare(large_values.iter().peekable(), &index_info_large),
-            RecordCompare::Generic
+            RecordCompare::Int { rhs_first_value: 0 }
         ));
 
         let blob_values = [ValueRef::Blob(&[1, 2, 3])];
