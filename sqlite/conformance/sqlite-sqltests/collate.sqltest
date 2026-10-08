@@ -1568,3 +1568,73 @@ test nocase-index-does-not-serve-binary-comparison {
 }
 expect {
 }
+
+# "x IN (SELECT y ...)" compares with the collation of "x = y": a column on the
+# left keeps its own collation, BINARY when it declares none, over a NOCASE
+# column on the right.
+test in-subquery-uses-comparison-collation {
+    CREATE TABLE l(y TEXT);
+    INSERT INTO l VALUES ('a');
+    CREATE TABLE r(w TEXT COLLATE NOCASE);
+    INSERT INTO r VALUES ('A'), ('b');
+    SELECT y IN (SELECT w FROM r),
+           y NOT IN (SELECT w FROM r),
+           'a' IN (SELECT w FROM r),
+           y COLLATE NOCASE IN (SELECT w FROM r),
+           y IN (SELECT w COLLATE BINARY FROM r),
+           (y, 1) IN (SELECT w, 1 FROM r)
+      FROM l;
+}
+expect {
+    0|1|1|1|0|0
+}
+
+# A row value IN that misses checks the list for NULL with each field's
+# comparison collation (sqlite3ExprCodeIN), not one collation for every field.
+test in-subquery-row-value-null-check-uses-each-field-collation {
+    CREATE TABLE l(y TEXT, z TEXT COLLATE NOCASE);
+    INSERT INTO l VALUES ('a', 'a');
+    CREATE TABLE r(w TEXT COLLATE NOCASE, v TEXT);
+    INSERT INTO r VALUES ('A', 'A');
+    SELECT (y, z) IN (SELECT w, v FROM r), (y, z) NOT IN (SELECT w, v FROM r),
+           (y, z) IN (SELECT v, v FROM r), (y, z) NOT IN (SELECT v, v FROM r)
+      FROM l;
+}
+expect {
+    0|1|0|1
+}
+
+# When the left field is not a column, the comparison collation comes from the
+# list column, as in SQLite 3.53. SQLite 3.50 used the left field's collation
+# here, so the 3.50 oracle gives 0 instead of NULL.
+@skip-if sqlite "SQLite 3.50 uses the left field's collation in this loop"
+test in-subquery-row-value-null-check-uses-list-collation-for-literals {
+    CREATE TABLE r(w TEXT COLLATE NOCASE, v TEXT);
+    INSERT INTO r VALUES ('A', NULL);
+    CREATE TABLE r2(w TEXT COLLATE NOCASE, v INT);
+    INSERT INTO r2 VALUES ('A', 1);
+    SELECT quote(('a', NULL) IN (SELECT w, v FROM r2)),
+           quote(('a', 'x') IN (SELECT w, v FROM r)),
+           quote(('a', 'x') NOT IN (SELECT w, v FROM r));
+}
+expect {
+    NULL|NULL|NULL
+}
+
+# The same collation applies when the IN subquery drives an index seek on the
+# left column.
+test in-subquery-index-seek-uses-comparison-collation {
+    CREATE TABLE l(y TEXT);
+    CREATE INDEX ly ON l(y);
+    INSERT INTO l VALUES ('a'), ('A'), ('b');
+    CREATE TABLE r(w TEXT COLLATE NOCASE);
+    INSERT INTO r VALUES ('A'), ('a');
+    SELECT y FROM l WHERE y IN (SELECT w FROM r) ORDER BY y;
+    DELETE FROM l WHERE y IN (SELECT w FROM r);
+    SELECT y FROM l ORDER BY y;
+}
+expect {
+    A
+    a
+    b
+}
