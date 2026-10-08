@@ -20,19 +20,11 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
-    session_state: Mutex<SessionState>,
-}
-
-impl PgConnectionInner {
-    fn set_search_path(&self, path: Vec<String>) {
-        let mut state = self.session_state.lock().unwrap();
-        state.search_path = path;
-    }
 }
 
 #[derive(Default)]
 struct SessionState {
-    search_path: Vec<String>,
+    search_path: Option<Vec<String>>,
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -72,13 +64,12 @@ pub fn open_database_with_io(
 }
 
 impl PgConnection {
-    pub fn new(conn: Arc<Connection>) -> Self {
-        Self {
-            inner: Arc::new(PgConnectionInner {
-                conn,
-                session_state: Mutex::new(SessionState::default()),
-            }),
-        }
+    pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
+        let state = Arc::new(Mutex::new(SessionState::default()));
+        let conn = db.connect_with_state(state)?;
+        Ok(Self {
+            inner: Arc::new(PgConnectionInner { conn }),
+        })
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -187,10 +178,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     reject_catalog_dml(translated.cmd.stmt())?;
 
     let options = {
-        let state = pg_conn.session_state.lock().unwrap();
-        let path = state.search_path.clone();
+        let state = pg_conn
+            .conn
+            .state::<Mutex<SessionState>>()
+            .expect("PostgreSQL connections have session state")
+            .lock()
+            .unwrap();
         PrepareOptions {
-            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+            unqualified_database_search_path: state.search_path.clone(),
         }
     };
     for prereq in translated.prereqs {
@@ -303,17 +298,91 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         let path = set_stmt
             .values
             .iter()
-            .map(|value| value.as_search_path_name().map(str::to_owned))
+            .map(|value| {
+                value
+                    .as_search_path_name()
+                    .map(turso_pg_parser::quote_identifier)
+            })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
-        return noop_statement(&pg_conn.conn);
+            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
+            .join(", ");
+        return pg_conn.conn.prepare(format!(
+            "SELECT 0 WHERE set_config('search_path', '{}', {}) IS NULL",
+            path.replace('\'', "''"),
+            set_stmt.is_local
+        ));
     }
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
     pg_conn.conn.prepare(&pragma_sql)
+}
+
+pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
+    let path = value.map(parse_search_path).transpose()?;
+    let state = conn.state::<Mutex<SessionState>>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })?;
+    state.lock().unwrap().search_path = path;
+    Ok(Value::build_text(
+        value.unwrap_or("\"$user\", public").to_owned(),
+    ))
+}
+
+fn parse_search_path(value: &str) -> Result<Vec<String>> {
+    let invalid =
+        || LimboError::ParseError("invalid value for parameter \"search_path\"".to_string());
+    let mut chars = value.chars().peekable();
+    while chars.peek().is_some_and(char::is_ascii_whitespace) {
+        chars.next();
+    }
+    let mut path = Vec::new();
+    if chars.peek().is_none() {
+        return Ok(path);
+    }
+    loop {
+        let mut name = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next().ok_or_else(invalid)? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        name.push('"');
+                    }
+                    '"' => break,
+                    ch => name.push(ch),
+                }
+            }
+        } else {
+            while chars
+                .peek()
+                .is_some_and(|ch| *ch != ',' && !ch.is_ascii_whitespace())
+            {
+                name.push(chars.next().unwrap().to_ascii_lowercase());
+            }
+            if name.is_empty() {
+                return Err(invalid());
+            }
+        }
+        path.push(name);
+        while chars.peek().is_some_and(char::is_ascii_whitespace) {
+            chars.next();
+        }
+        match chars.next() {
+            None => return Ok(path),
+            Some(',') => {
+                while chars.peek().is_some_and(char::is_ascii_whitespace) {
+                    chars.next();
+                }
+                if chars.peek().is_none() {
+                    return Err(invalid());
+                }
+            }
+            Some(_) => return Err(invalid()),
+        }
+    }
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
