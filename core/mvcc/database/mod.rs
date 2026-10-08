@@ -1881,11 +1881,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.db_id,
                 );
             }
-            self.end_read_tx_for_db();
-            if self.db_id == crate::MAIN_DB_ID {
-                self.connection
-                    .set_tx_state(crate::connection::TransactionState::None);
-            }
         }
 
         let tx_id = self.tx_id;
@@ -2088,14 +2083,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 )))
             }
         }
-    }
-
-    fn end_read_tx_for_db(&self) {
-        if let Ok(pager) = self.connection.get_pager_from_database_index(&self.db_id) {
-            pager.end_read_tx();
-            return;
-        }
-        self.pager.end_read_tx();
     }
 
     /// Validates commit-time write-write conflicts for one table row key.
