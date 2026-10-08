@@ -179,18 +179,49 @@ fn arbitrary_join<R: Rng + ?Sized, C: GenerationContext>(
     } else {
         ast::Operator::Or
     };
+    let limit = rng.random_bool(0.3).then(|| rng.random_range(1..=3));
+    let order_by = match limit {
+        Some(_) => arbitrary_order_by(rng, columns.len(), columns.len()),
+        None if rng.random_bool(0.2) => {
+            let sort_key_count = rng.random_range(1..=columns.len());
+            arbitrary_order_by(rng, columns.len(), sort_key_count)
+        }
+        None => Vec::new(),
+    };
     let join = LateralJoin {
         join_type,
         form: LateralForm::Lateral,
         alias,
         table: table.name.clone(),
         table_alias,
+        distinct: rng.random_bool(0.2),
         columns,
         correlation,
         filter_operator,
         filter: true_or_arbitrary(rng, context, &aliased_inner_table),
+        order_by,
+        limit,
     };
     (join, outputs)
+}
+
+fn arbitrary_order_by<R: Rng + ?Sized>(
+    rng: &mut R,
+    column_count: usize,
+    sort_key_count: usize,
+) -> Vec<(usize, ast::SortOrder)> {
+    pick_n_unique(0..column_count, sort_key_count, rng)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|column| {
+            let order = if rng.random_bool(0.5) {
+                ast::SortOrder::Asc
+            } else {
+                ast::SortOrder::Desc
+            };
+            (column, order)
+        })
+        .collect()
 }
 
 impl VisibleColumn {

@@ -2713,6 +2713,9 @@ mod tests {
     use turso_core::Value;
 
     use super::*;
+    use crate::model::lateral::{
+        ColumnRef, Comparison, LateralColumn, LateralForm, LateralJoin, LateralJoinType,
+    };
     use crate::profiles::Profile;
     use crate::runner::cli::SimulatorCLI;
     use crate::runner::env::{Paths, SimulationType};
@@ -2721,14 +2724,7 @@ mod tests {
     #[test]
     fn lateral_and_json_each_queries_return_the_same_rows_on_random_tables() {
         let output_dir = tempfile::tempdir().unwrap();
-        let mut env = SimulatorEnv::new(
-            0x1A7E,
-            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
-            Paths::new(output_dir.path()),
-            SimulationType::Default,
-            &Profile::default(),
-        );
-        env.connect(0);
+        let mut env = memory_env(output_dir.path());
         let mut rng = ChaCha8Rng::seed_from_u64(0x1A7E);
         let mut stack = Vec::new();
 
@@ -2749,19 +2745,162 @@ mod tests {
                 select,
                 json_each_joins,
             };
-            for interaction in property.interactions(0, NonZeroUsize::new(id).unwrap()) {
-                if let InteractionType::Assertion(_) = interaction.interaction {
-                    let [.., Ok(rows), _] = stack.as_slice() else {
-                        panic!("the LATERAL query must return rows: {stack:?}");
-                    };
-                    lateral_rows += rows.len();
-                }
-                execute_interaction(&mut env, &interaction, &mut stack).unwrap_or_else(|err| {
-                    panic!("{err}\nproperty: {property:?}");
-                });
-            }
+            lateral_rows += check_property(&mut env, &property, id, &mut stack).len();
         }
         assert!(lateral_rows > 0, "the LATERAL queries returned no rows");
+    }
+
+    #[test]
+    fn lateral_join_with_distinct_order_by_and_limit_returns_the_top_rows_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        let integer = |value: i64| SimValue(Value::from_i64(value));
+        let text = |value: &str| SimValue(Value::build_text(value.to_string()));
+        let column = |name: &str, column_type: ColumnType| Column {
+            name: name.to_string(),
+            column_type,
+            constraints: Vec::new(),
+        };
+        let create = |name: &str, columns: Vec<Column>| {
+            Query::Create(Create {
+                table: Table {
+                    name: name.to_string(),
+                    columns,
+                    rows: Vec::new(),
+                    indexes: Vec::new(),
+                },
+            })
+        };
+        let insert = |name: &str, values: Vec<Vec<SimValue>>| {
+            Query::Insert(Insert::Values {
+                table: name.to_string(),
+                values,
+                on_conflict: None,
+            })
+        };
+        execute_query(
+            &mut env,
+            create("t", vec![column("a", ColumnType::Integer)]),
+            &mut stack,
+        );
+        execute_query(
+            &mut env,
+            create(
+                "u",
+                vec![
+                    column("x", ColumnType::Integer),
+                    column("y", ColumnType::Text),
+                ],
+            ),
+            &mut stack,
+        );
+        execute_query(
+            &mut env,
+            insert(
+                "t",
+                vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+            ),
+            &mut stack,
+        );
+        execute_query(
+            &mut env,
+            insert(
+                "u",
+                [
+                    (1, "a"),
+                    (1, "b"),
+                    (2, "c"),
+                    (2, "c"),
+                    (3, "d"),
+                    (3, "e"),
+                    (3, "f"),
+                ]
+                .into_iter()
+                .map(|(x, y)| vec![integer(x), text(y)])
+                .collect(),
+            ),
+            &mut stack,
+        );
+        let table_column = |alias: &str, column: &str| ColumnRef::Table {
+            alias: alias.to_string(),
+            column: column.to_string(),
+        };
+        let select = LateralSelect {
+            table: "t".to_string(),
+            table_alias: "o".to_string(),
+            columns: vec!["a".to_string()],
+            joins: vec![LateralJoin {
+                join_type: LateralJoinType::Left {
+                    on: Predicate::true_(),
+                },
+                form: LateralForm::Lateral,
+                alias: "s0".to_string(),
+                table: "u".to_string(),
+                table_alias: "i0".to_string(),
+                distinct: true,
+                columns: vec![LateralColumn {
+                    source: table_column("i0", "y"),
+                    quoted: false,
+                }],
+                correlation: Comparison {
+                    left: table_column("i0", "x"),
+                    operator: ast::Operator::LessEquals,
+                    right: table_column("o", "a"),
+                },
+                filter_operator: ast::Operator::And,
+                filter: Predicate::true_(),
+                order_by: vec![(0, ast::SortOrder::Desc)],
+                limit: Some(2),
+            }],
+            where_clause: Predicate::true_(),
+        };
+        let property = Property::LateralMatchesJsonEach {
+            select,
+            json_each_joins: vec![0],
+        };
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected = [(1, "a"), (1, "b"), (2, "b"), (2, "c"), (3, "e"), (3, "f")]
+            .into_iter()
+            .map(|(a, y)| vec![integer(a), text(y)])
+            .collect::<Vec<_>>();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    fn memory_env(output_dir: &std::path::Path) -> SimulatorEnv {
+        let mut env = SimulatorEnv::new(
+            0x1A7E,
+            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
+            Paths::new(output_dir),
+            SimulationType::Default,
+            &Profile::default(),
+        );
+        env.connect(0);
+        env
+    }
+
+    fn check_property(
+        env: &mut SimulatorEnv,
+        property: &Property,
+        id: usize,
+        stack: &mut Vec<ResultSet>,
+    ) -> Vec<Vec<SimValue>> {
+        let mut lateral_rows = Vec::new();
+        for interaction in property.interactions(0, NonZeroUsize::new(id).unwrap()) {
+            if let InteractionType::Assertion(_) = interaction.interaction {
+                let [.., Ok(rows), _] = stack.as_slice() else {
+                    panic!("the LATERAL query must return rows: {stack:?}");
+                };
+                lateral_rows = rows.clone();
+            }
+            execute_interaction(env, &interaction, stack).unwrap_or_else(|err| {
+                panic!("{err}\nproperty: {property:?}");
+            });
+        }
+        lateral_rows
     }
 
     fn execute_query(env: &mut SimulatorEnv, query: Query, stack: &mut Vec<ResultSet>) {
