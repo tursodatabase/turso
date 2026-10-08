@@ -273,7 +273,7 @@ impl CommitState {
     }
 
     fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
-        match self {
+        let db_id = match self {
             CommitState::CommittingAttachedMvcc {
                 state_machine,
                 db_id: attached_db_id,
@@ -287,8 +287,11 @@ impl CommitState {
                 {
                     connection.bump_prepare_context_generation();
                 }
+                *attached_db_id
             }
-            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {
+                crate::MAIN_DB_ID
+            }
             _ => return, // no-op for already-finalized state machines and non-MVCC commit states
         };
 
@@ -301,6 +304,7 @@ impl CommitState {
         // The locks/exclusive slot the SM acquired are released by the same
         // cleanup path on drop.
         *self = CommitState::Ready;
+        connection.end_abandoned_mvcc_commit(db_id);
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();

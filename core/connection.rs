@@ -4909,6 +4909,24 @@ impl Connection {
         self.transaction_state.get()
     }
 
+    /// Finish a commit of this connection's own MVCC transaction that was
+    /// abandoned before it completed. The dropped `CommitStateMachine` rolls
+    /// back the MVCC transaction itself; this releases the read lock and
+    /// transaction state the connection holds for it, which the state machine
+    /// does not own. Nested transactions, such as the one `nextval()` opens
+    /// inside a user transaction, must not call this.
+    pub(crate) fn end_abandoned_mvcc_commit(&self, db_id: usize) {
+        self.get_pager_from_database_index(&db_id)
+            .expect("the database of an abandoned MVCC commit must still have its pager")
+            .end_read_tx();
+        // `transaction_state` tracks only the main database. An attached database
+        // records its transaction in `attached_mv_txs` and in its pager locks, and
+        // the dropped state machine has already cleared that slot.
+        if db_id == MAIN_DB_ID {
+            self.set_tx_state(TransactionState::None);
+        }
+    }
+
     /// Returns true if the connection is currently in a write transaction.
     /// Used by index methods to determine if it's safe to flush writes.
     pub fn is_in_write_tx(&self) -> bool {
