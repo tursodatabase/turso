@@ -466,6 +466,108 @@ fn update_abort_rowid_conflict_after_index_mutation(tmp_db: TempDatabase) -> any
 }
 
 // ──────────────────────────────────────────────────────────
+// Regression: UPDATE that changes the rowid of many rows
+// ──────────────────────────────────────────────────────────
+
+#[turso_macros::test(mvcc)]
+fn update_rowid_alias_range_conflict_on_later_row_keeps_no_changes(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v)")?;
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 2), (5, 5), (15, 15)")?;
+    conn.execute("BEGIN")?;
+    let result = conn.execute("UPDATE t SET k = k + 10 WHERE k BETWEEN 1 AND 5");
+    assert!(result.is_err(), "k = 15 already exists");
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT k, v FROM t ORDER BY k"),
+        vec!["1|1", "2|2", "5|5", "15|15"]
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn update_plain_rowid_range_conflict_on_later_row_keeps_no_changes(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(v)")?;
+    conn.execute("INSERT INTO t(rowid, v) VALUES (1, 1), (2, 2), (5, 5), (15, 15)")?;
+    conn.execute("BEGIN")?;
+    let result = conn.execute("UPDATE t SET rowid = rowid + 10 WHERE rowid BETWEEN 1 AND 5");
+    assert!(result.is_err(), "rowid 15 already exists");
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT rowid, v FROM t ORDER BY rowid"),
+        vec!["1|1", "2|2", "5|5", "15|15"]
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn update_rowid_alias_to_text_on_later_row_keeps_no_changes(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v)")?;
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")?;
+    conn.execute("BEGIN")?;
+    let result = conn.execute(
+        "UPDATE t SET k = CASE WHEN k = 3 THEN 'x' ELSE k + 10 END WHERE k BETWEEN 1 AND 3",
+    );
+    assert!(result.is_err(), "'x' is not an integer rowid");
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT k, v FROM t ORDER BY k"),
+        vec!["1|1", "2|2", "3|3"]
+    );
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
+#[test]
+fn update_making_not_null_generated_column_null_on_later_row_keeps_no_changes() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b AS (a + 0) NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t(id, a) VALUES (1, 1), (2, 2), (3, 3)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute("UPDATE t SET a = CASE WHEN id = 3 THEN NULL ELSE a + 10 END");
+    assert!(result.is_err(), "b must not be NULL");
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM t ORDER BY id"),
+        vec!["1|1", "2|2", "3|3"]
+    );
+}
+
+#[turso_macros::test(init_sql = "CREATE TABLE t(k INTEGER PRIMARY KEY, v);")]
+fn update_rowid_alias_range_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(needs_stmt_journal(
+        &conn,
+        "UPDATE t SET k = k + 1 WHERE k BETWEEN 1 AND 5"
+    ));
+    assert!(needs_stmt_journal(&conn, "UPDATE t SET rowid = rowid + 1"));
+    assert!(!needs_stmt_journal(
+        &conn,
+        "UPDATE OR IGNORE t SET k = k + 1"
+    ));
+    assert!(!needs_stmt_journal(
+        &conn,
+        "UPDATE OR REPLACE t SET k = k + 1"
+    ));
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────
 // Regression: partial index skipped in preflight
 // ──────────────────────────────────────────────────────────
 
