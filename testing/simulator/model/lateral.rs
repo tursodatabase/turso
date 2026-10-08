@@ -14,6 +14,8 @@ use turso_parser::ast::{
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
+const LATERAL_ROWS_ALIAS: &str = "q";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LateralSelect {
     pub table: String,
@@ -30,10 +32,13 @@ pub struct LateralJoin {
     pub alias: String,
     pub table: String,
     pub table_alias: String,
+    pub distinct: bool,
     pub columns: Vec<LateralColumn>,
     pub correlation: Comparison,
     pub filter_operator: ast::Operator,
     pub filter: Predicate,
+    pub order_by: Vec<(usize, ast::SortOrder)>,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +134,7 @@ impl LateralSelect {
                 .map(|join| self.joined_table(join))
                 .collect(),
         };
-        select_ast(columns, from, self.where_clause.0.clone())
+        select_ast(columns, from, Some(self.where_clause.0.clone()), false)
     }
 
     fn joined_table(&self, join: &LateralJoin) -> ast::JoinedSelectTable {
@@ -169,6 +174,40 @@ impl LateralSelect {
         }
     }
 
+    fn json_group_array_subquery(&self, join: &LateralJoin) -> ast::Select {
+        if join.distinct || !join.order_by.is_empty() || join.limit.is_some() {
+            return self.json_group_array_over_lateral_subquery(join);
+        }
+        let values = join
+            .columns
+            .iter()
+            .map(|column| self.lateral_column_expr(column))
+            .collect();
+        let column = ast::ResultColumn::Expr(Box::new(json_group_array(values)), None);
+        self.subquery(join, false, vec![column])
+    }
+
+    fn json_group_array_over_lateral_subquery(&self, join: &LateralJoin) -> ast::Select {
+        let values = (0..join.columns.len())
+            .map(|column| {
+                ast::Expr::Qualified(
+                    ast::Name::exact(LATERAL_ROWS_ALIAS.to_string()),
+                    ast::Name::exact(lateral_column_name(column)),
+                )
+            })
+            .collect();
+        let column = ast::ResultColumn::Expr(Box::new(json_group_array(values)), None);
+        let from = ast::FromClause {
+            select: Box::new(ast::SelectTable::Select {
+                select: self.lateral_subquery(join),
+                alias: Some(alias(LATERAL_ROWS_ALIAS)),
+                lateral: false,
+            }),
+            joins: Vec::new(),
+        };
+        select_ast(vec![column], from, None, false)
+    }
+
     fn lateral_subquery(&self, join: &LateralJoin) -> ast::Select {
         let columns = join
             .columns
@@ -181,28 +220,31 @@ impl LateralSelect {
                 )
             })
             .collect();
-        self.subquery(join, columns)
-    }
-
-    fn json_group_array_subquery(&self, join: &LateralJoin) -> ast::Select {
-        let mut values: Vec<ast::Expr> = join
-            .columns
+        let mut select = self.subquery(join, join.distinct, columns);
+        select.order_by = join
+            .order_by
             .iter()
-            .map(|column| self.lateral_column_expr(column))
+            .map(|(column, order)| ast::SortedColumn {
+                expr: Box::new(ast::Expr::Id(ast::Name::exact(lateral_column_name(
+                    *column,
+                )))),
+                order: Some(*order),
+                nulls: None,
+            })
             .collect();
-        let item = if values.len() == 1 {
-            values.pop().unwrap()
-        } else {
-            function_call("json_array", values)
-        };
-        let column = ast::ResultColumn::Expr(
-            Box::new(function_call("json_group_array", vec![item])),
-            None,
-        );
-        self.subquery(join, vec![column])
+        select.limit = join.limit.map(|limit| ast::Limit {
+            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(limit.to_string()))),
+            offset: None,
+        });
+        select
     }
 
-    fn subquery(&self, join: &LateralJoin, columns: Vec<ast::ResultColumn>) -> ast::Select {
+    fn subquery(
+        &self,
+        join: &LateralJoin,
+        distinct: bool,
+        columns: Vec<ast::ResultColumn>,
+    ) -> ast::Select {
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 table_qualified_name(&join.table),
@@ -221,7 +263,7 @@ impl LateralSelect {
             join.filter_operator,
             Box::new(join.filter.0.clone()),
         );
-        select_ast(columns, from, where_clause)
+        select_ast(columns, from, Some(where_clause), distinct)
     }
 
     fn lateral_column_expr(&self, column: &LateralColumn) -> ast::Expr {
@@ -266,6 +308,15 @@ impl LateralSelect {
     }
 }
 
+fn json_group_array(mut values: Vec<ast::Expr>) -> ast::Expr {
+    let item = if values.len() == 1 {
+        values.pop().unwrap()
+    } else {
+        function_call("json_array", values)
+    };
+    function_call("json_group_array", vec![item])
+}
+
 fn lateral_column_name(position: usize) -> String {
     format!("c{position}")
 }
@@ -277,16 +328,17 @@ fn alias(name: &str) -> ast::As {
 fn select_ast(
     columns: Vec<ast::ResultColumn>,
     from: ast::FromClause,
-    where_clause: ast::Expr,
+    where_clause: Option<ast::Expr>,
+    distinct: bool,
 ) -> ast::Select {
     ast::Select {
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
-                distinctness: None,
+                distinctness: distinct.then_some(ast::Distinctness::Distinct),
                 columns,
                 from: Some(from),
-                where_clause: Some(Box::new(where_clause)),
+                where_clause: where_clause.map(Box::new),
                 group_by: None,
                 window_clause: Vec::new(),
             },

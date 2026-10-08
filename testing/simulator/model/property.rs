@@ -197,6 +197,8 @@ pub enum Property {
     ///     SELECT t1.a, sub.value FROM t1
     ///     LEFT JOIN json_each((SELECT json_group_array(t2.x) FROM t2 WHERE t2.y < t1.a)) AS sub
     /// ```
+    /// When the LATERAL subquery has DISTINCT, ORDER BY or LIMIT, `json_group_array`
+    /// collects the rows of the unchanged subquery: `FROM (SELECT ... LIMIT 2) AS q`.
     LateralMatchesJsonEach {
         select: LateralSelect,
         json_each_joins: Vec<usize>,
