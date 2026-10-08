@@ -2709,12 +2709,14 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use sql_generation::generation::Arbitrary;
-    use sql_generation::model::query::{Create, Insert};
+    use sql_generation::model::query::{Create, CreateIndex, Insert};
+    use sql_generation::model::table::Index;
     use turso_core::Value;
 
     use super::*;
     use crate::model::lateral::{
         ColumnRef, Comparison, LateralColumn, LateralForm, LateralJoin, LateralJoinType,
+        SubqueryJoin,
     };
     use crate::profiles::Profile;
     use crate::runner::cli::SimulatorCLI;
@@ -2755,118 +2757,115 @@ mod tests {
         let output_dir = tempfile::tempdir().unwrap();
         let mut env = memory_env(output_dir.path());
         let mut stack = Vec::new();
-        let integer = |value: i64| SimValue(Value::from_i64(value));
-        let text = |value: &str| SimValue(Value::build_text(value.to_string()));
-        let column = |name: &str, column_type: ColumnType| Column {
-            name: name.to_string(),
-            column_type,
-            constraints: Vec::new(),
-        };
-        let create = |name: &str, columns: Vec<Column>| {
-            Query::Create(Create {
-                table: Table {
-                    name: name.to_string(),
-                    columns,
-                    rows: Vec::new(),
-                    indexes: Vec::new(),
-                },
-            })
-        };
-        let insert = |name: &str, values: Vec<Vec<SimValue>>| {
-            Query::Insert(Insert::Values {
-                table: name.to_string(),
-                values,
-                on_conflict: None,
-            })
-        };
-        execute_query(
+        create_table(
             &mut env,
-            create("t", vec![column("a", ColumnType::Integer)]),
             &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
         );
-        execute_query(
+        create_table(
             &mut env,
-            create(
-                "u",
-                vec![
-                    column("x", ColumnType::Integer),
-                    column("y", ColumnType::Text),
-                ],
-            ),
             &mut stack,
+            "u",
+            &[("x", ColumnType::Integer), ("y", ColumnType::Text)],
+            [
+                (1, "a"),
+                (1, "b"),
+                (2, "c"),
+                (2, "c"),
+                (3, "d"),
+                (3, "e"),
+                (3, "f"),
+            ]
+            .into_iter()
+            .map(|(x, y)| vec![integer(x), text(y)])
+            .collect(),
         );
-        execute_query(
-            &mut env,
-            insert(
-                "t",
-                vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
-            ),
-            &mut stack,
+        let mut join = lateral_join(
+            "u",
+            vec![table_column("i0", "y")],
+            Comparison {
+                left: table_column("i0", "x"),
+                operator: ast::Operator::LessEquals,
+                right: table_column("o", "a"),
+            },
         );
-        execute_query(
-            &mut env,
-            insert(
-                "u",
-                [
-                    (1, "a"),
-                    (1, "b"),
-                    (2, "c"),
-                    (2, "c"),
-                    (3, "d"),
-                    (3, "e"),
-                    (3, "f"),
-                ]
-                .into_iter()
-                .map(|(x, y)| vec![integer(x), text(y)])
-                .collect(),
-            ),
-            &mut stack,
-        );
-        let table_column = |alias: &str, column: &str| ColumnRef::Table {
-            alias: alias.to_string(),
-            column: column.to_string(),
+        join.join_type = LateralJoinType::Left {
+            on: Predicate::true_(),
         };
-        let select = LateralSelect {
-            table: "t".to_string(),
-            table_alias: "o".to_string(),
-            columns: vec!["a".to_string()],
-            joins: vec![LateralJoin {
-                join_type: LateralJoinType::Left {
-                    on: Predicate::true_(),
-                },
-                form: LateralForm::Lateral,
-                alias: "s0".to_string(),
-                table: "u".to_string(),
-                table_alias: "i0".to_string(),
-                distinct: true,
-                columns: vec![LateralColumn {
-                    source: table_column("i0", "y"),
-                    quoted: false,
-                }],
-                correlation: Comparison {
-                    left: table_column("i0", "x"),
-                    operator: ast::Operator::LessEquals,
-                    right: table_column("o", "a"),
-                },
-                filter_operator: ast::Operator::And,
-                filter: Predicate::true_(),
-                order_by: vec![(0, ast::SortOrder::Desc)],
-                limit: Some(2),
-            }],
-            where_clause: Predicate::true_(),
-        };
-        let property = Property::LateralMatchesJsonEach {
-            select,
-            json_each_joins: vec![0],
-        };
+        join.distinct = true;
+        join.order_by = vec![(0, ast::SortOrder::Desc)];
+        join.limit = Some(2);
+        let property = json_each_property("t", "a", join);
 
         let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
 
         lateral_rows.sort();
-        let expected = [(1, "a"), (1, "b"), (2, "b"), (2, "c"), (3, "e"), (3, "f")]
+        let expected: Vec<Vec<SimValue>> =
+            [(1, "a"), (1, "b"), (2, "b"), (2, "c"), (3, "e"), (3, "f")]
+                .into_iter()
+                .map(|(a, y)| vec![integer(a), text(y)])
+                .collect();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    #[test]
+    fn joined_table_that_compares_the_outer_row_first_returns_every_match_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        create_table(
+            &mut env,
+            &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "u",
+            &[("k", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "v",
+            &[("x", ColumnType::Integer), ("y", ColumnType::Text)],
+            [(1, "v1"), (2, "v2"), (3, "v3"), (2, "v22")]
+                .into_iter()
+                .map(|(x, y)| vec![integer(x), text(y)])
+                .collect(),
+        );
+        let mut join = lateral_join(
+            "u",
+            vec![table_column("i0_1", "y")],
+            Comparison {
+                left: table_column("i0", "k"),
+                operator: ast::Operator::Equals,
+                right: table_column("o", "a"),
+            },
+        );
+        join.joined_tables = vec![SubqueryJoin {
+            table: "v".to_string(),
+            alias: "i0_1".to_string(),
+            on: vec![Comparison {
+                left: table_column("o", "a"),
+                operator: ast::Operator::Equals,
+                right: table_column("i0_1", "x"),
+            }],
+        }];
+        let property = json_each_property("t", "a", join);
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected: Vec<Vec<SimValue>> = [(1, "v1"), (2, "v2"), (2, "v22"), (3, "v3")]
             .into_iter()
             .map(|(a, y)| vec![integer(a), text(y)])
-            .collect::<Vec<_>>();
+            .collect();
         assert_eq!(lateral_rows, expected);
     }
 
@@ -2901,6 +2900,159 @@ mod tests {
             });
         }
         lateral_rows
+    }
+
+    #[test]
+    fn joined_table_with_an_indexed_outer_comparison_returns_every_match_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        create_table(
+            &mut env,
+            &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "p",
+            &[("y", ColumnType::Integer), ("v", ColumnType::Text)],
+            [(1, "p1"), (2, "p2"), (3, "p3")]
+                .into_iter()
+                .map(|(y, v)| vec![integer(y), text(v)])
+                .collect(),
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "q",
+            &[("x", ColumnType::Integer), ("z", ColumnType::Integer)],
+            [(1, 1), (2, 2), (3, 3), (2, 3)]
+                .into_iter()
+                .map(|(x, z)| vec![integer(x), integer(z)])
+                .collect(),
+        );
+        let index = Index {
+            table_name: "q".to_string(),
+            index_name: "q_x".to_string(),
+            columns: vec![("x".to_string(), ast::SortOrder::Asc)],
+        };
+        execute_query(
+            &mut env,
+            Query::CreateIndex(CreateIndex { index }),
+            &mut stack,
+        );
+        let mut join = lateral_join(
+            "p",
+            vec![table_column("i0", "v")],
+            Comparison {
+                left: table_column("i0_1", "x"),
+                operator: ast::Operator::Equals,
+                right: table_column("o", "a"),
+            },
+        );
+        join.joined_tables = vec![SubqueryJoin {
+            table: "q".to_string(),
+            alias: "i0_1".to_string(),
+            on: vec![Comparison {
+                left: table_column("i0", "y"),
+                operator: ast::Operator::Equals,
+                right: table_column("i0_1", "z"),
+            }],
+        }];
+        let property = json_each_property("t", "a", join);
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected: Vec<Vec<SimValue>> = [(1, "p1"), (2, "p2"), (2, "p3"), (3, "p3")]
+            .into_iter()
+            .map(|(a, v)| vec![integer(a), text(v)])
+            .collect();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    fn create_table(
+        env: &mut SimulatorEnv,
+        stack: &mut Vec<ResultSet>,
+        name: &str,
+        columns: &[(&str, ColumnType)],
+        rows: Vec<Vec<SimValue>>,
+    ) {
+        let table = Table {
+            name: name.to_string(),
+            columns: columns
+                .iter()
+                .map(|(column, column_type)| Column {
+                    name: column.to_string(),
+                    column_type: *column_type,
+                    constraints: Vec::new(),
+                })
+                .collect(),
+            rows: Vec::new(),
+            indexes: Vec::new(),
+        };
+        execute_query(env, Query::Create(Create { table }), stack);
+        let insert = Insert::Values {
+            table: name.to_string(),
+            values: rows,
+            on_conflict: None,
+        };
+        execute_query(env, Query::Insert(insert), stack);
+    }
+
+    fn lateral_join(table: &str, columns: Vec<ColumnRef>, correlation: Comparison) -> LateralJoin {
+        LateralJoin {
+            join_type: LateralJoinType::Comma,
+            form: LateralForm::Lateral,
+            alias: "s0".to_string(),
+            table: table.to_string(),
+            table_alias: "i0".to_string(),
+            joined_tables: Vec::new(),
+            distinct: false,
+            columns: columns
+                .into_iter()
+                .map(|source| LateralColumn {
+                    source,
+                    quoted: false,
+                })
+                .collect(),
+            correlation,
+            filter_operator: ast::Operator::And,
+            filter: Predicate::true_(),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+
+    fn json_each_property(table: &str, column: &str, join: LateralJoin) -> Property {
+        Property::LateralMatchesJsonEach {
+            select: LateralSelect {
+                table: table.to_string(),
+                table_alias: "o".to_string(),
+                columns: vec![column.to_string()],
+                joins: vec![join],
+                where_clause: Predicate::true_(),
+            },
+            json_each_joins: vec![0],
+        }
+    }
+
+    fn table_column(alias: &str, column: &str) -> ColumnRef {
+        ColumnRef::Table {
+            alias: alias.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    fn integer(value: i64) -> SimValue {
+        SimValue(Value::from_i64(value))
+    }
+
+    fn text(value: &str) -> SimValue {
+        SimValue(Value::build_text(value.to_string()))
     }
 
     fn execute_query(env: &mut SimulatorEnv, query: Query, stack: &mut Vec<ResultSet>) {

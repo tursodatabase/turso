@@ -32,6 +32,7 @@ pub struct LateralJoin {
     pub alias: String,
     pub table: String,
     pub table_alias: String,
+    pub joined_tables: Vec<SubqueryJoin>,
     pub distinct: bool,
     pub columns: Vec<LateralColumn>,
     pub correlation: Comparison,
@@ -39,6 +40,13 @@ pub struct LateralJoin {
     pub filter: Predicate,
     pub order_by: Vec<(usize, ast::SortOrder)>,
     pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubqueryJoin {
+    pub table: String,
+    pub alias: String,
+    pub on: Vec<Comparison>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,8 +104,11 @@ impl Shadow for LateralSelect {
 
 impl LateralSelect {
     pub fn dependencies(&self) -> IndexSet<String> {
+        let subquery_tables = self.joins.iter().flat_map(|join| {
+            std::iter::once(&join.table).chain(join.joined_tables.iter().map(|t| &t.table))
+        });
         std::iter::once(&self.table)
-            .chain(self.joins.iter().map(|join| &join.table))
+            .chain(subquery_tables)
             .cloned()
             .collect()
     }
@@ -155,7 +166,7 @@ impl LateralSelect {
         };
         let table = match join.form {
             LateralForm::Lateral => ast::SelectTable::Select {
-                select: self.lateral_subquery(join),
+                select: self.lateral_subquery(join, None),
                 alias: Some(alias(&join.alias)),
                 lateral: true,
             },
@@ -184,7 +195,7 @@ impl LateralSelect {
             .map(|column| self.lateral_column_expr(column))
             .collect();
         let column = ast::ResultColumn::Expr(Box::new(json_group_array(values)), None);
-        self.subquery(join, false, vec![column])
+        self.subquery(join, false, vec![column], Some(ast::Indexed::NotIndexed))
     }
 
     fn json_group_array_over_lateral_subquery(&self, join: &LateralJoin) -> ast::Select {
@@ -199,7 +210,7 @@ impl LateralSelect {
         let column = ast::ResultColumn::Expr(Box::new(json_group_array(values)), None);
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Select {
-                select: self.lateral_subquery(join),
+                select: self.lateral_subquery(join, Some(ast::Indexed::NotIndexed)),
                 alias: Some(alias(LATERAL_ROWS_ALIAS)),
                 lateral: false,
             }),
@@ -208,7 +219,11 @@ impl LateralSelect {
         select_ast(vec![column], from, None, false)
     }
 
-    fn lateral_subquery(&self, join: &LateralJoin) -> ast::Select {
+    fn lateral_subquery(
+        &self,
+        join: &LateralJoin,
+        index_hint: Option<ast::Indexed>,
+    ) -> ast::Select {
         let columns = join
             .columns
             .iter()
@@ -220,7 +235,7 @@ impl LateralSelect {
                 )
             })
             .collect();
-        let mut select = self.subquery(join, join.distinct, columns);
+        let mut select = self.subquery(join, join.distinct, columns, index_hint);
         select.order_by = join
             .order_by
             .iter()
@@ -244,26 +259,52 @@ impl LateralSelect {
         join: &LateralJoin,
         distinct: bool,
         columns: Vec<ast::ResultColumn>,
+        index_hint: Option<ast::Indexed>,
     ) -> ast::Select {
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 table_qualified_name(&join.table),
                 Some(alias(&join.table_alias)),
-                None,
+                index_hint.clone(),
             )),
-            joins: Vec::new(),
+            joins: join
+                .joined_tables
+                .iter()
+                .map(|joined_table| ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::TypedJoin(None),
+                    table: Box::new(ast::SelectTable::Table(
+                        table_qualified_name(&joined_table.table),
+                        Some(alias(&joined_table.alias)),
+                        index_hint.clone(),
+                    )),
+                    constraint: Some(ast::JoinConstraint::On(Box::new(
+                        self.comparisons_expr(&joined_table.on),
+                    ))),
+                })
+                .collect(),
         };
-        let correlation = ast::Expr::Binary(
-            Box::new(self.column_ref_expr(&join.correlation.left)),
-            join.correlation.operator,
-            Box::new(self.column_ref_expr(&join.correlation.right)),
-        );
         let where_clause = ast::Expr::Binary(
-            Box::new(ast::Expr::Parenthesized(vec![Box::new(correlation)])),
+            Box::new(self.comparisons_expr(std::slice::from_ref(&join.correlation))),
             join.filter_operator,
             Box::new(join.filter.0.clone()),
         );
         select_ast(columns, from, Some(where_clause), distinct)
+    }
+
+    fn comparisons_expr(&self, comparisons: &[Comparison]) -> ast::Expr {
+        comparisons
+            .iter()
+            .map(|comparison| {
+                ast::Expr::Parenthesized(vec![Box::new(ast::Expr::Binary(
+                    Box::new(self.column_ref_expr(&comparison.left)),
+                    comparison.operator,
+                    Box::new(self.column_ref_expr(&comparison.right)),
+                ))])
+            })
+            .reduce(|left, right| {
+                ast::Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
+            })
+            .expect("a join needs at least one comparison")
     }
 
     fn lateral_column_expr(&self, column: &LateralColumn) -> ast::Expr {
