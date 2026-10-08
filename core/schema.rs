@@ -51,6 +51,7 @@ pub struct Trigger {
     pub name: String,
     pub sql: String,
     pub table_name: String,
+    pub table_name_sql: String,
     pub time: turso_parser::ast::TriggerTime,
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
@@ -77,6 +78,7 @@ impl Trigger {
         name: String,
         sql: String,
         table_name: String,
+        table_name_sql: String,
         time: Option<turso_parser::ast::TriggerTime>,
         event: turso_parser::ast::TriggerEvent,
         for_each_row: bool,
@@ -89,6 +91,7 @@ impl Trigger {
             name,
             sql,
             table_name,
+            table_name_sql,
             time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
             event,
             for_each_row,
@@ -735,6 +738,8 @@ pub struct Schema {
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
+    pub table_display_names: HashMap<String, String>,
+    pub table_sql_names: HashMap<String, String>,
     pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
@@ -867,6 +872,8 @@ impl Schema {
         let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
+        let table_display_names = HashMap::default();
+        let table_sql_names = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -895,6 +902,8 @@ impl Schema {
             views,
             triggers,
             indexes,
+            table_display_names,
+            table_sql_names,
             has_indexes,
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
@@ -1092,7 +1101,7 @@ impl Schema {
         !self
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name.eq_ignore_ascii_case(name)))
     }
 
     pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
@@ -1313,9 +1322,12 @@ impl Schema {
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
-        self.triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+        self.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -1334,7 +1346,7 @@ impl Schema {
         self.triggers
             .values()
             .flatten()
-            .find(|t| t.name == name)
+            .find(|t| t.name.eq_ignore_ascii_case(&name))
             .cloned()
     }
 
@@ -1381,6 +1393,8 @@ impl Schema {
 
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
+        self.table_display_names.remove(&name);
+        self.table_sql_names.remove(&name);
         #[cfg(feature = "conn_raw_api")]
         {
             if let Some(table) = self.tables.remove(&name) {
@@ -1484,7 +1498,7 @@ impl Schema {
         self.indexes
             .get(&name)?
             .iter()
-            .find(|index| index.name == index_name)
+            .find(|index| index.name.eq_ignore_ascii_case(index_name))
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
@@ -2090,6 +2104,8 @@ impl Schema {
     ) -> Result<()> {
         match ty {
             "table" => {
+                self.table_display_names
+                    .insert(normalize_ident(table_name), table_name.to_string());
                 let sql = maybe_sql.expect("sql should be present for table");
                 // In the SQLite file format a `type='table'` row describes a
                 // virtual table iff its rootpage is 0: virtual tables have no
@@ -2099,7 +2115,12 @@ impl Schema {
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
                     match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create))) => {
+                            self.table_sql_names.insert(
+                                normalize_ident(table_name),
+                                create.tbl_name.name.to_string(),
+                            );
+                        }
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
@@ -2123,7 +2144,10 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
+                    let (table, table_sql_name) =
+                        dialect.parse_table_sql_with_name(sql, root_page)?;
+                    self.table_sql_names
+                        .insert(normalize_ident(table_name), table_sql_name.to_string());
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2368,6 +2392,7 @@ impl Schema {
                         // schema lookup since `normalize_ident` does not strip quotes.
                         // This must match the bucket key used in `add_trigger` below.
                         tbl_name.name.as_str().to_string(),
+                        tbl_name.name.to_string(),
                         time,
                         event,
                         for_each_row,
@@ -2837,6 +2862,8 @@ impl TryClone for Schema {
             views,
             triggers,
             indexes,
+            table_display_names: self.table_display_names.try_clone()?,
+            table_sql_names: self.table_sql_names.try_clone()?,
             has_indexes: self.has_indexes.try_clone()?,
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
@@ -3553,11 +3580,16 @@ impl BTreeTable {
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        Ok(Self::from_sql_with_name(sql, root_page)?.0)
+    }
+
+    pub fn from_sql_with_name(sql: &str, root_page: i64) -> Result<(BTreeTable, ast::Name)> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page)
+                let table = Self::from_create_table_ast(&tbl_name, &body, root_page)?;
+                Ok((table, tbl_name.name))
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -3586,7 +3618,15 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
+        self.to_sql_with_name(&self.name)
+    }
+
+    pub fn to_sql_with_name(&self, table_name: &str) -> String {
+        self.to_sql_with_name_sql(&quote_ident(table_name))
+    }
+
+    pub fn to_sql_with_name_sql(&self, table_name_sql: &str) -> String {
+        let mut sql = format!("CREATE TABLE {table_name_sql} (");
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
@@ -5967,7 +6007,7 @@ impl Index {
                 with_clause,
                 ..
             })) => {
-                let index_name = normalize_ident(idx_name.name.as_str());
+                let index_name = idx_name.name.as_str().to_string();
                 let index_columns = resolve_sorted_columns(table, &columns)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
@@ -6075,7 +6115,7 @@ impl Index {
         assert!(primary_keys.len() == column_count);
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -6127,7 +6167,7 @@ impl Index {
         }
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,

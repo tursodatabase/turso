@@ -403,7 +403,7 @@ fn estimate_selectivity(
                     return selectivity_when_unique;
                 }
                 if let Some(stats) = table_stats {
-                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
+                    if let Some(idx_stat) = stats.get_index_stats(&index.name) {
                         if let (Some(total), Some(&avg_rows)) = (
                             idx_stat.total_rows,
                             idx_stat.avg_rows_per_distinct_prefix.first(),
@@ -490,8 +490,7 @@ fn selectivity_index_for_column<'a>(
                 return true;
             };
             table_stats
-                .index_stats
-                .get(&index.name)
+                .get_index_stats(&index.name)
                 .is_some_and(|idx_stat| {
                     matches!(
                         (

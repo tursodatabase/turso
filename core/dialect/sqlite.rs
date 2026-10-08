@@ -47,6 +47,14 @@ impl super::Dialect for SqliteDialect {
         BTreeTable::from_sql(sql, root_page)
     }
 
+    fn parse_table_sql_with_name(
+        &self,
+        sql: &str,
+        root_page: i64,
+    ) -> crate::Result<(BTreeTable, turso_parser::ast::Name)> {
+        BTreeTable::from_sql_with_name(sql, root_page)
+    }
+
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
         parse_table_sql_ast(sql)
     }

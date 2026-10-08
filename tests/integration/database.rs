@@ -1,3 +1,4 @@
+use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
@@ -82,6 +83,114 @@ fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> 
         None,
         Arc::new(SqliteDialect),
     )
+}
+
+#[test]
+fn test_mixed_case_table_rename_preserves_autoindex_casing() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("mixed_case_rename.db");
+    let db = open_plain_file(&path).unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE MiXeD_Source(ID TEXT PRIMARY KEY, Code TEXT UNIQUE, value TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO MiXeD_Source VALUES ('a', 'one', 'v')")
+        .unwrap();
+    conn.execute("ALTER TABLE mixed_source RENAME TO New_MiXeD")
+        .unwrap();
+
+    let catalog: Vec<(String, String, String)> = conn.exec_rows(
+        "SELECT type, name, tbl_name FROM sqlite_schema \
+         WHERE type IN ('table', 'index') ORDER BY type, name",
+    );
+    assert_eq!(
+        catalog,
+        vec![
+            (
+                "index".to_string(),
+                "sqlite_autoindex_New_MiXeD_1".to_string(),
+                "New_MiXeD".to_string(),
+            ),
+            (
+                "index".to_string(),
+                "sqlite_autoindex_New_MiXeD_2".to_string(),
+                "New_MiXeD".to_string(),
+            ),
+            (
+                "table".to_string(),
+                "New_MiXeD".to_string(),
+                "New_MiXeD".to_string(),
+            ),
+        ]
+    );
+    let pragma: Vec<(i64, String, i64, String, i64)> =
+        conn.exec_rows("PRAGMA index_list(New_MiXeD)");
+    assert_eq!(
+        pragma,
+        vec![
+            (
+                0,
+                "sqlite_autoindex_New_MiXeD_2".to_string(),
+                1,
+                "u".to_string(),
+                0,
+            ),
+            (
+                1,
+                "sqlite_autoindex_New_MiXeD_1".to_string(),
+                1,
+                "pk".to_string(),
+                0,
+            ),
+        ]
+    );
+    assert_eq!(
+        {
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM New_MiXeD WHERE ID = 'a'");
+            rows
+        },
+        vec![("v".to_string(),)]
+    );
+
+    drop(conn);
+    drop(db);
+
+    let reopened = open_plain_file(&path).unwrap();
+    let reopened_conn = reopened.connect().unwrap();
+    let value_rows: Vec<(String,)> =
+        reopened_conn.exec_rows("SELECT value FROM new_mixed WHERE ID = 'a'");
+    assert_eq!(value_rows, vec![("v".to_string(),)]);
+    reopened_conn
+        .execute("ALTER TABLE new_mixed ADD COLUMN AddedValue TEXT")
+        .unwrap();
+    let table_sql: Vec<(String,)> = reopened_conn
+        .exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'New_MiXeD'");
+    assert!(
+        table_sql[0].0.starts_with("CREATE TABLE \"New_MiXeD\""),
+        "{}",
+        table_sql[0].0
+    );
+    reopened_conn
+        .execute("INSERT INTO NEW_MIXED(ID, Code, value) VALUES ('b', 'two', 'w')")
+        .unwrap();
+    let count_rows: Vec<(i64,)> = reopened_conn.exec_rows("SELECT count(*) FROM New_MiXeD");
+    assert_eq!(count_rows, vec![(2,)]);
+    reopened_conn.execute("DROP TABLE new_mixed").unwrap();
+    drop(reopened_conn);
+    drop(reopened);
+
+    let after_drop = open_plain_file(&path).unwrap();
+    let after_drop_conn = after_drop.connect().unwrap();
+    let remaining_rows: Vec<(i64,)> = after_drop_conn.exec_rows(
+        "SELECT count(*) FROM sqlite_schema \
+         WHERE name = 'New_MiXeD' COLLATE NOCASE \
+            OR tbl_name = 'New_MiXeD' COLLATE NOCASE \
+            OR name COLLATE NOCASE IN (
+              'sqlite_autoindex_New_MiXeD_1',
+              'sqlite_autoindex_New_MiXeD_2'
+            )",
+    );
+    assert_eq!(remaining_rows, vec![(0,)]);
 }
 
 /// SQLite must refuse the file as "file is not a database" (SQLITE_NOTADB).
