@@ -346,12 +346,16 @@ fn parse_search_path(value: &str) -> Result<Vec<String>> {
 
 fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
     let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
+    // Parse double-quoted names such as "My, Schema" or "a""b".
+    // Preserve case, commas, and spaces. Turn doubled quotes into one quote.
     let quoted = just("\"\"")
         .to('"')
         .or(none_of('"'))
         .repeated()
         .collect::<String>()
         .delimited_by(just('"'), just('"'));
+    // Parse names such as PUBLIC or $user, up to a comma or ASCII whitespace.
+    // Require at least one character, reject a leading quote, and lowercase ASCII letters.
     let unquoted = any()
         .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
         .repeated()
