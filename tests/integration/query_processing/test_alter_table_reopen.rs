@@ -320,3 +320,31 @@ fn test_alter_table_add_column_preserves_primary_key_constraint_collation_on_reo
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_add_column_preserves_unique_constraint_desc_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_table_unique_desc_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t1 (a, UNIQUE (a DESC))")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('x'), ('y'), ('z')")
+            .unwrap();
+        conn.execute("ALTER TABLE t1 ADD COLUMN b").unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        assert_that!(conn.execute("INSERT INTO t1 VALUES ('x', 1)"))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("UNIQUE constraint failed: t1.a");
+        conn.close().unwrap();
+    }
+}

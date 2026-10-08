@@ -3771,6 +3771,9 @@ impl BTreeTable {
                 }
                 sql.push_str(&quote_ident(&unique_column.name));
                 push_collation(&mut sql, unique_column.collation);
+                if unique_column.sort_order == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
             push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
