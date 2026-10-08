@@ -13130,8 +13130,7 @@ mod tests {
         let root_type = root.get_contents().page_type()?;
         assert!(
             matches!(root_type, PageType::TableInterior),
-            "expected multi-level tree with TableInterior root, got {:?}",
-            root_type
+            "expected multi-level tree with TableInterior root, got {root_type:?}"
         );
 
         // Count via cursor must accurately traverse interior pages and leaf pages
