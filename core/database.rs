@@ -55,6 +55,7 @@ use crate::{
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
 #[cfg(host_shared_wal)]
@@ -1566,6 +1567,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
+                        None,
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1699,6 +1701,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
+                                None,
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -2363,7 +2366,7 @@ impl Database {
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
+                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2380,7 +2383,15 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None, StatsRefresh::Blocking)
+        self._connect(false, None, None, None, None, StatsRefresh::Blocking)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_state<S: Any + Send + Sync>(
+        self: &Arc<Database>,
+        state: Arc<S>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(false, None, None, None, Some(state), StatsRefresh::Blocking)
     }
 
     /// Connect with an encryption key.
@@ -2390,7 +2401,14 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            encryption_key,
+            None,
+            None,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Connect with an external page codec.
@@ -2402,7 +2420,14 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            None,
+            Some(page_codec),
+            None,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2444,8 +2469,14 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
-                let conn =
-                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
+                let conn = self._connect(
+                    false,
+                    None,
+                    encryption_key,
+                    None,
+                    None,
+                    StatsRefresh::Deferred,
+                )?;
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -2468,6 +2499,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
+        state: Option<Arc<dyn Any + Send + Sync>>,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2501,6 +2533,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            state,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2523,6 +2556,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            None,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2536,10 +2570,12 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        state: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
+            state,
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),

@@ -36,6 +36,7 @@ use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
+use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
 use std::ops::Deref;
@@ -383,6 +384,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
+    pub(super) state: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -632,6 +634,10 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn state<S: Any>(&self) -> Option<&S> {
+        self.state.as_deref()?.downcast_ref()
+    }
+
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(

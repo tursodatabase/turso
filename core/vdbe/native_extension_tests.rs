@@ -8,7 +8,7 @@ use crate::{
     Register, Result, SqliteDialect, Statement, StepResult, Value,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 
 #[test]
@@ -117,6 +117,110 @@ fn native_scalar_receives_each_executing_connection() {
                 .unwrap(),
             vec![vec![Value::from_i64(expected)]]
         );
+    }
+}
+
+#[test]
+fn native_scalar_connection_state_survives_io_and_helper_queries() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let plain = connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "connection_state_read".into(),
+                FunctionArity::Exact(1),
+                false,
+                ConnectionStateRead {
+                    queue: queue.clone(),
+                },
+            )
+            .unwrap(),
+        ),
+    );
+    let state = Arc::new(AtomicI64::new(7));
+    let first = plain.db.connect_with_state(state.clone()).unwrap();
+    let second = plain
+        .db
+        .connect_with_state(Arc::new(AtomicI64::new(19)))
+        .unwrap();
+    let mut statement = first.prepare("SELECT connection_state_read(1)").unwrap();
+    assert!(matches!(statement.step().unwrap(), StepResult::IO));
+    state.store(13, Ordering::SeqCst);
+    assert_eq!(
+        collect(&mut statement, &queue),
+        vec![vec![Value::from_i64(16)]]
+    );
+    statement.reset().unwrap();
+    state.store(17, Ordering::SeqCst);
+    assert_eq!(
+        collect(&mut statement, &queue),
+        vec![vec![Value::from_i64(20)]]
+    );
+    assert_eq!(
+        collect(
+            &mut second.prepare("SELECT connection_state_read(1)").unwrap(),
+            &queue
+        ),
+        vec![vec![Value::from_i64(22)]]
+    );
+    assert!(!first.is_nested_stmt());
+    assert!(!second.is_nested_stmt());
+    let error = plain
+        .prepare("SELECT connection_state_read(0)")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap_err();
+    assert!(matches!(error, LimboError::ExtensionError(_)));
+}
+
+#[derive(Debug)]
+struct ConnectionStateRead {
+    queue: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl ScalarFunction for ConnectionStateRead {
+    type Call = ConnectionStateCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(ConnectionStateCall {
+            statement: None,
+            total: 0,
+            gate: Gate::new(self.queue.clone()),
+        })
+    }
+}
+
+struct ConnectionStateCall {
+    statement: Option<Statement>,
+    total: i64,
+    gate: Gate,
+}
+
+impl ScalarCall for ConnectionStateCall {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        if integer(args[0].get_value()) == 0 {
+            let state = connection
+                .state::<AtomicI64>()
+                .ok_or_else(|| LimboError::ExtensionError("connection state is required".into()))?;
+            return Ok(IOResult::Done(Value::from_i64(
+                state.load(Ordering::SeqCst),
+            )));
+        }
+        if self.statement.is_none() {
+            self.statement =
+                Some(connection.prepare_internal("SELECT connection_state_read(0) + 3")?);
+        }
+        if let Some(io) = self.gate.wait() {
+            return Ok(IOResult::IO(io));
+        }
+        crate::return_if_io!(self
+            .statement
+            .as_mut()
+            .unwrap()
+            .run_with_row_callback_nonblock(|row| {
+                self.total += integer(row.get_value(0));
+                Ok(())
+            }));
+        Ok(IOResult::Done(Value::from_i64(self.total)))
     }
 }
 

@@ -22,6 +22,79 @@ use turso_ext::{
 static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[turso_macros::test(mvcc)]
+fn connection_state_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let state = Arc::new(std::sync::Mutex::new(7i64));
+    let first = db.connect_with_state(state.clone())?;
+    let first_clone = first.clone();
+    let second = db.connect_with_state(Arc::new(std::sync::Mutex::new(19i64)))?;
+    let shared = db.connect_with_state(state.clone())?;
+    let plain = db.connect()?;
+
+    assert!(std::ptr::eq(
+        state.as_ref(),
+        first.state::<std::sync::Mutex<i64>>().unwrap()
+    ));
+    assert!(first.state::<i64>().is_none());
+    assert!(first.state::<std::sync::Mutex<u64>>().is_none());
+    assert!(plain.state::<std::sync::Mutex<i64>>().is_none());
+
+    *state.lock().unwrap() = 13;
+    for (conn, expected) in [(&first_clone, 13), (&second, 19), (&shared, 13)] {
+        assert_eq!(
+            *conn
+                .state::<std::sync::Mutex<i64>>()
+                .unwrap()
+                .lock()
+                .unwrap(),
+            expected
+        );
+    }
+    *second
+        .state::<std::sync::Mutex<i64>>()
+        .unwrap()
+        .lock()
+        .unwrap() = 23;
+    assert_eq!(*state.lock().unwrap(), 13);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn connection_state_lives_until_the_last_connection_owner_drops(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(ConnectionStateDropCounter(drops.clone()));
+    let weak = Arc::downgrade(&state);
+    let conn = tmp_db.limbo_database().connect_with_state(state.clone())?;
+    let cloned_conn = conn.clone();
+    let mut statement = conn.prepare("SELECT 7")?;
+
+    drop(state);
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 0);
+    drop(conn);
+    assert!(weak.upgrade().is_some());
+    drop(cloned_conn);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(
+        statement.run_collect_rows()?,
+        vec![vec![turso_core::Value::from_i64(7)]]
+    );
+    drop(statement);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    Ok(())
+}
+
+struct ConnectionStateDropCounter(Arc<AtomicUsize>);
+
+impl Drop for ConnectionStateDropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
 struct MultiplierState {
     multiplier: i64,
 }
