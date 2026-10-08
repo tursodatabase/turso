@@ -140,6 +140,94 @@ expect {
     5
 }
 
+# A WITH clause in front of UNION / INTERSECT / EXCEPT covers every part of
+# the compound select.
+
+setup cte_rows {
+    CREATE TABLE t (id int PRIMARY KEY, x int);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+}
+
+@setup cte_rows
+test with-clause-before-union-all {
+    WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c ORDER BY x;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+@setup cte_rows
+test with-clause-before-union {
+    WITH c AS (SELECT x FROM t) SELECT x FROM c UNION SELECT x FROM c ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+@setup cte_rows
+test with-clause-before-intersect {
+    WITH c AS (SELECT x FROM t WHERE x > 1) SELECT x FROM t INTERSECT SELECT x FROM c ORDER BY x;
+}
+expect {
+    2
+}
+
+@setup cte_rows
+test with-clause-before-except {
+    WITH c AS (SELECT x FROM t WHERE x > 1) SELECT x FROM t EXCEPT SELECT x FROM c ORDER BY x;
+}
+expect {
+    1
+}
+
+test with-clause-two-ctes-three-way-union {
+    WITH a AS (SELECT 1 AS n), b AS (SELECT 2 AS n)
+    SELECT n FROM a UNION ALL SELECT n FROM b UNION ALL SELECT n FROM a ORDER BY n;
+}
+expect {
+    1
+    1
+    2
+}
+
+@setup cte_rows
+test with-clause-before-union-in-from-subquery {
+    SELECT * FROM (WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c) AS s ORDER BY x;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+@setup cte_rows
+test with-clause-before-union-with-limit {
+    WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c ORDER BY x LIMIT 3;
+}
+expect {
+    1
+    1
+    2
+}
+
+test with-recursive-before-union-all {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+    SELECT n FROM r UNION ALL SELECT n FROM r ORDER BY n;
+}
+expect {
+    1
+    1
+    2
+    2
+    3
+    3
+}
+
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
