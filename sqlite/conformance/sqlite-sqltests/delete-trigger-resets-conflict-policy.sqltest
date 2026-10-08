@@ -44,3 +44,27 @@ test delete-trigger-statement-keeps-its-own-or-clause {
 }
 expect {
 }
+
+# The reset holds when the DELETE is fired from inside another trigger. An
+# outer INSERT OR IGNORE fires a BEFORE INSERT trigger whose DELETE fires an
+# AFTER DELETE trigger, and that trigger's UPDATE violates the unique index.
+# The frame below the DELETE did not inherit OR IGNORE, so the INSERT aborts.
+# Turso used to re-apply the outer policy when the trigger returned the
+# constraint error, keeping both the DELETE and the inserted row.
+test delete-trigger-violation-not-ignored-by-outer-or-ignore {
+    CREATE TABLE t (pk INTEGER PRIMARY KEY, k INTEGER);
+    CREATE UNIQUE INDEX t_k ON t(k);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    CREATE TABLE u (x INTEGER);
+    INSERT INTO u VALUES (1);
+    CREATE TRIGGER t_bi BEFORE INSERT ON t FOR EACH ROW BEGIN
+        DELETE FROM u WHERE x = 1;
+    END;
+    CREATE TRIGGER u_ad AFTER DELETE ON u FOR EACH ROW BEGIN
+        UPDATE t SET k = k * 2 WHERE pk = 1;
+    END;
+    INSERT OR IGNORE INTO t VALUES (3, 30);
+}
+expect error {
+    UNIQUE constraint failed: t.k
+}
