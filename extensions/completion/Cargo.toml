@@ -11,7 +11,7 @@ description = "Limbo completion extension"
 turso_ext = { workspace = true, features = ["static"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+mimalloc.workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]

@@ -130,7 +130,7 @@ serde = "1.0"
 serde_json = "1.0"
 anyhow = "1.0.98"
 # Use NAPI-rs' mimalloc bindings
-mimalloc = { package = "mimalloc-safe", version = "0.1.67", default-features = false }
+mimalloc = { package = "mimalloc-safe", version = "0.1", default-features = false }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 itertools = "0.14.0"
 rand = "0.9.2"
