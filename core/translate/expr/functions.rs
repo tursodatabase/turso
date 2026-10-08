@@ -1,7 +1,4 @@
 use super::*;
-use crate::translate::sequence::emit_sequence_descriptor_literals;
-use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
 
 /// The base logic for translating LIKE and GLOB expressions.
 /// The logic for handling "NOT LIKE" is different depending on whether the expression
@@ -252,19 +249,6 @@ pub(super) fn translate_sequence_function(
             Some(start_reg),
         )?;
     } else {
-        // setval keeps its own cursor lifecycle: open the backing table,
-        // validate the user-supplied value via the Function handler,
-        // DELETE every existing row, then INSERT one at the requested
-        // value with the descriptor suffix.
-        let backing_table = backing_table.unwrap();
-        let root_page = backing_table.root_page;
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(root_page),
-            db: database_id,
-        });
-
         // Function instruction performs argument validation and writes the
         // user-visible result into target_register. The handler no longer
         // mutates any in-memory atomic.
@@ -274,68 +258,29 @@ pub(super) fn translate_sequence_function(
             dest: target_register,
             func: func_ctx,
         });
-
-        let empty_label = program.allocate_label();
-        let loop_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id,
-            pc_if_empty: empty_label,
-        });
-        program.preassign_label_to_next_insn(loop_label);
-        program.emit_insn(Insn::Delete {
-            cursor_id,
-            table_name: normalized_name.clone(),
-            // Sequence storage is internal bookkeeping, not a SQL row change.
-            is_part_of_update: true,
-        });
-        program.emit_insn(Insn::Next {
-            cursor_id,
-            pc_if_next: loop_label,
-            fullscan: false,
-            is_index: false,
-        });
-        program.preassign_label_to_next_insn(empty_label);
-
-        let col_base = program.alloc_registers(7);
-        program.emit_insn(Insn::Copy {
-            src_reg: start_reg + 1,
-            dst_reg: col_base,
-            extra_amount: 0,
-        });
-        if args.len() > 2 {
-            program.emit_insn(Insn::Copy {
-                src_reg: start_reg + 2,
-                dst_reg: col_base + 1,
-                extra_amount: 0,
-            });
+        let is_called_reg = if args.len() > 2 {
+            start_reg + 2
         } else {
+            let reg = program.alloc_register();
             program.emit_insn(Insn::Integer {
-                dest: col_base + 1,
+                dest: reg,
                 value: 1,
             });
-        }
-        emit_sequence_descriptor_literals(program, &seq_arc, col_base + 2);
-
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(col_base),
-            count: 7,
-            dest_reg: to_u32(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
-            key_reg: start_reg + 1,
-            record_reg,
-            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
-            table_name: normalized_name.clone(),
-        });
+            reg
+        };
+        crate::translate::sequence::emit_disk_set_watermark(
+            program,
+            database_id,
+            backing_table.unwrap(),
+            &normalized_name,
+            &seq_arc,
+            start_reg + 1,
+            is_called_reg,
+        );
         program.emit_insn(Insn::SetSequenceCurrval {
             seq_name_reg: start_reg,
             value_reg: start_reg + 1,
         });
-        program.emit_insn(Insn::Close { cursor_id });
         // For AUTOINCREMENT-backing sequences, also mirror the new
         // watermark into `sqlite_sequence` so the SQLite-compat row
         // tracks `setval()` without waiting for a checkpoint. Matches
