@@ -7524,6 +7524,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         write_set: Mutex::new(WriteSet::new()),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
+        schema_change_commit_in_flight: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
@@ -9248,6 +9249,7 @@ fn transaction_display() {
         write_set,
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
+        schema_change_commit_in_flight: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
@@ -23092,4 +23094,183 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     // A fresh blocking connect works once nothing is parked.
     let conn = db.connect();
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
+}
+
+const READER_STEP_LIMIT_WHILE_COMMIT_PAUSED: usize = 200;
+
+fn pause_drop_index_commit(db: &MvccTestDbNoConn) -> (Arc<Connection>, Statement, u64) {
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, p TEXT)")
+        .unwrap();
+    setup.execute("CREATE INDEX i ON t (p)").unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN").unwrap();
+    conn_a.execute("DROP INDEX i").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let tx_id = conn_a.get_mv_tx_id().expect("conn_a should have a tx");
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut commit = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit.step().unwrap(), StepResult::Yield),
+        "the DROP INDEX commit should pause after taking its commit timestamp"
+    );
+    let mvcc_store = db.get_mvcc_store();
+    let state = mvcc_store
+        .txs
+        .get(&tx_id)
+        .expect("conn_a's tx should still be tracked")
+        .value()
+        .state
+        .load();
+    assert!(
+        matches!(state, TransactionState::Preparing(_)),
+        "expected Preparing, got {state:?}"
+    );
+    (conn_a, commit, tx_id)
+}
+
+fn step_collecting_rows(
+    stmt: &mut Statement,
+    max_steps: usize,
+    rows: &mut Vec<Vec<Value>>,
+) -> bool {
+    for _ in 0..max_steps {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                rows.push(stmt.row().unwrap().get_values().cloned().collect());
+            }
+            StepResult::Done => return true,
+            StepResult::IO | StepResult::Yield => {
+                stmt.get_pager().io.step().unwrap();
+            }
+            other => panic!("unexpected step result while reading: {other:?}"),
+        }
+    }
+    false
+}
+
+fn finish_paused_commit(conn_a: &Arc<Connection>, commit: &mut Statement) {
+    conn_a.set_yield_injector(None);
+    commit.run_ignore_rows().unwrap();
+}
+
+/// A reader that starts while a DROP INDEX commit is between taking its commit
+/// timestamp and publishing the new schema must not report the dropped index as
+/// missing rows. The reader has to wait for the commit and then see one
+/// consistent state.
+#[test]
+fn integrity_check_during_drop_index_commit_sees_no_missing_index_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let (conn_a, mut commit, _) = pause_drop_index_commit(&db);
+
+    let conn_b = db.connect();
+    let mut check = conn_b.prepare("PRAGMA integrity_check").unwrap();
+    let mut rows = Vec::new();
+    let finished_while_paused =
+        step_collecting_rows(&mut check, READER_STEP_LIMIT_WHILE_COMMIT_PAUSED, &mut rows);
+
+    finish_paused_commit(&conn_a, &mut commit);
+    if !finished_while_paused {
+        assert!(step_collecting_rows(&mut check, 10_000, &mut rows));
+    }
+
+    assert_eq!(rows.len(), 1, "unexpected integrity_check rows: {rows:?}");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+/// Same window, seen through queries: a full scan and a lookup through the
+/// index the schema still lists must agree about row 2.
+#[test]
+fn select_during_drop_index_commit_finds_row_inserted_after_drop() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let (conn_a, mut commit, _) = pause_drop_index_commit(&db);
+
+    let conn_b = db.connect();
+    conn_b.execute("BEGIN").unwrap();
+    let mut scan = conn_b
+        .prepare("SELECT id FROM t NOT INDEXED WHERE p = 'b'")
+        .unwrap();
+    let mut by_index = conn_b.prepare("SELECT id FROM t WHERE p = 'b'").unwrap();
+    let mut scan_rows = Vec::new();
+    let mut index_rows = Vec::new();
+    let scan_done = step_collecting_rows(
+        &mut scan,
+        READER_STEP_LIMIT_WHILE_COMMIT_PAUSED,
+        &mut scan_rows,
+    );
+    let index_done = step_collecting_rows(
+        &mut by_index,
+        READER_STEP_LIMIT_WHILE_COMMIT_PAUSED,
+        &mut index_rows,
+    );
+
+    finish_paused_commit(&conn_a, &mut commit);
+    if !scan_done {
+        assert!(step_collecting_rows(&mut scan, 10_000, &mut scan_rows));
+    }
+    if !index_done {
+        assert!(step_collecting_rows(&mut by_index, 10_000, &mut index_rows));
+    }
+
+    assert_eq!(
+        scan_rows, index_rows,
+        "a full scan and an index lookup disagree about the same snapshot"
+    );
+}
+
+/// Internal callers such as the transaction a sequence opens for `nextval`
+/// start transactions directly and cannot retry a statement. They must still
+/// get a transaction while a schema-changing commit is publishing.
+#[test]
+fn begin_tx_without_schema_generation_succeeds_during_drop_index_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let (conn_a, mut commit, _) = pause_drop_index_commit(&db);
+
+    let conn_b = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let tx_id = mvcc_store
+        .begin_tx(conn_b.get_pager())
+        .expect("begin_tx must not fail while a schema-changing commit is publishing");
+    mvcc_store.remove_tx(tx_id).unwrap();
+
+    finish_paused_commit(&conn_a, &mut commit);
+}
+
+#[test]
+fn failed_nextval_commit_inside_begin_concurrent_keeps_outer_transaction_state() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let state_before = conn.get_tx_state();
+
+    let failure_injector = FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::TxError("synthetic inner commit failure".to_string()),
+    )]);
+    conn.set_failure_injector(Some(failure_injector.clone()));
+    assert!(conn.execute("SELECT nextval('s')").is_err());
+    assert!(failure_injector.is_empty());
+    conn.set_failure_injector(None);
+
+    assert_eq!(
+        conn.get_tx_state(),
+        state_before,
+        "a failed inner commit reset the state of the user's transaction"
+    );
+    conn.execute("COMMIT").unwrap();
+    assert!(
+        conn.get_mv_tx().is_none(),
+        "COMMIT left the transaction open: {:?}",
+        conn.get_mv_tx()
+    );
 }

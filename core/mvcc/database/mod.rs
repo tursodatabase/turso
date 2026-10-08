@@ -1018,6 +1018,10 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
     header_dirty: AtomicBool,
+    /// True from the moment a schema-changing commit gets its commit timestamp until its header
+    /// (with the new schema cookie) is published to `global_header`. In that window the commit's
+    /// rows are visible to newly started readers, but those readers still get the old schema.
+    schema_change_commit_in_flight: AtomicBool,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
@@ -1073,6 +1077,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
+            schema_change_commit_in_flight: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
@@ -3172,6 +3177,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
+                    if can_commit_tx && self.did_commit_schema_change {
+                        tx.schema_change_commit_in_flight
+                            .store(true, Ordering::Release);
+                    }
                     if can_commit_tx || read_only {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
@@ -3683,6 +3692,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     if last_committed_ts <= *end_ts {
                         global_header.replace(tx_header);
                     }
+                    tx_unlocked
+                        .schema_change_commit_in_flight
+                        .store(false, Ordering::Release);
                 }
                 if self.did_commit_schema_change {
                     mvcc_store
@@ -6693,6 +6705,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 schema_stale = true;
                 return;
             }
+            if expected_schema_generation.is_some() && self.schema_change_commit_in_flight() {
+                schema_stale = true;
+                return;
+            }
             let header = self
                 .global_header
                 .read()
@@ -6719,6 +6735,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
 
         Ok(tx_id)
+    }
+
+    /// True while a schema-changing commit has taken its commit timestamp but has not yet
+    /// published its new header. A transaction that starts in this window sees the commit's
+    /// rows with the old schema, so callers wait for it to end before starting one.
+    pub fn schema_change_commit_in_flight(&self) -> bool {
+        self.txs.iter().any(|entry| {
+            let tx = entry.value();
+            tx.schema_change_commit_in_flight.load(Ordering::Acquire)
+                && matches!(
+                    tx.state.load(),
+                    TransactionState::Preparing(_) | TransactionState::Committed(_)
+                )
+        })
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]

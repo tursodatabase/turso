@@ -4664,6 +4664,14 @@ pub fn op_transaction_inner(
                     );
                     return Err(LimboError::SchemaUpdated.into());
                 }
+                if is_main_db
+                    && conn.has_no_open_transaction_state()
+                    && mv_store
+                        .as_ref()
+                        .is_some_and(|mv_store| mv_store.schema_change_commit_in_flight())
+                {
+                    return Ok(state.suspend_on_io(IOCompletions(Completion::new_yield())));
+                }
                 #[cfg(any(test, injected_yields))]
                 {
                     if let Some(IOResult::IO(io)) =
@@ -14903,7 +14911,9 @@ pub fn op_sequence_commit_inner_tx(
                 LimboError::WriteWriteConflict | LimboError::BusySnapshot | LimboError::Conflict(_)
             ) =>
         {
+            let outer_tx_state = conn.get_tx_state();
             state.sequence_inner_commit = None;
+            conn.set_tx_state(outer_tx_state);
             // Inner tx may already be in a state where rollback is a
             // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
@@ -14943,7 +14953,9 @@ pub fn op_sequence_commit_inner_tx(
             Ok(InsnFunctionStepResult::Step)
         }
         Err(e) => {
+            let outer_tx_state = conn.get_tx_state();
             state.sequence_inner_commit = None;
+            conn.set_tx_state(outer_tx_state);
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
                     mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
