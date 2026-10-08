@@ -1267,7 +1267,12 @@ fn pre_materialize_multi_ref_ctes_in_select_plan(
     plan: &mut SelectPlan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<()> {
-    pre_materialize_multi_ref_ctes_in_tables(program, &mut plan.table_references, t_ctx)?;
+    pre_materialize_multi_ref_ctes_in_tables(
+        program,
+        &mut plan.table_references,
+        t_ctx,
+        QueryLevel::Nested,
+    )?;
     pre_materialize_multi_ref_ctes_in_non_from_subqueries(
         program,
         &mut plan.non_from_clause_subqueries,
@@ -1296,6 +1301,7 @@ fn pre_materialize_multi_ref_ctes_in_tables(
     program: &mut ProgramBuilder,
     tables: &mut TableReferences,
     t_ctx: &mut TranslateCtx,
+    query_level: QueryLevel,
 ) -> Result<()> {
     for table_reference in tables.joined_tables_mut().iter_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
@@ -1308,7 +1314,11 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                 if program.get_materialized_cte(cte_id).is_some() {
                     continue;
                 }
-                if from_clause_subquery.requires_table_materialization() {
+                let reads_a_row_of_an_outer_query = query_level == QueryLevel::Nested
+                    && plan_has_outer_scope_dependency(&from_clause_subquery.plan);
+                if from_clause_subquery.requires_table_materialization()
+                    && !reads_a_row_of_an_outer_query
+                {
                     tracing::trace!(
                         cte_id,
                         identifier = %table_reference.identifier,
@@ -1344,6 +1354,12 @@ fn pre_materialize_multi_ref_ctes_in_tables(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryLevel {
+    Current,
+    Nested,
 }
 
 /// Describe how a FROM-clause subquery reference will be executed, for
@@ -1436,7 +1452,7 @@ pub fn emit_from_clause_subqueries(
     // FIRST PASS: Pre-materialize all recursively reachable multi-ref / hinted CTEs
     // before any coroutine bodies are emitted. Otherwise a coroutine could try to
     // OpenDup a CTE whose backing table has not been created yet.
-    pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
+    pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx, QueryLevel::Current)?;
 
     let from_clause_has_right_or_full_join = tables.has_right_or_full_join();
     let mut visit_order: Vec<usize> = join_order
