@@ -48,3 +48,56 @@ test json-argument-of-arrow-keeps-subtype {
 expect {
     [{"b":5}]
 }
+
+setup collate_index {
+    CREATE TABLE t2(x TEXT PRIMARY KEY, y TEXT);
+    INSERT INTO t2 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t2_nocase ON t2(+y COLLATE NOCASE);
+}
+
+@setup collate_index
+test indexed-collate-expression-in-where-keeps-collation {
+    SELECT x FROM t2 INDEXED BY t2_nocase WHERE x = +y COLLATE NOCASE;
+}
+expect {
+    alpha
+}
+
+@setup collate_index
+test indexed-collate-expression-in-result-keeps-collation {
+    SELECT x, x = +y COLLATE NOCASE FROM t2 INDEXED BY t2_nocase ORDER BY x;
+}
+expect {
+    alpha|1
+    bravo|0
+}
+
+@setup collate_index
+@cross-check-integrity
+test indexed-collate-expression-in-delete-keeps-collation {
+    DELETE FROM t2 INDEXED BY t2_nocase WHERE x IS +y COLLATE NOCASE;
+    SELECT x FROM t2;
+}
+expect {
+    bravo
+}
+
+test indexed-unary-plus-column-keeps-column-collation {
+    CREATE TABLE t3(x TEXT, y TEXT COLLATE NOCASE);
+    INSERT INTO t3 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t3_plus ON t3(+y);
+    SELECT x FROM t3 INDEXED BY t3_plus WHERE +y = x;
+}
+expect {
+    alpha
+}
+
+test indexed-function-value-uses-collation-of-other-column {
+    CREATE TABLE t4(x TEXT COLLATE NOCASE, y TEXT);
+    INSERT INTO t4 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t4_trim ON t4(trim(y));
+    SELECT x FROM t4 INDEXED BY t4_trim WHERE trim(y) = x;
+}
+expect {
+    alpha
+}

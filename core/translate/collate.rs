@@ -7,7 +7,7 @@ use std::{
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     connection::SymbolTable,
@@ -471,6 +471,40 @@ pub fn get_expr_collation_ctx_with_symbols(
     Ok(maybe_explicit_collseq
         .map(|collation| (collation, true))
         .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
+}
+
+pub fn get_index_value_collation_ctx(
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<(CollationSeq, bool)>> {
+    let (explicit, _) = get_collseq_parts_from_expr_with_symbols(
+        expr,
+        referenced_tables,
+        Some(resolver.symbol_table),
+        Some(resolver),
+    )?;
+    if let Some(collation) = explicit {
+        return Ok(Some((collation, true)));
+    }
+    let mut column = expr;
+    loop {
+        match column {
+            Expr::Unary(UnaryOperator::Positive, inner) | Expr::Cast { expr: inner, .. } => {
+                column = inner;
+            }
+            Expr::Parenthesized(exprs) if exprs.len() == 1 => column = &exprs[0],
+            _ => break,
+        }
+    }
+    match column {
+        Expr::Column { .. } | Expr::RowId { .. } => get_expr_collation_ctx_with_symbols(
+            column,
+            referenced_tables,
+            Some(resolver.symbol_table),
+        ),
+        _ => Ok(None),
+    }
 }
 
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
