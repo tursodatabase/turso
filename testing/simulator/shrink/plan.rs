@@ -245,6 +245,7 @@ impl InteractionPlan {
                                 | PropertyDiscriminants::TableHasExpectedContent
                                 | PropertyDiscriminants::UnionAllPreservesCardinality
                                 | PropertyDiscriminants::WhereTrueFalseNull
+                                | PropertyDiscriminants::LateralMatchesJsonEach
                         ) {
                             // Theses properties only emit select queries, so they can be discarded entirely
                             true

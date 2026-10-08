@@ -22,6 +22,7 @@ use turso_core::Value;
 use turso_core::turso_assert_eq;
 use turso_parser::ast::{ColumnConstraint, Distinctness};
 
+use crate::model::lateral::LateralSelect;
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 use std::collections::{HashMap, HashSet};
@@ -237,6 +238,7 @@ fn prepare_insert_rows(
 }
 
 pub mod interactions;
+pub mod lateral;
 pub mod metrics;
 pub mod property;
 
@@ -356,6 +358,7 @@ impl Display for Setval {
 pub enum Query {
     Create(Create),
     Select(Select),
+    LateralSelect(LateralSelect),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
@@ -404,6 +407,7 @@ impl Query {
     pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
+            Query::LateralSelect(select) => select.dependencies(),
             Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
@@ -440,6 +444,7 @@ impl Query {
         match self {
             Query::Create(Create { table }) => vec![table.name.clone()],
             Query::Select(select) => select.dependencies().into_iter().collect(),
+            Query::LateralSelect(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
             | Query::Insert(Insert::ValuesWithColumns { table, .. })
@@ -509,7 +514,7 @@ impl Query {
 
     #[inline]
     pub fn is_select(&self) -> bool {
-        matches!(self, Self::Select(_))
+        matches!(self, Self::Select(_) | Self::LateralSelect(_))
     }
 
     /// Statements that, in MVCC mode, must run inside an exclusive write
@@ -529,6 +534,7 @@ impl Display for Query {
         match self {
             Self::Create(create) => write!(f, "{create}"),
             Self::Select(select) => write!(f, "{select}"),
+            Self::LateralSelect(select) => write!(f, "{select}"),
             Self::Insert(insert) => write!(f, "{insert}"),
             Self::Delete(delete) => write!(f, "{delete}"),
             Self::Update(update) => write!(f, "{update}"),
@@ -564,6 +570,7 @@ impl Shadow for Query {
             Query::Insert(insert) => insert.shadow(env),
             Query::Delete(delete) => delete.shadow(env),
             Query::Select(select) => select.shadow(env),
+            Query::LateralSelect(select) => select.shadow(env),
             Query::Update(update) => update.shadow(env),
             Query::Drop(drop) => drop.shadow(env),
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
@@ -624,7 +631,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
     fn from(value: QueryDiscriminants) -> Self {
         match value {
             QueryDiscriminants::Create => Self::CREATE,
-            QueryDiscriminants::Select => Self::SELECT,
+            QueryDiscriminants::Select | QueryDiscriminants::LateralSelect => Self::SELECT,
             QueryDiscriminants::Insert => Self::INSERT,
             QueryDiscriminants::Delete => Self::DELETE,
             QueryDiscriminants::Update => Self::UPDATE,
