@@ -144,6 +144,12 @@ fn text_arg(args: &[Register], i: usize) -> String {
     }
 }
 
+#[derive(strum::EnumString)]
+#[strum(ascii_case_insensitive, serialize_all = "snake_case")]
+enum ConfigParameter {
+    SearchPath,
+}
+
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     let name = match args[0].get_value() {
         Value::Text(name) => name.as_str(),
@@ -158,11 +164,9 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    if !name.eq_ignore_ascii_case("search_path") {
-        return Err(LimboError::InvalidArgument(format!(
-            "unrecognized configuration parameter \"{name}\""
-        )));
-    }
+    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
+        LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
+    })?;
     let value = match args[1].get_value() {
         Value::Text(value) => Some(value.as_str()),
         Value::Null => None,
@@ -189,7 +193,9 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             "transaction-local settings are not supported".to_string(),
         ));
     }
-    crate::session::set_search_path(conn, value)
+    match parameter {
+        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+    }
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
@@ -852,4 +858,25 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigParameter;
+
+    #[test]
+    fn config_parameter_parses_sql_names() {
+        for name in ["search_path", "SEARCH_PATH", "SeArCh_PaTh"] {
+            assert!(
+                matches!(
+                    name.parse::<ConfigParameter>(),
+                    Ok(ConfigParameter::SearchPath)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["", "statement_timeout", "SearchPath", "search_path "] {
+            assert!(name.parse::<ConfigParameter>().is_err(), "{name}");
+        }
+    }
 }
