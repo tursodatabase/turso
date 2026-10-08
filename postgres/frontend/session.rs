@@ -1,3 +1,4 @@
+use chumsky::{error::EmptyErr, prelude::*};
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,8 @@ struct PgConnectionInner {
 struct SessionState {
     search_path: Option<Vec<String>>,
 }
+
+type PgSessionState = Mutex<SessionState>;
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -65,7 +68,7 @@ pub fn open_database_with_io(
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
-        let state = Arc::new(Mutex::new(SessionState::default()));
+        let state = Arc::new(PgSessionState::default());
         let conn = db.connect_with_state(state)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -180,7 +183,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     let options = {
         let state = pg_conn
             .conn
-            .state::<Mutex<SessionState>>()
+            .state::<PgSessionState>()
             .expect("PostgreSQL connections have session state")
             .lock()
             .unwrap();
@@ -306,6 +309,8 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
             .join(", ");
+        // Change the setting when the statement runs, not when it is prepared.
+        // set_config returns text, so IS NULL prevents SET from returning rows.
         return pg_conn.conn.prepare(format!(
             "SELECT 0 WHERE set_config('search_path', '{}', {}) IS NULL",
             path.replace('\'', "''"),
@@ -321,7 +326,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
 
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
     let path = value.map(parse_search_path).transpose()?;
-    let state = conn.state::<Mutex<SessionState>>().ok_or_else(|| {
+    let state = conn.state::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
     state.lock().unwrap().search_path = path;
@@ -331,58 +336,35 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
-    let invalid =
-        || LimboError::ParseError("invalid value for parameter \"search_path\"".to_string());
-    let mut chars = value.chars().peekable();
-    while chars.peek().is_some_and(char::is_ascii_whitespace) {
-        chars.next();
-    }
-    let mut path = Vec::new();
-    if chars.peek().is_none() {
-        return Ok(path);
-    }
-    loop {
-        let mut name = String::new();
-        if chars.peek() == Some(&'"') {
-            chars.next();
-            loop {
-                match chars.next().ok_or_else(invalid)? {
-                    '"' if chars.peek() == Some(&'"') => {
-                        chars.next();
-                        name.push('"');
-                    }
-                    '"' => break,
-                    ch => name.push(ch),
-                }
-            }
-        } else {
-            while chars
-                .peek()
-                .is_some_and(|ch| *ch != ',' && !ch.is_ascii_whitespace())
-            {
-                name.push(chars.next().unwrap().to_ascii_lowercase());
-            }
-            if name.is_empty() {
-                return Err(invalid());
-            }
-        }
-        path.push(name);
-        while chars.peek().is_some_and(char::is_ascii_whitespace) {
-            chars.next();
-        }
-        match chars.next() {
-            None => return Ok(path),
-            Some(',') => {
-                while chars.peek().is_some_and(char::is_ascii_whitespace) {
-                    chars.next();
-                }
-                if chars.peek().is_none() {
-                    return Err(invalid());
-                }
-            }
-            Some(_) => return Err(invalid()),
-        }
-    }
+    search_path_parser()
+        .parse(value)
+        .into_result()
+        .map_err(|_| {
+            LimboError::ParseError("invalid value for parameter \"search_path\"".to_string())
+        })
+}
+
+fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
+    let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
+    let quoted = just("\"\"")
+        .to('"')
+        .or(none_of('"'))
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('"'), just('"'));
+    let unquoted = any()
+        .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
+        .repeated()
+        .at_least(1)
+        .to_slice()
+        .filter(|name: &&str| !name.starts_with('"'))
+        .map(str::to_ascii_lowercase);
+
+    quoted
+        .or(unquoted)
+        .separated_by(just(',').padded_by(whitespace.clone()))
+        .collect::<Vec<_>>()
+        .padded_by(whitespace)
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -594,4 +576,55 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{search_path_parser, PgSessionState, SessionState};
+    use chumsky::Parser;
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn session_state_alias_matches_injected_type() {
+        let state: Arc<dyn Any + Send + Sync> = Arc::new(Mutex::new(SessionState::default()));
+        assert!(state.downcast_ref::<PgSessionState>().is_some());
+    }
+
+    #[test]
+    fn search_path_parser_accepts_identifier_lists() {
+        for (input, expected) in [
+            ("", vec![]),
+            (" \t\n\r\u{c}", vec![]),
+            (" PUBLIC , \"MiXeD\" ", vec!["public", "MiXeD"]),
+            ("\"a,b\", \"a\"\"b\", $USER", vec!["a,b", "a\"b", "$user"]),
+            ("\"\"\"\"", vec!["\""]),
+            ("\"\", public", vec!["", "public"]),
+            ("public\"extra", vec!["public\"extra"]),
+            ("\u{b}PUBLIC\u{a0}", vec!["\u{b}public\u{a0}"]),
+        ] {
+            assert_eq!(
+                search_path_parser().parse(input).into_result().unwrap(),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_path_parser_rejects_invalid_identifier_lists() {
+        for input in [
+            ",public",
+            "public,",
+            "public, ",
+            "public,,main",
+            "one two",
+            "\"\"\"",
+            "\"unclosed",
+            "\"a\"b",
+            "\"a\" \"b\"",
+        ] {
+            assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
+        }
+    }
 }
