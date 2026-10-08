@@ -3430,6 +3430,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmimalloc-sys2"
+version = "0.1.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2812ea58f6620a137d0e7c7b9ba63f515248c5575bd669f739a9ea4b56ba8259"
+dependencies = [
+ "cc",
+ "cmake",
+ "libc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3838,6 +3849,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
 dependencies = [
  "libmimalloc-sys",
+]
+
+[[package]]
+name = "mimalloc-safe"
+version = "0.1.67"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f9fd5a18b7a9c72d89d0e906a9d5b93c330c159e9d5072c858e4631f0bd0ada"
+dependencies = [
+ "libmimalloc-sys2",
 ]
 
 [[package]]
@@ -7017,7 +7037,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "mimalloc",
+ "mimalloc-safe",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "reqwest",
@@ -7093,7 +7113,7 @@ dependencies = [
  "libc",
  "limbo_completion",
  "miette",
- "mimalloc",
+ "mimalloc-safe",
  "nu-ansi-term",
  "prost 0.14.1",
  "rand 0.8.6",
@@ -7161,7 +7181,7 @@ dependencies = [
  "loom",
  "memory-stats",
  "miette",
- "mimalloc",
+ "mimalloc-safe",
  "num-bigint 0.4.6",
  "num-traits",
  "pack1",
@@ -7551,7 +7571,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "limbo_completion",
- "mimalloc",
+ "mimalloc-safe",
  "nu-ansi-term",
  "rustyline",
  "schemars 0.8.22",
