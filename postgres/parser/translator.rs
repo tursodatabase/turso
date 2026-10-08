@@ -1777,7 +1777,8 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
-        let qualified_name = self.qualified_name_from_range_var(range_var);
+        let mut qualified_name = self.qualified_name_from_range_var(range_var);
+        qualified_name.alias = None;
         let alias = range_var
             .alias
             .as_ref()
