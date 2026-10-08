@@ -2588,8 +2588,13 @@ fn persist_type_definition(
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
+    let existing_types_table = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME);
+    // Whether this statement is the one that creates the types table. It decides where the schema
+    // cookie has to be emitted: before `ParseSchema`, which registers the table in the connection
+    // schema, or before `AddType`, which registers the type when the table already exists.
+    let creating_types_table = existing_types_table.is_none();
 
-    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
+    if let Some(existing) = existing_types_table {
         types_table = existing.clone();
         types_root_page = RegisterOrLiteral::Literal(existing.root_page);
     } else {
@@ -2624,6 +2629,12 @@ fn persist_type_definition(
             table_root_reg,
             Some(create_sql),
         )?;
+
+        // `SetCookie` is what marks the transaction as having changed the schema, so that a
+        // rollback restores the connection schema (see `Pager::rollback`). It has to precede
+        // `ParseSchema`: if a later instruction fails - `AddType` re-parses the type SQL and can -
+        // the schema would otherwise keep the types table while the rollback removed its page.
+        emit_schema_cookie(resolver, program);
 
         // Parse schema to register the new table in-memory
         program.emit_insn(Insn::ParseSchema {
@@ -2668,20 +2679,31 @@ fn persist_type_definition(
         table_name: TURSO_TYPES_TABLE_NAME.to_string(),
     });
 
+    if !creating_types_table {
+        // `AddType` below registers the type in the connection schema. Keep the cookie before the
+        // first instruction that can extend that schema, as on the creating path above; on this
+        // path that is belt and braces, since `AddType` fails before it mutates anything.
+        emit_schema_cookie(resolver, program);
+    }
+
     // Add the type to the in-memory registry
     program.emit_insn(Insn::AddType {
         db: MAIN_DB_ID,
         sql,
     });
 
+    Ok(())
+}
+
+/// Marks the transaction as having changed the schema, so that a rollback restores the connection
+/// schema, and bumps the schema cookie of the main database.
+fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
     program.emit_insn(Insn::SetCookie {
         db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
-
-    Ok(())
 }
 
 pub fn translate_create_type(
