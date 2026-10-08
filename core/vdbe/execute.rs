@@ -19759,7 +19759,7 @@ mod tests {
         let did_interrupt_for_handler = did_interrupt.clone();
         conn.set_progress_handler(
             1,
-            Some(Box::new(move || {
+            Some(std::sync::Arc::new(move || {
                 if !conn_for_progress.get_auto_commit() {
                     let calls =
                         source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
@@ -19958,7 +19958,7 @@ mod tests {
         let did_interrupt_for_handler = did_interrupt.clone();
         conn.set_progress_handler(
             1,
-            Some(Box::new(move || {
+            Some(std::sync::Arc::new(move || {
                 !conn_for_progress.get_auto_commit()
                     && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
             })),

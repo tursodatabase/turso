@@ -2617,7 +2617,13 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        Some(match self.abort(pager, None, state, true) {
+        let rollback_explicit_write = state.is_active_write && !self.connection.get_auto_commit();
+        let interrupt = LimboError::Interrupt;
+        let abort_result = self.abort(pager, Some(&interrupt), state, true);
+        if rollback_explicit_write {
+            self.connection.rollback_manual_txn_cleanup(pager, true);
+        }
+        Some(match abort_result {
             Ok(()) => ProgramStep::Interrupt,
             Err(err) => ProgramStep::Error(err.into()),
         })
@@ -4207,7 +4213,7 @@ mod tests {
             assert!(matches!(stmt.step(), Err(LimboError::IntegerOverflow)));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Failed);
 
-            conn.set_progress_handler(1, Some(Box::new(|| true)));
+            conn.set_progress_handler(1, Some(std::sync::Arc::new(|| true)));
             let mut stmt = conn.prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT sum(x) FROM t").unwrap();
             assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);

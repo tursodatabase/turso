@@ -61,6 +61,7 @@ extern "C" {
         tail: *mut *const libc::c_char,
     ) -> i32;
     fn sqlite3_step(stmt: *mut sqlite3_stmt) -> i32;
+    fn sqlite3_errcode(db: *mut sqlite3) -> i32;
     fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_wal_checkpoint(db: *mut sqlite3, db_name: *const libc::c_char) -> i32;
@@ -139,6 +140,8 @@ extern "C" {
     );
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
     fn sqlite3_interrupt(db: *mut sqlite3);
+    #[cfg(not(feature = "sqlite3"))]
+    fn turso_set_query_timeout(db: *mut sqlite3, milliseconds: u64) -> i32;
     fn sqlite3_get_table(
         db: *mut sqlite3,
         sql: *const libc::c_char,
@@ -195,6 +198,7 @@ extern "C" {
 
 const SQLITE_OK: i32 = 0;
 const SQLITE_ERROR: i32 = 1;
+const SQLITE_BUSY: i32 = 5;
 const SQLITE_MISUSE: i32 = 21;
 const SQLITE_RANGE: i32 = 25;
 const SQLITE_CANTOPEN: i32 = 14;
@@ -221,6 +225,8 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_libversion() {
@@ -2871,6 +2877,281 @@ mod tests {
                 matches!(finalize_rc, SQLITE_OK | SQLITE_INTERRUPT),
                 "unexpected finalize rc: {finalize_rc}"
             );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_step_interrupt_updates_connection_errcode() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE numbers(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                            sqlite3_prepare_v2(
+                                db,
+                                c"SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                                -1,
+                                &mut stmt,
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+            let db_addr = db as usize;
+            let finished = Arc::new(AtomicBool::new(false));
+            let finished_in_thread = Arc::clone(&finished);
+            let interrupter = std::thread::spawn(move || {
+                while !finished_in_thread.load(Ordering::Acquire) {
+                    sqlite3_interrupt(db_addr as *mut sqlite3);
+                    std::thread::yield_now();
+                }
+            });
+
+            let rc = loop {
+                let rc = sqlite3_step(stmt);
+                if rc != SQLITE_ROW {
+                    break rc;
+                }
+            };
+            finished.store(true, Ordering::Release);
+            interrupter.join().unwrap();
+            assert_eq!(rc, SQLITE_INTERRUPT);
+            assert_eq!(sqlite3_errcode(db), SQLITE_INTERRUPT);
+            assert!(matches!(
+                sqlite3_finalize(stmt),
+                SQLITE_OK | SQLITE_INTERRUPT
+            ));
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_interrupted_create_table_as_select_rolls_back_savepoint_and_schema() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE source(v INTEGER); INSERT INTO source(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9); BEGIN; SAVEPOINT ddl_boundary;".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+            assert_eq!(turso_set_query_timeout(db, 10), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                            sqlite3_prepare_v2(
+                                db,
+                                c"CREATE TABLE interrupted_schema AS SELECT a.v FROM source AS a, source AS b, source AS c, source AS d, source AS e, source AS f, source AS g, source AS h".as_ptr(),
+                                -1,
+                                &mut stmt,
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+            assert_eq!(sqlite3_step(stmt), SQLITE_INTERRUPT);
+            assert!(matches!(
+                sqlite3_finalize(stmt),
+                SQLITE_OK | SQLITE_INTERRUPT
+            ));
+            assert_ne!(sqlite3_get_autocommit(db), 0);
+            assert_eq!(turso_set_query_timeout(db, 0), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"ROLLBACK TO ddl_boundary".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE interrupted_schema(value INTEGER); INSERT INTO interrupted_schema VALUES (42);".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    struct CoordinatedInterrupt {
+        entered: AtomicBool,
+        release: AtomicBool,
+    }
+
+    unsafe extern "C" fn coordinate_active_native_work(data: *mut libc::c_void) -> i32 {
+        let state = &*(data as *const CoordinatedInterrupt);
+        state.entered.store(true, Ordering::Release);
+        while !state.release.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        0
+    }
+
+    #[test]
+    fn test_close_racing_active_execution_can_be_interrupted_without_deadlock() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                            sqlite3_exec(
+                                db,
+                                c"CREATE TABLE numbers(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                                None,
+                                ptr::null_mut(),
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+            let state = Arc::new(CoordinatedInterrupt {
+                entered: AtomicBool::new(false),
+                release: AtomicBool::new(false),
+            });
+            sqlite3_progress_handler(
+                db,
+                1,
+                Some(coordinate_active_native_work),
+                Arc::as_ptr(&state) as *mut libc::c_void,
+            );
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                            sqlite3_prepare_v2(
+                                db,
+                                c"SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                                -1,
+                                &mut stmt,
+                                ptr::null_mut(),
+                            ),
+                            SQLITE_OK
+                        );
+
+            let stmt_addr = stmt as usize;
+            let execution = std::thread::spawn(move || {
+                let rc = loop {
+                    let rc = sqlite3_step(stmt_addr as *mut sqlite3_stmt);
+                    if rc != SQLITE_ROW {
+                        break rc;
+                    }
+                };
+                let finalize_rc = sqlite3_finalize(stmt_addr as *mut sqlite3_stmt);
+                (rc, finalize_rc)
+            });
+            while !state.entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+
+            let db_addr = db as usize;
+            let close = std::thread::spawn(move || sqlite3_close(db_addr as *mut sqlite3));
+            sqlite3_interrupt(db);
+            state.release.store(true, Ordering::Release);
+
+            let (step_rc, finalize_rc) = execution.join().unwrap();
+            assert_eq!(step_rc, SQLITE_INTERRUPT);
+            assert!(matches!(finalize_rc, SQLITE_OK | SQLITE_INTERRUPT));
+            let close_rc = close.join().unwrap();
+            assert!(matches!(close_rc, SQLITE_OK | SQLITE_BUSY));
+            if close_rc == SQLITE_BUSY {
+                sqlite3_progress_handler(db, 0, None, ptr::null_mut());
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "sqlite3"))]
+    fn test_turso_query_timeout_interrupts_cpu_bound_statement() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); CREATE TABLE output(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(turso_set_query_timeout(db, 10), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO output SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_INTERRUPT);
+            assert!(matches!(
+                sqlite3_finalize(stmt),
+                SQLITE_OK | SQLITE_INTERRUPT
+            ));
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_exec_dml_can_be_interrupted() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); CREATE TABLE output(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let finished = Arc::new(AtomicBool::new(false));
+            let finished_in_thread = Arc::clone(&finished);
+            let db_addr = db as usize;
+            let interrupter = std::thread::spawn(move || {
+                while !finished_in_thread.load(Ordering::Acquire) {
+                    sqlite3_interrupt(db_addr as *mut sqlite3);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            let rc = sqlite3_exec(
+                db,
+                c"INSERT INTO output SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            finished.store(true, Ordering::Release);
+            interrupter.join().unwrap();
+            assert_eq!(rc, SQLITE_INTERRUPT, "expected SQLITE_INTERRUPT, got {rc}");
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

@@ -1551,6 +1551,12 @@ pub struct TursoExecutionResult {
 }
 
 impl TursoStatement {
+    pub fn set_query_timeout(&self, timeout: Option<Duration>) {
+        if let Some(stmt) = self.handle.lock().unwrap().as_mut() {
+            stmt.set_query_timeout_override(Some(timeout));
+        }
+    }
+
     /// return amount of row modifications (insert/delete operations) made by the most recent executed statement
     pub fn n_change(&self) -> i64 {
         let handle = self.handle.lock().unwrap();
