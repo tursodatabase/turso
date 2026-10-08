@@ -31,7 +31,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode                p1  p2  p3  p4              p5  comment
    0      Init               0  46   0                   0  Start at 46
-   1      SorterOpen         0   1   0  k(1,B)           0  cursor=0
+   1      SorterOpen         0   1   0  k(1,Binary)      0  cursor=0
    2      OpenRead           1   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
    3      OpenRead           3   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
    4      OpenRead           4   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0

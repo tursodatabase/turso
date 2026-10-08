@@ -29,7 +29,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode                  p1  p2  p3  p4                  p5  comment
    0          Init             0  61   0                       0  Start at 61
-   1          SorterOpen       0   1   0  k(1,-B)              0  cursor=0
+   1          SorterOpen       0   1   0  k(1,-Binary)         0  cursor=0
    2          Null             0  13  17                       0  r[13..17]=NULL
    3          Integer          0  10   0                       0  r[10]=0; clear group by abort flag
    4          Null             0  11   0                       0  r[11]=NULL; initialize group by comparison registers to NULL

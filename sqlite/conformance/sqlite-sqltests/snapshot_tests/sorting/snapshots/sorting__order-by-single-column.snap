@@ -19,7 +19,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode          p1  p2  p3  p4                p5  comment
    0  Init             0  20   0                     0  Start at 20
-   1  SorterOpen       0   1   0  k(1,B)             0  cursor=0
+   1  SorterOpen       0   1   0  k(1,Binary)        0  cursor=0
    2  OpenRead         1   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
    3  Rewind           1  11   0                     0  Rewind table products
    4    Column         1   1   5                     0  r[5]=products.name

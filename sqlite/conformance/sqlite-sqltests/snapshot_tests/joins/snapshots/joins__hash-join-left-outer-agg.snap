@@ -25,7 +25,7 @@ BYTECODE
 addr  opcode                       p1  p2  p3  p4                                          p5  comment
    0            Init                0  93   0                                               0  Start at 93
    1            Null                0   8   0                                               0  r[8]=NULL
-   2            SorterOpen          0   2   0  k(1,B)                                       0  cursor=0
+   2            SorterOpen          0   2   0  k(1,Binary)                                  0  cursor=0
    3            Integer             0   5   0                                               0  r[5]=0; clear group by abort flag
    4            Null                0   6   0                                               0  r[6]=NULL; initialize group by comparison registers to NULL
    5            Gosub              12  89   0                                               0  ; go to clear accumulator subroutine

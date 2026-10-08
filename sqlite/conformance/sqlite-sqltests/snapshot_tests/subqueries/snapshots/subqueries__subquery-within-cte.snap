@@ -60,7 +60,7 @@ addr  opcode             p1  p2  p3  p4              p5  comment
   26    Next              3  19   0                   0
   27  Next                0  16   0                   0
   28  EndCoroutine        1   0   0                   0
-  29  SorterOpen          4   1   0  k(1,-B)          0  cursor=4
+  29  SorterOpen          4   1   0  k(1,-Binary)     0  cursor=4
   30  InitCoroutine       1   0   2                   0
   31    Yield             1  39   0                   0
   32    Copy              7  13   0                   0  r[13]=r[7]
