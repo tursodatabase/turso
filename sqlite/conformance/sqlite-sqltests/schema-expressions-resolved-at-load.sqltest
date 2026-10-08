@@ -1,0 +1,170 @@
+@database :memory:
+
+# Index key expressions, partial-index predicates and CHECK constraints are
+# resolved to column positions once, when the schema loads. Statements point
+# the stored positions at their own table reference and never look the names
+# up again. A table alias in a DML statement, a table-qualified name in the
+# stored expression and a rowid reference in a predicate all work.
+
+@cross-check-integrity
+test partial-index-rowid-predicate-insert {
+    CREATE TABLE p (x INTEGER, y INTEGER);
+    CREATE UNIQUE INDEX p_x_late ON p (x) WHERE rowid > 1;
+    INSERT INTO p VALUES (1, 1), (1, 2), (2, 3);
+    SELECT rowid, x, y FROM p ORDER BY rowid;
+}
+expect {
+    1|1|1
+    2|1|2
+    3|2|3
+}
+
+@cross-check-integrity
+test partial-index-rowid-predicate-unique-violation {
+    CREATE TABLE p (x INTEGER, y INTEGER);
+    CREATE UNIQUE INDEX p_x_late ON p (x) WHERE rowid > 1;
+    INSERT INTO p VALUES (1, 1), (1, 2), (2, 3);
+    INSERT INTO p VALUES (1, 4);
+}
+expect error {
+    UNIQUE constraint failed: p.x
+}
+
+@cross-check-integrity
+test partial-index-rowid-predicate-update-and-delete {
+    CREATE TABLE p (x INTEGER, y INTEGER);
+    CREATE UNIQUE INDEX p_x_late ON p (x) WHERE rowid > 1;
+    INSERT INTO p VALUES (1, 1), (1, 2), (2, 3);
+    UPDATE p SET x = 3 WHERE rowid = 2;
+    DELETE FROM p WHERE rowid = 3;
+    SELECT rowid, x, y FROM p ORDER BY rowid;
+}
+expect {
+    1|1|1
+    2|3|2
+}
+
+@cross-check-integrity
+test partial-index-rowid-predicate-upsert {
+    CREATE TABLE p (x INTEGER, y INTEGER);
+    CREATE UNIQUE INDEX p_x_late ON p (x) WHERE rowid > 1;
+    INSERT INTO p VALUES (1, 1), (1, 2), (2, 3);
+    INSERT INTO p VALUES (2, 9) ON CONFLICT (x) WHERE rowid > 1 DO UPDATE SET y = excluded.y;
+    SELECT rowid, x, y FROM p ORDER BY rowid;
+}
+expect {
+    1|1|1
+    2|1|2
+    3|2|9
+}
+
+@cross-check-integrity
+test partial-index-rowid-predicate-query {
+    CREATE TABLE p (x INTEGER, y INTEGER);
+    CREATE INDEX p_x_late ON p (x) WHERE rowid > 1;
+    INSERT INTO p VALUES (1, 1), (1, 2), (2, 3);
+    SELECT rowid, y FROM p WHERE rowid > 1 AND x = 1 ORDER BY rowid;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test expression-index-qualified-names-with-dml-alias {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX t_sum ON t (t.a + t.b);
+    INSERT INTO t VALUES (1, 2), (3, 4);
+    UPDATE t AS z SET a = a + 10 WHERE z.b = 2;
+    DELETE FROM t WHERE a = 3;
+    INSERT INTO t AS z VALUES (10, 4);
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    10|4
+    11|2
+}
+
+@cross-check-integrity
+test expression-index-qualified-names-unique-violation {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX t_sum ON t (t.a + t.b);
+    INSERT INTO t VALUES (1, 2);
+    UPDATE t AS z SET a = a + 10 WHERE z.b = 2;
+    INSERT INTO t VALUES (10, 3);
+}
+expect error {
+}
+
+@cross-check-integrity
+test check-constraint-qualified-name-with-dml-alias {
+    CREATE TABLE t (a INTEGER, b INTEGER, CHECK (t.a < t.b));
+    INSERT INTO t AS z VALUES (1, 2);
+    UPDATE t AS z SET b = b + 1 WHERE z.a = 1;
+    UPDATE t AS z SET b = 0 WHERE z.a = 1;
+}
+expect error {
+    CHECK constraint failed: t.a < t.b
+}
+
+@cross-check-integrity
+test drop-column-keeps-partial-index-predicate-and-check-positions {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, CHECK (c > 0));
+    CREATE UNIQUE INDEX t_b_big ON t (b) WHERE c > 10;
+    INSERT INTO t VALUES (1, 1, 5), (2, 1, 11);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t VALUES (1, 5);
+    SELECT b, c FROM t ORDER BY c;
+}
+expect {
+    1|5
+    1|5
+    1|11
+}
+
+@cross-check-integrity
+test drop-column-partial-index-predicate-still-enforced {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, CHECK (c > 0));
+    CREATE UNIQUE INDEX t_b_big ON t (b) WHERE c > 10;
+    INSERT INTO t VALUES (1, 1, 5), (2, 1, 11);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t VALUES (1, 12);
+}
+expect error {
+    UNIQUE constraint failed: t.b
+}
+
+@cross-check-integrity
+test drop-column-check-still-enforced {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, CHECK (c > 0));
+    INSERT INTO t VALUES (1, 1, 5);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t VALUES (3, 0);
+}
+expect error {
+    CHECK constraint failed: c > 0
+}
+
+@cross-check-integrity
+test rename-column-keeps-expression-index-enforced {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX t_sum ON t (a + b);
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN a TO c;
+    INSERT INTO t VALUES (2, 1);
+}
+expect error {
+}
+
+@cross-check-integrity
+test rename-column-keeps-expression-index-query {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE UNIQUE INDEX t_sum ON t (a + b);
+    INSERT INTO t VALUES (1, 2), (5, 5);
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT c, b FROM t WHERE c + b = 10;
+    SELECT sql FROM sqlite_schema WHERE name = 't_sum';
+}
+expect {
+    5|5
+    CREATE UNIQUE INDEX t_sum ON t (c + b)
+}

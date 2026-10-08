@@ -329,18 +329,25 @@ pub(super) fn find_custom_type_operator(
 /// 1. Clone the expression from `idx_col.expr`
 /// 2. Build the initial `column_regs` mapping (before decode)
 ///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
-/// columns are decoded in-place in `column_regs`.
+/// The expression keeps its stored `SELF_TABLE` positions, which read the
+/// registers in `column_regs` and `rowid_reg`. Custom-type columns are decoded
+/// in-place in `column_regs`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut expr: ast::Expr,
     columns: &[Column],
     column_regs: &mut [usize],
+    rowid_reg: usize,
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
-    crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
+    crate::schema::bind_schema_expr_in_place(
+        &mut expr,
+        ast::TableInternalId::SELF_TABLE,
+        resolver,
+    )?;
 
     let is_strict = table.is_strict;
     for (i, col) in columns.iter().enumerate() {
@@ -359,7 +366,7 @@ pub(crate) fn emit_dml_expr_index_value(
 
     let pairs = columns.iter().zip(column_regs.iter().copied());
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, rowid_reg),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {

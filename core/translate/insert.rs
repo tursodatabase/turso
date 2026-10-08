@@ -519,8 +519,8 @@ pub fn translate_insert(
         &btree_table,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -529,7 +529,9 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        }),
+        insertion.key_register(),
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -1366,6 +1368,7 @@ fn emit_partial_index_check(
         expr,
         &columns,
         &mut column_regs,
+        insertion.key_register(),
         table,
         reg,
     )?;
@@ -3584,6 +3587,7 @@ fn emit_index_column_value_for_insert(
             expr,
             &columns,
             &mut column_regs,
+            insertion.key_register(),
             table,
             dest_reg,
         )?;
@@ -3860,7 +3864,7 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)?
+                .bind_where_expr(table_references, resolver)?
                 .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();

@@ -9,9 +9,7 @@ use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResultOr;
@@ -3141,8 +3139,13 @@ pub struct UniqueSetColumn {
 pub struct CheckConstraint {
     /// Optional constraint name
     pub name: Option<String>,
-    /// CHECK expression
+    /// CHECK expression as written, with column names. It renders the schema
+    /// SQL and is rewritten when a column or the table is renamed.
     pub expr: ast::Expr,
+    /// The CHECK expression with column names resolved to table positions
+    /// (`Expr::Column { table: SELF_TABLE }`). Statements evaluate this form.
+    /// [BTreeTable::resolve_check_constraints] builds it from `expr`.
+    pub bound: ast::Expr,
     /// The expression's source text exactly as the user wrote it between the
     /// CHECK parens (whitespace-trimmed). SQLite reports an unnamed failed
     /// constraint with this text, not a re-rendering of the expression.
@@ -3162,6 +3165,7 @@ impl CheckConstraint {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
+            bound: expr.clone(),
             source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
         }
@@ -3501,14 +3505,15 @@ impl BTreeTable {
                     notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                    let rewritten = *rewrite_value_to_column(&dc.check, &col_name);
                     let name = dc
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{}_{}", td.name, i));
                     new_checks.try_push(CheckConstraint {
                         name: Some(name),
-                        expr: *rewritten,
+                        bound: rewritten.clone(),
+                        expr: rewritten,
                         source: None,
                         column: Some(col_name.clone()),
                     })?;
@@ -3520,6 +3525,7 @@ impl BTreeTable {
             self.columns[col_idx].set_notnull(true);
         }
         self.check_constraints.try_extend(new_checks)?;
+        self.resolve_check_constraints();
         Ok(())
     }
 
@@ -3903,8 +3909,19 @@ impl BTreeTable {
                 }
             }
         }
+        self.resolve_check_constraints();
         self.column_graph()?;
         Ok(())
+    }
+
+    /// Rebuild the bound form of every CHECK constraint from its written form.
+    /// Call this after the column list or the table name changes.
+    pub fn resolve_check_constraints(&mut self) {
+        for i in 0..self.check_constraints.len() {
+            let mut bound = self.check_constraints[i].expr.clone();
+            resolve_schema_expr_columns(&mut bound, self);
+            self.check_constraints[i].bound = bound;
+        }
     }
 
     pub fn shift_generated_column_indices_after_drop(
@@ -4320,26 +4337,172 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
-/// Re-render the SQL text of a generated-column expression using current column names. The input
+/// Resolve the column names of a stored index key expression, partial-index
+/// WHERE clause or CHECK constraint to positions in `table`
+/// (`Expr::Column { table: SELF_TABLE }` or `Expr::RowId { table: SELF_TABLE }`).
+/// A name that is not a column of `table` stays as written, so a stale schema
+/// still loads and the error appears when a statement uses the expression.
+pub fn resolve_schema_expr_columns(expr: &mut Expr, table: &BTreeTable) {
+    let table_name = normalize_ident(&table.name);
+    let _ = walk_expr_mut(expr, &mut |e| {
+        let resolved = match e {
+            Expr::Id(name) | Expr::Name(name) => {
+                schema_expr_leaf(name.as_str(), &table.columns, table.has_rowid)
+            }
+            Expr::Qualified(namespace, name) | Expr::DoublyQualified(_, namespace, name)
+                if normalize_ident(namespace.as_str()) == table_name =>
+            {
+                schema_expr_leaf(name.as_str(), &table.columns, table.has_rowid)
+            }
+            _ => None,
+        };
+        if let Some(resolved) = resolved {
+            *e = resolved;
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+fn schema_expr_leaf(name: &str, columns: &[Column], has_rowid: bool) -> Option<Expr> {
+    let name = normalize_ident(name);
+    if let Some(column) = find_column_index_by_name(columns, &name) {
+        return Some(Expr::Column {
+            database: None,
+            table: TableInternalId::SELF_TABLE,
+            column,
+            is_rowid_alias: columns[column].is_rowid_alias(),
+        });
+    }
+    if has_rowid
+        && ROWID_STRS
+            .iter()
+            .any(|rowid| rowid.eq_ignore_ascii_case(&name))
+    {
+        return Some(Expr::RowId {
+            database: None,
+            table: TableInternalId::SELF_TABLE,
+        });
+    }
+    None
+}
+
+/// Point the SELF_TABLE references of a stored schema expression at one table
+/// reference of a statement.
+pub fn rebase_schema_expr(expr: &mut Expr, internal_id: TableInternalId) {
+    let _ = walk_expr_mut(expr, &mut |e| {
+        match e {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
+                *table = internal_id;
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// Copy a stored schema expression for one table reference of a statement.
+/// A name that schema load could not resolve is handled like an unknown
+/// column in a query: it becomes a string when double-quoted strings are
+/// enabled, otherwise it is an error.
+pub fn bind_schema_expr(
+    expr: &Expr,
+    internal_id: TableInternalId,
+    resolver: &Resolver,
+) -> Result<Expr> {
+    let mut bound = expr.clone();
+    bind_schema_expr_in_place(&mut bound, internal_id, resolver)?;
+    Ok(bound)
+}
+
+/// Same as [bind_schema_expr], on an expression the caller already owns.
+pub fn bind_schema_expr_in_place(
+    expr: &mut Expr,
+    internal_id: TableInternalId,
+    resolver: &Resolver,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |e| {
+        match e {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
+                *table = internal_id;
+            }
+            Expr::Id(name) | Expr::Name(name) => {
+                if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
+                    *e = Expr::Literal(ast::Literal::String(name.as_literal()));
+                } else {
+                    bail_parse_error!("no such column: {}", name.as_str());
+                }
+            }
+            Expr::Qualified(namespace, name) => {
+                bail_parse_error!("no such column: {}.{}", namespace.as_str(), name.as_str());
+            }
+            Expr::DoublyQualified(database, namespace, name) => {
+                bail_parse_error!(
+                    "no such column: {}.{}.{}",
+                    database.as_str(),
+                    namespace.as_str(),
+                    name.as_str()
+                );
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// True when a stored schema expression reads the table column at `column_index`.
+pub fn schema_expr_references_column(expr: &Expr, column_index: usize) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if let Expr::Column { table, column, .. } = e {
+            if table.is_self_table() && *column == column_index {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Move the positions in a stored schema expression down by one after the
+/// column at `dropped_index` is removed from the table.
+pub fn shift_schema_expr_positions_after_drop(expr: &mut Expr, dropped_index: usize) {
+    let _ = walk_expr_mut(expr, &mut |e| {
+        if let Expr::Column { table, column, .. } = e {
+            if table.is_self_table() && *column > dropped_index {
+                *column -= 1;
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// Re-render the SQL text of a stored schema expression (generated column,
+/// index key expression, partial-index WHERE clause) using current column names. The input
 /// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
 /// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
 /// stringifying so the result round-trips through the parser, even if a referenced column was
 /// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+pub fn render_schema_expr_sql(expr: &Expr, columns: &[Column]) -> String {
     let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
+    let _ = walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
                 if let Some(col) = columns.get(*column) {
                     if let Some(name) = col.name.as_ref() {
                         *e = Expr::Id(Name::exact(name.clone()));
                     }
                 }
             }
+            Expr::RowId { table, .. } if table.is_self_table() => {
+                *e = Expr::Id(Name::exact(ROWID_STRS[0].to_string()));
+            }
+            _ => {}
         }
         Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
+    });
+    clone.to_string()
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -5969,6 +6132,10 @@ impl Index {
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let index_columns = resolve_sorted_columns(table, &columns)?;
+                let where_clause = where_clause.map(|mut predicate| {
+                    resolve_schema_expr_columns(&mut predicate, table);
+                    predicate
+                });
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -6248,70 +6415,50 @@ impl Index {
         ok
     }
 
-    /// Bind a copy of this index's WHERE clause against the given table references.
+    /// Copy this index's WHERE clause for the statement's reference to the
+    /// indexed table.
     ///
-    /// Returns `Ok(None)` when the index has no WHERE clause. Binding errors are
-    /// propagated, never swallowed: callers must not treat `None` as "binding failed".
-    ///
-    /// The predicate may qualify columns with the table's real name
-    /// (e.g. `CREATE INDEX i ON t(a) WHERE t.b > 0`), while the DML statement
-    /// may refer to that table only under an alias (e.g. `UPDATE t AS z ...`).
-    /// Rewrite such qualifiers to the identifier the statement uses, so the
-    /// predicate always resolves against the index's own table, like in SQLite.
+    /// Returns `Ok(None)` when the index has no WHERE clause. Errors are
+    /// propagated, never swallowed: callers must not treat `None` as a failure.
     pub fn bind_where_expr(
         &self,
-        table_refs: Option<&mut TableReferences>,
+        table_refs: &TableReferences,
         resolver: &Resolver,
     ) -> crate::Result<Option<ast::Expr>> {
         let Some(where_clause) = &self.where_clause else {
             return Ok(None);
         };
-        let mut expr = where_clause.clone();
-        let target_identifier = table_refs.as_deref().and_then(|refs| {
-            // Only a real b-tree table can be the DML target that owns this index.
-            // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
-            // UPDATE t ...`) must not be picked, so match on b-tree identity.
-            let mut matches = refs
-                .joined_tables()
-                .iter()
-                .map(|jt| (&jt.identifier, &jt.table))
-                .chain(
-                    refs.outer_query_refs()
-                        .iter()
-                        .map(|r| (&r.identifier, &r.table)),
-                )
-                .filter(|(_, table)| {
-                    table
-                        .btree()
-                        .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
-                })
-                .map(|(identifier, _)| identifier);
-            let target = matches.next().cloned();
-            assert!(
-                matches.next().is_none(),
-                "multiple table references match the table of partial index {}",
+        // Only a real b-tree table can be the DML target that owns this index.
+        // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
+        // UPDATE t ...`) must not be picked, so match on b-tree identity.
+        let mut matches = table_refs
+            .joined_tables()
+            .iter()
+            .map(|jt| (jt.internal_id, &jt.table))
+            .chain(
+                table_refs
+                    .outer_query_refs()
+                    .iter()
+                    .map(|r| (r.internal_id, &r.table)),
+            )
+            .filter(|(_, table)| {
+                table
+                    .btree()
+                    .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
+            })
+            .map(|(internal_id, _)| internal_id);
+        let Some(internal_id) = matches.next() else {
+            return Err(LimboError::InternalError(format!(
+                "no table reference matches the table of partial index {}",
                 self.name
-            );
-            target
-        });
-        if let Some(identifier) = target_identifier {
-            walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
-                if let Expr::Qualified(ns, _) | Expr::DoublyQualified(_, ns, _) = e {
-                    if normalize_ident(ns.as_str()) == self.table_name {
-                        *ns = Name::exact(identifier.clone());
-                    }
-                }
-                Ok(WalkControl::Continue)
-            })?;
-        }
-        bind_and_rewrite_expr(
-            &mut expr,
-            table_refs,
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        Ok(Some(*expr))
+            )));
+        };
+        assert!(
+            matches.next().is_none(),
+            "multiple table references match the table of partial index {}",
+            self.name
+        );
+        Ok(Some(bind_schema_expr(where_clause, internal_id, resolver)?))
     }
 }
 
@@ -7172,6 +7319,84 @@ mod tests {
         assert_eq!(index.columns[1].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
+        Ok(())
+    }
+
+    /// Column positions, rowid reads and names left in a stored expression.
+    fn stored_expr_leaves(expr: &Expr) -> (Vec<usize>, usize, usize) {
+        let mut positions = Vec::new();
+        let mut rowids = 0;
+        let mut names = 0;
+        let _ = walk_expr(expr, &mut |e| {
+            match e {
+                Expr::Column { table, column, .. } => {
+                    assert!(
+                        table.is_self_table(),
+                        "stored expression must use SELF_TABLE"
+                    );
+                    positions.push(*column);
+                }
+                Expr::RowId { table, .. } => {
+                    assert!(
+                        table.is_self_table(),
+                        "stored expression must use SELF_TABLE"
+                    );
+                    rowids += 1;
+                }
+                Expr::Id(_) | Expr::Name(_) | Expr::Qualified(..) | Expr::DoublyQualified(..) => {
+                    names += 1;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        });
+        (positions, rowids, names)
+    }
+
+    #[test]
+    fn schema_load_resolves_index_and_check_expressions_to_positions() -> Result<()> {
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (t.a > 0 AND b < rowid))",
+            2,
+        )?;
+        let check = &table.check_constraints[0];
+        assert_eq!(stored_expr_leaves(&check.bound), (vec![0, 1], 1, 0));
+        assert_eq!(stored_expr_leaves(&check.expr), (vec![], 0, 3));
+
+        let index = Index::from_sql(
+            &SymbolTable::default(),
+            "CREATE INDEX i ON t (a + t.b) WHERE b > rowid",
+            3,
+            &table,
+        )?;
+        let key = index.columns[0]
+            .expr
+            .as_deref()
+            .expect("expression index key");
+        assert_eq!(stored_expr_leaves(key), (vec![0, 1], 0, 0));
+        assert_eq!(index.columns[0].name, "a + t.b");
+        let predicate = index
+            .where_clause
+            .as_deref()
+            .expect("partial index predicate");
+        assert_eq!(stored_expr_leaves(predicate), (vec![1], 1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_load_keeps_unknown_names_in_stored_expressions() -> Result<()> {
+        let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER)", 2)?;
+        let index = Index::from_sql(
+            &SymbolTable::default(),
+            "CREATE INDEX i ON t (a) WHERE gone > 0",
+            3,
+            &table,
+        )?;
+        let predicate = index
+            .where_clause
+            .as_deref()
+            .expect("partial index predicate");
+        assert_eq!(stored_expr_leaves(predicate), (vec![], 0, 1));
         Ok(())
     }
 

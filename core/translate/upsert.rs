@@ -7,7 +7,10 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{
+    resolve_schema_expr_columns, BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL,
+    ROWID_SENTINEL,
+};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -258,60 +261,12 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
-fn bind_partial_index_where_expr(expr: &mut ast::Expr, table: &Table) {
-    let table_name = normalize_ident(table.get_name());
-
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Id(name) => {
-                    if let Some((column, col)) =
-                        table.get_column_by_name(&normalize_ident(name.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col)
-                    if normalize_ident(ns.as_str()).eq_ignore_ascii_case(&table_name) =>
-                {
-                    if let Some((column, table_col)) =
-                        table.get_column_by_name(&normalize_ident(col.as_str()))
-                    {
-                        *e = ast::Expr::Column {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                            column,
-                            is_rowid_alias: table_col.is_rowid_alias(),
-                        };
-                    } else if ROWID_STRS
-                        .iter()
-                        .any(|rowid| rowid.eq_ignore_ascii_case(col.as_str()))
-                    {
-                        *e = ast::Expr::RowId {
-                            database: None,
-                            table: ast::TableInternalId::SELF_TABLE,
-                        };
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
+/// Resolve the column names of an ON CONFLICT target expression the same way
+/// the schema resolves the stored index expressions it is compared with.
+fn bind_conflict_target_expr(expr: &mut ast::Expr, table: &Table) {
+    if let Some(btree) = table.btree() {
+        resolve_schema_expr_columns(expr, &btree);
+    }
 }
 
 fn partial_index_where_clauses_match(
@@ -320,11 +275,8 @@ fn partial_index_where_clauses_match(
     table: &Table,
 ) -> bool {
     let mut target_where = target_where.clone();
-    let mut index_where = index_where.clone();
-    // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
-    bind_partial_index_where_expr(&mut target_where, table);
-    bind_partial_index_where_expr(&mut index_where, table);
-    exprs_are_equivalent(&target_where, &index_where)
+    bind_conflict_target_expr(&mut target_where, table);
+    exprs_are_equivalent(&target_where, index_where)
 }
 
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
@@ -381,12 +333,14 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // Expression target (e.g. lower(val)): match against expression index
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
+            let mut target_expr = target_expr.clone();
+            bind_conflict_target_expr(&mut target_expr, table);
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
-                    if exprs_are_equivalent(target_expr, idx_expr) {
+                    if exprs_are_equivalent(&target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
                             let icoll = effective_collation_for_index_col(ic, table);
@@ -1678,6 +1632,7 @@ fn eval_partial_pred_for_row_image(
         expr,
         columns,
         &mut column_regs,
+        rowid_reg,
         &bt,
         r,
     )
@@ -1718,6 +1673,7 @@ fn emit_upsert_expr_index_value(
         expr,
         columns,
         &mut column_regs,
+        rowid_reg,
         &bt,
         dest_reg,
     )?;

@@ -13,8 +13,8 @@ use crate::mvcc::database::{
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
+    render_schema_expr_sql, shift_schema_expr_positions_after_drop, FromDefinitionFlags, Schema,
+    Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -16881,6 +16881,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                btree.resolve_check_constraints();
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17080,6 +17081,7 @@ pub fn op_drop_column(
         });
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
+        btree.resolve_check_constraints();
         Ok(())
     })??;
 
@@ -17114,18 +17116,11 @@ pub fn op_drop_column(
                         index_column.pos_in_table -= 1;
                     }
                     if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
-                            }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
+                        shift_schema_expr_positions_after_drop(expr, *column_index);
                     }
+                }
+                if let Some(ref mut predicate) = index.where_clause {
+                    shift_schema_expr_positions_after_drop(predicate, *column_index);
                 }
             }
         }
@@ -17309,8 +17304,7 @@ pub fn op_alter_column(
                 let cols_view = btree.columns();
                 if let Some(new_sql) = cols_view[i]
                     .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
-                    .transpose()?
+                    .map(|expr| render_schema_expr_sql(expr, cols_view))
                 {
                     btree.columns_mut()[i].set_generated_original_sql(new_sql)
                 }
@@ -17326,10 +17320,9 @@ pub fn op_alter_column(
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                            ic.name = expr.to_string();
+                    if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                        if let Some(expr) = &ic.expr {
+                            ic.name = render_schema_expr_sql(expr, btree.columns());
                         }
                     }
                     if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
@@ -17345,10 +17338,6 @@ pub fn op_alter_column(
                             .generated_expr()
                             .map(|expr| Box::new(expr.clone()));
                     }
-                }
-                // Update partial index WHERE clause column references
-                if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
                 }
             }
         }
@@ -17382,6 +17371,7 @@ pub fn op_alter_column(
                 }
             }
         }
+        btree.resolve_check_constraints();
 
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
         if !*rename {

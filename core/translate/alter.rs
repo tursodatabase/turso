@@ -1,10 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::{ast, parser::Parser};
 
 use super::{
     index::emit_refill_index,
@@ -15,20 +12,20 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
+        collect_column_dependencies_of_expr, render_schema_expr_sql, schema_expr_references_column,
+        BTreeTable, CheckConstraint, Column, ColumnLayout, ForeignKey, FromDefinitionFlags, Index,
+        EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::ColumnMask,
         trigger::create_trigger_to_sql,
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        parse_numeric_literal, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
+        rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -974,8 +971,11 @@ pub fn translate_alter_table(
                 }
                 // Referenced in expression index
                 for idx_col in &index.columns {
+                    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+                        continue;
+                    }
                     if let Some(expr) = &idx_col.expr {
-                        if check_expr_references_column(expr, &col_normalized) {
+                        if schema_expr_references_column(expr, dropped_index) {
                             return Err(LimboError::ParseError(format!(
                                 "error in index {} after drop column: no such column: {column_name}",
                                 index.name
@@ -984,52 +984,8 @@ pub fn translate_alter_table(
                     }
                 }
                 // Referenced in partial index
-                if index.where_clause.is_some() {
-                    let mut table_references = TableReferences::new(
-                        vec![],
-                        vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
-                            internal_id: TableInternalId::from(0),
-                            table: Table::BTree(Arc::new(btree.clone())),
-                            join_info: None,
-                            col_used_mask: ColumnUsedMask::default(),
-                            cte_select: None,
-                            cte_explicit_columns: vec![],
-                            cte_id: None,
-                            cte_definition_only: false,
-                            rowid_referenced: false,
-                            outer_join_may_null_extend: false,
-                            scope_depth: 0,
-                        }],
-                    );
-                    let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), resolver)?
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
-                            )
-                        })?;
-                    let mut column_referenced = false;
-                    walk_expr(
-                        &where_copy,
-                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                            if let ast::Expr::Column {
-                                table,
-                                column: column_index,
-                                ..
-                            } = e
-                            {
-                                if *table == TableInternalId::from(0)
-                                    && *column_index == dropped_index
-                                {
-                                    column_referenced = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            Ok(WalkControl::Continue)
-                        },
-                    )?;
-                    if column_referenced {
+                if let Some(predicate) = &index.where_clause {
+                    if schema_expr_references_column(predicate, dropped_index) {
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": indexed"
                         )));
@@ -2367,14 +2323,6 @@ fn indexes_affected_by_column_rewrite(
     let mut affected_columns = original_table.columns_affected_by_update([column_index])?;
     affected_columns.union_with(&rewritten_table.columns_affected_by_update([column_index])?)?;
     let affected_names = affected_column_names(original_table, rewritten_table, &affected_columns);
-    let old_column_name = original_table.columns()[column_index]
-        .name
-        .as_deref()
-        .expect("ALTER COLUMN target must be named");
-    let new_column_name = rewritten_table.columns()[column_index]
-        .name
-        .as_deref()
-        .expect("ALTER COLUMN replacement must be named");
 
     Ok(indexes
         .iter()
@@ -2386,14 +2334,7 @@ fn indexes_affected_by_column_rewrite(
                 &affected_names,
             )
         })
-        .map(|index| {
-            rewrite_index_for_column_rewrite(
-                index.as_ref(),
-                rewritten_table,
-                old_column_name,
-                new_column_name,
-            )
-        })
+        .map(|index| rewrite_index_for_column_rewrite(index.as_ref(), rewritten_table))
         .collect())
 }
 
@@ -2455,23 +2396,19 @@ fn expr_references_any_affected_column(
 }
 
 // Build the post-ALTER index metadata used when refilling an affected index.
-// Expression-index terms and partial-index WHERE clauses need identifier
-// rewrites, while direct index columns need to be refreshed from the rewritten
-// table so renamed columns and generated-column expressions stay in sync.
+// Expression-index terms and partial-index WHERE clauses store column
+// positions, so they stay valid; expression-index terms only need their
+// displayed name refreshed. Direct index columns need to be refreshed from
+// the rewritten table so renamed columns and generated-column expressions
+// stay in sync.
 // Example: after `x NUMERIC -> y TEXT`, `INDEX ON t(typeof(x)) WHERE x IS NOT NULL`
 // must be refilled as `INDEX ON t(typeof(y)) WHERE y IS NOT NULL`.
-fn rewrite_index_for_column_rewrite(
-    index: &Index,
-    rewritten_table: &BTreeTable,
-    old_column_name: &str,
-    new_column_name: &str,
-) -> Arc<Index> {
+fn rewrite_index_for_column_rewrite(index: &Index, rewritten_table: &BTreeTable) -> Arc<Index> {
     let mut rewritten_index = index.clone();
     for column in &mut rewritten_index.columns {
-        if let Some(expr) = &mut column.expr {
-            rename_identifiers(expr.as_mut(), old_column_name, new_column_name);
-            if column.pos_in_table == EXPR_INDEX_SENTINEL {
-                column.name = expr.to_string();
+        if column.pos_in_table == EXPR_INDEX_SENTINEL {
+            if let Some(expr) = &column.expr {
+                column.name = render_schema_expr_sql(expr, rewritten_table.columns());
             }
         }
 
@@ -2485,10 +2422,6 @@ fn rewrite_index_for_column_rewrite(
                 .generated_expr()
                 .map(|expr| Box::new(expr.clone()));
         }
-    }
-
-    if let Some(where_clause) = &mut rewritten_index.where_clause {
-        rename_identifiers(where_clause, old_column_name, new_column_name);
     }
 
     Arc::new(rewritten_index)

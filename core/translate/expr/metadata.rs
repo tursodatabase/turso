@@ -280,7 +280,7 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    let normalized = normalize_expr_for_index_matching(expr, table, referenced_tables);
+    let normalized = normalize_expr_for_index_matching(expr, table);
     if !table
         .expression_index_usages
         .iter()

@@ -199,6 +199,9 @@ fn translate_expr_by_kind(
         ast::Expr::Column { .. } => {
             translate_column_expr(program, referenced_tables, expr, target_register, resolver)
         }
+        ast::Expr::RowId { table, .. } if table.is_self_table() => {
+            translate_self_table_rowid_expr(program, expr, target_register, resolver)
+        }
         ast::Expr::RowId { .. } => {
             translate_rowid_expr(program, referenced_tables, expr, target_register)
         }
@@ -2376,6 +2379,41 @@ fn translate_self_table_column_expr(
                     "SELF_TABLE column reference outside of generated column context"
                 );
             }
+        }
+    })
+}
+
+#[inline(never)]
+fn translate_self_table_rowid_expr(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::RowId { database, .. } = expr else {
+        unreachable!("translate_self_table_rowid_expr expects Expr::RowId");
+    };
+    resolver.with_existing_self_table_context(|self_table_context| match self_table_context {
+        Some(SelfTableContext::ForSelect {
+            table_ref_id,
+            ref referenced_tables,
+        }) => {
+            let rowid = Expr::RowId {
+                database: *database,
+                table: *table_ref_id,
+            };
+            translate_rowid_expr(program, Some(referenced_tables), &rowid, target_register)
+        }
+        Some(SelfTableContext::ForDML { dml_ctx, .. }) => {
+            program.emit_insn(Insn::Copy {
+                src_reg: dml_ctx.rowid_reg(),
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+            Ok(target_register)
+        }
+        None => {
+            crate::bail_parse_error!("SELF_TABLE rowid reference outside of a table context");
         }
     })
 }

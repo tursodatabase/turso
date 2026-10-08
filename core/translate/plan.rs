@@ -2029,7 +2029,7 @@ impl TableReferences {
         else {
             return;
         };
-        let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        let normalized = normalize_expr_for_index_matching(expr, table_ref);
         let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
         if let Some(table_ref_mut) = self
             .joined_tables_mut()

@@ -8,8 +8,8 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        emit_table_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -2029,7 +2029,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs, rowid_reg);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2063,14 +2063,7 @@ pub(crate) fn emit_index_column_value_old_image(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        let expr = crate::schema::bind_schema_expr(expr, table_internal_id, resolver)?;
 
         let self_table_context = SelfTableContext::ForSelect {
             table_ref_id: table_internal_id,
@@ -2166,6 +2159,7 @@ fn emit_index_column_value_new_image(
             expr,
             columns,
             &mut column_regs,
+            rowid_reg,
             table,
             dest_reg,
         )?;
@@ -2214,27 +2208,19 @@ fn emit_check_constraint_bytecode(
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
-    table_name: &str,
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
-        let mut rewritten_expr = check_constraint.expr.clone();
-        if let Some(referenced_tables) = referenced_tables {
-            let mut binding_tables = referenced_tables.clone();
-            if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
-                // CHECK expressions come from schema SQL and may use the base table name
-                // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
-            }
-            bind_and_rewrite_expr(
-                &mut rewritten_expr,
-                Some(&mut binding_tables),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-        }
+        let rewritten_expr =
+            match referenced_tables.and_then(|tables| tables.joined_tables().first()) {
+                Some(joined_table) => crate::schema::bind_schema_expr(
+                    &check_constraint.bound,
+                    joined_table.internal_id,
+                    resolver,
+                )?,
+                None => check_constraint.bound.clone(),
+            };
 
         translate_expr_no_constant_opt(
             program,
@@ -2401,7 +2387,6 @@ pub(crate) fn emit_check_constraints<'a>(
         or_conflict,
         skip_row_label,
         referenced_tables,
-        table_name,
     );
 
     // Always restore resolver state, even on error.

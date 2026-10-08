@@ -2,12 +2,12 @@ use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
-    schema::{Column, Index, Schema},
+    schema::{rebase_schema_expr, Column, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
-            walk_expr_mut, WalkControl,
+            WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -17,7 +17,7 @@ use crate::{
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
-            TableMask, ROWID_STRS,
+            TableMask,
         },
         Resolver,
     },
@@ -1277,8 +1277,7 @@ pub fn constraints_from_where_clause(
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
                     None => constraint.expr.as_ref().and_then(|e| {
-                        let normalized =
-                            normalize_expr_for_index_matching(e, table_reference, table_references);
+                        let normalized = normalize_expr_for_index_matching(e, table_reference);
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
@@ -1722,12 +1721,12 @@ pub(super) fn partial_index_predicate_terms(
         }
         true
     };
-    // Bind the index WHERE expression's column references to this query's
+    // Point the index WHERE expression's column references at this query's
     // table reference so it can be compared symmetrically against bound query
     // WHERE terms. Each conjunct of the index WHERE must be implied by some
     // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
-    bind_partial_index_columns(&mut bound, table_reference);
+    rebase_schema_expr(&mut bound, table_reference.internal_id);
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
@@ -1766,65 +1765,6 @@ pub(super) fn can_use_partial_index(
     partial_index_predicate_terms(index, table_reference, query_where_clause).is_some()
 }
 
-/// Rewrite identifier nodes in a partial-index WHERE expression to bound
-/// `Expr::Column` / `Expr::RowId` against `table_reference`. Partial-index
-/// WHERE clauses are validated to only reference columns of the indexed
-/// table (`Index::validate_where_expr`), so this minimal binder is enough
-/// to make the expression directly comparable to a bound query expression
-/// via `exprs_are_equivalent` — without threading a full `Resolver`.
-fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
-    let column_pos = |name: &str| -> Option<usize> {
-        table_reference.columns().iter().position(|c| {
-            c.name
-                .as_ref()
-                .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
-        })
-    };
-    let is_rowid_keyword = |name: &str| ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name));
-    let qualifier_matches = |ns: &str| -> bool {
-        ns.eq_ignore_ascii_case(&table_reference.identifier)
-            || ns.eq_ignore_ascii_case(table_reference.table.get_name())
-    };
-    let make_column = |col_idx: usize| -> ast::Expr {
-        let col = &table_reference.columns()[col_idx];
-        ast::Expr::Column {
-            database: None,
-            table: table_reference.internal_id,
-            column: col_idx,
-            is_rowid_alias: col.is_rowid_alias(),
-        }
-    };
-    let make_rowid = || -> ast::Expr {
-        ast::Expr::RowId {
-            database: None,
-            table: table_reference.internal_id,
-        }
-    };
-
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Id(name) => {
-                if let Some(idx) = column_pos(name.as_str()) {
-                    *e = make_column(idx);
-                } else if is_rowid_keyword(name.as_str()) {
-                    *e = make_rowid();
-                }
-            }
-            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                if qualifier_matches(ns.as_str()) {
-                    if let Some(idx) = column_pos(col.as_str()) {
-                        *e = make_column(idx);
-                    } else if is_rowid_keyword(col.as_str()) {
-                        *e = make_rowid();
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
 /// Estimate the selectivity of a partial index's WHERE clause, i.e. what
 /// fraction of the table's rows pass the predicate (and therefore appear in
 /// the partial index). The expression is bound to the table's column space
@@ -1838,7 +1778,7 @@ pub fn estimate_partial_index_where_selectivity(
     params: &CostModelParams,
 ) -> f64 {
     let mut bound = where_expr.clone();
-    bind_partial_index_columns(&mut bound, table_reference);
+    rebase_schema_expr(&mut bound, table_reference.internal_id);
     estimate_bound_expr_selectivity(&bound, table_reference, schema, available_indexes, params)
 }
 

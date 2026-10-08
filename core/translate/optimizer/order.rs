@@ -808,8 +808,7 @@ fn target_matches_order_column(
             // was stored in the schema. A query may write the same expression in
             // a slightly different but equivalent way, so normalize before the
             // final comparison.
-            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
-            let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
+            let normalized = normalize_expr_for_index_matching(target_expr, table_ref);
             exprs_are_equivalent(&normalized, idx_expr)
         }
         _ => false,

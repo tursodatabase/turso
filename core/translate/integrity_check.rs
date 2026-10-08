@@ -4,12 +4,14 @@ use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
+    schema::{
+        bind_schema_expr, BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL,
+    },
     translate::{
         emitter::Resolver,
         expr::{
-            bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-            BindingBehavior, ConditionMetadata, NoConstantOptReason,
+            translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
+            NoConstantOptReason,
         },
         plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
     },
@@ -155,18 +157,15 @@ fn emit_row_missing_from_index_error(
 
 fn bind_expr_for_table(
     expr: &ast::Expr,
-    table_references: &mut TableReferences,
+    table_references: &TableReferences,
     resolver: &Resolver,
 ) -> crate::Result<ast::Expr> {
-    let mut out = expr.clone();
-    bind_and_rewrite_expr(
-        &mut out,
-        Some(table_references),
-        None,
-        resolver,
-        BindingBehavior::ResultColumnsNotAllowed,
-    )?;
-    Ok(out)
+    let table_internal_id = table_references
+        .joined_tables()
+        .first()
+        .expect("integrity check scans one table")
+        .internal_id;
+    bind_schema_expr(expr, table_internal_id, resolver)
 }
 
 fn translate_integrity_check_for_schema(
@@ -284,7 +283,7 @@ fn translate_integrity_check_for_schema(
             db: database_id,
         });
 
-        let mut table_references = TableReferences::new(
+        let table_references = TableReferences::new(
             vec![JoinedTable {
                 op: Operation::Scan(Scan::BTreeTable {
                     iter_dir: IterationDirection::Forwards,
@@ -324,7 +323,7 @@ fn translate_integrity_check_for_schema(
 
                 let mut where_expr = None;
                 if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &mut table_references, resolver)?);
+                    where_expr = Some(bind_expr_for_table(pred, &table_references, resolver)?);
                 }
 
                 let mut columns = Vec::with_capacity(index.columns.len());
@@ -338,7 +337,7 @@ fn translate_integrity_check_for_schema(
                             None
                         };
                         columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                            Box::new(bind_expr_for_table(expr, &table_references, resolver)?),
                             affinity,
                         ));
                         unique_nullable.push(true);
@@ -362,8 +361,8 @@ fn translate_integrity_check_for_schema(
         let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
         for check in &btree_table.check_constraints {
             bound_checks.push(bind_expr_for_table(
-                &check.expr,
-                &mut table_references,
+                &check.bound,
+                &table_references,
                 resolver,
             )?);
         }
@@ -396,7 +395,7 @@ fn translate_integrity_check_for_schema(
             .map(|(idx, col)| {
                 let col_ref = match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
-                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                        Box::new(bind_expr_for_table(expr, &table_references, resolver)?),
                         Some(col.affinity()),
                     ),
                     GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
