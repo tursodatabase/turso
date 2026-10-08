@@ -35,6 +35,7 @@ use crate::{
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
+        lateral::LateralSelect,
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
@@ -277,6 +278,7 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::LateralMatchesJsonEach { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
@@ -1252,6 +1254,42 @@ impl Property {
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
+            Property::LateralMatchesJsonEach {
+                select,
+                json_each_joins,
+            } => {
+                let tables: Vec<String> = select.dependencies().into_iter().collect();
+                let json_each_select = select.with_json_each_joins(json_each_joins);
+                vec![
+                    assume_tables_exist(tables.clone(), connection_index),
+                    InteractionType::Query(Query::LateralSelect(select.clone())),
+                    InteractionType::Query(Query::LateralSelect(json_each_select)),
+                    InteractionType::Assertion(Assertion::new(
+                        "LATERAL joins and their json_each form should return the same rows"
+                            .to_string(),
+                        move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
+                            let [.., lateral_rows, json_each_rows] = stack.as_slice() else {
+                                return Err(LimboError::InternalError(
+                                    "Not enough result sets on the stack".to_string(),
+                                ));
+                            };
+                            match (lateral_rows, json_each_rows) {
+                                (Ok(lateral_rows), Ok(json_each_rows)) => {
+                                    Ok(compare_rows_in_any_order(lateral_rows, json_each_rows))
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    tracing::error!("Error in LATERAL or json_each query: {}", e);
+                                    Err(LimboError::InternalError(e.to_string()))
+                                }
+                            }
+                        },
+                        tables,
+                    )),
+                ]
+                .into_iter()
+                .map(InteractionBuilder::with_interaction)
+                .collect()
+            }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
@@ -1408,6 +1446,47 @@ impl Property {
             })
             .collect()
     }
+}
+
+fn assume_tables_exist(tables: Vec<String>, connection_index: usize) -> InteractionType {
+    InteractionType::Assumption(Assertion::new(
+        format!("tables ({}) exist", tables.join(", ")),
+        {
+            let tables = tables.clone();
+            move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                let conn_tables = env.get_conn_tables(connection_index);
+                let missing_tables: Vec<&String> = tables
+                    .iter()
+                    .filter(|table| !conn_tables.iter().any(|t| t.name == **table))
+                    .collect();
+                if missing_tables.is_empty() {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(format!("missing tables: {missing_tables:?}")))
+                }
+            }
+        },
+        tables,
+    ))
+}
+
+fn compare_rows_in_any_order(
+    lateral_rows: &[Vec<SimValue>],
+    json_each_rows: &[Vec<SimValue>],
+) -> Result<(), String> {
+    let mut lateral_rows = lateral_rows.to_vec();
+    let mut json_each_rows = json_each_rows.to_vec();
+    lateral_rows.sort();
+    json_each_rows.sort();
+    if lateral_rows == json_each_rows {
+        return Ok(());
+    }
+    print_diff(&lateral_rows, &json_each_rows, "LATERAL", "json_each");
+    Err(format!(
+        "LATERAL returned {} rows and json_each returned {} rows, and the rows are not the same",
+        lateral_rows.len(),
+        json_each_rows.len()
+    ))
 }
 
 fn random_main_table_write<R: rand::Rng + ?Sized>(
@@ -2223,6 +2302,29 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_lateral_matches_json_each<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let select = LateralSelect::arbitrary(rng, ctx);
+    let json_each_joins = arbitrary_json_each_joins(rng, select.joins.len());
+    Property::LateralMatchesJsonEach {
+        select,
+        json_each_joins,
+    }
+}
+
+fn arbitrary_json_each_joins<R: rand::Rng + ?Sized>(rng: &mut R, join_count: usize) -> Vec<usize> {
+    let mut json_each_joins: Vec<usize> =
+        (0..join_count).filter(|_| rng.random_bool(0.5)).collect();
+    if json_each_joins.is_empty() {
+        json_each_joins.push(pick_index(join_count, rng));
+    }
+    json_each_joins
+}
+
 fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
@@ -2329,6 +2431,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
             }
+            PropertyDiscriminants::LateralMatchesJsonEach => property_lateral_matches_json_each,
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
             PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
@@ -2434,6 +2537,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::LateralMatchesJsonEach => {
+                if !env.opts.disable_lateral_matches_json_each && !ctx.tables().is_empty() {
+                    remaining.select / 3
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::FsyncNoWait => {
                 if env.profile.io.enable
                     && !env.opts.disable_fsync_no_wait
@@ -2500,6 +2610,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::LateralMatchesJsonEach => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
@@ -2588,4 +2699,95 @@ fn print_row(row: &[SimValue]) -> String {
         })
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use clap::Parser as _;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+    use sql_generation::generation::Arbitrary;
+    use sql_generation::model::query::{Create, Insert};
+    use turso_core::Value;
+
+    use super::*;
+    use crate::profiles::Profile;
+    use crate::runner::cli::SimulatorCLI;
+    use crate::runner::env::{Paths, SimulationType};
+    use crate::runner::execution::execute_interaction;
+
+    #[test]
+    fn lateral_and_json_each_queries_return_the_same_rows_on_random_tables() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = SimulatorEnv::new(
+            0x1A7E,
+            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
+            Paths::new(output_dir.path()),
+            SimulationType::Default,
+            &Profile::default(),
+        );
+        env.connect(0);
+        let mut rng = ChaCha8Rng::seed_from_u64(0x1A7E);
+        let mut stack = Vec::new();
+
+        for _ in 0..3 {
+            let create = Query::Create(Create::arbitrary(&mut rng, &env.connection_context(0)));
+            execute_query(&mut env, create, &mut stack);
+        }
+        for _ in 0..30 {
+            let insert = Query::Insert(Insert::arbitrary(&mut rng, &env.connection_context(0)));
+            execute_query(&mut env, insert, &mut stack);
+        }
+
+        let mut lateral_rows = 0;
+        for id in 1..=200 {
+            let select = LateralSelect::arbitrary(&mut rng, &env.connection_context(0));
+            let json_each_joins = arbitrary_json_each_joins(&mut rng, select.joins.len());
+            let property = Property::LateralMatchesJsonEach {
+                select,
+                json_each_joins,
+            };
+            for interaction in property.interactions(0, NonZeroUsize::new(id).unwrap()) {
+                if let InteractionType::Assertion(_) = interaction.interaction {
+                    let [.., Ok(rows), _] = stack.as_slice() else {
+                        panic!("the LATERAL query must return rows: {stack:?}");
+                    };
+                    lateral_rows += rows.len();
+                }
+                execute_interaction(&mut env, &interaction, &mut stack).unwrap_or_else(|err| {
+                    panic!("{err}\nproperty: {property:?}");
+                });
+            }
+        }
+        assert!(lateral_rows > 0, "the LATERAL queries returned no rows");
+    }
+
+    fn execute_query(env: &mut SimulatorEnv, query: Query, stack: &mut Vec<ResultSet>) {
+        let interaction = InteractionBuilder::with_interaction(InteractionType::Query(query))
+            .connection_index(0)
+            .id(NonZeroUsize::new(1).unwrap())
+            .build()
+            .unwrap();
+        execute_interaction(env, &interaction, stack).unwrap();
+        stack.clear();
+    }
+
+    #[test]
+    fn rows_are_the_same_in_any_order_but_not_with_a_missing_copy() {
+        let row = |values: &[i64]| -> Vec<SimValue> {
+            values
+                .iter()
+                .map(|v| SimValue(Value::from_i64(*v)))
+                .collect()
+        };
+
+        assert!(
+            compare_rows_in_any_order(&[row(&[1, 2]), row(&[3, 4])], &[row(&[3, 4]), row(&[1, 2])])
+                .is_ok()
+        );
+        assert!(compare_rows_in_any_order(&[row(&[1, 2]), row(&[1, 2])], &[row(&[1, 2])]).is_err());
+        assert!(compare_rows_in_any_order(&[row(&[1, 2])], &[row(&[1, 3])]).is_err());
+    }
 }

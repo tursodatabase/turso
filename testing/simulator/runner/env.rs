@@ -1443,6 +1443,7 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_lateral_matches_json_each: cli_opts.disable_lateral_matches_json_each,
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
@@ -1523,6 +1524,9 @@ impl SimulatorEnv {
             profile.query.drop_sequence_weight = 0;
             profile.query.nextval_weight = 0;
             profile.query.setval_weight = 0;
+
+            // SQLite does not have LATERAL joins, so we can't use this property.
+            opts.disable_lateral_matches_json_each = true;
         }
 
         profile.validate().unwrap();
@@ -1808,6 +1812,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_lateral_matches_json_each: bool,
     pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
