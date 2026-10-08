@@ -199,6 +199,8 @@ pub enum Property {
     /// ```
     /// When the LATERAL subquery has DISTINCT, ORDER BY or LIMIT, `json_group_array`
     /// collects the rows of the unchanged subquery: `FROM (SELECT ... LIMIT 2) AS q`.
+    /// The `json_each` form reads its tables with NOT INDEXED. Thus it uses no index,
+    /// automatic index or hash join, and it cannot share such a bug with the LATERAL form.
     LateralMatchesJsonEach {
         select: LateralSelect,
         json_each_joins: Vec<usize>,
