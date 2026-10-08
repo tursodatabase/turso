@@ -1115,7 +1115,7 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
             .described_as("reading an encrypted database as plaintext")
             .err()
             .display_string()
-            .contains("Corrupt database");
+            .contains("database disk image is malformed");
 
         // VACUUM INTO should also fail because it cannot read the source schema/data
         let fail_path = dest_dir.path().join("should_fail.db");
@@ -1125,7 +1125,7 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
             .described_as("VACUUM INTO from an encrypted database with no keys")
             .err()
             .display_string()
-            .contains("Corrupt database");
+            .contains("database disk image is malformed");
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
