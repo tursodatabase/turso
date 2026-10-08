@@ -1956,6 +1956,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
             self.invalidate_record();
+            self.current_pos = CursorPosition::BeforeFirst;
             let int_key = match key {
                 Value::Numeric(crate::numeric::Numeric::Integer(i)) => i,
                 _ => unreachable!("btree tables are indexed by integers!"),
