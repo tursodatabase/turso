@@ -1,0 +1,50 @@
+@database :memory:
+
+setup json_index {
+    CREATE TABLE t1(x INT, y TEXT);
+    INSERT INTO t1 VALUES(1, '{b:5}');
+    CREATE INDEX t1_json ON t1(json(y));
+}
+
+@cross-check-integrity
+test json-argument-of-coalesce-keeps-subtype {
+    CREATE TABLE t0(x INT, y TEXT);
+    INSERT INTO t0 VALUES(1, '{b:5}');
+    CREATE INDEX t0_coalesce ON t0(coalesce(null, json(y)));
+    SELECT json_insert('{}', '$.a', coalesce(null, json(y)))->>'$.a.b' FROM t0;
+}
+expect {
+    5
+}
+
+@setup json_index
+test json-argument-keeps-subtype-when-also-selected {
+    SELECT json(y), json_insert('{}', '$.a', json(y)) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"b":5}|{"a":{"b":5}}
+}
+
+@setup json_index
+test parenthesized-json-argument-keeps-subtype {
+    SELECT json_insert('{}', '$.a', (json(y))) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"a":{"b":5}}
+}
+
+@setup json_index
+test json-aggregate-argument-keeps-subtype {
+    SELECT json(y), json_group_array(json(y)) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"b":5}|[{"b":5}]
+}
+
+@setup json_index
+test json-argument-of-arrow-keeps-subtype {
+    SELECT json_array(json(y) -> '$') FROM t1 INDEXED BY t1_json;
+}
+expect {
+    [{"b":5}]
+}

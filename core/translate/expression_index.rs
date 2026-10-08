@@ -127,3 +127,102 @@ pub fn expression_index_column_usage(
         .map(|(_, columns_mask)| columns_mask)
         .unwrap_or_default())
 }
+
+pub fn for_each_part_that_can_use_index_value<F>(
+    expr: &ast::Expr,
+    resolver: &Resolver,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ast::Expr),
+{
+    visit_part_that_can_use_index_value(expr, false, resolver, visit)
+}
+
+fn visit_part_that_can_use_index_value<F>(
+    expr: &ast::Expr,
+    is_subtype_argument: bool,
+    resolver: &Resolver,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ast::Expr),
+{
+    if !index_value_would_lose_subtype(expr, is_subtype_argument, resolver)? {
+        visit(expr);
+    }
+    let subtype_arguments = arguments_that_keep_subtypes(expr, is_subtype_argument, resolver)?;
+    walk_expr(expr, &mut |part| {
+        if std::ptr::eq(part, expr) {
+            return Ok(WalkControl::Continue);
+        }
+        let is_subtype_argument = subtype_arguments
+            .iter()
+            .any(|argument| std::ptr::eq(*argument, part));
+        visit_part_that_can_use_index_value(part, is_subtype_argument, resolver, visit)?;
+        Ok(WalkControl::SkipChildren)
+    })?;
+    Ok(())
+}
+
+pub fn index_value_would_lose_subtype(
+    expr: &ast::Expr,
+    is_subtype_argument: bool,
+    resolver: &Resolver,
+) -> Result<bool> {
+    Ok(is_subtype_argument && can_return_subtype(expr, resolver)?)
+}
+
+pub fn arguments_that_keep_subtypes<'a>(
+    expr: &'a ast::Expr,
+    is_subtype_argument: bool,
+    resolver: &Resolver,
+) -> Result<Vec<&'a ast::Expr>> {
+    let arguments: Vec<&ast::Expr> = match expr {
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let reads_subtypes = is_subtype_argument
+                || resolver
+                    .resolve_function(name.as_str(), args.len())?
+                    .is_some_and(|func| func.reads_argument_subtypes());
+            if !reads_subtypes {
+                return Ok(Vec::new());
+            }
+            args.iter().map(|arg| arg.as_ref()).collect()
+        }
+        _ if !is_subtype_argument => return Ok(Vec::new()),
+        ast::Expr::Binary(lhs, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, rhs) => {
+            vec![lhs.as_ref(), rhs.as_ref()]
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => vec![exprs[0].as_ref()],
+        _ => Vec::new(),
+    };
+    Ok(arguments)
+}
+
+fn can_return_subtype(expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
+    match expr {
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let func = resolver.resolve_function(name.as_str(), args.len())?;
+            if func.is_none_or(|func| func.can_return_subtype()) {
+                return Ok(true);
+            }
+            for arg in args {
+                if can_return_subtype(arg, resolver)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ast::Expr::FunctionCallStar { name, .. } => Ok(resolver
+            .resolve_function(name.as_str(), 0)?
+            .is_none_or(|func| func.can_return_subtype())),
+        ast::Expr::Binary(_, ast::Operator::ArrowRight, _) => Ok(true),
+        ast::Expr::Binary(lhs, ast::Operator::ArrowRightShift, rhs) => {
+            Ok(can_return_subtype(lhs, resolver)? || can_return_subtype(rhs, resolver)?)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            can_return_subtype(&exprs[0], resolver)
+        }
+        _ => Ok(false),
+    }
+}

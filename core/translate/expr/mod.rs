@@ -19,7 +19,9 @@ use crate::schema::{
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
-use crate::translate::expression_index::selected_expression_index;
+use crate::translate::expression_index::{
+    arguments_that_keep_subtypes, index_value_would_lose_subtype, selected_expression_index,
+};
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};

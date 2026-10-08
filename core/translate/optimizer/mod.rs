@@ -25,8 +25,9 @@ use crate::{
     translate::{
         expr::{
             expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
-            expression_can_fail_on_input, walk_expr, WalkControl,
+            expression_can_fail_on_input,
         },
+        expression_index::for_each_part_that_can_use_index_value,
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::{
@@ -2023,6 +2024,7 @@ fn optimize_table_access_with_custom_modules(
 /// and covering checks reuse the same facts.
 fn register_index_expression_usages_for_plan(
     table_references: &mut TableReferences,
+    resolver: &Resolver,
     result_columns: &[ResultSetColumn],
     order_by: &[(
         Box<ast::Expr>,
@@ -2035,9 +2037,8 @@ fn register_index_expression_usages_for_plan(
     table_references.reset_expression_index_usages();
 
     let mut register = |expr: &ast::Expr| {
-        walk_expr(expr, &mut |part| {
+        for_each_part_that_can_use_index_value(expr, resolver, &mut |part| {
             table_references.register_expression_index_usage(part);
-            Ok(WalkControl::Continue)
         })
     };
 
@@ -2584,6 +2585,7 @@ fn find_table_access_plan(
     if has_expression_idx_or_partial_idx {
         register_index_expression_usages_for_plan(
             table_references,
+            resolver,
             result_columns,
             order_by.as_slice(),
             group_by.as_ref(),

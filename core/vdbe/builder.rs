@@ -264,6 +264,7 @@ pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
+    subtype_argument_addresses: Vec<usize>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
@@ -717,6 +718,7 @@ impl ProgramBuilder {
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
+            subtype_argument_addresses: Vec::new(),
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
@@ -1976,6 +1978,25 @@ impl ProgramBuilder {
 
     pub const fn reset_collation(&mut self) {
         self.collation = None;
+    }
+
+    pub fn mark_subtype_arguments(&mut self, arguments: &[&ast::Expr]) -> usize {
+        let marked_before = self.subtype_argument_addresses.len();
+        self.subtype_argument_addresses.extend(
+            arguments
+                .iter()
+                .map(|argument| std::ptr::from_ref(*argument).addr()),
+        );
+        marked_before
+    }
+
+    pub fn unmark_subtype_arguments(&mut self, marked_before: usize) {
+        self.subtype_argument_addresses.truncate(marked_before);
+    }
+
+    pub fn is_subtype_argument(&self, expr: &ast::Expr) -> bool {
+        let address = std::ptr::from_ref(expr).addr();
+        self.subtype_argument_addresses.contains(&address)
     }
 
     #[inline]
