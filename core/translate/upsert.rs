@@ -439,7 +439,6 @@ pub fn emit_upsert(
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
-    table_alias: Option<&str>,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -591,12 +590,11 @@ pub fn emit_upsert(
         rewrite_expr_to_registers(
             pred,
             table,
+            table_ref_id,
+            ctx.excluded_table_id,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            table_alias,
-            Some(insertion),
-            true,
+            insertion,
             excluded_decoded_start,
             &layout,
         )?;
@@ -615,12 +613,11 @@ pub fn emit_upsert(
         rewrite_expr_to_registers(
             expr,
             table,
+            table_ref_id,
+            ctx.excluded_table_id,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
-            table_alias,
-            Some(insertion),
-            true,
+            insertion,
             excluded_decoded_start,
             &layout,
         )?;
@@ -1680,102 +1677,62 @@ fn emit_upsert_expr_index_value(
     Ok(())
 }
 
+/// Replace the bound column references of a DO UPDATE expression with the
+/// registers that hold the conflicting row (`target_table_id`) and the row
+/// that was to be inserted (`excluded_table_id`).
 #[allow(clippy::too_many_arguments)]
 fn rewrite_expr_to_registers(
     e: &mut ast::Expr,
     table: &Table,
+    target_table_id: ast::TableInternalId,
+    excluded_table_id: ast::TableInternalId,
     base_start: usize,
     rowid_reg: usize,
-    table_name: Option<&str>,
-    table_alias: Option<&str>,
-    insertion: Option<&Insertion>,
-    allow_excluded: bool,
+    insertion: &Insertion,
     excluded_decoded_start: Option<usize>,
     layout: &ColumnLayout,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
-    let table_name_norm = table_name.map(normalize_ident);
-
-    // Map a column name to a register within the row image at `base_start`.
-    let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            return Some(rowid_reg);
-        }
-        let (idx, c) = table.get_column_by_name(name)?;
-        if c.is_rowid_alias() {
-            Some(rowid_reg)
-        } else {
-            Some(base_start + layout.to_reg_offset(idx))
-        }
-    };
-
     walk_expr_mut(
         e,
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
-                Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                    let ns = normalize_ident(ns.as_str());
-                    let c = normalize_ident(c.as_str());
-                    // An INSERT target alias replaces the base table name in
-                    // the DO UPDATE scope.  It also shadows the special
-                    // `excluded` pseudo-table when the alias is literally
-                    // named `excluded` (SQLite's name-resolution rule).
-                    let is_target_namespace = if let Some(alias) = table_alias {
-                        ns.eq_ignore_ascii_case(alias)
+                Expr::Column {
+                    table: table_id,
+                    column,
+                    ..
+                } if *table_id == target_table_id => {
+                    let register = if table.columns()[*column].is_rowid_alias() {
+                        rowid_reg
                     } else {
-                        table_name_norm
-                            .as_ref()
-                            .is_some_and(|tn| ns.eq_ignore_ascii_case(tn))
+                        base_start + layout.to_reg_offset(*column)
                     };
-                    // Handle EXCLUDED.* if enabled
-                    if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
-                    {
-                        if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
-                                *expr = Expr::Register(ins.key_register());
-                            } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
-                                // Use decoded excluded registers when available
-                                // to prevent double-encoding of custom type values
-                                if let Some(decoded_start) = excluded_decoded_start {
-                                    let (col_idx, _) =
-                                        table.get_column_by_name(&c).expect("column exists");
-                                    *expr = Expr::Register(
-                                        decoded_start + layout.to_reg_offset(col_idx),
-                                    );
-                                } else {
-                                    *expr = Expr::Register(cm.register);
-                                }
-                            } else {
-                                bail_parse_error!("no such column in EXCLUDED: {}", c);
-                            }
-                        }
-                        // If insertion is None, leave EXCLUDED.* untouched.
-                        return Ok(WalkControl::Continue);
-                    }
-
-                    // Match the target table namespace if provided
-                    if is_target_namespace {
-                        if let Some(r) = col_reg_from_row_image(&c) {
-                            *expr = Expr::Register(r);
-                        } else {
-                            bail_parse_error!("no such column: {}.{}", ns, c);
-                        }
-                        return Ok(WalkControl::Continue);
-                    }
-
-                    // In UPSERT DO UPDATE context (allow_excluded=true), a qualified
-                    // reference that doesn't match the target table or EXCLUDED is
-                    // invalid. Return a graceful error instead of leaving it
-                    // unresolved (which would panic later in translate_expr).
-                    if allow_excluded {
-                        bail_parse_error!("no such column: {}.{}", ns, c);
-                    }
+                    *expr = Expr::Register(register);
                 }
-                // Unqualified id -> row image (CURRENT/NEW depending on caller)
-                Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
-                        *expr = Expr::Register(r);
-                    }
+                Expr::RowId {
+                    table: table_id, ..
+                } if *table_id == target_table_id => {
+                    *expr = Expr::Register(rowid_reg);
+                }
+                Expr::Column {
+                    table: table_id,
+                    column,
+                    ..
+                } if *table_id == excluded_table_id => {
+                    // Use decoded excluded registers when available
+                    // to prevent double-encoding of custom type values
+                    let register = match excluded_decoded_start {
+                        Some(decoded_start) if !table.columns()[*column].is_rowid_alias() => {
+                            decoded_start + layout.to_reg_offset(*column)
+                        }
+                        _ => insertion.column_register(*column),
+                    };
+                    *expr = Expr::Register(register);
+                }
+                Expr::RowId {
+                    table: table_id, ..
+                } if *table_id == excluded_table_id => {
+                    *expr = Expr::Register(insertion.key_register());
                 }
                 _ => {}
             }

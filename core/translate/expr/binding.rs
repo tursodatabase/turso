@@ -13,8 +13,6 @@ pub enum BindingBehavior {
     TryCanonicalColumnsFirst,
     /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
-    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
-    AllowUnboundIdentifiers,
 }
 
 /// The result of resolving the `<id>` half of a qualified `<tbl>.<id>`
@@ -127,9 +125,6 @@ pub fn bind_and_rewrite_expr<'a>(
                 Expr::Id(id) => {
                     crate::stack::trace_stack!("bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
                     let normalized_id = normalize_ident(id.as_str());
@@ -234,9 +229,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     // a matching column in an outer scope.
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}",
                             tbl.as_str(),
@@ -340,9 +332,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     let db_name_clone = db_name.clone();
 
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}.{}",
                             db_name_str,

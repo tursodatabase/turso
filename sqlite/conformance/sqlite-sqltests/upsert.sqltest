@@ -665,7 +665,7 @@ test upsert-unresolved-table-reference {
     INSERT INTO t VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = other.val;
 }
 expect error {
-    .*no such column.*
+    .*no such (column|table).*
 }
 
 # Same for DO UPDATE WHERE clause referencing another table.
@@ -677,7 +677,7 @@ test upsert-unresolved-table-in-where {
     INSERT INTO t VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = excluded.val WHERE other.val > 0;
 }
 expect error {
-    .*no such column.*
+    .*no such (column|table).*
 }
 
 # CHECK constraints are evaluated on INSERT values BEFORE conflict resolution.

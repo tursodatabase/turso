@@ -26,8 +26,8 @@ use crate::{
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnUsedMask, EvalAt, JoinedTable, Operation, OuterQueryReference, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -57,8 +57,8 @@ use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
-    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo, With,
+    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TableInternalId,
+    TriggerEvent, TriggerTime, Upsert, UpsertDo, With,
 };
 
 /// Validate anything with this insert statement that should throw an early parse error
@@ -163,6 +163,9 @@ pub struct InsertEmitCtx<'a> {
     /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
     /// then scanned back and yielded to the caller after all DML is complete.
     pub returning_buffer: Option<ReturningBufferCtx>,
+    /// Table reference id of `excluded`, the row that was to be inserted, in
+    /// the bound DO UPDATE clauses.
+    pub excluded_table_id: TableInternalId,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -176,6 +179,7 @@ impl<'a> InsertEmitCtx<'a> {
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
+        excluded_table_id: TableInternalId,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -216,6 +220,7 @@ impl<'a> InsertEmitCtx<'a> {
             autoincrement_meta: None,
             database_id,
             returning_buffer: None,
+            excluded_table_id,
         })
     }
 }
@@ -352,6 +357,14 @@ pub fn translate_insert(
         }],
         vec![],
     );
+    let excluded_table_id = program.table_reference_counter.next();
+    bind_upsert_actions(
+        &mut upsert_actions,
+        &table_references,
+        tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+        excluded_table_id,
+        resolver,
+    )?;
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
     plan_ctes_as_outer_refs(
@@ -419,6 +432,7 @@ pub fn translate_insert(
         values.len(),
         None,
         database_id,
+        excluded_table_id,
     )?;
     program
         .flags
@@ -1204,7 +1218,6 @@ pub fn translate_insert(
             &mut result_columns,
             connection,
             &mut table_references,
-            tbl_name.alias.as_ref().map(|alias| alias.as_str()),
         )?;
     }
 
@@ -1620,7 +1633,6 @@ fn resolve_upserts(
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
-    table_alias: Option<&str>,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -1644,7 +1656,6 @@ fn resolve_upserts(
                 result_columns,
                 connection,
                 table_references,
-                table_alias,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -2110,30 +2121,6 @@ fn bind_insert(
         program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
-        if let UpsertDo::Set {
-            ref mut sets,
-            ref mut where_clause,
-        } = &mut upsert_opt.do_clause
-        {
-            for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
-                    &mut set.expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
-            }
-            if let Some(ref mut where_expr) = where_clause {
-                bind_and_rewrite_expr(
-                    where_expr,
-                    None,
-                    None,
-                    resolver,
-                    BindingBehavior::AllowUnboundIdentifiers,
-                )?;
-            }
-        }
         let next = upsert_opt.next.take();
         upsert_actions.push((
             // resolve the constrained target for UPSERT in the chain
@@ -2150,6 +2137,68 @@ fn bind_insert(
         upsert_actions,
         inserting_multiple_rows,
     })
+}
+
+/// Bind the DO UPDATE clauses of every UPSERT action to the target table
+/// reference and to `excluded`, the row that was to be inserted. An INSERT
+/// alias replaces the table name in this scope, and hides `excluded` when
+/// the alias is spelled that way.
+fn bind_upsert_actions(
+    upsert_actions: &mut [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    table_references: &TableReferences,
+    table_alias: Option<&str>,
+    excluded_table_id: TableInternalId,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }))
+    {
+        return Ok(());
+    }
+    let mut target = table_references.joined_tables()[0].clone();
+    if let Some(alias) = table_alias {
+        target.identifier = normalize_ident(alias);
+    }
+    let excluded = OuterQueryReference {
+        identifier: "excluded".to_string(),
+        internal_id: excluded_table_id,
+        table: target.table.clone(),
+        join_info: None,
+        col_used_mask: ColumnUsedMask::default(),
+        cte_select: None,
+        cte_explicit_columns: vec![],
+        cte_id: None,
+        cte_definition_only: false,
+        rowid_referenced: false,
+        outer_join_may_null_extend: false,
+        scope_depth: 0,
+    };
+    let mut scope = TableReferences::new(vec![target], vec![excluded]);
+    for (_, _, upsert) in upsert_actions.iter_mut() {
+        let UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause else {
+            continue;
+        };
+        for set in sets.iter_mut() {
+            bind_and_rewrite_expr(
+                &mut set.expr,
+                Some(&mut scope),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+        }
+        if let Some(where_expr) = where_clause {
+            bind_and_rewrite_expr(
+                where_expr,
+                Some(&mut scope),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Depending on the InsertBody, we begin to initialize the source of the insert values
@@ -2462,6 +2511,18 @@ impl<'a> Insertion<'a> {
 
     pub fn first_col_register(&self) -> usize {
         self.base_reg
+    }
+
+    /// The register that holds the value of table column `col_idx` in the row
+    /// to insert. A rowid alias column reads the key register, because its
+    /// own register holds a NULL placeholder.
+    pub fn column_register(&self, col_idx: usize) -> usize {
+        let mapping = &self.col_mappings[col_idx];
+        if mapping.column.is_rowid_alias() {
+            self.key_register()
+        } else {
+            mapping.register
+        }
     }
 
     /// Return the register that contains the record built using the MakeRecord instruction.

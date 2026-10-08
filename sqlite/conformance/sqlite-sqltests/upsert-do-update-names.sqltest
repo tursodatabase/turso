@@ -1,0 +1,88 @@
+@database :memory:
+
+# The SET and WHERE clauses of ON CONFLICT DO UPDATE are bound when the
+# INSERT is translated, in a scope that holds the target table (under its
+# alias, when the INSERT gives one) and the excluded row. An unknown name is
+# an error, an alias replaces the table name, and an alias spelled
+# "excluded" hides the excluded row, as in SQLite.
+
+@cross-check-integrity
+test do-update-set-unknown-name-is-an-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (1, 20) ON CONFLICT (a) DO UPDATE SET b = nosuch;
+}
+expect error {
+    no such column: nosuch
+}
+
+@cross-check-integrity
+test do-update-where-unknown-name-is-an-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (1, 20) ON CONFLICT (a) DO UPDATE SET b = 30 WHERE nosuch > 0;
+}
+expect error {
+    no such column: nosuch
+}
+
+@cross-check-integrity
+test do-update-alias-target-and-excluded-rowid {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    INSERT INTO t VALUES (1, 10, 'x');
+    INSERT INTO t AS z VALUES (1, 5, 'q')
+        ON CONFLICT (a) DO UPDATE
+        SET b = z.b + excluded.b + rowid + excluded.rowid, c = z.c || excluded.c
+        WHERE z.b > 1;
+    SELECT * FROM t;
+}
+expect {
+    1|17|xq
+}
+
+@cross-check-integrity
+test do-update-alias-hides-the-table-name {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t AS z VALUES (1, 20) ON CONFLICT (a) DO UPDATE SET b = t.b;
+}
+expect error {
+    no such (column|table): t
+}
+
+@cross-check-integrity
+test do-update-alias-named-excluded-hides-the-excluded-row {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT);
+    INSERT INTO t VALUES (1, 10, 'x');
+    INSERT INTO t AS excluded VALUES (1, 5, 'q')
+        ON CONFLICT (a) DO UPDATE SET c = excluded.c || '!';
+    SELECT * FROM t;
+}
+expect {
+    1|10|x!
+}
+
+@cross-check-integrity
+test do-update-reads-the-excluded-rowid-alias-column {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    INSERT INTO t VALUES (1, 20) ON CONFLICT (a) DO UPDATE SET b = excluded.a * 100 + excluded.b;
+    SELECT * FROM t;
+}
+expect {
+    1|120
+}
+
+@cross-check-integrity
+test do-update-binds-once-for-every-inserted-row {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+        ON CONFLICT (a) DO UPDATE SET b = b + excluded.b WHERE excluded.b < t.b;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|11
+    2|22
+    3|3
+}
