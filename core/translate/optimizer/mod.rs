@@ -19,8 +19,8 @@ use crate::{
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
-        ROWID_SENTINEL,
+        rebase_schema_expr, BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn,
+        Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
         expr::{
@@ -48,7 +48,7 @@ use crate::{
     },
     types::SeekOp,
     util::{
-        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
+        count_fts_column_args, exprs_are_equivalent, try_capture_parameters,
         try_capture_parameters_column_agnostic,
     },
     vdbe::{
@@ -333,35 +333,16 @@ fn try_match_index_method_pattern(
         panic!("unexpected from clause");
     };
 
-    // Bind expressions to this table
     for column in columns.iter_mut() {
         if let ast::ResultColumn::Expr(e, _) = column {
-            if soft_bind_errors {
-                if simple_bind_expr(table, &[], e).is_err() {
-                    return None;
-                }
-            } else {
-                simple_bind_expr(table, &[], e).ok()?;
-            }
+            rebase_schema_expr(e, table.internal_id);
         }
     }
     for column in pattern.order_by.iter_mut() {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, &mut column.expr).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, &mut column.expr).ok()?;
-        }
+        rebase_schema_expr(&mut column.expr, table.internal_id);
     }
     if let Some(pattern_where) = pattern_where_clause {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, pattern_where).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, pattern_where).ok()?;
-        }
+        rebase_schema_expr(pattern_where, table.internal_id);
     }
 
     if name.name.as_str() != table.table.get_name() {

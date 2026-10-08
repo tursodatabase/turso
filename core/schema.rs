@@ -4,7 +4,9 @@ use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
-use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::index_method::{
+    IndexMethodAttachment, IndexMethodConfiguration, ResolvedPatternAttachment,
+};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
@@ -6153,7 +6155,9 @@ impl Index {
                         columns: index_columns.try_clone()?,
                         parameters,
                     };
-                    let descriptor = module.attach(&configuration)?;
+                    let descriptor: Arc<dyn IndexMethodAttachment> = Arc::new(
+                        ResolvedPatternAttachment::new(module.attach(&configuration)?, table),
+                    );
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),

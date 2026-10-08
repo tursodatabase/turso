@@ -8,12 +8,13 @@ use turso_parser::ast;
 
 use crate::{
     mvcc::cursor::MvccCursorType,
-    schema::IndexColumn,
+    schema::{resolve_schema_expr_columns, BTreeTable, IndexColumn},
     storage::{
         btree::{BTreeCursor, CursorTrait},
         journal_mode::JournalMode,
     },
     translate::emitter::TransactionMode,
+    translate::expr::{walk_expr_mut, WalkControl},
     types::IOResult,
     vdbe::Register,
     Connection, LimboError, MvCursor, Result, Value,
@@ -78,6 +79,96 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     ) -> Option<Box<ast::Expr>> {
         crate::util::try_substitute_parameters(pattern, parameters)
     }
+}
+
+/// An attachment whose SELECT patterns have their column names resolved to
+/// positions in the indexed table, like stored index expressions. The query
+/// planner points these positions at the query's table reference and never
+/// resolves a pattern's names itself.
+#[derive(Debug)]
+pub struct ResolvedPatternAttachment {
+    attachment: Arc<dyn IndexMethodAttachment>,
+    patterns: Vec<ast::Select>,
+}
+
+impl ResolvedPatternAttachment {
+    pub fn new(attachment: Arc<dyn IndexMethodAttachment>, table: &BTreeTable) -> Self {
+        let patterns = attachment
+            .definition()
+            .patterns
+            .iter()
+            .map(|pattern| resolve_pattern(pattern, table))
+            .collect();
+        Self {
+            attachment,
+            patterns,
+        }
+    }
+}
+
+impl IndexMethodAttachment for ResolvedPatternAttachment {
+    fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
+        IndexMethodDefinition {
+            patterns: &self.patterns,
+            ..self.attachment.definition()
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
+        self.attachment.init()
+    }
+
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        self.attachment.result_column(pattern, parameters)
+    }
+}
+
+/// Resolve the column names of one pattern to positions in `table`. A
+/// reference to a result column alias in `WHERE` or `ORDER BY` is replaced
+/// by that result column's expression first.
+fn resolve_pattern(pattern: &ast::Select, table: &BTreeTable) -> ast::Select {
+    let mut pattern = pattern.clone();
+    if let ast::OneSelect::Select {
+        columns,
+        where_clause,
+        ..
+    } = &mut pattern.body.select
+    {
+        let mut aliases: Vec<(String, ast::Expr)> = Vec::new();
+        for column in columns.iter_mut() {
+            if let ast::ResultColumn::Expr(expr, alias) = column {
+                resolve_schema_expr_columns(expr, table);
+                if let Some(ast::As::As(alias)) = alias {
+                    aliases.push((alias.as_str().to_string(), (**expr).clone()));
+                }
+            }
+        }
+        let resolve = |expr: &mut ast::Expr| {
+            let _ = walk_expr_mut(expr, &mut |e| {
+                if let ast::Expr::Id(name) = e {
+                    if let Some((_, aliased)) = aliases
+                        .iter()
+                        .find(|(alias, _)| alias.eq_ignore_ascii_case(name.as_str()))
+                    {
+                        *e = aliased.clone();
+                    }
+                }
+                Ok(WalkControl::Continue)
+            });
+            resolve_schema_expr_columns(expr, table);
+        };
+        for sorted_column in pattern.order_by.iter_mut() {
+            resolve(&mut sorted_column.expr);
+        }
+        if let Some(where_clause) = where_clause {
+            resolve(where_clause);
+        }
+    }
+    pattern
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,7 +855,88 @@ pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_mvcc_support, IndexMethodDefinition, IndexMethodMvccSupport};
+    use super::{
+        ensure_mvcc_support, parse_patterns, IndexMethodAttachment, IndexMethodCursor,
+        IndexMethodDefinition, IndexMethodMvccSupport, ResolvedPatternAttachment,
+    };
+    use crate::schema::BTreeTable;
+    use crate::translate::expr::{walk_expr, WalkControl};
+    use std::sync::Arc;
+    use turso_parser::ast;
+
+    #[derive(Debug)]
+    struct PatternOnlyAttachment {
+        patterns: Vec<ast::Select>,
+    }
+
+    impl IndexMethodAttachment for PatternOnlyAttachment {
+        fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
+            IndexMethodDefinition {
+                method_name: "test_method",
+                table_name: "t",
+                index_name: "test_index",
+                patterns: &self.patterns,
+                backing_btree: false,
+                results_materialized: true,
+                mvcc_support: IndexMethodMvccSupport::Unsupported,
+            }
+        }
+
+        fn init(&self) -> crate::Result<Box<dyn IndexMethodCursor>> {
+            Err(crate::LimboError::InternalError(
+                "test attachment has no cursor".to_string(),
+            ))
+        }
+    }
+
+    /// Table positions read by a pattern expression. Panics on a name that
+    /// was not resolved.
+    fn column_positions(expr: &ast::Expr) -> Vec<usize> {
+        let mut positions = Vec::new();
+        let _ = walk_expr(expr, &mut |e| {
+            match e {
+                ast::Expr::Column { table, column, .. } => {
+                    assert!(table.is_self_table(), "pattern must use SELF_TABLE");
+                    positions.push(*column);
+                }
+                ast::Expr::Id(name) => panic!("unresolved name {name} in pattern"),
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        });
+        positions
+    }
+
+    #[test]
+    fn patterns_resolve_to_table_positions_when_attached() -> crate::Result<()> {
+        let table = BTreeTable::from_sql("CREATE TABLE t (a, b)", 2)?;
+        let attachment = Arc::new(PatternOnlyAttachment {
+            patterns: parse_patterns(&[
+                "SELECT f(b, ?1) AS score FROM t WHERE g(a, ?1) ORDER BY score LIMIT ?",
+            ])?,
+        });
+        let resolved = ResolvedPatternAttachment::new(attachment, &table);
+        let definition = resolved.definition();
+        let pattern = &definition.patterns[0];
+        let ast::OneSelect::Select {
+            columns,
+            where_clause,
+            ..
+        } = &pattern.body.select
+        else {
+            panic!("pattern is a plain SELECT");
+        };
+        let ast::ResultColumn::Expr(score, _) = &columns[0] else {
+            panic!("pattern selects one expression");
+        };
+        assert_eq!(column_positions(score), vec![1]);
+        assert_eq!(
+            column_positions(where_clause.as_deref().expect("pattern has a WHERE")),
+            vec![0]
+        );
+        assert_eq!(pattern.order_by[0].expr, *score);
+        Ok(())
+    }
 
     fn definition(support: IndexMethodMvccSupport) -> IndexMethodDefinition<'static> {
         IndexMethodDefinition {

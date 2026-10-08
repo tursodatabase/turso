@@ -1,7 +1,9 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
-use crate::index_method::IndexMethodConfiguration;
+use crate::index_method::{
+    IndexMethodAttachment, IndexMethodConfiguration, ResolvedPatternAttachment,
+};
 use crate::numeric::Numeric;
 use crate::schema::{
     bind_schema_expr, resolve_schema_expr_columns, Column, GeneratedType, Table,
@@ -197,7 +199,7 @@ pub fn translate_create_index(
         );
     }
 
-    let mut index_method = None;
+    let mut index_method: Option<Arc<dyn IndexMethodAttachment>> = None;
     if let Some(using) = &using {
         let index_modules = &resolver.symbol_table.index_methods;
         let using = using.as_str();
@@ -207,12 +209,13 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            index_method = Some(index_module.attach(&IndexMethodConfiguration {
+            let attachment = index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.try_clone()?,
                 parameters,
-            })?);
+            })?;
+            index_method = Some(Arc::new(ResolvedPatternAttachment::new(attachment, &tbl)));
         }
     }
     let mut idx = Index {
