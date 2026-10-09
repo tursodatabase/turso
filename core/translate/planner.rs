@@ -264,7 +264,7 @@ impl RecursiveRefCounter<'_> {
                     0
                 }
             }
-            ast::SelectTable::TableCall(name, args, _) => {
+            ast::SelectTable::TableCall(name, args, ..) => {
                 let mut count = if name.db_name.is_none() {
                     self.name_weight(&normalize_ident(name.name.as_str()), scope)
                 } else {
@@ -337,7 +337,7 @@ impl RecursiveRefCounter<'_> {
             scope: &RecursiveRefScope,
         ) -> usize {
             match table {
-                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, ..) => {
                     if name.db_name.is_some() {
                         return 0;
                     }
@@ -386,7 +386,7 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
                 out.push(normalize_ident(qualified_name.name.as_str()));
             }
         }
-        ast::SelectTable::TableCall(qualified_name, args, _) => {
+        ast::SelectTable::TableCall(qualified_name, args, ..) => {
             if qualified_name.db_name.is_none() {
                 out.push(normalize_ident(qualified_name.name.as_str()));
             }
@@ -1599,6 +1599,7 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &[],
+            &[],
             indexed,
             connection,
         ),
@@ -1675,7 +1676,7 @@ fn parse_from_clause_table(
             )?);
             Ok(())
         }
-        ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => parse_table(
+        ast::SelectTable::TableCall(qualified_name, args, maybe_alias, columns) => parse_table(
             table_references,
             resolver,
             program,
@@ -1684,6 +1685,7 @@ fn parse_from_clause_table(
             &qualified_name,
             maybe_alias.as_ref(),
             &args,
+            &columns,
             None, // table-valued functions don't support INDEXED BY
             connection,
         ),
@@ -1929,6 +1931,7 @@ fn parse_table(
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
+    column_aliases: &[ast::Name],
     indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -2084,7 +2087,29 @@ fn parse_table(
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
-            Table::Virtual(tbl.clone())
+            if column_aliases.is_empty() {
+                Table::Virtual(tbl.clone())
+            } else {
+                let mut aliased = tbl.as_ref().clone();
+                let visible_count = aliased.columns.iter().filter(|c| !c.hidden()).count();
+                if column_aliases.len() > visible_count {
+                    crate::bail_parse_error!(
+                        "function {} has {} columns but {} column names were provided",
+                        table_name.as_str(),
+                        visible_count,
+                        column_aliases.len()
+                    );
+                }
+                for (column, alias) in aliased
+                    .columns
+                    .iter_mut()
+                    .filter(|c| !c.hidden())
+                    .zip(column_aliases)
+                {
+                    column.name = Some(normalize_ident(alias.as_str()));
+                }
+                Table::Virtual(Arc::new(aliased))
+            }
         } else if let Table::BTree(table) = table.as_ref() {
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
@@ -2454,8 +2479,8 @@ pub fn parse_from(
 fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {
     match table {
         ast::SelectTable::Table(name, _, indexed) => ast::SelectTable::Table(name, alias, indexed),
-        ast::SelectTable::TableCall(name, args, _) => {
-            ast::SelectTable::TableCall(name, args, alias)
+        ast::SelectTable::TableCall(name, args, _, columns) => {
+            ast::SelectTable::TableCall(name, args, alias, columns)
         }
         ast::SelectTable::Select(select, _) => ast::SelectTable::Select(select, alias),
         ast::SelectTable::Sub(from, _) => ast::SelectTable::Sub(from, alias),

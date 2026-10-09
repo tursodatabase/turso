@@ -1125,7 +1125,7 @@ pub enum SelectTable {
     /// table
     Table(QualifiedName, Option<As>, Option<Indexed>),
     /// table function call
-    TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>),
+    TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>, Vec<Name>),
     /// `SELECT` subquery
     Select(Select, Option<As>),
     /// subquery

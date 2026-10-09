@@ -486,6 +486,7 @@ impl SnapshotRows for PgAttributeTable {
             attoptions TEXT,
             attfdwoptions TEXT,
             attmissingval TEXT,
+            attcompression TEXT,
             tableoid INTEGER HIDDEN
         )";
     const TABLE_OID: Option<i64> = Some(1249);
@@ -506,6 +507,10 @@ impl SnapshotRows for PgAttributeTable {
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let type_info = PG_BASE_TYPES
+                    .iter()
+                    .find(|t| t.oid == type_oid)
+                    .expect("column type OIDs refer to PostgreSQL base types");
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -515,27 +520,28 @@ impl SnapshotRows for PgAttributeTable {
                     Value::Text(col_name.into()), // attname
                     Value::from_i64(type_oid),    // atttypid
                     Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
-                    Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::from_i64(type_info.typlen),
+                    Value::from_i64(attnum), // attnum
+                    Value::from_i64(0),      // attndims
+                    Value::from_i64(-1),     // attcacheoff
+                    Value::from_i64(-1),     // atttypmod
+                    Value::from_i64(i64::from(type_info.typbyval)),
+                    Value::build_text(type_info.typstorage),
+                    Value::build_text(type_info.typalign),
+                    Value::from_i64(notnull), // attnotnull
+                    Value::from_i64(has_def), // atthasdef
+                    Value::from_i64(0),       // atthasmissing
+                    Value::Text("".into()),   // attidentity
+                    Value::Text("".into()),   // attgenerated
+                    Value::from_i64(0),       // attisdropped
+                    Value::from_i64(1),       // attislocal
+                    Value::from_i64(0),       // attinhcount
+                    Value::from_i64(0),       // attcollation
+                    Value::Null,              // attacl
+                    Value::Null,              // attoptions
+                    Value::Null,              // attfdwoptions
+                    Value::Null,              // attmissingval
+                    Value::build_text(""),
                 ]);
             }
         }
@@ -1363,7 +1369,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, indnullsnotdistinct BOOLEAN, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -1449,6 +1455,7 @@ impl SnapshotRows for PgIndexTable {
                     Value::Null,                   // indoption
                     indexprs,                      // indexprs
                     indpred,                       // indpred
+                    Value::from_i64(0),
                 ]);
                 index_oid += 1;
             }
@@ -1947,66 +1954,66 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_inherits",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_foreign_table",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable {
             create_sql:
-                "CREATE TABLE pg_foreign_table (ftrelid INTEGER, ftserver INTEGER, ftoptions TEXT)"
+                "CREATE TABLE pg_foreign_table (ftrelid INTEGER, ftserver INTEGER, ftoptions TEXT, tableoid INTEGER HIDDEN)"
                     .to_string(),
         },
     );
     options = options.native_module(
         "pg_partitioned_table",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_collation",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_description",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_rel",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_depend",
@@ -2067,6 +2074,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         PgOptionsToTable,
     );
+    options = options.native_module("unnest", VTabKind::TableValuedFunction, PgUnnest);
     for (name, create_sql) in [
         (
             "pg_operator",
@@ -2206,6 +2214,105 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         );
     }
     options
+}
+
+#[derive(Debug)]
+struct PgUnnest;
+
+impl VirtualTableModule for PgUnnest {
+    type Table = Self;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok("CREATE TABLE unnest (unnest, input BLOB HIDDEN)".to_owned())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+impl VirtualTable for PgUnnest {
+    type Cursor = PgUnnestCursor;
+
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgUnnestCursor {
+            values: vec![],
+            input: Value::Null,
+            index: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+        let input = constraints
+            .iter()
+            .position(|c| c.column_index == 1 && c.op == ConstraintOp::Eq);
+        let Some(input) = input else {
+            return Err(ResultCode::InvalidArgs);
+        };
+        if !constraints[input].usable {
+            return Err(ResultCode::ConstraintViolation);
+        }
+        Ok(IndexInfo {
+            constraint_usages: constraints
+                .iter()
+                .enumerate()
+                .map(|(i, _)| ConstraintUsage {
+                    argv_index: (i == input).then_some(1),
+                    omit: i == input,
+                })
+                .collect(),
+            estimated_cost: 1.0,
+            estimated_rows: 10,
+            ..Default::default()
+        })
+    }
+}
+
+struct PgUnnestCursor {
+    values: Vec<Value>,
+    input: Value,
+    index: usize,
+}
+
+impl VirtualTableCursor for PgUnnestCursor {
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<&str>,
+        _idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
+        self.index = 0;
+        self.input = args[0].clone();
+        self.values = turso_core::array_values_from_any(&self.input)
+            .ok_or_else(|| LimboError::InvalidArgument("unnest requires an array".to_owned()))?;
+        Ok(IOResult::Done(!self.values.is_empty()))
+    }
+
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.index += 1;
+        Ok(IOResult::Done(self.index < self.values.len()))
+    }
+
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        Ok(IOResult::Done(if column == 1 {
+            self.input.clone()
+        } else {
+            self.values[self.index].clone()
+        }))
+    }
+
+    fn rowid(&self) -> i64 {
+        self.index as i64
+    }
 }
 
 #[derive(Debug)]
