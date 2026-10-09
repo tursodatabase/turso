@@ -1723,12 +1723,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .saturating_add(COLLECT_PREEMPTION_THRESHOLD),
         );
         for (key, stamp) in &self.prune_candidates[self.prune_cursor..end] {
-            let Some(latest) = mvstore.unmark_checkpoint_dirty_key(key) else {
-                continue;
-            };
-            if latest != *stamp && mvstore.mark_checkpoint_dirty_key(key, latest).is_err() {
-                mvstore.require_checkpoint_full_scan();
-            }
+            mvstore.unmark_checkpoint_dirty_key_if_stamp(key, *stamp);
         }
         self.prune_cursor = end;
         if end < self.prune_candidates.len() {

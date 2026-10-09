@@ -4072,6 +4072,7 @@ pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
 /// Used to determine the replay boundary for recovery; only records with a higher timestamp
 /// are replayed.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
+const REMOVED_DIRTY_KEY_STAMP: u64 = u64::MAX;
 
 #[derive(Debug)]
 pub struct RowidAllocator {
@@ -7778,31 +7779,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: &RowID,
         stamp: u64,
     ) -> Result<(), TryReserveError> {
+        turso_assert!(
+            stamp != REMOVED_DIRTY_KEY_STAMP,
+            "a dirty key stamp must not equal the stamp that marks a removed dirty key"
+        );
         let dirty_keys = self.checkpoint_dirty_keys_for(key);
         loop {
             let entry = dirty_keys.try_get_or_insert(key.clone(), AtomicU64::new(stamp))?;
-            entry.value().fetch_max(stamp, Ordering::AcqRel);
-            if !entry.is_removed() {
+            if entry.value().fetch_max(stamp, Ordering::AcqRel) != REMOVED_DIRTY_KEY_STAMP {
                 return Ok(());
             }
+            entry.remove();
         }
     }
 
-    pub(crate) fn unmark_checkpoint_dirty_key(&self, key: &RowID) -> Option<u64> {
-        self.checkpoint_dirty_keys_for(key)
-            .remove(key)
-            .map(|entry| entry.value().load(Ordering::Acquire))
-    }
-
-    fn unmark_checkpoint_dirty_key_if_stamp(&self, key: &RowID, stamp: u64) {
-        let Some(actual) = self.unmark_checkpoint_dirty_key(key) else {
+    pub(crate) fn unmark_checkpoint_dirty_key_if_stamp(&self, key: &RowID, stamp: u64) {
+        let Some(entry) = self.checkpoint_dirty_keys_for(key).get(key) else {
             return;
         };
-        if actual == stamp {
-            return;
-        }
-        if self.mark_checkpoint_dirty_key(key, actual).is_err() {
-            self.require_checkpoint_full_scan();
+        if entry
+            .value()
+            .compare_exchange(
+                stamp,
+                REMOVED_DIRTY_KEY_STAMP,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            entry.remove();
         }
     }
 
