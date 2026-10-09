@@ -6,6 +6,7 @@ SQLite rewrite in Rust. 40+ crate workspace.
 
 ```bash
 cargo build                    # build. never build with --release
+cargo check                    # type check. prefer to `cargo build`
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
@@ -107,6 +108,8 @@ Explain intent rather than narrating the diff. Omit the body only when the
 subject fully explains a trivial change. Conventional Commit prefixes such as
 `feat(scope):` are not required. See [CONTRIBUTING.md](CONTRIBUTING.md) for a
 complete example.
+
+Before opening a PR, read the "PR Workflow" document linked above.
 
 ## Benchmark Naming
 
