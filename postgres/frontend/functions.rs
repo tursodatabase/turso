@@ -75,6 +75,7 @@ scalar_functions! {
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
     PgBackendPid(FunctionArity::Exact(0), true),
+    PgIsInRecovery(FunctionArity::Exact(0), false),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -120,6 +121,10 @@ impl ScalarCall for PgScalarFunction {
             }
             Self::CurrentSchema => Value::build_text("public"),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
+            Self::PgIsInRecovery => {
+                // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
+                Value::build_text("t")
+            }
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp

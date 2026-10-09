@@ -207,6 +207,34 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT pg_catalog.set_config('search_path', '', false)"
+        ),
+        [""]
+    );
+    for sql in [
+        "SELECT pg_catalog.pg_is_in_recovery()",
+        "SELECT pg_is_in_recovery() AS recovery",
+    ] {
+        assert_eq!(query_text(&conn, sql), ["t"]);
+    }
+    assert!(conn.prepare("SELECT pg_is_in_recovery(1)").is_err());
+
+    let raw = db.connect_limbo();
+    assert_eq!(
+        raw.prepare("SELECT pg_is_in_recovery()")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("t")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_version_is_client_parseable(db: TempDatabase) {
     let conn = db.connect_postgres();
 
