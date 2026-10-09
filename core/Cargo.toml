@@ -37,7 +37,7 @@ conn_raw_api = []
 aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs"]
 json = []
-uuid = ["dep:uuid"]
+uuid = []
 io_uring = ["dep:io-uring", "rustix/io_uring"]
 experimental_win_iocp = []
 time = []
@@ -125,7 +125,7 @@ bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 pastey = "0.2.1"
-uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7"] }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
@@ -159,7 +159,7 @@ simsimd = { version = "6.5.3", optional = true }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 # From  aes-gcm
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-uuid = { version = "1.11.0", features = ["js"], optional = true }
+uuid = { version = "1.11.0", features = ["js"] }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }

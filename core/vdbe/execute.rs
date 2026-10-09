@@ -10538,7 +10538,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 {
@@ -10592,7 +10593,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 'outer: {
