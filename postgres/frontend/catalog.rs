@@ -536,7 +536,10 @@ impl SnapshotRows for PgAttributeTable {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
+                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
+                    _ => sqlite_type_to_pg_oid(&col.ty_str),
+                };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -1291,28 +1294,34 @@ impl SnapshotRows for PgTypeTable {
             }));
         }
 
-        // Dynamic: user-defined enum types from type_registry
         let schema = conn.current_schema();
         for (name, td) in &schema.type_registry {
             if td.is_builtin {
                 continue;
             }
-            // User-defined enums: typtype='e', typcategory='E'
-            let enum_oid = 50000
-                + (name
-                    .as_bytes()
+            let (typtype, typcategory, typbasetype) = if td.is_domain {
+                let base_oid = match schema.get_type_def_unchecked(td.base()) {
+                    Some(base) if !base.is_builtin => user_type_oid(&base.name),
+                    _ => sqlite_type_to_pg_oid(td.base()),
+                };
+                let base_category = PG_BASE_TYPES
                     .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                    % 10000) as i64;
+                    .find(|t| t.oid == base_oid)
+                    .map_or("U", |t| t.typcategory);
+                ("d", base_category, base_oid)
+            } else {
+                ("e", "E", 0)
+            };
+            let oid = user_type_oid(&td.name);
             rows.push(vec![
-                Value::from_i64(enum_oid),        // oid
+                Value::from_i64(oid),             // oid
                 Value::Text(name.clone().into()), // typname
-                Value::from_i64(11),              // typnamespace (pg_catalog)
+                Value::from_i64(2200),            // typnamespace (public)
                 Value::from_i64(10),              // typowner
                 Value::from_i64(4),               // typlen
                 Value::from_i64(1),               // typbyval
-                Value::build_text("e"),           // typtype (enum)
-                Value::build_text("E"),           // typcategory (enum)
+                Value::build_text(typtype),       // typtype
+                Value::build_text(typcategory),   // typcategory
                 Value::from_i64(0),               // typispreferred
                 Value::from_i64(1),               // typisdefined
                 Value::build_text(","),           // typdelim
@@ -1330,7 +1339,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::build_text("i"),           // typalign
                 Value::build_text("p"),           // typstorage
                 Value::from_i64(0),               // typnotnull
-                Value::from_i64(0),               // typbasetype
+                Value::from_i64(typbasetype),     // typbasetype
                 Value::from_i64(-1),              // typtypmod
                 Value::from_i64(0),               // typndims
                 Value::from_i64(0),               // typcollation
@@ -1341,6 +1350,15 @@ impl SnapshotRows for PgTypeTable {
         }
         rows
     }
+}
+
+fn user_type_oid(name: &str) -> i64 {
+    50000
+        + (name
+            .as_bytes()
+            .iter()
+            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+            % 10000) as i64
 }
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
