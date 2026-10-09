@@ -6473,11 +6473,11 @@ impl BTreeCursor {
         };
         let skip_advance = self.skip_advance;
         let res = self.seek(seek_key, ctx.seek_op)?;
+        self.skip_advance = skip_advance;
         match res {
             IOResult::Done(res) => {
                 match res {
                     SeekResult::Found => {
-                        self.skip_advance = skip_advance;
                         self.valid_state = CursorValidState::Valid;
                         Ok(IOResult::Done(()))
                     }
@@ -6502,7 +6502,6 @@ impl BTreeCursor {
                 }
             }
             IOResult::IO(io) => {
-                self.skip_advance = skip_advance;
                 self.context = Some(ctx);
                 Ok(IOResult::IO(io))
             }
@@ -14770,6 +14769,114 @@ mod tests {
                 Some(5),
                 "peer must observe its saved rowid after a left-of-it peer insert"
             );
+        }
+
+        #[test]
+        fn index_delete_then_next_returns_next_key_with_and_without_peer_insert() {
+            use crate::storage::pager::CreateBTreeFlags;
+
+            fn index_key(n: u32) -> ImmutableRecord {
+                let mut blob = n.to_be_bytes().to_vec();
+                blob.resize(300, b'x');
+                let regs = [Register::Value(Value::Blob(blob))];
+                ImmutableRecord::from_registers(&regs, regs.len()).unwrap()
+            }
+
+            let (pager, _, _db, _conn) = empty_btree();
+            pager.begin_read_tx().unwrap();
+            run_until_done(
+                || pager.begin_write_tx(WalAutoActions::all_enabled()),
+                &pager,
+            )
+            .unwrap();
+            let index_root_page = run_until_done(
+                || pager.btree_create(&CreateBTreeFlags::new_index()),
+                &pager,
+            )
+            .unwrap() as i64;
+            let index_def = Index {
+                name: "testindex".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(vec!["testcol"]),
+                table_name: "test".to_string(),
+                root_page: index_root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: false,
+                index_method: None,
+                on_conflict: None,
+            };
+            let make_cursor = || {
+                let cursor = Box::new(
+                    BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap(),
+                );
+                cursor.register_with_pager();
+                cursor
+            };
+            let mut deleter = make_cursor();
+            let mut peer = make_cursor();
+            let insert = |cursor: &mut BTreeCursor, n: u32| {
+                let key = index_key(n);
+                run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(key.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    &pager,
+                )
+                .unwrap();
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(key.as_record_ref())),
+                    &pager,
+                )
+                .unwrap();
+            };
+
+            let current_key = |cursor: &mut BTreeCursor| {
+                run_until_done(
+                    || {
+                        Ok(cursor
+                            .record_payload()?
+                            .map(|payload| payload.map(<[u8]>::to_vec)))
+                    },
+                    &pager,
+                )
+                .unwrap()
+            };
+
+            const KEYS: u32 = 300;
+            for n in 0..KEYS {
+                insert(&mut peer, n);
+            }
+            for n in 0..KEYS - 1 {
+                let key = index_key(n);
+                let seek_result = run_until_done(
+                    || {
+                        deleter.seek(
+                            SeekKey::IndexKey(key.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    &pager,
+                )
+                .unwrap();
+                if matches!(seek_result, SeekResult::TryAdvance) {
+                    run_until_done(|| deleter.next(), &pager).unwrap();
+                }
+                assert!(current_key(&mut deleter) == Some(key.get_payload().to_vec()));
+                run_until_done(|| deleter.delete(), &pager).unwrap();
+                if n % 2 == 0 {
+                    insert(&mut peer, KEYS + n);
+                }
+                run_until_done(|| deleter.next(), &pager).unwrap();
+                assert!(
+                    current_key(&mut deleter) == Some(index_key(n + 1).get_payload().to_vec()),
+                    "next() after deleting key {n} did not return key {}",
+                    n + 1
+                );
+            }
         }
     }
 
