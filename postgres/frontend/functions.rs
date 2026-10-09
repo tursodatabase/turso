@@ -70,6 +70,7 @@ scalar_functions! {
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
+    SetConfig(FunctionArity::Exact(3), false),
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
@@ -112,6 +113,7 @@ impl ScalarCall for PgScalarFunction {
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
+            Self::SetConfig => exec_set_config(connection, args)?,
             Self::Version => exec_version(),
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
@@ -139,6 +141,60 @@ fn text_arg(args: &[Register], i: usize) -> String {
     match args.get(i).map(Register::get_value) {
         Some(Value::Text(t)) => t.as_str().to_string(),
         _ => String::new(),
+    }
+}
+
+#[derive(strum::EnumString)]
+#[strum(ascii_case_insensitive, serialize_all = "snake_case")]
+enum ConfigParameter {
+    SearchPath,
+}
+
+fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
+    let name = match args[0].get_value() {
+        Value::Text(name) => name.as_str(),
+        Value::Null => {
+            return Err(LimboError::InvalidArgument(
+                "SET requires parameter name".to_string(),
+            ));
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "set_config requires a text parameter name".to_string(),
+            ));
+        }
+    };
+    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
+        LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
+    })?;
+    let value = match args[1].get_value() {
+        Value::Text(value) => Some(value.as_str()),
+        Value::Null => None,
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "set_config requires a text value".to_string(),
+            ));
+        }
+    };
+    let is_local = match args[2].get_value() {
+        Value::Null => false,
+        value => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "set_config requires a boolean".to_string(),
+                ));
+            }
+        },
+    };
+    if is_local {
+        return Err(LimboError::InvalidArgument(
+            "transaction-local settings are not supported".to_string(),
+        ));
+    }
+    match parameter {
+        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
     }
 }
 
@@ -802,4 +858,25 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigParameter;
+
+    #[test]
+    fn config_parameter_parses_sql_names() {
+        for name in ["search_path", "SEARCH_PATH", "SeArCh_PaTh"] {
+            assert!(
+                matches!(
+                    name.parse::<ConfigParameter>(),
+                    Ok(ConfigParameter::SearchPath)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["", "statement_timeout", "SearchPath", "search_path "] {
+            assert!(name.parse::<ConfigParameter>().is_err(), "{name}");
+        }
+    }
 }

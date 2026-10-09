@@ -811,6 +811,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chumsky"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0d2bfadce76f963d776feff99db6dc33783829539258314776383b33e2a00f8"
+dependencies = [
+ "hashbrown 0.15.2",
+ "regex-automata 0.4.13",
+ "serde",
+ "unicode-ident",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6111,7 +6124,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "chumsky",
+ "chumsky 0.12.0",
  "clap",
  "fake",
  "futures",
@@ -7272,6 +7285,7 @@ name = "turso_pg"
 version = "0.8.0"
 dependencies = [
  "chrono",
+ "chumsky 0.13.0",
  "parking_lot",
  "rustc-hash 2.1.1",
  "strum",

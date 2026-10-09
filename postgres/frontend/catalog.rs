@@ -11,6 +11,8 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
 
+pub use turso_pg_parser::translator::is_catalog_table_name;
+
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -152,38 +154,6 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
-}
-
-pub fn is_catalog_table_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "pg_class"
-            | "pg_namespace"
-            | "pg_attribute"
-            | "pg_roles"
-            | "pg_proc"
-            | "pg_database"
-            | "pg_am"
-            | "pg_type"
-            | "pg_collation"
-            | "pg_attrdef"
-            | "pg_description"
-            | "pg_publication"
-            | "pg_publication_namespace"
-            | "pg_publication_rel"
-            | "pg_sequences"
-            | "pg_constraint"
-            | "pg_index"
-            | "pg_inherits"
-            | "pg_rewrite"
-            | "pg_foreign_table"
-            | "pg_partitioned_table"
-            | "pg_trigger"
-            | "pg_policy"
-            | "pg_input_error_info"
-            | "pg_get_tabledef"
-            | "pg_tables"
-    )
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -3004,7 +2974,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = crate::Connection::new(db.connect().unwrap());
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
@@ -3062,7 +3032,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for regular tables
         let mut stmt = conn
@@ -3118,7 +3089,8 @@ mod tests {
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for table details
         let mut stmt = conn
@@ -3183,7 +3155,8 @@ mod tests {
         conn.execute("CREATE TABLE test_table (id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Try to query sqlite_master - should fail
         let result = conn.prepare("SELECT * FROM sqlite_master");
@@ -3283,7 +3256,7 @@ mod tests {
         assert!(found, "users table not found in sqlite_master");
 
         // PostgreSQL-mode connection: pg_class sees the user table.
-        let pg_conn = crate::Connection::new(db.connect().unwrap());
+        let pg_conn = crate::Connection::connect(&db).unwrap();
         let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
@@ -3326,7 +3299,8 @@ mod tests {
         conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Test various WHERE clause combinations
 
@@ -3396,7 +3370,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_tables
         let mut stmt = conn
@@ -3441,7 +3416,8 @@ mod tests {
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         let mut stmt = conn.prepare("SELECT tablename FROM pg_tables").unwrap();
 

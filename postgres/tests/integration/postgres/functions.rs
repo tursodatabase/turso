@@ -42,6 +42,171 @@ fn query_integer(conn: &PgConnection, sql: &str) -> Vec<i64> {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_set_config_shares_connection_state(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', 'missing', false)"),
+        ["missing"]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(query_integer(&other, "SELECT v FROM config_items"), [17]);
+
+    let clone = conn.clone();
+    clone.execute("SET search_path TO public").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        conn.inner()
+            .prepare("SELECT set_config('search_path', 'missing', false)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("missing")]]
+    );
+    assert!(clone.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(query_integer(&other, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_empty_and_quoted_search_paths(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT set_config('search_path', ' \"missing, public\", PUBLIC ', false)"
+        ),
+        [" \"missing, public\", PUBLIC "]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT set_config('search_path', '\"public, missing\"', false)"
+        ),
+        ["\"public, missing\""]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT pg_catalog.set_config('search_path', '', false)"
+        ),
+        [""]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(
+        query_integer(&conn, "SELECT v FROM public.config_items"),
+        [17]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT COUNT(*) FROM pg_catalog.pg_namespace"),
+        [3]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT COUNT(*) FROM pg_namespace"),
+        [3]
+    );
+    conn.execute("SET search_path TO public").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_changes_settings_only_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    let mut setter = conn
+        .prepare("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        setter.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    conn.execute("SET search_path TO public").unwrap();
+    setter.reset().unwrap();
+    setter.run_ignore_rows().unwrap();
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    let mut setter = conn.prepare("SET search_path TO public").unwrap();
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    setter.run_ignore_rows().unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_validates_arguments(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    for (sql, message) in [
+        (
+            "SELECT set_config('statement_timeout', '100', false)",
+            "unrecognized configuration parameter",
+        ),
+        (
+            "SELECT set_config(NULL, 'public', false)",
+            "SET requires parameter name",
+        ),
+        (
+            "SELECT set_config('search_path', 5, false)",
+            "set_config requires a text value",
+        ),
+        (
+            "SELECT set_config('search_path', '', 2)",
+            "set_config requires a boolean",
+        ),
+        (
+            "SELECT set_config('search_path', '', true)",
+            "transaction-local settings are not supported",
+        ),
+        (
+            "SET LOCAL search_path TO missing",
+            "transaction-local settings are not supported",
+        ),
+        (
+            "SELECT set_config('search_path', 'public,', false)",
+            "invalid value for parameter",
+        ),
+        (
+            "SELECT set_config('search_path', '\"unclosed', false)",
+            "invalid value for parameter",
+        ),
+        (
+            "SELECT set_config('search_path', 'one two', false)",
+            "invalid value for parameter",
+        ),
+    ] {
+        let error = conn.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+        assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    }
+    for sql in [
+        "SELECT set_config('search_path', '')",
+        "SELECT set_config('search_path', '', false, false)",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('SEARCH_PATH', '', NULL)"),
+        [""]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', NULL, false)"),
+        ["\"$user\", public"]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_version_is_client_parseable(db: TempDatabase) {
     let conn = db.connect_postgres();
 

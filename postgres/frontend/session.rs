@@ -1,3 +1,4 @@
+use chumsky::{error::EmptyErr, prelude::*};
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -20,20 +21,14 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
-    session_state: Mutex<SessionState>,
-}
-
-impl PgConnectionInner {
-    fn set_search_path(&self, path: Vec<String>) {
-        let mut state = self.session_state.lock().unwrap();
-        state.search_path = path;
-    }
 }
 
 #[derive(Default)]
 struct SessionState {
-    search_path: Vec<String>,
+    search_path: Option<Vec<String>>,
 }
+
+type PgSessionState = Mutex<SessionState>;
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -72,13 +67,12 @@ pub fn open_database_with_io(
 }
 
 impl PgConnection {
-    pub fn new(conn: Arc<Connection>) -> Self {
-        Self {
-            inner: Arc::new(PgConnectionInner {
-                conn,
-                session_state: Mutex::new(SessionState::default()),
-            }),
-        }
+    pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
+        let context = Arc::new(PgSessionState::default());
+        let conn = db.connect_with_context(context)?;
+        Ok(Self {
+            inner: Arc::new(PgConnectionInner { conn }),
+        })
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -187,10 +181,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     reject_catalog_dml(translated.cmd.stmt())?;
 
     let options = {
-        let state = pg_conn.session_state.lock().unwrap();
-        let path = state.search_path.clone();
+        let state = pg_conn
+            .conn
+            .context::<PgSessionState>()
+            .expect("PostgreSQL connections have session state")
+            .lock()
+            .unwrap();
         PrepareOptions {
-            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+            unqualified_database_search_path: state.search_path.clone(),
         }
     };
     for prereq in translated.prereqs {
@@ -303,17 +301,74 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         let path = set_stmt
             .values
             .iter()
-            .map(|value| value.as_search_path_name().map(str::to_owned))
+            .map(|value| {
+                value
+                    .as_search_path_name()
+                    .map(turso_pg_parser::quote_identifier)
+            })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
-        return noop_statement(&pg_conn.conn);
+            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?
+            .join(", ");
+        // Change the setting when the statement runs, not when it is prepared.
+        // set_config returns text, so IS NULL prevents SET from returning rows.
+        return pg_conn.conn.prepare(format!(
+            "SELECT 0 WHERE set_config('search_path', '{}', {}) IS NULL",
+            path.replace('\'', "''"),
+            set_stmt.is_local
+        ));
     }
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
     pg_conn.conn.prepare(&pragma_sql)
+}
+
+pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
+    let path = value.map(parse_search_path).transpose()?;
+    let state = conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })?;
+    state.lock().unwrap().search_path = path;
+    Ok(Value::build_text(
+        value.unwrap_or("\"$user\", public").to_owned(),
+    ))
+}
+
+fn parse_search_path(value: &str) -> Result<Vec<String>> {
+    search_path_parser()
+        .parse(value)
+        .into_result()
+        .map_err(|_| {
+            LimboError::ParseError("invalid value for parameter \"search_path\"".to_string())
+        })
+}
+
+fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra::Err<EmptyErr>> {
+    let whitespace = any().filter(char::is_ascii_whitespace).repeated().ignored();
+    // Parse double-quoted names such as "My, Schema" or "a""b".
+    // Preserve case, commas, and spaces. Turn doubled quotes into one quote.
+    let quoted = just("\"\"")
+        .to('"')
+        .or(none_of('"'))
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('"'), just('"'));
+    // Parse names such as PUBLIC or $user, up to a comma or ASCII whitespace.
+    // Require at least one character, reject a leading quote, and lowercase ASCII letters.
+    let unquoted = any()
+        .filter(|c: &char| *c != ',' && !c.is_ascii_whitespace())
+        .repeated()
+        .at_least(1)
+        .to_slice()
+        .filter(|name: &&str| !name.starts_with('"'))
+        .map(str::to_ascii_lowercase);
+
+    quoted
+        .or(unquoted)
+        .separated_by(just(',').padded_by(whitespace))
+        .collect::<Vec<_>>()
+        .padded_by(whitespace)
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -525,4 +580,55 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{search_path_parser, PgSessionState, SessionState};
+    use chumsky::Parser;
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn session_state_alias_matches_injected_type() {
+        let state: Arc<dyn Any + Send + Sync> = Arc::new(Mutex::new(SessionState::default()));
+        assert!(state.downcast_ref::<PgSessionState>().is_some());
+    }
+
+    #[test]
+    fn search_path_parser_accepts_identifier_lists() {
+        for (input, expected) in [
+            ("", vec![]),
+            (" \t\n\r\u{c}", vec![]),
+            (" PUBLIC , \"MiXeD\" ", vec!["public", "MiXeD"]),
+            ("\"a,b\", \"a\"\"b\", $USER", vec!["a,b", "a\"b", "$user"]),
+            ("\"\"\"\"", vec!["\""]),
+            ("\"\", public", vec!["", "public"]),
+            ("public\"extra", vec!["public\"extra"]),
+            ("\u{b}PUBLIC\u{a0}", vec!["\u{b}public\u{a0}"]),
+        ] {
+            assert_eq!(
+                search_path_parser().parse(input).into_result().unwrap(),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_path_parser_rejects_invalid_identifier_lists() {
+        for input in [
+            ",public",
+            "public,",
+            "public, ",
+            "public,,main",
+            "one two",
+            "\"\"\"",
+            "\"unclosed",
+            "\"a\"b",
+            "\"a\" \"b\"",
+        ] {
+            assert!(search_path_parser().parse(input).has_errors(), "{input:?}");
+        }
+    }
 }

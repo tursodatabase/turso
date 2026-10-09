@@ -43,15 +43,15 @@ impl PostgreSQLTranslator {
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let mut qn = if range_var.schemaname.is_empty()
-            || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "public" | "information_schema"
-            ) {
-            ast::QualifiedName::single(name)
-        } else {
-            let schema = ast::Name::from_string(range_var.schemaname.clone());
-            ast::QualifiedName::fullname(schema, name)
+        let schema = match range_var.schemaname.to_ascii_lowercase().as_str() {
+            "pg_catalog" | "public" | "information_schema" => Some("main"),
+            "" if is_catalog_table_name(name.as_str()) => Some("main"),
+            "" => None,
+            _ => Some(range_var.schemaname.as_str()),
+        };
+        let mut qn = match schema {
+            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
         qn
@@ -4030,6 +4030,38 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     )
 }
 
+pub fn is_catalog_table_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_class"
+            | "pg_namespace"
+            | "pg_attribute"
+            | "pg_roles"
+            | "pg_proc"
+            | "pg_database"
+            | "pg_am"
+            | "pg_type"
+            | "pg_collation"
+            | "pg_attrdef"
+            | "pg_description"
+            | "pg_publication"
+            | "pg_publication_namespace"
+            | "pg_publication_rel"
+            | "pg_sequences"
+            | "pg_constraint"
+            | "pg_index"
+            | "pg_inherits"
+            | "pg_rewrite"
+            | "pg_foreign_table"
+            | "pg_partitioned_table"
+            | "pg_trigger"
+            | "pg_policy"
+            | "pg_input_error_info"
+            | "pg_get_tabledef"
+            | "pg_tables"
+    )
+}
+
 /// PostgreSQL derives a name for result columns without an explicit alias
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
@@ -4515,6 +4547,7 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
+    pub is_local: bool,
 }
 
 #[derive(Clone)]
@@ -4613,6 +4646,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
         values,
+        is_local: set_stmt.is_local,
     })
 }
 
