@@ -264,13 +264,18 @@ fn sim_mvcc_restart_recovery_is_idempotent() -> Result<()> {
     Ok(())
 }
 
-/// What this test checks: Startup fails closed when WAL has committed state but the MVCC log file is missing.
-/// Why this matters: In uncertain durability states, refusing to open is safer than guessing and risking data loss.
+/// What this test checks: Startup completes the interrupted checkpoint when the WAL has
+/// committed state and the MVCC log is empty (this IO backend recreates a removed log as an
+/// empty file on open, so removal and truncation are the same state here).
+/// Why this matters: A TRUNCATE checkpoint leaves exactly this state when the process dies
+/// between truncating the logical log and truncating the WAL. The log is only cleared once the
+/// WAL holds every frame it had, so completing the checkpoint loses nothing; failing closed made
+/// the database impossible to open (#7480).
 #[test]
-fn sim_mvcc_fail_closed_case_wal_without_log() -> Result<()> {
+fn sim_mvcc_completes_checkpoint_case_wal_without_log() -> Result<()> {
     let seed = 203;
     let io = make_io(seed, 100);
-    let path = format!("sim_mvcc_fail_closed_missing_log_{seed}.db");
+    let path = format!("sim_mvcc_wal_without_log_{seed}.db");
 
     let conn = open_conn(io.clone(), &path)?;
     enable_mvcc(&conn)?;
@@ -278,7 +283,13 @@ fn sim_mvcc_fail_closed_case_wal_without_log() -> Result<()> {
     drop(conn);
 
     remove_file_by_suffix(io.as_ref(), ".db-log")?;
-    assert_open_fails_closed(io, &path);
+    let conn = open_conn(io.clone(), &path)?;
+    assert_eq!(query_rows(&conn, io.as_ref())?, vec![(1, "a".to_string())]);
+    conn.execute("INSERT INTO t VALUES (2, 'b')")?;
+    assert_eq!(
+        query_rows(&conn, io.as_ref())?,
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
     Ok(())
 }
 
