@@ -63,6 +63,8 @@ public class SQLite3LateralJsonOracle extends LateralJsonOracle<SQLite3GlobalSta
     private static final Pattern FIRST_INDEX_COLUMN = Pattern.compile(
             "(?is)\\bON\\s+[\"`\\[]?\\w+[\"`\\]]?\\s*\\(\\s*[\"`\\[]?(\\w+)[\"`\\]]?\\s*(?:[,)]|COLLATE|ASC|DESC)");
     private static final String TURSO_ISSUE_9051 = "insufficient registers allocated for expression vector write";
+    private static final String TURSO_BARE_COLLATE_CONDITION = "Collate in WHERE clause is not supported";
+    private static final String TURSO_INTEGER_OVERFLOW = "integer overflow";
     private static final List<String> UNSUPPORTED_FEATURE_ERRORS = Arrays.asList("Parse error", "not yet implemented",
             "not implemented", "not supported", "unsupported", "no such function", "COLLATE", "INDEXED BY",
             "NOT INDEXED");
@@ -73,8 +75,8 @@ public class SQLite3LateralJsonOracle extends LateralJsonOracle<SQLite3GlobalSta
     private List<Integer> jsonJoins = Collections.emptyList();
 
     public SQLite3LateralJsonOracle(SQLite3GlobalState state) {
-        super(state, ExpectedErrors.newErrors().with(SQLite3Errors.getExpectedExpressionErrors()).with(TURSO_ISSUE_9051)
-                .build());
+        super(state, ExpectedErrors.newErrors().with(SQLite3Errors.getExpectedExpressionErrors())
+                .with(TURSO_INTEGER_OVERFLOW, TURSO_ISSUE_9051, TURSO_BARE_COLLATE_CONDITION).build());
         predicateErrors = ExpectedErrors.newErrors().with(SQLite3Errors.getExpectedExpressionErrors())
                 .with(SQLite3Errors.getMatchQueryErrors()).with(SQLite3Errors.getQueryErrors())
                 .with(UNSUPPORTED_FEATURE_ERRORS).build();
