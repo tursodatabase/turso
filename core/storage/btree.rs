@@ -6471,9 +6471,12 @@ impl BTreeCursor {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
             CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record.reborrow()),
         };
-        let skip_advance = self.skip_advance;
-        let res = self.seek(seek_key, ctx.seek_op)?;
-        self.skip_advance = skip_advance;
+        // A saved position is restored as it was, including skip_advance.
+        // A cursor that just deleted a row sits on the next row with skip_advance set.
+        // If the flag were cleared here, the next next() would move past that row.
+        // seek() clears the flag, so use the variant that keeps it.
+        // SQLite's btreeRestoreCursorPosition also keeps skipNext.
+        let res = self.seek_keeping_skip_advance(seek_key, ctx.seek_op)?;
         match res {
             IOResult::Done(res) => {
                 match res {
@@ -6506,6 +6509,26 @@ impl BTreeCursor {
                 Ok(IOResult::IO(io))
             }
         }
+    }
+
+    fn seek_keeping_skip_advance(
+        &mut self,
+        key: SeekKey<'_>,
+        op: SeekOp,
+    ) -> IOResultOr<SeekResult> {
+        // Empty trace to capture the span information
+        tracing::trace!("");
+        // We need to clear the null flag for the table cursor before seeking,
+        // because it might have been set to false by an unmatched left-join row during the previous iteration
+        // on the outer loop.
+        self.set_null_flag(false);
+        let seek_result = return_if_io!(self.do_seek(key, op));
+        self.invalidate_record();
+        // Reset seek state
+        self.seek_state = CursorSeekState::Start;
+        self.valid_state = CursorValidState::Valid;
+        self.read_overflow_state = None;
+        Ok(IOResult::Done(seek_result))
     }
 
     pub fn read_page_blocking(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
@@ -6804,19 +6827,7 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
         self.skip_advance = false;
-        // Empty trace to capture the span information
-        tracing::trace!("");
-        // We need to clear the null flag for the table cursor before seeking,
-        // because it might have been set to false by an unmatched left-join row during the previous iteration
-        // on the outer loop.
-        self.set_null_flag(false);
-        let seek_result = return_if_io!(self.do_seek(key, op));
-        self.invalidate_record();
-        // Reset seek state
-        self.seek_state = CursorSeekState::Start;
-        self.valid_state = CursorValidState::Valid;
-        self.read_overflow_state = None;
-        Ok(IOResult::Done(seek_result))
+        self.seek_keeping_skip_advance(key, op)
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
@@ -7285,11 +7296,22 @@ impl CursorTrait for BTreeCursor {
                             self.state =
                                 CursorState::Delete(DeleteState::PostInteriorNodeReplacement);
                         } else {
+                            // Deleting cell i shifted the later cells left, so cell i now holds
+                            // the row after the deleted one. Stay on it and set skip_advance,
+                            // so the next next() returns this row instead of moving past it.
+                            // If the deleted cell was the last one on the page, there is no
+                            // cell i. Step back to cell i - 1, and next() moves forward as usual.
+                            // Stepping back from cell 0 instead would leave the cursor at cell -1.
+                            // That position cannot be saved when another cursor writes the table
+                            // (as an FK action does), so the scan would end early.
+                            // SQLite's sqlite3BtreeDelete does the same with skipNext.
                             let cell_count = self.stack.top_ref().get_contents().cell_count();
-                            if (self.stack.current_cell_index() as usize) < cell_count {
-                                self.skip_advance = true;
-                            } else {
+                            let deleted_cell_was_last =
+                                self.stack.current_cell_index() as usize >= cell_count;
+                            if deleted_cell_was_last {
                                 self.stack.retreat();
+                            } else {
+                                self.skip_advance = true;
                             }
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
