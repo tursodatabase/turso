@@ -15,8 +15,8 @@ use crate::{
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate, SubqueryEvalPhase,
+            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
+            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -989,6 +989,17 @@ fn build_materialized_build_input_plan(
         }
     };
 
+    // The WHERE terms that use a subquery reading tables outside the prefix are
+    // consumed above, so the subquery must not be emitted in this subplan either.
+    let non_from_clause_subqueries = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| {
+            subquery_reads_only_tables_in(subquery, &plan.table_references, &included_tables)
+        })
+        .cloned()
+        .collect();
+
     let mut materialize_plan = SelectPlan {
         table_references,
         join_order,
@@ -1011,7 +1022,7 @@ fn build_materialized_build_input_plan(
         distinctness: Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+        non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         estimated_cost: None,
@@ -1022,4 +1033,27 @@ fn build_materialized_build_input_plan(
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
 
     Ok(materialize_plan)
+}
+
+fn subquery_reads_only_tables_in(
+    subquery: &NonFromClauseSubquery,
+    table_references: &TableReferences,
+    tables: &TableMask,
+) -> bool {
+    let SubqueryState::Unevaluated {
+        plan: Some(subquery_plan),
+    } = &subquery.state
+    else {
+        return true;
+    };
+    subquery_plan
+        .used_outer_query_ref_ids()
+        .iter()
+        .all(|outer_ref_id| {
+            table_references
+                .joined_tables()
+                .iter()
+                .position(|table| table.internal_id == *outer_ref_id)
+                .is_none_or(|table_idx| tables.get(table_idx))
+        })
 }
