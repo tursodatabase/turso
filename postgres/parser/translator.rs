@@ -180,14 +180,14 @@ impl PostgreSQLTranslator {
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
-                ))
+                ));
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
                     node_ref_name(&node)
-                )))
+                )));
             }
         })
     }
@@ -1999,13 +1999,25 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let name = ast::Name::from_string(func_name);
-        let qualified_name = if matches!(func_name, "pg_options_to_table" | "unnest") {
+        let table_name = match func_name {
+            "generate_series" => "pg_generate_series",
+            _ => func_name,
+        };
+        let alias = if table_name != func_name && alias.is_none() {
+            Some(ast::As::Elided(ast::Name::from_string(func_name)))
+        } else {
+            alias
+        };
+        let name = ast::Name::from_string(table_name);
+        let qualified_name = if matches!(
+            func_name,
+            "pg_options_to_table" | "unnest" | "generate_series"
+        ) {
             ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
         } else {
             ast::QualifiedName::single(name)
         };
-        let columns = range_func
+        let mut columns = range_func
             .alias
             .as_ref()
             .map(|a| a.colnames.as_slice())
@@ -2020,6 +2032,11 @@ impl PostgreSQLTranslator {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() && matches!(func_name, "generate_series" | "unnest") {
+            if let Some(ast::As::As(name) | ast::As::Elided(name)) = &alias {
+                columns.push(name.clone());
+            }
+        }
         Ok(ast::SelectTable::TableCall(
             qualified_name,
             args,
@@ -2564,7 +2581,7 @@ impl PostgreSQLTranslator {
                                     _ => {
                                         return Err(ParseError::ParseError(
                                             "Field access on non-identifier expression".into(),
-                                        ))
+                                        ));
                                     }
                                 },
                                 ast::Name::from_string(s.sval.clone()),
@@ -3288,6 +3305,7 @@ impl PostgreSQLTranslator {
         // take — so the rewrite is purely a name change.
         let func_name = match func_name.as_str() {
             "position" => "strpos".to_string(),
+            "array_upper" => "pg_array_upper".to_string(),
             _ => func_name,
         };
 
@@ -4302,6 +4320,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_largeobject_metadata"
             | "pg_amop"
             | "pg_amproc"
+            | "pg_seclabels"
             | "pg_tables"
             | "pg_indexes"
     )
