@@ -89,8 +89,12 @@ impl StressConn {
         result
     }
 
+    pub fn in_transaction(&self) -> turso::Result<bool> {
+        Ok(!self.conn.is_autocommit()?)
+    }
+
     pub async fn rollback_if_open(&self) -> turso::Result<()> {
-        if !self.conn.is_autocommit()? {
+        if self.in_transaction()? {
             self.execute("ROLLBACK", ()).await?;
         }
         Ok(())
