@@ -38,6 +38,7 @@ Each yield-capable live object has:
 - `inject_transition_yield!(self, Point)`: for `StateTransition` returning `TransitionResult<T>`.
 - `inject_io_yield!(self, Point)`: for cursor/helper functions returning `IOResult<T>`.
 - `inject_transition_failure!(self, Point)`: returns `Err(LimboError)` from `StateTransition`.
+- `inject_coro_yield!(self, coro, Point)`: for async functions that run in a `Coro` (the MVCC checkpoint). It pauses with `coro.wait_for_io`, so the function continues after the yield and does no work again.
 
 There is no `inject_io_failure!` today; failure injection only works for `TransitionResult` state machines.
 
@@ -111,6 +112,8 @@ conn.set_yield_injector(Some(FixedYieldInjector::new([
 
 `FixedYieldInjector` stores a `HashSet<YieldPoint>`, ignores `instance_id`/`selection_key`, and consumes each configured point once total. If two simultaneous instances hit the same point, the first one consumes it.
 
+`YieldPoint` has no family. If two families have the same `point_count`, a fixed point also matches the hook with the same ordinal in the other family. Before you add a variant, make sure that the new count is not the count of another family.
+
 `FixedFailureInjector` behaves similarly but maps one point to one `LimboError`.
 
 Clear injectors when reusing the same connection:
@@ -128,6 +131,8 @@ conn.set_failure_injector(None);
 - Commit `AfterRemoveTx` failure: verify tx maps, connection tx slots, locks, and exclusive tx atomics are not stranded.
 - Checkpoint `BeforeAcquireLock`: interleave before checkpoint boundary sampling.
 - Checkpoint `AfterDurableBoundaryAdvanced` failure: test retry/recovery after durable state advanced.
+- Checkpoint `AfterDurableBoundaryAdvanced` yield: stop a checkpoint after the pager commit, before the WAL checkpoint.
+- Checkpoint `BeforeTruncateLogicalLog` or `BeforeTruncateWal`: stop a checkpoint after the DB file sync, before it truncates the logical log or the WAL.
 - Cursor `NextStart` or `SeekStart`: test cursor re-entry and dropped-statement cleanup, especially rowid allocator locks.
 
 Abandoned commit tests rely on cleanup paths: `CommitStateMachine::drop` calls `cleanup_unfinished_commit`, and abort-side cleanup runs through `cleanup_abandoned_mvcc_commit`.

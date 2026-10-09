@@ -71,41 +71,6 @@ fn sqlite_schema_row_range_bounds() -> (Bound<RowID>, Bound<RowID>) {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckpointState {
-    PrepareCheckpoint,
-    AcquireLock,
-    BuildLocalSchemaView,
-    CollectTableRows,
-    CollectIndexRows,
-    BeginPagerTxn,
-    WriteTableRows,
-    WriteIndexRows,
-    /// Compact each non-CYCLE sequence backing table down to a single
-    /// watermark row. CYCLE seqs are skipped — they manage wrap
-    /// correctness via inline compaction in the nextval bytecode and
-    /// already stay at one row in steady state. Non-CYCLE seqs grow
-    /// monotonically (one row per nextval) since inline compaction
-    /// was removed from the hot path to eliminate shared-row WW
-    /// conflicts; checkpoint reclaims the historical rows here, via
-    /// `SeqCompactDriver` which drives `BTreeCursor` ops with normal
-    /// `IOResult` propagation (no `io.block` / `wait_for_completion`).
-    CompactSequences,
-    CommitPagerTxn,
-    CheckpointWal,
-    /// Fsync the database file after checkpoint, before truncating WAL.
-    /// This ensures durability: if we crash after WAL truncation but before DB fsync,
-    /// the data would be lost.
-    SyncDbFile,
-    TruncateLogicalLog,
-    FsyncLogicalLog,
-    /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
-    TruncateWal,
-    GcTableRows,
-    GcIndexRows,
-    Finalize,
-}
-
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
@@ -115,6 +80,8 @@ pub(crate) enum CheckpointYieldPoint {
     AfterCollectTableRows,
     BeforePagerCommit,
     BeforePublishWindow,
+    BeforeTruncateLogicalLog,
+    BeforeTruncateWal,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -166,22 +133,10 @@ pub struct LockStates {
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
 /// outcome (WAL backfill, log truncate, metadata) is the same.
 pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    state: CheckpointState,
-    runner: CoroRunner<CheckpointYield, CheckpointExit>,
+    runner: CoroRunner<IOCompletions, CheckpointExit>,
     #[cfg(test)]
     initial_bounds: (Option<u64>, u64),
     _phantom: PhantomData<(Clock, A)>,
-}
-
-enum CheckpointYield {
-    Phase(CheckpointState),
-    Io(IOCompletions),
-}
-
-impl From<IOCompletions> for CheckpointYield {
-    fn from(io: IOCompletions) -> Self {
-        Self::Io(io)
-    }
 }
 
 struct CheckpointExit {
@@ -209,7 +164,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             mode,
         );
         Self {
-            state: CheckpointState::PrepareCheckpoint,
             #[cfg(test)]
             initial_bounds: (
                 checkpoint.durable_txid_max_old.map(u64::from),
@@ -218,11 +172,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             runner: CoroRunner::new(|coro| run_checkpoint(coro, checkpoint)),
             _phantom: PhantomData,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn state_for_test(&self) -> CheckpointState {
-        self.state
     }
 
     #[cfg(test)]
@@ -251,15 +200,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
         match self.runner.resume() {
-            CoroResume::Yielded(CheckpointYield::Phase(state)) => {
-                self.state = state;
-                Ok(TransitionResult::Continue)
-            }
-            CoroResume::Yielded(CheckpointYield::Io(io)) => Ok(TransitionResult::Io(io)),
+            CoroResume::Yielded(io) => Ok(TransitionResult::Io(io)),
             CoroResume::Completed(CheckpointExit { result, on_end }) => {
-                if result.is_ok() {
-                    self.state = CheckpointState::Finalize;
-                }
                 on_end?;
                 result.map(TransitionResult::Done)
             }
@@ -271,12 +213,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
     }
 
     fn is_finalized(&self) -> bool {
-        matches!(self.state, CheckpointState::Finalize)
+        self.runner.is_finished()
     }
 }
 
 async fn run_checkpoint<Clock: LogicalClock, A: ConcurrentAllocator>(
-    mut coro: Coro<CheckpointYield>,
+    mut coro: Coro<IOCompletions>,
     mut checkpoint: Checkpoint<Clock, A>,
 ) -> CheckpointExit {
     match checkpoint.run(&mut coro).await {
@@ -1572,7 +1514,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
     }
 
     /// Fsync the logical log file
-    async fn fsync_logical_log(&self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn fsync_logical_log(&self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         // Skip fsync when synchronous mode is off
         if self.sync_mode == SyncMode::Off {
             tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
@@ -1587,7 +1529,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn truncate_logical_log(&self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn truncate_logical_log(&self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         tracing::debug!("Truncating logical log file");
         let boundary = if self.clears_whole_logical_log() {
@@ -1634,7 +1576,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
-    async fn checkpoint_wal(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn checkpoint_wal(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         tracing::debug!("Performing checkpoint on WAL");
         loop {
             let Some(wal) = &self.pager.wal else {
@@ -2143,8 +2085,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn run(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<CheckpointResult> {
-        coro.enter(CheckpointState::PrepareCheckpoint).await?;
+    async fn run(&mut self, coro: &mut Coro<IOCompletions>) -> Result<CheckpointResult> {
         let passive = self.mvstore.uses_passive_checkpoint();
         if passive {
             // The passive checkpoint acquires the blocking lock only after
@@ -2167,22 +2108,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
             // Checkpoint state machines can be created before they are run.
             // Resample after serializing so already-durable index deletes are not replayed.
             self.refresh_checkpoint_bounds();
-            coro.enter(CheckpointState::BuildLocalSchemaView).await?;
             self.build_local_schema_view(coro).await?;
         } else {
-            coro.enter(CheckpointState::AcquireLock).await?;
             inject_coro_yield!(self, coro, CheckpointYieldPoint::BeforeAcquireLock);
             self.acquire_lock()?;
         }
 
-        coro.enter(CheckpointState::CollectTableRows).await?;
         while let Some(io) = self.collect_table_rows()? {
             coro.wait_for_io(io).await?;
         }
         tracing::debug!("Collected {} committed versions", self.write_set.len());
         inject_coro_yield!(self, coro, CheckpointYieldPoint::AfterCollectTableRows);
 
-        coro.enter(CheckpointState::CollectIndexRows).await?;
         while let Some(io) = self.collect_index_rows()? {
             coro.wait_for_io(io).await?;
         }
@@ -2208,43 +2145,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         self.mvstore.storage.on_checkpoint_start()?;
 
         if !self.write_set.is_empty() || !self.index_write_set.is_empty() {
-            coro.enter(CheckpointState::BeginPagerTxn).await?;
             self.begin_pager_txn()?;
-            coro.enter(CheckpointState::WriteTableRows).await?;
             self.write_table_rows(coro).await?;
-            coro.enter(CheckpointState::WriteIndexRows).await?;
             self.write_index_rows(coro).await?;
-            coro.enter(CheckpointState::CompactSequences).await?;
             self.compact_sequences(coro).await?;
-            coro.enter(CheckpointState::CommitPagerTxn).await?;
             self.commit_pager_txn(coro).await?;
         }
 
-        coro.enter(CheckpointState::CheckpointWal).await?;
         self.checkpoint_wal(coro).await?;
-        coro.enter(CheckpointState::SyncDbFile).await?;
         self.sync_db_file(coro).await?;
-        coro.enter(CheckpointState::TruncateLogicalLog).await?;
+        inject_coro_yield!(self, coro, CheckpointYieldPoint::BeforeTruncateLogicalLog);
         self.truncate_logical_log(coro).await?;
-        coro.enter(CheckpointState::FsyncLogicalLog).await?;
         self.fsync_logical_log(coro).await?;
-        coro.enter(CheckpointState::TruncateWal).await?;
+        inject_coro_yield!(self, coro, CheckpointYieldPoint::BeforeTruncateWal);
         let lwm = self.truncate_wal(coro).await?;
 
-        coro.enter(CheckpointState::GcTableRows).await?;
         let mut next_index = 0;
         while let Some(index) = self.gc_checkpointed_table_versions(next_index, lwm) {
             next_index = index;
             coro.preempt().await?;
         }
-        coro.enter(CheckpointState::GcIndexRows).await?;
         let mut next_index = 0;
         while let Some(index) = self.gc_checkpointed_index_versions(next_index, lwm) {
             next_index = index;
             coro.preempt().await?;
         }
 
-        coro.enter(CheckpointState::Finalize).await?;
         if self.lock_states.blocking_checkpoint_lock_held {
             // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
             // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
@@ -2265,7 +2191,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
             .ok_or_else(|| LimboError::InternalError("checkpoint_result not set".to_string()))
     }
 
-    async fn build_local_schema_view(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn build_local_schema_view(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         let began_read_tx = !self
             .pager
             .wal
@@ -2356,7 +2282,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn write_table_rows(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn write_table_rows(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         let mut requires_seek = true;
         for write_set_index in 0..self.write_set.len() {
             let inserted = self
@@ -2369,7 +2295,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
 
     async fn write_table_row(
         &mut self,
-        coro: &mut Coro<CheckpointYield>,
+        coro: &mut Coro<IOCompletions>,
         write_set_index: usize,
         requires_seek: bool,
     ) -> Result<bool> {
@@ -2660,7 +2586,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         }
     }
 
-    async fn write_index_rows(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn write_index_rows(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         for index_write_set_index in 0..self.index_write_set.len() {
             self.write_index_row(coro, index_write_set_index).await?;
         }
@@ -2669,7 +2595,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
 
     async fn write_index_row(
         &mut self,
-        coro: &mut Coro<CheckpointYield>,
+        coro: &mut Coro<IOCompletions>,
         index_write_set_index: usize,
     ) -> Result<()> {
         let (index_id, row_version, is_delete) = &self.index_write_set[index_write_set_index];
@@ -2740,7 +2666,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn compact_sequences(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    /// Compact each non-CYCLE sequence backing table down to a single
+    /// watermark row. CYCLE seqs are skipped — they manage wrap
+    /// correctness via inline compaction in the nextval bytecode and
+    /// already stay at one row in steady state. Non-CYCLE seqs grow
+    /// monotonically (one row per nextval) since inline compaction
+    /// was removed from the hot path to eliminate shared-row WW
+    /// conflicts; checkpoint reclaims the historical rows here, via
+    /// `SeqCompactDriver` which drives `BTreeCursor` ops with normal
+    /// `IOResult` propagation (no `io.block` / `wait_for_completion`).
+    async fn compact_sequences(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         let pending = self.pending_sequence_compactions()?;
         if pending.is_empty() {
             return Ok(());
@@ -2764,7 +2699,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn commit_pager_txn(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn commit_pager_txn(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         inject_coro_yield!(self, coro, CheckpointYieldPoint::BeforePagerCommit);
         let passive = matches!(self.mode, CheckpointMode::Passive { .. });
         let passive_auto_publish_retry = passive && !self.update_transaction_state;
@@ -2837,7 +2772,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn sync_db_file(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<()> {
+    async fn sync_db_file(&mut self, coro: &mut Coro<IOCompletions>) -> Result<()> {
         // Fsync DB before WAL truncate / publish_backfill (pager PublishBackfill order).
         // Crash after truncate but before fsync would lose checkpointed data.
         if self.sync_mode == SyncMode::Off {
@@ -2867,7 +2802,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
         Ok(())
     }
 
-    async fn truncate_wal(&mut self, coro: &mut Coro<CheckpointYield>) -> Result<u64> {
+    /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
+    async fn truncate_wal(&mut self, coro: &mut Coro<IOCompletions>) -> Result<u64> {
         if self.mode.should_restart_log() {
             // Truncate/Restart renumbers WAL frames — only safe stop-the-world. Acquire
             // the lock if the blocking path didn't already. Passive never restarts the
@@ -2918,11 +2854,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Checkpoint<Clock, A> {
     }
 }
 
-impl Coro<CheckpointYield> {
-    async fn enter(&mut self, state: CheckpointState) -> Result<()> {
-        self.yield_(CheckpointYield::Phase(state)).await
-    }
-
+impl Coro<IOCompletions> {
     async fn preempt(&mut self) -> Result<()> {
         self.wait_for_io(IOCompletions(Completion::new_yield()))
             .await
