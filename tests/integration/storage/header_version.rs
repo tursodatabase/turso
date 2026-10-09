@@ -724,6 +724,47 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
     }
 }
 
+/// Switching to MVCC inside a transaction is refused, as in SQLite. Before,
+/// the switch ran, and after COMMIT or ROLLBACK the database could not be
+/// opened again ("Missing MVCC metadata table while logical log state exists").
+#[test]
+fn test_switch_to_mvcc_inside_transaction_is_rejected() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a')")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let result = conn.pragma_update("journal_mode", "'mvcc'");
+        assert!(
+            matches!(result, Err(turso_core::LimboError::TxError(_))),
+            "got: {result:?}"
+        );
+        conn.execute("COMMIT").unwrap();
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect().unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts");
+    assert_eq!(rows, vec![(1, "a".to_string())]);
+}
+
+fn open_db(db_path: &Path) -> Arc<Database> {
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("Failed to open database")
+}
+
 /// Open database in readonly mode with limbo and check header versions
 fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());

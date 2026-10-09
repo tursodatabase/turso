@@ -18872,6 +18872,22 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
+                // SQLite refuses this too. Switching to MVCC inside the user's
+                // transaction wrote to the MVCC log before the MVCC metadata
+                // table existed. After the user's COMMIT or ROLLBACK, the
+                // database could not be opened again.
+                if !program.connection.get_auto_commit() {
+                    let direction = if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                        "into"
+                    } else {
+                        "out of"
+                    };
+                    return Err(LimboError::TxError(format!(
+                        "cannot change {direction} mvcc mode from within a transaction"
+                    ))
+                    .into());
+                }
+
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
