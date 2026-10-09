@@ -807,21 +807,10 @@ fn emit_update_column_values<'a>(
     for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
 
-        // If the column needs to be updated, retrieve its column index, or its expression.
-        // Such a column can be directly updated, in which case `expr` is the right-side of the SET
-        // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
-        // column's expression.
         let update_expr = set_clauses
             .iter()
             .find(|set_clause| set_clause.column_index == idx)
-            .map(UpdateSetClause::emitted_expr)
-            .or_else(|| {
-                if column_ctx.affected_columns.get(idx) {
-                    table_column.generated_expr()
-                } else {
-                    None
-                }
-            });
+            .map(UpdateSetClause::emitted_expr);
 
         if let Some(expr) = update_expr {
             if !skip_set_clauses {
@@ -1621,6 +1610,13 @@ fn emit_update_insns<'a>(
                 &dml_ctx,
                 &t_ctx.resolver,
                 btree,
+            )?;
+            emit_notnull_checks_for_affected_virtual_columns(
+                program,
+                table_references,
+                &column_ctx,
+                skip_row_label,
+                &t_ctx.resolver,
             )?;
         }
     }
@@ -2649,5 +2645,39 @@ fn emit_update_insns<'a>(
 
     t_ctx.resolver.register_affinities.clear();
     t_ctx.resolver.register_collations.clear();
+    Ok(())
+}
+
+fn emit_notnull_checks_for_affected_virtual_columns(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    column_ctx: &UpdateColumnCtx<'_>,
+    skip_row_label: BranchOffset,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
+    for (idx, column) in column_ctx.target_table.table.columns().iter().enumerate() {
+        if !column.is_virtual_generated()
+            || !column.notnull()
+            || !column_ctx.affected_columns.get(idx)
+        {
+            continue;
+        }
+        let notnull_conflict = if program.flags.has_statement_conflict() {
+            or_conflict
+        } else {
+            column.notnull_conflict_clause.unwrap_or(ResolveType::Abort)
+        };
+        emit_notnull_constraint_check(
+            program,
+            table_references,
+            column_ctx.layout.to_register(column_ctx.start, idx),
+            column,
+            column_ctx.table_name(),
+            notnull_conflict,
+            skip_row_label,
+            resolver,
+        )?;
+    }
     Ok(())
 }
