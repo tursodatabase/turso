@@ -1976,11 +1976,13 @@ impl PostgreSQLTranslator {
             return Ok(ast::SelectTable::Select(select, alias));
         }
 
-        Ok(ast::SelectTable::TableCall(
-            ast::QualifiedName::single(ast::Name::from_string(func_name)),
-            args,
-            alias,
-        ))
+        let name = ast::Name::from_string(func_name);
+        let qualified_name = if is_catalog_table_name(func_name) {
+            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+        } else {
+            ast::QualifiedName::single(name)
+        };
+        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
     fn translate_join_expr(
@@ -3558,6 +3560,7 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(self.translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
@@ -3574,6 +3577,71 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    fn translate_array_subquery(&self, select: ast::Select) -> ast::Expr {
+        let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string(name),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let query = select.to_string().to_ascii_lowercase();
+        let mut table_name = "_turso_array_rows".to_owned();
+        while query.contains(&table_name) {
+            table_name.push('_');
+        }
+        let table = ast::Name::from_string(table_name);
+        let column = ast::Name::from_string("_turso_array_value");
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table.clone(),
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column.clone(),
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Any,
+                    select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(call(
+                            "coalesce",
+                            vec![
+                                Box::new(call("array_agg", vec![Box::new(ast::Expr::Id(column))])),
+                                Box::new(call("array", vec![])),
+                            ],
+                        )),
+                        None,
+                    )],
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Table(
+                            ast::QualifiedName::single(table),
+                            None,
+                            None,
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
     }
 
     fn translate_with_clause(
@@ -4101,6 +4169,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_policy"
             | "pg_input_error_info"
             | "pg_get_tabledef"
+            | "pg_options_to_table"
             | "pg_settings"
             | "pg_extension"
             | "pg_depend"

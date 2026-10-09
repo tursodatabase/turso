@@ -2062,6 +2062,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgLanguageTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_options_to_table",
+        VTabKind::TableValuedFunction,
+        PgOptionsToTable,
+    );
     for (name, create_sql) in [
         (
             "pg_operator",
@@ -2201,6 +2206,124 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         );
     }
     options
+}
+
+#[derive(Debug)]
+struct PgOptionsToTable;
+
+impl VirtualTableModule for PgOptionsToTable {
+    type Table = Self;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok("CREATE TABLE pg_options_to_table (
+            option_name TEXT, option_value TEXT, options BLOB HIDDEN
+        )"
+        .to_owned())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+impl VirtualTable for PgOptionsToTable {
+    type Cursor = PgOptionsCursor;
+
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgOptionsCursor {
+            rows: vec![],
+            input: Value::Null,
+            index: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+
+        let input = constraints
+            .iter()
+            .position(|c| c.column_index == 2 && c.op == ConstraintOp::Eq);
+        let Some(input) = input else {
+            return Err(ResultCode::InvalidArgs);
+        };
+        if !constraints[input].usable {
+            return Err(ResultCode::ConstraintViolation);
+        }
+        Ok(IndexInfo {
+            constraint_usages: constraints
+                .iter()
+                .enumerate()
+                .map(|(i, _)| ConstraintUsage {
+                    argv_index: (i == input).then_some(1),
+                    omit: i == input,
+                })
+                .collect(),
+            estimated_cost: 1.0,
+            estimated_rows: 10,
+            ..Default::default()
+        })
+    }
+}
+
+struct PgOptionsCursor {
+    rows: Vec<[Value; 2]>,
+    input: Value,
+    index: usize,
+}
+
+impl VirtualTableCursor for PgOptionsCursor {
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<&str>,
+        _idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
+        self.index = 0;
+        self.rows.clear();
+        self.input = args[0].clone();
+        let values = turso_core::array_values_from_any(&self.input).ok_or_else(|| {
+            LimboError::InvalidArgument("pg_options_to_table requires a text array".to_owned())
+        })?;
+        for value in values {
+            let Value::Text(text) = value else {
+                return Err(LimboError::InvalidArgument(
+                    "pg_options_to_table requires non-null text elements".to_owned(),
+                )
+                .into());
+            };
+            let (name, value) = match text.as_str().split_once('=') {
+                Some((name, value)) => (name, Value::build_text(value.to_owned())),
+                None => (text.as_str(), Value::Null),
+            };
+            self.rows.push([Value::build_text(name.to_owned()), value]);
+        }
+        Ok(IOResult::Done(!self.rows.is_empty()))
+    }
+
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.index += 1;
+        Ok(IOResult::Done(self.index < self.rows.len()))
+    }
+
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        Ok(IOResult::Done(if column == 2 {
+            self.input.clone()
+        } else {
+            self.rows[self.index][column].clone()
+        }))
+    }
+
+    fn rowid(&self) -> i64 {
+        self.index as i64
+    }
 }
 
 #[derive(Debug)]
