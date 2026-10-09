@@ -376,8 +376,6 @@ fn translate_subquery_result_expr(
             let label_null_result = program.allocate_label();
             // jump here when we need to make extra null-related checks
             let label_null_rewind = program.allocate_label();
-            let label_null_checks_loop_start = program.allocate_label();
-            let label_null_checks_next = program.allocate_label();
             program.emit_insn(Insn::Integer {
                 value: 0,
                 dest: target_register,
@@ -455,46 +453,74 @@ fn translate_subquery_result_expr(
                 });
             }
 
-            // Null checking loop: scan ephemeral for any all-NULL tuples.
-            // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
-            program.preassign_label_to_next_insn(label_null_rewind);
-            program.emit_insn(Insn::Rewind {
-                cursor_id: *cursor_id,
-                pc_if_empty: label_on_no_null,
-            });
-            program.preassign_label_to_next_insn(label_null_checks_loop_start);
-            let column_check_reg = program.alloc_register();
-            for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
+            if lhs_column_count == 1 {
+                program.preassign_label_to_next_insn(label_null_rewind);
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_on_no_null,
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: lhs_column_regs_start,
+                    target_pc: label_null_result,
+                });
+                let first_value_reg = program.alloc_register();
                 program.emit_insn(Insn::Column {
                     cursor_id: *cursor_id,
-                    column: i,
-                    dest: column_check_reg,
+                    column: 0,
+                    dest: first_value_reg,
                     default: None,
                 });
-                // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_column_regs_start + i,
-                    rhs: column_check_reg,
-                    target_pc: label_null_checks_next,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                program.emit_insn(Insn::IsNull {
+                    reg: first_value_reg,
+                    target_pc: label_null_result,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_on_no_null,
+                });
+            } else {
+                // Null checking loop: scan ephemeral for any all-NULL tuples.
+                // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+                let label_null_checks_loop_start = program.allocate_label();
+                let label_null_checks_next = program.allocate_label();
+                program.preassign_label_to_next_insn(label_null_rewind);
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_on_no_null,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                let column_check_reg = program.alloc_register();
+                for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: *cursor_id,
+                        column: i,
+                        dest: column_check_reg,
+                        default: None,
+                    });
+                    // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
+                    program.emit_insn(Insn::Ne {
+                        lhs: lhs_column_regs_start + i,
+                        rhs: column_check_reg,
+                        target_pc: label_null_checks_next,
+                        flags: CmpInsFlags::default().with_affinity(affinity),
+                        collation: program.curr_collation(),
+                    });
+                }
+                // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_null_result,
+                });
+                program.preassign_label_to_next_insn(label_null_checks_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: *cursor_id,
+                    pc_if_next: label_null_checks_loop_start,
+                    fullscan: false,
+                    is_index: false,
+                });
+                // Loop exhausted without finding all-NULL row
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_on_no_null,
                 });
             }
-            // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
-            program.emit_insn(Insn::Goto {
-                target_pc: label_null_result,
-            });
-            program.preassign_label_to_next_insn(label_null_checks_next);
-            program.emit_insn(Insn::Next {
-                cursor_id: *cursor_id,
-                pc_if_next: label_null_checks_loop_start,
-                fullscan: false,
-                is_index: false,
-            });
-            // Loop exhausted without finding all-NULL row
-            program.emit_insn(Insn::Goto {
-                target_pc: label_on_no_null,
-            });
             // Final result handling:
             // label_include_row: result = 1 (TRUE)
             // label_skip_row: result = 0 (FALSE)
