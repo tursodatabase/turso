@@ -121,14 +121,13 @@ impl Property for SimpleKeysDoNotDisappear {
 
         // on successful COMMIT we move information about current transaction keys to the "commited" state (None key in the map)
         // note, that we use end_exec_id of current COMMIT operation as AdditionMoment of moved keys
-        if let Operation::Commit = &op {
-            if let Some(keys) = self.simple_keys_added_at.remove(&txn_id) {
+        if let Operation::Commit = &op
+            && let Some(keys) = self.simple_keys_added_at.remove(&txn_id) {
                 let global = self.simple_keys_added_at.get_mut(&None).unwrap();
                 for (key, _) in keys {
                     global.insert(key, end_exec_id);
                 }
             }
-        }
 
         // on successful BEGIN we record start time of the transaction
         if let Operation::Begin { .. } = &op {
@@ -177,11 +176,9 @@ impl Property for SimpleKeysDoNotDisappear {
         // We still catch the canonical INSERT-then-SELECT pattern on
         // seeds without intervening arbitrary mutators.
         if let Operation::Delete { .. } | Operation::Update { .. } | Operation::Insert { .. } = &op
-        {
-            if let Some(global) = self.simple_keys_added_at.get_mut(&None) {
+            && let Some(global) = self.simple_keys_added_at.get_mut(&None) {
                 global.clear();
             }
-        }
 
         // on successful SELECT get information about the key AdditionMoment from the "commited" state: key_exec_id
         // calculate our current ViewMoment as start_exec_id (in auto-commit mode) or start moment of the current transaction: view_exec_id
@@ -474,15 +471,14 @@ impl ElleHistoryRecorder {
         } else {
             None
         };
-        if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
-            if result.is_ok() {
+        if let Some(pending) = self.pending_txns.get_mut(&fiber_id)
+            && result.is_ok() {
                 if let Some(idx) = new_index {
                     pending.invoke_index = Some(idx);
                     pending.invoke_time = Some(start_exec_id);
                 }
                 pending.ops.push(op);
             }
-        }
     }
 
     /// Emit invoke + completion events for an auto-commit Elle operation.
@@ -775,9 +771,9 @@ impl Property for ElleHistoryRecorder {
     }
 
     fn abort_fiber(&mut self, fiber_id: usize, _txn_id: Option<u64>) -> anyhow::Result<()> {
-        if let Some(pending) = self.pending_txns.remove(&fiber_id) {
-            if let Some(invoke_index) = pending.invoke_index {
-                if !pending.ops.is_empty() {
+        if let Some(pending) = self.pending_txns.remove(&fiber_id)
+            && let Some(invoke_index) = pending.invoke_index
+                && !pending.ops.is_empty() {
                     let invoke_time = pending
                         .invoke_time
                         .expect("invoke_time must be set when invoke_index is set");
@@ -798,8 +794,6 @@ impl Property for ElleHistoryRecorder {
                         invoke_time,
                     );
                 }
-            }
-        }
 
         if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
             self.add_event(
@@ -1198,8 +1192,8 @@ impl Property for SequenceCorrectnessProperty {
         result: &OpResult,
     ) -> anyhow::Result<()> {
         // Handle NextVal/SetVal errors
-        if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op {
-            if let Err(e) = result {
+        if let Operation::NextVal { seq_name } | Operation::SetVal { seq_name, .. } = op
+            && let Err(e) = result {
                 // Drop the in-flight baseline so a future NextVal on the
                 // same (fiber, seq) doesn't reuse a stale snapshot.
                 self.in_flight_nextval_baselines
@@ -1263,7 +1257,6 @@ impl Property for SequenceCorrectnessProperty {
                     err_msg
                 );
             }
-        }
 
         // Handle CurrVal: validate against tracked per-fiber state
         if let Operation::CurrVal { seq_name } = op {
@@ -1559,13 +1552,11 @@ impl Property for SequenceCorrectnessProperty {
                     // wrapping) still fires.
                     if params.cycle {
                         let prev_wm = self.watermark.get(seq_name).map(|&(wm, _)| wm);
-                        if let Some(prev) = prev_wm {
-                            if is_cycle_wrap(params, value, prev) {
-                                if let Some(values) = self.all_values.get_mut(seq_name) {
+                        if let Some(prev) = prev_wm
+                            && is_cycle_wrap(params, value, prev)
+                                && let Some(values) = self.all_values.get_mut(seq_name) {
                                     values.clear();
                                 }
-                            }
-                        }
                     }
                     // Skip the duplicate check for seqs that have ever been
                     // setval'd. `all_values` only models the "no nextval
@@ -1624,8 +1615,8 @@ impl Property for SequenceCorrectnessProperty {
                     // target whose target+inc was the actual match). A
                     // second emission of the same value WOULD trip the
                     // duplicate check on the next observation.
-                    if is_allowed_re_emission {
-                        if let Some(allowed) = self.pending_setval_re_emission.get_mut(seq_name) {
+                    if is_allowed_re_emission
+                        && let Some(allowed) = self.pending_setval_re_emission.get_mut(seq_name) {
                             if !allowed.remove(&value) {
                                 let derived = value.saturating_sub(params.increment);
                                 allowed.remove(&derived);
@@ -1634,7 +1625,6 @@ impl Property for SequenceCorrectnessProperty {
                                 self.pending_setval_re_emission.remove(seq_name);
                             }
                         }
-                    }
                 }
 
                 // Monotonicity (wrong-direction) check.
@@ -1683,9 +1673,9 @@ impl Property for SequenceCorrectnessProperty {
                 // so post-setval duplicates still fire there.
                 let skip_monotonicity = self.seqs_with_setval_ever.contains(seq_name)
                     || self.seqs_with_seq_default_ever.contains(seq_name);
-                if txn_id.is_none() && !setval_could_have_raced && !skip_monotonicity {
-                    if let Some(&(wm, wm_eid)) = self.watermark.get(seq_name) {
-                        if wm_eid < start_exec_id && !is_cycle_wrap(params, value, wm) {
+                if txn_id.is_none() && !setval_could_have_raced && !skip_monotonicity
+                    && let Some(&(wm, wm_eid)) = self.watermark.get(seq_name)
+                        && wm_eid < start_exec_id && !is_cycle_wrap(params, value, wm) {
                             if params.increment > 0 && value <= wm {
                                 bail!(
                                     "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
@@ -1705,8 +1695,6 @@ impl Property for SequenceCorrectnessProperty {
                                 );
                             }
                         }
-                    }
-                }
                 // Only autocommit emissions update the cross-fiber
                 // watermark immediately. In-tx emissions defer their
                 // watermark update to the Operation::Commit branch —
@@ -1837,9 +1825,9 @@ impl Property for SequenceCorrectnessProperty {
                             // emit X+k*inc for varying k.
                             let skip_monotonicity = self.seqs_with_setval_ever.contains(&seq_name)
                                 || self.seqs_with_seq_default_ever.contains(&seq_name);
-                            if let Some(params) = params.as_ref() {
-                                if !params.cycle && !skip_monotonicity {
-                                    if let Some(prev) = baseline {
+                            if let Some(params) = params.as_ref()
+                                && !params.cycle && !skip_monotonicity
+                                    && let Some(prev) = baseline {
                                         if params.increment > 0 && value <= prev {
                                             bail!(
                                                 "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
@@ -1859,8 +1847,6 @@ impl Property for SequenceCorrectnessProperty {
                                             );
                                         }
                                     }
-                                }
-                            }
                             // Duplicate check: tightened post-setval. The
                             // allowance set tracks target + target+inc;
                             // matching values land in `all_values` once
@@ -1907,21 +1893,19 @@ impl Property for SequenceCorrectnessProperty {
                             } else {
                                 entry.insert(value);
                             }
-                            if is_allowed_re_emission {
-                                if let Some(allowed) =
+                            if is_allowed_re_emission
+                                && let Some(allowed) =
                                     self.pending_setval_re_emission.get_mut(&seq_name)
                                 {
-                                    if !allowed.remove(&value) {
-                                        if let Some(p) = params.as_ref() {
+                                    if !allowed.remove(&value)
+                                        && let Some(p) = params.as_ref() {
                                             let derived = value.saturating_sub(p.increment);
                                             allowed.remove(&derived);
                                         }
-                                    }
                                     if allowed.is_empty() {
                                         self.pending_setval_re_emission.remove(&seq_name);
                                     }
                                 }
-                            }
                             self.promote_committed(&seq_name, value);
                             // Now-durable: promote into the cross-fiber
                             // watermark. Deferred from emission time so
@@ -2583,13 +2567,11 @@ impl Property for AutoincWatermarkMonotonicity {
                 self.snapshot_at_init.remove(&start_exec_id);
             }
             Operation::Commit => {
-                if let Some(t) = txn_id {
-                    if let Some(pending) = self.pending_per_tx.remove(&t) {
-                        if pending > self.committed_max {
+                if let Some(t) = txn_id
+                    && let Some(pending) = self.pending_per_tx.remove(&t)
+                        && pending > self.committed_max {
                             self.committed_max = pending;
                         }
-                    }
-                }
             }
             Operation::Rollback => {
                 if let Some(t) = txn_id {

@@ -4735,75 +4735,82 @@ pub fn op_transaction_inner(
                         // checkpoint gate.
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
-                        if current_mv_tx.is_none() {
+                        match current_mv_tx {
                             // Reject CONCURRENT on an attached DB if the main
                             // DB already started with BEGIN DEFERRED.
-                            let conn_has_executed_begin_deferred =
-                                !conn.auto_commit.load(Ordering::SeqCst)
-                                    && conn.get_mv_tx().is_none();
-                            if conn_has_executed_begin_deferred
-                                && *tx_mode == TransactionMode::Concurrent
-                            {
-                                mark_unlikely();
-                                return Err(LimboError::TxError(
-                                    "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
-                            // Use the same tx_mode as the main DB's active
-                            // transaction when available, so BEGIN CONCURRENT
-                            // applies to all databases uniformly.
-                            let effective_mode =
-                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            #[cfg(any(test, injected_yields))]
-                            {
-                                if let Some(IOResult::IO(io)) =
-                                    crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
-                                        conn.yield_injector().as_ref(),
-                                        0,
-                                        *db as u64,
-                                        TransactionYieldPoint::BeforeMvccBegin,
-                                    )
+                            None => {
+                                let conn_has_executed_begin_deferred =
+                                    !conn.auto_commit.load(Ordering::SeqCst)
+                                        && conn.get_mv_tx().is_none();
+                                if conn_has_executed_begin_deferred
+                                    && *tx_mode == TransactionMode::Concurrent
                                 {
-                                    return Ok(state.suspend_on_io(io));
+                                    mark_unlikely();
+                                    return Err(LimboError::TxError(
+                                        "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
+                                            .to_string(),
+                                    )
+                                    .into());
                                 }
-                            }
-                            match begin_fresh_mvcc_tx(
-                                mv_store,
-                                &pager,
-                                &effective_mode,
-                                &conn,
-                                None,
-                            ) {
-                                Ok(tx_id) => {
-                                    conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
-                                    started_secondary_tx = true;
-                                    if conn.get_auto_commit() && !conn.is_nested_stmt() {
-                                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                // Use the same tx_mode as the main DB's active
+                                // transaction when available, so BEGIN CONCURRENT
+                                // applies to all databases uniformly.
+                                let effective_mode =
+                                    conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                                #[cfg(any(test, injected_yields))]
+                                {
+                                    if let Some(IOResult::IO(io)) =
+                                        crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                                            conn.yield_injector().as_ref(),
+                                            0,
+                                            *db as u64,
+                                            TransactionYieldPoint::BeforeMvccBegin,
+                                        )
+                                    {
+                                        return Ok(state.suspend_on_io(io));
                                     }
                                 }
-                                Err(err) => return Err(err.into()),
-                            }
-                        } else if write {
-                            // Upgrade: attached DB has a Read/Concurrent tx but the
-                            // statement needs write access. Mirror the main DB's
-                            // upgrade logic so that exclusive locks are acquired.
-                            let (tx_id, current_mode) = current_mv_tx.unwrap();
-                            if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
-                                && matches!(tx_mode, TransactionMode::Write)
-                            {
-                                begin_mvcc_tx(
+                                match begin_fresh_mvcc_tx(
                                     mv_store,
                                     &pager,
-                                    tx_mode,
-                                    Some(tx_id),
+                                    &effective_mode,
                                     &conn,
                                     None,
-                                    CheckpointReadLockState::NotHeld,
-                                )?;
-                                conn.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                ) {
+                                    Ok(tx_id) => {
+                                        conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                        started_secondary_tx = true;
+                                        if conn.get_auto_commit() && !conn.is_nested_stmt() {
+                                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                        }
+                                    }
+                                    Err(err) => return Err(err.into()),
+                                }
                             }
+                            Some((tx_id, current_mode)) if write => {
+                                // Upgrade: attached DB has a Read/Concurrent tx but the
+                                // statement needs write access. Mirror the main DB's
+                                // upgrade logic so that exclusive locks are acquired.
+                                if matches!(
+                                    current_mode,
+                                    TransactionMode::None | TransactionMode::Read
+                                ) && matches!(tx_mode, TransactionMode::Write)
+                                {
+                                    begin_mvcc_tx(
+                                        mv_store,
+                                        &pager,
+                                        tx_mode,
+                                        Some(tx_id),
+                                        &conn,
+                                        None,
+                                        CheckpointReadLockState::NotHeld,
+                                    )?;
+                                    conn.set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                }
+                            }
+                            Some((_, _)) => unreachable!(
+                                "attached database already has a write-capable transaction"
+                            ),
                         }
                     } else {
                         // Main database MVCC path (unchanged logic)

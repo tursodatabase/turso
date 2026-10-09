@@ -170,17 +170,17 @@ impl SelectStmt {
         }
         // Check JOIN ON conditions
         for join in &self.joins {
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                if let Some(reason) = expr.unordered_limit_reason() {
-                    return Some(reason);
-                }
+            if let Some(JoinConstraint::On(expr)) = &join.constraint
+                && let Some(reason) = expr.unordered_limit_reason()
+            {
+                return Some(reason);
             }
         }
         // Check WHERE clause
-        if let Some(w) = &self.where_clause {
-            if let Some(reason) = w.unordered_limit_reason() {
-                return Some(reason);
-            }
+        if let Some(w) = &self.where_clause
+            && let Some(reason) = w.unordered_limit_reason()
+        {
+            return Some(reason);
         }
         // Check GROUP BY / HAVING
         if let Some(gb) = &self.group_by {
@@ -189,10 +189,10 @@ impl SelectStmt {
                     return Some(reason);
                 }
             }
-            if let Some(h) = &gb.having {
-                if let Some(reason) = h.unordered_limit_reason() {
-                    return Some(reason);
-                }
+            if let Some(h) = &gb.having
+                && let Some(reason) = h.unordered_limit_reason()
+            {
+                return Some(reason);
             }
         }
         // Check compound arms' subquery expressions
@@ -202,10 +202,10 @@ impl SelectStmt {
                     return Some(reason);
                 }
             }
-            if let Some(w) = &arm.where_clause {
-                if let Some(reason) = w.unordered_limit_reason() {
-                    return Some(reason);
-                }
+            if let Some(w) = &arm.where_clause
+                && let Some(reason) = w.unordered_limit_reason()
+            {
+                return Some(reason);
             }
         }
         // Check ORDER BY expressions
@@ -249,16 +249,16 @@ impl SelectStmt {
             }
         }
         for join in &self.joins {
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                if let Some(r) = expr.non_unique_order_by_reason(schema) {
-                    return Some(r);
-                }
-            }
-        }
-        if let Some(w) = &self.where_clause {
-            if let Some(r) = w.non_unique_order_by_reason(schema) {
+            if let Some(JoinConstraint::On(expr)) = &join.constraint
+                && let Some(r) = expr.non_unique_order_by_reason(schema)
+            {
                 return Some(r);
             }
+        }
+        if let Some(w) = &self.where_clause
+            && let Some(r) = w.non_unique_order_by_reason(schema)
+        {
+            return Some(r);
         }
         if let Some(gb) = &self.group_by {
             for expr in &gb.exprs {
@@ -266,10 +266,10 @@ impl SelectStmt {
                     return Some(r);
                 }
             }
-            if let Some(h) = &gb.having {
-                if let Some(r) = h.non_unique_order_by_reason(schema) {
-                    return Some(r);
-                }
+            if let Some(h) = &gb.having
+                && let Some(r) = h.non_unique_order_by_reason(schema)
+            {
+                return Some(r);
             }
         }
         for item in &self.order_by {
@@ -297,10 +297,11 @@ impl SelectStmt {
         self.order_by.iter().any(|item| {
             if let Expr::ColumnRef(col_ref) = &item.expr {
                 // If table-qualified, verify it matches the FROM table
-                if let Some(ref tbl) = col_ref.table {
-                    if *tbl != from.table && from.alias.as_deref() != Some(tbl) {
-                        return false;
-                    }
+                if let Some(ref tbl) = col_ref.table
+                    && *tbl != from.table
+                    && from.alias.as_deref() != Some(tbl)
+                {
+                    return false;
                 }
                 table.columns.iter().any(|c| {
                     c.name == col_ref.column && (c.primary_key || (c.unique && !c.nullable))

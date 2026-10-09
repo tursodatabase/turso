@@ -347,13 +347,12 @@ fn generate_insert_values<C: Capabilities>(
         let mut row = Vec::with_capacity(columns.len());
         for col_name in columns {
             let col = table_columns.iter().find(|c| &c.name == col_name).unwrap();
-            if let Some(ref expr_gen) = insert_expr_gen {
-                if ctx.gen_bool_with_prob(expr_prob) {
-                    if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
-                        row.push(expr);
-                        continue;
-                    }
-                }
+            if let Some(ref expr_gen) = insert_expr_gen
+                && ctx.gen_bool_with_prob(expr_prob)
+                && let Ok(expr) = generate_expr(expr_gen, ctx, 0)
+            {
+                row.push(expr);
+                continue;
             }
             let lit = generate_literal(ctx, col.data_type, generator.policy());
             row.push(Expr::literal(ctx, lit));
@@ -586,21 +585,20 @@ fn generate_update_sets<C: Capabilities>(
         }
 
         // When FROM is active, try referencing a FROM-side column
-        if !from_tables.is_empty() && ctx.gen_bool_with_prob(from_ref_prob) {
-            if let Some(expr) = generate_from_column_ref(ctx, col, &from_tables, generator.policy())
-            {
-                sets.push((col.name.clone(), expr));
-                continue;
-            }
+        if !from_tables.is_empty()
+            && ctx.gen_bool_with_prob(from_ref_prob)
+            && let Some(expr) = generate_from_column_ref(ctx, col, &from_tables, generator.policy())
+        {
+            sets.push((col.name.clone(), expr));
+            continue;
         }
 
-        if let Some(ref expr_gen) = update_expr_gen {
-            if ctx.gen_bool_with_prob(expr_prob) {
-                if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
-                    sets.push((col.name.clone(), expr));
-                    continue;
-                }
-            }
+        if let Some(ref expr_gen) = update_expr_gen
+            && ctx.gen_bool_with_prob(expr_prob)
+            && let Ok(expr) = generate_expr(expr_gen, ctx, 0)
+        {
+            sets.push((col.name.clone(), expr));
+            continue;
         }
         let lit = generate_literal(ctx, col.data_type, generator.policy());
         sets.push((col.name.clone(), Expr::literal(ctx, lit)));

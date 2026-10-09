@@ -66,14 +66,12 @@ impl InteractionPlan {
                         table_name,
                         alter_table_type: AlterTableType::RenameTo { new_name },
                     }) = query
-                    {
-                        if depending_tables.contains(new_name)
-                            || depending_tables.contains(table_name)
+                        && (depending_tables.contains(new_name)
+                            || depending_tables.contains(table_name))
                         {
                             depending_tables.insert(new_name.clone());
                             depending_tables.insert(table_name.clone());
                         }
-                    }
                 }
                 _ => {}
             });
@@ -322,8 +320,8 @@ impl InteractionPlan {
 
             let iter = range_transactions.get_mut(&interactions.connection_index);
 
-            if let Some(iter) = iter {
-                if let Some(txn_interaction_idx) = iter.peek().copied() {
+            if let Some(iter) = iter
+                && let Some(txn_interaction_idx) = iter.peek().copied() {
                     if txn_interaction_idx == idx {
                         iter.next();
                     }
@@ -331,7 +329,6 @@ impl InteractionPlan {
                         retain = false;
                     }
                 }
-            }
 
             idx += 1;
             retain

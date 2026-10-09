@@ -80,8 +80,8 @@ pub(crate) fn install_global_allocation_fault_backend(
     }
 
     ALLOCATION_FAULT_INJECTOR.configure(config, seed);
-    if !ALLOCATION_FAULT_BACKEND_INSTALLED.swap(true, Ordering::AcqRel) {
-        if let Err(err) = unsafe { turso_core::alloc::set_allocator(&ALLOCATION_FAULT_INJECTOR) } {
+    if !ALLOCATION_FAULT_BACKEND_INSTALLED.swap(true, Ordering::AcqRel)
+        && let Err(err) = unsafe { turso_core::alloc::set_allocator(&ALLOCATION_FAULT_INJECTOR) } {
             ALLOCATION_FAULT_BACKEND_INSTALLED.store(false, Ordering::Release);
             return Err(match err {
                 SetAllocatorError::AlreadyInitialized => anyhow::anyhow!(
@@ -90,7 +90,6 @@ pub(crate) fn install_global_allocation_fault_backend(
                 ),
             });
         }
-    }
 
     Ok(Some(&ALLOCATION_FAULT_INJECTOR))
 }

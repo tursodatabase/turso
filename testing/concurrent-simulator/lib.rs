@@ -59,7 +59,7 @@ use crate::{
 pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(Arc::new(WindowsIOCP::new()?));
+        Ok(Arc::new(WindowsIOCP::new()?))
     }
 
     #[cfg(unix)]
@@ -1102,15 +1102,14 @@ impl Whopper {
             let _enter = span.enter();
             debug!("result={step_result:?}, rows.len()={}", rows.len());
 
-            if let Operation::Begin { mode } = completed_op {
-                if step_result.is_ok() {
+            if let Operation::Begin { mode } = completed_op
+                && step_result.is_ok() {
                     ctx.fiber.state = if mode == TxMode::Concurrent {
                         FiberState::InConcurrentTx
                     } else {
                         FiberState::InTx
                     };
                 }
-            }
 
             let txn_id = ctx.fiber.txn_id;
 
@@ -1303,11 +1302,9 @@ impl Whopper {
         // workloads start with BEGIN and can't nest inside an existing transaction)
         if self.context.fibers[fiber_idx].chaotic_workload.is_none()
             && self.context.fibers[fiber_idx].state == FiberState::Idle
-        {
-            if let Some(op) = self.pick_chaotic_workload(fiber_idx) {
+            && let Some(op) = self.pick_chaotic_workload(fiber_idx) {
                 self.context.fibers[fiber_idx].current_op = Some(op);
             }
-        }
     }
 
     /// Pick a chaotic workload for the given fiber using weighted random selection.
@@ -1541,11 +1538,10 @@ impl Whopper {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
             for fiber in fibers {
                 drop(fiber.statement.into_inner());
-                if self.close_connections_gracefully {
-                    if let Err(e) = fiber.connection.close() {
+                if self.close_connections_gracefully
+                    && let Err(e) = fiber.connection.close() {
                         debug!("Error closing connection during restart: {}", e);
                     }
-                }
                 drop(fiber.connection);
             }
             // All fibers are now dropped, database Arc should be released
@@ -1717,11 +1713,10 @@ impl Whopper {
             if let Some(mv_store) = db.get_mv_store().as_ref() {
                 mv_store.set_checkpoint_threshold(-1);
             }
-        } else if let Some(threshold) = self.mvcc_checkpoint_threshold {
-            if let Some(mv_store) = db.get_mv_store().as_ref() {
+        } else if let Some(threshold) = self.mvcc_checkpoint_threshold
+            && let Some(mv_store) = db.get_mv_store().as_ref() {
                 mv_store.set_checkpoint_threshold(threshold);
             }
-        }
 
         for i in 0..self.max_connections {
             let conn = db
