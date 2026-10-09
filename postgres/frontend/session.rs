@@ -366,7 +366,7 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
 
     quoted
         .or(unquoted)
-        .separated_by(just(',').padded_by(whitespace.clone()))
+        .separated_by(just(',').padded_by(whitespace))
         .collect::<Vec<_>>()
         .padded_by(whitespace)
 }
