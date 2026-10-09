@@ -1568,3 +1568,32 @@ test nocase-index-does-not-serve-binary-comparison {
 }
 expect {
 }
+
+setup case_when_collation {
+    CREATE TABLE cs(l TEXT, r TEXT COLLATE NOCASE);
+    INSERT INTO cs VALUES('a', 'A');
+}
+
+@setup case_when_collation
+test case-when-uses-base-column-collation {
+    SELECT CASE l WHEN r THEN 1 ELSE 0 END, CASE r WHEN l THEN 1 ELSE 0 END FROM cs;
+}
+expect {
+    0|1
+}
+
+@setup case_when_collation
+test case-when-explicit-collate-on-base-wins {
+    SELECT CASE l COLLATE BINARY WHEN r COLLATE NOCASE THEN 1 ELSE 0 END FROM cs;
+}
+expect {
+    0
+}
+
+@setup case_when_collation
+test case-when-uses-base-column-collation-for-every-when {
+    SELECT CASE r WHEN 'x' THEN 'x' WHEN l THEN 'l' ELSE 'none' END FROM cs;
+}
+expect {
+    l
+}
