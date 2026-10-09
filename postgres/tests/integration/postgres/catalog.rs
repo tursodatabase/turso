@@ -187,7 +187,13 @@ fn test_pg_security_labels_are_empty_and_cannot_be_created(db: TempDatabase) {
         "SELECT label, provider, classoid, objoid, objsubid FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid",
         "SELECT objoid, classoid, objsubid, objtype, objnamespace, objname, provider, label FROM pg_seclabels",
     ] {
-        assert!(conn.prepare(query).unwrap().run_collect_rows().unwrap().is_empty());
+        assert!(
+            conn.prepare(query)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .is_empty()
+        );
     }
     assert_eq!(
         conn.prepare("SELECT * FROM pg_catalog.pg_seclabels")
@@ -1611,6 +1617,188 @@ fn test_pg_get_indexdef(db: TempDatabase) {
     assert!(
         has_unique_idx,
         "should have UNIQUE idx_items_price definition"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_logical_primary_key_catalog_and_restore_definitions(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE parent_table (payload TEXT, id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX payload_index ON parent_table(payload)")
+        .unwrap();
+    conn.execute("CREATE TABLE child_table (parent_id INTEGER REFERENCES parent_table(id))")
+        .unwrap();
+
+    assert_eq!(
+        conn.prepare(
+            "SELECT c.relname, c.relhasindex, a.attnotnull, i.indisprimary, i.indisunique,
+                    i.indkey, k.conindid = i.indexrelid, pg_get_constraintdef(k.oid),
+                    pg_get_indexdef(i.indexrelid)
+             FROM pg_class c
+             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'id'
+             JOIN pg_constraint k ON k.conrelid = c.oid AND k.contype = 'p'
+             JOIN pg_index i ON i.indexrelid = k.conindid
+             WHERE c.relname = 'parent_table'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("parent_table"),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::build_text("2"),
+            Value::from_i64(1),
+            Value::build_text("PRIMARY KEY (id)"),
+            Value::build_text(
+                "CREATE UNIQUE INDEX parent_table_pkey ON public.parent_table USING btree (id)"
+            ),
+        ]]
+    );
+
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT c.relname, i.indisprimary, i.indisunique, pg_get_indexdef(c.oid)
+             FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+             WHERE c.relname IN ('payload_index', 'sqlite_autoindex_parent_table_1')
+             ORDER BY c.relname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("payload_index"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text(
+                    "CREATE INDEX payload_index ON public.parent_table USING btree (payload)"
+                ),
+            ],
+            vec![
+                Value::build_text("sqlite_autoindex_parent_table_1"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text(
+                    "CREATE UNIQUE INDEX sqlite_autoindex_parent_table_1 ON public.parent_table USING btree (code)"
+                ),
+            ],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT pg_get_constraintdef(k.oid) FROM pg_constraint k
+             JOIN pg_class c ON c.oid = k.conrelid
+             WHERE c.relname = 'child_table' AND k.contype = 'f'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text(
+            "FOREIGN KEY (parent_id) REFERENCES public.parent_table(id)"
+        )]]
+    );
+
+    conn.execute("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    conn.execute("CREATE TABLE \"quoted parent\" (\"primary id\" INTEGER PRIMARY KEY, \"payload value\" TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX \"payload index\" ON \"quoted parent\"(\"payload value\")")
+        .unwrap();
+    conn.execute("CREATE TABLE \"quoted child\" (\"parent id\" INTEGER REFERENCES \"quoted parent\"(\"primary id\"))")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT pg_get_indexdef(c.oid) FROM pg_class c WHERE c.relname = 'payload index'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text(
+            "CREATE INDEX \"payload index\" ON public.\"quoted parent\" USING btree (\"payload value\")"
+        )]]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT pg_get_constraintdef(k.oid) FROM pg_constraint k
+             JOIN pg_class c ON c.oid = k.conrelid
+             WHERE c.relname = 'quoted child' AND k.contype = 'f'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text(
+            "FOREIGN KEY (\"parent id\") REFERENCES public.\"quoted parent\"(\"primary id\")"
+        )]]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT i.relname, k.conname, d.deptype FROM pg_depend d
+            JOIN pg_class i ON d.classid=1259 AND i.oid=d.objid
+            JOIN pg_constraint k ON d.refclassid=2606 AND k.oid=d.refobjid
+            WHERE k.conname='parent_table_pkey'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("parent_table_pkey"),
+            Value::build_text("parent_table_pkey"),
+            Value::build_text("i")
+        ]]
+    );
+    conn.execute("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE public.physical_keys (payload TEXT, id TEXT PRIMARY KEY, code TEXT UNIQUE)",
+    )
+    .unwrap();
+    conn.execute("CREATE UNIQUE INDEX duplicate_primary ON public.physical_keys(id)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX partial_code ON public.physical_keys(code) WHERE code IS NOT NULL",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT c.relname, i.indisprimary, i.indkey FROM pg_index i
+            JOIN pg_class c ON c.oid=i.indexrelid
+            WHERE c.relname IN ('duplicate_primary', 'partial_code', 'sqlite_autoindex_physical_keys_1', 'sqlite_autoindex_physical_keys_2')
+            ORDER BY c.relname")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("duplicate_primary"), Value::from_i64(0), Value::build_text("2")],
+            vec![Value::build_text("partial_code"), Value::from_i64(0), Value::build_text("3")],
+            vec![Value::build_text("sqlite_autoindex_physical_keys_1"), Value::from_i64(1), Value::build_text("2")],
+            vec![Value::build_text("sqlite_autoindex_physical_keys_2"), Value::from_i64(0), Value::build_text("3")],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT k.contype, c.relname FROM pg_constraint k JOIN pg_class c ON c.oid=k.conindid
+            JOIN pg_class t ON t.oid=k.conrelid WHERE t.relname='physical_keys' ORDER BY k.contype"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("p"),
+                Value::build_text("sqlite_autoindex_physical_keys_1")
+            ],
+            vec![
+                Value::build_text("u"),
+                Value::build_text("sqlite_autoindex_physical_keys_2")
+            ]
+        ]
     );
 }
 

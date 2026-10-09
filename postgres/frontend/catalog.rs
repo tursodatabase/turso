@@ -10,6 +10,7 @@ use turso_core::{
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
+use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
@@ -294,7 +295,7 @@ impl SnapshotRows for PgClassTable {
         let mut rows = Vec::new();
 
         let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
+        let indexes = catalog_indexes(&schema);
 
         for (i, (table_name, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
@@ -303,7 +304,7 @@ impl SnapshotRows for PgClassTable {
             };
             let table_oid = USER_TABLE_OID_START + i as i64;
             let relnatts = btree.columns().len() as i64;
-            let relhasindex = if schema.get_indices(table_name).next().is_some() {
+            let relhasindex = if indexes.iter().any(|index| index.table_oid == table_oid) {
                 1i64
             } else {
                 0
@@ -348,50 +349,43 @@ impl SnapshotRows for PgClassTable {
         }
 
         // Add index rows (relkind='i')
-        let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                let indnatts = idx.columns.len() as i64;
-                rows.push(vec![
-                    Value::from_i64(index_oid),           // oid
-                    Value::Text(idx.name.clone().into()), // relname
-                    Value::from_i64(2200),                // relnamespace (public)
-                    Value::from_i64(0),                   // reltype
-                    Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
-                    Value::from_i64(403),                 // relam (btree)
-                    Value::from_i64(0),                   // relfilenode
-                    Value::from_i64(0),                   // reltablespace
-                    Value::from_i64(1),                   // relpages
-                    Value::from_f64(0.0),                 // reltuples
-                    Value::from_i64(0),                   // relallvisible
-                    Value::from_i64(0),                   // reltoastrelid
-                    Value::from_i64(0),                   // relhasindex
-                    Value::from_i64(0),                   // relisshared
-                    Value::Text("p".into()),              // relpersistence
-                    Value::Text("i".into()),              // relkind (index)
-                    Value::from_i64(indnatts),            // relnatts
-                    Value::from_i64(0),                   // relchecks
-                    Value::from_i64(0),                   // relhasrules
-                    Value::from_i64(0),                   // relhastriggers
-                    Value::from_i64(0),                   // relhassubclass
-                    Value::from_i64(0),                   // relrowsecurity
-                    Value::from_i64(0),                   // relforcerowsecurity
-                    Value::from_i64(1),                   // relispopulated
-                    Value::Text("d".into()),              // relreplident
-                    Value::from_i64(0),                   // relispartition
-                    Value::from_i64(0),                   // relrewrite
-                    Value::from_i64(0),                   // relfrozenxid
-                    Value::from_i64(0),                   // relminmxid
-                    Value::Null,                          // relacl
-                    Value::Null,                          // reloptions
-                    Value::Null,                          // relpartbound
-                ]);
-                index_oid += 1;
-            }
+        for index in indexes {
+            let indnatts = index.columns.len() as i64;
+            rows.push(vec![
+                Value::from_i64(index.oid),     // oid
+                Value::Text(index.name.into()), // relname
+                Value::from_i64(2200),          // relnamespace (public)
+                Value::from_i64(0),             // reltype
+                Value::from_i64(0),             // reloftype
+                Value::from_i64(10),            // relowner
+                Value::from_i64(403),           // relam (btree)
+                Value::from_i64(0),             // relfilenode
+                Value::from_i64(0),             // reltablespace
+                Value::from_i64(1),             // relpages
+                Value::from_f64(0.0),           // reltuples
+                Value::from_i64(0),             // relallvisible
+                Value::from_i64(0),             // reltoastrelid
+                Value::from_i64(0),             // relhasindex
+                Value::from_i64(0),             // relisshared
+                Value::Text("p".into()),        // relpersistence
+                Value::Text("i".into()),        // relkind (index)
+                Value::from_i64(indnatts),      // relnatts
+                Value::from_i64(0),             // relchecks
+                Value::from_i64(0),             // relhasrules
+                Value::from_i64(0),             // relhastriggers
+                Value::from_i64(0),             // relhassubclass
+                Value::from_i64(0),             // relrowsecurity
+                Value::from_i64(0),             // relforcerowsecurity
+                Value::from_i64(1),             // relispopulated
+                Value::Text("d".into()),        // relreplident
+                Value::from_i64(0),             // relispartition
+                Value::from_i64(0),             // relrewrite
+                Value::from_i64(0),             // relfrozenxid
+                Value::from_i64(0),             // relminmxid
+                Value::Null,                    // relacl
+                Value::Null,                    // reloptions
+                Value::Null,                    // relpartbound
+            ]);
         }
 
         rows
@@ -512,7 +506,13 @@ impl SnapshotRows for PgAttributeTable {
                     .find(|t| t.oid == type_oid)
                     .expect("column type OIDs refer to PostgreSQL base types");
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                let rowid_alias = match table.as_ref() {
+                    Table::BTree(btree) => btree
+                        .get_rowid_alias_column()
+                        .is_some_and(|(position, _)| position == i),
+                    _ => false,
+                };
+                let notnull = i64::from(col.notnull() || rowid_alias);
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 rows.push(vec![
@@ -1384,81 +1384,61 @@ impl SnapshotRows for PgIndexTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
-        let tbl_oid_map = table_oid_map(&schema);
+        for index in catalog_indexes(&schema) {
+            let indnatts = index.columns.len() as i64;
+            let indkey: String = index
+                .columns
+                .iter()
+                .map(|(_, position, expression)| {
+                    if expression.is_some() {
+                        "0".to_string()
+                    } else {
+                        (position + 1).to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
 
-        let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                let indnatts = idx.columns.len() as i64;
-                let indisunique = i64::from(idx.unique);
-                let indisprimary = i64::from(
-                    idx.name
-                        .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-                        && idx.unique,
-                );
+            let indpred = index
+                .where_clause
+                .as_ref()
+                .map(|e| Value::build_text(e.clone()))
+                .unwrap_or(Value::Null);
 
-                // Build indkey: space-separated 1-based column positions (0 for expression cols)
-                let indkey: String = idx
+            let indexprs = if index.columns.iter().any(|(_, _, e)| e.is_some()) {
+                let exprs: Vec<String> = index
                     .columns
                     .iter()
-                    .map(|col| {
-                        if col.expr.is_some() {
-                            "0".to_string()
-                        } else {
-                            (col.pos_in_table + 1).to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .filter_map(|(_, _, e)| e.clone())
+                    .collect();
+                Value::build_text(exprs.join(", "))
+            } else {
+                Value::Null
+            };
 
-                let indpred = idx
-                    .where_clause
-                    .as_ref()
-                    .map(|e| Value::build_text(e.to_string()))
-                    .unwrap_or(Value::Null);
-
-                let indexprs = if idx.columns.iter().any(|c| c.expr.is_some()) {
-                    let exprs: Vec<String> = idx
-                        .columns
-                        .iter()
-                        .filter_map(|c| c.expr.as_ref().map(|e| e.to_string()))
-                        .collect();
-                    Value::build_text(exprs.join(", "))
-                } else {
-                    Value::Null
-                };
-
-                rows.push(vec![
-                    Value::from_i64(index_oid),    // indexrelid
-                    Value::from_i64(table_oid),    // indrelid
-                    Value::from_i64(indnatts),     // indnatts
-                    Value::from_i64(indnatts),     // indnkeyatts
-                    Value::from_i64(indisunique),  // indisunique
-                    Value::from_i64(indisprimary), // indisprimary
-                    Value::from_i64(0),            // indisexclusion
-                    Value::from_i64(1),            // indimmediate
-                    Value::from_i64(0),            // indisclustered
-                    Value::from_i64(1),            // indisvalid
-                    Value::from_i64(0),            // indcheckxmin
-                    Value::from_i64(1),            // indisready
-                    Value::from_i64(1),            // indislive
-                    Value::from_i64(0),            // indisreplident
-                    Value::build_text(indkey),     // indkey
-                    Value::Null,                   // indcollation
-                    Value::Null,                   // indclass
-                    Value::Null,                   // indoption
-                    indexprs,                      // indexprs
-                    indpred,                       // indpred
-                    Value::from_i64(0),
-                ]);
-                index_oid += 1;
-            }
+            rows.push(vec![
+                Value::from_i64(index.oid),                // indexrelid
+                Value::from_i64(index.table_oid),          // indrelid
+                Value::from_i64(indnatts),                 // indnatts
+                Value::from_i64(indnatts),                 // indnkeyatts
+                Value::from_i64(i64::from(index.unique)),  // indisunique
+                Value::from_i64(i64::from(index.primary)), // indisprimary
+                Value::from_i64(0),                        // indisexclusion
+                Value::from_i64(1),                        // indimmediate
+                Value::from_i64(0),                        // indisclustered
+                Value::from_i64(1),                        // indisvalid
+                Value::from_i64(0),                        // indcheckxmin
+                Value::from_i64(1),                        // indisready
+                Value::from_i64(1),                        // indislive
+                Value::from_i64(0),                        // indisreplident
+                Value::build_text(indkey),                 // indkey
+                Value::Null,                               // indcollation
+                Value::Null,                               // indclass
+                Value::Null,                               // indoption
+                indexprs,                                  // indexprs
+                indpred,                                   // indpred
+                Value::from_i64(0),
+            ]);
         }
         rows
     }
@@ -1484,23 +1464,13 @@ impl SnapshotRows for PgConstraintTable {
         let mut rows = Vec::new();
 
         let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
         let tbl_oid_map = table_oid_map(&schema);
-
-        // Build index_name -> index_oid map (same OID assignment as pg_class/pg_index)
-        let mut index_oid_map: HashMap<String, i64> = HashMap::default();
-        let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                index_oid_map.insert(idx.name.clone(), next_index_oid);
-                next_index_oid += 1;
-            }
-        }
-
-        let mut constraint_oid = next_index_oid;
+        let indexes = catalog_indexes(&schema);
+        let mut constraint_oid = indexes
+            .last()
+            .map_or(USER_TABLE_OID_START + tables.len() as i64, |index| {
+                index.oid + 1
+            });
 
         for (table_name, table) in &tables {
             let btree = match table.as_ref() {
@@ -1511,7 +1481,7 @@ impl SnapshotRows for PgConstraintTable {
 
             // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
             let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-            if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
+            if !has_pk_in_unique_sets && btree.get_rowid_alias_column().is_some() {
                 let conname = format!("{table_name}_pkey");
                 let conkey: String = btree
                     .primary_key_columns
@@ -1534,7 +1504,13 @@ impl SnapshotRows for PgConstraintTable {
                     Value::from_i64(1),
                     Value::from_i64(table_oid),
                     Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(
+                        indexes
+                            .iter()
+                            .find(|index| index.table_oid == table_oid && index.primary)
+                            .expect("rowid primary keys have a catalog index")
+                            .oid,
+                    ),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
@@ -1577,25 +1553,32 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                // Find matching index OID
-                let conindid = if us.is_primary_key {
-                    // PK auto-index name: sqlite_autoindex_{table}_{N}
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| {
-                            k.starts_with(&format!(
-                                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{table_name}"
-                            ))
-                        })
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                } else {
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| k.contains(&col_names.join("_")))
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                };
+                let positions: Vec<usize> = col_names
+                    .iter()
+                    .map(|name| btree.get_column(name).expect("constraint columns exist").0)
+                    .collect();
+                let conindid = indexes
+                    .iter()
+                    .find(|index| {
+                        index.table_oid == table_oid
+                            && index.unique
+                            && index
+                                .name
+                                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                            && index.where_clause.is_none()
+                            && index
+                                .columns
+                                .iter()
+                                .all(|(_, _, expression)| expression.is_none())
+                            && index.primary == us.is_primary_key
+                            && index
+                                .columns
+                                .iter()
+                                .map(|(_, pos, _)| *pos)
+                                .eq(positions.iter().copied())
+                    })
+                    .expect("unique constraints have a catalog index")
+                    .oid;
 
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
@@ -2736,19 +2719,10 @@ impl SnapshotRows for PgDependTable {
             let oid = index[0].as_int().expect("catalog OIDs are integers");
             let table = index[1].as_int().expect("catalog OIDs are integers");
             let columns = catalog_column_numbers(&index[14]);
-            let automatic = relations.iter().any(|relation| {
-                relation[0].as_int() == Some(oid)
-                    && matches!(&relation[1], Value::Text(name) if name.as_str().starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX))
+            let constraint = constraints.iter().find(|constraint| {
+                matches!(&constraint[3], Value::Text(kind) if matches!(kind.as_str(), "p" | "u"))
+                    && constraint[9].as_int() == Some(oid)
             });
-            let constraint = if automatic {
-                constraints.iter().find(|constraint| {
-                    matches!(&constraint[3], Value::Text(kind) if matches!(kind.as_str(), "p" | "u"))
-                        && constraint[7].as_int() == Some(table)
-                        && catalog_column_numbers(&constraint[18]) == columns
-                })
-            } else {
-                None
-            };
             if let Some(constraint) = constraint {
                 let constraint_oid = constraint[0].as_int().expect("catalog OIDs are integers");
                 rows.push(dependency_row(
@@ -3334,19 +3308,12 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
     let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    // Build index_name -> index_oid map (same as pg_constraint)
-    let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if !idx.ephemeral {
-                next_index_oid += 1;
-            }
-        }
-    }
-
-    let mut constraint_oid = next_index_oid;
+    let indexes = catalog_indexes(&schema);
+    let mut constraint_oid = indexes
+        .last()
+        .map_or(USER_TABLE_OID_START + tables.len() as i64, |index| {
+            index.oid + 1
+        });
 
     for (_, table) in &tables {
         let btree = match table.as_ref() {
@@ -3356,12 +3323,12 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
 
         // Synthesized PK for rowid-alias tables
         let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-        if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
+        if !has_pk_in_unique_sets && btree.get_rowid_alias_column().is_some() {
             if constraint_oid == target_oid {
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| quote_identifier(name))
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -3371,7 +3338,11 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // PK / UNIQUE from unique_sets
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
+                let col_names: Vec<String> = us
+                    .columns
+                    .iter()
+                    .map(|column| quote_identifier(&column.name))
+                    .collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {
@@ -3385,11 +3356,21 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // FK constraints
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
+                let child_cols = fk
+                    .child_columns
+                    .iter()
+                    .map(|column| quote_identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let parent_cols = fk
+                    .parent_columns
+                    .iter()
+                    .map(|column| quote_identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                    "FOREIGN KEY ({child_cols}) REFERENCES public.{}({parent_cols})",
+                    quote_identifier(&fk.parent_table)
                 );
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
@@ -3420,43 +3401,126 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if idx.ephemeral {
-                continue;
+    for index in catalog_indexes(&schema) {
+        if index.oid == target_oid {
+            let unique = if index.unique { "UNIQUE " } else { "" };
+            let cols: Vec<String> = index
+                .columns
+                .iter()
+                .map(|(name, _, expression)| {
+                    if let Some(expression) = expression {
+                        expression.clone()
+                    } else {
+                        quote_identifier(name)
+                    }
+                })
+                .collect();
+            let mut def = format!(
+                "CREATE {unique}INDEX {} ON public.{} USING btree ({})",
+                quote_identifier(&index.name),
+                quote_identifier(&index.table_name),
+                cols.join(", ")
+            );
+            if let Some(where_clause) = &index.where_clause {
+                def.push_str(&format!(" WHERE {where_clause}"));
             }
-            if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
-            }
-            index_oid += 1;
+            return Some(def);
         }
     }
 
     None
+}
+
+struct CatalogIndex {
+    oid: i64,
+    table_oid: i64,
+    table_name: String,
+    name: String,
+    columns: Vec<(String, usize, Option<String>)>,
+    unique: bool,
+    primary: bool,
+    where_clause: Option<String>,
+}
+
+fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
+    let tables = user_tables_sorted(schema);
+    let table_oids = table_oid_map(schema);
+    let mut oid = USER_TABLE_OID_START + tables.len() as i64;
+    let mut indexes = Vec::new();
+    for (table_name, table) in tables {
+        let Table::BTree(btree) = table.as_ref() else {
+            continue;
+        };
+        let table_oid = table_oids[table_name];
+        if let Some((position, column)) = btree.get_rowid_alias_column() {
+            indexes.push(CatalogIndex {
+                oid,
+                table_oid,
+                table_name: table_name.clone(),
+                name: format!("{table_name}_pkey"),
+                columns: vec![(
+                    column.name.clone().expect("primary key columns have names"),
+                    position,
+                    None,
+                )],
+                unique: true,
+                primary: true,
+                where_clause: None,
+            });
+            oid += 1;
+        }
+        for index in schema
+            .get_indices(table_name)
+            .filter(|index| !index.ephemeral)
+        {
+            let positions: Vec<usize> = index
+                .columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .collect();
+            let primary = index.unique
+                && index
+                    .name
+                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                && index.where_clause.is_none()
+                && index.columns.iter().all(|column| column.expr.is_none())
+                && btree.unique_sets.iter().any(|set| {
+                    set.is_primary_key
+                        && set
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                btree
+                                    .get_column(&column.name)
+                                    .expect("primary key columns exist")
+                                    .0
+                            })
+                            .eq(positions.iter().copied())
+                });
+            indexes.push(CatalogIndex {
+                oid,
+                table_oid,
+                table_name: table_name.clone(),
+                name: index.name.clone(),
+                columns: index
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        (
+                            column.name.clone(),
+                            column.pos_in_table,
+                            column.expr.as_ref().map(ToString::to_string),
+                        )
+                    })
+                    .collect(),
+                unique: index.unique,
+                primary,
+                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+            });
+            oid += 1;
+        }
+    }
+    indexes
 }
 
 // TODO: Fix tests to use correct API
