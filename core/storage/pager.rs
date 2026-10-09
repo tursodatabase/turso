@@ -5331,8 +5331,8 @@ impl Pager {
                                 "wal_max_frame": result.wal_max_frame
                             }
                         );
+                        wal.publish_backfill(result);
                     }
-                    wal.publish_backfill(max_frame);
                     let next_phase = {
                         let state = self.checkpoint_state.read();
                         if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {
