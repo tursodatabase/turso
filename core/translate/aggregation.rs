@@ -5,6 +5,7 @@ use crate::{
     schema::Table,
     sync::Arc,
     translate::collate::CollationSeq,
+    types::KeyInfo,
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
@@ -277,6 +278,7 @@ pub enum AggArgumentSource<'a> {
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
         distinctness: &'a Distinctness,
+        order_by: &'a [(ast::SortOrder, Option<ast::NullsOrder>)],
     },
 }
 
@@ -292,11 +294,20 @@ impl<'a> AggArgumentSource<'a> {
         func: &'a AggFunc,
         args: &'a Vec<ast::Expr>,
         distinctness: &'a Distinctness,
+        order_by: &'a [(ast::SortOrder, Option<ast::NullsOrder>)],
     ) -> Self {
         Self::Expression {
             func,
             args,
             distinctness,
+            order_by,
+        }
+    }
+
+    pub fn order_by(&self) -> &[(ast::SortOrder, Option<ast::NullsOrder>)] {
+        match self {
+            Self::Register { aggregate, .. } => &aggregate.order_by,
+            Self::Expression { order_by, .. } => order_by,
         }
     }
 
@@ -384,6 +395,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -400,6 +412,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -418,6 +431,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -446,6 +460,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -469,6 +484,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
+                    order_by: Vec::new(),
                     comparator,
                     collation: Some(arg_collation),
                 }),
@@ -491,6 +507,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
+                    order_by: Vec::new(),
                     comparator,
                     collation: Some(arg_collation),
                 }),
@@ -512,6 +529,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -531,6 +549,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -552,6 +571,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -571,6 +591,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -589,6 +610,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
@@ -597,17 +619,55 @@ pub fn translate_aggregation_step(
         }
         AggFunc::ArrayAgg => {
             resolver.require_custom_types("Array features")?;
-            if num_args != 1 {
+            if num_args != 1 + agg_arg_source.order_by().len() {
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let mut order_by = Vec::new();
+            for (i, &(sort_order, nulls_order)) in agg_arg_source.order_by().iter().enumerate() {
+                let expr = agg_arg_source.arg_at(i + 1);
+                let mut sort_expr = expr;
+                while let ast::Expr::Collate(inner, _) = sort_expr {
+                    sort_expr = inner;
+                }
+                if super::order_by::custom_type_comparator(
+                    sort_expr,
+                    referenced_tables,
+                    resolver.schema(),
+                )
+                .is_some()
+                {
+                    crate::bail_parse_error!("custom type ORDER BY in array_agg is not supported");
+                }
+                let reg = agg_arg_source.translate(program, referenced_tables, resolver, i + 1)?;
+                let collation = super::collate::get_collseq_from_expr_with_symbols(
+                    expr,
+                    referenced_tables,
+                    Some(resolver.symbol_table),
+                )?
+                .unwrap_or_default();
+                if collation.is_custom() {
+                    crate::bail_parse_error!(
+                        "custom collation ORDER BY in array_agg is not supported"
+                    );
+                }
+                order_by.push((
+                    reg,
+                    KeyInfo {
+                        sort_order,
+                        nulls_order,
+                        collation,
+                    },
+                ));
+            }
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
+                    order_by,
                     comparator: None,
                     collation: None,
                 }),
@@ -629,6 +689,7 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: Some(arg_collation),
                 }),
@@ -654,6 +715,7 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: Some(arg_collation),
                 }),
@@ -696,6 +758,7 @@ pub fn translate_aggregation_step(
                     } else {
                         func.clone()
                     })),
+                    order_by: Vec::new(),
                     comparator: None,
                     collation: None,
                 }),
