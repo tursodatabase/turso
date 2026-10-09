@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
@@ -7,7 +8,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use futures::{stream, Sink, SinkExt};
+use futures::{stream, Sink, SinkExt, TryStreamExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
@@ -71,21 +72,20 @@ impl TursoPgServer {
             self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let factory_ref = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: self.conn.clone(),
+                                    db_file: self.db_file.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                    cursors: Mutex::new(HashMap::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
                                 if let Err(e) = process_socket(socket, None, factory_ref).await {
                                     error!("Error processing connection from {}: {}", addr, e);
@@ -117,6 +117,7 @@ struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
+    cursors: Mutex<HashMap<String, PgCursor>>,
 }
 
 impl TursoPgHandler {
@@ -260,7 +261,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         send_ready_for_query(client, transaction_status).await
     }
 
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -275,6 +276,19 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
+            let parsed = turso_pg_parser::parse(sql)
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            if let Some(cursor) = turso_pg_parser::translator::try_extract_cursor(&parsed)
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?
+            {
+                if client.transaction_status() == TransactionStatus::Error {
+                    return Err(PgWireError::UserError(Box::new(error_info(
+                        "current transaction is aborted",
+                    ))));
+                }
+                responses.push(self.cursor_response(cursor).await?);
+                continue;
+            }
             let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -287,9 +301,88 @@ impl SimpleQueryHandler for TursoPgHandler {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
             }
+            if conn.inner().get_auto_commit() {
+                self.cursors.lock().unwrap().clear();
+            }
         }
 
         Ok(responses)
+    }
+}
+
+struct PgCursor {
+    header: Arc<Vec<FieldInfo>>,
+    rows: VecDeque<DataRow>,
+}
+
+impl TursoPgHandler {
+    async fn cursor_response(
+        &self,
+        command: turso_pg_parser::translator::PgCursorStmt,
+    ) -> PgWireResult<Response> {
+        use turso_pg_parser::translator::PgCursorStmt;
+
+        match command {
+            PgCursorStmt::Declare { name, query } => {
+                if self.transaction_status() != TransactionStatus::Transaction {
+                    return Err(PgWireError::UserError(Box::new(error_info(
+                        "DECLARE CURSOR can only be used in transaction blocks",
+                    ))));
+                }
+                if self.cursors.lock().unwrap().contains_key(&name) {
+                    return Err(PgWireError::UserError(Box::new(error_info(&format!(
+                        "cursor \"{name}\" already exists"
+                    )))));
+                }
+                let conn = self.conn.lock().unwrap().clone();
+                let mut stmt = conn
+                    .prepare(&query)
+                    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let Response::Query(mut result) = execute_query(&mut stmt, header.clone())? else {
+                    unreachable!();
+                };
+                let rows: Vec<DataRow> = result.data_rows().try_collect().await?;
+                self.cursors.lock().unwrap().insert(
+                    name,
+                    PgCursor {
+                        header,
+                        rows: rows.into(),
+                    },
+                );
+                Ok(Response::Execution(Tag::new("DECLARE CURSOR")))
+            }
+            PgCursorStmt::Fetch { name, count } => {
+                let mut cursors = self.cursors.lock().unwrap();
+                let cursor = cursors.get_mut(&name).ok_or_else(|| {
+                    PgWireError::UserError(Box::new(error_info(&format!(
+                        "cursor \"{name}\" does not exist"
+                    ))))
+                })?;
+                let count = cursor
+                    .rows
+                    .len()
+                    .min(usize::try_from(count).unwrap_or(usize::MAX));
+                let rows: Vec<_> = cursor.rows.drain(..count).map(Ok).collect();
+                let mut response = QueryResponse::new(cursor.header.clone(), stream::iter(rows));
+                response.set_command_tag("FETCH");
+                Ok(Response::Query(response))
+            }
+            PgCursorStmt::Close { name } => {
+                let mut cursors = self.cursors.lock().unwrap();
+                match name {
+                    Some(name) => {
+                        cursors.remove(&name).ok_or_else(|| {
+                            PgWireError::UserError(Box::new(error_info(&format!(
+                                "cursor \"{name}\" does not exist"
+                            ))))
+                        })?;
+                    }
+                    None => cursors.clear(),
+                }
+                Ok(Response::Execution(Tag::new("CLOSE CURSOR")))
+            }
+        }
     }
 }
 
@@ -408,7 +501,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query)?;
+            if conn.inner().get_auto_commit() {
+                self.cursors.lock().unwrap().clear();
+            }
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -957,6 +1054,7 @@ mod tests {
             conn: Arc::new(Mutex::new(conn)),
             db_file: ":memory:".to_owned(),
             query_parser: Arc::new(NoopQueryParser::new()),
+            cursors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1046,6 +1144,206 @@ mod tests {
             [b'H', b'c', b'C', b'Z']
         );
         assert_eq!(command_complete(&messages[2].1), "COPY 0");
+    }
+
+    #[test]
+    fn test_cursor_protocol_batches_exhausts_and_reuses_name() {
+        let mut client = protocol_client();
+        let values = (1..=205)
+            .map(|id| format!("({id}, 'payload-{}')", (id * 17) % 43))
+            .collect::<Vec<_>>()
+            .join(",");
+        client.simple_query(&format!("CREATE TABLE dump_probe (id INTEGER, name TEXT);
+            INSERT INTO dump_probe VALUES {values}; CREATE TABLE dump_empty (id INTEGER, name TEXT)")).unwrap();
+        let events = client.simple_query("BEGIN; DECLARE _pg_dump_cursor CURSOR FOR SELECT id, name FROM ONLY public.dump_probe ORDER BY id").unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(_))),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'T'))
+        ));
+        for (start, count) in [(1, 100), (101, 100), (201, 5), (206, 0), (206, 0)] {
+            let events = client
+                .simple_query("FETCH 100 FROM _pg_dump_cursor")
+                .unwrap();
+            let rows: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    BackendEvent::DataRow(row) => Some(row.clone()),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<_> = (start..start + count)
+                .map(|id| {
+                    vec![
+                        Some(id.to_string()),
+                        Some(format!("payload-{}", (id * 17) % 43)),
+                    ]
+                })
+                .collect();
+            assert_eq!(rows, expected);
+            assert!(
+                matches!(&events[0], BackendEvent::RowDescription(columns) if columns.len() == 2 && columns[0].name == "id" && columns[1].name == "name")
+            );
+            assert!(events.iter().any(|event| matches!(event, BackendEvent::CommandComplete(tag) if tag == &format!("FETCH {count}"))), "{events:?}");
+            assert!(matches!(
+                events.last(),
+                Some(BackendEvent::ReadyForQuery(b'T'))
+            ));
+        }
+        let events = client.simple_query("CLOSE _pg_dump_cursor; DECLARE _pg_dump_cursor NO SCROLL CURSOR FOR SELECT id, name FROM ONLY public.dump_empty; FETCH 100 FROM _pg_dump_cursor; CLOSE _pg_dump_cursor; COMMIT; SELECT 47").unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(_))),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    BackendEvent::CommandComplete(tag) => Some(tag.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [
+                "CLOSE CURSOR",
+                "DECLARE CURSOR",
+                "FETCH 0",
+                "CLOSE CURSOR",
+                "COMMIT",
+                "SELECT 1"
+            ]
+        );
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'I'))
+        ));
+    }
+
+    #[test]
+    fn test_cursor_requires_transaction_and_closes_at_transaction_end() {
+        let mut client = protocol_client();
+        let events = client
+            .simple_query("DECLARE c CURSOR FOR SELECT 17")
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ErrorResponse(_))));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'I'))
+        ));
+        let events = client
+            .simple_query("BEGIN; DECLARE c CURSOR FOR SELECT 17; COMMIT; BEGIN; FETCH 1 FROM c")
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, BackendEvent::CommandComplete(tag) if tag == "DECLARE CURSOR")), "{events:?}");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ErrorResponse(_))));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'E'))
+        ));
+        let events = client.simple_query("ROLLBACK; BEGIN; DECLARE c CURSOR FOR SELECT 29; FETCH ALL FROM c; CLOSE ALL; COMMIT").unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(_))),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(event, BackendEvent::DataRow(row) if row == &vec![Some("29".to_owned())])));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'I'))
+        ));
+    }
+
+    #[test]
+    fn test_current_schemas_wire_text_is_a_postgres_array() {
+        let mut client = protocol_client();
+        client
+            .simple_query("SELECT set_config('search_path', '', false)")
+            .unwrap();
+        let events = client.simple_query("SELECT pg_catalog.current_schemas(false), pg_catalog.current_schemas(true), pg_catalog.current_schemas(NULL)").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::DataRow(row)
+            if row == &vec![Some("{}".to_owned()), Some("{pg_catalog}".to_owned()), None])),
+            "{events:?}"
+        );
+        client
+            .simple_query("SELECT set_config('search_path', 'missing, public, public', false)")
+            .unwrap();
+        let events = client
+            .simple_query(
+                "SELECT pg_catalog.current_schemas(false), pg_catalog.current_schemas(true)",
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::DataRow(row)
+            if row == &vec![Some("{public}".to_owned()), Some("{pg_catalog,public}".to_owned())])),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn test_cursor_errors_preserve_failed_transaction_and_release_names() {
+        let mut client = protocol_client();
+        let events = client
+            .simple_query("BEGIN; DECLARE c CURSOR FOR SELECT * FROM missing_relation")
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ErrorResponse(_))));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'E'))
+        ));
+        let events = client
+            .simple_query(
+                "ROLLBACK; BEGIN; DECLARE c CURSOR FOR SELECT 17; DECLARE c CURSOR FOR SELECT 29",
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(fields)
+            if turso_pg_client::error_message(fields).contains("already exists"))),
+            "{events:?}"
+        );
+        let events = client.simple_query("FETCH 1 FROM c").unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ErrorResponse(fields)
+            if turso_pg_client::error_message(fields).contains("aborted"))));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'E'))
+        ));
+        let events = client
+            .simple_query(
+                "ROLLBACK; BEGIN; DECLARE c CURSOR FOR SELECT 43; FETCH ALL FROM c; COMMIT",
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::DataRow(row)
+            if row == &vec![Some("43".to_owned())])),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'I'))
+        ));
     }
 
     #[test]
