@@ -1092,6 +1092,50 @@ mod tests {
     }
 
     #[test]
+    fn test_sequence_dump_protocol_uses_persisted_state_and_boolean_text() {
+        let mut client = protocol_client();
+        let setup = client.simple_query("CREATE SEQUENCE dump_counter START 41 INCREMENT 3 MAXVALUE 999; SELECT set_config('search_path','',false)").unwrap();
+        assert!(
+            !setup
+                .iter()
+                .any(|event| matches!(event, BackendEvent::ErrorResponse(_))),
+            "{setup:?}"
+        );
+        for expected in [["41", "f"], ["44", "t"]] {
+            let events = client
+                .simple_query("SELECT last_value,is_called FROM public.dump_counter")
+                .unwrap();
+            assert_eq!(
+                events.iter().find_map(|event| match event {
+                    BackendEvent::RowDescription(columns) => Some(
+                        columns
+                            .iter()
+                            .map(|column| column.type_oid)
+                            .collect::<Vec<_>>()
+                    ),
+                    _ => None,
+                }),
+                Some(vec![20, 16])
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        BackendEvent::DataRow(row) => Some(row.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![expected.map(|value| Some(value.to_string())).to_vec()]
+            );
+            if expected[1] == "f" {
+                client
+                    .simple_query("SELECT nextval('dump_counter'); SELECT nextval('dump_counter')")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn test_copy_protocol_orders_statements_and_encodes_rows() {
         let mut client = protocol_client();
         client

@@ -64,6 +64,7 @@ scalar_functions! {
     FormatType(FunctionArity::OneOf(&[1, 2]), true),
     PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
     PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
+    PgGetViewdef(FunctionArity::OneOf(&[1, 2]), false),
     PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false),
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
@@ -116,6 +117,9 @@ impl ScalarCall for PgScalarFunction {
             Self::FormatType => exec_pg_format_type(int_arg(args, 0, 0), int_arg(args, 1, -1)),
             Self::PgGetConstraintdef => exec_pg_get_constraintdef(connection, int_arg(args, 0, 0)),
             Self::PgGetIndexdef => exec_pg_get_indexdef(connection, int_arg(args, 0, 0)),
+            Self::PgGetViewdef => crate::catalog::pg_get_viewdef(connection, int_arg(args, 0, 0))?
+                .map(Value::build_text)
+                .unwrap_or(Value::Null),
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),

@@ -1,5 +1,6 @@
 use crate::functions::validate_pg_input;
 use rustc_hash::FxHashMap as HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use turso_core::{
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{self, RefAct};
 use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
@@ -469,6 +470,8 @@ impl SnapshotRows for PgAttributeTable {
                     .iter()
                     .find(|t| t.oid == type_oid)
                     .expect("column type OIDs refer to PostgreSQL base types");
+                let array = col.array_dimensions() > 0;
+                let type_oid = if array { type_info.typarray } else { type_oid };
                 let attnum = (i + 1) as i64; // 1-based
                 let primary_key = match &relation.kind {
                     CatalogRelationKind::Table(table) => table
@@ -485,14 +488,14 @@ impl SnapshotRows for PgAttributeTable {
                     Value::Text(col_name.into()), // attname
                     Value::from_i64(type_oid),    // atttypid
                     Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(type_info.typlen),
-                    Value::from_i64(attnum), // attnum
-                    Value::from_i64(0),      // attndims
-                    Value::from_i64(-1),     // attcacheoff
-                    Value::from_i64(-1),     // atttypmod
-                    Value::from_i64(i64::from(type_info.typbyval)),
-                    Value::build_text(type_info.typstorage),
-                    Value::build_text(type_info.typalign),
+                    Value::from_i64(if array { -1 } else { type_info.typlen }),
+                    Value::from_i64(attnum),                        // attnum
+                    Value::from_i64(col.array_dimensions() as i64), // attndims
+                    Value::from_i64(-1),                            // attcacheoff
+                    Value::from_i64(-1),                            // atttypmod
+                    Value::from_i64(i64::from(!array && type_info.typbyval)),
+                    Value::build_text(if array { "x" } else { type_info.typstorage }),
+                    Value::build_text(if array { "i" } else { type_info.typalign }),
                     Value::from_i64(notnull), // attnotnull
                     Value::from_i64(has_def), // atthasdef
                     Value::from_i64(0),       // atthasmissing
@@ -1751,6 +1754,41 @@ impl SnapshotRows for PgAttrdefTable {
     }
 }
 
+#[derive(Debug)]
+struct PgSequenceTable;
+
+impl SnapshotRows for PgSequenceTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_sequence (
+        seqrelid INTEGER, seqtypid INTEGER, seqstart INTEGER, seqincrement INTEGER,
+        seqmax INTEGER, seqmin INTEGER, seqcache INTEGER, seqcycle BOOLEAN,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2224);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        catalog_relations(conn)
+            .into_iter()
+            .filter_map(|relation| {
+                let CatalogRelationKind::Sequence(sequence) = relation.kind else {
+                    return None;
+                };
+                Some(vec![
+                    Value::from_i64(relation.oid),
+                    Value::from_i64(20),
+                    Value::from_i64(sequence.start_value),
+                    Value::from_i64(sequence.increment_by),
+                    Value::from_i64(sequence.max_value),
+                    Value::from_i64(sequence.min_value),
+                    Value::from_i64(1),
+                    Value::from_i64(i64::from(sequence.cycle)),
+                ])
+            })
+            .collect()
+    }
+}
+
 /// Virtual table implementation for pg_catalog.pg_sequences
 /// Reads sequence metadata from Schema.sequences at scan time.
 #[derive(Debug)]
@@ -1774,32 +1812,32 @@ impl SnapshotRows for PgSequencesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        let mut rows = Vec::new();
-        for relation in catalog_relations(conn) {
-            if let CatalogRelationKind::Sequence(seq) = &relation.kind {
-                let seq_name = seq.name.clone();
-                // currval is per-connection; expose this connection's last
-                // value via the connection currval map, falling back to start.
-                let last_val = conn
-                    .get_sequence_currval(&seq_name)
-                    .unwrap_or(seq.start_value);
-                rows.push(vec![
-                    Value::build_text(relation.namespace),
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
-                    Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
-                ]);
-            }
-        }
-        rows
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        Vec::new()
+    }
+
+    fn read_sql(conn: &Connection) -> Option<String> {
+        let selects: Vec<_> = catalog_relations(conn)
+            .into_iter()
+            .filter_map(|relation| {
+                let CatalogRelationKind::Sequence(sequence) = &relation.kind else {
+                    return None;
+                };
+                let state = sequence_state_sql(&relation.namespace, sequence);
+                Some(format!(
+                    "SELECT '{}', '{}', 'turso', 'bigint', {}, {}, {}, {}, {}, 1,
+                (SELECT CASE WHEN is_called THEN last_value ELSE NULL END FROM ({state}))",
+                    relation.namespace.replace('\'', "''"),
+                    sequence.name.replace('\'', "''"),
+                    sequence.start_value,
+                    sequence.min_value,
+                    sequence.max_value,
+                    sequence.increment_by,
+                    i64::from(sequence.cycle)
+                ))
+            })
+            .collect();
+        (!selects.is_empty()).then(|| selects.join(" UNION ALL "))
     }
 }
 
@@ -1879,6 +1917,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             schema: PgInputErrorInfoTable::schema,
             create: PgInputErrorInfoTable::new,
         },
+    );
+    options = options.native_module(
+        "pg_sequence",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSequenceTable>(PhantomData),
     );
     options = options.native_module(
         "pg_sequences",
@@ -2668,7 +2711,8 @@ impl SnapshotRows for PgDependTable {
         let relations = PgClassTable::load_rows(conn);
 
         for relation in &relations {
-            if !matches!(&relation[16], Value::Text(kind) if kind.as_str() == "r") {
+            if !matches!(&relation[16], Value::Text(kind) if matches!(kind.as_str(), "r" | "v" | "S"))
+            {
                 continue;
             }
             let oid = relation[0].as_int().expect("catalog OIDs are integers");
@@ -2681,6 +2725,21 @@ impl SnapshotRows for PgDependTable {
                     [2601, access_method, 0],
                     "n",
                 ));
+            }
+        }
+
+        let objects = catalog_relations(conn);
+        for object in &objects {
+            if matches!(object.kind, CatalogRelationKind::View(_)) {
+                let (_, dependencies) = qualified_view_select(object, &objects)
+                    .expect("stored views have valid relation names");
+                for referenced_oid in dependencies {
+                    rows.push(dependency_row(
+                        [1259, object.oid, 0],
+                        [1259, referenced_oid, 0],
+                        "n",
+                    ));
+                }
             }
         }
 
@@ -2781,6 +2840,10 @@ trait SnapshotRows: Debug + Send + Sync + 'static {
     const ESTIMATED_ROWS: u32;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>>;
+
+    fn read_sql(_conn: &Connection) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -2809,6 +2872,8 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
+            read_sql: T::read_sql,
+            statement: None,
             table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
@@ -2842,6 +2907,8 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 struct SnapshotCursor {
     conn: Arc<Connection>,
     load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    read_sql: fn(&Connection) -> Option<String>,
+    statement: Option<Statement>,
     table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2877,8 +2944,25 @@ impl VirtualTableCursor for SnapshotCursor {
         _idx_str: Option<&str>,
         _idx_num: i32,
     ) -> turso_core::types::IOResultOr<bool> {
-        self.current_row = 0;
-        self.rows = (self.load_rows)(&self.conn);
+        if self.statement.is_none() {
+            self.current_row = 0;
+            self.rows.clear();
+            if let Some(sql) = (self.read_sql)(&self.conn) {
+                self.statement = Some(self.conn.prepare_internal(sql)?);
+            } else {
+                self.rows = (self.load_rows)(&self.conn);
+            }
+        }
+        if let Some(statement) = &mut self.statement {
+            let rows = &mut self.rows;
+            if let IOResult::IO(completions) = statement.run_with_row_callback_nonblock(|row| {
+                rows.push(row.get_values().cloned().collect());
+                Ok(())
+            })? {
+                return Ok(IOResult::IO(completions));
+            }
+            self.statement = None;
+        }
         Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
@@ -3410,6 +3494,344 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
     None
 }
 
+pub(crate) fn pg_get_viewdef(conn: &Connection, target_oid: i64) -> Result<Option<String>> {
+    let relations = catalog_relations(conn);
+    let Some(relation) = relations.iter().find(|relation| {
+        relation.oid == target_oid && matches!(relation.kind, CatalogRelationKind::View(_))
+    }) else {
+        return Ok(None);
+    };
+    let (select, _) = qualified_view_select(relation, &relations)?;
+    Ok(Some(format!("{select};")))
+}
+
+fn qualified_view_select(
+    relation: &CatalogRelation,
+    relations: &[CatalogRelation],
+) -> Result<(ast::Select, Vec<i64>)> {
+    let CatalogRelationKind::View(view) = &relation.kind else {
+        unreachable!()
+    };
+    let mut select = view.select_stmt.clone();
+    let mut dependencies = Vec::new();
+    visit_select_relations(
+        &mut select,
+        &HashSet::new(),
+        &mut |table, ctes| {
+            let name = match table {
+                ast::SelectTable::Table(name, _, _) => name,
+                ast::SelectTable::TableCall(name, _, _, _) => {
+                    if name.name.as_str() == "pg_generate_series" {
+                        name.name = ast::Name::exact("generate_series".to_string());
+                    }
+                    if name
+                        .db_name
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "main")
+                    {
+                        name.db_name = Some(ast::Name::exact("pg_catalog".to_string()));
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            };
+            if name.db_name.is_none() && ctes.contains(name.name.as_str()) {
+                return Ok(());
+            }
+            let namespace = match name.db_name.as_ref().map(ast::Name::as_str) {
+                Some("main") => "public",
+                Some(namespace) => namespace,
+                None if is_catalog_table_name(name.name.as_str()) => "pg_catalog",
+                None => &relation.namespace,
+            };
+            if let Some(referenced) = relations.iter().find(|candidate| {
+                candidate.namespace == namespace && candidate.name == name.name.as_str()
+            }) {
+                if !dependencies.contains(&referenced.oid) {
+                    dependencies.push(referenced.oid);
+                }
+            }
+            name.db_name = Some(ast::Name::exact(namespace.to_string()));
+            Ok(())
+        },
+        postgres_view_expr,
+    )?;
+    Ok((select, dependencies))
+}
+
+pub(crate) fn rewrite_sequence_reads(
+    conn: &Connection,
+    cmd: &mut ast::Cmd,
+    options: &turso_core::PrepareOptions,
+) -> Result<bool> {
+    let stmt = match cmd {
+        ast::Cmd::Stmt(stmt)
+        | ast::Cmd::Explain(stmt)
+        | ast::Cmd::ExplainQueryPlan { stmt, .. } => stmt,
+    };
+    let ast::Stmt::Select(select) = stmt else {
+        return Ok(false);
+    };
+    let relations = catalog_relations(conn);
+    let mut changed = false;
+    visit_select_relations(
+        select,
+        &HashSet::new(),
+        &mut |table, ctes| {
+            let ast::SelectTable::Table(name, alias, _) = table else {
+                return Ok(());
+            };
+            if name.db_name.is_none() && ctes.contains(name.name.as_str()) {
+                return Ok(());
+            }
+            let search_path = match name.db_name.as_ref() {
+                Some(database) => vec![if database.as_str() == "main" {
+                    "public".to_string()
+                } else {
+                    database.as_str().to_string()
+                }],
+                None => options
+                    .unqualified_database_search_path
+                    .clone()
+                    .unwrap_or_else(|| vec!["public".to_string()]),
+            };
+            let relation = search_path.iter().find_map(|namespace| {
+                relations.iter().find(|relation| {
+                    relation.namespace == *namespace && relation.name == name.name.as_str()
+                })
+            });
+            let Some(CatalogRelation {
+                namespace,
+                kind: CatalogRelationKind::Sequence(sequence),
+                ..
+            }) = relation
+            else {
+                return Ok(());
+            };
+            let sql = sequence_state_sql(namespace, sequence);
+            let (Some(ast::Cmd::Stmt(ast::Stmt::Select(state))), _) = conn.dialect().parse(&sql)?
+            else {
+                unreachable!("sequence state queries are SELECT statements");
+            };
+            let alias = alias
+                .clone()
+                .or_else(|| Some(ast::As::As(name.name.clone())));
+            *table = ast::SelectTable::Select(state, alias);
+            changed = true;
+            Ok(())
+        },
+        |_| {},
+    )?;
+    Ok(changed)
+}
+
+fn sequence_state_sql(namespace: &str, sequence: &Sequence) -> String {
+    let database = if namespace == "public" {
+        "main"
+    } else {
+        namespace
+    };
+    let backing_table = format!("__turso_internal_seq_{}", sequence.name);
+    let order = if sequence.increment_by > 0 {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    format!("SELECT CAST(value AS BIGINT) AS last_value, 0 AS log_cnt, CAST(is_called AS BOOLEAN) AS is_called
+        FROM {}.{} ORDER BY value {order} LIMIT 1", quote_identifier(database), quote_identifier(&backing_table))
+}
+
+fn visit_select_relations<F>(
+    select: &mut ast::Select,
+    ctes: &HashSet<String>,
+    visit: &mut F,
+    expr_visit: fn(&mut ast::Expr),
+) -> Result<()>
+where
+    F: FnMut(&mut ast::SelectTable, &HashSet<String>) -> Result<()>,
+{
+    let mut ctes = ctes.clone();
+    if let Some(with) = &mut select.with {
+        if with.recursive {
+            ctes.extend(
+                with.ctes
+                    .iter()
+                    .map(|cte| cte.tbl_name.as_str().to_string()),
+            );
+        }
+        for cte in &mut with.ctes {
+            visit_select_relations(&mut cte.select, &ctes, visit, expr_visit)?;
+            ctes.insert(cte.tbl_name.as_str().to_string());
+        }
+    }
+    for body in std::iter::once(&mut select.body.select).chain(
+        select
+            .body
+            .compounds
+            .iter_mut()
+            .map(|compound| &mut compound.select),
+    ) {
+        match body {
+            ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                window_clause,
+                ..
+            } => {
+                for column in columns {
+                    if let ast::ResultColumn::Expr(expr, _) = column {
+                        visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                    }
+                }
+                if let Some(from) = from {
+                    visit_relation_from(from, &ctes, visit, expr_visit)?;
+                }
+                if let Some(expr) = where_clause {
+                    visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                }
+                if let Some(group) = group_by {
+                    for expr in &mut group.exprs {
+                        visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                    }
+                    if let Some(expr) = &mut group.having {
+                        visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                    }
+                }
+                for window in window_clause {
+                    for expr in &mut window.window.partition_by {
+                        visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                    }
+                    for column in &mut window.window.order_by {
+                        visit_relation_expr(&mut column.expr, &ctes, visit, expr_visit)?;
+                    }
+                    if let Some(frame) = &mut window.window.frame_clause {
+                        for bound in std::iter::once(&mut frame.start).chain(frame.end.iter_mut()) {
+                            if let ast::FrameBound::Preceding(expr)
+                            | ast::FrameBound::Following(expr) = bound
+                            {
+                                visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                            }
+                        }
+                    }
+                }
+            }
+            ast::OneSelect::Values(rows) => {
+                for expr in rows.iter_mut().flatten() {
+                    visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+                }
+            }
+        }
+    }
+    for column in &mut select.order_by {
+        visit_relation_expr(&mut column.expr, &ctes, visit, expr_visit)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        visit_relation_expr(&mut limit.expr, &ctes, visit, expr_visit)?;
+        if let Some(expr) = &mut limit.offset {
+            visit_relation_expr(expr, &ctes, visit, expr_visit)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_relation_from<F>(
+    from: &mut ast::FromClause,
+    ctes: &HashSet<String>,
+    visit: &mut F,
+    expr_visit: fn(&mut ast::Expr),
+) -> Result<()>
+where
+    F: FnMut(&mut ast::SelectTable, &HashSet<String>) -> Result<()>,
+{
+    visit_relation_table(&mut from.select, ctes, visit, expr_visit)?;
+    for join in &mut from.joins {
+        visit_relation_table(&mut join.table, ctes, visit, expr_visit)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            visit_relation_expr(expr, ctes, visit, expr_visit)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_relation_table<F>(
+    table: &mut ast::SelectTable,
+    ctes: &HashSet<String>,
+    visit: &mut F,
+    expr_visit: fn(&mut ast::Expr),
+) -> Result<()>
+where
+    F: FnMut(&mut ast::SelectTable, &HashSet<String>) -> Result<()>,
+{
+    match table {
+        ast::SelectTable::Select(select, _) => {
+            visit_select_relations(select, ctes, visit, expr_visit)?
+        }
+        ast::SelectTable::Sub(from, _) => visit_relation_from(from, ctes, visit, expr_visit)?,
+        ast::SelectTable::TableCall(_, args, _, _) => {
+            for expr in args {
+                visit_relation_expr(expr, ctes, visit, expr_visit)?;
+            }
+        }
+        ast::SelectTable::Table(_, _, _) => (),
+    }
+    visit(table, ctes)
+}
+
+fn visit_relation_expr<F>(
+    expr: &mut ast::Expr,
+    ctes: &HashSet<String>,
+    visit: &mut F,
+    expr_visit: fn(&mut ast::Expr),
+) -> Result<()>
+where
+    F: FnMut(&mut ast::SelectTable, &HashSet<String>) -> Result<()>,
+{
+    turso_core::walk_expr_mut(expr, &mut |expr| {
+        expr_visit(expr);
+        match expr {
+            ast::Expr::Array { elements } => {
+                for element in elements {
+                    visit_relation_expr(element, ctes, visit, expr_visit)?;
+                }
+                return Ok(turso_core::WalkControl::SkipChildren);
+            }
+            ast::Expr::Subscript { base, index } => {
+                visit_relation_expr(base, ctes, visit, expr_visit)?;
+                visit_relation_expr(index, ctes, visit, expr_visit)?;
+                return Ok(turso_core::WalkControl::SkipChildren);
+            }
+            ast::Expr::Subquery(select)
+            | ast::Expr::Exists(select)
+            | ast::Expr::InSelect { rhs: select, .. } => {
+                visit_select_relations(select, ctes, visit, expr_visit)?
+            }
+            _ => (),
+        }
+        Ok(turso_core::WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn postgres_view_expr(expr: &mut ast::Expr) {
+    if let ast::Expr::FunctionCall { name, args, .. } = expr {
+        match name.as_str() {
+            "array" => {
+                *expr = ast::Expr::Array {
+                    elements: std::mem::take(args),
+                }
+            }
+            "array_element" if args.len() == 2 => {
+                let index = args.pop().unwrap();
+                let base = args.pop().unwrap();
+                *expr = ast::Expr::Subscript { base, index };
+            }
+            _ => (),
+        }
+    }
+}
+
 struct CatalogIndex {
     oid: i64,
     table_oid: i64,
@@ -3544,13 +3966,17 @@ fn catalog_relations(conn: &Connection) -> Vec<CatalogRelation> {
             }
         }
         for (name, view) in &schema.views {
-            objects.push((name.clone(), CatalogRelationKind::View(view.clone())));
+            if !is_system_table(name) {
+                objects.push((name.clone(), CatalogRelationKind::View(view.clone())));
+            }
         }
         for (name, sequence) in &schema.sequences {
-            objects.push((
-                name.clone(),
-                CatalogRelationKind::Sequence(sequence.clone()),
-            ));
+            if !is_system_table(name) {
+                objects.push((
+                    name.clone(),
+                    CatalogRelationKind::Sequence(sequence.clone()),
+                ));
+            }
         }
         objects.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (name, kind) in objects {

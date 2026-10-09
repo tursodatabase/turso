@@ -1340,14 +1340,23 @@ impl Statement {
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
         // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
-            return Ok(None);
+        let (name, array_dimensions) = match &column.expr {
+            turso_parser::ast::Expr::Cast {
+                type_name: Some(type_name),
+                ..
+            } => (type_name.name.as_str(), type_name.array_dimensions),
+            expr => {
+                let Some(name) =
+                    infer_expression_primitive(expr, Some(&self.program.table_references))
+                else {
+                    return Ok(None);
+                };
+                (name, 0)
+            }
         };
         Ok(Some(ColumnTypeInfo {
             declared_name: name.to_string(),
-            array_dimensions: 0,
+            array_dimensions,
             base_type: None,
             kind: ColumnTypeKind::Builtin,
         }))

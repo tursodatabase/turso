@@ -1064,6 +1064,37 @@ fn test_pg_type_array_types(db: TempDatabase) {
         }
         _ => panic!("_text not found in pg_type"),
     }
+    conn.execute("CREATE TABLE dump_arrays (id INTEGER PRIMARY KEY, vals INTEGER[])")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT a.attname,a.atttypid,a.attndims,a.attlen,a.attbyval,
+            pg_catalog.format_type(a.atttypid,a.atttypmod)
+            FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+            WHERE c.relname='dump_arrays' ORDER BY a.attnum"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("id"),
+                Value::from_i64(23),
+                Value::from_i64(0),
+                Value::from_i64(4),
+                Value::from_i64(1),
+                Value::build_text("integer")
+            ],
+            vec![
+                Value::build_text("vals"),
+                Value::from_i64(1007),
+                Value::from_i64(1),
+                Value::from_i64(-1),
+                Value::from_i64(0),
+                Value::build_text("integer[]")
+            ],
+        ]
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1894,6 +1925,135 @@ fn test_pg_attrdef_populated(db: TempDatabase) {
         rows.len() >= 2,
         "expected at least 2 default values, got {}",
         rows.len()
+    );
+}
+
+#[turso_macros::test(mvcc, views)]
+fn test_dump_view_and_persisted_sequence_queries(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dump_probe (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO dump_probe VALUES (1,'excluded'),(3,'retained')")
+        .unwrap();
+    conn.execute("CREATE VIEW dump_names AS SELECT id,name FROM public.dump_probe WHERE id>1")
+        .unwrap();
+    conn.execute(
+        "CREATE VIEW dump_cte AS WITH dump_probe AS (SELECT id,name FROM public.dump_probe)
+        SELECT id,name FROM dump_probe WHERE id IN (SELECT id FROM public.dump_probe WHERE id>1)",
+    )
+    .unwrap();
+    conn.execute("CREATE SEQUENCE dump_counter START 41 INCREMENT 3 MAXVALUE 999")
+        .unwrap();
+    conn.execute(
+        "CREATE SEQUENCE descending_counter START -11 INCREMENT -4 MINVALUE -20 MAXVALUE -1",
+    )
+    .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT format_type(seqtypid,NULL),seqstart,seqincrement,seqmax,seqmin,seqcache,seqcycle
+            FROM pg_catalog.pg_sequence WHERE seqrelid=(SELECT oid FROM pg_class WHERE relname='dump_counter' AND relkind='S')")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("bigint"),Value::from_i64(41),Value::from_i64(3),Value::from_i64(999),Value::from_i64(1),Value::from_i64(1),Value::from_i64(0)]]
+    );
+    for name in ["dump_names", "dump_cte"] {
+        let definition = conn
+            .prepare(format!(
+                "SELECT pg_catalog.pg_get_viewdef(oid) FROM pg_class WHERE relname='{name}'"
+            ))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let Value::Text(sql) = &definition[0][0] else {
+            panic!("expected view SQL")
+        };
+        assert!(sql.as_str().ends_with(';'), "{sql}");
+        assert_eq!(
+            conn.prepare(sql.as_str())
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(3), Value::build_text("retained")]]
+        );
+    }
+    assert_eq!(
+        conn.prepare(
+            "SELECT v.relname,r.relname FROM pg_depend d
+            JOIN pg_class v ON v.oid=d.objid AND d.classid=1259
+            JOIN pg_class r ON r.oid=d.refobjid AND d.refclassid=1259
+            WHERE v.relkind='v' ORDER BY v.relname"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("dump_cte"),
+                Value::build_text("dump_probe")
+            ],
+            vec![
+                Value::build_text("dump_names"),
+                Value::build_text("dump_probe")
+            ],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT last_value,is_called FROM public.dump_counter")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(41), Value::from_i64(0)]]
+    );
+    for name in ["dump_counter", "descending_counter"] {
+        conn.execute(format!("SELECT nextval('{name}')")).unwrap();
+        conn.execute(format!("SELECT nextval('{name}')")).unwrap();
+    }
+    let io = db.io.clone();
+    let path = db.path.clone();
+    conn.close().unwrap();
+    drop(conn);
+    drop(db);
+    let database = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new()
+            .with_views(true)
+            .with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&database).unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    let mut statement = conn
+        .prepare("SELECT last_value,is_called FROM public.dump_counter")
+        .unwrap();
+    conn.execute("CREATE TABLE public.reprepare_check (id INTEGER)")
+        .unwrap();
+    assert_eq!(
+        statement.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(44), Value::from_i64(1)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT last_value,is_called FROM public.descending_counter")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(-15), Value::from_i64(1)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT last_value FROM pg_sequences WHERE sequencename='dump_counter'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(44)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT nextval('dump_counter')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(47)]]
     );
 }
 
