@@ -194,8 +194,9 @@ fn current_pos_is_only_row_of_seek_key(
 }
 
 fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInfo) -> bool {
-    // A key with every column of the index entry names one entry. That includes
-    // the rowid when the index stores one: two rows never share a rowid.
+    // num_cols counts the rowid when the index stores one. So a key this long
+    // ends with the rowid, and two rows never share a rowid. An index without
+    // a rowid (an index method's backing B-tree) stores each whole key once.
     if key.len() == index_info.num_cols {
         return true;
     }
