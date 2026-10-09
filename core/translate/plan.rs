@@ -2,9 +2,9 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
-        ROWID_SENTINEL,
+        bind_schema_expr, BTreeTable, CheckConstraint, ColDef, Column, FromClauseSubquery, Index,
+        ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility, PseudoCursorType,
+        RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -13,7 +13,7 @@ use crate::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
+        expression_index::single_table_column_usage,
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
@@ -2022,14 +2022,13 @@ impl TableReferences {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
             return;
         };
-        let Some(table_ref) = self
+        if !self
             .joined_tables()
             .iter()
-            .find(|t| t.internal_id == table_id)
-        else {
+            .any(|t| t.internal_id == table_id)
+        {
             return;
-        };
-        let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        }
         let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
@@ -2037,7 +2036,7 @@ impl TableReferences {
             .find(|t| t.internal_id == table_id)
         {
             table_ref_mut.register_expression_index_usage(
-                normalized,
+                expr.clone(),
                 columns_mask,
                 may_be_null_row,
             );
@@ -2180,6 +2179,15 @@ impl TableReferences {
                     .find(|t| t.identifier == identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
+    }
+
+    /// A copy of the expression of the virtual generated column `column_index`
+    /// of table reference `table_id`, bound to that reference.
+    pub fn virtual_column_expr(&self, table_id: TableInternalId, column_index: usize) -> ast::Expr {
+        let (_, table) = self
+            .find_table_by_internal_id(table_id)
+            .expect("a virtual column is read from a table reference in scope");
+        bound_virtual_column_expr(&table.columns()[column_index], table_id)
     }
 
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
@@ -2757,9 +2765,8 @@ impl<T> TryFrom<u128> for BitSet<T> {
 
 #[derive(Clone, Debug)]
 pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
-    /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    /// The bound query expression. Example: `lower(name)` for INDEX ON t(lower(name)).
+    pub expr: Box<ast::Expr>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -3144,6 +3151,31 @@ impl JoinedTable {
     }
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
+    /// A reference to a table that a statement reads outside its FROM clause,
+    /// such as the parent table of a foreign key.
+    pub fn new_btree(
+        table: Arc<BTreeTable>,
+        internal_id: TableInternalId,
+        database_id: usize,
+    ) -> Self {
+        let identifier = table.name.clone();
+        let table = Table::BTree(table);
+        Self {
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+            plan_estimate: None,
+        }
+    }
+
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
@@ -3308,7 +3340,7 @@ impl JoinedTable {
     /// covered by expression keys.
     pub fn register_expression_index_usage(
         &mut self,
-        normalized_expr: ast::Expr,
+        expr: ast::Expr,
         columns_mask: ColumnUsedMask,
         may_be_null_row: bool,
     ) {
@@ -3318,15 +3350,71 @@ impl JoinedTable {
         if self
             .expression_index_usages
             .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+            .any(|usage| exprs_are_equivalent(&usage.expr, &expr))
         {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
-            normalized_expr: Box::new(normalized_expr),
+            expr: Box::new(expr),
             columns_mask,
             may_be_null_row,
         });
+    }
+
+    /// A copy of this reference with no access path, for expressions that
+    /// are evaluated against a row image in registers instead of a cursor.
+    /// Such an expression must not read its value from an index key.
+    pub fn without_access_path(&self) -> JoinedTable {
+        let mut table = self.clone();
+        table.op = Operation::default_scan_for(&table.table);
+        table.expression_index_usages.clear();
+        table
+    }
+
+    /// The CHECK constraints of the table, each with a copy of its expression
+    /// bound to this reference.
+    pub fn check_constraints(&self) -> impl Iterator<Item = (&CheckConstraint, ast::Expr)> {
+        let checks: &[CheckConstraint] = match &self.table {
+            Table::BTree(table) => &table.check_constraints,
+            _ => &[],
+        };
+        checks
+            .iter()
+            .map(move |check| (check, bind_schema_expr(&check.bound, self.internal_id)))
+    }
+
+    /// A copy of the expression of the virtual generated column `column_index`,
+    /// bound to this reference.
+    pub fn virtual_column_expr(&self, column_index: usize) -> ast::Expr {
+        bound_virtual_column_expr(&self.columns()[column_index], self.internal_id)
+    }
+
+    /// A copy of the key expression of index column `position`, bound to this
+    /// reference.
+    pub fn index_column_expr(&self, index: &Index, position: usize) -> Option<ast::Expr> {
+        let expr = index.columns.get(position)?.expr.as_deref()?;
+        Some(bind_schema_expr(expr, self.internal_id))
+    }
+
+    /// A copy of the predicate of a partial index, bound to this reference.
+    pub fn index_where_expr(&self, index: &Index) -> Option<ast::Expr> {
+        let expr = index.where_clause.as_deref()?;
+        Some(bind_schema_expr(expr, self.internal_id))
+    }
+
+    /// A query pattern of an index method, bound to this reference.
+    pub fn index_method_pattern(&self, pattern: &ast::Select) -> ast::Select {
+        crate::index_method::bind_pattern(pattern, self.internal_id)
+    }
+
+    /// The position of the index column whose key expression is `expr`, a
+    /// bound query expression.
+    pub fn expression_index_position(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
+        index.columns.iter().position(|column| {
+            column.expr.as_deref().is_some_and(|key| {
+                exprs_are_equivalent(&bind_schema_expr(key, self.internal_id), expr)
+            })
+        })
     }
 
     /// Provided an index that may contain expression keys, remove any
@@ -3346,16 +3434,12 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
+            let matches_where_clause = self
+                .index_where_expr(index)
+                .is_some_and(|where_clause| exprs_are_equivalent(&where_clause, &usage.expr));
 
             let index_key_covers_columns = !usage.may_be_null_row
-                && index
-                    .expression_to_index_pos(&usage.normalized_expr)
-                    .is_some();
+                && self.expression_index_position(index, &usage.expr).is_some();
             if index_key_covers_columns || matches_where_clause {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
@@ -4593,6 +4677,15 @@ fn resolve_outer_ref_loop(
     None
 }
 
+/// A copy of the expression of the virtual generated column `column`, bound
+/// to the table reference `internal_id`.
+fn bound_virtual_column_expr(column: &Column, internal_id: TableInternalId) -> ast::Expr {
+    let expr = column
+        .generated_expr()
+        .expect("the column is a virtual generated column");
+    bind_schema_expr(expr, internal_id)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::alloc::TursoFromIterator;
@@ -4604,6 +4697,72 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    #[test]
+    fn stored_expressions_are_bound_to_the_table_reference() -> crate::Result<()> {
+        use crate::translate::expr::{walk_expr, WalkControl};
+        use crate::SymbolTable;
+        let mut table = BTreeTable::from_sql(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a * b) VIRTUAL, CHECK (a > 0 AND b < rowid))",
+            2,
+        )?;
+        table.prepare_generated_columns()?;
+        let index = Index::from_sql(
+            &SymbolTable::default(),
+            "CREATE INDEX i ON t (a + b, b) WHERE b > rowid",
+            3,
+            &table,
+        )?;
+        let reference = TableInternalId::from(7);
+        let table = Table::BTree(Arc::new(table));
+        let joined_table = JoinedTable {
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            identifier: "t".to_string(),
+            internal_id: reference,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+            indexed: None,
+            plan_estimate: None,
+            table,
+        };
+        let leaves_of = |expr: &ast::Expr| {
+            let mut tables = Vec::new();
+            let _ = walk_expr(expr, &mut |e| {
+                if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = e {
+                    tables.push(*table);
+                }
+                Ok(WalkControl::Continue)
+            });
+            tables
+        };
+        let (_, check) = joined_table
+            .check_constraints()
+            .next()
+            .expect("one CHECK constraint");
+        assert_eq!(leaves_of(&check), vec![reference; 3]);
+        assert_eq!(
+            leaves_of(&joined_table.virtual_column_expr(2)),
+            vec![reference; 2]
+        );
+        let key = joined_table
+            .index_column_expr(&index, 0)
+            .expect("key expression");
+        assert_eq!(leaves_of(&key), vec![reference; 2]);
+        assert!(joined_table.index_column_expr(&index, 1).is_none());
+        assert_eq!(
+            leaves_of(&joined_table.index_where_expr(&index).expect("predicate")),
+            vec![reference; 2]
+        );
+        assert_eq!(
+            joined_table.expression_index_position(&index, &key),
+            Some(0)
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {

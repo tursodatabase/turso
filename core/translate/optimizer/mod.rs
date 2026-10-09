@@ -48,7 +48,7 @@ use crate::{
     },
     types::SeekOp,
     util::{
-        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
+        count_fts_column_args, exprs_are_equivalent, try_capture_parameters,
         try_capture_parameters_column_agnostic,
     },
     vdbe::{
@@ -302,7 +302,7 @@ fn try_match_index_method_pattern(
     pattern_idx: usize,
     soft_bind_errors: bool,
 ) -> Option<IndexMethodPatternMatch> {
-    let mut pattern = pattern.clone();
+    let mut pattern = table.index_method_pattern(pattern);
     if pattern.with.is_some() || !pattern.body.compounds.is_empty() {
         return None;
     }
@@ -332,37 +332,6 @@ fn try_match_index_method_pattern(
         }
         panic!("unexpected from clause");
     };
-
-    // Bind expressions to this table
-    for column in columns.iter_mut() {
-        if let ast::ResultColumn::Expr(e, _) = column {
-            if soft_bind_errors {
-                if simple_bind_expr(table, &[], e).is_err() {
-                    return None;
-                }
-            } else {
-                simple_bind_expr(table, &[], e).ok()?;
-            }
-        }
-    }
-    for column in pattern.order_by.iter_mut() {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, &mut column.expr).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, &mut column.expr).ok()?;
-        }
-    }
-    if let Some(pattern_where) = pattern_where_clause {
-        if soft_bind_errors {
-            if simple_bind_expr(table, columns, pattern_where).is_err() {
-                return None;
-            }
-        } else {
-            simple_bind_expr(table, columns, pattern_where).ok()?;
-        }
-    }
 
     if name.name.as_str() != table.table.get_name() {
         return None;
@@ -552,8 +521,7 @@ fn collect_index_method_candidates(
                 continue;
             }
 
-            let definition = module.definition();
-            for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
                 // Use shared helper for pattern matching
                 let Some(pattern_match) = try_match_index_method_pattern(
                     pattern,
@@ -1500,8 +1468,7 @@ fn update_write_set_reason(
         let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
         for c in index.columns.iter() {
             if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask =
-                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                let expr_idx_cols_mask = expression_index_column_usage(expr.as_ref());
                 if expr_idx_cols_mask
                     .iter()
                     .any(|cidx| affected_cols.get(cidx))
@@ -1923,8 +1890,7 @@ fn optimize_table_access_with_custom_modules(
         if index.is_backing_btree_index() {
             continue;
         }
-        let definition = module.definition();
-        'patterns: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+        'patterns: for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
                 table,
@@ -4270,7 +4236,7 @@ fn ephemeral_index_build(
         .filter(|(index, _)| table_reference.column_is_used(*index))
         .map(|(i, c)| {
             let expr = match c.generated_type() {
-                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                GeneratedType::Virtual { .. } => Some(table_reference.virtual_column_expr(i)),
                 GeneratedType::NotGenerated => None,
             };
             IndexColumn {

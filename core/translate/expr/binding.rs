@@ -13,8 +13,6 @@ pub enum BindingBehavior {
     TryCanonicalColumnsFirst,
     /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
-    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
-    AllowUnboundIdentifiers,
 }
 
 /// The result of resolving the `<id>` half of a qualified `<tbl>.<id>`
@@ -127,9 +125,6 @@ pub fn bind_and_rewrite_expr<'a>(
                 Expr::Id(id) => {
                     crate::stack::trace_stack!("bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
                     let normalized_id = normalize_ident(id.as_str());
@@ -234,9 +229,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     // a matching column in an outer scope.
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}",
                             tbl.as_str(),
@@ -255,30 +247,8 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // --- Error reporting. ---
                     if matches!(qualified_match, QualifiedNameMatch::NoTable) {
-                        // No scope contains a table with this identifier. Normally we
-                        // report "no such table", but there is one case where SQLite
-                        // reports "no such column" instead: when the identifier names a
-                        // CTE that was preplanned for subquery FROM visibility and kept
-                        // as a definition-only outer ref. The CTE *name* is valid in
-                        // principle; it's the column access through it that isn't,
-                        // because the CTE hasn't been brought into this scope's FROM.
-                        // The `cte_id`/`cte_select` check restricts this to real CTE
-                        // definition refs so any other future use of `cte_definition_only`
-                        // still falls through to "no such table".
-                        let is_definition_only_cte = referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
-                            .is_some_and(|outer_ref| {
-                                outer_ref.cte_definition_only
-                                    && (outer_ref.cte_id.is_some()
-                                        || outer_ref.cte_select.is_some())
-                            });
-                        if is_definition_only_cte {
-                            crate::bail_parse_error!(
-                                "no such column: {}.{}",
-                                tbl.as_str(),
-                                id.as_str()
-                            );
-                        }
+                        // No scope contains a table with this identifier. SQLite reports
+                        // the whole qualified name as a missing column.
                         // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
                         //
                         // For `a.b`, resolution order is:
@@ -309,7 +279,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
@@ -340,9 +314,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     let db_name_clone = db_name.clone();
 
                     let Some(referenced_tables) = &mut referenced_tables else {
-                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                            return Ok(WalkControl::Continue);
-                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}.{}",
                             db_name_str,
@@ -923,14 +894,7 @@ pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> 
     }
 }
 
-/// Resolve the UnionDef for a column expression. Returns the variant names list
-/// and optionally resolves a tag name to its numeric index.
-/// Used by union_value, union_tag, union_extract function translation.
-///
-/// In the DML index-maintenance path (INSERT with expression indexes),
-/// `referenced_tables` is `None` and columns use `SELF_TABLE`. We fall back
-/// to the Resolver's `SelfTableContext::ForDML` to obtain column metadata.
-/// Resolve the TypeDef for a column expression (Column or DML self-table column).
+/// Resolve the TypeDef for a column expression.
 pub(super) fn resolve_typedef_from_column(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
@@ -938,7 +902,7 @@ pub(super) fn resolve_typedef_from_column(
 ) -> Option<Arc<TypeDef>> {
     let ty_str = match expr {
         ast::Expr::Column { table, column, .. } => {
-            resolve_column_type_str(*table, *column, referenced_tables, resolver)?
+            resolve_column_type_str(*table, *column, referenced_tables)?
         }
         ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
         _ => return None,
@@ -1013,17 +977,9 @@ pub(super) fn resolve_column_type_str(
     table: ast::TableInternalId,
     column: usize,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
 ) -> Option<String> {
-    if let Some(rt) = referenced_tables {
-        if let Some((_, tbl)) = rt.find_table_by_internal_id(table) {
-            return Some(tbl.columns().get(column)?.ty_str.clone());
-        }
-    }
-    if table.is_self_table() {
-        return resolver.self_table_column_type_str(column);
-    }
-    None
+    let (_, tbl) = referenced_tables?.find_table_by_internal_id(table)?;
+    Some(tbl.columns().get(column)?.ty_str.clone())
 }
 
 /// Result of finding a column with a custom (struct/union) type across joined tables.

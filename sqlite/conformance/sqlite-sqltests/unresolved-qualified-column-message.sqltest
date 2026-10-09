@@ -1,0 +1,82 @@
+@database :memory:
+
+# A qualified column reference whose qualifier names no table in scope is
+# reported as a missing column, with the name as written, like SQLite does.
+# A missing table in FROM, or in a `t.*` result column, is still a missing
+# table.
+
+@cross-check-integrity
+test select-unknown-qualifier-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    SELECT nosuch.x FROM t;
+}
+expect error {
+    no such column: nosuch\.x
+}
+
+@cross-check-integrity
+test select-table-name-hidden-by-alias-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    SELECT t.x FROM t AS z;
+}
+expect error {
+    no such column: t\.x
+}
+
+@cross-check-integrity
+test select-table-outside-the-join-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    CREATE TABLE u (y INTEGER);
+    CREATE TABLE v (z INTEGER);
+    SELECT v.z FROM t JOIN u;
+}
+expect error {
+    no such column: v\.z
+}
+
+@cross-check-integrity
+test select-unknown-table-with-database-prefix-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    SELECT main.nosuch.x FROM t;
+}
+expect error {
+    no such column: main\.nosuch\.x
+}
+
+@cross-check-integrity
+test update-set-from-table-outside-the-statement-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    CREATE TABLE other (x INTEGER);
+    UPDATE t SET x = other.x;
+}
+expect error {
+    no such column: other\.x
+}
+
+@cross-check-integrity
+test delete-where-from-table-outside-the-statement-is-a-missing-column {
+    CREATE TABLE t (x INTEGER);
+    CREATE TABLE other (x INTEGER);
+    DELETE FROM t WHERE other.x = 1;
+}
+expect error {
+    no such column: other\.x
+}
+
+@cross-check-integrity
+test qualified-name-keeps-its-written-spelling {
+    CREATE TABLE t (x INTEGER);
+    SELECT NoSuch.X FROM t;
+}
+expect error {
+    no such column: NoSuch\.X
+}
+
+@cross-check-integrity
+test star-on-unknown-table-is-still-a-missing-table {
+    CREATE TABLE t (x INTEGER);
+    SELECT nosuch.* FROM t;
+}
+expect error {
+    no such table: nosuch
+}

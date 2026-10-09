@@ -276,10 +276,11 @@ fn prepare_update_plan(
 
     let table_name = table.get_name();
 
+    let target_table_id = program.table_reference_counter.next();
     let target_table = JoinedTable {
         table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
-        internal_id: program.table_reference_counter.next(),
+        internal_id: target_table_id,
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
         join_info: None,
@@ -563,8 +564,7 @@ fn collect_indexes_to_update(
 
         for col in idx.columns.iter() {
             if let Some(expr) = col.expr.as_ref() {
-                let cols_used =
-                    expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
+                let cols_used = expression_index_column_usage(expr.as_ref());
                 expression_cols_used.union_with(&cols_used)?;
 
                 if !must_update
@@ -585,8 +585,7 @@ fn collect_indexes_to_update(
 
         if !must_update {
             if let Some(where_expr) = &idx.where_clause {
-                let cols_used =
-                    expression_index_column_usage(where_expr.as_ref(), target_table_ref, resolver)?;
+                let cols_used = expression_index_column_usage(where_expr.as_ref());
                 must_update = affected_cols.as_ref().is_some_and(|affected_cols| {
                     cols_used.iter().any(|cidx| affected_cols.get(cidx))
                 });

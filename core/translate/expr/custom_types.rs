@@ -319,29 +319,27 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
+/// Evaluate an index expression or a partial-index predicate of the DML
+/// target table against the row image in `column_regs` and `rowid_reg`
+/// (INSERT/UPDATE/UPSERT).
 ///
-/// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
-///
-/// The caller must:
-/// 1. Clone the expression from `idx_col.expr`
-/// 2. Build the initial `column_regs` mapping (before decode)
-///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
-/// columns are decoded in-place in `column_regs`.
+/// `expr` is bound to the table reference `table_internal_id`. Custom-type
+/// columns are decoded in place in `column_regs` first, so the expression
+/// sees user-facing values. The expression then reads the columns of the
+/// reference from the registers through a row image scope.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    mut expr: ast::Expr,
+    table_references: &TableReferences,
+    table_internal_id: ast::TableInternalId,
+    expr: &ast::Expr,
     columns: &[Column],
     column_regs: &mut [usize],
+    rowid_reg: usize,
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
-    crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
-
     let is_strict = table.is_strict;
     for (i, col) in columns.iter().enumerate() {
         if col.is_rowid_alias() {
@@ -357,16 +355,14 @@ pub(crate) fn emit_dml_expr_index_value(
         }
     }
 
-    let pairs = columns.iter().zip(column_regs.iter().copied());
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
+    let registers = DmlColumnContext::from_column_reg_mapping(
+        columns.iter().zip(column_regs.iter().copied()),
+        rowid_reg,
+    );
+    resolver.with_row_image(program, table_internal_id, Some(&registers), |program| {
+        translate_expr(program, Some(table_references), expr, dest_reg, resolver)?;
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
 /// Emit bytecode that transforms a stored column value into its user-facing

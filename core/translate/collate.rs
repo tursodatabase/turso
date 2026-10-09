@@ -374,7 +374,7 @@ pub fn get_collseq_from_expr_with_symbols(
     symbol_table: Option<&SymbolTable>,
 ) -> Result<Option<CollationSeq>> {
     let (explicit, column) =
-        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table, None)?;
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table)?;
     Ok(explicit.or(column))
 }
 
@@ -385,18 +385,10 @@ pub fn resolve_comparison_collseq_with_resolver(
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
     let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-    let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr_with_symbols(
-        lhs_expr,
-        referenced_tables,
-        symbol_table,
-        resolver,
-    )?;
-    let (rhs_explicit, rhs_column) = get_collseq_parts_from_expr_with_symbols(
-        rhs_expr,
-        referenced_tables,
-        symbol_table,
-        resolver,
-    )?;
+    let (lhs_explicit, lhs_column) =
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
+    let (rhs_explicit, rhs_column) =
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
@@ -447,20 +439,14 @@ pub fn get_expr_collation_ctx_with_symbols(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
-                // collation from their expression, so we skip them
-                if !table.is_self_table() {
-                    let (_, table_ref) = referenced_tables
-                        .find_table_by_internal_id(*table)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError("table not found".to_string())
-                        })?;
-                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
-                        crate::LimboError::ParseError("column not found".to_string())
-                    })?;
-                    if maybe_column_collseq.is_none() {
-                        maybe_column_collseq = Some(column.collation());
-                    }
+                let (_, table_ref) = referenced_tables
+                    .find_table_by_internal_id(*table)
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                let column = table_ref
+                    .get_column_at(*column)
+                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq = Some(column.collation());
                 }
             }
             _ => {}
@@ -493,9 +479,9 @@ pub fn resolve_comparison_collseq_with_symbols(
     symbol_table: Option<&SymbolTable>,
 ) -> Result<CollationSeq> {
     let (lhs_explicit, _) =
-        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table, None)?;
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
     let (rhs_explicit, _) =
-        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table, None)?;
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
     let lhs_column = comparison_operand_column_collseq(lhs_expr, referenced_tables)?;
     let rhs_column = comparison_operand_column_collseq(rhs_expr, referenced_tables)?;
     Ok(lhs_explicit
@@ -532,9 +518,6 @@ fn comparison_operand_column_collseq(
                     .expect("a merged column must have at least two source columns")
             }
             Expr::Column { table, column, .. } => {
-                if table.is_self_table() {
-                    return Ok(None);
-                }
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
@@ -567,7 +550,6 @@ fn get_collseq_parts_from_expr_with_symbols(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
-    resolver: Option<&Resolver>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
@@ -584,18 +566,6 @@ fn get_collseq_parts_from_expr_with_symbols(
                 // Skip children since we've found a COLLATE operator
                 return Ok(WalkControl::SkipChildren);
             }
-            Expr::Column { table, column, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)));
-                }
-            }
-            Expr::RowId { table, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(None));
-                }
-            }
             Expr::MergedColumn(columns) => {
                 // A merged USING column takes the collation of its first column
                 // only, so a NOCASE later column is ignored even when the first
@@ -607,7 +577,6 @@ fn get_collseq_parts_from_expr_with_symbols(
                     first_column,
                     referenced_tables,
                     symbol_table,
-                    resolver,
                 )?;
                 if maybe_explicit_collseq.is_none() {
                     maybe_explicit_collseq = explicit;

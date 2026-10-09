@@ -1,5 +1,4 @@
 use super::*;
-use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -280,11 +279,10 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
-    let normalized = normalize_expr_for_index_matching(expr, table, referenced_tables);
     if !table
         .expression_index_usages
         .iter()
-        .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized))
+        .any(|usage| exprs_are_equivalent(&usage.expr, expr))
     {
         return Ok(false);
     }

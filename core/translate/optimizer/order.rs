@@ -4,7 +4,6 @@ use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
-        expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
@@ -801,16 +800,7 @@ fn target_matches_order_column(
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
-            if exprs_are_equivalent(target_expr, idx_expr) {
-                return true;
-            }
-            // Expression indexes are compared against the normalized form that
-            // was stored in the schema. A query may write the same expression in
-            // a slightly different but equivalent way, so normalize before the
-            // final comparison.
-            let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
-            let normalized = normalize_expr_for_index_matching(target_expr, table_ref, &refs);
-            exprs_are_equivalent(&normalized, idx_expr)
+            exprs_are_equivalent(target_expr, idx_expr)
         }
         _ => false,
     }
@@ -894,25 +884,34 @@ pub(super) fn btree_access_order_consumed(
                 includes_rowid: correct_order,
             }
         }
-        Some(index) => index_columns_order_consumed(
-            table_ref,
-            iter_dir,
-            constraint_refs,
-            order_target,
-            target_columns,
-            schema,
-            equality_prefix_scope,
-            index.columns.iter().map(|column| IndexOrderColumn {
-                pos_in_table: column.pos_in_table,
-                order: column.order,
-                nulls_order: column.nulls_order,
-                collation: column.collation,
-                expr: column.expr.as_deref(),
-            }),
-            index.columns.len(),
-            index.has_rowid,
-            rowid_alias_col,
-        ),
+        Some(index) => {
+            let key_exprs: Vec<Option<ast::Expr>> = (0..index.columns.len())
+                .map(|position| table_ref.index_column_expr(index, position))
+                .collect();
+            index_columns_order_consumed(
+                table_ref,
+                iter_dir,
+                constraint_refs,
+                order_target,
+                target_columns,
+                schema,
+                equality_prefix_scope,
+                index
+                    .columns
+                    .iter()
+                    .zip(&key_exprs)
+                    .map(|(column, expr)| IndexOrderColumn {
+                        pos_in_table: column.pos_in_table,
+                        order: column.order,
+                        nulls_order: column.nulls_order,
+                        collation: column.collation,
+                        expr: expr.as_ref(),
+                    }),
+                index.columns.len(),
+                index.has_rowid,
+                rowid_alias_col,
+            )
+        }
     }
 }
 
@@ -951,6 +950,20 @@ fn temporary_index_order_consumed(
                 .any(|constraint| constraint.table_col_pos == Some(*column_pos))
         })
         .map(|(column_pos, _)| column_pos);
+    let generated_exprs: Vec<Option<ast::Expr>> =
+        if columns.iter().any(|column| column.is_virtual_generated()) {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(column_pos, column)| {
+                    column
+                        .is_virtual_generated()
+                        .then(|| table_ref.virtual_column_expr(column_pos))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let index_columns = key_columns.chain(other_columns).map(|column_pos| {
         let column = &columns[column_pos];
         IndexOrderColumn {
@@ -958,7 +971,7 @@ fn temporary_index_order_consumed(
             order: SortOrder::Asc,
             nulls_order: None,
             collation: column.collation_opt(),
-            expr: column.generated_expr(),
+            expr: generated_exprs.get(column_pos).and_then(Option::as_ref),
         }
     });
 

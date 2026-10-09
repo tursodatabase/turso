@@ -1,32 +1,32 @@
-use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
+use crate::schema::ColumnsTopologicalSort;
 use crate::translate::expr::translate_expr;
+use crate::translate::plan::TableReferences;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
-use crate::{Arc, Result};
-use turso_parser::ast;
+use crate::vdbe::builder::DmlColumnContext;
+use crate::Result;
+use turso_parser::ast::{self, TableInternalId};
 
 use super::{ProgramBuilder, Resolver};
 
-/// Emit bytecode to compute virtual generated columns for a row.
+/// Compute the virtual generated columns of the row of table reference
+/// `table_id`, which is held in `registers`.
 #[turso_macros::trace_stack]
 pub fn compute_virtual_columns(
     program: &mut ProgramBuilder,
     columns: &ColumnsTopologicalSort<'_>,
-    dml_ctx: &DmlColumnContext,
+    registers: &DmlColumnContext,
     resolver: &Resolver,
-    table: &Arc<BTreeTable>,
+    table_references: &TableReferences,
+    table_id: TableInternalId,
 ) -> Result<()> {
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: dml_ctx.clone(),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+    resolver.with_row_image(program, table_id, Some(registers), |program| {
         for (idx, column) in columns.iter() {
-            let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
+            if !column.is_virtual_generated() {
                 continue;
-            };
-            let target_reg = dml_ctx.to_column_reg(idx);
-            translate_expr(program, None, expr, target_reg, resolver)?;
+            }
+            let expr = table_references.virtual_column_expr(table_id, idx);
+            let target_reg = registers.to_column_reg(idx);
+            translate_expr(program, Some(table_references), &expr, target_reg, resolver)?;
             if column.affinity() != Affinity::Blob {
                 program.emit_column_affinity(target_reg, column.affinity());
             }
@@ -35,27 +35,20 @@ pub fn compute_virtual_columns(
     })
 }
 
-/// Emit bytecode to compute a single virtual generated column expression.
-#[allow(clippy::too_many_arguments)]
+/// Compute one virtual generated column of the row of table reference
+/// `table_id`, which is held in `registers`. `expr` is the expression of the
+/// column, bound to that reference.
 pub(crate) fn emit_gencol_expr_from_registers(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
     target_reg: usize,
-    registers_start: usize,
-    columns: &[crate::schema::Column],
+    registers: &DmlColumnContext,
     resolver: &Resolver,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-    table: &Arc<BTreeTable>,
+    table_references: &TableReferences,
+    table_id: TableInternalId,
 ) -> Result<()> {
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
+    resolver.with_row_image(program, table_id, Some(registers), |program| {
+        translate_expr(program, Some(table_references), expr, target_reg, resolver)?;
         Ok(())
-    })?;
-
-    Ok(())
+    })
 }

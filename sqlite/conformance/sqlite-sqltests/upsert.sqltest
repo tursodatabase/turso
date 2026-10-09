@@ -929,3 +929,15 @@ expect {
     11
     ok
 }
+
+# The CHECK constraints of the DO UPDATE row read a rowid alias column from
+# the rowid of the row, like INSERT and UPDATE do.
+test upsert-check-reads-the-rowid-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, CHECK (id IS NOT NULL AND id > 0));
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT id, a FROM t;
+}
+expect {
+    1|2
+}

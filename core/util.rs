@@ -5,14 +5,13 @@ use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources, BitSet,
-    ColumnLookup, JoinInfo, JoinType, JoinedTable,
+    ColumnLookup, JoinInfo, JoinType,
 };
-use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
 use crate::IO;
 use crate::{
-    schema::{Column, Schema, Table, Type},
+    schema::{Column, Schema, Type},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
@@ -479,58 +478,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
         _ => false,
     }
-}
-
-/// bind AST identifiers to either Column or Rowid if possible
-pub fn simple_bind_expr(
-    joined_table: &JoinedTable,
-    result_columns: &[ast::ResultColumn],
-    expr: &mut ast::Expr,
-) -> Result<()> {
-    let internal_id = joined_table.internal_id;
-    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-        #[allow(clippy::single_match)]
-        match expr {
-            Expr::Id(id) => {
-                for result_column in result_columns.iter() {
-                    if let ast::ResultColumn::Expr(result, Some(ast::As::As(alias))) = result_column
-                    {
-                        if alias.as_str().eq_ignore_ascii_case(id.as_str()) {
-                            *expr = *result.clone();
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-                let col_idx = joined_table.columns().iter().position(|c| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(id.as_str()))
-                });
-                if let Some(col_idx) = col_idx {
-                    let col = joined_table.table.columns().get(col_idx).unwrap();
-                    *expr = ast::Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                } else {
-                    // only if we haven't found a match, check for explicit rowid reference
-                    let is_btree_table = matches!(joined_table.table, Table::BTree(_));
-                    if is_btree_table {
-                        if let Some(rowid) =
-                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
-                        {
-                            *expr = rowid;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
 }
 
 pub fn try_substitute_parameters(

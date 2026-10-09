@@ -107,19 +107,6 @@ impl CursorKey {
     }
 }
 
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
-}
-
 #[derive(Clone)]
 enum DmlColumnRegisters {
     // Used to compute column registers lazily
@@ -130,6 +117,7 @@ enum DmlColumnRegisters {
     },
     Indexed {
         column_regs: Vec<usize>,
+        rowid_reg: usize,
     },
 }
 
@@ -158,7 +146,10 @@ impl DmlColumnContext {
         }
     }
 
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+    pub fn from_column_reg_mapping<'a>(
+        pairs: impl Iterator<Item = (&'a Column, usize)>,
+        rowid_reg: usize,
+    ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -168,7 +159,10 @@ impl DmlColumnContext {
             }
         }
         Self {
-            registers: DmlColumnRegisters::Indexed { column_regs },
+            registers: DmlColumnRegisters::Indexed {
+                column_regs,
+                rowid_reg,
+            },
             rowid_alias_col,
         }
     }
@@ -186,7 +180,14 @@ impl DmlColumnContext {
                     layout.to_register(*base_reg, col_idx)
                 }
             }
-            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
+            DmlColumnRegisters::Indexed { column_regs, .. } => column_regs[col_idx],
+        }
+    }
+
+    pub fn rowid_reg(&self) -> usize {
+        match &self.registers {
+            DmlColumnRegisters::Layout { rowid_reg, .. }
+            | DmlColumnRegisters::Indexed { rowid_reg, .. } => *rowid_reg,
         }
     }
 }

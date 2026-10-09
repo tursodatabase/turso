@@ -387,3 +387,16 @@ expect {
     3
     ok
 }
+
+# The CHECK constraint reads the new value of the row, not the key of the
+# expression index that the UPDATE scans.
+@cross-check-integrity
+test update-via-expression-index-scan-checks-the-new-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT, CHECK (val * 2 < 1000));
+    CREATE INDEX idx ON t(val * 2);
+    INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);
+    UPDATE t SET val = 600 WHERE val * 2 = 40;
+}
+expect error {
+    CHECK constraint failed
+}

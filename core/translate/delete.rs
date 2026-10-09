@@ -206,12 +206,13 @@ pub fn prepare_delete_plan(
     let indexes = resolver.with_schema(database_id, |schema| {
         schema.get_indices(table.get_name()).cloned().collect()
     });
+    let target_table_id = program.table_reference_counter.next();
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
-        internal_id: program.table_reference_counter.next(),
+        internal_id: target_table_id,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),

@@ -193,15 +193,20 @@ fn translate_expr_by_kind(
             resolver,
         ),
         ast::Expr::Id(_) => translate_id_expr(program, expr, target_register, resolver),
-        ast::Expr::Column { table, .. } if table.is_self_table() => {
-            translate_self_table_column_expr(program, expr, target_register, resolver)
-        }
         ast::Expr::Column { .. } => {
             translate_column_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::RowId { .. } => {
-            translate_rowid_expr(program, referenced_tables, expr, target_register)
-        }
+        ast::Expr::RowId { table, .. } => match resolver.row_image_rowid_register(*table) {
+            Some(src_reg) => {
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: target_register,
+                    extra_amount: 0,
+                });
+                Ok(target_register)
+            }
+            None => translate_rowid_expr(program, referenced_tables, expr, target_register),
+        },
         ast::Expr::InList { .. } => {
             translate_in_list_expr(program, referenced_tables, expr, target_register, resolver)
         }
@@ -2318,69 +2323,6 @@ fn translate_id_expr(
 }
 
 #[inline(never)]
-fn translate_self_table_column_expr(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let ast::Expr::Column {
-        database: _,
-        table: table_ref_id,
-        column,
-        is_rowid_alias,
-    } = expr
-    else {
-        unreachable!("translate_self_table_column_expr expects Expr::Column");
-    };
-    turso_assert!(table_ref_id.is_self_table());
-    // the table is a SELF_TABLE placeholder (used for generated columns), so we now have
-    // to resolve it to the actual reference id using the SelfTableContext.
-    resolver.with_existing_self_table_context(|self_table_context| {
-        match self_table_context {
-            Some(SelfTableContext::ForSelect {
-                table_ref_id: real_id,
-                ref referenced_tables,
-            }) => {
-                let real_col = Expr::Column {
-                    database: None,
-                    table: *real_id,
-                    column: *column,
-                    is_rowid_alias: *is_rowid_alias,
-                };
-                translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    &real_col,
-                    target_register,
-                    resolver,
-                )
-            }
-            Some(SelfTableContext::ForDML { dml_ctx, table }) => {
-                let Some(table_column) = table.columns().get(*column) else {
-                    crate::bail_parse_error!("column index out of bounds");
-                };
-                program.set_collation(Some((table_column.collation(), false)));
-                let src_reg = dml_ctx.to_column_reg(*column);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
-                Ok(target_register)
-            }
-            None => {
-                // This error means that a resolver.with_self_table_context() scope was missing
-                // somewhere in the call stack.
-                crate::bail_parse_error!(
-                    "SELF_TABLE column reference outside of generated column context"
-                );
-            }
-        }
-    })
-}
-
-#[inline(never)]
 fn translate_column_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -2442,6 +2384,15 @@ fn translate_column_expr(
         };
         // Counter intuitive but a column always needs to have a collation
         program.set_collation(Some((table_column.collation(), false)));
+    }
+
+    if let Some(src_reg) = resolver.row_image_column_register(*table_ref_id, *column) {
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: target_register,
+            extra_amount: 0,
+        });
+        return Ok(target_register);
     }
 
     // If we are reading a column from a table, we find the cursor that corresponds to
@@ -2537,23 +2488,16 @@ fn translate_column_expr(
                 match table_column.generated_type() {
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
-                    GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                        resolver.with_self_table_context(
+                    GeneratedType::Virtual { .. } if !read_from_index => {
+                        let expr = referenced_tables
+                            .expect("a virtual column is read from a table reference in scope")
+                            .virtual_column_expr(*table_ref_id, *column);
+                        translate_expr(
                             program,
-                            Some(&SelfTableContext::ForSelect {
-                                table_ref_id: *table_ref_id,
-                                referenced_tables: referenced_tables.unwrap().clone(),
-                            }),
-                            |program, _| {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    expr,
-                                    target_register,
-                                    resolver,
-                                )?;
-                                Ok(())
-                            },
+                            referenced_tables,
+                            &expr,
+                            target_register,
+                            resolver,
                         )?;
 
                         program.emit_column_affinity(target_register, table_column.affinity());
