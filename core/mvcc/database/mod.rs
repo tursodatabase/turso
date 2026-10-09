@@ -21,7 +21,7 @@ use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
-use crate::sync::atomic::{AtomicBool, AtomicI64};
+use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
@@ -7782,6 +7782,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             let entry = dirty_keys.try_get_or_insert(key.clone(), AtomicU64::new(stamp))?;
             entry.value().fetch_max(stamp, Ordering::AcqRel);
+            fence(Ordering::SeqCst);
             if !entry.is_removed() {
                 return Ok(());
             }
@@ -7789,9 +7790,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub(crate) fn unmark_checkpoint_dirty_key(&self, key: &RowID) -> Option<u64> {
-        self.checkpoint_dirty_keys_for(key)
-            .remove(key)
-            .map(|entry| entry.value().load(Ordering::Acquire))
+        let entry = self.checkpoint_dirty_keys_for(key).remove(key)?;
+        fence(Ordering::SeqCst);
+        Some(entry.value().load(Ordering::Acquire))
     }
 
     fn unmark_checkpoint_dirty_key_if_stamp(&self, key: &RowID, stamp: u64) {
