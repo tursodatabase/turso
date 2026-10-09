@@ -292,6 +292,31 @@ fn test_open_blob_handle_keeps_read_transaction_open_after_sibling_finishes() {
     );
 }
 
+#[test]
+fn test_write_after_other_connection_checkpoints_during_scan_succeeds() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    let other_conn = tmp_db.connect_limbo();
+    create_table_with_rows(&conn);
+
+    let mut select = conn.prepare("SELECT id FROM t ORDER BY id DESC").unwrap();
+    let mut ids = Vec::new();
+    while let Some(id) = next_id(&mut select) {
+        ids.push(id);
+        conn.execute(format!("INSERT INTO other(v) VALUES ({id})"))
+            .unwrap();
+        other_conn
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+    }
+    let expected: Vec<i64> = (1..=ROWS).rev().collect();
+    assert_eq!(ids, expected);
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM other"),
+        vec![vec![rusqlite::types::Value::Integer(ROWS)]]
+    );
+}
+
 fn assert_scan_keeps_snapshot_while_both_connections_write(scan_db: &str, write_db: &str) {
     for order in ["ASC", "DESC"] {
         let mut expected: Vec<i64> = (1..=ROWS).collect();
