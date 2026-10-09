@@ -1365,6 +1365,10 @@ pub fn translate_alter_table(
                             .max()
                             .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
+                            name: constraint
+                                .name
+                                .as_ref()
+                                .map(|name| name.as_str().to_string()),
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
                                 .columns
