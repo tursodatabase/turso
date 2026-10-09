@@ -89,6 +89,7 @@ impl PostgreSQLTranslator {
             | "pg_publication_rel"
             | "pg_get_tabledef"
             | "pg_settings"
+            | "pg_extension"
             | "pg_tables" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
@@ -4060,6 +4061,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_settings"
+            | "pg_extension"
             | "pg_tables"
     )
 }

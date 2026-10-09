@@ -74,6 +74,28 @@ fn test_physical_catalog_boolean_metadata(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_extension_has_no_postgres_extensions(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for table in ["pg_extension", "pg_catalog.pg_extension"] {
+        let mut stmt = conn
+            .prepare(format!(
+                "SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable,
+                        x.extversion, x.extconfig, x.extcondition
+                 FROM {table} x JOIN pg_namespace n ON n.oid = x.extnamespace"
+            ))
+            .unwrap();
+        assert_eq!(stmt.num_columns(), 8);
+        assert!(stmt.run_collect_rows().unwrap().is_empty());
+    }
+    let mut stmt = conn.prepare("SELECT * FROM pg_extension").unwrap();
+    assert_eq!(stmt.num_columns(), 8);
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+    assert!(conn.prepare("DELETE FROM pg_extension").is_err());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_settings_reports_connection_settings(db: TempDatabase) {
     let conn = db.connect_postgres();
     let other = db.connect_postgres();

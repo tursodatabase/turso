@@ -1933,6 +1933,18 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgSettingsTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_extension",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_extension (
+                oid INTEGER, extname TEXT, extowner INTEGER, extnamespace INTEGER,
+                extrelocatable BOOLEAN, extversion TEXT, extconfig INTEGER[], extcondition TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)".to_string() },
@@ -2714,6 +2726,7 @@ mod tests {
             "pg_input_error_info",
             "pg_sequences",
             "pg_settings",
+            "pg_extension",
             "pg_policy",
             "pg_trigger",
             "pg_statistic_ext",
