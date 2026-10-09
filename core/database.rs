@@ -25,7 +25,7 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::refresh_analyze_stats,
+    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -33,13 +33,13 @@ use crate::{
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
-        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
+        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, SharedPagerState},
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
         self,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8,
             AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
@@ -49,7 +49,7 @@ use crate::{
     vdbe::metrics::ConnectionMetrics,
     AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
     Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
-    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, Page, PageCodec, PageCodecId,
+    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
@@ -224,6 +224,7 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
+    pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
@@ -238,17 +239,19 @@ impl OpenOptions {
     /// The dialect has no default: it is fixed at open time and shared by
     /// every user of the instance, so the caller must choose it explicitly.
     pub fn new(dialect: Arc<dyn Dialect>) -> Self {
-        Self {
+        let options = Self {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
+            native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
-            dialect,
-        }
+            dialect: dialect.clone(),
+        };
+        dialect.register_native_extensions(options)
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
@@ -449,6 +452,54 @@ impl Default for HeaderValidationState {
     }
 }
 
+/// How `Database::_connect` loads the connection's ANALYZE stats.
+///
+/// A new connection starts from a clone of the shared schema, which carries
+/// no `sqlite_stat1` contents until some connection has loaded them, and the
+/// planner uses those stats for its cost estimates. `_connect` therefore
+/// refreshes them. The refresh is a `SELECT` over `sqlite_stat1`, and that
+/// statement can have to wait: on page I/O, or on another transaction when
+/// it speculatively reads a version whose writer is still preparing. Two
+/// states exist because there are two kinds of caller for that wait:
+///
+/// - `Blocking`: the caller may block, so `_connect` runs the scan to
+///   completion right here by pumping `io.step()`. This is the public
+///   `connect` family for embedded users, where whatever the scan waits for
+///   can make progress on its own, and the internal open-time and MVCC
+///   bootstrap connections, for which the refresh is a no-op because the
+///   database is not initialized yet.
+/// - `Deferred`: the caller must not block, so `_connect` returns the bare
+///   connection and the caller drives the same scan through
+///   `refresh_analyze_stats_nonblock`, handing every wait to its own
+///   scheduler. This is `connect_async`, for hosts that run every connection
+///   cooperatively on one thread: there an explicit yield from the scan is a
+///   request to run *other* connections, which `io.step()` can never satisfy,
+///   so `Blocking` would spin forever.
+///
+/// Stats loading is never skipped outright; `Deferred` only moves it to the
+/// caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsRefresh {
+    Blocking,
+    Deferred,
+}
+
+/// Resumable state for [`Database::connect_async`]. Create one per
+/// connect and pass it to every call until `IOResult::Done`.
+#[derive(Default)]
+pub struct ConnectAsyncState {
+    /// The connection, once created; handed out when the stats refresh ends.
+    conn: Option<Arc<Connection>>,
+    /// The in-flight `sqlite_stat1` scan.
+    refresh: RefreshAnalyzeStatsState,
+}
+
+impl ConnectAsyncState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// State machine for async database opening
 pub struct OpenDbAsyncState {
     phase: OpenDbAsyncPhase,
@@ -581,7 +632,6 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
-    init_lock: Arc<Mutex<()>>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -598,8 +648,7 @@ pub struct Database<
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
 
-    /// In Memory Page 1 for Empty Dbs
-    init_page_1: Arc<ArcSwapOption<Page>>,
+    pager_state: Arc<SharedPagerState>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -618,10 +667,10 @@ impl fmt::Debug for Database {
             .field("open_flags", &self.open_flags);
 
         // Database state information
-        let db_state_value = match &*self.init_page_1.load() {
-            // If init_page1 exists, this means the DB is empty
-            Some(_) => "uninitialized",
-            None => "initialized",
+        let db_state_value = if self.initialized() {
+            "initialized"
+        } else {
+            "uninitialized"
         };
         debug_struct.field("db_state", &db_state_value);
 
@@ -632,10 +681,10 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("mv_store", &mv_store_status);
 
-        let init_lock_status = if self.init_lock.try_lock().is_some() {
-            "unlocked"
-        } else {
+        let init_lock_status = if self.pager_state.is_init_locked() {
             "locked"
+        } else {
+            "unlocked"
         };
         debug_struct.field("init_lock", &init_lock_status);
 
@@ -681,6 +730,7 @@ impl Database {
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -732,7 +782,6 @@ impl Database {
             dialect,
             io: io.clone(),
             open_flags: flags,
-            init_lock: Arc::new(Mutex::new(())),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -749,7 +798,7 @@ impl Database {
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
 
-            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
+            pager_state: Arc::new(SharedPagerState::new(init_page_1)),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -761,6 +810,7 @@ impl Database {
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
+        native_extensions.register(&db)?;
         Ok(db)
     }
 
@@ -1290,6 +1340,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         );
 
         match &result {
@@ -1367,6 +1418,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         )
     }
 
@@ -1387,6 +1439,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1408,6 +1461,7 @@ impl Database {
             page_codec,
             allocators,
             dialect,
+            native_extensions,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1429,6 +1483,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1457,6 +1512,7 @@ impl Database {
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1510,6 +1566,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
+                        StatsRefresh::Blocking,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1584,15 +1641,6 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
-                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
-                            let LimboError::ExtensionError(e) = *err else {
-                                unreachable!()
-                            };
-                            // this means that a vtab exists and we no longer have the module loaded.
-                            // we print a warning to the user to load the module
-                            state.schema_guard = None;
-                            tracing::warn!("open warning, failed to load extension: {e}");
-                        }
                         Err(e) => return Err(e),
                     }
 
@@ -1651,6 +1699,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
+                                StatsRefresh::Blocking,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -2313,7 +2362,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn = self._connect(true, None, None, None)?;
+            let mvcc_bootstrap_conn =
+                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2330,7 +2380,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None)
+        self._connect(false, None, None, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an encryption key.
@@ -2340,7 +2390,7 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None)
+        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an external page codec.
@@ -2352,7 +2402,63 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec))
+        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
+    }
+
+    /// Non-blocking [`Self::connect`].
+    ///
+    /// Creating the connection itself never waits, but the connect-time
+    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
+    /// statement can have to wait: on page I/O, or on another transaction
+    /// (a read that speculatively saw a version whose writer is still
+    /// preparing waits for that writer at its own commit). `connect` pumps
+    /// `io.step()` until the statement finishes, which is only correct when
+    /// the other transaction can make progress on its own. In a host that
+    /// schedules every connection cooperatively on one thread it cannot:
+    /// the wait is an explicit yield asking the host to run *other*
+    /// connections, and `io.step()` never does that, so `connect` spins.
+    ///
+    /// This variant hands every wait back to the caller as
+    /// `IOResult::IO(..)`. Drive it like `open_async`: on `IO`, run the host
+    /// scheduler if the completion is an explicit yield, wait for the
+    /// completion, then call again with the same `state`. The stats refresh
+    /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
+    /// logged and the connection is returned without stats.
+    pub fn connect_async(
+        self: &Arc<Database>,
+        state: &mut ConnectAsyncState,
+    ) -> IOResultOr<Arc<Connection>> {
+        self.connect_with_encryption_async(None, state)
+    }
+
+    /// Non-blocking [`Self::connect_with_encryption`]; see [`Self::connect_async`].
+    ///
+    /// `encryption_key` is consumed by the first call, which creates the
+    /// connection; later calls with the same `state` only resume the stats
+    /// refresh.
+    pub fn connect_with_encryption_async(
+        self: &Arc<Database>,
+        encryption_key: Option<EncryptionKey>,
+        state: &mut ConnectAsyncState,
+    ) -> IOResultOr<Arc<Connection>> {
+        let conn = match &state.conn {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn =
+                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
+                state.conn = Some(conn.clone());
+                conn
+            }
+        };
+        match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => {}
+            Err(err) => {
+                tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+            }
+        }
+        *state = ConnectAsyncState::default();
+        Ok(IOResult::Done(conn))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2362,6 +2468,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
+        stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
@@ -2389,14 +2496,21 @@ impl Database {
             .unwrap_or_default()
             .get();
 
-        self._connect_with_pager_and_default_cache_size(
+        let conn = self.new_connection(
             is_mvcc_bootstrap_connection,
             pager,
             encryption_key,
             default_cache_size,
-        )
+        )?;
+        if stats == StatsRefresh::Blocking {
+            refresh_analyze_stats(&conn);
+        }
+        Ok(conn)
     }
 
+    /// Create a connection and run the blocking connect-time stats refresh.
+    /// Hosts that schedule connections cooperatively must use
+    /// [`Self::connect_async`] instead; see its docs.
     pub(crate) fn _connect_with_pager_and_default_cache_size(
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
@@ -2404,7 +2518,25 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
     ) -> Result<Arc<Connection>> {
-        let page_size = pager.get_page_size_unchecked();
+        let conn = self.new_connection(
+            is_mvcc_bootstrap_connection,
+            pager,
+            encryption_key,
+            default_cache_size,
+        )?;
+        refresh_analyze_stats(&conn);
+        Ok(conn)
+    }
+
+    /// Build the `Connection` object. Does not touch the database: the
+    /// ANALYZE stats refresh is the caller's job, blocking or not.
+    fn new_connection(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+        pager: Arc<Pager>,
+        encryption_key: Option<EncryptionKey>,
+        default_cache_size: i32,
+    ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
@@ -2420,8 +2552,8 @@ impl Database {
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
-            page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
+            wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
             #[cfg(feature = "conn_raw_api")]
@@ -2492,7 +2624,6 @@ impl Database {
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
-        refresh_analyze_stats(&conn);
         Ok(conn)
     }
 
@@ -3080,10 +3211,11 @@ impl Database {
             self.io.clone(),
             PageCache::default(),
             buffer_pool,
-            self.init_lock.clone(),
-            self.init_page_1.clone(),
+            self.pager_state.clone(),
         )?;
-        pager.set_page_size(page_size);
+        if self.initialized() {
+            pager.set_page_size(page_size);
+        }
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
         }
@@ -3191,7 +3323,7 @@ impl Database {
 
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
-        self.init_page_1.load().is_none()
+        self.pager_state.initialized()
     }
 
     pub(crate) fn can_load_extensions(&self) -> bool {

@@ -2565,7 +2565,8 @@ static int rj_register(sqlite3 *db)
 /* load_static_extension DB NAME ?NAME ...?
  *
  * Upstream's testfixture links the extensions under ext/misc statically and
- * this command registers one on a connection. Only randomjson exists here;
+ * this command registers one on a connection. Only randomjson is registered
+ * here (the csv module is built into libturso_sqlite3, see the csv feature);
  * every other name is accepted and does nothing, so the tests that use the
  * missing extension fail on their own assertions instead of the whole file
  * stopping at this line. */
@@ -3353,6 +3354,7 @@ int Tursotcl_Init(Tcl_Interp *interp)
     turso_enable_experimental();
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite", TursoOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);

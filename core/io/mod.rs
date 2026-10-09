@@ -939,7 +939,7 @@ const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimen
 
 /// Register a named Rust IO backend.
 ///
-/// Once registered, it can be used via [`Database::io_for_vfs`] or through
+/// Once registered, it can be used via [`crate::Database::io_for_vfs`] or through
 /// any language binding's `vfs=` parameter (Go DSN, Python kwarg, etc.).
 ///
 /// Re-registering the same name replaces the previous backend. Registered
@@ -949,7 +949,7 @@ const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimen
 ///
 /// # Errors
 ///
-/// Returns [`LimboError::InvalidArgument`] if `name` is empty.
+/// Returns [`crate::LimboError::InvalidArgument`] if `name` is empty.
 pub fn register_io(name: &str, io: Arc<dyn IO>) -> crate::Result<()> {
     if name.is_empty() {
         return Err(crate::LimboError::InvalidArgument(

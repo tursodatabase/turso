@@ -13,7 +13,7 @@ use crate::{
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::{pull_pages_v1, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE},
     errors,
-    types::{Coro, PartialSyncOpts},
+    types::{Coro, PartialSyncOpts, Secret},
 };
 
 /// [PageStates] holds information about active operations with pages in the [LazyDatabaseStorage]
@@ -230,7 +230,7 @@ pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     // optional remote_url from saved configuration section of metadata file
     remote_url: Option<String>,
     // optional encryption key (base64 encoded) for encrypted Turso Cloud databases
-    remote_encryption_key: Option<String>,
+    remote_encryption_key: Option<Secret>,
 }
 
 impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
@@ -241,7 +241,7 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
         server_revision: String,
         opts: PartialSyncOpts,
         remote_url: Option<String>,
-        remote_encryption_key: Option<String>,
+        remote_encryption_key: Option<Secret>,
     ) -> Result<Self, errors::Error> {
         let clean_file_size = Arc::new(clean_file.size()?.into());
         Ok(Self {
@@ -565,7 +565,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     &coro,
                     &sync_engine_io,
                     remote_url,
-                    remote_encryption_key.as_deref(),
+                    remote_encryption_key.as_ref(),
                 );
                 read_page(
                     ctx,

@@ -1,4 +1,5 @@
 #include "TursoSyncIoItemHostObject.h"
+#include "TursoArrayBuffer.h"
 
 extern "C" {
 #include <turso_sync.h>
@@ -19,12 +20,13 @@ void TursoSyncIoItemHostObject::throwError(jsi::Runtime &rt, const char *error) 
 
 jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "getKind") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getKind(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getKind(rt);
             }
         );
     }
@@ -32,8 +34,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "getHttpRequest") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getHttpRequest(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getHttpRequest(rt);
             }
         );
     }
@@ -41,8 +43,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "getFullReadPath") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getFullReadPath(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getFullReadPath(rt);
             }
         );
     }
@@ -50,8 +52,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "getFullWriteRequest") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getFullWriteRequest(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getFullWriteRequest(rt);
             }
         );
     }
@@ -59,8 +61,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "poison") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->poison(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->poison(rt, args, count);
             }
         );
     }
@@ -68,8 +70,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "setStatus") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->setStatus(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->setStatus(rt, args, count);
             }
         );
     }
@@ -77,8 +79,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "pushBuffer") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->pushBuffer(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->pushBuffer(rt, args, count);
             }
         );
     }
@@ -86,8 +88,8 @@ jsi::Value TursoSyncIoItemHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "done") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->done(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->done(rt);
             }
         );
     }
@@ -163,10 +165,8 @@ jsi::Value TursoSyncIoItemHostObject::getHttpRequest(jsi::Runtime &rt) {
     // Body (may be empty)
     if (request.body.ptr && request.body.len > 0) {
         // Create ArrayBuffer for body
-        jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(request.body.len)).asObject(rt);
-        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-        memcpy(buf.data(rt), request.body.ptr, request.body.len);
+        jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, request.body.len);
+        memcpy(arrayBuffer.data(rt), request.body.ptr, arrayBuffer.size(rt));
         result.setProperty(rt, "body", arrayBuffer);
     } else {
         result.setProperty(rt, "body", jsi::Value::null());
@@ -223,10 +223,8 @@ jsi::Value TursoSyncIoItemHostObject::getFullWriteRequest(jsi::Runtime &rt) {
 
     // Content
     if (request.content.ptr && request.content.len > 0) {
-        jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(request.content.len)).asObject(rt);
-        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-        memcpy(buf.data(rt), request.content.ptr, request.content.len);
+        jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, request.content.len);
+        memcpy(arrayBuffer.data(rt), request.content.ptr, arrayBuffer.size(rt));
         result.setProperty(rt, "content", arrayBuffer);
     } else {
         result.setProperty(rt, "content", jsi::Value::null());

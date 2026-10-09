@@ -1281,7 +1281,7 @@ impl Schema {
         Ok(())
     }
 
-    /// Like [`remove_triggers_for_table`] but only removes triggers whose
+    /// Like [`Self::remove_triggers_for_table`] but only removes triggers whose
     /// `target_database_id` matches `target_db` (or is `None`, meaning
     /// "targets the parent schema's table of this name", which also
     /// applies). Used from `DROP TABLE main.t` to clean up temp triggers
@@ -1336,6 +1336,18 @@ impl Schema {
             .flatten()
             .find(|t| t.name == name)
             .cloned()
+    }
+
+    pub(crate) fn copy_table_valued_functions(&mut self, source: &Schema) {
+        for (name, table) in &source.tables {
+            if matches!(table.as_ref(), Table::Virtual(vtab)
+                if vtab.kind == turso_ext::VTabKind::TableValuedFunction)
+            {
+                self.tables
+                    .entry(name.clone())
+                    .or_insert_with(|| table.clone());
+            }
+        }
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
@@ -1943,7 +1955,7 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
+            let cols = incremental_view.column_schema.flat_columns()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
@@ -2285,7 +2297,7 @@ impl Schema {
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
+                            let mut final_columns = view_column_schema.flat_columns()?;
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     // as_str: Display would render the quoted form,
@@ -2706,6 +2718,7 @@ impl TryClone for FromClauseSubquery {
             name: self.name.clone(),
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
+            parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
             cte: self.cte,
@@ -3035,6 +3048,13 @@ impl Table {
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
+        }
+    }
+
+    pub(crate) fn parenthesized_join_columns(&self) -> Option<&[ParenthesizedJoinColumn]> {
+        match self {
+            Self::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_deref(),
+            _ => None,
         }
     }
 
@@ -3608,6 +3628,9 @@ impl BTreeTable {
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if !column.is_rowid_alias() && self.primary_key_columns[0].1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
                 push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
                 if self.has_autoincrement && column.is_rowid_alias() {
                     sql.push_str(" AUTOINCREMENT");
@@ -3667,6 +3690,9 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
+                if col.1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
             push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
@@ -3682,14 +3708,16 @@ impl BTreeTable {
             }
             sql.push_str(") REFERENCES ");
             sql.push_str(&quote_ident(&fk.parent_table));
-            sql.push('(');
-            for (i, col) in fk.parent_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            if !fk.parent_columns.is_empty() {
+                sql.push('(');
+                for (i, col) in fk.parent_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&quote_ident(col));
                 }
-                sql.push_str(&quote_ident(col));
+                sql.push(')');
             }
-            sql.push(')');
 
             // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
             if fk.on_delete != RefAct::NoAction {
@@ -4038,6 +4066,13 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
+    /// Source names for a parenthesized join. SQLite stores these in
+    /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
+    ///
+    /// Turso keeps the same data here because outer name binding sees this
+    /// derived table, not the inner result expressions. Each item describes
+    /// the column at the same position in `columns`.
+    pub(crate) parenthesized_join_columns: Option<Vec<ParenthesizedJoinColumn>>,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
@@ -4047,6 +4082,88 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+/// Name data that an outer query can use through a parenthesized join.
+#[derive(Debug, Clone)]
+pub(crate) struct ParenthesizedJoinColumn {
+    /// The name that SQLite keeps for later name binding.
+    pub(crate) source: ParenthesizedJoinColumnSource,
+    /// The ways in which an outer query can use this column.
+    pub(crate) visibility: ParenthesizedJoinColumnVisibility,
+}
+
+/// This value tells how an outer query can read a column from a parenthesized join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParenthesizedJoinColumnVisibility {
+    /// Bare names, qualified names, and `*` can use this column.
+    Visible,
+    /// Only a qualified name can use this column.
+    QualifiedOnly,
+    /// Bare and qualified names can use this column, but `*` omits it.
+    HiddenFromStar,
+}
+
+/// The source name of a result column from a parenthesized join.
+#[derive(Debug, Clone)]
+pub(crate) enum ParenthesizedJoinColumnSource {
+    /// SQLite inserts one name that represents all copies merged by `USING`.
+    Using { column_name: String },
+    /// Turso keeps these names separate because quoted names can contain dots.
+    /// SQLite's dot-separated string cannot represent those names.
+    Table {
+        database_id: Option<usize>,
+        table_name: String,
+        column_name: String,
+    },
+    /// An implicit rowid keeps its table name but matches each rowid alias.
+    RowId {
+        database_id: Option<usize>,
+        table_name: String,
+    },
+}
+
+impl ParenthesizedJoinColumnSource {
+    pub(crate) fn matches_table(&self, database_id: Option<usize>, table_name: &str) -> bool {
+        match self {
+            Self::Using { .. } => false,
+            Self::Table {
+                database_id: saved_database,
+                table_name: saved_table,
+                ..
+            }
+            | Self::RowId {
+                database_id: saved_database,
+                table_name: saved_table,
+            } => {
+                database_id.is_none_or(|database| *saved_database == Some(database))
+                    && saved_table.eq_ignore_ascii_case(table_name)
+            }
+        }
+    }
+
+    pub(crate) fn matches_column_name(&self, column_name: &str) -> bool {
+        match self {
+            Self::Using {
+                column_name: saved_column,
+            }
+            | Self::Table {
+                column_name: saved_column,
+                ..
+            } => saved_column.eq_ignore_ascii_case(column_name),
+            Self::RowId { .. } => ROWID_STRS
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column_name)),
+        }
+    }
+
+    pub(crate) fn is_rowid(&self) -> bool {
+        matches!(self, Self::RowId { .. })
+    }
+
+    pub(crate) fn is_using(&self) -> bool {
+        matches!(self, Self::Using { .. })
+    }
 }
 
 /// The one-row table read by the recursive part of a recursive CTE.

@@ -22,5 +22,8 @@ turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_parser = { workspace = true }
 
+[dev-dependencies]
+turso_core = { workspace = true, features = ["io_memory_yield"] }
+
 [lints]
 workspace = true

@@ -120,6 +120,10 @@ pub trait Dialect: Send + Sync + 'static {
         enable_custom_types: bool,
     ) -> crate::Result<()>;
 
+    fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
+        options
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -256,14 +260,15 @@ mod tests {
             schema: &mut crate::schema::Schema,
             enable_custom_types: bool,
         ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)?;
-            let vtab = crate::VirtualTable::new_internal(
-                "test_catalog".to_string(),
-                "CREATE TABLE test_catalog (value INTEGER)".to_string(),
-                turso_ext::VTabKind::VirtualTable,
-                Arc::new(crate::sync::RwLock::new(TestCatalogTable)),
-            )?;
-            schema.add_virtual_table(Arc::new(vtab))
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
+            options.native_module(
+                "test_catalog",
+                turso_ext::VTabKind::TableValuedFunction,
+                TestCatalogTable,
+            )
         }
     }
 
@@ -330,23 +335,23 @@ mod tests {
     #[derive(Debug)]
     struct TestCatalogTable;
 
-    impl crate::InternalVirtualTable for TestCatalogTable {
-        fn name(&self) -> String {
-            "test_catalog".to_string()
+    impl crate::native_ext::VirtualTableModule for TestCatalogTable {
+        type Table = Self;
+
+        fn schema(&self, _args: &[crate::Value]) -> crate::Result<String> {
+            Ok("CREATE TABLE test_catalog (value INTEGER)".to_string())
         }
 
-        fn sql(&self) -> String {
-            "CREATE TABLE test_catalog (value INTEGER)".to_string()
+        fn create(&self, _args: &[crate::Value]) -> crate::Result<Self::Table> {
+            Ok(Self)
         }
+    }
 
-        fn open(
-            &self,
-            _conn: Arc<crate::Connection>,
-        ) -> crate::Result<Arc<crate::sync::RwLock<dyn crate::InternalVirtualTableCursor>>>
-        {
-            Ok(Arc::new(crate::sync::RwLock::new(TestCatalogCursor {
-                row: 0,
-            })))
+    impl crate::native_ext::VirtualTable for TestCatalogTable {
+        type Cursor = TestCatalogCursor;
+
+        fn open(&self, _conn: Arc<crate::Connection>) -> crate::Result<Self::Cursor> {
+            Ok(TestCatalogCursor { row: 0 })
         }
 
         fn best_index(
@@ -375,31 +380,31 @@ mod tests {
         row: usize,
     }
 
-    impl crate::InternalVirtualTableCursor for TestCatalogCursor {
+    impl crate::native_ext::VirtualTableCursor for TestCatalogCursor {
         fn filter(
             &mut self,
             _args: &[crate::Value],
-            _idx_str: Option<String>,
+            _idx_str: Option<&str>,
             _idx_num: i32,
-        ) -> crate::Result<bool> {
+        ) -> crate::types::IOResultOr<bool> {
             self.row = 0;
-            Ok(true)
+            Ok(crate::IOResult::Done(true))
         }
 
-        fn next(&mut self) -> crate::Result<bool> {
+        fn next(&mut self) -> crate::types::IOResultOr<bool> {
             self.row += 1;
-            Ok(self.row < 1)
+            Ok(crate::IOResult::Done(self.row < 1))
         }
 
         fn rowid(&self) -> i64 {
             self.row as i64
         }
 
-        fn column(&self, column: usize) -> crate::Result<crate::Value> {
-            match column {
-                0 => Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(42))),
-                _ => Ok(crate::Value::Null),
-            }
+        fn column(&mut self, column: usize) -> crate::types::IOResultOr<crate::Value> {
+            Ok(crate::IOResult::Done(match column {
+                0 => crate::Value::from_i64(42),
+                _ => crate::Value::Null,
+            }))
         }
     }
 

@@ -3041,3 +3041,75 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
 
     observer_conn.close().unwrap();
 }
+
+#[test]
+fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
+    let readers = [db.connect().unwrap(), db.connect().unwrap()];
+    let writer = db.connect().unwrap();
+    writer.execute("PRAGMA synchronous = NORMAL").unwrap();
+    writer
+        .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, k BLOB UNIQUE, v BLOB)")
+        .unwrap();
+    let insert = "INSERT INTO test(k, v) VALUES(randomblob(16), randomblob(200))";
+
+    readers[0].execute("BEGIN").unwrap();
+    count_test_rows(&readers[0]);
+    let mut open_reader = 0;
+    let mut rows = 0;
+    while wal_max_frame(&writer) < 9000 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+        if rows % 50 == 0 {
+            let next = 1 - open_reader;
+            readers[next].execute("BEGIN").unwrap();
+            assert_eq!(count_test_rows(&readers[next]), rows);
+            readers[open_reader].execute("COMMIT").unwrap();
+            open_reader = next;
+        }
+    }
+
+    let held_reader = &readers[1 - open_reader];
+    held_reader.execute("BEGIN").unwrap();
+    let held_rows = count_test_rows(held_reader);
+    assert_eq!(held_rows, rows);
+    readers[open_reader].execute("COMMIT").unwrap();
+    let held_frame = wal_max_frame(&writer);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+
+    for _ in 0..1500 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+    }
+    assert!(wal_max_frame(&writer) > held_frame + 1000);
+    assert_eq!(count_test_rows(held_reader), held_rows);
+    assert_eq!(count_test_rows(&writer), rows);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    authority.take_frame_index_blocks_scanned_for_tests();
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+    assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
+    assert_eq!(authority.take_frame_index_blocks_scanned_for_tests(), 0);
+
+    held_reader.execute("COMMIT").unwrap();
+    let checkpoint = run_checkpoint(
+        &writer,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    assert_eq!(wal_max_frame(&writer), 0);
+    let fresh = db.connect().unwrap();
+    assert_eq!(count_test_rows(&fresh), rows);
+    assert_eq!(
+        get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}

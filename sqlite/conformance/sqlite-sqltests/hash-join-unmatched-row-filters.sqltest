@@ -85,3 +85,27 @@ expect {
     1||2|3
     2|10|3|2
 }
+
+# The unmatched scan must not test a WHERE term whose correlated subquery reads
+# a later table. That subquery runs inside the later table's loop, so at the
+# unmatched scan its result register still holds the previous row's value.
+# Here l=3 has no m match (hash join) and no p match, so p.w is NULL and the
+# subquery finds no row. The stale result from l=2 found one.
+test hash-join-unmatched-row-defers-subquery-over-later-table {
+    CREATE TABLE l(seed INT);
+    CREATE TABLE m(seed INT);
+    CREATE TABLE p(seed INT, w INT);
+    CREATE TABLE r(value INTEGER);
+    CREATE INDEX r_value ON r(value);
+    INSERT INTO l VALUES (1), (2), (3);
+    INSERT INTO m VALUES (1), (2);
+    INSERT INTO p VALUES (1, 5), (2, 7);
+    INSERT INTO r VALUES (NULL), (0), (2);
+    SELECT l.seed FROM l
+    LEFT JOIN m ON m.seed = l.seed
+    LEFT JOIN p ON p.seed = l.seed
+    WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.value <= p.w);
+}
+expect {
+    3
+}

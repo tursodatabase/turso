@@ -17,4 +17,4 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-pprof = { version = "0.15.0", optional = true }
+pprof = { workspace = true, optional = true }

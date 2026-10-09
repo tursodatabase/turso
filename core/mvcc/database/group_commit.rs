@@ -6,6 +6,7 @@ use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::SyncMode;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -14,6 +15,7 @@ pub(crate) struct QueuedCommit {
     pub ticket: u64,
     pub tx_id: TxID,
     pub log_record: LogRecord,
+    pub sync_mode: SyncMode,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,7 @@ struct GroupState {
     next_ticket: u64,
     durable_through: u64,
     written_through: u64,
+    full_sync_written_through: u64,
     pending: VecDeque<QueuedCommit>,
     /// Tickets whose in-flight `log_tx` was discarded before the offset was
     /// advanced. The waiter rebuilds its log record instead of hanging.
@@ -81,6 +84,7 @@ impl CommitCoordinator {
                 next_ticket: 0,
                 durable_through: 0,
                 written_through: 0,
+                full_sync_written_through: 0,
                 pending: VecDeque::new(),
                 retry: HashSet::default(),
                 issued: None,
@@ -132,7 +136,7 @@ impl CommitCoordinator {
         self.group_commit_enabled.store(enabled, Ordering::Release);
     }
 
-    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord) -> u64 {
+    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord, sync_mode: SyncMode) -> u64 {
         let mut group = self.group.lock();
         group.next_ticket += 1;
         let ticket = group.next_ticket;
@@ -140,6 +144,7 @@ impl CommitCoordinator {
             ticket,
             tx_id,
             log_record,
+            sync_mode,
         });
         ticket
     }
@@ -207,6 +212,16 @@ impl CommitCoordinator {
             return;
         }
         group.written_through = group.written_through.max(ticket);
+    }
+
+    pub(crate) fn note_full_sync_written(&self, ticket: u64) {
+        let mut group = self.group.lock();
+        group.full_sync_written_through = group.full_sync_written_through.max(ticket);
+    }
+
+    pub(crate) fn needs_full_sync(&self) -> bool {
+        let group = self.group.lock();
+        group.full_sync_written_through > group.durable_through
     }
 
     pub(crate) fn written_through(&self) -> u64 {

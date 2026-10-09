@@ -1,9 +1,4 @@
-use std::sync::Arc;
-use turso_core::schema::{Schema, Table};
 use turso_core::{Connection, LimboError, Result, Value};
-use turso_parser::ast::RefAct;
-
-const USER_TABLE_OID_START: i64 = 16384;
 
 /// Resolve a PostgreSQL scalar function by name and argument count. Entry
 /// point for [`crate::catalog::PostgresDialect::resolve_function`].
@@ -136,14 +131,14 @@ fn exec_pg_encoding_to_char(encoding: i64) -> Value {
 }
 
 fn exec_pg_get_constraintdef(conn: &Connection, oid: i64) -> Value {
-    match pg_get_constraintdef(conn, oid) {
+    match crate::catalog::pg_get_constraintdef(conn, oid) {
         Some(s) => Value::build_text(s),
         None => Value::Null,
     }
 }
 
 fn exec_pg_get_indexdef(conn: &Connection, oid: i64) -> Value {
-    match pg_get_indexdef(conn, oid) {
+    match crate::catalog::pg_get_indexdef(conn, oid) {
         Some(s) => Value::build_text(s),
         None => Value::Null,
     }
@@ -249,166 +244,6 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
             "Expected text value".to_string(),
         )),
     }
-}
-
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
-    tables
-}
-
-fn ref_act_to_char(act: &RefAct) -> &'static str {
-    match act {
-        RefAct::NoAction => "a",
-        RefAct::Restrict => "r",
-        RefAct::Cascade => "c",
-        RefAct::SetNull => "n",
-        RefAct::SetDefault => "d",
-    }
-}
-
-fn ref_act_to_sql(code: &str) -> &'static str {
-    match code {
-        "r" => "RESTRICT",
-        "c" => "CASCADE",
-        "n" => "SET NULL",
-        "d" => "SET DEFAULT",
-        _ => "NO ACTION",
-    }
-}
-
-fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if !idx.ephemeral {
-                next_index_oid += 1;
-            }
-        }
-    }
-
-    let mut constraint_oid = next_index_oid;
-
-    for (_, table) in &tables {
-        let btree = match table.as_ref() {
-            Table::BTree(bt) => bt,
-            _ => continue,
-        };
-
-        let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-        if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-            if constraint_oid == target_oid {
-                let cols: Vec<String> = btree
-                    .primary_key_columns
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        for us in &btree.unique_sets {
-            if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let kw = if us.is_primary_key {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                };
-                return Some(format!("{kw} ({})", col_names.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        for fk in &btree.foreign_keys {
-            if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
-                );
-                let on_update = ref_act_to_char(&fk.on_update);
-                let on_delete = ref_act_to_char(&fk.on_delete);
-                if on_update != "a" {
-                    def.push_str(&format!(" ON UPDATE {}", ref_act_to_sql(on_update)));
-                }
-                if on_delete != "a" {
-                    def.push_str(&format!(" ON DELETE {}", ref_act_to_sql(on_delete)));
-                }
-                return Some(def);
-            }
-            constraint_oid += 1;
-        }
-
-        for chk in &btree.check_constraints {
-            if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
-            }
-            constraint_oid += 1;
-        }
-    }
-
-    None
-}
-
-fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if idx.ephemeral {
-                continue;
-            }
-            if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
-            }
-            index_oid += 1;
-        }
-    }
-
-    None
 }
 
 /// Validate input for a PostgreSQL type, returning error info if invalid.

@@ -1,7 +1,5 @@
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -572,21 +570,6 @@ fn bench_before_trigger(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = trigger_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(30);
-    targets =
-        bench_multirow_insert_with_trigger,
-        bench_wide_table_sparse_trigger,
-        bench_multiple_triggers,
-        bench_trigger_overhead,
-        bench_before_trigger
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = trigger_benches;
     config = Criterion::default().sample_size(30);

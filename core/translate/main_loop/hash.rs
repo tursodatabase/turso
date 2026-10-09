@@ -187,12 +187,6 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             key_affinities: key_affinities.clone(),
             use_bloom_filter,
             materialized_input_cursor: materialized_cursor_id,
-            materialized_mode: materialized_input.as_ref().map(|input| match input.mode {
-                MaterializedBuildInputMode::RowidOnly => MaterializedBuildInputModeTag::RowidOnly,
-                MaterializedBuildInputMode::KeyPayload { .. } => {
-                    MaterializedBuildInputModeTag::Payload
-                }
-            }),
         };
 
         if self
@@ -300,7 +294,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .set_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
+                .set_table_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
         }
 
         planner
@@ -328,23 +322,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             config.uses_materialized_keys_and_payload,
         )? {
             let cond = &planner.predicates[cond_idx];
-            let jump_target_when_true = planner.program.allocate_label();
-            let condition_metadata = ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true,
-                jump_target_when_false: skip_to_next,
-                jump_target_when_null: skip_to_next,
-            };
-            translate_condition_expr(
+            super::conditions::emit_where_term(
                 planner.program,
                 planner.table_references,
-                &cond.expr,
-                condition_metadata,
+                cond,
+                skip_to_next,
                 &planner.t_ctx.resolver,
             )?;
-            planner
-                .program
-                .preassign_label_to_next_insn(jump_target_when_true);
         }
 
         if config.uses_materialized_keys_and_payload {
@@ -444,7 +428,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .clear_cursor_override(build_table.internal_id);
+                .clear_table_cursor_override(build_table.internal_id);
         }
 
         planner.program.emit_insn(Insn::HashBuild {
@@ -503,7 +487,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
 /// unmatched, so they would be emitted as spurious null-extended rows.
 ///
 /// OUTER JOIN predicates stay on the right-table loop recorded in
-/// `from_outer_join`; applying them while building the hash table would drop
+/// `origin`; applying them while building the hash table would drop
 /// unmatched build rows before null-extension. Terms with outer-query
 /// references run where those references are in scope.
 pub(super) fn build_prefilter_where_terms(
@@ -519,7 +503,7 @@ pub(super) fn build_prefilter_where_terms(
     let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
     let mut term_indices = Vec::new();
     for (cond_idx, cond) in predicates.iter().enumerate() {
-        if cond.from_outer_join.is_some() {
+        if cond.origin.is_outer_join() {
             continue;
         }
         let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;

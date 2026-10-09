@@ -2,7 +2,7 @@ use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{Connection, Database, LimboError, StepResult, Value};
+use crate::{Connection, Database, LimboError, StepResult, SyncMode, Value};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -257,8 +257,8 @@ fn empty_record(end_ts: u64) -> LogRecord {
 #[test]
 fn requeued_records_go_back_in_ticket_order() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let second = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
 
     let batch = coordinator.take_pending();
     assert_eq!(
@@ -266,7 +266,7 @@ fn requeued_records_go_back_in_ticket_order() {
         vec![first, second]
     );
 
-    let latecomer = coordinator.enqueue(3, empty_record(30));
+    let latecomer = coordinator.enqueue(3, empty_record(30), SyncMode::Full);
     coordinator.requeue(batch.into_iter());
     assert_eq!(
         coordinator
@@ -282,10 +282,10 @@ fn requeued_records_go_back_in_ticket_order() {
 fn drop_pending_only_removes_queued_records() {
     let coordinator = CommitCoordinator::new();
 
-    let queued = coordinator.enqueue(1, empty_record(10));
+    let queued = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
     assert!(coordinator.drop_pending(queued));
 
-    let claimed = coordinator.enqueue(2, empty_record(20));
+    let claimed = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
     let _batch = coordinator.take_pending();
     assert!(
         !coordinator.drop_pending(claimed),
@@ -305,8 +305,8 @@ fn durability_watermark_only_moves_forward() {
 #[test]
 fn failed_leader_does_not_publish_unsynced_prefix() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let second = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
     let mut batch = coordinator.take_pending();
     let writing = batch.pop_front().unwrap();
     assert_eq!(writing.ticket, first);
@@ -331,9 +331,9 @@ fn failed_leader_does_not_publish_unsynced_prefix() {
 #[test]
 fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     let coordinator = CommitCoordinator::new();
-    let t2 = coordinator.enqueue(2, empty_record(20));
-    let t3 = coordinator.enqueue(3, empty_record(30));
-    let t4 = coordinator.enqueue(4, empty_record(40));
+    let t2 = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
+    let t3 = coordinator.enqueue(3, empty_record(30), SyncMode::Full);
+    let t4 = coordinator.enqueue(4, empty_record(40), SyncMode::Full);
     assert_eq!((t2, t3, t4), (1, 2, 3));
 
     let mut batch = coordinator.take_pending();
@@ -375,16 +375,16 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits() {
-    dropped_after_own_still_commits(true);
+fn dropped_commit_after_log_record_is_written_still_commits() {
+    dropped_after_log_record_written_still_commits(true);
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits_without_group() {
-    dropped_after_own_still_commits(false);
+fn dropped_commit_after_log_record_is_written_still_commits_without_group() {
+    dropped_after_log_record_written_still_commits(false);
 }
 
-fn dropped_after_own_still_commits(group_commit: bool) {
+fn dropped_after_log_record_written_still_commits(group_commit: bool) {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
@@ -396,7 +396,7 @@ fn dropped_after_own_still_commits(group_commit: bool) {
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogicalLogOwned.point(),
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
     ])));
 
     {

@@ -303,50 +303,50 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(666));
     let row = Row::new_table_row(row_id, &[], 0).unwrap();
 
-    let mut replacement = RowVersion::new(
+    let replacement = RowVersion::new(
         1,
         Some(TxTimestampOrID::TxID(tx_id)),
         None,
         row.clone(),
         true,
     );
-    assert!(!rollback_row_version(tx_id, &mut replacement));
+    assert!(!rollback_restores_rowid(tx_id, &replacement));
 
-    let mut deleted_existing_row = RowVersion::new(
+    let deleted_existing_row = RowVersion::new(
         2,
         Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_existing_row));
+    assert!(rollback_restores_rowid(tx_id, &deleted_existing_row));
 
-    let mut deleted_btree_row = RowVersion::new(
+    let deleted_btree_row = RowVersion::new(
         3,
         None,
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_btree_row));
+    assert!(rollback_restores_rowid(tx_id, &deleted_btree_row));
 
-    let mut deleted_replacement = RowVersion::new(
+    let deleted_replacement = RowVersion::new(
         4,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_replacement));
+    assert!(rollback_restores_rowid(tx_id, &deleted_replacement));
 
-    let mut inserted_then_deleted = RowVersion::new(
+    let inserted_then_deleted = RowVersion::new(
         5,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row,
         false,
     );
-    assert!(!rollback_row_version(tx_id, &mut inserted_then_deleted));
+    assert!(!rollback_restores_rowid(tx_id, &inserted_then_deleted));
 }
 
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
@@ -3076,6 +3076,93 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
         0,
         "logical log must stay empty after reopen following TRUNCATE checkpoint"
     );
+}
+
+/// Regression for https://github.com/tursodatabase/turso/issues/8076.
+///
+/// With `experimental_mvcc_passive_checkpoint` enabled, an explicit TRUNCATE checkpoint
+/// collects rows without the blocking checkpoint lock and writers never take it, so another
+/// connection can commit after the checkpoint snapshot. That commit is not in the B-tree
+/// yet, so the checkpoint must keep it in the logical log instead of clearing the whole
+/// file.
+#[test]
+fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'collected')")
+        .unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint finished before collecting rows"),
+        }
+    }
+
+    let sibling = db.connect();
+    sibling
+        .execute("INSERT INTO t VALUES (2, 'after-snapshot')")
+        .unwrap();
+
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        finished,
+        "TRUNCATE checkpoint must complete after the sibling commit"
+    );
+    assert!(
+        mvcc_store.get_logical_log_file().size().unwrap() > 0,
+        "logical log must keep the commit that landed after the checkpoint snapshot"
+    );
+
+    let rows = get_rows(&sibling, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2, "both rows must be visible before restart");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    drop(sibling);
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        2,
+        "commit that landed after the TRUNCATE snapshot must survive reopen"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "collected");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "after-snapshot");
+    assert_integrity_ok(&conn);
 }
 
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
@@ -7446,6 +7533,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        created_table_ids: Mutex::new(Vec::new()),
     }
 }
 
@@ -7644,6 +7732,38 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
         mvcc_store.finalized_tx_states.len(),
         baseline,
         "GC scan should prune finalized tx cache entries with no remaining TxID references"
+    );
+}
+
+#[test]
+fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+    let commit_ts = match mvcc_store.txs.get(&tx_id).unwrap().value().state.load() {
+        TransactionState::Committed(ts) => ts,
+        other => panic!("writer should be committed, got {other:?}"),
+    };
+    mvcc_store
+        .insert_finalized_tx_state(tx_id, commit_ts)
+        .unwrap();
+    mvcc_store.drop_unused_row_versions();
+
+    assert!(
+        lookup_finalized_tx_state(&mvcc_store.finalized_tx_states, tx_id).is_some(),
+        "GC removed the finalized state of a writer that is still in txs"
     );
 }
 
@@ -9137,6 +9257,7 @@ fn transaction_display() {
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        created_table_ids: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -11189,53 +11310,157 @@ fn test_gc_integration_insert_commit_gc() {
     assert!(!db.mvcc_store.rows.is_empty());
 }
 
-/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
-/// Rolling back a transaction leaves aborted garbage (begin=None, end=None).
-/// GC reclaims the versions. The SkipMap entry stays (lazy removal to avoid
-/// TOCTOU with concurrent writers) but the version vec is empty.
-fn test_gc_integration_rollback_creates_aborted_garbage() {
+fn transaction_rollback_removes_created_versions_immediately() {
     let db = MvccTestDb::new();
+    let row_id = RowID::new((-2).into(), RowKey::Int(1));
 
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
-    db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
-
-    // Rollback should leave aborted garbage (begin=None, end=None).
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some());
-    {
-        let versions = entry.as_ref().unwrap().value().read();
-        assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin().is_none());
-        assert!(versions[0].end().is_none());
+    for _ in 0..100 {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
+        db.mvcc_store.insert(tx, row).unwrap();
+        db.mvcc_store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+        );
     }
 
-    // GC should clean up the version. The SkipMap entry stays (lazy removal
-    // in background GC avoids TOCTOU), but the version vec should be empty.
+    let entry = db.mvcc_store.rows.get(&row_id);
+    assert!(entry.is_some());
+    assert!(entry.unwrap().value().read().is_empty());
+    assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
     let dropped = db.mvcc_store.drop_unused_row_versions();
-    assert_eq!(dropped, 1);
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some(), "SkipMap entry stays (lazy removal)");
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but versions should be empty"
-    );
+    assert_eq!(dropped, 0);
+}
+
+#[test]
+fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    // Nothing else may reclaim slots: disable the checkpoint and inline GC.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..100 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let index_slots = || -> usize {
+        db.mvcc_store
+            .index_rows
+            .iter()
+            .map(|index| index.value().len())
+            .sum()
+    };
+    let table_slots = || -> usize {
+        db.mvcc_store
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .count()
+    };
+    let index_slots_before = index_slots();
+    let table_slots_before = table_slots();
+
+    // A retried CREATE INDEX gets a new index id every attempt. Before the fix, each
+    // rolled-back attempt left one slot per indexed row behind.
+    for _ in 0..5 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        assert_eq!(index_slots(), index_slots_before + 100);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(index_slots(), index_slots_before);
+    }
+
+    // The same for a table created and filled in the rolled-back transaction.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO u VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    assert_eq!(table_slots(), table_slots_before + 50);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(table_slots(), table_slots_before);
+
+    // A committed CREATE INDEX keeps its rows.
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    assert_eq!(index_slots(), index_slots_before + 100);
+}
+
+#[test]
+fn rollback_of_created_index_keeps_open_reader_valid() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let mut read = conn
+        .prepare("SELECT id FROM t INDEXED BY idx_v ORDER BY v")
+        .unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    conn.execute("ROLLBACK").unwrap();
+
+    // Each rolled-back CREATE INDEX frees and reallocates per-index maps, so a
+    // reader pointing into a freed map would see memory reused by a new one.
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    assert!(matches!(read.step().unwrap(), StepResult::Done));
+}
+
+#[test]
+fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 'v1'), (2, 'v2'), (3, 'v3')")
+        .unwrap();
+    let mut insert = conn
+        .prepare("INSERT OR ROLLBACK INTO u VALUES (1000, 'v2')")
+        .unwrap();
+    assert!(insert.step().is_err());
+
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    insert.reset().unwrap();
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
@@ -11338,9 +11563,11 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         crate::MAIN_DB_ID,
     );
 
-    // Rollback leaves aborted garbage behind in the chain.
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    db.mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // The slot-removing GC variant collects the garbage AND drops the slot.
     // No concurrent writers exist in this test, satisfying the caller contract.
@@ -11733,14 +11960,27 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
 
-    // Insert many indexed rows in one transaction, then roll back: each leaves
-    // aborted garbage in its own index chain.
+    // Insert many indexed rows in one transaction, then roll back. Rollback
+    // keeps the empty slots but removes their versions immediately.
     conn.execute("BEGIN").unwrap();
     for i in 100..200 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
             .unwrap();
     }
     conn.execute("ROLLBACK").unwrap();
+
+    // Populate the empty slots with stale versions to exercise the GC cursor
+    // directly rather than relying on rollback to manufacture garbage.
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let mut versions = inner.value().write();
+            if versions.is_empty() {
+                db.mvcc_store
+                    .insert_version_raw(&mut versions, make_rv(None, None))
+                    .unwrap();
+            }
+        }
+    }
 
     let count_index_versions = || -> usize {
         db.mvcc_store
@@ -11888,7 +12128,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     let mvcc_store = db.get_mvcc_store();
     let table_id: MVTableId = (-2).into();
 
-    // Aborted insert leaves aborted garbage (begin=None, end=None) behind.
+    // Rollback keeps an empty SkipMap slot. Add stale data to that slot so the
+    // incremental GC path is what empties the chain.
     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
@@ -11896,7 +12137,10 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    assert!(mvcc_store.rows.get(&row_id).is_some());
+    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // Drive incremental GC to completion.
     for _ in 0..4 {
@@ -20347,7 +20591,7 @@ fn abandoned_committed_writer_notifies_dependents() {
 
             if n_rows == 1 {
                 writer.set_yield_injector(Some(FixedYieldInjector::new([
-                    CommitYieldPoint::LogicalLogOwned.point(),
+                    CommitYieldPoint::LogRecordMarkedWritten.point(),
                 ])));
             }
             for _ in 0..100 {
@@ -21021,6 +21265,69 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
         b_retries, 0,
         "B's inner tx retried — same canary as A. See PR #7137."
     );
+}
+
+#[test]
+fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        setup.execute("CREATE TABLE t(x)").unwrap();
+        setup.execute("CREATE TABLE u(x)").unwrap();
+        setup.execute("SELECT nextval('s')").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.reset_sequence_inner_retries();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let injector = FixedYieldInjector::new([CommitYieldPoint::CommitValidation.point()]);
+    conn_b.set_yield_injector(Some(injector.clone()));
+    let mut insert_b = conn_b.prepare("INSERT INTO u VALUES (1)").unwrap();
+    loop {
+        match insert_b.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if injector.is_empty() {
+                    break;
+                }
+                conn_b.pager.load().io.step().unwrap();
+            }
+            other => panic!("B's insert should yield inside its commit, got {other:?}"),
+        }
+    }
+
+    let mut next_a = conn_a.prepare("SELECT nextval('s')").unwrap();
+    let mut seek_injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+    conn_a.set_yield_injector(Some(seek_injector.clone()));
+    while conn_a.sequence_inner_retries() == 0 {
+        if seek_injector.is_empty() {
+            seek_injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+            conn_a.set_yield_injector(None);
+            conn_a.set_yield_injector(Some(seek_injector.clone()));
+        }
+        match next_a.step().unwrap() {
+            StepResult::IO | StepResult::Yield => conn_a.pager.load().io.step().unwrap(),
+            other => panic!("A's nextval should retry its inner tx while B commits, got {other:?}"),
+        }
+    }
+    conn_a.set_yield_injector(None);
+
+    conn_b.set_yield_injector(None);
+    insert_b.run_collect_rows().unwrap();
+    drop(insert_b);
+
+    next_a.run_collect_rows().unwrap();
+    drop(next_a);
+    conn_a.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT x FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
 
 #[test]
@@ -22677,3 +22984,175 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
+#[path = "group_commit_sync_mode_tests.rs"]
+mod group_commit_sync_mode_tests;
+
+/// Drive a statement until it yields or finishes; IO is pumped, an explicit
+/// yield is handed back so the test can observe it.
+fn step_until_yield_or_done_pumping_io(
+    stmt: &mut crate::Statement,
+    io: &dyn IO,
+) -> crate::StepResult {
+    for _ in 0..100_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                if let Some(pending) = stmt.take_io_completions() {
+                    pending.wait(io).unwrap();
+                }
+            }
+            other => return other,
+        }
+    }
+    panic!("statement kept returning IO")
+}
+
+/// Regression test for a host that schedules every connection cooperatively
+/// on one thread (turso-server). `Database::connect` runs the connect-time
+/// ANALYZE stats refresh through a blocking loop that pumps `io.step()`. When
+/// that refresh's `sqlite_stat1` scan speculatively read a version written by
+/// a transaction still in `Preparing`, its own end-of-statement commit waited
+/// for that writer with an explicit yield, and `io.step()` can never let the
+/// writer run, so `connect` spun forever. `connect_async` must hand that wait
+/// to the caller instead and finish once the writer commits.
+#[test]
+fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let database = db.get_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t1 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t2 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t1 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t2 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    // Populate sqlite_stat1 so the connect-time refresh has rows to scan.
+    writer.execute("ANALYZE").unwrap();
+
+    // Park a second ANALYZE inside its commit: its new sqlite_stat1 versions
+    // stay in `Preparing` until the statement is stepped again.
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
+    ])));
+    let mut parked = writer.prepare("ANALYZE t2").unwrap();
+    assert!(
+        matches!(
+            step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
+            crate::StepResult::Yield
+        ),
+        "ANALYZE t2 should park inside its commit"
+    );
+    writer.set_yield_injector(None);
+
+    // While the writer is parked, connect_async must keep handing the wait
+    // back instead of completing or spinning. (`connect()` never returns here.)
+    let mut state = crate::ConnectAsyncState::new();
+    let mut yielded = false;
+    for _ in 0..1_000 {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(_) => panic!(
+                "connect must not complete while the commit its stats scan depends on is parked"
+            ),
+            crate::IOResult::IO(io) => {
+                yielded |= io.is_explicit_yield();
+                io.wait(database.io.as_ref()).unwrap();
+            }
+        }
+    }
+    assert!(
+        yielded,
+        "the commit-dependency wait should surface as an explicit yield"
+    );
+
+    // Let the parked commit finish. The dependency resolves and the same
+    // connect state runs to completion with fresh stats.
+    loop {
+        match parked.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                if let Some(io) = parked.take_io_completions() {
+                    io.wait(database.io.as_ref()).unwrap();
+                }
+            }
+            other => panic!("unexpected step result finishing ANALYZE: {other:?}"),
+        }
+    }
+    let conn = loop {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(conn) => break conn,
+            crate::IOResult::IO(io) => io.wait(database.io.as_ref()).unwrap(),
+        }
+    };
+    let schema = conn.schema.read();
+    assert!(
+        schema.analyze_stats.table_stats("t1").is_some()
+            && schema.analyze_stats.table_stats("t2").is_some(),
+        "connect_async should load the committed ANALYZE stats: {:?}",
+        schema.analyze_stats
+    );
+}
+
+/// Abandoning a connect whose stats refresh is parked on another transaction
+/// must not block: the state drops its half-built connection and the nested
+/// `sqlite_stat1` statement, whose reset only rolls a read transaction back.
+#[test]
+fn dropping_connect_async_state_mid_wait_does_not_block() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let database = db.get_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t1 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t1 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    writer.execute("ANALYZE").unwrap();
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
+    ])));
+    let mut parked = writer.prepare("ANALYZE t1").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
+        crate::StepResult::Yield
+    ));
+    writer.set_yield_injector(None);
+
+    let mut state = crate::ConnectAsyncState::new();
+    let mut yielded = false;
+    for _ in 0..100 {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(_) => panic!("connect must wait for the parked commit"),
+            crate::IOResult::IO(io) => {
+                yielded |= io.is_explicit_yield();
+                io.wait(database.io.as_ref()).unwrap();
+            }
+        }
+    }
+    assert!(yielded);
+    // The abandonment under test. If it blocked, this test would hang.
+    drop(state);
+
+    loop {
+        match parked.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                if let Some(io) = parked.take_io_completions() {
+                    io.wait(database.io.as_ref()).unwrap();
+                }
+            }
+            other => panic!("unexpected step result finishing ANALYZE: {other:?}"),
+        }
+    }
+    let conn = writer;
+    drop(conn);
+    // A fresh blocking connect works once nothing is parked.
+    let conn = db.connect();
+    assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
+}

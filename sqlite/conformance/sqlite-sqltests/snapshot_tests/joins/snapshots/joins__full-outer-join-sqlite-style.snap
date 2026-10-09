@@ -1,0 +1,65 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT h.order_id, h.customer_name, i.item_id, i.product
+      FROM h_orders h
+      FULL OUTER JOIN h_items i ON h.customer_name = i.order_name;
+info:
+  statement_type: SELECT
+  tables:
+  - h.customer_name
+  - h_items
+  - h_orders
+  setup_blocks:
+  - hash_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN h_orders AS h
+|--SCAN h_items AS i LEFT-JOIN
+`--RIGHT-JOIN i
+   `--SCAN h_items AS i
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4            p5  comment
+   0      Init              0  39   0                 0  Start at 39
+   1      OpenRead          0   2   0  k(3,B,B,B)     0  table=h_orders, root=2, iDb=0
+   2      OpenRead          2   3   0  k(4,B,B,B,B)   0  table=h_items, root=3, iDb=0
+   3      Null              0   7   0                 0  r[7]=NULL
+   4      OpenEphemeral     1   0   0                 0  cursor=1 is_table=false
+   5      Rewind            0  30   0                 0  Rewind table h_orders
+   6        Integer         0   5   0                 0  r[5]=0
+   7        Rewind          2  25   0                 0  Rewind table h_items
+   8          Column        0   1   9                 0  r[9]=h_orders.customer_name
+   9          Column        2   1  10                 0  r[10]=h_items.order_name
+  10          Ne            9  10  23  Binary         0  if r[9]!=r[10] goto 23
+  11          RowId         2   6   0                 0  r[6]=h_items.rowid
+  12          Found         1  16   6                 0  if found goto 16
+  13          MakeRecord    6   1  11                 0  r[11]=mkrec(r[6..6])
+  14          IdxInsert     1  11   6                 0  key=r[11]
+  15          FilterAdd     1   6   1                 0  bloom_filter_add(r[6..7])
+  16          Integer       1   5   0                 0  r[5]=1
+  17          BeginSubrtn   7   0   0                 0  r[7]=NULL
+  18          RowId         0   1   0                 0  r[1]=h_orders.rowid
+  19          Column        0   1   2                 0  r[2]=h_orders.customer_name
+  20          RowId         2   3   0                 0  r[3]=h_items.rowid
+  21          Column        2   2   4                 0  r[4]=h_items.product
+  22          ResultRow     1   4   0                 0  output=r[1..4]
+  23        Return          7   0   1                 0
+  24      Next              2   8   0                 1
+  25    Return              7   0   1                 0
+  26    IfPos               5  29   0                 0  r[5]>0 -> r[5]-=0, goto 29
+  27    NullRow             2   0   0                 0  Set cursor 2 to a (pseudo) NULL row
+  28    Goto                0  16   0                 0
+  29  Next                  0   6   0                 1
+  30  NullRow               0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
+  31  OpenRead              2   3   0  k(4,B,B,B,B)   0  table=h_items, root=3, iDb=0
+  32  Rewind                2  38   0                 0  Rewind table h_items
+  33    RowId               2   6   0                 0  r[6]=h_items.rowid
+  34    Filter              1  36   6                 1  if !bloom_filter(r[6..7]) goto 36
+  35    Found               1  37   6                 0  if found goto 37
+  36    Gosub               7  18   0                 0
+  37  Next                  2  33   0                 1
+  38  Halt                  0   0   0                 0
+  39  Transaction           0   1   3                 0  iDb=0 tx_mode=Read
+  40  Goto                  0   1   0                 0

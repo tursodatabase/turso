@@ -1,4 +1,5 @@
 #include "TursoStatementHostObject.h"
+#include "TursoArrayBuffer.h"
 
 extern "C" {
 #include <turso.h>
@@ -19,137 +20,138 @@ void TursoStatementHostObject::throwError(jsi::Runtime &rt, const char *error) {
 
 jsi::Value TursoStatementHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "bindPositionalNull") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->bindPositionalNull(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->bindPositionalNull(rt, args, count);
             });
     }
     if (propName == "bindPositionalInt") {
         return jsi::Function::createFromHostFunction(rt, name, 2,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->bindPositionalInt(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->bindPositionalInt(rt, args, count);
             });
     }
     if (propName == "bindPositionalDouble") {
         return jsi::Function::createFromHostFunction(rt, name, 2,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->bindPositionalDouble(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->bindPositionalDouble(rt, args, count);
             });
     }
     if (propName == "bindPositionalBlob") {
         return jsi::Function::createFromHostFunction(rt, name, 2,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->bindPositionalBlob(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->bindPositionalBlob(rt, args, count);
             });
     }
     if (propName == "bindPositionalText") {
         return jsi::Function::createFromHostFunction(rt, name, 2,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->bindPositionalText(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->bindPositionalText(rt, args, count);
             });
     }
     if (propName == "execute") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->execute(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->execute(rt);
             });
     }
     if (propName == "step") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->step(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->step(rt);
             });
     }
     if (propName == "runIo") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->runIo(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->runIo(rt);
             });
     }
     if (propName == "reset") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->reset(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->reset(rt);
             });
     }
     if (propName == "finalize") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->finalize(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->finalize(rt);
             });
     }
     if (propName == "nChange") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->nChange(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->nChange(rt);
             });
     }
     if (propName == "columnCount") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->columnCount(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->columnCount(rt);
             });
     }
     if (propName == "columnName") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->columnName(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->columnName(rt, args, count);
             });
     }
     if (propName == "rowValueKind") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueKind(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueKind(rt, args, count);
             });
     }
     if (propName == "rowValueBytesCount") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueBytesCount(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueBytesCount(rt, args, count);
             });
     }
     if (propName == "rowValueBytesPtr") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueBytesPtr(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueBytesPtr(rt, args, count);
             });
     }
     if (propName == "rowValueText") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueText(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueText(rt, args, count);
             });
     }
     if (propName == "rowValueInt") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueInt(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueInt(rt, args, count);
             });
     }
     if (propName == "rowValueDouble") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->rowValueDouble(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->rowValueDouble(rt, args, count);
             });
     }
     if (propName == "namedPosition") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->namedPosition(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->namedPosition(rt, args, count);
             });
     }
     if (propName == "parametersCount") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->parametersCount(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->parametersCount(rt);
             });
     }
     if (propName == "getAllRows") {
         return jsi::Function::createFromHostFunction(rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getAllRows(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getAllRows(rt);
             });
     }
 
@@ -369,10 +371,8 @@ jsi::Value TursoStatementHostObject::rowValueBytesPtr(jsi::Runtime &rt, const js
     }
 
     // Create ArrayBuffer and copy data
-    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(bytes)).asObject(rt);
-    jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-    memcpy(buf.data(rt), ptr, bytes);
+    jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, static_cast<uint64_t>(bytes));
+    memcpy(arrayBuffer.data(rt), ptr, arrayBuffer.size(rt));
 
     return arrayBuffer;
 }
@@ -502,12 +502,10 @@ jsi::Value TursoStatementHostObject::getAllRows(jsi::Runtime &rt) {
                 case TURSO_TYPE_BLOB: {
                     const char* ptr = turso_statement_row_value_bytes_ptr(stmt_, idx);
                     int64_t len = turso_statement_row_value_bytes_count(stmt_, idx);
-                    size_t blobLen = (len > 0) ? static_cast<size_t>(len) : 0;
-                    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-                    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(blobLen)).asObject(rt);
+                    uint64_t blobLen = (len > 0) ? static_cast<uint64_t>(len) : 0;
+                    jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, blobLen);
                     if (ptr && blobLen > 0) {
-                        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-                        memcpy(buf.data(rt), ptr, blobLen);
+                        memcpy(arrayBuffer.data(rt), ptr, arrayBuffer.size(rt));
                     }
                     row.setProperty(rt, colNames[i].c_str(), std::move(arrayBuffer));
                     break;

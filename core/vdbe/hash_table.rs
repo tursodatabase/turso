@@ -987,7 +987,7 @@ pub struct HashTable {
     temp_store: crate::TempStore,
     /// Whether to track matched entries (for FULL OUTER JOIN).
     track_matched: bool,
-    /// Parallel to `buckets`: one Vec<bool> per bucket tracking which entries were matched.
+    /// Parallel to `buckets`: one `Vec<bool>` per bucket tracking which entries were matched.
     matched_bits: Vec<Vec<bool>>,
     /// Bucket index for iterating unmatched entries.
     unmatched_scan_bucket: usize,

@@ -7,8 +7,6 @@ use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -168,8 +166,7 @@ fn bench_recovery(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .sample_size(10)
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+        .sample_size(10);
     targets = bench_recovery
 }
 

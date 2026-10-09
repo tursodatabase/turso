@@ -1,4 +1,8 @@
 use super::*;
+use crate::translate::plan::{
+    merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
+    OuterQueryReference, ResolvedColumn,
+};
 
 /// The precedence of binding identifiers to columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +83,32 @@ pub(super) fn resolve_qualified_on_ref(
     Ok(None)
 }
 
+/// The result of one qualified-name search in one table reference.
+#[derive(Clone, Copy)]
+enum QualifiedTableMatch {
+    /// The qualifier does not name this table reference.
+    NoTable,
+    /// The qualifier names this table reference, but its column does not exist.
+    NoColumn,
+    /// The qualifier and column both match this table reference.
+    Found(QualifiedMatch),
+    /// More than one column in this table reference matches the name.
+    Ambiguous,
+}
+
+/// The result of searching the current scope and its parent scopes.
+#[derive(Clone, Copy)]
+enum QualifiedNameMatch {
+    /// No visible query scope contains the requested table.
+    NoTable,
+    /// A visible table exists, but its column does not exist.
+    NoColumn,
+    /// One visible column matches the requested name.
+    Found(TableInternalId, QualifiedMatch),
+    /// More than one visible column matches the requested name.
+    Ambiguous,
+}
+
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
@@ -116,45 +146,22 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         }
                     }
-                    let mut match_result = None;
                     let joined_tables = referenced_tables.joined_tables();
-
                     // First check joined tables
+                    if let Some(resolved_column) =
+                        resolve_unqualified_column(joined_tables, id.as_str())?
+                    {
+                        *expr = resolved_column.expr;
+                        // FULL JOIN can make the merged value read several table columns.
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    // No real column matched. SQLite now tries rowid names before outer scopes.
                     for joined_table in joined_tables.iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if col_idx.is_some() {
-                            if match_result.is_some() {
-                                let mut ok = false;
-                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                // and the left table is used.
-                                if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
-                                        ok = true;
-                                    }
-                                }
-                                if !ok {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
-                                }
-                            } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
-                            }
-                        // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Table::BTree(btree) = &joined_table.table {
+                        if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) =
                                 parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
                                     joined_tables.len() != 1
@@ -189,56 +196,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     //
                     // Ambiguity is only checked within the same scope depth. Once a match
                     // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
-                    if match_result.is_none() {
-                        let mut matched_scope_depth = None;
-                        for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            // Definition-only entries let a FROM clause find a CTE by
-                            // name; the CTE's columns are visible only after a FROM
-                            // clause actually adds the table. Every other outer ref is
-                            // a real table in an enclosing scope, including CTEs and
-                            // the recursive self-reference, and its columns can be
-                            // referenced without qualification.
-                            if outer_ref.cte_definition_only {
-                                continue;
-                            }
-                            // Skip refs from deeper scopes once we found a match
-                            if let Some(depth) = matched_scope_depth {
-                                if outer_ref.scope_depth > depth {
-                                    continue;
-                                }
-                            }
-                            let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                            });
-                            if col_idx.is_some() {
-                                let col_idx = col_idx.unwrap();
-                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
-                                    continue;
-                                }
-                                if match_result.is_some() {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
-                                }
-                                let col = outer_ref.table.columns().get(col_idx).unwrap();
-                                match_result =
-                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
-                                matched_scope_depth = Some(outer_ref.scope_depth);
-                            }
+                    if let Some(resolved_column) =
+                        resolve_unqualified_outer_column(referenced_tables, &normalized_id)?
+                    {
+                        *expr = resolved_column.expr;
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
                         }
-                    }
-
-                    if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: table_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(table_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
 
@@ -266,16 +230,8 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 Expr::Qualified(tbl, id) => {
                     crate::stack::trace_stack!("bind_qualified");
-                    // Resolve a `<tbl>.<id>` reference.
-                    //
-                    // Two-stage lookup with shadowing:
-                    //   1. Search the current scope's FROM tables (`joined_tables`).
-                    //   2. Fall back to enclosing scopes (`outer_query_refs`), restricted to
-                    //      the *nearest* scope whose identifier matches — so an inner alias
-                    //      shadows a same-named alias in an outer scope instead of conflicting.
-                    //
-                    // Produces either `Expr::Column` (real column) or `Expr::RowId`
-                    // (bare rowid alias like `t.rowid` on a btree with rowids).
+                    // A qualifier without the requested column does not hide
+                    // a matching column in an outer scope.
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -290,119 +246,15 @@ pub fn bind_and_rewrite_expr<'a>(
                     let normalized_table_name = normalize_ident(tbl.as_str());
                     let normalized_id = normalize_ident(id.as_str());
 
-                    // `resolved` holds the accepted binding (at most one).
-                    // `identifier_matched` is true once *any* scope produced a table whose
-                    // identifier equals `tbl`; it distinguishes "no such table" from
-                    // "no such column" in error reporting below.
-                    let mut resolved: Option<(TableInternalId, QualifiedMatch)> = None;
-                    let mut identifier_matched = false;
-
-                    let ambiguous = || -> LimboError {
-                        LimboError::ParseError(format!(
-                            "ambiguous column name: {}.{}",
-                            tbl.as_str(),
-                            id.as_str()
-                        ))
-                    };
-
-                    // --- Stage 1: search the current scope's FROM tables. ---
-                    for joined_table in referenced_tables
-                        .joined_tables()
-                        .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
-                    {
-                        identifier_matched = true;
-                        let Some(candidate) = resolve_qualified_on_ref(
-                            &joined_table.table,
-                            joined_table.internal_id,
-                            &normalized_id,
-                        )?
-                        else {
-                            continue;
-                        };
-
-                        // Multiple FROM tables share this identifier and both contain `id`.
-                        // For column matches, a USING/NATURAL join on `id` lets the first
-                        // match stand (the duplicate side is implicitly merged). Rowid
-                        // matches never get this exception (rowid isn't a USING column).
-                        if resolved.is_some() {
-                            let allowed_by_using =
-                                matches!(candidate, QualifiedMatch::Column { .. })
-                                    && joined_table.join_info.as_ref().is_some_and(|ji| {
-                                        ji.using.iter().any(|u| {
-                                            u.as_str().eq_ignore_ascii_case(&normalized_id)
-                                        })
-                                    });
-                            if !allowed_by_using {
-                                return Err(ambiguous());
-                            }
-                            continue;
-                        }
-                        resolved = Some((joined_table.internal_id, candidate));
-                    }
-                    // --- Stage 2: fall back to enclosing scopes ---
-                    // Only attempted if no inner-scope table matched the identifier — an
-                    // inner alias of the same name shadows everything outside.
-                    //
-                    // We pick the *nearest* outer scope that contains a matching identifier
-                    // (smallest `scope_depth`) and search only refs at that depth. This lets
-                    // the same alias be reused at different nesting levels without triggering
-                    // spurious "ambiguous column" errors across unrelated scopes.
-                    //
-                    // `cte_definition_only` refs are excluded: those entries exist purely so
-                    // that a subquery's FROM clause can *look up* the CTE by name; once the
-                    // CTE is consumed into a FROM, column resolution must go through the
-                    // corresponding `joined_table`, not the definition-only ref.
-                    if !identifier_matched {
-                        let nearest_outer_scope = referenced_tables
-                            .outer_query_refs()
-                            .iter()
-                            .filter(|t| {
-                                !t.cte_definition_only && t.identifier == normalized_table_name
-                            })
-                            .map(|t| t.scope_depth)
-                            .min();
-
-                        if let Some(scope_depth) = nearest_outer_scope {
-                            identifier_matched = true;
-                            for outer_ref in
-                                referenced_tables.outer_query_refs().iter().filter(|t| {
-                                    !t.cte_definition_only
-                                        && t.scope_depth == scope_depth
-                                        && t.identifier == normalized_table_name
-                                })
-                            {
-                                let Some(candidate) = resolve_qualified_on_ref(
-                                    &outer_ref.table,
-                                    outer_ref.internal_id,
-                                    &normalized_id,
-                                )?
-                                else {
-                                    continue;
-                                };
-
-                                // When multiple outer refs share this identifier
-                                // (e.g. self-join `t1 JOIN t1 USING(a)`), a USING-hidden
-                                // column on the duplicate side lets the first match stand,
-                                // mirroring the Stage 1 logic for local-scope tables.
-                                if resolved.is_some() {
-                                    let allowed_by_using = matches!(
-                                        candidate,
-                                        QualifiedMatch::Column { col_idx, .. }
-                                            if outer_ref.using_dedup_hidden_cols.get(col_idx)
-                                    );
-                                    if !allowed_by_using {
-                                        return Err(ambiguous());
-                                    }
-                                    continue;
-                                }
-                                resolved = Some((outer_ref.internal_id, candidate));
-                            }
-                        }
-                    }
+                    let qualified_match = resolve_qualified_name(
+                        referenced_tables,
+                        None,
+                        &normalized_table_name,
+                        &normalized_id,
+                    )?;
 
                     // --- Error reporting. ---
-                    if resolved.is_none() && !identifier_matched {
+                    if matches!(qualified_match, QualifiedNameMatch::NoTable) {
                         // No scope contains a table with this identifier. Normally we
                         // report "no such table", but there is one case where SQLite
                         // reports "no such column" instead: when the identifier names a
@@ -459,34 +311,21 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
-                    // Identifier matched somewhere but no column/rowid binding was
-                    // produced — the table exists, the column doesn't.
-                    let Some((tbl_id, binding)) = resolved else {
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
-                    };
-
-                    match binding {
-                        QualifiedMatch::Column {
-                            col_idx,
-                            is_rowid_alias,
-                        } => {
-                            *expr = Expr::Column {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                                column: col_idx,
-                                is_rowid_alias,
-                            };
-                            tracing::debug!("rewritten to column");
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                    match qualified_match {
+                        QualifiedNameMatch::Found(table_id, column) => {
+                            bind_qualified_name(expr, referenced_tables, None, table_id, column)
                         }
-                        QualifiedMatch::RowId => {
-                            *expr = Expr::RowId {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                            };
-                            tracing::debug!("rewritten to rowid");
-                            referenced_tables.mark_rowid_referenced(tbl_id);
-                        }
+                        QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        ),
+                        QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        ),
+                        QualifiedNameMatch::NoTable => unreachable!("handled above"),
                     }
                     return Ok(WalkControl::Continue);
                 }
@@ -524,6 +363,39 @@ pub fn bind_and_rewrite_expr<'a>(
                         alias: None,
                     };
                     let db_resolution = resolver.resolve_database_id(&qualified_name);
+
+                    if let Ok(database_id) = db_resolution.as_ref() {
+                        match resolve_qualified_name(
+                            referenced_tables,
+                            Some(*database_id),
+                            &tbl_name_str,
+                            &normalized_col_name,
+                        )? {
+                            QualifiedNameMatch::Found(table_id, column) => {
+                                bind_qualified_name(
+                                    expr,
+                                    referenced_tables,
+                                    Some(*database_id),
+                                    table_id,
+                                    column,
+                                );
+                                return Ok(WalkControl::Continue);
+                            }
+                            QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
+                                "no such column: {}.{}.{}",
+                                db_name_str,
+                                tbl_name_str,
+                                col_name_str
+                            ),
+                            QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
+                                "ambiguous column name: {}.{}.{}",
+                                db_name_str,
+                                tbl_name_str,
+                                col_name_str
+                            ),
+                            QualifiedNameMatch::NoTable => {}
+                        }
+                    }
 
                     // Try db.table.column interpretation first. If database resolves AND
                     // the table+column exist, use that. Otherwise fall through to
@@ -710,6 +582,336 @@ pub fn bind_and_rewrite_expr<'a>(
         },
     )?;
     Ok(())
+}
+
+/// Bind an unqualified name to a column of an outer query, closest scope first.
+///
+/// Within one scope the outer query's USING rules apply, as they do in that
+/// query itself (see [unqualified_column_sources]). In
+/// `SELECT (SELECT a) FROM t1 FULL JOIN t2 USING(a)`, the inner `a` is the
+/// merged value of `t1.a` and `t2.a`, not just `t1.a`.
+fn resolve_unqualified_outer_column(
+    table_references: &TableReferences,
+    column_name: &str,
+) -> Result<Option<ResolvedColumn>> {
+    // Definition-only entries let a FROM clause find a CTE by name; the CTE's
+    // columns are visible only after a FROM clause adds the table.
+    let outer_refs: Vec<&OuterQueryReference> = table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|outer_ref| !outer_ref.cte_definition_only)
+        .collect();
+    let mut scope_depths: Vec<usize> = outer_refs.iter().map(|r| r.scope_depth).collect();
+    scope_depths.sort_unstable();
+    scope_depths.dedup();
+    let is_rowid_name = crate::translate::planner::ROWID_STRS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(column_name));
+    for scope_depth in scope_depths {
+        let scope: Vec<&OuterQueryReference> = outer_refs
+            .iter()
+            .copied()
+            .filter(|outer_ref| outer_ref.scope_depth == scope_depth)
+            .collect();
+        let has_declared_column = is_rowid_name
+            && scope.iter().any(|outer_ref| {
+                !matches!(
+                    lookup_unqualified_column(&outer_ref.table, column_name, false),
+                    ColumnLookup::Missing
+                )
+            });
+        let found = unqualified_column_sources(
+            &scope,
+            column_name,
+            |outer_ref| outer_ref.join_info.as_ref(),
+            |outer_ref| {
+                lookup_unqualified_column(&outer_ref.table, column_name, !has_declared_column)
+            },
+        );
+        if found.ambiguous {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+        if found.sources.is_empty() {
+            continue;
+        }
+        return Ok(Some(merge_columns(found.sources.into_iter().map(
+            |(scope_index, column_index)| {
+                let outer_ref = scope[scope_index];
+                (outer_ref.internal_id, &outer_ref.table, column_index)
+            },
+        ))));
+    }
+    Ok(None)
+}
+
+/// Find one column by its unqualified name.
+///
+/// A parenthesized join can keep several source columns with the same name.
+/// Hidden source copies do not take part in an unqualified lookup.
+pub(in crate::translate) fn find_unqualified_column(
+    table: &Table,
+    column_name: &str,
+) -> Result<Option<usize>> {
+    find_unqualified_column_with_rowid(table, column_name, true)
+}
+
+fn find_unqualified_column_with_rowid(
+    table: &Table,
+    column_name: &str,
+    include_rowid: bool,
+) -> Result<Option<usize>> {
+    match lookup_unqualified_column(table, column_name, include_rowid) {
+        ColumnLookup::Found(column_index) => Ok(Some(column_index)),
+        ColumnLookup::Missing => Ok(None),
+        ColumnLookup::Ambiguous => {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name)
+        }
+    }
+}
+
+/// Like [find_unqualified_column_with_rowid], but reports an ambiguous name
+/// instead of failing, so a later RIGHT JOIN USING can still replace it.
+pub(in crate::translate) fn lookup_unqualified_column(
+    table: &Table,
+    column_name: &str,
+    include_rowid: bool,
+) -> ColumnLookup {
+    let Some(join_columns) = table.parenthesized_join_columns() else {
+        return match table.get_column_by_name(column_name) {
+            Some((column_index, _)) => ColumnLookup::Found(column_index),
+            None => ColumnLookup::Missing,
+        };
+    };
+    let candidates = join_columns.iter().enumerate().filter(|(_, join_column)| {
+        join_column.source.matches_column_name(column_name)
+            && if join_column.source.is_rowid() {
+                include_rowid
+            } else {
+                join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+            }
+    });
+    match pick_parenthesized_join_column(candidates) {
+        Ok(Some(column_index)) => ColumnLookup::Found(column_index),
+        Ok(None) => ColumnLookup::Missing,
+        Err(()) => ColumnLookup::Ambiguous,
+    }
+}
+
+/// Search the current query first, then search the nearest outer query.
+fn resolve_qualified_name(
+    table_references: &TableReferences,
+    database_id: Option<usize>,
+    table_name: &str,
+    column_name: &str,
+) -> Result<QualifiedNameMatch> {
+    let mut table_found = false;
+    let mut found = None;
+    for joined_table in table_references.joined_tables() {
+        let candidate = match_qualified_name_in_table(
+            &joined_table.table,
+            joined_table.internal_id,
+            &joined_table.identifier,
+            if database_id == Some(joined_table.database_id)
+                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
+            {
+                None
+            } else {
+                database_id
+            },
+            table_name,
+            column_name,
+        )?;
+        match candidate {
+            QualifiedTableMatch::NoTable => continue,
+            QualifiedTableMatch::NoColumn => table_found = true,
+            QualifiedTableMatch::Ambiguous => return Ok(QualifiedNameMatch::Ambiguous),
+            QualifiedTableMatch::Found(column) => {
+                table_found = true;
+                if found.is_some() {
+                    let duplicate_is_merged = matches!(column, QualifiedMatch::Column { .. })
+                        && joined_table
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|join| join.merges_column(column_name));
+                    if !duplicate_is_merged {
+                        return Ok(QualifiedNameMatch::Ambiguous);
+                    }
+                } else {
+                    found = Some((joined_table.internal_id, column));
+                }
+            }
+        }
+    }
+    if let Some((table_id, column)) = found {
+        return Ok(QualifiedNameMatch::Found(table_id, column));
+    }
+
+    let mut nearest_scope = None;
+    let mut ambiguous = false;
+    for outer_ref in table_references.outer_query_refs() {
+        if outer_ref.cte_definition_only {
+            continue;
+        }
+        if nearest_scope.is_some_and(|scope| outer_ref.scope_depth > scope) {
+            continue;
+        }
+        let candidate = match_qualified_name_in_table(
+            &outer_ref.table,
+            outer_ref.internal_id,
+            &outer_ref.identifier,
+            database_id,
+            table_name,
+            column_name,
+        )?;
+        if matches!(candidate, QualifiedTableMatch::NoColumn) {
+            table_found = true;
+            continue;
+        }
+        if matches!(candidate, QualifiedTableMatch::NoTable) {
+            continue;
+        }
+        if nearest_scope.is_none_or(|scope| outer_ref.scope_depth < scope) {
+            nearest_scope = Some(outer_ref.scope_depth);
+            found = None;
+            ambiguous = false;
+        }
+        match candidate {
+            QualifiedTableMatch::Ambiguous => ambiguous = true,
+            QualifiedTableMatch::Found(column) if found.is_some() => {
+                let duplicate_is_merged = matches!(
+                    column,
+                    QualifiedMatch::Column { col_idx, .. }
+                        if outer_ref_merges_column(outer_ref, col_idx)
+                );
+                ambiguous |= !duplicate_is_merged;
+            }
+            QualifiedTableMatch::Found(column) => {
+                found = Some((outer_ref.internal_id, column));
+            }
+            QualifiedTableMatch::NoTable | QualifiedTableMatch::NoColumn => {}
+        }
+    }
+
+    if ambiguous {
+        Ok(QualifiedNameMatch::Ambiguous)
+    } else if let Some((table_id, column)) = found {
+        Ok(QualifiedNameMatch::Found(table_id, column))
+    } else if table_found || nearest_scope.is_some() {
+        Ok(QualifiedNameMatch::NoColumn)
+    } else {
+        Ok(QualifiedNameMatch::NoTable)
+    }
+}
+
+/// Whether the join that added this outer table merged the column with USING.
+fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize) -> bool {
+    let Some(join_info) = outer_ref.join_info.as_ref() else {
+        return false;
+    };
+    outer_ref.table.columns()[column_index]
+        .name
+        .as_deref()
+        .is_some_and(|name| join_info.merges_column(name))
+}
+
+/// Match a qualified name against one table reference.
+///
+/// SQLite lets an outer query refer to tables inside a parenthesized join.
+/// If no inner column matches, the query can use the group's alias.
+fn match_qualified_name_in_table(
+    table: &Table,
+    table_id: TableInternalId,
+    table_reference_name: &str,
+    database_id: Option<usize>,
+    table_name: &str,
+    column_name: &str,
+) -> Result<QualifiedTableMatch> {
+    if let Some(join_columns) = table.parenthesized_join_columns() {
+        let mut table_columns = join_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, join_column)| join_column.source.matches_table(database_id, table_name))
+            .peekable();
+        let table_found = table_columns.peek().is_some();
+        let candidates = table_columns
+            .filter(|(_, join_column)| join_column.source.matches_column_name(column_name));
+        let Ok(column) = pick_parenthesized_join_column(candidates) else {
+            return Ok(QualifiedTableMatch::Ambiguous);
+        };
+        if let Some(col_idx) = column {
+            return Ok(QualifiedTableMatch::Found(QualifiedMatch::Column {
+                col_idx,
+                is_rowid_alias: table.columns()[col_idx].is_rowid_alias(),
+            }));
+        }
+        if table_found && !table_reference_name.eq_ignore_ascii_case(table_name) {
+            return Ok(QualifiedTableMatch::NoColumn);
+        }
+    }
+
+    if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
+        return Ok(QualifiedTableMatch::NoTable);
+    }
+    Ok(
+        match resolve_qualified_on_ref(table, table_id, column_name)? {
+            Some(column) => QualifiedTableMatch::Found(column),
+            None => QualifiedTableMatch::NoColumn,
+        },
+    )
+}
+
+/// A real column wins over an implicit rowid. Two real columns, or two
+/// implicit rowids without a real column, make the name ambiguous.
+fn pick_parenthesized_join_column<'a>(
+    candidates: impl Iterator<Item = (usize, &'a ParenthesizedJoinColumn)>,
+) -> std::result::Result<Option<usize>, ()> {
+    let mut real_column = None;
+    let mut rowid_column = None;
+    let mut rowid_is_ambiguous = false;
+    for (column_index, join_column) in candidates {
+        if join_column.source.is_rowid() {
+            rowid_is_ambiguous |= rowid_column.replace(column_index).is_some();
+        } else if real_column.replace(column_index).is_some() {
+            return Err(());
+        }
+    }
+    if real_column.is_none() && rowid_is_ambiguous {
+        return Err(());
+    }
+    Ok(real_column.or(rowid_column))
+}
+
+/// Replace a qualified name with its bound column and record the read.
+fn bind_qualified_name(
+    expr: &mut Expr,
+    table_references: &mut TableReferences,
+    database_id: Option<usize>,
+    table_id: TableInternalId,
+    column: QualifiedMatch,
+) {
+    match column {
+        QualifiedMatch::Column {
+            col_idx,
+            is_rowid_alias,
+        } => {
+            *expr = Expr::Column {
+                database: database_id,
+                table: table_id,
+                column: col_idx,
+                is_rowid_alias,
+            };
+            tracing::debug!("rewritten to column");
+            table_references.mark_column_used(table_id, col_idx);
+        }
+        QualifiedMatch::RowId => {
+            *expr = Expr::RowId {
+                database: database_id,
+                table: table_id,
+            };
+            tracing::debug!("rewritten to rowid");
+            table_references.mark_rowid_referenced(table_id);
+        }
+    }
 }
 
 /// Extract a string literal value from an expression that has already been

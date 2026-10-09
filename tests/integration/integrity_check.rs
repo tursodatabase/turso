@@ -1999,3 +1999,73 @@ fn test_blob_read_corrupt_spilled_header_overflow_no_panic(db: TempDatabase) {
     });
     assert_that!(read_result).is_err();
 }
+
+/// Reads the page at `page_no` (1-based) from the database file.
+#[cfg(not(feature = "checksum"))]
+fn read_page(path: &std::path::Path, page_no: u64) -> [u8; PAGE_SIZE] {
+    let mut file = OpenOptions::new().read(true).open(path).unwrap();
+    let mut page = [0u8; PAGE_SIZE];
+    file.seek(SeekFrom::Start((page_no - 1) * PAGE_SIZE as u64))
+        .unwrap();
+    file.read_exact(&mut page).unwrap();
+    page
+}
+
+/// Writes `page` back to the database file at `page_no` (1-based).
+#[cfg(not(feature = "checksum"))]
+fn write_page(path: &std::path::Path, page_no: u64, page: &[u8; PAGE_SIZE]) {
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start((page_no - 1) * PAGE_SIZE as u64))
+        .unwrap();
+    file.write_all(page).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A child pointer that points back at the root page makes the tree a loop.
+/// Reading the table and dropping it must both report corruption; the page
+/// stack used to assert when the same page was pushed twice, which aborts
+/// any process using the C API on a merely corrupt file (corruptJ.test
+/// and corrupt4.test).
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_child_pointer_back_to_root_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a, b);").unwrap();
+    conn.execute(
+        "WITH RECURSIVE c(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM c WHERE i<100) \
+         INSERT INTO t1(a, b) SELECT i, zeroblob(700) FROM c;",
+    )
+    .unwrap();
+    checkpoint_database(&conn);
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+
+    // Page 2 is the t1 root, an interior table page. Its first cell starts
+    // with the left child page number; point it back at the root.
+    let mut page = read_page(&path, 2);
+    assert_eq!(page[0], 0x05, "expected an interior table page");
+    let first_cell = read_u16_be(&page, 12) as usize;
+    page[first_cell..first_cell + 4].copy_from_slice(&2u32.to_be_bytes());
+    write_page(&path, 2, &page);
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    for sql in ["SELECT count(*) FROM t1;", "DROP TABLE t1;"] {
+        assert_statement_fails_without_panic(&conn, sql, "a tree whose child points at its root");
+    }
+}
+
+#[cfg(not(feature = "checksum"))]
+fn assert_statement_fails_without_panic(conn: &Arc<turso_core::Connection>, sql: &str, what: &str) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut stmt = conn.prepare(sql)?;
+        stmt.run_with_row_callback(|_| Ok(()))?;
+        Ok::<(), turso_core::LimboError>(())
+    }));
+    match result {
+        Ok(Ok(())) => panic!("{sql} succeeded on {what}"),
+        Ok(Err(_)) => {}
+        Err(_) => panic!("{sql} panicked instead of returning an error on {what}"),
+    }
+}

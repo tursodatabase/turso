@@ -34,7 +34,7 @@ use crate::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
-        PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, SyncEngineStats,
+        PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult, SyncEngineStats,
         DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
@@ -55,7 +55,7 @@ pub struct DatabaseSyncEngineOpts {
     /// Experimental [`turso_core::DatabaseOpts`] applied whenever the sync
     /// engine opens the local database itself (the main connection in
     /// [`DatabaseSyncEngine::create_db`] and the revert connection in
-    /// [`DatabaseSyncEngine::open_revert_db_conn`]). Bindings translate their
+    /// `DatabaseSyncEngine::open_revert_db_conn`). Bindings translate their
     /// user-facing experimental feature list into these options. Note that
     /// callers which open the main database on their own (e.g. the sdk-kit
     /// path) must still apply the same options there — this field only governs
@@ -63,8 +63,8 @@ pub struct DatabaseSyncEngineOpts {
     pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
-    pub remote_encryption_key: Option<String>,
-    /// When set, [`push_changes_to_remote`] sends the local change set to the
+    pub remote_encryption_key: Option<Secret>,
+    /// When set, [`DatabaseSyncEngine::push_changes_to_remote`] sends the local change set to the
     /// remote in multiple HTTP batches, sealing the current batch as soon as it
     /// has accumulated >= `push_operations_threshold` operations *and* the
     /// next batch boundary lines up with a transaction boundary in the local
@@ -596,7 +596,7 @@ fn resolve_remote_pull_protocol(
 /// instead. Never called for page-mode (legacy) replicas.
 fn ensure_logical_mvcc_pull_supported(
     partial_sync_active: bool,
-    remote_encryption_key: Option<&str>,
+    remote_encryption_key: Option<&Secret>,
 ) -> Result<()> {
     if partial_sync_active {
         return Err(Error::DatabaseSyncEngineError(
@@ -965,7 +965,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         .to_string(),
                 ));
             }
-            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_deref())?;
+            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_ref())?;
         }
 
         let configuration = DatabaseSavedConfiguration {
@@ -987,7 +987,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if meta.remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     )?;
                 }
                 if metadata_changed {
@@ -1010,7 +1010,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &sync_engine_io,
                         opts.remote_url.clone(),
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     ),
                     &io,
                     main_db_path,
@@ -1023,7 +1023,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     )?;
                 }
                 let meta = DatabaseMetadata {
@@ -1131,7 +1131,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
-        remote_encryption_key: Option<&str>,
+        remote_encryption_key: Option<&Secret>,
     ) -> Result<Arc<dyn DatabaseStorage>> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
@@ -1149,7 +1149,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             };
             tracing::info!("create LazyDatabaseStorage database storage");
-            let encoded_key = remote_encryption_key.map(|k| k.to_string());
+            let encoded_key = remote_encryption_key.cloned();
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
@@ -1298,7 +1298,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             sync_engine_io.clone(),
             &meta,
             main_db_path,
-            opts.remote_encryption_key.as_deref(),
+            opts.remote_encryption_key.as_ref(),
         )?;
 
         // Use async database opening that yields on IO for large schemas
@@ -1706,7 +1706,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.opts.remote_encryption_key.as_ref(),
         );
         let mut stream_kind =
             if self.opts.protocol_version_hint == DatabaseSyncEngineProtocolVersion::Legacy {
@@ -1787,7 +1787,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if detected == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     )?;
                     // Deferred replicas may still be in WAL mode locally; the
                     // MVCC page base must be applied to an MVCC-mode database.
@@ -2082,7 +2082,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &self.sync_engine_io,
                         self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     );
                     Some(apply_transformation(ctx, &local_changes, &local_replay.generator).await?)
                 } else {
@@ -2528,7 +2528,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 coro,
                                 &self.sync_engine_io,
                                 self.meta().remote_url(),
-                                self.opts.remote_encryption_key.as_deref(),
+                                self.opts.remote_encryption_key.as_ref(),
                             );
                             match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
                                 (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
@@ -2860,7 +2860,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &self.sync_engine_io,
                         self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     );
                     Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
                 } else {
@@ -3169,7 +3169,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.opts.remote_encryption_key.as_ref(),
         );
         let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
@@ -3272,7 +3272,8 @@ mod tests {
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSavedConfiguration,
             DatabaseSyncEngineProtocolVersion, DbChangesStatus, DbChangesStreamKind,
-            PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, DATABASE_METADATA_VERSION,
+            PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
+            DATABASE_METADATA_VERSION,
         },
         Result,
     };
@@ -3328,7 +3329,7 @@ mod tests {
 
     #[test]
     fn logical_mvcc_pull_with_remote_encryption_is_a_hard_error() {
-        assert!(ensure_logical_mvcc_pull_supported(false, Some("key")).is_err());
+        assert!(ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key"))).is_err());
     }
 
     #[test]
@@ -3776,6 +3777,16 @@ mod tests {
             pull_bytes_threshold: None,
             logical_mvcc_pull: Some(true),
         }
+    }
+
+    #[test]
+    fn opts_debug_output_hides_the_remote_encryption_key() {
+        let mut opts = default_test_opts();
+        opts.remote_encryption_key = Some(Secret::new("c2VjcmV0LWtleQ=="));
+        let printed = format!("{opts:?}");
+        assert!(!printed.contains("c2VjcmV0LWtleQ=="));
+        assert!(printed.contains("remote_encryption_key: Some(<redacted>)"));
+        assert!(printed.contains("client_name: \"test-client\""));
     }
 
     fn replace_base_guard_test_paths(
