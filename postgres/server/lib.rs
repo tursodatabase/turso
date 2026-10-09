@@ -638,6 +638,7 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
 fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
+        || upper.starts_with("SET")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
@@ -795,6 +796,17 @@ mod tests {
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         assert_eq!(*fields[0].datatype(), Type::INT4);
+    }
+
+    #[test]
+    fn test_set_transaction_is_non_query() {
+        assert!(is_pg_non_query(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        ));
+        assert!(is_pg_non_query("  set\ntransaction read only"));
+        assert!(!is_pg_non_query(
+            "SELECT set_config('search_path', '', false)"
+        ));
     }
 
     #[test]
