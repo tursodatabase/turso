@@ -2,6 +2,66 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_access_share_lock_retains_read_snapshot(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();
+    conn.execute("CREATE TABLE lock_other (v INTEGER)").unwrap();
+    conn.execute("INSERT INTO lock_items VALUES (17)").unwrap();
+    let writer = db.connect_postgres();
+    let mut lock = conn
+        .prepare("LOCK TABLE public.lock_items, ONLY public.lock_other IN ACCESS SHARE MODE")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(lock.run_collect_rows().unwrap().is_empty());
+    drop(lock);
+    assert!(!conn.inner().get_auto_commit());
+    for sql in [
+        "LOCK TABLE public.lock_items, public.missing_lock_table IN ACCESS SHARE MODE",
+        "LOCK TABLE missing_schema.lock_items IN ACCESS SHARE MODE",
+        "LOCK TABLE lock_items IN ROW EXCLUSIVE MODE",
+        "LOCK TABLE lock_items IN EXCLUSIVE MODE",
+        "LOCK TABLE lock_items IN ACCESS SHARE MODE NOWAIT",
+        "LOCK TABLE lock_items",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+        assert!(!conn.inner().get_auto_commit());
+    }
+    writer
+        .execute("INSERT INTO lock_items VALUES (29)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM lock_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17)]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert!(conn.inner().get_auto_commit());
+    assert_eq!(
+        conn.prepare("SELECT v FROM lock_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17)], vec![Value::from_i64(29)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_access_share_lock_requires_transaction_at_execution(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut stmt = conn
+        .prepare("LOCK TABLE lock_items IN ACCESS SHARE MODE")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let error = stmt.run_ignore_rows().unwrap_err();
+    assert!(error.to_string().contains("transaction blocks"), "{error}");
+    assert!(conn.inner().get_auto_commit());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_set_transaction_preserves_transaction(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("BEGIN").unwrap();
