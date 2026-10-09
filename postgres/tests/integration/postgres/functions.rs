@@ -2,6 +2,139 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[turso_macros::test(mvcc)]
+fn test_pg_array_subquery_preserves_query_results(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE array_items (v INTEGER, group_id INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO array_items VALUES (9, 1), (2, 2), (17, 1), (NULL, 1)")
+        .unwrap();
+    for (query, expected) in [
+        (
+            "SELECT v AS number FROM array_items WHERE group_id = 1
+             ORDER BY number DESC NULLS LAST LIMIT 3",
+            "17|9|<null>",
+        ),
+        (
+            "SELECT DISTINCT group_id FROM array_items ORDER BY group_id DESC",
+            "2|1",
+        ),
+        ("SELECT 17 UNION ALL SELECT 2 ORDER BY 1 DESC", "17|2"),
+        ("SELECT v FROM array_items WHERE group_id = 3", ""),
+        (
+            "WITH _turso_array_rows AS (SELECT 29 AS v) SELECT v FROM _turso_array_rows",
+            "29",
+        ),
+    ] {
+        assert_eq!(
+            query_text(
+                &conn,
+                &format!("SELECT array_to_string(ARRAY({query}), '|', '<null>')")
+            ),
+            vec![expected],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        query_text(
+            &conn,
+            "WITH _turso_array_rows AS (SELECT 29 AS v)
+        SELECT array_to_string(ARRAY(SELECT v FROM _turso_array_rows), '|')"
+        ),
+        vec!["29"]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT g.group_id, array_to_string(
+                ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id
+                      ORDER BY v NULLS LAST), '|', '<null>')
+             FROM (SELECT 1 AS group_id UNION ALL SELECT 2 UNION ALL SELECT 3) g
+             ORDER BY g.group_id",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("9|17|<null>")],
+            vec![Value::from_i64(2), Value::build_text("2")],
+            vec![Value::from_i64(3), Value::build_text("")],
+        ]
+    );
+    assert!(conn
+        .prepare("SELECT ARRAY(SELECT v, group_id FROM array_items)")
+        .is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_options_to_table_reads_options(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for input in [
+        "ARRAY['x=a=b', 'z=', 'flag', 'space=two words']",
+        "'{\"x=a=b\",\"z=\",\"flag\",\"space=two words\"}'",
+    ] {
+        assert_eq!(
+            conn.prepare(format!(
+                "SELECT option_name, option_value FROM pg_catalog.pg_options_to_table({input})"
+            ))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+            vec![
+                vec![Value::build_text("x"), Value::build_text("a=b")],
+                vec![Value::build_text("z"), Value::build_text("")],
+                vec![Value::build_text("flag"), Value::Null],
+                vec![Value::build_text("space"), Value::build_text("two words")],
+            ]
+        );
+    }
+    for input in ["NULL", "ARRAY[]", "'{}'"] {
+        assert!(conn
+            .prepare(format!("SELECT * FROM pg_options_to_table({input})"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+    }
+    for input in ["'not an array'", "ARRAY[NULL]", "17"] {
+        assert!(conn
+            .prepare(format!("SELECT * FROM pg_options_to_table({input})"))
+            .unwrap()
+            .run_collect_rows()
+            .is_err());
+    }
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT array_to_string(ARRAY(
+                SELECT quote_ident(option_name) || ' ' || quote_literal(option_value)
+                FROM pg_options_to_table(ARRAY['z=a=b', 'a=two words']) ORDER BY option_name
+             ), ', ')"
+        ),
+        vec!["a 'two words', z 'a=b'"]
+    );
+    conn.execute("CREATE TABLE option_sets (id INTEGER, options TEXT[])")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO option_sets VALUES (1, ARRAY['x=9']), (2, ARRAY['x=17']), (3, ARRAY[])",
+    )
+    .unwrap();
+    assert_eq!(conn.prepare(
+        "SELECT s.id, p.option_value FROM option_sets s, pg_options_to_table(s.options) p ORDER BY s.id"
+    ).unwrap().run_collect_rows().unwrap(), vec![
+        vec![Value::from_i64(1), Value::build_text("9")],
+        vec![Value::from_i64(2), Value::build_text("17")],
+    ]);
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert!(conn.prepare(
+        "SELECT tableoid, oid, fdwname, fdwowner, fdwhandler::pg_catalog.regproc,
+                fdwvalidator::pg_catalog.regproc, fdwacl, acldefault('F', fdwowner) AS acldefault,
+                array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value)
+                    FROM pg_options_to_table(fdwoptions) ORDER BY option_name), E',\n    ') AS fdwoptions
+         FROM pg_foreign_data_wrapper"
+    ).unwrap().run_collect_rows().unwrap().is_empty());
+}
+
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut result = Vec::new();
