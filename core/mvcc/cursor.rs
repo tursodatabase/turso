@@ -16,7 +16,7 @@ use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    SeekResult, Value, ValueRef,
 };
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
@@ -170,27 +170,42 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
     }
 }
 
-fn current_pos_matches_seek_key(
+fn current_pos_is_only_row_of_seek_key(
     current_row_id: &RowKey,
     seek_key: &SeekKey<'_>,
     mv_cursor_type: &MvccCursorType,
 ) -> Result<bool> {
-    Ok(match (current_row_id, seek_key) {
-        (RowKey::Int(current), SeekKey::TableRowId(target)) => *current == *target,
-        (RowKey::Record(current), SeekKey::IndexKey(target)) => {
-            let MvccCursorType::Index(index_info) = mv_cursor_type else {
-                return Ok(false);
-            };
-            let key_info: Vec<_> = index_info
-                .key_info
-                .iter()
-                .take(target.column_count())
-                .cloned()
-                .collect();
-            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+    Ok(match (current_row_id, seek_key, mv_cursor_type) {
+        (RowKey::Int(current), SeekKey::TableRowId(target), MvccCursorType::Table) => {
+            *current == *target
+        }
+        (RowKey::Record(current), SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
+            let target_values = target.get_values()?;
+            index_key_matches_at_most_one_row(&target_values, index_info)
+                && compare_immutable(
+                    target_values,
+                    current.key.get_values()?,
+                    &index_info.key_info[..target.column_count()],
+                )
+                .is_eq()
         }
         _ => false,
     })
+}
+
+fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInfo) -> bool {
+    // num_cols counts the rowid when the index stores one. So a key this long
+    // ends with the rowid, and two rows never share a rowid. An index without
+    // a rowid (an index method's backing B-tree) stores each whole key once.
+    if key.len() == index_info.num_cols {
+        return true;
+    }
+    // In a UNIQUE index, the indexed columns alone also name one row, unless a
+    // value is NULL: a UNIQUE index can hold any number of rows with NULL there.
+    let indexed_columns = index_info.num_cols - usize::from(index_info.has_rowid);
+    index_info.is_unique
+        && key.len() == indexed_columns
+        && !key.iter().any(|value| matches!(value, ValueRef::Null))
 }
 
 #[cfg(any(test, injected_yields))]
@@ -1566,6 +1581,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // Skip the seek and short-circuit to SeekResult::Found if the following are true:
         //
         // - the seek is eq_only
+        // - the seek key matches at most one row (a table rowid, the whole index entry, or every
+        //   column of a UNIQUE index with no NULL), so the current row is the first and only match
         // - the cursor is already correctly positioned on a visible version
         //
         // This is because in the situation where the following are true:
@@ -1595,7 +1612,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 row_id, in_btree, ..
             } = &self.current_pos
             {
-                if current_pos_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)? {
+                if current_pos_is_only_row_of_seek_key(
+                    &row_id.row_id,
+                    &seek_key,
+                    &self.mv_cursor_type,
+                )? {
                     let maybe_index_id = match &self.mv_cursor_type {
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
