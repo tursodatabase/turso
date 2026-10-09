@@ -26,9 +26,12 @@ struct PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path: Option<Vec<String>>,
+    search_path_setting: Option<String>,
 }
 
 type PgSessionState = Mutex<SessionState>;
+
+pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -329,10 +332,17 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
     let state = conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
-    state.lock().unwrap().search_path = path;
+    let mut state = state.lock().unwrap();
+    state.search_path = path;
+    state.search_path_setting = value.map(str::to_owned);
     Ok(Value::build_text(
-        value.unwrap_or("\"$user\", public").to_owned(),
+        value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
+    conn.context::<PgSessionState>()
+        .and_then(|state| state.lock().unwrap().search_path_setting.clone())
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
