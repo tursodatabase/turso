@@ -1581,9 +1581,13 @@ fn compute_new_row_virtual_columns(
     if !ctx.table.has_virtual_columns {
         return Ok(());
     }
-    let dml_ctx =
-        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone())
-            .with_encoded_columns(encoded_columns);
+    let dml_ctx = DmlColumnContext::layout(
+        ctx.table.columns(),
+        new_start,
+        rowid_reg,
+        layout.clone(),
+        encoded_columns,
+    );
     compute_virtual_columns(
         program,
         &ctx.table

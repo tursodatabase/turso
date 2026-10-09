@@ -1375,9 +1375,13 @@ fn emit_update_insns<'a>(
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
-                    let new_ctx =
-                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone())
-                            .with_encoded_columns(columns_read_from_table.try_clone()?);
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        new_rowid_reg,
+                        layout.clone(),
+                        columns_read_from_table.try_clone()?,
+                    );
                     compute_virtual_columns(
                         program,
                         &btree.columns_topo_sort()?,
@@ -1566,9 +1570,13 @@ fn emit_update_insns<'a>(
         )?;
 
         // compute virtual columns pre-encoding, so that we can type-check them later
-        let dml_ctx =
-            DmlColumnContext::layout(btree.columns(), start, effective_rowid_reg, layout.clone())
-                .with_encoded_columns(columns_read_from_table.try_clone()?);
+        let dml_ctx = DmlColumnContext::layout(
+            btree.columns(),
+            start,
+            effective_rowid_reg,
+            layout.clone(),
+            columns_read_from_table.try_clone()?,
+        );
         compute_virtual_columns(
             program,
             &btree
