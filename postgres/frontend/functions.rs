@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
@@ -155,19 +155,38 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
             "acldefault owner must be an OID".to_string(),
         ));
     }
+    let no_privileges = AclPrivileges::empty();
     let (public_privileges, owner_privileges) = match kind {
-        "c" => (None, None),
-        "r" => (None, Some("arwdDxt")),
-        "s" => (None, Some("rwU")),
-        "d" => (Some("Tc"), Some("CTc")),
-        "f" => (Some("X"), Some("X")),
-        "l" => (Some("U"), Some("U")),
-        "L" => (None, Some("rw")),
-        "n" => (None, Some("UC")),
-        "p" => (None, Some("sA")),
-        "t" => (None, Some("C")),
-        "F" | "S" => (None, Some("U")),
-        "T" => (Some("U"), Some("U")),
+        "c" => (no_privileges, no_privileges),
+        "r" => (
+            no_privileges,
+            AclPrivileges::INSERT
+                | AclPrivileges::SELECT
+                | AclPrivileges::UPDATE
+                | AclPrivileges::DELETE
+                | AclPrivileges::TRUNCATE
+                | AclPrivileges::REFERENCES
+                | AclPrivileges::TRIGGER,
+        ),
+        "s" => (
+            no_privileges,
+            AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
+        ),
+        "d" => (
+            AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+            AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+        ),
+        "f" => (AclPrivileges::EXECUTE, AclPrivileges::EXECUTE),
+        "l" => (AclPrivileges::USAGE, AclPrivileges::USAGE),
+        "L" => (no_privileges, AclPrivileges::SELECT | AclPrivileges::UPDATE),
+        "n" => (no_privileges, AclPrivileges::USAGE | AclPrivileges::CREATE),
+        "p" => (
+            no_privileges,
+            AclPrivileges::SET | AclPrivileges::ALTER_SYSTEM,
+        ),
+        "t" => (no_privileges, AclPrivileges::CREATE),
+        "F" | "S" => (no_privileges, AclPrivileges::USAGE),
+        "T" => (AclPrivileges::USAGE, AclPrivileges::USAGE),
         _ => {
             return Err(LimboError::InvalidArgument(format!(
                 "unrecognized object type abbreviation: {kind}"
@@ -181,14 +200,60 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         owner.to_string()
     };
     let mut entries = Vec::with_capacity(2);
-    if let Some(privileges) = public_privileges {
-        entries.push(format!("={privileges}/{role}"));
+    if !public_privileges.is_empty() {
+        entries.push(format!("={public_privileges}/{role}"));
     }
-    if let Some(privileges) = owner_privileges {
+    if !owner_privileges.is_empty() {
         let grantee = if owner == 0 { "" } else { &role };
-        entries.push(format!("{grantee}={privileges}/{role}"));
+        entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
     Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy)]
+    struct AclPrivileges: u16 {
+        const INSERT = 1 << 0;
+        const SELECT = 1 << 1;
+        const UPDATE = 1 << 2;
+        const DELETE = 1 << 3;
+        const TRUNCATE = 1 << 4;
+        const REFERENCES = 1 << 5;
+        const TRIGGER = 1 << 6;
+        const EXECUTE = 1 << 7;
+        const USAGE = 1 << 8;
+        const CREATE = 1 << 9;
+        const TEMPORARY = 1 << 10;
+        const CONNECT = 1 << 11;
+        const SET = 1 << 12;
+        const ALTER_SYSTEM = 1 << 13;
+    }
+}
+
+impl fmt::Display for AclPrivileges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (privilege, letter) in [
+            (Self::INSERT, "a"),
+            (Self::SELECT, "r"),
+            (Self::UPDATE, "w"),
+            (Self::DELETE, "d"),
+            (Self::TRUNCATE, "D"),
+            (Self::REFERENCES, "x"),
+            (Self::TRIGGER, "t"),
+            (Self::EXECUTE, "X"),
+            (Self::USAGE, "U"),
+            (Self::CREATE, "C"),
+            (Self::TEMPORARY, "T"),
+            (Self::CONNECT, "c"),
+            (Self::SET, "s"),
+            (Self::ALTER_SYSTEM, "A"),
+        ] {
+            if self.contains(privilege) {
+                f.write_str(letter)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
