@@ -3924,6 +3924,51 @@ mod tests {
         }
     }
 
+    /// sqlite3_errmsg must report corruption with the fixed text SQLite
+    /// uses for SQLITE_CORRUPT, which applications and the upstream TCL
+    /// tests compare against.
+    #[test]
+    fn test_sqlite3_errmsg_corruption_matches_sqlite() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("corrupt.db");
+            let c_path = CString::new(path.to_str().unwrap()).unwrap();
+
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(a); INSERT INTO t VALUES (1);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            let page_size = 4096;
+            let mut bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes[page_size], 0x0d, "expected a table leaf page");
+            bytes[page_size] = 0x07;
+            std::fs::write(&path, &bytes).unwrap();
+
+            assert_eq!(sqlite3_open(c_path.as_ptr(), &mut db), SQLITE_OK);
+            let rc = sqlite3_exec(
+                db,
+                c"SELECT * FROM t".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_CORRUPT);
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert_eq!(msg, "database disk image is malformed");
+            sqlite3_close(db);
+        }
+    }
+
     /// A statement that hit SQLITE_BUSY cannot be run to completion at
     /// finalize time while another connection still holds the write lock.
     /// sqlite3_finalize must free it anyway and report the error, like

@@ -1446,9 +1446,9 @@ fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<
 /// Recipe: insert a wide-enough row (a 4 KiB blob) under MVCC, run
 /// wal_checkpoint(TRUNCATE) so the row is flushed to the btree and the WAL is
 /// reset, close the database, reopen it, and UPDATE the row by primary key.
-/// Without the fix, the UPDATE returns
-/// `Corrupt database: Btree cursor should have a record when deleting a row
-/// that only exists in the btree`.
+/// Without the fix, the UPDATE fails with a corruption error whose detail is
+/// `Btree cursor should have a record when deleting a row that only exists in
+/// the btree`.
 #[turso_macros::test]
 fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     db: TempDatabase,

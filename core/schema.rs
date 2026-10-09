@@ -7345,10 +7345,12 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("root_page must be 0 for virtual table v1"));
+        match result.unwrap_err() {
+            LimboError::Corrupt(detail) => {
+                assert!(detail.contains("root_page must be 0 for virtual table v1"))
+            }
+            other => panic!("expected a corruption error, got {other:?}"),
+        }
     }
 
     #[test]

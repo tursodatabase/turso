@@ -1183,7 +1183,7 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
 
     assert_that!(run_integrity_check_catching_panic(&conn))
         .ok()
-        .matches("extends out of page|out of range|out of bounds|corrupt");
+        .matches("extends out of page|out of range|out of bounds|corrupt|malformed");
 }
 
 // =============================================================================

@@ -159,7 +159,7 @@ set test_files {
   corruptD             fail
   corruptE             fail
   corruptF             fail
-  corruptG             fail
+  corruptG             pass
   corruptH             fail
   corruptI             fail
   corruptJ             fail

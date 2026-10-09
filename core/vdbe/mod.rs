@@ -3296,6 +3296,9 @@ impl Program {
             }
         }
 
+        if let Some(LimboError::Corrupt(detail)) = err {
+            tracing::error!("database disk image is malformed: {detail}");
+        }
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");

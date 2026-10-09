@@ -220,10 +220,14 @@ fn test_zeroed_page_returns_corrupt_error() {
 
         let result = limbo_exec_rows_fallible(&existing_db, &conn, "SELECT * FROM test");
 
-        assert_that!(result)
-            .err()
-            .display_string()
-            .contains("Corrupt")
-            .contains("Invalid page type: 0");
+        match result {
+            Err(turso_core::LimboError::Corrupt(detail)) => {
+                assert!(
+                    detail.contains("Invalid page type: 0"),
+                    "unexpected corruption detail: {detail}"
+                );
+            }
+            other => panic!("expected a corruption error, got {other:?}"),
+        }
     }
 }
