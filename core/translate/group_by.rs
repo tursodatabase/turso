@@ -802,8 +802,12 @@ pub fn group_by_process_single_group(
                     None
                 };
 
-                let agg_arg_source =
-                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
+                let agg_arg_source = AggArgumentSource::new_from_expression(
+                    &agg.func,
+                    &agg.args,
+                    &agg.distinctness,
+                    &agg.order_by,
+                );
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
