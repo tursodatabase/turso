@@ -49,3 +49,46 @@ expect {
     3
     4
 }
+
+# A UNIQUE index can hold many rows with NULL. The semi-join leaves the cursor
+# on (NULL, 2). The next outer row seeks NULL again and must start at the first
+# NULL row, so it still finds id 1.
+test mvcc-repeated-unique-index-seeks-for-null-start-at-first-row {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE);
+    INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+    CREATE TABLE o(k, m);
+    INSERT INTO o VALUES (NULL, 2), (NULL, 1), (NULL, 3), (NULL, 1);
+    SELECT o.rowid FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.u IS o.k AND t.id + 0 = o.m) ORDER BY 1;
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+}
+
+# A UNIQUE index key without NULL names one row, so a repeated seek for the
+# key the cursor is on may be skipped. Rows on both sides of a checkpoint must
+# still be found.
+test mvcc-repeated-unique-index-seeks-after-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE);
+    CREATE TABLE o(k);
+    INSERT INTO t VALUES (1, 5), (2, 7);
+    INSERT INTO o VALUES (5), (5), (6), (6), (7), (7);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (3, 6);
+    SELECT o.k, t.id FROM o JOIN t ON t.u = o.k ORDER BY o.rowid;
+}
+expect {
+    mvcc
+    0|0|0
+    5|1
+    5|1
+    6|3
+    6|3
+    7|2
+    7|2
+}
