@@ -2,6 +2,240 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_pg_depend_tracks_live_objects(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dep_parent (id TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE dep_child (parent_id TEXT REFERENCES dep_parent(id), qty INTEGER DEFAULT 17)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX dep_child_qty ON dep_child(qty)")
+        .unwrap();
+    conn.execute("CREATE INDEX dep_parent_id ON dep_parent(id)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX dep_parent_unique_id ON dep_parent(id)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT c.relname, n.nspname, d.deptype FROM pg_depend d
+                      JOIN pg_class c ON d.classid = 1259 AND c.oid = d.objid
+                      JOIN pg_namespace n ON d.refclassid = 2615 AND n.oid = d.refobjid
+                      WHERE c.relname IN ('dep_parent', 'dep_child') ORDER BY c.relname"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("dep_child"),
+                Value::build_text("public"),
+                Value::build_text("n")
+            ],
+            vec![
+                Value::build_text("dep_parent"),
+                Value::build_text("public"),
+                Value::build_text("n")
+            ],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d
+                      JOIN pg_constraint c ON d.classid = 2606 AND c.oid = d.objid
+                      JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+                      WHERE c.conname = 'dep_child_parent_id_fkey' AND r.relkind = 'r'
+                      ORDER BY r.relname"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("dep_child"),
+                Value::from_i64(1),
+                Value::build_text("a")
+            ],
+            vec![
+                Value::build_text("dep_parent"),
+                Value::from_i64(1),
+                Value::build_text("n")
+            ],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT r.relname, a.adnum, d.refobjsubid, d.deptype FROM pg_depend d
+                      JOIN pg_attrdef a ON d.classid = 2604 AND a.oid = d.objid
+                      JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+                      WHERE r.relname = 'dep_child'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("dep_child"),
+            Value::from_i64(2),
+            Value::from_i64(2),
+            Value::build_text("a")
+        ]]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT d.refobjsubid, d.deptype FROM pg_depend d
+                      JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid AND i.relkind = 'i'
+                      JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+                      WHERE r.relname = 'dep_child'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::from_i64(2), Value::build_text("a")]]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT i.relname, d.refobjsubid, d.deptype FROM pg_depend d
+                      JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid
+                      JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+                      WHERE i.relname IN ('dep_parent_id', 'dep_parent_unique_id')
+                        AND r.relname = 'dep_parent' ORDER BY i.relname"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("dep_parent_id"),
+                Value::from_i64(1),
+                Value::build_text("a")
+            ],
+            vec![
+                Value::build_text("dep_parent_unique_id"),
+                Value::from_i64(1),
+                Value::build_text("a")
+            ],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT c.conname, d.deptype FROM pg_depend d
+                      JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid AND i.relkind = 'i'
+                      JOIN pg_constraint c ON d.refclassid = 2606 AND c.oid = d.refobjid
+                      WHERE c.conname = 'dep_parent_id_key'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("dep_parent_id_key"),
+            Value::build_text("i")
+        ]]
+    );
+    let mut stmt = conn.prepare("SELECT * FROM pg_catalog.pg_depend").unwrap();
+    assert_eq!(stmt.num_columns(), 7);
+    assert!(!stmt.run_collect_rows().unwrap().is_empty());
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT tableoid FROM pg_depend LIMIT 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2608)]]
+    );
+    assert!(conn.prepare("DELETE FROM pg_depend").is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_depend_for_dump_table_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dump_indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE TABLE dump_plain (value TEXT)")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.tableoid, c.oid, c.relname, c.relnamespace, c.relkind, c.reltype,
+                c.relowner, c.relchecks, c.relhasindex, c.relhasrules, c.relpages,
+                c.relhastriggers, c.relpersistence, c.reloftype, c.relacl,
+                acldefault(CASE WHEN c.relkind = 'S' THEN 's'::\"char\" ELSE 'r'::\"char\" END,
+                           c.relowner) AS acldefault,
+                CASE WHEN c.relkind = 'f' THEN (SELECT ftserver FROM pg_catalog.pg_foreign_table
+                     WHERE ftrelid = c.oid) ELSE 0 END AS foreignserver,
+                c.relfrozenxid, tc.relfrozenxid AS tfrozenxid, tc.oid AS toid,
+                tc.relpages AS toastpages, tc.reloptions AS toast_reloptions,
+                d.refobjid AS owning_tab, d.refobjsubid AS owning_col,
+                tsp.spcname AS reltablespace, false AS relhasoids, c.relispopulated,
+                c.relreplident, c.relrowsecurity, c.relforcerowsecurity, c.relminmxid,
+                tc.relminmxid AS tminmxid,
+                array_remove(array_remove(c.reloptions,'check_option=local'),
+                             'check_option=cascaded') AS reloptions,
+                CASE WHEN 'check_option=local' = ANY(c.reloptions) THEN 'LOCAL'::text
+                     WHEN 'check_option=cascaded' = ANY(c.reloptions) THEN 'CASCADED'::text
+                     ELSE NULL END AS checkoption,
+                am.amname, (d.deptype = 'i') IS TRUE AS is_identity_sequence,
+                c.relispartition AS ispartition
+         FROM pg_class c
+         LEFT JOIN pg_depend d ON (c.relkind = 'S' AND d.classid = 'pg_class'::regclass
+             AND d.objid = c.oid AND d.objsubid = 0
+             AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i'))
+         LEFT JOIN pg_tablespace tsp ON (tsp.oid = c.reltablespace)
+         LEFT JOIN pg_am am ON (c.relam = am.oid)
+         LEFT JOIN pg_class tc ON (c.reltoastrelid = tc.oid AND tc.relkind = 't'
+                                  AND c.relkind <> 'p')
+         WHERE c.relkind IN ('r', 'S', 'v', 'c', 'm', 'f', 'p')
+           AND c.relname IN ('dump_indexed', 'dump_plain') ORDER BY c.relname",
+        )
+        .unwrap();
+    assert_eq!(stmt.get_column_decltype(8).as_deref(), Some("BOOLEAN"));
+    assert_eq!(
+        stmt.run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                [
+                    row[0].clone(),
+                    row[2].clone(),
+                    row[8].clone(),
+                    row[15].clone(),
+                    row[24].clone(),
+                    row[32].clone(),
+                    row[33].clone(),
+                    row[34].clone(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            [
+                Value::from_i64(1259),
+                Value::build_text("dump_indexed"),
+                Value::from_i64(1),
+                Value::build_text("{turso=arwdDxt/turso}"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::build_text("heap")
+            ],
+            [
+                Value::from_i64(1259),
+                Value::build_text("dump_plain"),
+                Value::from_i64(0),
+                Value::build_text("{turso=arwdDxt/turso}"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::build_text("heap")
+            ],
+        ]
+    );
+    let mut tablespaces = conn.prepare("SELECT * FROM pg_tablespace").unwrap();
+    assert_eq!(tablespaces.num_columns(), 5);
+    assert!(tablespaces.run_collect_rows().unwrap().is_empty());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE DEFAULT 'a')")
