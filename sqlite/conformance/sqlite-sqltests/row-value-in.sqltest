@@ -288,3 +288,24 @@ test row-value-null-in-both-lhs-rhs-in {
 expect {
     1
 }
+
+# A row value IN reads every left field before checking for NULL: a NULL in
+# an earlier field must not leave a later field holding the previous row's
+# value when the list is checked for a possible NULL match.
+test in-subquery-row-value-reads-every-field-before-null-check {
+    CREATE TABLE r(w TEXT, b TEXT);
+    INSERT INTO r VALUES ('A', 'A'), ('B', NULL);
+    CREATE TABLE l(y TEXT, n TEXT);
+    INSERT INTO l VALUES ('a', 'a'), (NULL, NULL);
+    CREATE TABLE l2(y TEXT, n TEXT);
+    INSERT INTO l2 VALUES ('a', NULL), (NULL, NULL);
+    SELECT quote((n, y) IN (SELECT b, w FROM r)), quote((n, y) NOT IN (SELECT b, w FROM r))
+      FROM l ORDER BY rowid;
+    SELECT quote((n, y) IN (SELECT b, w FROM r)) FROM l2 ORDER BY rowid;
+}
+expect {
+    0|1
+    NULL|NULL
+    0
+    NULL
+}
