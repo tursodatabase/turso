@@ -4989,6 +4989,71 @@ pub struct PgCopyToStmt {
     pub columns: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgCursorStmt {
+    Declare { name: String, query: String },
+    Fetch { name: String, count: u64 },
+    Close { name: Option<String> },
+}
+
+pub fn try_extract_cursor(parse_result: &ParseResult) -> Result<Option<PgCursorStmt>, String> {
+    use pg_query::{protobuf::FetchDirection, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return Ok(None);
+    };
+    let command = match &node.0 {
+        NodeRef::DeclareCursorStmt(cursor) => {
+            if cursor.options & !(0x0100 | 0x0004) != 0 {
+                return Err("only forward, text cursors without HOLD are supported".to_owned());
+            }
+            let query = cursor
+                .query
+                .as_ref()
+                .and_then(|query| query.node.as_ref())
+                .ok_or_else(|| "DECLARE CURSOR requires a query".to_owned())?;
+            if !matches!(query.to_ref(), NodeRef::SelectStmt(_)) {
+                return Err("DECLARE CURSOR requires SELECT".to_owned());
+            }
+            let query = query
+                .to_ref()
+                .deparse()
+                .map_err(|error| error.to_string())?;
+            let parsed_query = crate::parse(&query).map_err(|error| error.to_string())?;
+            if parsed_query.protobuf.nodes().iter().any(|node| {
+                matches!(&node.0, NodeRef::SelectStmt(select)
+                if !select.locking_clause.is_empty() || select.into_clause.is_some())
+            }) {
+                return Err("cursor row locks and SELECT INTO are not supported".to_owned());
+            }
+            PgCursorStmt::Declare {
+                name: cursor.portalname.clone(),
+                query,
+            }
+        }
+        NodeRef::FetchStmt(fetch) => {
+            if fetch.ismove
+                || fetch.direction() != FetchDirection::FetchForward
+                || fetch.how_many <= 0
+            {
+                return Err(
+                    "only FETCH FORWARD with a positive count or ALL is supported".to_owned(),
+                );
+            }
+            PgCursorStmt::Fetch {
+                name: fetch.portalname.clone(),
+                count: fetch.how_many as u64,
+            }
+        }
+        NodeRef::ClosePortalStmt(close) => PgCursorStmt::Close {
+            name: (!close.portalname.is_empty()).then(|| close.portalname.clone()),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(command))
+}
+
 pub fn try_extract_copy_to(parse_result: &ParseResult) -> Result<Option<PgCopyToStmt>, String> {
     use pg_query::NodeRef;
 
@@ -7789,6 +7854,65 @@ mod tests {
         assert_eq!(copy.schema_name.as_deref(), Some("Odd Schema"));
         assert_eq!(copy.table_name, "Odd Table");
         assert_eq!(copy.columns.unwrap(), vec!["second", "first"]);
+    }
+
+    #[test]
+    fn test_cursor_commands_preserve_query_and_quoted_names() {
+        let parsed = crate::parse(r#"DECLARE "Odd Cursor" NO SCROLL CURSOR FOR SELECT id, name FROM ONLY public.dump_probe"#).unwrap();
+        let Some(PgCursorStmt::Declare { name, query }) = try_extract_cursor(&parsed).unwrap()
+        else {
+            panic!("expected DECLARE CURSOR");
+        };
+        assert_eq!(name, "Odd Cursor");
+        assert_eq!(query, "SELECT id, name FROM ONLY public.dump_probe");
+        for (sql, count) in [
+            (r#"FETCH 100 FROM "Odd Cursor""#, 100),
+            (r#"FETCH ALL FROM "Odd Cursor""#, i64::MAX as u64),
+        ] {
+            assert_eq!(
+                try_extract_cursor(&crate::parse(sql).unwrap()).unwrap(),
+                Some(PgCursorStmt::Fetch {
+                    name: "Odd Cursor".to_owned(),
+                    count
+                })
+            );
+        }
+        assert_eq!(
+            try_extract_cursor(&crate::parse(r#"CLOSE "Odd Cursor""#).unwrap()).unwrap(),
+            Some(PgCursorStmt::Close {
+                name: Some("Odd Cursor".to_owned())
+            })
+        );
+        assert_eq!(
+            try_extract_cursor(&crate::parse("CLOSE ALL").unwrap()).unwrap(),
+            Some(PgCursorStmt::Close { name: None })
+        );
+    }
+
+    #[test]
+    fn test_cursor_rejects_unsupported_options_and_directions() {
+        for sql in [
+            "DECLARE c BINARY CURSOR FOR SELECT 1",
+            "DECLARE c SCROLL CURSOR FOR SELECT 1",
+            "DECLARE c INSENSITIVE CURSOR FOR SELECT 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
+            "DECLARE c CURSOR FOR SELECT * FROM t FOR UPDATE",
+            "DECLARE c CURSOR FOR SELECT * FROM (SELECT * FROM t FOR SHARE) x",
+            "FETCH BACKWARD 1 FROM c",
+            "FETCH ABSOLUTE 1 FROM c",
+            "FETCH RELATIVE 1 FROM c",
+            "FETCH 0 FROM c",
+            "FETCH -1 FROM c",
+            "MOVE FORWARD 1 FROM c",
+        ] {
+            assert!(
+                try_extract_cursor(&crate::parse(sql).unwrap()).is_err(),
+                "{sql}"
+            );
+        }
+        assert!(try_extract_cursor(&crate::parse("SELECT 1").unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
