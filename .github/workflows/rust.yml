@@ -229,6 +229,19 @@ jobs:
       - name: Check turso builds for wasm32-unknown-unknown
         run: cargo check -p turso --target wasm32-unknown-unknown --locked
 
+  check-core-no-default-features:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Check turso_core builds without default features
+        run: cargo check -p turso_core --no-default-features --features fs --locked
+
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
