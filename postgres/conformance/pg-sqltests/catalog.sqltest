@@ -1,0 +1,32 @@
+# pg_catalog contents seen through the PostgreSQL frontend.
+
+@database :memory:
+
+test catalog-pg-type-enum-and-domain {
+    CREATE TYPE catalog_mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN catalog_posint AS integer;
+    SELECT typname, typtype, typbasetype, typnamespace
+    FROM pg_type
+    WHERE typname IN ('catalog_mood', 'catalog_posint')
+    ORDER BY typname;
+}
+expect {
+    catalog_mood|e|0|2200
+    catalog_posint|d|23|2200
+}
+
+test catalog-pg-attribute-enum-and-domain-columns {
+    CREATE TYPE catalog_color AS ENUM ('red', 'blue');
+    CREATE DOMAIN catalog_age AS integer;
+    CREATE TABLE catalog_t (c catalog_color, a catalog_age);
+    SELECT a.attname, ty.typname
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_type ty ON ty.oid = a.atttypid
+    WHERE c.relname = 'catalog_t' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    c|catalog_color
+    a|catalog_age
+}
