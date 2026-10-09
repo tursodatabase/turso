@@ -64,6 +64,7 @@ scalar_functions! {
     FormatType(FunctionArity::OneOf(&[1, 2]), true),
     PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
     PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
+    PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false),
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
@@ -75,9 +76,11 @@ scalar_functions! {
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
+    CurrentSchemas(FunctionArity::Exact(1), false),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgArrayUpper(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -103,6 +106,7 @@ impl ScalarCall for PgScalarFunction {
             | Self::PgGetStatisticsobjdefColumns
             | Self::PgRelationIsPublishable
             | Self::ObjDescription
+            | Self::PgGetTriggerdef
             | Self::ColDescription => Value::Null,
             Self::QuoteIdent => match args[0].get_value() {
                 Value::Null => Value::Null,
@@ -123,6 +127,7 @@ impl ScalarCall for PgScalarFunction {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
             Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentSchemas => exec_current_schemas(connection, args)?,
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -137,6 +142,7 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
+            Self::PgArrayUpper => exec_pg_array_upper(args)?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -145,6 +151,64 @@ impl ScalarCall for PgScalarFunction {
             }
         };
         Ok(IOResult::Done(value))
+    }
+}
+
+fn exec_current_schemas(connection: &Connection, args: &[Register]) -> Result<Value> {
+    let include_implicit = match args[0].get_value().as_int() {
+        Some(0) => false,
+        Some(1) => true,
+        None if matches!(args[0].get_value(), Value::Null) => return Ok(Value::Null),
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "current_schemas requires a boolean".to_string(),
+            ));
+        }
+    };
+    let schemas = crate::session::current_schemas(connection, include_implicit)?;
+    Ok(Value::build_text(pg_array_text(&schemas)))
+}
+
+fn pg_array_text(values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| {
+            let must_quote = value.is_empty()
+                || value.eq_ignore_ascii_case("null")
+                || value
+                    .chars()
+                    .any(|c| c.is_ascii_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\'));
+            if must_quote {
+                format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                value.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    format!("{{{}}}", values.join(","))
+}
+
+fn exec_pg_array_upper(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let dimension = args[1].get_value().as_int().ok_or_else(|| {
+        LimboError::InvalidArgument("array_upper requires an integer dimension".to_owned())
+    })?;
+    let values = turso_core::array_values_from_any(args[0].get_value())
+        .ok_or_else(|| LimboError::InvalidArgument("array_upper requires an array".to_owned()))?;
+    if values.iter().any(|value| matches!(value, Value::Blob(_))) {
+        return Err(LimboError::InvalidArgument(
+            "array_upper supports one-dimensional arrays only".to_owned(),
+        ));
+    }
+    if values.is_empty() || dimension != 1 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::from_i64(values.len() as i64))
     }
 }
 
