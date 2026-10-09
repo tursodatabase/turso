@@ -263,20 +263,20 @@ impl SnapshotRows for PgClassTable {
             reltuples REAL,
             relallvisible INTEGER,
             reltoastrelid INTEGER,
-            relhasindex INTEGER,
-            relisshared INTEGER,
+            relhasindex BOOLEAN,
+            relisshared BOOLEAN,
             relpersistence TEXT,
             relkind TEXT,
             relnatts INTEGER,
             relchecks INTEGER,
-            relhasrules INTEGER,
-            relhastriggers INTEGER,
-            relhassubclass INTEGER,
-            relrowsecurity INTEGER,
-            relforcerowsecurity INTEGER,
-            relispopulated INTEGER,
+            relhasrules BOOLEAN,
+            relhastriggers BOOLEAN,
+            relhassubclass BOOLEAN,
+            relrowsecurity BOOLEAN,
+            relforcerowsecurity BOOLEAN,
+            relispopulated BOOLEAN,
             relreplident TEXT,
-            relispartition INTEGER,
+            relispartition BOOLEAN,
             relrewrite INTEGER,
             relfrozenxid INTEGER,
             relminmxid INTEGER,
@@ -470,16 +470,16 @@ impl SnapshotRows for PgAttributeTable {
             attndims INTEGER,
             attcacheoff INTEGER,
             atttypmod INTEGER,
-            attbyval INTEGER,
+            attbyval BOOLEAN,
             attstorage TEXT,
             attalign TEXT,
-            attnotnull INTEGER,
-            atthasdef INTEGER,
-            atthasmissing INTEGER,
+            attnotnull BOOLEAN,
+            atthasdef BOOLEAN,
+            atthasmissing BOOLEAN,
             attidentity TEXT,
             attgenerated TEXT,
-            attisdropped INTEGER,
-            attislocal INTEGER,
+            attisdropped BOOLEAN,
+            attislocal BOOLEAN,
             attinhcount INTEGER,
             attcollation INTEGER,
             attacl TEXT,
@@ -607,10 +607,10 @@ impl SnapshotRows for PgProcTable {
             prorows REAL,
             provariadic INTEGER,
             prokind TEXT,
-            prosecdef INTEGER,
-            proleakproof INTEGER,
-            proisstrict INTEGER,
-            proretset INTEGER,
+            prosecdef BOOLEAN,
+            proleakproof BOOLEAN,
+            proisstrict BOOLEAN,
+            proretset BOOLEAN,
             provolatile TEXT,
             proparallel TEXT,
             pronargs INTEGER,
@@ -736,8 +736,8 @@ impl SnapshotRows for PgDatabaseTable {
             datdba INTEGER,
             encoding INTEGER,
             datlocprovider TEXT,
-            datistemplate INTEGER,
-            datallowconn INTEGER,
+            datistemplate BOOLEAN,
+            datallowconn BOOLEAN,
             datconnlimit INTEGER,
             datfrozenxid INTEGER,
             datminmxid INTEGER,
@@ -1235,7 +1235,7 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (3807, "_jsonb", 3802),
 ];
 
-const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
+const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval BOOLEAN, typtype TEXT, typcategory TEXT, typispreferred BOOLEAN, typisdefined BOOLEAN, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull BOOLEAN, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgTypeTable;
@@ -1363,7 +1363,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -1461,7 +1461,7 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
