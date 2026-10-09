@@ -29,7 +29,7 @@ test upsert-base-name-is-out-of-scope-when-aliased {
         ON CONFLICT(k) DO UPDATE SET n = t.n + 1;
 }
 expect error {
-    no such (column|table)
+    no such column
 }
 
 test plain-update-target-alias-still-works {

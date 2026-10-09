@@ -47,7 +47,7 @@ test do-update-alias-hides-the-table-name {
     INSERT INTO t AS z VALUES (1, 20) ON CONFLICT (a) DO UPDATE SET b = t.b;
 }
 expect error {
-    no such (column|table): t
+    no such column: t.b
 }
 
 @cross-check-integrity
