@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::schema::resolve_schema_expr_columns;
 use crate::sync::Arc;
 use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
 use turso_parser::{ast, parser::Parser};
@@ -584,6 +585,14 @@ fn emit_add_virtual_column_validation(
         })
         .collect();
 
+    let check_constraints: Vec<CheckConstraint> = check_constraints
+        .into_iter()
+        .map(|mut check| {
+            resolve_schema_expr_columns(&mut check.bound, table);
+            check
+        })
+        .collect();
+
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
     }
@@ -663,27 +672,16 @@ fn emit_add_virtual_column_validation(
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if !check_constraints.is_empty() {
-        let mut check_resolver = resolver.fork();
         let skip_row_label = program.allocate_label();
         emit_check_constraints(
             program,
             &check_constraints,
-            &mut check_resolver,
-            resolved_table.name.as_str(),
-            rowid_reg,
-            resolved_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
-                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
-                }),
+            resolver,
+            &dml_ctx,
             connection,
             ast::ResolveType::Abort,
             skip_row_label,
-            None,
+            &table_references,
         )?;
     }
 

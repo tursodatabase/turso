@@ -1767,29 +1767,21 @@ fn emit_update_insns<'a>(
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.without_access_path()], vec![]);
+            let registers = DmlColumnContext::layout(
+                btree_table.columns(),
+                start,
+                effective_rowid_reg,
+                layout.clone(),
+            );
             emit_check_constraints(
                 program,
                 &relevant_checks,
-                &mut t_ctx.resolver,
-                &btree_table.name,
-                effective_rowid_reg,
-                btree_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
-                            if col.is_rowid_alias() {
-                                (n, effective_rowid_reg)
-                            } else {
-                                (n, layout.to_register(start, idx))
-                            }
-                        })
-                    }),
+                &t_ctx.resolver,
+                &registers,
                 connection,
                 or_conflict,
                 skip_row_label,
-                Some(&check_constraint_tables),
+                &check_constraint_tables,
             )?;
         }
     }
@@ -1856,7 +1848,7 @@ fn emit_update_insns<'a>(
             let bt = target_table.table.require_btree()?;
             emit_dml_expr_index_value(
                 program,
-                &mut t_ctx.resolver,
+                &t_ctx.resolver,
                 &index_expr_tables,
                 target_table.internal_id,
                 &where_clause,

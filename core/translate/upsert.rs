@@ -775,21 +775,21 @@ pub fn emit_upsert(
         }
 
         // Evaluate CHECK constraints on the new values
+        let registers = DmlColumnContext::layout(
+            bt.columns(),
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            layout.clone(),
+        );
         emit_check_constraints(
             program,
             &bt.check_constraints,
             resolver,
-            &bt.name,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
-                col.name
-                    .as_deref()
-                    .map(|n| (n, layout.to_register(new_start, idx)))
-            }),
+            &registers,
             connection,
             ast::ResolveType::Abort,
             ctx.loop_labels.row_done,
-            Some(table_references),
+            table_references,
         )?;
     }
 

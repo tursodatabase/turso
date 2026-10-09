@@ -1,5 +1,4 @@
 use super::*;
-use std::borrow::Cow;
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -326,12 +325,12 @@ pub(super) fn find_custom_type_operator(
 ///
 /// `expr` is bound to the table reference `table_internal_id`. Custom-type
 /// columns are decoded in place in `column_regs` first, so the expression
-/// sees user-facing values. The registers are then mapped to the column
-/// references of the table through the expression register cache.
+/// sees user-facing values. The expression then reads the columns of the
+/// reference from the registers through a row image scope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     table_references: &TableReferences,
     table_internal_id: ast::TableInternalId,
     expr: &ast::Expr,
@@ -356,36 +355,14 @@ pub(crate) fn emit_dml_expr_index_value(
         }
     }
 
-    let cache_len = resolver.expr_to_reg_cache.len();
-    let cache_enabled = resolver.expr_to_reg_cache_enabled;
-    resolver.cache_expr_reg(
-        Cow::Owned(ast::Expr::RowId {
-            database: None,
-            table: table_internal_id,
-        }),
+    let registers = DmlColumnContext::from_column_reg_mapping(
+        columns.iter().zip(column_regs.iter().copied()),
         rowid_reg,
-        false,
-        None,
     );
-    for (i, col) in columns.iter().enumerate() {
-        resolver.cache_expr_reg(
-            Cow::Owned(ast::Expr::Column {
-                database: None,
-                table: table_internal_id,
-                column: i,
-                is_rowid_alias: col.is_rowid_alias(),
-            }),
-            column_regs[i],
-            false,
-            Some((col.collation(), false)),
-        );
-    }
-    resolver.enable_expr_to_reg_cache();
-    let result = translate_expr(program, Some(table_references), expr, dest_reg, resolver);
-    resolver.expr_to_reg_cache.truncate(cache_len);
-    resolver.expr_to_reg_cache_enabled = cache_enabled;
-    result?;
-    Ok(())
+    resolver.with_row_image(program, table_internal_id, Some(&registers), |program| {
+        translate_expr(program, Some(table_references), expr, dest_reg, resolver)?;
+        Ok(())
+    })
 }
 
 /// Emit bytecode that transforms a stored column value into its user-facing

@@ -19,7 +19,7 @@ use super::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
         TableReferences,
     },
-    planner::{TableMask, ROWID_STRS},
+    planner::TableMask,
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
@@ -2156,24 +2156,19 @@ fn emit_index_column_value_new_image(
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
-    referenced_tables: Option<&TableReferences>,
+    table_references: &TableReferences,
 ) -> Result<()> {
-    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
+    let joined_table = &table_references.joined_tables()[0];
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
-
-        // A constraint that is not on the table yet (ALTER TABLE ADD COLUMN)
-        // keeps its written names, which the caller mapped to registers.
-        let rewritten_expr = joined_table
-            .map(|joined_table| joined_table.check_constraint_expr(check_constraint))
-            .unwrap_or_else(|| check_constraint.bound.clone());
+        let rewritten_expr = joined_table.check_constraint_expr(check_constraint);
 
         translate_expr_no_constant_opt(
             program,
-            referenced_tables,
+            Some(table_references),
             &rewritten_expr,
             expr_result_reg,
             resolver,
@@ -2242,105 +2237,33 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
 /// Takes column-to-register mappings as an iterator to avoid heap allocation.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_check_constraints<'a>(
+pub(crate) fn emit_check_constraints(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
-    resolver: &mut Resolver,
-    table_name: &str,
-    rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    resolver: &Resolver,
+    registers: &DmlColumnContext,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
-    referenced_tables: Option<&TableReferences>,
+    table_references: &TableReferences,
 ) -> Result<()> {
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
-
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
-    let initial_cache_size = resolver.expr_to_reg_cache.len();
-    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
-
-    // Map rowid aliases to the actual rowid register.
-    // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
-    // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
-    for rowid_name in ROWID_STRS {
-        let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
-        let qualified_expr = ast::Expr::Qualified(
-            ast::Name::exact(table_name.to_string()),
-            ast::Name::exact(rowid_name.to_string()),
-        );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
-    }
-
-    // Map each column to its register (both unqualified and qualified forms).
-    for (col_name, register) in column_mappings.iter().copied() {
-        let collation = joined_table
-            .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
-            })
-            .map(|col| (col.collation(), false));
-        let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
-        let qualified_expr = ast::Expr::Qualified(
-            ast::Name::exact(table_name.to_string()),
-            ast::Name::exact(col_name.to_string()),
-        );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
-    }
-
-    if let Some(joined_table) = joined_table {
-        resolver.cache_expr_reg(
-            Cow::Owned(ast::Expr::RowId {
-                database: None,
-                table: joined_table.internal_id,
-            }),
-            rowid_reg,
-            false,
-            None,
-        );
-
-        for (col_name, register) in column_mappings.iter().copied() {
-            if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
-            }) {
-                resolver.cache_expr_reg(
-                    Cow::Owned(ast::Expr::Column {
-                        database: None,
-                        table: joined_table.internal_id,
-                        column: idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    }),
-                    register,
-                    false,
-                    Some((col.collation(), false)),
-                );
-            }
-        }
-    }
-
-    resolver.enable_expr_to_reg_cache();
-
-    let result = emit_check_constraint_bytecode(
+    let target_table = &table_references.joined_tables()[0];
+    resolver.with_row_image(
         program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        skip_row_label,
-        referenced_tables,
-    );
-
-    // Always restore resolver state, even on error.
-    resolver.expr_to_reg_cache.truncate(initial_cache_size);
-    resolver.expr_to_reg_cache_enabled = false;
-
-    result
+        target_table.internal_id,
+        Some(registers),
+        |program| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                skip_row_label,
+                table_references,
+            )
+        },
+    )
 }
