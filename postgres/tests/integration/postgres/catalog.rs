@@ -51,6 +51,28 @@ fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn test_physical_catalog_boolean_metadata(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE TABLE plain (value TEXT)").unwrap();
+    let mut booleans = conn
+        .prepare(
+            "SELECT relname, relhasindex FROM pg_class
+                  WHERE relname IN ('indexed', 'plain') ORDER BY relname",
+        )
+        .unwrap();
+    assert_eq!(booleans.get_column_decltype(1).as_deref(), Some("BOOLEAN"));
+    assert_eq!(
+        booleans.run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("indexed"), Value::from_i64(1)],
+            vec![Value::build_text("plain"), Value::from_i64(0)],
+        ]
+    );
+}
+
 #[turso_macros::test]
 fn test_postgres_pg_namespace(db: TempDatabase) {
     let conn = db.connect_postgres();
