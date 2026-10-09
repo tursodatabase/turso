@@ -271,6 +271,7 @@ pub fn plan_subqueries_from_select_plan(
     // WHERE
     {
         crate::stack::trace_stack!("select_where");
+        let aggregates_moved_before_where = resolver.count_aggregates_moved_from_subqueries();
         plan_subqueries_with_outer_query_access(
             program,
             &mut plan.non_from_clause_subqueries,
@@ -285,6 +286,13 @@ pub fn plan_subqueries_from_select_plan(
             &mut same_query_map,
             &[],
         )?;
+        // A subquery in WHERE moves an aggregate of this query's columns up to
+        // this query, but this query cannot compute an aggregate in WHERE. ON
+        // clauses and table-valued function arguments are WHERE terms too.
+        if let Some(func) = resolver.aggregate_moved_from_subqueries(aggregates_moved_before_where)
+        {
+            crate::bail_parse_error!("misuse of aggregate: {}()", func);
+        }
     }
 
     // GROUP BY
