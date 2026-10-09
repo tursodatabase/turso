@@ -7328,7 +7328,7 @@ mod tests {
 
     /// Column positions, rowid reads and names left in a stored expression.
     fn stored_expr_leaves(expr: &Expr) -> (Vec<usize>, usize, usize) {
-        let mut positions = Vec::new();
+        let mut positions = vec![];
         let mut rowids = 0;
         let mut names = 0;
         let _ = walk_expr(expr, &mut |e| {

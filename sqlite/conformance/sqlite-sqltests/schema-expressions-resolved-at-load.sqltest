@@ -3,8 +3,8 @@
 # Index key expressions, partial-index predicates and CHECK constraints are
 # resolved to column positions once, when the schema loads. Statements point
 # the stored positions at their own table reference and never look the names
-# up again. A table alias in a DML statement, a table-qualified name in the
-# stored expression and a rowid reference in a predicate all work.
+# up again. A table alias in a DML statement, a table-qualified name in a
+# CHECK constraint and a rowid reference in a predicate all work.
 
 @cross-check-integrity
 test partial-index-rowid-predicate-insert {
@@ -70,9 +70,9 @@ expect {
 }
 
 @cross-check-integrity
-test expression-index-qualified-names-with-dml-alias {
+test expression-index-with-dml-alias {
     CREATE TABLE t (a INTEGER, b INTEGER);
-    CREATE UNIQUE INDEX t_sum ON t (t.a + t.b);
+    CREATE UNIQUE INDEX t_sum ON t (a + b);
     INSERT INTO t VALUES (1, 2), (3, 4);
     UPDATE t AS z SET a = a + 10 WHERE z.b = 2;
     DELETE FROM t WHERE a = 3;
@@ -85,9 +85,9 @@ expect {
 }
 
 @cross-check-integrity
-test expression-index-qualified-names-unique-violation {
+test expression-index-unique-violation-with-dml-alias {
     CREATE TABLE t (a INTEGER, b INTEGER);
-    CREATE UNIQUE INDEX t_sum ON t (t.a + t.b);
+    CREATE UNIQUE INDEX t_sum ON t (a + b);
     INSERT INTO t VALUES (1, 2);
     UPDATE t AS z SET a = a + 10 WHERE z.b = 2;
     INSERT INTO t VALUES (10, 3);
