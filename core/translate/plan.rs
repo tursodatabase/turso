@@ -2,10 +2,9 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        bind_schema_expr, schema_expr_is_bound, BTreeTable, CheckConstraint, ColDef, Column,
-        FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
-        ROWID_SENTINEL,
+        bind_schema_expr, BTreeTable, CheckConstraint, ColDef, Column, FromClauseSubquery, Index,
+        ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility, PseudoCursorType,
+        RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -1773,143 +1772,6 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
-    /// The stored expressions of the table, bound to this reference. None
-    /// for a table without stored expressions.
-    pub schema_exprs: Option<Arc<BoundSchemaExprs>>,
-}
-
-/// The stored expressions of one table, bound to one table reference of a
-/// statement: the column references of its CHECK constraints, virtual
-/// generated columns, index key expressions and partial-index predicates
-/// point at that reference. A statement that references the table twice
-/// binds them once per reference.
-#[derive(Debug)]
-pub struct BoundSchemaExprs {
-    /// The CHECK constraints, in the order of the table definition.
-    pub checks: Vec<ast::Expr>,
-    /// One entry per table column: the expression of a virtual generated
-    /// column. Empty for a table without virtual generated columns.
-    pub generated_columns: Vec<Option<ast::Expr>>,
-    /// The indexes of the table that have a key expression or a predicate,
-    /// by index name.
-    pub indexes: Vec<(String, BoundIndexExprs)>,
-}
-
-/// The expressions of one index, bound to one table reference.
-#[derive(Debug)]
-pub struct BoundIndexExprs {
-    /// One entry per index column: the key expression, or None for a column key.
-    pub columns: Vec<Option<ast::Expr>>,
-    /// The predicate of a partial index.
-    pub where_clause: Option<ast::Expr>,
-}
-
-impl BoundSchemaExprs {
-    /// Bind the stored expressions of `table` to the reference `internal_id`,
-    /// with the indexes of the table read from the schema of `database_id`.
-    pub fn from_schema(
-        resolver: &Resolver,
-        database_id: usize,
-        table: &Table,
-        internal_id: TableInternalId,
-    ) -> Option<Arc<Self>> {
-        let Table::BTree(table) = table else {
-            return None;
-        };
-        resolver.with_schema(database_id, |schema| {
-            Self::new(
-                table,
-                schema.get_indices(&table.name).map(|index| index.as_ref()),
-                internal_id,
-            )
-        })
-    }
-
-    /// Bind the stored expressions of `table` and of its `indexes` to the
-    /// reference `internal_id`. None when there is nothing to bind.
-    pub fn new<'a>(
-        table: &BTreeTable,
-        indexes: impl IntoIterator<Item = &'a Index>,
-        internal_id: TableInternalId,
-    ) -> Option<Arc<Self>> {
-        let checks: Vec<ast::Expr> = table
-            .check_constraints
-            .iter()
-            .map(|check| bind_schema_expr(&check.bound, internal_id))
-            .collect();
-        let generated_columns: Vec<Option<ast::Expr>> =
-            if table.columns().iter().any(Column::is_virtual_generated) {
-                table
-                    .columns()
-                    .iter()
-                    .map(|column| {
-                        column
-                            .generated_expr()
-                            .map(|expr| bind_schema_expr(expr, internal_id))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let indexes: Vec<(String, BoundIndexExprs)> = indexes
-            .into_iter()
-            .filter_map(|index| {
-                let bound = BoundIndexExprs::new(index, internal_id)?;
-                Some((index.name.clone(), bound))
-            })
-            .collect();
-        if checks.is_empty() && generated_columns.is_empty() && indexes.is_empty() {
-            return None;
-        }
-        Some(Arc::new(Self {
-            checks,
-            generated_columns,
-            indexes,
-        }))
-    }
-
-    /// The expression of the virtual generated column `column_index`, bound
-    /// to the reference that `schema_exprs` belongs to.
-    pub fn virtual_column_expr(schema_exprs: Option<&Self>, column_index: usize) -> &ast::Expr {
-        schema_exprs
-            .and_then(|exprs| exprs.generated_columns.get(column_index)?.as_ref())
-            .expect(
-                "a table reference binds the expressions of its virtual columns when it is created",
-            )
-    }
-
-    fn index_exprs(&self, index: &Index) -> Option<&BoundIndexExprs> {
-        self.indexes
-            .iter()
-            .find(|(name, _)| *name == index.name)
-            .map(|(_, bound)| bound)
-    }
-}
-
-impl BoundIndexExprs {
-    /// None for an index with column keys only and no predicate.
-    fn new(index: &Index, internal_id: TableInternalId) -> Option<Self> {
-        if index.where_clause.is_none() && index.columns.iter().all(|column| column.expr.is_none())
-        {
-            return None;
-        }
-        Some(Self {
-            columns: index
-                .columns
-                .iter()
-                .map(|column| {
-                    column
-                        .expr
-                        .as_deref()
-                        .map(|expr| bind_schema_expr(expr, internal_id))
-                })
-                .collect(),
-            where_clause: index
-                .where_clause
-                .as_deref()
-                .map(|expr| bind_schema_expr(expr, internal_id)),
-        })
-    }
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -1971,9 +1833,6 @@ pub struct OuterQueryReference {
     /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
     /// errors when the same column name exists at different nesting depths.
     pub scope_depth: usize,
-    /// The stored expressions of the table, bound to this reference (see
-    /// [JoinedTable::schema_exprs]).
-    pub schema_exprs: Option<Arc<BoundSchemaExprs>>,
 }
 
 impl OuterQueryReference {
@@ -2322,22 +2181,13 @@ impl TableReferences {
             })
     }
 
-    /// The expression of the virtual generated column `column_index` of table
-    /// reference `table_id`, bound to that reference.
-    pub fn virtual_column_expr(
-        &self,
-        table_id: TableInternalId,
-        column_index: usize,
-    ) -> &ast::Expr {
-        let schema_exprs = match self.find_joined_table_by_internal_id(table_id) {
-            Some(table) => table.schema_exprs.as_deref(),
-            None => self
-                .find_outer_query_ref_by_internal_id(table_id)
-                .expect("a virtual column is read from a table reference in scope")
-                .schema_exprs
-                .as_deref(),
-        };
-        BoundSchemaExprs::virtual_column_expr(schema_exprs, column_index)
+    /// A copy of the expression of the virtual generated column `column_index`
+    /// of table reference `table_id`, bound to that reference.
+    pub fn virtual_column_expr(&self, table_id: TableInternalId, column_index: usize) -> ast::Expr {
+        let (_, table) = self
+            .find_table_by_internal_id(table_id)
+            .expect("a virtual column is read from a table reference in scope");
+        bound_virtual_column_expr(&table.columns()[column_index], table_id)
     }
 
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
@@ -3300,17 +3150,15 @@ impl JoinedTable {
             && self.table.get_name().eq_ignore_ascii_case(table_name)
     }
 
+    /// Creates a new TableReference for a subquery from a SelectPlan.
     /// A reference to a table that a statement reads outside its FROM clause,
-    /// such as the parent table of a foreign key. `indexes` are the indexes
-    /// of the table whose expressions the statement evaluates.
-    pub fn new_btree<'a>(
+    /// such as the parent table of a foreign key.
+    pub fn new_btree(
         table: Arc<BTreeTable>,
         internal_id: TableInternalId,
         database_id: usize,
-        indexes: impl IntoIterator<Item = &'a Index>,
     ) -> Self {
         let identifier = table.name.clone();
-        let schema_exprs = BoundSchemaExprs::new(&table, indexes, internal_id);
         let table = Table::BTree(table);
         Self {
             op: Operation::default_scan_for(&table),
@@ -3325,11 +3173,9 @@ impl JoinedTable {
             database_id,
             indexed: None,
             plan_estimate: None,
-            schema_exprs,
         }
     }
 
-    /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
@@ -3361,7 +3207,6 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
-            schema_exprs: None,
         })
     }
 
@@ -3411,7 +3256,6 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
-            schema_exprs: None,
         })
     }
 
@@ -3446,7 +3290,6 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
-            schema_exprs: None,
         })
     }
 
@@ -3528,79 +3371,38 @@ impl JoinedTable {
         table
     }
 
-    /// The CHECK constraints of the table, each with its expression bound to
-    /// this reference.
-    pub fn check_constraints(&self) -> impl Iterator<Item = (&CheckConstraint, &ast::Expr)> {
+    /// The CHECK constraints of the table, each with a copy of its expression
+    /// bound to this reference.
+    pub fn check_constraints(&self) -> impl Iterator<Item = (&CheckConstraint, ast::Expr)> {
         let checks: &[CheckConstraint] = match &self.table {
             Table::BTree(table) => &table.check_constraints,
             _ => &[],
         };
-        let bound: &[ast::Expr] = match &self.schema_exprs {
-            Some(exprs) => &exprs.checks,
-            None => &[],
-        };
-        assert_eq!(
-            checks.len(),
-            bound.len(),
-            "a table reference binds the CHECK constraints of its table when it is created"
-        );
-        checks.iter().zip(bound)
+        checks
+            .iter()
+            .map(move |check| (check, bind_schema_expr(&check.bound, self.internal_id)))
     }
 
-    /// The expression of the virtual generated column `column_index`, bound
-    /// to this reference.
-    pub fn virtual_column_expr(&self, column_index: usize) -> &ast::Expr {
-        BoundSchemaExprs::virtual_column_expr(self.schema_exprs.as_deref(), column_index)
+    /// A copy of the expression of the virtual generated column `column_index`,
+    /// bound to this reference.
+    pub fn virtual_column_expr(&self, column_index: usize) -> ast::Expr {
+        bound_virtual_column_expr(&self.columns()[column_index], self.internal_id)
     }
 
-    /// The key expression of index column `position`, bound to this reference.
-    /// An index that is not in the schema, such as a temporary index that the
-    /// optimizer builds for this statement, carries its own bound expressions.
-    pub fn index_column_expr<'a>(
-        &'a self,
-        index: &'a Index,
-        position: usize,
-    ) -> Option<&'a ast::Expr> {
-        match self
-            .schema_exprs
-            .as_deref()
-            .and_then(|exprs| exprs.index_exprs(index))
-        {
-            Some(bound) => bound.columns.get(position)?.as_ref(),
-            None => {
-                let expr = index.columns.get(position)?.expr.as_deref()?;
-                assert!(
-                    schema_expr_is_bound(expr),
-                    "an index that is not bound to the table reference carries bound expressions"
-                );
-                Some(expr)
-            }
-        }
+    /// A copy of the key expression of index column `position`, bound to this
+    /// reference.
+    pub fn index_column_expr(&self, index: &Index, position: usize) -> Option<ast::Expr> {
+        let expr = index.columns.get(position)?.expr.as_deref()?;
+        Some(bind_schema_expr(expr, self.internal_id))
     }
 
-    /// The predicate of a partial index, bound to this reference (see
-    /// [JoinedTable::index_column_expr] for an index that is not in the schema).
-    pub fn index_where_expr<'a>(&'a self, index: &'a Index) -> Option<&'a ast::Expr> {
-        match self
-            .schema_exprs
-            .as_deref()
-            .and_then(|exprs| exprs.index_exprs(index))
-        {
-            Some(bound) => bound.where_clause.as_ref(),
-            None => {
-                let expr = index.where_clause.as_deref()?;
-                assert!(
-                    schema_expr_is_bound(expr),
-                    "an index that is not bound to the table reference carries bound expressions"
-                );
-                Some(expr)
-            }
-        }
+    /// A copy of the predicate of a partial index, bound to this reference.
+    pub fn index_where_expr(&self, index: &Index) -> Option<ast::Expr> {
+        let expr = index.where_clause.as_deref()?;
+        Some(bind_schema_expr(expr, self.internal_id))
     }
 
-    /// A query pattern of an index method, bound to this reference. The
-    /// patterns of an index method are templates that the matcher rewrites
-    /// for one query, so it binds a pattern when it tries it.
+    /// A query pattern of an index method, bound to this reference.
     pub fn index_method_pattern(&self, pattern: &ast::Select) -> ast::Select {
         crate::index_method::bind_pattern(pattern, self.internal_id)
     }
@@ -3608,9 +3410,10 @@ impl JoinedTable {
     /// The position of the index column whose key expression is `expr`, a
     /// bound query expression.
     pub fn expression_index_position(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
-        (0..index.columns.len()).find(|&position| {
-            self.index_column_expr(index, position)
-                .is_some_and(|key| exprs_are_equivalent(key, expr))
+        index.columns.iter().position(|column| {
+            column.expr.as_deref().is_some_and(|key| {
+                exprs_are_equivalent(&bind_schema_expr(key, self.internal_id), expr)
+            })
         })
     }
 
@@ -3633,7 +3436,7 @@ impl JoinedTable {
             // expression value from the index and drop the table cursor.
             let matches_where_clause = self
                 .index_where_expr(index)
-                .is_some_and(|where_clause| exprs_are_equivalent(where_clause, &usage.expr));
+                .is_some_and(|where_clause| exprs_are_equivalent(&where_clause, &usage.expr));
 
             let index_key_covers_columns = !usage.may_be_null_row
                 && self.expression_index_position(index, &usage.expr).is_some();
@@ -4874,6 +4677,15 @@ fn resolve_outer_ref_loop(
     None
 }
 
+/// A copy of the expression of the virtual generated column `column`, bound
+/// to the table reference `internal_id`.
+fn bound_virtual_column_expr(column: &Column, internal_id: TableInternalId) -> ast::Expr {
+    let expr = column
+        .generated_expr()
+        .expect("the column is a virtual generated column");
+    bind_schema_expr(expr, internal_id)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::alloc::TursoFromIterator;
@@ -4902,7 +4714,6 @@ mod tests {
             &table,
         )?;
         let reference = TableInternalId::from(7);
-        let schema_exprs = BoundSchemaExprs::new(&table, [&index], reference);
         let table = Table::BTree(Arc::new(table));
         let joined_table = JoinedTable {
             op: Operation::default_scan_for(&table),
@@ -4916,7 +4727,6 @@ mod tests {
             database_id: 0,
             indexed: None,
             plan_estimate: None,
-            schema_exprs,
             table,
         };
         let leaves_of = |expr: &ast::Expr| {
@@ -4933,35 +4743,24 @@ mod tests {
             .check_constraints()
             .next()
             .expect("one CHECK constraint");
-        assert_eq!(leaves_of(check), vec![reference; 3]);
+        assert_eq!(leaves_of(&check), vec![reference; 3]);
         assert_eq!(
-            leaves_of(joined_table.virtual_column_expr(2)),
+            leaves_of(&joined_table.virtual_column_expr(2)),
             vec![reference; 2]
         );
         let key = joined_table
             .index_column_expr(&index, 0)
             .expect("key expression");
-        assert_eq!(leaves_of(key), vec![reference; 2]);
+        assert_eq!(leaves_of(&key), vec![reference; 2]);
         assert!(joined_table.index_column_expr(&index, 1).is_none());
         assert_eq!(
-            leaves_of(joined_table.index_where_expr(&index).expect("predicate")),
+            leaves_of(&joined_table.index_where_expr(&index).expect("predicate")),
             vec![reference; 2]
         );
-        assert_eq!(joined_table.expression_index_position(&index, key), Some(0));
-        Ok(())
-    }
-
-    #[test]
-    fn a_table_without_stored_expressions_binds_nothing() -> crate::Result<()> {
-        use crate::SymbolTable;
-        let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER, b INTEGER)", 2)?;
-        let index = Index::from_sql(
-            &SymbolTable::default(),
-            "CREATE INDEX i ON t (a, b)",
-            3,
-            &table,
-        )?;
-        assert!(BoundSchemaExprs::new(&table, [&index], TableInternalId::from(7)).is_none());
+        assert_eq!(
+            joined_table.expression_index_position(&index, &key),
+            Some(0)
+        );
         Ok(())
     }
 

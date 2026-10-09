@@ -884,29 +884,34 @@ pub(super) fn btree_access_order_consumed(
                 includes_rowid: correct_order,
             }
         }
-        Some(index) => index_columns_order_consumed(
-            table_ref,
-            iter_dir,
-            constraint_refs,
-            order_target,
-            target_columns,
-            schema,
-            equality_prefix_scope,
-            index
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(position, column)| IndexOrderColumn {
-                    pos_in_table: column.pos_in_table,
-                    order: column.order,
-                    nulls_order: column.nulls_order,
-                    collation: column.collation,
-                    expr: table_ref.index_column_expr(index, position),
-                }),
-            index.columns.len(),
-            index.has_rowid,
-            rowid_alias_col,
-        ),
+        Some(index) => {
+            let key_exprs: Vec<Option<ast::Expr>> = (0..index.columns.len())
+                .map(|position| table_ref.index_column_expr(index, position))
+                .collect();
+            index_columns_order_consumed(
+                table_ref,
+                iter_dir,
+                constraint_refs,
+                order_target,
+                target_columns,
+                schema,
+                equality_prefix_scope,
+                index
+                    .columns
+                    .iter()
+                    .zip(&key_exprs)
+                    .map(|(column, expr)| IndexOrderColumn {
+                        pos_in_table: column.pos_in_table,
+                        order: column.order,
+                        nulls_order: column.nulls_order,
+                        collation: column.collation,
+                        expr: expr.as_ref(),
+                    }),
+                index.columns.len(),
+                index.has_rowid,
+                rowid_alias_col,
+            )
+        }
     }
 }
 
@@ -945,6 +950,20 @@ fn temporary_index_order_consumed(
                 .any(|constraint| constraint.table_col_pos == Some(*column_pos))
         })
         .map(|(column_pos, _)| column_pos);
+    let generated_exprs: Vec<Option<ast::Expr>> =
+        if columns.iter().any(|column| column.is_virtual_generated()) {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(column_pos, column)| {
+                    column
+                        .is_virtual_generated()
+                        .then(|| table_ref.virtual_column_expr(column_pos))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let index_columns = key_columns.chain(other_columns).map(|column_pos| {
         let column = &columns[column_pos];
         IndexOrderColumn {
@@ -952,9 +971,7 @@ fn temporary_index_order_consumed(
             order: SortOrder::Asc,
             nulls_order: None,
             collation: column.collation_opt(),
-            expr: column
-                .is_virtual_generated()
-                .then(|| table_ref.virtual_column_expr(column_pos)),
+            expr: generated_exprs.get(column_pos).and_then(Option::as_ref),
         }
     });
 

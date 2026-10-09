@@ -375,7 +375,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                         translate_expr(
                             planner.program,
                             Some(planner.table_references),
-                            expr,
+                            &expr,
                             payload_reg + i,
                             &planner.t_ctx.resolver,
                         )?;

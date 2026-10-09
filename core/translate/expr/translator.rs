@@ -2495,7 +2495,7 @@ fn translate_column_expr(
                         translate_expr(
                             program,
                             referenced_tables,
-                            expr,
+                            &expr,
                             target_register,
                             resolver,
                         )?;

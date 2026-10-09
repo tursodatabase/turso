@@ -1723,7 +1723,7 @@ pub(super) fn partial_index_predicate_terms(
     // it compares symmetrically against the bound query WHERE terms. Each
     // conjunct of the index WHERE must be implied by some query WHERE term for
     // the partial index to be safe to use.
-    let mut bound = index_where.clone();
+    let mut bound = index_where;
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
@@ -1778,7 +1778,7 @@ pub fn estimate_partial_index_where_selectivity(
         return 1.0;
     };
     estimate_bound_expr_selectivity(
-        where_expr,
+        &where_expr,
         table_reference,
         schema,
         available_indexes,

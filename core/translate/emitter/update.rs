@@ -3,7 +3,7 @@ use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
-use crate::translate::plan::{BoundSchemaExprs, ColumnMask};
+use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
     ast, emit_explain,
@@ -156,11 +156,6 @@ pub fn emit_program_for_update(
         };
         let scratch_table = scratch_table.clone();
         let scratch_table_internal_id = write_set_plan.scratch_table_id;
-        let schema_exprs = BoundSchemaExprs::new(
-            &scratch_table,
-            std::iter::empty(),
-            scratch_table_internal_id,
-        );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
@@ -184,7 +179,6 @@ pub fn emit_program_for_update(
                 database_id: MAIN_DB_ID,
                 indexed: None,
                 plan_estimate: None,
-                schema_exprs,
             }],
             vec![],
         );
@@ -192,7 +186,6 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
-            schema_exprs: target_table.schema_exprs.clone(),
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
@@ -815,17 +808,14 @@ fn emit_update_column_values<'a>(
         // Such a column can be directly updated, in which case `expr` is the right-side of the SET
         // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
         // column's expression.
+        let generated_expr = (column_ctx.affected_columns.get(idx)
+            && table_column.is_virtual_generated())
+        .then(|| column_ctx.target_table.virtual_column_expr(idx));
         let update_expr = set_clauses
             .iter()
             .find(|set_clause| set_clause.column_index == idx)
             .map(UpdateSetClause::emitted_expr)
-            .or_else(|| {
-                if column_ctx.affected_columns.get(idx) && table_column.is_virtual_generated() {
-                    Some(column_ctx.target_table.virtual_column_expr(idx))
-                } else {
-                    None
-                }
-            });
+            .or(generated_expr.as_ref());
 
         if let Some(expr) = update_expr {
             if !skip_set_clauses {
@@ -1822,7 +1812,7 @@ fn emit_update_insns<'a>(
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
-                where_clause,
+                &where_clause,
                 old_satisfied_reg,
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
@@ -1848,7 +1838,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 &index_expr_tables,
                 target_table.internal_id,
-                where_clause,
+                &where_clause,
                 columns,
                 &mut column_regs,
                 effective_rowid_reg,

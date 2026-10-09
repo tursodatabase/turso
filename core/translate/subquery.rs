@@ -607,7 +607,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 };
                 let outer_ref = OuterQueryReference {
                     table: t.table.clone(),
-                    schema_exprs: t.schema_exprs.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     join_info: t.join_info.clone(),
@@ -626,7 +625,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
             .chain(referenced_tables.outer_query_refs().iter().map(|t| {
                 Ok(OuterQueryReference {
                     table: t.table.clone(),
-                    schema_exprs: t.schema_exprs.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
                     join_info: t.join_info.clone(),

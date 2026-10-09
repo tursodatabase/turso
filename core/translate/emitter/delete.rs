@@ -778,7 +778,7 @@ fn emit_delete_row_common(
                 translate_expr_no_constant_opt(
                     program,
                     Some(table_references),
-                    where_copy,
+                    &where_copy,
                     reg,
                     &t_ctx.resolver,
                     NoConstantOptReason::RegisterReuse,

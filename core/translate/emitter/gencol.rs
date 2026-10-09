@@ -26,7 +26,7 @@ pub fn compute_virtual_columns(
             }
             let expr = table_references.virtual_column_expr(table_id, idx);
             let target_reg = registers.to_column_reg(idx);
-            translate_expr(program, Some(table_references), expr, target_reg, resolver)?;
+            translate_expr(program, Some(table_references), &expr, target_reg, resolver)?;
             if column.affinity() != Affinity::Blob {
                 program.emit_column_affinity(target_reg, column.affinity());
             }

@@ -20,7 +20,7 @@ pub fn emit_table_column(
         translate_expr(
             program,
             Some(referenced_tables),
-            expr,
+            &expr,
             target_register,
             resolver,
         )?;

@@ -1322,7 +1322,6 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             plan_estimate: None,
-            schema_exprs: None,
             indexed: None,
         }
     }

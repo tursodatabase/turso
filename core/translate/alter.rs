@@ -650,7 +650,6 @@ fn emit_add_virtual_column_validation(
             Arc::new(resolved_table.clone()),
             table_id,
             database_id,
-            std::iter::empty(),
         )],
         vec![],
     );

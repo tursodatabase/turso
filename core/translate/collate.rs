@@ -1045,7 +1045,6 @@ mod tests {
             join_info: None,
             table,
             plan_estimate: None,
-            schema_exprs: None,
             indexed: None,
         });
 
@@ -1081,7 +1080,6 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,
-            schema_exprs: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t1".to_string(),
@@ -1119,7 +1117,6 @@ mod tests {
             internal_id: TableInternalId::from(2),
             join_info: None,
             plan_estimate: None,
-            schema_exprs: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t2".to_string(),
@@ -1167,7 +1164,6 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,
-            schema_exprs: None,
             indexed: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,

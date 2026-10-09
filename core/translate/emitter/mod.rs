@@ -2019,7 +2019,7 @@ pub(crate) fn emit_index_column_value_old_image(
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
-            expr,
+            &expr,
             dest_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
@@ -2108,7 +2108,7 @@ fn emit_index_column_value_new_image(
             resolver,
             table_references,
             target_table.internal_id,
-            expr,
+            &expr,
             columns,
             &mut column_regs,
             rowid_reg,
@@ -2126,7 +2126,7 @@ fn emit_index_column_value_new_image(
                     DmlColumnContext::layout(columns, columns_start_reg, rowid_reg, layout.clone());
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    expr,
+                    &expr,
                     dest_reg,
                     &registers,
                     resolver,
@@ -2156,7 +2156,7 @@ fn emit_index_column_value_new_image(
 /// Assumes the resolver cache is already populated with column-to-register mappings.
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
-    check_constraints: &[(&CheckConstraint, &ast::Expr)],
+    check_constraints: &[(&CheckConstraint, ast::Expr)],
     resolver: &Resolver,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
@@ -2238,7 +2238,7 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
-    check_constraints: impl IntoIterator<Item = (&'a CheckConstraint, &'a ast::Expr)>,
+    check_constraints: impl IntoIterator<Item = (&'a CheckConstraint, ast::Expr)>,
     resolver: &Resolver,
     registers: &DmlColumnContext,
     connection: &Arc<Connection>,
@@ -2249,7 +2249,7 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() {
         return Ok(());
     }
-    let check_constraints: Vec<(&CheckConstraint, &ast::Expr)> =
+    let check_constraints: Vec<(&CheckConstraint, ast::Expr)> =
         check_constraints.into_iter().collect();
     if check_constraints.is_empty() {
         return Ok(());
