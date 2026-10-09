@@ -2,6 +2,129 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_pg_attribute_compression_defaults(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dump_columns (id INTEGER NOT NULL, payload TEXT DEFAULT 'pending')")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT a.attname, a.attcompression, a.attnotnull, a.atthasdef,
+                pg_catalog.format_type(t.oid, a.atttypmod), a.attlen, a.attbyval,
+                a.attalign, a.attstorage
+            FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+            JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+            WHERE c.relname = 'dump_columns' ORDER BY a.attnum"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("id"),
+                Value::build_text(""),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::build_text("integer"),
+                Value::from_i64(4),
+                Value::from_i64(1),
+                Value::build_text("i"),
+                Value::build_text("p")
+            ],
+            vec![
+                Value::build_text("payload"),
+                Value::build_text(""),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("text"),
+                Value::from_i64(-1),
+                Value::from_i64(0),
+                Value::build_text("i"),
+                Value::build_text("x")
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_index_nulls_are_distinct(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dump_indexes (id INTEGER, payload TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX dump_unique ON dump_indexes(payload)")
+        .unwrap();
+    conn.execute("CREATE INDEX dump_plain ON dump_indexes(id)")
+        .unwrap();
+    conn.execute("INSERT INTO dump_indexes VALUES (17, NULL), (2, NULL), (9, 'present')")
+        .unwrap();
+    assert!(conn
+        .execute("INSERT INTO dump_indexes VALUES (3, 'present')")
+        .is_err());
+    assert_eq!(
+        conn.prepare(
+            "SELECT c.relname, i.indisunique, i.indnullsnotdistinct, i.indnatts, i.indkey
+            FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname IN ('dump_unique', 'dump_plain') ORDER BY c.relname"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![
+                Value::build_text("dump_plain"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("1")
+            ],
+            vec![
+                Value::build_text("dump_unique"),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("2")
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_empty_physical_catalogs_have_hidden_tableoid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for (table, columns) in [
+        ("pg_collation", 12),
+        ("pg_policy", 8),
+        ("pg_trigger", 18),
+        ("pg_statistic_ext", 9),
+        ("pg_inherits", 4),
+        ("pg_rewrite", 8),
+        ("pg_foreign_table", 3),
+        ("pg_partitioned_table", 8),
+        ("pg_description", 4),
+        ("pg_publication", 9),
+        ("pg_publication_namespace", 3),
+        ("pg_publication_rel", 5),
+    ] {
+        let mut stmt = conn
+            .prepare(format!("SELECT tableoid FROM {table}"))
+            .unwrap();
+        assert!(stmt.run_collect_rows().unwrap().is_empty(), "{table}");
+        assert_eq!(
+            conn.prepare(format!("SELECT * FROM {table}"))
+                .unwrap()
+                .num_columns(),
+            columns,
+            "{table}"
+        );
+    }
+    assert!(conn.prepare("SELECT tableoid, oid, collname, collnamespace, collowner, collencoding FROM pg_collation")
+        .unwrap().run_collect_rows().unwrap().is_empty());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_language_describes_native_function_languages(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("SELECT set_config('search_path', '', false)")

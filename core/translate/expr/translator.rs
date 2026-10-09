@@ -761,6 +761,31 @@ fn translate_cast_expr(
 
     // Check if casting to a custom type
     if let Some(ref tn) = type_name {
+        if tn.array_dimensions > 0 {
+            let mut column = Column::new(
+                None,
+                tn.name.clone(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            );
+            column.set_array_dimensions(tn.array_dimensions);
+            column.ty_params = match &tn.size {
+                Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
+                Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
+                None => vec![],
+            };
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: target_register,
+                target_pc: skip_label,
+            });
+            emit_array_encode(program, target_register, &column, resolver, "CAST")?;
+            program.preassign_label_to_next_insn(skip_label);
+            return Ok(target_register);
+        }
         if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.

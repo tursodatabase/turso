@@ -615,7 +615,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }))
             }
             ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
-            ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
+            ast::SelectTable::TableCall(..) => Err(LimboError::ParseError(
                 "Table-valued functions are not supported in logical plans".to_string(),
             )),
             ast::SelectTable::Sub(_, _) => Err(LimboError::ParseError(

@@ -1491,13 +1491,18 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::TableCall(name, exprs, alias) => {
+            Self::TableCall(name, exprs, alias, columns) => {
                 name.to_tokens(s, context)?;
                 s.append(TK_LP, None)?;
                 comma(exprs, s, context)?;
                 s.append(TK_RP, None)?;
                 if let Some(alias) = alias {
                     alias.to_tokens(s, context)?;
+                }
+                if !columns.is_empty() {
+                    s.append(TK_LP, None)?;
+                    comma(columns, s, context)?;
+                    s.append(TK_RP, None)?;
                 }
                 Ok(())
             }
