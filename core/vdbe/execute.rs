@@ -4735,7 +4735,7 @@ pub fn op_transaction_inner(
                         // checkpoint gate.
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
-                        if current_mv_tx.is_none() {
+                        if let None = current_mv_tx {
                             // Reject CONCURRENT on an attached DB if the main
                             // DB already started with BEGIN DEFERRED.
                             let conn_has_executed_begin_deferred =

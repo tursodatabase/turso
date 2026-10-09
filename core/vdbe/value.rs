@@ -291,10 +291,12 @@ impl Value {
             }
 
             let code = get_code(b);
-            if code.is_some() && code != prev_code {
-                result.push(code.unwrap());
-                prev_code = code;
-            } else if code.is_none() {
+            if let Some(code) = code {
+                if code != prev_code.unwrap() {
+                    result.push(code);
+                    prev_code = Some(code);
+                }
+            } else {
                 // Reset previous code for vowels/separators (a,e,i,o,u,y)
                 prev_code = None;
             }
