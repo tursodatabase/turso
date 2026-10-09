@@ -174,6 +174,10 @@ pub trait Dialect: Send + Sync + 'static {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         false
     }
+
+    fn uses_rowid_alias_defaults(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

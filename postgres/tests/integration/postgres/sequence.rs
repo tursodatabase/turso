@@ -599,7 +599,7 @@ fn test_serial_auto_increment(db: TempDatabase) {
 
     pg_execute(
         &conn,
-        "CREATE TABLE ser_items (id serial, name text NOT NULL)",
+        "CREATE TABLE ser_items (id serial PRIMARY KEY, name text NOT NULL)",
     );
 
     pg_execute(&conn, "INSERT INTO ser_items (name) VALUES ('alice')");
@@ -618,6 +618,61 @@ fn test_serial_auto_increment(db: TempDatabase) {
         pg_query_int(&conn, "SELECT id FROM ser_items WHERE name = 'charlie'"),
         3
     );
+    pg_execute(&conn, "INSERT INTO ser_items VALUES(100,'explicit')");
+    pg_execute(&conn, "INSERT INTO ser_items(name) VALUES('dave')");
+    assert_eq!(
+        pg_query_int(&conn, "SELECT id FROM ser_items WHERE name='dave'"),
+        4
+    );
+    pg_execute(&conn, "INSERT INTO ser_items(name) VALUES('eve'),('frank')");
+    pg_execute(&conn, "INSERT INTO ser_items(name) SELECT 'grace'");
+    assert_eq!(
+        conn.prepare("SELECT id FROM ser_items WHERE id<>100 ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        (1..=7)
+            .map(|id| vec![Value::from_i64(id)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        conn.prepare("SELECT last_value,is_called FROM public.ser_items_id_seq")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(7), Value::from_i64(1)]]
+    );
+    let default = pg_query_text(
+        &conn,
+        "SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef a
+        JOIN pg_class c ON c.oid=a.adrelid WHERE c.relname='ser_items'",
+    );
+    assert!(default.contains("'public.ser_items_id_seq'"), "{default}");
+    assert!(default.contains("regclass"), "{default}");
+    assert_eq!(
+        pg_query_int(
+            &conn,
+            "SELECT count(*) FROM pg_depend d
+        JOIN pg_attrdef a ON a.oid=d.objid AND d.classid=2604
+        JOIN pg_class s ON s.oid=d.refobjid AND d.refclassid=1259
+        WHERE s.relname='ser_items_id_seq' AND d.deptype='n'"
+        ),
+        1
+    );
+
+    pg_execute(
+        &conn,
+        "CREATE TABLE ser_qualified (id INTEGER PRIMARY KEY DEFAULT nextval('main.ser_items_id_seq'), note TEXT)",
+    );
+    pg_execute(&conn, "INSERT INTO ser_qualified(note) VALUES('qualified')");
+    assert_eq!(pg_query_int(&conn, "SELECT id FROM ser_qualified"), 8);
+    let default = pg_query_text(
+        &conn,
+        "SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef a
+        JOIN pg_class c ON c.oid=a.adrelid WHERE c.relname='ser_qualified'",
+    );
+    assert!(default.contains("'public.ser_items_id_seq'"), "{default}");
+    assert!(default.contains("regclass"), "{default}");
 
     pg_execute(&conn, "DROP TABLE ser_items");
 }
