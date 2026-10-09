@@ -1,4 +1,3 @@
-use crate::schema::bind_schema_expr;
 use crate::schema::{impl_effective_nulls_order, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
@@ -801,11 +800,7 @@ fn target_matches_order_column(
         (ColumnTarget::Column(col_no), _) => idx_col.pos_in_table == *col_no,
         (ColumnTarget::Expr(expr), Some(idx_expr)) => {
             let target_expr = unsafe { &**expr };
-            if exprs_are_equivalent(target_expr, idx_expr) {
-                return true;
-            }
-            let generated = bind_schema_expr(idx_expr, table_ref.internal_id);
-            exprs_are_equivalent(target_expr, &generated)
+            exprs_are_equivalent(target_expr, idx_expr)
         }
         _ => false,
     }
@@ -889,34 +884,29 @@ pub(super) fn btree_access_order_consumed(
                 includes_rowid: correct_order,
             }
         }
-        Some(index) => {
-            let key_exprs: Vec<Option<ast::Expr>> = (0..index.columns.len())
-                .map(|position| table_ref.index_column_expr(index, position))
-                .collect();
-            index_columns_order_consumed(
-                table_ref,
-                iter_dir,
-                constraint_refs,
-                order_target,
-                target_columns,
-                schema,
-                equality_prefix_scope,
-                index
-                    .columns
-                    .iter()
-                    .zip(&key_exprs)
-                    .map(|(column, expr)| IndexOrderColumn {
-                        pos_in_table: column.pos_in_table,
-                        order: column.order,
-                        nulls_order: column.nulls_order,
-                        collation: column.collation,
-                        expr: expr.as_ref(),
-                    }),
-                index.columns.len(),
-                index.has_rowid,
-                rowid_alias_col,
-            )
-        }
+        Some(index) => index_columns_order_consumed(
+            table_ref,
+            iter_dir,
+            constraint_refs,
+            order_target,
+            target_columns,
+            schema,
+            equality_prefix_scope,
+            index
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(position, column)| IndexOrderColumn {
+                    pos_in_table: column.pos_in_table,
+                    order: column.order,
+                    nulls_order: column.nulls_order,
+                    collation: column.collation,
+                    expr: table_ref.index_column_expr(index, position),
+                }),
+            index.columns.len(),
+            index.has_rowid,
+            rowid_alias_col,
+        ),
     }
 }
 
@@ -962,7 +952,9 @@ fn temporary_index_order_consumed(
             order: SortOrder::Asc,
             nulls_order: None,
             collation: column.collation_opt(),
-            expr: column.generated_expr(),
+            expr: column
+                .is_virtual_generated()
+                .then(|| table_ref.virtual_column_expr(column_pos)),
         }
     });
 

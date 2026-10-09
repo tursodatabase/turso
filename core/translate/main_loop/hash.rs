@@ -368,14 +368,14 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .get(col_idx)
                     .map(|c| c.generated_type())
                 {
-                    Some(GeneratedType::Virtual { expr, .. })
+                    Some(GeneratedType::Virtual { .. })
                         if !config.uses_materialized_keys_and_payload =>
                     {
-                        let expr = crate::schema::bind_schema_expr(expr, build_table.internal_id);
+                        let expr = build_table.virtual_column_expr(col_idx);
                         translate_expr(
                             planner.program,
                             Some(planner.table_references),
-                            &expr,
+                            expr,
                             payload_reg + i,
                             &planner.t_ctx.resolver,
                         )?;

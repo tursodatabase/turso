@@ -4396,6 +4396,21 @@ pub fn bind_schema_expr(expr: &Expr, internal_id: TableInternalId) -> Expr {
     bound
 }
 
+/// True when `expr` is bound to a table reference of a statement: no column
+/// reference of it points at the stored table.
+pub fn schema_expr_is_bound(expr: &Expr) -> bool {
+    let mut bound = true;
+    let _ = walk_expr(expr, &mut |e| {
+        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = e {
+            if points_at_stored_table(*table) {
+                bound = false;
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    bound
+}
+
 /// Point the stored table references of a stored schema expression at one table
 /// reference of a statement.
 pub fn rebase_schema_expr(expr: &mut Expr, internal_id: TableInternalId) {

@@ -2488,12 +2488,14 @@ fn translate_column_expr(
                 match table_column.generated_type() {
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
-                    GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                        let expr = crate::schema::bind_schema_expr(expr, *table_ref_id);
+                    GeneratedType::Virtual { .. } if !read_from_index => {
+                        let expr = referenced_tables
+                            .expect("a virtual column is read from a table reference in scope")
+                            .virtual_column_expr(*table_ref_id, *column);
                         translate_expr(
                             program,
                             referenced_tables,
-                            &expr,
+                            expr,
                             target_register,
                             resolver,
                         )?;

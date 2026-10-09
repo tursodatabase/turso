@@ -10,6 +10,7 @@ use crate::schema::{
     RESERVED_TABLE_PREFIXES,
 };
 use crate::sync::Arc;
+use crate::translate::plan::BoundSchemaExprs;
 use crate::translate::{
     collate::CollationSeq,
     emitter::{
@@ -366,6 +367,7 @@ pub(crate) fn emit_refill_index(
             database_id,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::new(tbl, std::iter::once(idx.as_ref()), table_ref),
         }],
         vec![],
     );
@@ -403,7 +405,7 @@ pub(crate) fn emit_refill_index(
             translate_condition_expr(
                 program,
                 &table_references,
-                &where_clause,
+                where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
@@ -505,7 +507,7 @@ pub(crate) fn emit_refill_index(
             translate_condition_expr(
                 program,
                 &table_references,
-                &where_clause,
+                where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
                     jump_target_when_false: label,
@@ -1159,7 +1161,7 @@ fn emit_index_column_value_from_cursor(
             .first()
             .and_then(|table| table.index_column_expr(index, position))
             .expect("an index is filled from one table reference");
-        translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+        translate_expr(program, Some(table_references), expr, dest_reg, resolver)?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

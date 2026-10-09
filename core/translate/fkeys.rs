@@ -2679,6 +2679,7 @@ fn table_scope(
             Arc::new(table.clone()),
             table_id,
             database_id,
+            std::iter::empty(),
         )],
         vec![],
     );

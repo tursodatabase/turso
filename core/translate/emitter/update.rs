@@ -3,14 +3,13 @@ use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
-use crate::translate::plan::ColumnMask;
+use crate::translate::plan::{BoundSchemaExprs, ColumnMask};
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
-        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+        collect_column_dependencies_of_expr, BTreeTable, Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
     },
     sync::Arc,
     translate::{
@@ -157,6 +156,11 @@ pub fn emit_program_for_update(
         };
         let scratch_table = scratch_table.clone();
         let scratch_table_internal_id = write_set_plan.scratch_table_id;
+        let schema_exprs = BoundSchemaExprs::new(
+            &scratch_table,
+            std::iter::empty(),
+            scratch_table_internal_id,
+        );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
@@ -180,6 +184,7 @@ pub fn emit_program_for_update(
                 database_id: MAIN_DB_ID,
                 indexed: None,
                 plan_estimate: None,
+                schema_exprs,
             }],
             vec![],
         );
@@ -187,6 +192,7 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
+            schema_exprs: target_table.schema_exprs.clone(),
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
@@ -814,8 +820,8 @@ fn emit_update_column_values<'a>(
             .find(|set_clause| set_clause.column_index == idx)
             .map(UpdateSetClause::emitted_expr)
             .or_else(|| {
-                if column_ctx.affected_columns.get(idx) {
-                    table_column.generated_expr()
+                if column_ctx.affected_columns.get(idx) && table_column.is_virtual_generated() {
+                    Some(column_ctx.target_table.virtual_column_expr(idx))
                 } else {
                     None
                 }
@@ -848,13 +854,7 @@ fn emit_update_column_values<'a>(
                     program.emit_null(target_reg, None);
                 } else {
                     let target_table_id = column_ctx.target_table.internal_id;
-                    let generated_expr = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => {
-                            Some(crate::schema::bind_schema_expr(expr, target_table_id))
-                        }
-                        GeneratedType::NotGenerated => None,
-                    };
-                    let row_image = generated_expr.as_ref().map(|_| {
+                    let row_image = table_column.is_virtual_generated().then(|| {
                         DmlColumnContext::layout(
                             column_ctx.target_table.table.columns(),
                             column_ctx.start,
@@ -862,7 +862,6 @@ fn emit_update_column_values<'a>(
                             column_ctx.layout.clone(),
                         )
                     });
-                    let expr = generated_expr.as_ref().unwrap_or(expr);
 
                     t_ctx.resolver.with_row_image(
                         program,
@@ -1758,15 +1757,13 @@ fn emit_update_insns<'a>(
                 }
             }
 
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-                .cloned()
-                .collect();
-
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.without_access_path()], vec![]);
+            let relevant_checks = check_constraint_tables.joined_tables()[0]
+                .check_constraints()
+                .filter(|(check, _)| {
+                    check_expr_references_columns(&check.expr, &updated_col_names)
+                });
             let registers = DmlColumnContext::layout(
                 btree_table.columns(),
                 start,
@@ -1775,7 +1772,7 @@ fn emit_update_insns<'a>(
             );
             emit_check_constraints(
                 program,
-                &relevant_checks,
+                relevant_checks,
                 &t_ctx.resolver,
                 &registers,
                 connection,
@@ -1825,7 +1822,7 @@ fn emit_update_insns<'a>(
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
-                &where_clause,
+                where_clause,
                 old_satisfied_reg,
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
@@ -1851,7 +1848,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 &index_expr_tables,
                 target_table.internal_id,
-                &where_clause,
+                where_clause,
                 columns,
                 &mut column_regs,
                 effective_rowid_reg,

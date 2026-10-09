@@ -4236,7 +4236,9 @@ fn ephemeral_index_build(
         .filter(|(index, _)| table_reference.column_is_used(*index))
         .map(|(i, c)| {
             let expr = match c.generated_type() {
-                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                GeneratedType::Virtual { .. } => {
+                    Some(table_reference.virtual_column_expr(i).clone())
+                }
                 GeneratedType::NotGenerated => None,
             };
             IndexColumn {

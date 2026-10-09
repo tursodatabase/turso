@@ -4,8 +4,8 @@ use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
-    DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
-    QueryDestination, ResultSetColumn, Scan, SelectPlan,
+    BoundSchemaExprs, DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember,
+    Operation, Plan, QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
@@ -207,6 +207,8 @@ pub fn prepare_delete_plan(
         schema.get_indices(table.get_name()).cloned().collect()
     });
     let target_table_id = program.table_reference_counter.next();
+    let schema_exprs =
+        BoundSchemaExprs::from_schema(resolver, database_id, &table, target_table_id);
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
@@ -220,6 +222,7 @@ pub fn prepare_delete_plan(
         database_id,
         indexed,
         plan_estimate: None,
+        schema_exprs,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

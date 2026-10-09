@@ -5,7 +5,7 @@ use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{ColumnMask, Operation};
+use crate::translate::plan::{BoundSchemaExprs, ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
@@ -290,6 +290,7 @@ fn prepare_update_plan(
         database_id,
         indexed,
         plan_estimate: None,
+        schema_exprs: BoundSchemaExprs::from_schema(resolver, database_id, &table, target_table_id),
     };
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];

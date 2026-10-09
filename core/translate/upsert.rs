@@ -324,7 +324,7 @@ fn upsert_matches_index(
     let partial_index_predicate_matches =
         match (target_table.index_where_expr(index), &bound.where_clause) {
             (Some(index_where), Some(target_where)) => {
-                exprs_are_equivalent(target_where, &index_where)
+                exprs_are_equivalent(target_where, index_where)
             }
             (Some(_), None) => false,
             (None, _) => true,
@@ -374,7 +374,7 @@ fn upsert_matches_index(
                     continue;
                 }
                 if let Some(idx_expr) = target_table.index_column_expr(index, i) {
-                    if exprs_are_equivalent(target_expr, &idx_expr) {
+                    if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
                             let icoll = effective_collation_for_index_col(ic, table);
@@ -783,7 +783,7 @@ pub fn emit_upsert(
         );
         emit_check_constraints(
             program,
-            &bt.check_constraints,
+            table_references.joined_tables()[0].check_constraints(),
             resolver,
             &registers,
             connection,
@@ -1683,7 +1683,7 @@ fn eval_partial_pred_for_row_image(
         resolver,
         table_references,
         target.internal_id,
-        &expr,
+        expr,
         columns,
         &mut column_regs,
         rowid_reg,
@@ -1733,7 +1733,7 @@ fn emit_upsert_expr_index_value(
         resolver,
         table_references,
         target.internal_id,
-        &expr,
+        expr,
         columns,
         &mut column_regs,
         rowid_reg,

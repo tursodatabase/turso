@@ -1,5 +1,4 @@
 use crate::alloc::TursoIteratorExt;
-use crate::schema::resolve_schema_expr_columns;
 use crate::sync::Arc;
 use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
 use turso_parser::{ast, parser::Parser};
@@ -569,7 +568,7 @@ fn emit_add_virtual_column_validation(
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
-    let check_constraints: Vec<CheckConstraint> = constraints
+    let check_constraints: crate::alloc::Vec<CheckConstraint> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
@@ -583,21 +582,14 @@ fn emit_add_virtual_column_validation(
                 None
             }
         })
-        .collect();
-
-    let check_constraints: Vec<CheckConstraint> = check_constraints
-        .into_iter()
-        .map(|mut check| {
-            resolve_schema_expr_columns(&mut check.bound, table);
-            check
-        })
-        .collect();
+        .try_collect()?;
 
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
     }
 
     let mut resolved_table = table.clone();
+    resolved_table.check_constraints = check_constraints;
     resolved_table.prepare_generated_columns()?;
     let new_column_name = column
         .name
@@ -658,6 +650,7 @@ fn emit_add_virtual_column_validation(
             Arc::new(resolved_table.clone()),
             table_id,
             database_id,
+            std::iter::empty(),
         )],
         vec![],
     );
@@ -671,11 +664,11 @@ fn emit_add_virtual_column_validation(
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
-    if !check_constraints.is_empty() {
+    if !resolved_table.check_constraints.is_empty() {
         let skip_row_label = program.allocate_label();
         emit_check_constraints(
             program,
-            &check_constraints,
+            table_references.joined_tables()[0].check_constraints(),
             resolver,
             &dml_ctx,
             connection,

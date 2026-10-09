@@ -1,5 +1,4 @@
 use super::*;
-use crate::schema::bind_schema_expr;
 
 /// Read a single column from a BTreeTable cursor, transparently computing
 /// virtual generated columns inline instead of hitting `emit_column`.
@@ -16,19 +15,18 @@ pub fn emit_table_column(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    match column.generated_expr() {
-        Some(expr) => {
-            let expr = bind_schema_expr(expr, table_ref_id);
-            translate_expr(
-                program,
-                Some(referenced_tables),
-                &expr,
-                target_register,
-                resolver,
-            )?;
-            program.emit_column_affinity(target_register, column.affinity());
-        }
-        None => program.emit_column_or_rowid(cursor_id, column_index, target_register),
+    if column.is_virtual_generated() {
+        let expr = referenced_tables.virtual_column_expr(table_ref_id, column_index);
+        translate_expr(
+            program,
+            Some(referenced_tables),
+            expr,
+            target_register,
+            resolver,
+        )?;
+        program.emit_column_affinity(target_register, column.affinity());
+    } else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
     }
     Ok(())
 }

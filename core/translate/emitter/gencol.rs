@@ -1,4 +1,4 @@
-use crate::schema::{bind_schema_expr, ColumnsTopologicalSort};
+use crate::schema::ColumnsTopologicalSort;
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::TableReferences;
 use crate::vdbe::affinity::Affinity;
@@ -21,12 +21,12 @@ pub fn compute_virtual_columns(
 ) -> Result<()> {
     resolver.with_row_image(program, table_id, Some(registers), |program| {
         for (idx, column) in columns.iter() {
-            let Some(expr) = column.generated_expr() else {
+            if !column.is_virtual_generated() {
                 continue;
-            };
+            }
+            let expr = table_references.virtual_column_expr(table_id, idx);
             let target_reg = registers.to_column_reg(idx);
-            let expr = bind_schema_expr(expr, table_id);
-            translate_expr(program, Some(table_references), &expr, target_reg, resolver)?;
+            translate_expr(program, Some(table_references), expr, target_reg, resolver)?;
             if column.affinity() != Affinity::Blob {
                 program.emit_column_affinity(target_reg, column.affinity());
             }
@@ -35,8 +35,9 @@ pub fn compute_virtual_columns(
     })
 }
 
-/// Compute one virtual generated column expression of the row of table
-/// reference `table_id`, which is held in `registers`.
+/// Compute one virtual generated column of the row of table reference
+/// `table_id`, which is held in `registers`. `expr` is the expression of the
+/// column, bound to that reference.
 pub(crate) fn emit_gencol_expr_from_registers(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
@@ -46,9 +47,8 @@ pub(crate) fn emit_gencol_expr_from_registers(
     table_references: &TableReferences,
     table_id: TableInternalId,
 ) -> Result<()> {
-    let expr = bind_schema_expr(expr, table_id);
     resolver.with_row_image(program, table_id, Some(registers), |program| {
-        translate_expr(program, Some(table_references), &expr, target_reg, resolver)?;
+        translate_expr(program, Some(table_references), expr, target_reg, resolver)?;
         Ok(())
     })
 }

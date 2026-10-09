@@ -13,7 +13,7 @@ use super::{
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
-use crate::translate::plan::BitSet;
+use crate::translate::plan::{BitSet, BoundSchemaExprs};
 use crate::translate::{
     emitter::Resolver,
     expr::{
@@ -1229,6 +1229,7 @@ fn plan_cte(
                 identifier: referenced_cte_table.identifier.clone(),
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
+                schema_exprs: referenced_cte_table.schema_exprs.clone(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 cte_select: None,
@@ -1431,6 +1432,7 @@ fn prepare_recursive_cte_plan(
         identifier: cte_definition.name.clone(),
         internal_id: input_table.internal_id,
         table: input_table.table,
+        schema_exprs: input_table.schema_exprs,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
@@ -1565,6 +1567,7 @@ pub fn plan_ctes_as_outer_refs(
             identifier: cte_definition.name.clone(),
             internal_id: joined_table.internal_id,
             table: joined_table.table,
+            schema_exprs: joined_table.schema_exprs.clone(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
@@ -1631,6 +1634,7 @@ fn parse_from_clause_table(
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    schema_exprs: cte_table.schema_exprs.clone(),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: (!cte_definition.references_itself)
@@ -2056,6 +2060,8 @@ fn parse_table(
                 } else {
                     program.table_reference_counter.next()
                 };
+                let schema_exprs =
+                    BoundSchemaExprs::from_schema(resolver, database_id, &outer_table, internal_id);
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
                     unmatched_right_rows_plan: None,
@@ -2069,6 +2075,7 @@ fn parse_table(
                     database_id,
                     indexed: None,
                     plan_estimate: None,
+                    schema_exprs,
                 });
             }
             return Ok(());
@@ -2094,6 +2101,8 @@ fn parse_table(
                 "Table type not supported".to_string(),
             ));
         };
+        let schema_exprs =
+            BoundSchemaExprs::from_schema(resolver, database_id, &tbl_ref, internal_id);
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             unmatched_right_rows_plan: None,
@@ -2107,6 +2116,7 @@ fn parse_table(
             database_id,
             indexed,
             plan_estimate: None,
+            schema_exprs,
         });
         return Ok(());
     };
@@ -2211,6 +2221,7 @@ fn parse_table(
             database_id,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: None,
         });
         return Ok(());
     }
@@ -2237,6 +2248,7 @@ fn parse_table(
                     database_id,
                     indexed: None,
                     plan_estimate: None,
+                    schema_exprs: None,
                 });
                 return Ok(());
             }
@@ -2390,6 +2402,7 @@ pub fn parse_from(
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    schema_exprs: cte_table.schema_exprs.clone(),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: (!cte_definition.references_itself)

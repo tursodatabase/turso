@@ -1,5 +1,6 @@
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
+use crate::translate::plan::BoundSchemaExprs;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -312,6 +313,8 @@ pub fn translate_insert(
     };
 
     let target_table_id = program.table_reference_counter.next();
+    let schema_exprs =
+        BoundSchemaExprs::from_schema(resolver, database_id, &table, target_table_id);
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
             table: Table::BTree(btree_table.clone()),
@@ -326,6 +329,7 @@ pub fn translate_insert(
             database_id,
             indexed: None,
             plan_estimate: None,
+            schema_exprs,
         }],
         vec![],
     );
@@ -841,7 +845,7 @@ pub fn translate_insert(
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     emit_check_constraints(
         program,
-        &ctx.table.check_constraints,
+        table_references.joined_tables()[0].check_constraints(),
         resolver,
         &dml_ctx,
         connection,
@@ -1377,7 +1381,7 @@ fn emit_partial_index_check(
         resolver,
         table_references,
         target.internal_id,
-        &expr,
+        expr,
         &columns,
         &mut column_regs,
         insertion.key_register(),
@@ -2180,6 +2184,7 @@ fn bind_upsert_actions(
         identifier: "excluded".to_string(),
         internal_id: excluded_table_id,
         table: target.table.clone(),
+        schema_exprs: None,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
@@ -3678,7 +3683,7 @@ fn emit_index_column_value_for_insert(
             resolver,
             table_references,
             target.internal_id,
-            &expr,
+            expr,
             &columns,
             &mut column_regs,
             insertion.key_register(),
@@ -3965,7 +3970,7 @@ fn emit_replace_delete_conflicting_row(
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
-                &where_copy,
+                where_copy,
                 reg,
                 resolver,
                 NoConstantOptReason::RegisterReuse,

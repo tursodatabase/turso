@@ -2019,7 +2019,7 @@ pub(crate) fn emit_index_column_value_old_image(
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
-            &expr,
+            expr,
             dest_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
@@ -2108,7 +2108,7 @@ fn emit_index_column_value_new_image(
             resolver,
             table_references,
             target_table.internal_id,
-            &expr,
+            expr,
             columns,
             &mut column_regs,
             rowid_reg,
@@ -2120,7 +2120,8 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
+            GeneratedType::Virtual { .. } => {
+                let expr = target_table.virtual_column_expr(idx_col.pos_in_table);
                 let registers =
                     DmlColumnContext::layout(columns, columns_start_reg, rowid_reg, layout.clone());
                 gencol::emit_gencol_expr_from_registers(
@@ -2155,21 +2156,19 @@ fn emit_index_column_value_new_image(
 /// Assumes the resolver cache is already populated with column-to-register mappings.
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
-    check_constraints: &[CheckConstraint],
+    check_constraints: &[(&CheckConstraint, &ast::Expr)],
     resolver: &Resolver,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     table_references: &TableReferences,
 ) -> Result<()> {
-    let joined_table = &table_references.joined_tables()[0];
-    for check_constraint in check_constraints {
+    for (check_constraint, bound_expr) in check_constraints {
         let expr_result_reg = program.alloc_register();
-        let rewritten_expr = joined_table.check_constraint_expr(check_constraint);
 
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
-            &rewritten_expr,
+            bound_expr,
             expr_result_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
@@ -2237,9 +2236,9 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
 /// Takes column-to-register mappings as an iterator to avoid heap allocation.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_check_constraints(
+pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
-    check_constraints: &[CheckConstraint],
+    check_constraints: impl IntoIterator<Item = (&'a CheckConstraint, &'a ast::Expr)>,
     resolver: &Resolver,
     registers: &DmlColumnContext,
     connection: &Arc<Connection>,
@@ -2247,7 +2246,12 @@ pub(crate) fn emit_check_constraints(
     skip_row_label: BranchOffset,
     table_references: &TableReferences,
 ) -> Result<()> {
-    if connection.check_constraints_ignored() || check_constraints.is_empty() {
+    if connection.check_constraints_ignored() {
+        return Ok(());
+    }
+    let check_constraints: Vec<(&CheckConstraint, &ast::Expr)> =
+        check_constraints.into_iter().collect();
+    if check_constraints.is_empty() {
         return Ok(());
     }
     let target_table = &table_references.joined_tables()[0];
@@ -2258,7 +2262,7 @@ pub(crate) fn emit_check_constraints(
         |program| {
             emit_check_constraint_bytecode(
                 program,
-                check_constraints,
+                &check_constraints,
                 resolver,
                 or_conflict,
                 skip_row_label,
