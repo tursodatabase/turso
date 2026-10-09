@@ -75,7 +75,7 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   58  MakeRecord     19   2  25                  0  r[25]=mkrec(r[19..20]); for sqlite_autoindex_items_1
   59  IdxInsert       1  25  19                  2  key=r[25]
   60  MakeRecord      3   4   7                  0  r[7]=mkrec(r[3..6])
-  61  Insert          2   7   2  items           2  intkey=r[2] data=r[7]
+  61  Insert          2   7   2  items          66  intkey=r[2] data=r[7]
   62  Goto            0  63   0                  0
   63  Goto            0  64   0                  0
   64  Halt            0   0   0                  0

@@ -184,6 +184,7 @@ impl InsertFlags {
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
     pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
     pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
+    pub const OLD_ROW_ALREADY_DELETED: u8 = 0x40; // Flag indicating that a preceding Insn::Delete removed the row at this rowid and already recorded it for materialized view maintenance
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -220,6 +221,11 @@ impl InsertFlags {
 
     pub fn skip_all_change_counts(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_ALL_CHANGE_COUNTS;
+        self
+    }
+
+    pub fn old_row_already_deleted(mut self) -> Self {
+        self.0 |= InsertFlags::OLD_ROW_ALREADY_DELETED;
         self
     }
 }
