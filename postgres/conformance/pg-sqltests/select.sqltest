@@ -67,6 +67,30 @@ expect {
     1!
 }
 
+test select-cast-text-to-date-and-time {
+    SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
+}
+expect {
+    2024-01-15|10:30:00
+}
+
+test select-cast-text-to-timestamp {
+    SELECT '2024-01-15T10:30:00'::timestamp;
+}
+expect {
+    2024-01-15 10:30:00
+}
+
+test select-cast-invalid-text-to-date {
+    SELECT 'hello'::date;
+}
+expect error {}
+
+test select-cast-invalid-text-to-timestamp {
+    SELECT 'hello'::timestamp;
+}
+expect error {}
+
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
 }
