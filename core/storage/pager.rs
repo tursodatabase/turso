@@ -473,13 +473,11 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+    pub fn rightmost_pointer_offset(&self) -> crate::Result<Option<usize>> {
         match self.page_type()? {
-            PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
-                self.as_ptr()
-                    .as_mut_ptr()
-                    .add(self.offset() + BTREE_RIGHTMOST_PTR)
-            })),
+            PageType::IndexInterior | PageType::TableInterior => {
+                Ok(Some(self.offset() + BTREE_RIGHTMOST_PTR))
+            }
             PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
         }
     }
