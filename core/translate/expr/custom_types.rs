@@ -320,11 +320,18 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
+/// Emit bytecode that computes `expr` for one row of `table` and writes the result to
+/// `dest_reg`. INSERT, UPDATE, and UPSERT use this function for the key expressions of an
+/// index and for the WHERE clause of a partial index.
 ///
-/// `column_regs` holds the stored (encoded) values of the row. The expression is
-/// resolved via `resolve_gencol_expr_columns`, and its column references read
-/// user-facing values.
+/// Preconditions:
+/// - `expr` refers to columns by their names in `columns`.
+/// - `column_regs[i]` is the register that holds the value of `columns[i]`.
+/// - Each value is in the format that the table stores. For a custom type column, this is
+///   the value after ENCODE.
+///
+/// When `expr` reads a column, the bytecode applies DECODE to the value before `expr`
+/// uses it. Thus `expr` gets the same value that a SELECT gets for this column.
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -339,8 +346,7 @@ pub(crate) fn emit_dml_expr_index_value(
     let pairs = columns.iter().zip(column_regs.iter().copied());
     let encoded_columns: ColumnMask = (0..columns.len()).try_collect()?;
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs)
-            .with_encoded_columns(encoded_columns),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, encoded_columns),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
