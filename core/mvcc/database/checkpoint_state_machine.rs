@@ -62,8 +62,9 @@ enum CollectTablePhase {
     DirtyStamps,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum CollectIndexPhase {
+    #[default]
     Rows,
     DirtyStamps,
 }
@@ -163,13 +164,13 @@ fn last_key_of_first_table<V, A: SkiplistAllocator>(
     Some(last.unwrap_or_else(|| first.key().clone()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointState {
     PrepareCheckpoint,
     AcquireLock,
     BuildLocalSchemaView,
     CollectTableRows,
-    CollectIndexRows,
+    CollectIndexRows(CollectIndexRowsState),
     BeginPagerTxn,
     WriteRow {
         write_set_index: usize,
@@ -219,8 +220,17 @@ pub enum CheckpointState {
         next_index: usize,
         lwm: u64,
     },
-    PruneDirtyKeys,
+    PruneDirtyKeys {
+        next_index: usize,
+    },
     Finalize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollectIndexRowsState {
+    phase: CollectIndexPhase,
+    dirty_cursor: TableWalkCursor,
+    key_end: Option<Arc<SortableIndexKey>>,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -357,12 +367,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     collect_table_phase: CollectTablePhase,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
-    collect_index_key_end: Option<Arc<SortableIndexKey>>,
-    collect_dirty_index_cursor: TableWalkCursor,
-    collect_index_phase: CollectIndexPhase,
     full_scan_generation: Option<NonZeroU64>,
     prune_candidates: Vec<(RowID, u64)>,
-    prune_cursor: usize,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
@@ -961,12 +967,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             collect_table_phase: CollectTablePhase::Schema,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
-            collect_index_key_end: None,
-            collect_dirty_index_cursor: TableWalkCursor::default(),
-            collect_index_phase: CollectIndexPhase::Rows,
             full_scan_generation: None,
             prune_candidates: crate::alloc::vec![],
-            prune_cursor: 0,
             seq_compact: None,
             pending_seq_deletes: crate::alloc::vec![],
             // Set in PrepareCheckpoint once the collection snapshot is taken; until
@@ -986,7 +988,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> CheckpointState {
-        self.state
+        self.state.clone()
     }
 
     #[cfg(test)]
@@ -1523,7 +1525,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             ),
             DirtyMap::Index => (
                 &mvstore.checkpoint_dirty_index_keys,
-                std::mem::take(&mut self.collect_dirty_index_cursor),
+                std::mem::take(&mut self.collect_index_rows_state().dirty_cursor),
             ),
         };
         let guard = epoch::pin();
@@ -1540,7 +1542,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         );
         match map {
             DirtyMap::Table => self.collect_table_cursor = cursor,
-            DirtyMap::Index => self.collect_dirty_index_cursor = cursor,
+            DirtyMap::Index => self.collect_index_rows_state().dirty_cursor = cursor,
         }
         result
     }
@@ -1555,7 +1557,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
         loop {
             let full_scan = self.full_scan_generation.is_some();
-            let must_yield = match (full_scan, self.collect_index_phase) {
+            let phase = self.collect_index_rows_state().phase;
+            let must_yield = match (full_scan, phase) {
                 (true, CollectIndexPhase::Rows) => self.collect_index_rows_from_store()?,
                 (true, CollectIndexPhase::DirtyStamps) => {
                     let mut processed = 0;
@@ -1566,8 +1569,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if must_yield {
                 return Ok(Some(IOCompletions(Completion::new_yield())));
             }
-            if full_scan && self.collect_index_phase == CollectIndexPhase::Rows {
-                self.collect_index_phase = CollectIndexPhase::DirtyStamps;
+            if full_scan && phase == CollectIndexPhase::Rows {
+                self.collect_index_rows_state().phase = CollectIndexPhase::DirtyStamps;
                 continue;
             }
             break;
@@ -1603,8 +1606,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             let index_rows_map = outer.value();
-            let key_end = match (&self.collect_index_key_cursor, &self.collect_index_key_end) {
-                (Some(_), Some(end)) => end.clone(),
+            let saved_key_end = self.collect_index_rows_state().key_end.clone();
+            let key_end = match (&self.collect_index_key_cursor, saved_key_end) {
+                (Some(_), Some(end)) => end,
                 _ => match index_rows_map.back() {
                     Some(last) => last.key().clone(),
                     None => {
@@ -1613,7 +1617,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                 },
             };
-            self.collect_index_key_end = Some(key_end.clone());
+            self.collect_index_rows_state().key_end = Some(key_end.clone());
             let inner_bounds: (Bound<Arc<SortableIndexKey>>, Bound<Arc<SortableIndexKey>>) =
                 match self.collect_index_key_cursor.clone() {
                     None => (Bound::Unbounded, Bound::Included(key_end)),
@@ -1639,7 +1643,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn finish_index_scan(&mut self, index_id: MVTableId) {
         self.collect_index_tableid_cursor = Some(index_id);
         self.collect_index_key_cursor = None;
-        self.collect_index_key_end = None;
+        self.collect_index_rows_state().key_end = None;
     }
 
     fn collect_index_rows_from_dirty_keys(&mut self) -> Result<bool> {
@@ -1651,7 +1655,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             IndexRowsEntry<'_, A>,
             IndexKeyCursor<'_, '_, A>,
         )> = None;
-        let mut cursor = std::mem::take(&mut self.collect_dirty_index_cursor);
+        let mut cursor = std::mem::take(&mut self.collect_index_rows_state().dirty_cursor);
         let result = walk_table_keys(
             &mvstore.checkpoint_dirty_index_keys,
             &guard,
@@ -1684,8 +1688,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 Ok(processed >= COLLECT_PREEMPTION_THRESHOLD)
             },
         );
-        self.collect_dirty_index_cursor = cursor;
+        self.collect_index_rows_state().dirty_cursor = cursor;
         result
+    }
+
+    fn collect_index_rows_state(&mut self) -> &mut CollectIndexRowsState {
+        let CheckpointState::CollectIndexRows(state) = &mut self.state else {
+            unreachable!("index rows are collected only in CollectIndexRows");
+        };
+        state
     }
 
     fn collect_index_row_versions(
@@ -1717,12 +1728,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn prune_dirty_keys(&mut self) -> Option<IOCompletions> {
+        let CheckpointState::PruneDirtyKeys { next_index } = self.state else {
+            unreachable!("prune_dirty_keys runs only in PruneDirtyKeys");
+        };
         let mvstore = self.mvstore.clone();
-        let end = self.prune_candidates.len().min(
-            self.prune_cursor
-                .saturating_add(COLLECT_PREEMPTION_THRESHOLD),
-        );
-        for (key, stamp) in &self.prune_candidates[self.prune_cursor..end] {
+        let end = self
+            .prune_candidates
+            .len()
+            .min(next_index.saturating_add(COLLECT_PREEMPTION_THRESHOLD));
+        for (key, stamp) in &self.prune_candidates[next_index..end] {
             let Some(latest) = mvstore.unmark_checkpoint_dirty_key(key) else {
                 continue;
             };
@@ -1730,7 +1744,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 mvstore.require_checkpoint_full_scan();
             }
         }
-        self.prune_cursor = end;
+        let CheckpointState::PruneDirtyKeys { next_index } = &mut self.state else {
+            unreachable!("prune_dirty_keys runs only in PruneDirtyKeys");
+        };
+        *next_index = end;
         if end < self.prune_candidates.len() {
             return Some(IOCompletions(Completion::new_yield()));
         }
@@ -2549,11 +2566,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(TransitionResult::Io(io));
                 }
                 tracing::debug!("Collected {} committed versions", self.write_set.len());
-                self.state = CheckpointState::CollectIndexRows;
+                self.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
                 inject_transition_yield!(self, CheckpointYieldPoint::AfterCollectTableRows);
                 Ok(TransitionResult::Continue)
             }
-            CheckpointState::CollectIndexRows => {
+            CheckpointState::CollectIndexRows(_) => {
                 if let Some(io) = self.collect_index_rows()? {
                     return Ok(TransitionResult::Io(io));
                 }
@@ -3453,11 +3470,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
-                self.state = CheckpointState::PruneDirtyKeys;
+                self.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
                 Ok(TransitionResult::Continue)
             }
 
-            CheckpointState::PruneDirtyKeys => {
+            CheckpointState::PruneDirtyKeys { .. } => {
                 if let Some(io) = self.prune_dirty_keys() {
                     return Ok(TransitionResult::Io(io));
                 }
@@ -4024,6 +4041,7 @@ mod tests {
             .clone();
         insert_dirty_index_version(&mvstore, index_id, tombstone_key, tombstone_version);
 
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         while checkpoint.collect_index_rows().unwrap().is_some() {}
 
         assert!(
@@ -4364,6 +4382,7 @@ mod tests {
             insert_dirty_index_version(&mvstore, index_id, key, version);
         }
 
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         let first = checkpoint.collect_index_rows().unwrap();
         assert!(
             first.is_some_and(|io| io.is_explicit_yield()),
@@ -4592,6 +4611,7 @@ mod tests {
         while checkpoint.collect_table_rows().unwrap().is_some() {}
         assert!(checkpoint.write_set.is_empty());
 
+        checkpoint.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
         assert!(checkpoint.prune_dirty_keys().is_none());
         assert!(!dirty_table_key(&mvstore, table_id, 7));
     }
@@ -4608,6 +4628,7 @@ mod tests {
         while checkpoint.collect_table_rows().unwrap().is_some() {}
         mvstore.mark_checkpoint_dirty_key(&key, 50).unwrap();
 
+        checkpoint.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
         assert!(checkpoint.prune_dirty_keys().is_none());
         let entry = mvstore
             .checkpoint_dirty_table_keys
@@ -4630,11 +4651,16 @@ mod tests {
             index_row_version(index_id, "k", 2, 1, Some(5), None, false);
         insert_dirty_index_version(&mvstore, index_id, dirty_key, dirty_version);
 
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         while checkpoint.collect_index_rows().unwrap().is_some() {}
 
         assert_eq!(checkpoint.index_write_set.len(), 1);
         assert_eq!(checkpoint.index_write_set[0].1.id, 1);
-        assert!(checkpoint.collect_dirty_index_cursor.last_visited.is_some());
+        assert!(checkpoint
+            .collect_index_rows_state()
+            .dirty_cursor
+            .last_visited
+            .is_some());
         assert!(checkpoint.collect_index_key_cursor.is_none());
     }
 
@@ -4731,6 +4757,7 @@ mod tests {
             insert_dirty_index_version(&mvstore, other, key, version);
 
             let mut next_rowid = row_count as i64;
+            checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
             collect_while_rows_are_appended(
                 || checkpoint.collect_index_rows(),
                 || append_index_rows(&mvstore, walked, &mut next_rowid),
@@ -4765,8 +4792,10 @@ mod tests {
         insert_dirty_index_version(&mvstore, index_id, new_key, new_version);
         checkpoint.snapshot_ts = 10;
         while checkpoint.collect_table_rows().unwrap().is_some() {}
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         while checkpoint.collect_index_rows().unwrap().is_some() {}
 
+        checkpoint.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
         assert!(checkpoint.prune_dirty_keys().is_none());
 
         assert!(!dirty_table_key(&mvstore, table_id, 1));
@@ -4804,8 +4833,10 @@ mod tests {
         }
         checkpoint.snapshot_ts = 10;
         while checkpoint.collect_table_rows().unwrap().is_some() {}
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         while checkpoint.collect_index_rows().unwrap().is_some() {}
 
+        checkpoint.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
         let first = checkpoint.prune_dirty_keys();
         assert!(
             first.is_some_and(|io| io.is_explicit_yield()),
@@ -4861,7 +4892,9 @@ mod tests {
         insert_dirty_index_version(&mvstore, index_id, key, version);
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
+        checkpoint.state = CheckpointState::CollectIndexRows(CollectIndexRowsState::default());
         while checkpoint.collect_index_rows().unwrap().is_some() {}
+        checkpoint.state = CheckpointState::PruneDirtyKeys { next_index: 0 };
         assert!(checkpoint.prune_dirty_keys().is_none());
 
         assert!(!dirty_table_key(&mvstore, table_id, 1));
