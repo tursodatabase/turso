@@ -1,0 +1,331 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head><title>TATP Test Suite - using TATP with UnixODBC</title>
+
+  
+
+
+
+
+  
+  <meta name="description" content="">
+
+  
+  <meta name="keywords" content="">
+
+  
+  <link rel="stylesheet" type="text/css" href="images/styles.css">
+
+  
+  <link rel="stylesheet" type="text/css" href="images/position.css"></head><body leftmargin="0" topmargin="0" bgcolor="#dddcdb" link="#566782" marginheight="0" marginwidth="0" text="#4d4d4d" vlink="#566782">
+<table border="0" cellpadding="0" cellspacing="0" width="100%">
+
+      <tbody>
+        <tr>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+          <td valign="top" width="800"><a name="top"></a>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="3" width="18"><img src="images/nav_left.gif" alt="" border="0" height="73" width="18"></td>
+                  <td colspan="3" valign="top" width="764"><img src="images/logo_top.gif" alt="" border="0" height="10" width="764"></td>
+                  <td rowspan="3" width="18"><img src="images/nav_right.gif" alt="" border="0" height="73" width="18"></td>
+                </tr>
+                <tr>
+                <td align="center" width="141"><img alt="TATP" src="images/tatp-logo.gif" height="63" width="141"></td>
+                  <td width="3"><img src="images/logo_right.gif" alt="" border="0" height="63" width="3"></td>
+                  <td bgcolor="#75b2dd" width="620">
+            <table border="0" cellpadding="0" cellspacing="0" width="570">
+                      <tbody><tr>
+                        <td width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="20"></td>
+                        <td class="mission" align="right" width="510">Telecom Application Transaction Processing Benchmark<br>
+</td>
+                      </tr>
+                    </tbody>
+            </table>
+</td>
+                </tr>
+                <tr>
+                  <td colspan="3" bgcolor="#ffffff" valign="top" width="764"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">
+                    <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                      <tbody>
+                        <tr>
+                          <td height="150" valign="top">
+
+                            <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                              <tbody>
+                                <tr>
+                                  <td colspan="4"><img src="images/clear.gif" alt="" border="0" height="29" width="138"></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                <tr height="17">
+                                  <td width="10">&nbsp;</td>
+                                  <td colspan="3" class="note" valign="top"><a href="index.html"><b>Home</b></a></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                
+                              </tbody>
+                            </table>
+
+                          </td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#c1def1"><img src="images/clear.gif" alt="" border="0" height="20" width="138"></td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="138"></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="10"><img src="images/clear.gif" alt="" border="0" height="1" width="10"></td>
+                  <td bgcolor="#ffffff" valign="top" width="610">
+<br>
+
+<table border="0" cellpadding="2" cellspacing="0" width="100%">
+<tbody><tr>
+<td>
+                  
+
+                  <h1>UnixODBC Guide for TATP</h1>
+
+                  <h2>CONTENTS</h2>
+
+                  <ul>
+<li><a href="#SEC01">General information</a></li>
+<li><a href="#SEC02">Configuration files</a></li>
+<li><a href="#SEC03">Syntax of configuration files</a></li>
+<li><a href="#SEC04">Using solidDB ODBC driver and solid.ini</a></li>
+<li><a href="#SEC05">Location of configuration files</a></li>
+<li><a href="#SEC06">Troubleshooting</a></li>
+                  </ul>
+
+                  <h2><a name="SEC01"></a>General information</h2>
+ 
+                  <p> UnixODBC 
+(<a href="http://www.unixodbc.org/">http://www.unixodbc.org/</a>) is an
+ODBC driver manager for unix-like environment. Instead of linking an
+application directly with an ODBC driver, unixODBC can be used. 
+</p><p>
+Download and install unixODBC, then follow the instructions in the TATP Makefile to build TATP binaries linked to unixODBC.
+Additionally, for each database product you are using, you need a proprietary driver delived as a shared
+library. </p>
+
+<a href="#top"></a>
+                  <h2><a name="SEC02"></a>Configuration files</h2>
+
+                  <p>
+UnixODBC can load the correct data source driver according to
+the specifications of the following two configuration files:
+                  </p>
+                  <ul>
+<li>odbc.ini (or .odbc.ini), in which the logical name of the data source and the actual ODBC driver is specified</li>
+<li>odbcinst.ini, in which the logical driver name is connected with its physical location in the file system.</li>
+                  </ul>
+
+
+                  <p>
+In addition to the files above, if the solidDB ODBC driver is to be used, it requires another file:
+</p><ul><li>solid.ini, in which the
+logical data source name is connected with the physical connect string.</li>
+</ul>
+The solid.ini file, despite its name, includes 
+information for client-side driver only. It has to be located in the TATP working directory.&nbsp;<a href="#top"></a>
+                  <h2><a name="SEC03"></a>Syntax of configuration files
+                  </h2>
+
+                  <h4>
+Syntax of odbc.ini
+                  </h4>
+
+                  <p class="padded">
+In odbc.ini (or .odbc.ini) for each data source, at least two
+things should be presented:
+                  </p>
+
+                  <ol>
+<li>the logical name of the data source inside brackets: "[&lt;data source name&gt;]" </li>
+<li>the logical name of the actual ODBC driver to be used by using
+the syntax "Driver = &lt;driver name&gt;"
+</li><li>Inaddition, a description can be added.</li>
+</ol>
+<p class="padded">
+An example:</p>
+<pre>[my_solid]<br>Driver = solid_odbc<br>Description = My first Solid data source<br></pre>
+<p class="padded">
+All other information is ignored.</p>
+                  
+
+                  <h4>
+Syntax of odbcinst.ini
+                  </h4>
+
+                  <p class="padded">
+In odbcinst.ini (or .odbcinst.ini) the logical name and the
+physical location of the ODBC driver must be specified as
+follows:
+                  </p>
+
+                  <ol>
+<li>[&lt;the logical name of the driver&gt;]</li>
+<li>Driver = &lt;absolute path to the driver library&gt; </li>
+<li>Threading = &lt;threading parameter value (0,1,2,3) for unixODBC&gt;, see unixODBC documentation for details</li>
+                  </ol>
+
+<p class="padded">An example:</p>
+<pre>[solid_odbc]<br>Driver = /home/jsmith/sacl2x6463.so<br>Threading = 0<br></pre>
+
+<a href="#top">[Back to top]</a>
+
+                  <h2><a name="SEC04"></a>Using solidDB ODBC driver and solid.ini</h2>
+                           
+                  <p>
+TATP stores the contents of the configuration file of the test database
+into the TIRDB. Therefore the configuration of the database needs to be
+copied to the location, which is specified in the ddf file
+('configuration_file'). In solidDB that file is solid.ini.
+                              </p>
+
+                              
+<p>Configuration information for client-side ODBC driver is stored
+in client-side configuration file, also named solid.ini. These two
+identically named files must be separated by storing them in different
+locations in the file system.
+</p>
+
+                              
+                  <p>
+In client-side solid.ini the logical data source names (used in unixODBC) are connected
+to their physical connect strings as follows. The syntax is described
+further in solidDB Administrator Guide.
+                              </p>
+
+
+                              
+                  <ol>
+<li>under [Data Sources] tag: &lt;the logical data source name&gt;
+= &lt;physical connect string&gt;</li>
+                  </ol>
+<p>An example:
+</p><pre>my_solid = tcp localhost 1964<br></pre>
+
+<a href="#top">[Back to top]</a>
+
+                  <h2><a name="SEC05"></a>Location of the configuration files</h2>
+
+
+                  <p>
+System-level data sources are specified in
+'/usr/local/etc/odbc.ini'. User-level DSNs are specified
+in '~/.odbc.ini'. In a similar way, system-level drivers are
+specified in '/usr/local/etc/odbcinst.ini'.
+                  </p>
+
+                  <p>
+Client-side solid.ini can be located either in the directory
+set by the SOLIDDIR environment variable or in the current
+working directory.
+                  </p>
+<a href="#top">[Back to top]</a>
+
+<h2><a name="SEC06"></a>Troubleshooting</h2>
+
+<h4>Building TATP in Linux with unixODBC</h4>
+<p class="padded">
+If you are building TATP in Linux with unixODBC and you get the 
+following error message: "/usr/bin/ld: cannot find -lodbc" 
+it might be because of a missing symbolic link. In order to fix this problem
+you should try the following. </p>
+                  <ol>
+<li>Locate the systems unixODBC libraries (probably under /usr/lib)
+</li><li>List all the files starting with libodbc.so (ls -l /usr/lib/libodbc.so*)
+</li><li>If the command does not return a file called "libodbc.so", but does return 
+other files like:<br>
+<pre>ls -l /usr/lib/libodbc.so*<br>lrwxrwxrwx 1 root root     16 ... /usr/lib/libodbc.so.1 -&gt; libodbc.so.1.0.0<br>-rw-r--r-- 1 root root 382096 ... /usr/lib/libodbc.so.1.0.0<br></pre>
+then the problem might be because of a missing symbolic link.
+</li><li>Run the following command as root: <br><br>
+ln -s /usr/lib/libodbc.so.1 /usr/lib/libodbc.so<br><br>
+Now ls -l /usr/lib/libodbc.so* should return:
+<pre>ls -l /usr/lib/libodbc.so*<br>lrwxrwxrwx 1 root root     21 ... /usr/lib/libodbc.so -&gt; /usr/lib/libodbc.so.1<br>lrwxrwxrwx 1 root root     16 ... /usr/lib/libodbc.so.1 -&gt; libodbc.so.1.0.0<br>-rw-r--r-- 1 root root 382096 ... /usr/lib/libodbc.so.1.0.0<br></pre>
+</li><li>Try building TATP again</li>
+                  </ol>
+
+<a href="#top">[Back to top]</a><br>
+&nbsp;<br>
+
+
+</td></tr>
+
+</tbody></table>
+
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">&nbsp;</td>
+                  <td bgcolor="#ffffff" valign="top" width="10"><img src="images/clear.gif" alt="" border="0" height="1" width="10"></td>
+                  <td bgcolor="#ffffff" valign="top" width="610">&nbsp;<cite>Updated: 2009-03-27</cite></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138"><img src="images/clear.gif" alt="" border="0" height="25" width="138"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td align="center" bgcolor="#0072c6" width="617">
+                    <table border="0" cellpadding="0" cellspacing="0" width="550">
+                      <tbody>
+                        <tr>
+                          <td class="footer">
+                          <br>
+</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td colspan="5" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td width="21"><img src="images/footer_left.gif" alt="" border="0" height="24" width="21"></td>
+                  <td class="copyright" align="center" bgcolor="#96938e" width="758">March 2009<br>
+</td>
+                  <td width="21"><img src="images/footer_right.gif" alt="" border="0" height="24" width="21"></td>
+                </tr>
+                <tr>
+                  <td colspan="3"><img src="images/footer_bottom.gif" alt="" border="0" height="13" width="800"></td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+        </tr>
+      </tbody>
+</table>
+
+</body></html>
