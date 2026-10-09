@@ -1775,7 +1775,12 @@ fn rewrite_expr_to_registers(
                     if allow_excluded && ns.eq_ignore_ascii_case("excluded") && !is_target_namespace
                     {
                         if let Some(ins) = insertion {
-                            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
+                            let is_rowid_alias = table
+                                .get_column_by_name(&c)
+                                .is_some_and(|(_, col)| col.is_rowid_alias());
+                            if is_rowid_alias
+                                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c))
+                            {
                                 *expr = Expr::Register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 // Use decoded excluded registers when available
