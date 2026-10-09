@@ -77,6 +77,32 @@ macro_rules! inject_io_yield {
 
 pub(crate) use inject_io_yield;
 
+macro_rules! inject_coro_yield {
+    ($state_machine:expr, $coro:expr, $point:expr) => {{
+        #[cfg(any(test, injected_yields))]
+        {
+            loop {
+                let io = {
+                    use $crate::mvcc::yield_hooks::ProvidesYieldContext;
+                    let yield_context = $state_machine.yield_context();
+                    match crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+                        yield_context.injector.as_ref(),
+                        yield_context.instance_id,
+                        yield_context.selection_key,
+                        $point,
+                    ) {
+                        Some($crate::types::IOResult::IO(io)) => io,
+                        Some($crate::types::IOResult::Done(())) | None => break,
+                    }
+                };
+                $coro.wait_for_io(io).await?;
+            }
+        }
+    }};
+}
+
+pub(crate) use inject_coro_yield;
+
 // At a safe resumable boundary, ask the active failure injector whether this
 // state machine should return Err here. Used to reproduce mid-commit failures
 // in tests without requiring a real I/O fault.

@@ -1145,8 +1145,8 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
             CheckpointState::TruncateLogicalLog
             | CheckpointState::FsyncLogicalLog
             | CheckpointState::TruncateWal
-            | CheckpointState::GcTableRows { .. }
-            | CheckpointState::GcIndexRows { .. } => {
+            | CheckpointState::GcTableRows
+            | CheckpointState::GcIndexRows => {
                 reached_tail = true;
                 break;
             }
@@ -2967,6 +2967,111 @@ fn test_checkpoint_truncates_wal_last() {
         0,
         "logical log should be truncated to 0 after checkpoint"
     );
+}
+
+/// What this test checks: a checkpoint returns `Continue` the same number of times for 10 rows and for 200 rows.
+/// Why this matters: each step goes back to the caller, so a step per row slows down large checkpoints.
+#[test]
+fn test_checkpoint_steps_do_not_grow_with_row_count() {
+    fn checkpoint_continue_steps(row_count: usize) -> usize {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..row_count {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let pager = conn.pager.load().clone();
+        let mut checkpoint_sm = CheckpointStateMachine::new(
+            pager.clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        let mut continue_steps = 0;
+        loop {
+            match checkpoint_sm.step(&()).unwrap() {
+                TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+                TransitionResult::Continue => continue_steps += 1,
+                TransitionResult::Done(_) => return continue_steps,
+            }
+        }
+    }
+
+    assert_eq!(
+        checkpoint_continue_steps(10),
+        checkpoint_continue_steps(200)
+    );
+}
+
+/// What this test checks: a checkpoint reports each phase once, in order, before it runs the phase.
+/// Why this matters: callers and tests stop a checkpoint at a phase to make sure that it is crash safe.
+#[test]
+fn test_checkpoint_reports_each_phase_once_in_order() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        db.get_mvcc_store(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let mut phases = vec![];
+    loop {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => phases.push(checkpoint_sm.state_for_test()),
+            TransitionResult::Done(_) => break,
+        }
+    }
+
+    assert_eq!(
+        phases,
+        vec![
+            CheckpointState::PrepareCheckpoint,
+            CheckpointState::AcquireLock,
+            CheckpointState::CollectTableRows,
+            CheckpointState::CollectIndexRows,
+            CheckpointState::BeginPagerTxn,
+            CheckpointState::WriteTableRows,
+            CheckpointState::WriteIndexRows,
+            CheckpointState::CompactSequences,
+            CheckpointState::CommitPagerTxn,
+            CheckpointState::CheckpointWal,
+            CheckpointState::SyncDbFile,
+            CheckpointState::TruncateLogicalLog,
+            CheckpointState::FsyncLogicalLog,
+            CheckpointState::TruncateWal,
+            CheckpointState::GcTableRows,
+            CheckpointState::GcIndexRows,
+            CheckpointState::Finalize,
+        ]
+    );
+    assert!(checkpoint_sm.is_finalized());
 }
 
 /// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
