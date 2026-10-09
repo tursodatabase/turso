@@ -52,6 +52,7 @@ macro_rules! scalar_functions {
 }
 
 scalar_functions! {
+    Acldefault(FunctionArity::Exact(2), true),
     PgGetUserbyid(FunctionArity::Exact(1), true),
     PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true),
     PgEncodingToChar(FunctionArity::Exact(1), true),
@@ -90,6 +91,7 @@ impl ScalarFunction for PgScalarFunction {
 impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
+            Self::Acldefault => exec_acl_default(args)?,
             Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(args, 0, 0)),
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
                 exec_pg_is_visible(int_arg(args, 0, 0))
@@ -134,6 +136,59 @@ impl ScalarCall for PgScalarFunction {
         };
         Ok(IOResult::Done(value))
     }
+}
+
+fn exec_acl_default(args: &[Register]) -> Result<Value> {
+    if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let kind = match args[0].get_value() {
+        Value::Text(value) => value.as_str(),
+        _ => "",
+    };
+    let owner = args[1].get_value().as_int().ok_or_else(|| {
+        LimboError::InvalidArgument("acldefault owner must be an OID".to_string())
+    })?;
+    if !(0..=u32::MAX as i64).contains(&owner) {
+        return Err(LimboError::InvalidArgument(
+            "acldefault owner must be an OID".to_string(),
+        ));
+    }
+    let (public_privileges, owner_privileges) = match kind {
+        "c" => (None, None),
+        "r" => (None, Some("arwdDxt")),
+        "s" => (None, Some("rwU")),
+        "d" => (Some("Tc"), Some("CTc")),
+        "f" => (Some("X"), Some("X")),
+        "l" => (Some("U"), Some("U")),
+        "L" => (None, Some("rw")),
+        "n" => (None, Some("UC")),
+        "p" => (None, Some("sA")),
+        "t" => (None, Some("C")),
+        "F" | "S" => (None, Some("U")),
+        "T" => (Some("U"), Some("U")),
+        _ => {
+            return Err(LimboError::InvalidArgument(format!(
+                "unrecognized object type abbreviation: {kind}"
+            )));
+        }
+    };
+
+    let role = if owner == 10 {
+        "turso".to_string()
+    } else {
+        owner.to_string()
+    };
+    let mut entries = Vec::with_capacity(2);
+    if let Some(privileges) = public_privileges {
+        entries.push(format!("={privileges}/{role}"));
+    }
+    if let Some(privileges) = owner_privileges {
+        let grantee = if owner == 0 { "" } else { &role };
+        entries.push(format!("{grantee}={privileges}/{role}"));
+    }
+    Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
 }
 
 fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {

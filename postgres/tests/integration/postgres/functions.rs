@@ -235,6 +235,75 @@ fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_acl_default_matches_postgres_defaults(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for (kind, expected) in [
+        ("c", "{}"),
+        ("n", "{turso=UC/turso}"),
+        ("r", "{turso=arwdDxt/turso}"),
+        ("s", "{turso=rwU/turso}"),
+        ("d", "{=Tc/turso,turso=CTc/turso}"),
+        ("f", "{=X/turso,turso=X/turso}"),
+        ("F", "{turso=U/turso}"),
+        ("S", "{turso=U/turso}"),
+        ("l", "{=U/turso,turso=U/turso}"),
+        ("L", "{turso=rw/turso}"),
+        ("p", "{turso=sA/turso}"),
+        ("t", "{turso=C/turso}"),
+        ("T", "{=U/turso,turso=U/turso}"),
+    ] {
+        assert_eq!(
+            query_text(&conn, &format!("SELECT acldefault('{kind}', 10)")),
+            [expected],
+            "object kind {kind}"
+        );
+    }
+    assert_eq!(
+        query_text(&conn, "SELECT acldefault('f', 4294967294)"),
+        ["{=X/4294967294,4294967294=X/4294967294}"]
+    );
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
+                             acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n
+                      WHERE n.nspname = 'public'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::from_i64(2615),
+            Value::from_i64(2200),
+            Value::build_text("public"),
+            Value::from_i64(10),
+            Value::Null,
+            Value::build_text("{turso=UC/turso}"),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_acl_default_null_and_invalid_arguments(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in [
+        "SELECT acldefault(NULL, 10)",
+        "SELECT acldefault('r', NULL)",
+    ] {
+        assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
+    }
+
+    let error = conn.execute("SELECT acldefault('?', 10)").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unrecognized object type abbreviation: ?"),
+        "{error}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_version_is_client_parseable(db: TempDatabase) {
     let conn = db.connect_postgres();
 
