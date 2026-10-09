@@ -113,7 +113,7 @@ use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
 
-type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
+pub(crate) type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -3021,9 +3021,7 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.set_mv_tx(None);
-                    conn.set_tx_state(TransactionState::None);
-                    pager.end_read_tx();
+                    conn.end_committed_main_mvcc_tx(&pager);
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }

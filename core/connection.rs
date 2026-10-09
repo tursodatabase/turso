@@ -2,6 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -15,6 +16,7 @@ use crate::types::IOResultOr;
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::MvccCommitStateMachine;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
@@ -328,25 +330,32 @@ pub enum SyncAutoincrementState {
         stmt: Box<Statement>,
         rows: Vec<(String, i64)>,
     },
-    /// Per-table: read the backing `MAX(value)` then maybe upsert a watermark.
+    /// Per table: read its sequence row, and advance it if it is behind
+    /// `sqlite_sequence`.
     Process {
         rows: Vec<(String, i64)>,
         idx: usize,
         sub: SyncRowStep,
+    },
+    /// Committing the MVCC transaction the sync statements ran in.
+    Commit {
+        mv_store: Arc<MvStore>,
+        state_machine: StateMachine<Box<MvccCommitStateMachine>>,
     },
 }
 
 /// Per-row sub-state of [`SyncAutoincrementState::Process`].
 #[derive(Default)]
 pub enum SyncRowStep {
-    /// Resolve `rows[idx]`'s backing table and start reading `MAX(value)`.
+    /// Find `rows[idx]`'s backing table and start reading its sequence row.
     #[default]
     Start,
-    /// Reading `MAX(value)` from the backing table.
-    ReadMax {
+    /// Reading `(value, is_called)` of the backing table row with the largest value.
+    ReadSequenceRow {
         backing_table_name: String,
-        stmt: Box<Statement>,
-        current_max: Option<i64>,
+        seq: Arc<crate::schema::Sequence>,
+        stmt: Option<Box<Statement>>,
+        sequence_row: Option<(i64, bool)>,
     },
     /// Running the `INSERT OR REPLACE` watermark upsert.
     Upsert { stmt: Box<Statement> },
@@ -4383,8 +4392,9 @@ impl Connection {
     ///
     /// For each `name` in `sqlite_sequence`, locate the backing table
     /// `__turso_internal_seq___turso_internal_autoincrement_<name>` and,
-    /// if its current MAX(value) is below the sqlite_sequence value,
-    /// INSERT a new watermark row to advance it. This is the same
+    /// unless its next value is already past the sqlite_sequence value,
+    /// INSERT OR REPLACE a watermark row to advance it, then commit the
+    /// MVCC transaction the sync ran in. This is the same
     /// pattern the translator emits for `emit_disk_advance_past`,
     /// expressed as statement-level SQL so it can run at bootstrap.
     ///
@@ -4441,13 +4451,30 @@ impl Connection {
                 }
                 SyncAutoincrementState::Process { rows, idx, sub } => {
                     if *idx >= rows.len() {
-                        return Ok(IOResult::Done(()));
+                        // The statements above are internal helpers. Helpers never
+                        // commit: they expect a parent statement to do it. At
+                        // bootstrap there is no parent statement, so commit here.
+                        // Without this, the watermark writes are thrown away and
+                        // the next insert reuses id 1, replacing an existing row.
+                        let mv_store = self
+                            .db
+                            .get_mv_store()
+                            .clone()
+                            .expect("the watermark sync runs only in MVCC mode");
+                        let tx_id = self
+                            .get_mv_tx_id()
+                            .expect("the watermark sync statements run in an MVCC transaction");
+                        let state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+                        *state = SyncAutoincrementState::Commit {
+                            mv_store,
+                            state_machine,
+                        };
+                        continue;
                     }
                     match sub {
                         SyncRowStep::Start => {
-                            let backing_table_name = sequence_backing_table_name(
-                                &autoincrement_sequence_name(&rows[*idx].0),
-                            );
+                            let sequence_name = autoincrement_sequence_name(&rows[*idx].0);
+                            let backing_table_name = sequence_backing_table_name(&sequence_name);
                             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
                                 s.get_btree_table(&backing_table_name).is_some()
                             });
@@ -4455,54 +4482,60 @@ impl Connection {
                                 *idx += 1;
                                 continue;
                             }
-                            // Read current backing watermark; only upsert if we'd
-                            // actually advance it (avoids needless writes on boot).
-                            let escaped = backing_table_name.replace('"', "\"\"");
-                            let stmt = self.prepare_internal(format!(
-                                "SELECT MAX(value) FROM \"{escaped}\""
-                            ))?;
-                            *sub = SyncRowStep::ReadMax {
+                            let seq = self
+                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(&sequence_name).cloned())
+                                .ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "sequence \"{sequence_name}\" is not loaded although its backing table exists"
+                                    ))
+                                })?;
+                            *sub = SyncRowStep::ReadSequenceRow {
                                 backing_table_name,
-                                stmt: Box::new(stmt),
-                                current_max: None,
+                                seq,
+                                stmt: None,
+                                sequence_row: None,
                             };
                         }
-                        SyncRowStep::ReadMax {
+                        SyncRowStep::ReadSequenceRow {
                             backing_table_name,
+                            seq,
                             stmt,
-                            current_max,
+                            sequence_row,
                         } => {
-                            crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                                if let crate::Value::Numeric(crate::Numeric::Integer(v)) =
-                                    row.get_value(0)
-                                {
-                                    *current_max = Some(*v);
-                                }
-                                Ok(())
-                            }));
-                            let watermark = rows[*idx].1;
-                            // Skip only when the backing table is already strictly
-                            // ahead; an equal value is NOT enough because the
-                            // initial row written by CREATE TABLE bytecode is
-                            // (value=1, is_called=false), which would cause the
-                            // next nextval to re-emit value=1 and collide with the
-                            // rowid already inserted in WAL mode. We always upsert
-                            // with is_called=1 so the next nextval computes
-                            // watermark+1 like sqlite_sequence semantics demand.
-                            if matches!(*current_max, Some(c) if c > watermark) {
+                            crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
+                                backing_table_name,
+                                seq,
+                                stmt,
+                                sequence_row,
+                            ));
+                            // sqlite_sequence holds the largest id the table ever used.
+                            let last_used_id = rows[*idx].1;
+                            // A sequence row (value, is_called) hands out `value` next
+                            // when is_called is false, and `value + 1` when it is true.
+                            // The sequence is up to date when its next id is above
+                            // last_used_id. Skipping it then matters: every open runs
+                            // this sync, and a write on each open would grow the MVCC
+                            // log and fail on a read-only open.
+                            // A new table's row is (1, false), whose next id is 1. With
+                            // last_used_id = 1, that row must still be advanced.
+                            let next_id_is_above_last_used =
+                                sequence_row.is_some_and(|(value, is_called)| {
+                                    value > last_used_id || (value == last_used_id && is_called)
+                                });
+                            if next_id_is_above_last_used {
                                 *idx += 1;
                                 *sub = SyncRowStep::Start;
                                 continue;
                             }
-                            // Standard AUTOINCREMENT descriptor columns (start=1,
-                            // inc=1, min=1, max=i64::MAX, cycle=0) — mirror what
-                            // the translator emits when CREATE TABLE bytecode
-                            // creates the backing table for an AUTOINCREMENT column.
+                            // Write (last_used_id, is_called = 1), so the next id is
+                            // last_used_id + 1. The other columns are the standard
+                            // AUTOINCREMENT ones (start=1, inc=1, min=1,
+                            // max=i64::MAX, cycle=0) that CREATE TABLE writes.
                             let escaped = backing_table_name.replace('"', "\"\"");
                             let insert_sql = format!(
                                 "INSERT OR REPLACE INTO \"{escaped}\"\
                                  (value, is_called, start, inc, min, max, cycle) \
-                                 VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
+                                 VALUES ({last_used_id}, 1, 1, 1, 1, {}, 0)",
                                 i64::MAX
                             );
                             let stmt = self.prepare_internal(insert_sql)?;
@@ -4513,8 +4546,9 @@ impl Connection {
                         SyncRowStep::Upsert { stmt } => {
                             crate::return_if_io!(stmt.run_with_row_callback_nonblock(|_| Ok(())));
                             if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                                let watermark = rows[*idx].1;
-                                let first_unsafe = watermark.checked_add(1).unwrap_or(watermark);
+                                let last_used_id = rows[*idx].1;
+                                let first_unsafe =
+                                    last_used_id.checked_add(1).unwrap_or(last_used_id);
                                 mv_store.set_sequence_watermark(
                                     &autoincrement_sequence_name(&rows[*idx].0),
                                     first_unsafe,
@@ -4524,6 +4558,15 @@ impl Connection {
                             *sub = SyncRowStep::Start;
                         }
                     }
+                }
+                SyncAutoincrementState::Commit {
+                    mv_store,
+                    state_machine,
+                } => {
+                    crate::return_if_io!(state_machine.step(mv_store));
+                    assert!(state_machine.is_finalized());
+                    self.end_committed_main_mvcc_tx(&self.pager.load());
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
@@ -4945,6 +4988,15 @@ impl Connection {
     pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
         tracing::debug!("set_mv_tx: {:?}", tx_id_and_mode);
         *self.mv_tx.write() = tx_id_and_mode;
+    }
+
+    /// After an MVCC commit of the main database: forget the MVCC transaction,
+    /// mark the connection as outside a transaction, and release the pager's
+    /// read lock.
+    pub(crate) fn end_committed_main_mvcc_tx(&self, pager: &Pager) {
+        self.set_mv_tx(None);
+        self.set_tx_state(TransactionState::None);
+        pager.end_read_tx();
     }
 
     /// Get MVCC transaction ID for a specific database.
