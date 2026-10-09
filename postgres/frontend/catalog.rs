@@ -190,6 +190,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_tables"
+            | "pg_indexes"
     )
 }
 
@@ -955,6 +956,61 @@ impl SnapshotRows for PgTablesTable {
             ]);
         }
 
+        rows
+    }
+}
+
+/// Virtual table implementation for pg_indexes
+/// Maps user indexes to PostgreSQL's pg_indexes view
+#[derive(Debug)]
+struct PgIndexesTable;
+
+impl SnapshotRows for PgIndexesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_indexes (
+            schemaname TEXT,
+            tablename TEXT,
+            indexname TEXT,
+            tablespace TEXT,
+            indexdef TEXT
+        )";
+
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let mut rows = Vec::new();
+        for (table_name, _) in user_tables_sorted(&schema) {
+            for idx in schema.get_indices(table_name) {
+                if idx.ephemeral {
+                    continue;
+                }
+                let unique = if idx.unique { "UNIQUE " } else { "" };
+                let cols: Vec<String> = idx
+                    .columns
+                    .iter()
+                    .map(|col| match &col.expr {
+                        Some(expr) => format!("({expr})"),
+                        None => col.name.clone(),
+                    })
+                    .collect();
+                let mut def = format!(
+                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
+                    idx.name,
+                    cols.join(", ")
+                );
+                if let Some(where_clause) = &idx.where_clause {
+                    def.push_str(&format!(" WHERE {where_clause}"));
+                }
+                rows.push(vec![
+                    Value::Text("public".into()),
+                    Value::Text(table_name.clone().into()),
+                    Value::Text(idx.name.clone().into()),
+                    Value::Null,
+                    Value::Text(def.into()),
+                ]);
+            }
+        }
         rows
     }
 }
@@ -1904,6 +1960,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgTablesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_indexes",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgIndexesTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_get_tabledef",
         VTabKind::TableValuedFunction,
         CatalogModule {
@@ -2649,6 +2710,7 @@ mod tests {
             "pg_proc",
             "pg_database",
             "pg_tables",
+            "pg_indexes",
             "pg_get_tabledef",
             "pg_index",
             "pg_constraint",
@@ -3380,6 +3442,73 @@ mod tests {
             }
         }
         assert_eq!(tables, vec!["table1", "table2", "table3"]);
+    }
+
+    #[test]
+    fn test_pg_indexes_lists_user_indexes() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = crate::session::open_database_with_io(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, total REAL)").unwrap();
+        conn.execute("CREATE INDEX idx_orders_user ON orders(user_id)").unwrap();
+        conn.execute("CREATE UNIQUE INDEX idx_orders_id_total ON orders(id, total DESC)").unwrap();
+        conn.execute("CREATE INDEX idx_users_name ON users(lower(name))").unwrap();
+        conn.execute("CREATE INDEX idx_orders_partial ON orders(total) WHERE total > 0").unwrap();
+
+        let conn = crate::Connection::new(conn);
+
+        let mut stmt = conn
+            .prepare("SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname")
+            .unwrap();
+
+        let mut indexes = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let (Value::Text(table), Value::Text(name), Value::Text(def)) = (
+                        row.get_value(0),
+                        row.get_value(1),
+                        row.get_value(2),
+                    ) {
+                        indexes.push((table.to_string(), name.to_string(), def.to_string()));
+                    }
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+
+        let defs: std::collections::BTreeMap<String, String> = indexes
+            .iter()
+            .map(|(t, n, d)| (n.clone(), d.clone()))
+            .collect();
+        assert_eq!(
+            defs.get("idx_orders_user").unwrap(),
+            "CREATE INDEX idx_orders_user ON orders USING btree (user_id)"
+        );
+        assert_eq!(
+            defs.get("idx_orders_id_total").unwrap(),
+            "CREATE UNIQUE INDEX idx_orders_id_total ON orders USING btree (id, total)"
+        );
+        assert_eq!(
+            defs.get("idx_users_name").unwrap(),
+            "CREATE INDEX idx_users_name ON users USING btree ((lower (name)))"
+        );
+        assert!(defs
+            .get("idx_orders_partial")
+            .unwrap()
+            .starts_with("CREATE INDEX idx_orders_partial ON orders USING btree (total) WHERE"));
     }
 
     #[test]
