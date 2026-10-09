@@ -880,8 +880,9 @@ pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_mvcc_support, parse_patterns, IndexMethodAttachment, IndexMethodCursor,
-        IndexMethodDefinition, IndexMethodMvccSupport, ResolvedPatternAttachment,
+        bind_pattern, ensure_mvcc_support, parse_patterns, IndexMethodAttachment,
+        IndexMethodCursor, IndexMethodDefinition, IndexMethodMvccSupport,
+        ResolvedPatternAttachment,
     };
     use crate::schema::BTreeTable;
     use crate::translate::expr::{walk_expr, WalkControl};
@@ -913,14 +914,17 @@ mod tests {
         }
     }
 
-    /// Table positions read by a pattern expression. Panics on a name that
-    /// was not resolved.
-    fn column_positions(expr: &ast::Expr) -> Vec<usize> {
+    /// Table positions read by a pattern expression that is bound to
+    /// `reference`. Panics on a name that was not resolved.
+    fn column_positions(expr: &ast::Expr, reference: ast::TableInternalId) -> Vec<usize> {
         let mut positions = Vec::new();
         let _ = walk_expr(expr, &mut |e| {
             match e {
                 ast::Expr::Column { table, column, .. } => {
-                    assert!(table.is_self_table(), "pattern must use SELF_TABLE");
+                    assert_eq!(
+                        *table, reference,
+                        "pattern must point at the bound reference"
+                    );
                     positions.push(*column);
                 }
                 ast::Expr::Id(name) => panic!("unresolved name {name} in pattern"),
@@ -941,7 +945,8 @@ mod tests {
         });
         let resolved = ResolvedPatternAttachment::new(attachment, &table);
         let definition = resolved.definition();
-        let pattern = &definition.patterns[0];
+        let reference = ast::TableInternalId::from(7);
+        let pattern = bind_pattern(&definition.patterns[0], reference);
         let ast::OneSelect::Select {
             columns,
             where_clause,
@@ -953,9 +958,12 @@ mod tests {
         let ast::ResultColumn::Expr(score, _) = &columns[0] else {
             panic!("pattern selects one expression");
         };
-        assert_eq!(column_positions(score), vec![1]);
+        assert_eq!(column_positions(score, reference), vec![1]);
         assert_eq!(
-            column_positions(where_clause.as_deref().expect("pattern has a WHERE")),
+            column_positions(
+                where_clause.as_deref().expect("pattern has a WHERE"),
+                reference
+            ),
             vec![0]
         );
         assert_eq!(pattern.order_by[0].expr, *score);

@@ -3144,8 +3144,9 @@ pub struct CheckConstraint {
     /// CHECK expression as written, with column names. It renders the schema
     /// SQL and is rewritten when a column or the table is renamed.
     pub expr: ast::Expr,
-    /// The CHECK expression with column names resolved to table positions
-    /// (`Expr::Column { table: SELF_TABLE }`). Statements evaluate this form.
+    /// The CHECK expression with column names resolved to table positions,
+    /// pointed at the stored table. A statement binds this form to its table
+    /// reference.
     /// [BTreeTable::resolve_check_constraints] builds it from `expr`.
     pub bound: ast::Expr,
     /// The expression's source text exactly as the user wrote it between the
@@ -3945,7 +3946,7 @@ impl BTreeTable {
                     column,
                     is_rowid_alias: _,
                     ..
-                } if table.is_self_table() => {
+                } if points_at_stored_table(*table) => {
                     if *column == dropped_index {
                         return Err(LimboError::InternalError(
                             "dropped column remained referenced by generated column".to_string(),
@@ -4242,7 +4243,7 @@ fn collect_column_refs(expr: &Expr) -> HashSet<String> {
 }
 
 /// Extract all column name references from an expression as a set.
-/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
+/// `columns` is used to resolve stored column positions back to names.
 //TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
 pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
@@ -4256,7 +4257,7 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
             refs.insert(normalize_ident(col.as_str()));
             Ok(WalkControl::Continue)
         }
-        Expr::Column { table, column, .. } if table.is_self_table() => {
+        Expr::Column { table, column, .. } if points_at_stored_table(*table) => {
             if let Some(col) = columns.get(*column) {
                 if let Some(name) = &col.name {
                     refs.insert(normalize_ident(name));
@@ -4277,7 +4278,7 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
 fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
     let _ = walk_expr(expr, &mut |e| {
         match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
+            Expr::Column { table, column, .. } if points_at_stored_table(*table) => {
                 out.set(*column)?;
             }
             Expr::Id(name) | Expr::Name(name) => {
@@ -4312,7 +4313,7 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
 }
 
 /// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
-/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
+/// or partial-index expression to `Expr::Column` pointed at the stored table.
 pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
     walk_expr_mut(gencol_expr, &mut |e| match e {
         Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
@@ -4328,7 +4329,7 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
                 .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
             *e = Expr::Column {
                 database: None,
-                table: TableInternalId::SELF_TABLE,
+                table: stored_table(),
                 column: idx,
                 is_rowid_alias: col.is_rowid_alias(),
             };
@@ -4341,7 +4342,7 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
 
 /// Resolve the column names of a stored index key expression, partial-index
 /// WHERE clause or CHECK constraint to positions in `table`
-/// (`Expr::Column { table: SELF_TABLE }` or `Expr::RowId { table: SELF_TABLE }`).
+/// (`Expr::Column` or `Expr::RowId` pointed at the stored table).
 /// A name that is not a column of `table` stays as written, so a stale schema
 /// still loads and the error appears when a statement uses the expression.
 pub fn resolve_schema_expr_columns(expr: &mut Expr, table: &BTreeTable) {
@@ -4370,7 +4371,7 @@ fn schema_expr_leaf(name: &str, columns: &[Column], has_rowid: bool) -> Option<E
     if let Some(column) = find_column_index_by_name(columns, &name) {
         return Some(Expr::Column {
             database: None,
-            table: TableInternalId::SELF_TABLE,
+            table: stored_table(),
             column,
             is_rowid_alias: columns[column].is_rowid_alias(),
         });
@@ -4382,7 +4383,7 @@ fn schema_expr_leaf(name: &str, columns: &[Column], has_rowid: bool) -> Option<E
     {
         return Some(Expr::RowId {
             database: None,
-            table: TableInternalId::SELF_TABLE,
+            table: stored_table(),
         });
     }
     None
@@ -4395,12 +4396,14 @@ pub fn bind_schema_expr(expr: &Expr, internal_id: TableInternalId) -> Expr {
     bound
 }
 
-/// Point the SELF_TABLE references of a stored schema expression at one table
+/// Point the stored table references of a stored schema expression at one table
 /// reference of a statement.
 pub fn rebase_schema_expr(expr: &mut Expr, internal_id: TableInternalId) {
     let _ = walk_expr_mut(expr, &mut |e| {
         match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
+            Expr::Column { table, .. } | Expr::RowId { table, .. }
+                if points_at_stored_table(*table) =>
+            {
                 *table = internal_id;
             }
             _ => {}
@@ -4414,7 +4417,7 @@ pub fn schema_expr_references_column(expr: &Expr, column_index: usize) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e| {
         if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() && *column == column_index {
+            if points_at_stored_table(*table) && *column == column_index {
                 found = true;
                 return Ok(WalkControl::SkipChildren);
             }
@@ -4429,7 +4432,7 @@ pub fn schema_expr_references_column(expr: &Expr, column_index: usize) -> bool {
 pub fn shift_schema_expr_positions_after_drop(expr: &mut Expr, dropped_index: usize) {
     let _ = walk_expr_mut(expr, &mut |e| {
         if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() && *column > dropped_index {
+            if points_at_stored_table(*table) && *column > dropped_index {
                 *column -= 1;
             }
         }
@@ -4439,22 +4442,22 @@ pub fn shift_schema_expr_positions_after_drop(expr: &mut Expr, dropped_index: us
 
 /// Re-render the SQL text of a stored schema expression (generated column,
 /// index key expression, partial-index WHERE clause) using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
+/// AST may have been previously resolved into `Expr::Column` nodes pointed at the stored
+/// table; we replace each such reference with a fresh `Expr::Id(<col-name>)` before
 /// stringifying so the result round-trips through the parser, even if a referenced column was
 /// renamed since the original `original_sql` was captured.
 pub fn render_schema_expr_sql(expr: &Expr, columns: &[Column]) -> String {
     let mut clone = expr.clone();
     let _ = walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
         match e {
-            Expr::Column { table, column, .. } if table.is_self_table() => {
+            Expr::Column { table, column, .. } if points_at_stored_table(*table) => {
                 if let Some(col) = columns.get(*column) {
                     if let Some(name) = col.name.as_ref() {
                         *e = Expr::Id(Name::exact(name.clone()));
                     }
                 }
             }
-            Expr::RowId { table, .. } if table.is_self_table() => {
+            Expr::RowId { table, .. } if points_at_stored_table(*table) => {
                 *e = Expr::Id(Name::exact(ROWID_STRS[0].to_string()));
             }
             _ => {}
@@ -4462,6 +4465,18 @@ pub fn render_schema_expr_sql(expr: &Expr, columns: &[Column]) -> String {
         Ok(WalkControl::Continue)
     });
     clone.to_string()
+}
+
+/// The table that a stored schema expression points at. A statement binds
+/// the expression to one of its table references with [bind_schema_expr].
+/// The table reference counter of a statement starts at
+/// `TableInternalId::default()`, so no table reference has this id.
+fn stored_table() -> TableInternalId {
+    TableInternalId::from(0)
+}
+
+fn points_at_stored_table(table: TableInternalId) -> bool {
+    table == stored_table()
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -5543,8 +5558,8 @@ impl ColDefFlags {
 
 #[derive(Debug, Clone)]
 pub enum GeneratedType {
-    /// `resolved` holds the expression with column references resolved to
-    /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
+    /// `expr` holds the expression with column references resolved to
+    /// `Expr::Column` pointed at the stored table.
     /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
     Virtual {
         expr: Box<Expr>,
@@ -7235,15 +7250,15 @@ mod tests {
             match e {
                 Expr::Column { table, column, .. } => {
                     assert!(
-                        table.is_self_table(),
-                        "stored expression must use SELF_TABLE"
+                        points_at_stored_table(*table),
+                        "stored expression must point at the stored table"
                     );
                     positions.push(*column);
                 }
                 Expr::RowId { table, .. } => {
                     assert!(
-                        table.is_self_table(),
-                        "stored expression must use SELF_TABLE"
+                        points_at_stored_table(*table),
+                        "stored expression must point at the stored table"
                     );
                     rowids += 1;
                 }

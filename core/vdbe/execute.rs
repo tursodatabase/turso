@@ -17102,7 +17102,7 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
+    // Shift left pos_in_table in all indexes, and stored table references in generated column
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
