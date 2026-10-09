@@ -458,8 +458,8 @@ fn first_empty_read_of_committed_key(history: &str) -> Option<(String, u64, u64)
             }
             if let Some((key, empty, next)) = parse_edn_read(slice) {
                 if empty {
-                    if let Some(&created_at) = created.get(&key) {
-                        if snapshot > created_at {
+                    && let Some(&created_at) = created.get(&key) {
+                        && snapshot > created_at {
                             return Some((key, index, created_at));
                         }
                     }
