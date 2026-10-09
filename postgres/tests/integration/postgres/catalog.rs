@@ -97,7 +97,7 @@ fn test_empty_physical_catalogs_have_hidden_tableoid(db: TempDatabase) {
     for (table, columns) in [
         ("pg_collation", 12),
         ("pg_policy", 8),
-        ("pg_trigger", 18),
+        ("pg_trigger", 19),
         ("pg_statistic_ext", 9),
         ("pg_inherits", 4),
         ("pg_rewrite", 8),
@@ -122,6 +122,79 @@ fn test_empty_physical_catalogs_have_hidden_tableoid(db: TempDatabase) {
     }
     assert!(conn.prepare("SELECT tableoid, oid, collname, collnamespace, collowner, collencoding FROM pg_collation")
         .unwrap().run_collect_rows().unwrap().is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_trigger_supports_pg_dump_parent_trigger_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.tgrelid, t.tgname, t.tgfoid::pg_catalog.regproc AS tgfname,
+                    pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef,
+                    t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS tgispartition
+             FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+             JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+             LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+             WHERE ((NOT t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled)
+             ORDER BY t.tgrelid, t.tgname",
+        )
+        .unwrap();
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+    assert_eq!(
+        conn.prepare("SELECT * FROM pg_trigger")
+            .unwrap()
+            .num_columns(),
+        19
+    );
+    assert_eq!(
+        conn.prepare("SELECT pg_get_triggerdef(0), pg_catalog.pg_get_triggerdef(2147483647, false), pg_get_triggerdef(NULL)")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::Null, Value::Null, Value::Null]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_dump_publication_membership_query(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert!(conn.prepare(
+        "SELECT tableoid, oid, prpubid, prrelid,
+                pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual,
+                (CASE WHEN pr.prattrs IS NOT NULL THEN
+                    (SELECT array_agg(attname)
+                     FROM pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s,
+                          pg_catalog.pg_attribute
+                     WHERE attrelid = pr.prrelid AND attnum = prattrs[s])
+                 ELSE NULL END) prattrs
+         FROM pg_catalog.pg_publication_rel pr"
+    ).unwrap().run_collect_rows().unwrap().is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_security_labels_are_empty_and_cannot_be_created(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE label_probe (id INTEGER)")
+        .unwrap();
+    assert!(conn
+        .execute("SECURITY LABEL FOR probe ON TABLE label_probe IS 'private'")
+        .is_err());
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for query in [
+        "SELECT label, provider, classoid, objoid, objsubid FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid",
+        "SELECT objoid, classoid, objsubid, objtype, objnamespace, objname, provider, label FROM pg_seclabels",
+    ] {
+        assert!(conn.prepare(query).unwrap().run_collect_rows().unwrap().is_empty());
+    }
+    assert_eq!(
+        conn.prepare("SELECT * FROM pg_catalog.pg_seclabels")
+            .unwrap()
+            .num_columns(),
+        8
+    );
 }
 
 #[turso_macros::test(mvcc)]

@@ -1751,8 +1751,7 @@ impl SnapshotRows for PgConstraintTable {
 // pg_attrdef
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_ATTRDEF_SQL: &str = "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;
@@ -1959,7 +1958,17 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tableoid INTEGER HIDDEN)".to_string() },
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_trigger (
+                oid INTEGER, tgrelid INTEGER, tgparentid INTEGER NOT NULL DEFAULT 0,
+                tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT,
+                tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER,
+                tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER,
+                tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT,
+                tgnewtable TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
     );
     options = options.native_module(
         "pg_statistic_ext",
@@ -2075,6 +2084,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         PgOptionsToTable,
     );
     options = options.native_module("unnest", VTabKind::TableValuedFunction, PgUnnest);
+    options = options.native_module(
+        "pg_generate_series",
+        VTabKind::TableValuedFunction,
+        PgGenerateSeries,
+    );
     for (name, create_sql) in [
         (
             "pg_operator",
@@ -2204,6 +2218,13 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             amprocnum INTEGER, amproc INTEGER, tableoid INTEGER HIDDEN
         )",
         ),
+        (
+            "pg_seclabels",
+            "CREATE TABLE pg_seclabels (
+            objoid INTEGER, classoid INTEGER, objsubid INTEGER, objtype TEXT,
+            objnamespace INTEGER, objname TEXT, provider TEXT, label TEXT
+        )",
+        ),
     ] {
         options = options.native_module(
             name,
@@ -2214,6 +2235,155 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         );
     }
     options
+}
+
+#[derive(Debug)]
+struct PgGenerateSeries;
+
+impl VirtualTableModule for PgGenerateSeries {
+    type Table = Self;
+
+    fn schema(&self, _args: &[Value]) -> Result<String> {
+        Ok("CREATE TABLE pg_generate_series (generate_series INTEGER, start INTEGER HIDDEN, stop INTEGER HIDDEN, step INTEGER HIDDEN)".to_owned())
+    }
+
+    fn create(&self, _args: &[Value]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+impl VirtualTable for PgGenerateSeries {
+    type Cursor = PgGenerateSeriesCursor;
+
+    fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
+        Ok(PgGenerateSeriesCursor {
+            start: 0,
+            current: 0,
+            stop: 0,
+            step: 1,
+            rowid: 0,
+        })
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+        let mut inputs = [None; 3];
+        for (index, constraint) in constraints.iter().enumerate() {
+            if (1..=3).contains(&constraint.column_index) && constraint.op == ConstraintOp::Eq {
+                if !constraint.usable {
+                    return Err(ResultCode::ConstraintViolation);
+                }
+                inputs[constraint.column_index as usize - 1] = Some(index);
+            }
+        }
+        if inputs[0].is_none() || inputs[1].is_none() {
+            return Err(ResultCode::InvalidArgs);
+        }
+        let mut next_arg = 1;
+        let mut usages = vec![
+            ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            };
+            constraints.len()
+        ];
+        for input in inputs.into_iter().flatten() {
+            usages[input] = ConstraintUsage {
+                argv_index: Some(next_arg),
+                omit: true,
+            };
+            next_arg += 1;
+        }
+        Ok(IndexInfo {
+            constraint_usages: usages,
+            estimated_cost: 1.0,
+            estimated_rows: 1000,
+            ..Default::default()
+        })
+    }
+}
+
+struct PgGenerateSeriesCursor {
+    start: i64,
+    current: i64,
+    stop: i64,
+    step: i64,
+    rowid: i64,
+}
+
+impl VirtualTableCursor for PgGenerateSeriesCursor {
+    fn filter(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<&str>,
+        _idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
+        if args.iter().any(|arg| matches!(arg, Value::Null)) {
+            return Ok(IOResult::Done(false));
+        }
+        self.current = args[0].as_int().ok_or_else(|| {
+            LimboError::InvalidArgument("generate_series requires integer arguments".to_owned())
+        })?;
+        self.start = self.current;
+        self.stop = args[1].as_int().ok_or_else(|| {
+            LimboError::InvalidArgument("generate_series requires integer arguments".to_owned())
+        })?;
+        self.step = match args.get(2) {
+            Some(value) => value.as_int().ok_or_else(|| {
+                LimboError::InvalidArgument("generate_series requires integer arguments".to_owned())
+            })?,
+            None => 1,
+        };
+        if self.step == 0 {
+            return Err(
+                LimboError::InvalidArgument("step size cannot equal zero".to_owned()).into(),
+            );
+        }
+        self.rowid = 0;
+        Ok(IOResult::Done(self.in_bounds()))
+    }
+
+    fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.rowid += 1;
+        let Some(next) = self.current.checked_add(self.step) else {
+            return Ok(IOResult::Done(false));
+        };
+        self.current = next;
+        Ok(IOResult::Done(self.in_bounds()))
+    }
+
+    fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        let value = match column {
+            0 => self.current,
+            1 => self.start,
+            2 => self.stop,
+            3 => self.step,
+            _ => unreachable!(),
+        };
+        Ok(IOResult::Done(Value::from_i64(value)))
+    }
+
+    fn rowid(&self) -> i64 {
+        self.rowid
+    }
+}
+
+impl PgGenerateSeriesCursor {
+    fn in_bounds(&self) -> bool {
+        if self.step > 0 {
+            self.current <= self.stop
+        } else {
+            self.current >= self.stop
+        }
+    }
 }
 
 #[derive(Debug)]
