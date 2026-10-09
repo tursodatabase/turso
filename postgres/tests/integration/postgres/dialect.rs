@@ -2,6 +2,37 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE shadowed_cte (v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO shadowed_cte VALUES (99)")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for sql in [
+        "WITH shadowed_cte AS (SELECT 17 AS v) SELECT v FROM shadowed_cte",
+        "WITH shadowed_cte AS (SELECT 17 AS v) SELECT (SELECT v FROM shadowed_cte)",
+        "WITH RECURSIVE n(v) AS (SELECT 17 UNION ALL SELECT v + 1 FROM n WHERE v < 19)
+         SELECT v FROM n WHERE v = 17",
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(17)]],
+            "{sql}"
+        );
+    }
+    assert!(conn.prepare("SELECT v FROM shadowed_cte").is_err());
+    assert_eq!(
+        conn.prepare("SELECT v FROM public.shadowed_cte")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(99)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_access_share_lock_retains_read_snapshot(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();

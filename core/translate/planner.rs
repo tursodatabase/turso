@@ -1933,7 +1933,6 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
     if qualified_name.db_name.is_none() {
@@ -1986,6 +1985,7 @@ fn parse_table(
         if let Some(outer_ref) =
             table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
+            let database_id = crate::MAIN_DB_ID;
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
                     // SQLite resolves the recursive self-reference as a plain
@@ -2076,6 +2076,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
+    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
