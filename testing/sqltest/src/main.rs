@@ -746,8 +746,8 @@ fn convert_single_file(
         // If multiple files, create a subdirectory
         let (output_base, use_subdir) = if num_files > 1 {
             let subdir = base_dir.join(file_stem.as_ref());
-            if !subdir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&subdir) {
+            if !subdir.exists()
+                && let Err(e) = std::fs::create_dir_all(&subdir) {
                     eprintln!(
                         "  {} Failed to create directory {}: {}",
                         "ERROR".red().bold(),
@@ -756,12 +756,11 @@ fn convert_single_file(
                     );
                     return (0, warning_count);
                 }
-            }
             (subdir, true)
         } else {
             // Ensure base dir exists
-            if !base_dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&base_dir) {
+            if !base_dir.exists()
+                && let Err(e) = std::fs::create_dir_all(&base_dir) {
                     eprintln!(
                         "  {} Failed to create directory {}: {}",
                         "ERROR".red().bold(),
@@ -770,7 +769,6 @@ fn convert_single_file(
                     );
                     return (0, warning_count);
                 }
-            }
             (base_dir, false)
         };
 
@@ -830,8 +828,8 @@ async fn generate_debug_databases(
     eprintln!();
 
     // Create output directory if it doesn't exist
-    if !output_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+    if !output_dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&output_dir) {
             eprintln!(
                 "{}: Failed to create output directory {}: {}",
                 "Error".red().bold(),
@@ -840,7 +838,6 @@ async fn generate_debug_databases(
             );
             return ExitCode::from(1);
         }
-    }
 
     // Generate default database (INTEGER PRIMARY KEY - has rowid alias)
     let default_db_path = output_dir.join("database.db");
