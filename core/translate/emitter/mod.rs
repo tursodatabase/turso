@@ -2049,8 +2049,8 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs)
-        .with_encoded_columns((0..table.columns().len()).try_collect()?);
+    let dml_ctx =
+        DmlColumnContext::from_column_reg_mapping(pairs, (0..table.columns().len()).try_collect()?);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
