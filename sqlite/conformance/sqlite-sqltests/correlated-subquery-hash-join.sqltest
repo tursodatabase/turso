@@ -130,7 +130,6 @@ expect {
     3|0
 }
 
-
 # A correlated subquery in WHERE reads a table that is not part of the
 # materialized hash build input, so it must not run while building that input.
 setup materialized-build-input-schema {
@@ -180,4 +179,72 @@ test correlated-scalar-subquery-reads-table-outside-materialized-build-input {
 }
 expect {
     1
+}
+
+setup large-tables {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE TABLE q(id INTEGER PRIMARY KEY, x INT, z INT);
+    CREATE INDEX p_x ON p(x);
+    CREATE INDEX q_x ON q(x);
+    CREATE INDEX q_z ON q(z);
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO p SELECT n, n % 10, (n * 7) % 31 FROM c;
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO q SELECT n, (n * 3) % 10, (n * 11) % 31 FROM c;
+    INSERT INTO o VALUES (1, 1), (2, 2), (3, 3), (4, NULL);
+}
+
+@setup large-tables
+test correlated-subquery-hash-join-build-filter-reads-the-outer-row {
+    SELECT o.id, (SELECT count(*) FROM p JOIN q ON p.y = q.z WHERE q.x IN (SELECT o.a))
+    FROM o
+    ORDER BY o.id;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|0
+}
+
+@setup large-tables
+@skip-if sqlite "SQLite does not use hash joins"
+test correlated-subquery-hash-join-build-filter-reads-the-outer-row-uses-a-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id, (SELECT count(*) FROM p JOIN q ON p.y = q.z WHERE q.x IN (SELECT o.a))
+    FROM o
+    ORDER BY o.id;
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*HASH JOIN p
+}
+
+@setup large-tables
+test correlated-subquery-materialized-hash-build-reads-the-outer-row {
+    SELECT o.id, (SELECT c FROM (SELECT count(*) AS c FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) LIMIT 1)
+    FROM o
+    ORDER BY o.id;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|0
+}
+
+@setup large-tables
+@skip-if sqlite "SQLite does not use hash joins"
+test correlated-subquery-materialized-hash-build-reads-the-outer-row-uses-no-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id, (SELECT c FROM (SELECT count(*) AS c FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) LIMIT 1)
+    FROM o
+    ORDER BY o.id;
+}
+expect {
+    1|0|0|SCAN o
+    4|0|0|CORRELATED SCALAR SUBQUERY 1
+    7|4|0|SCAN (subquery-0)
+    9|7|0|SEARCH q USING INDEX q_x (x=?)
+    10|7|0|SEARCH p USING COVERING INDEX ephemeral_p_t3 (y=?)
 }
