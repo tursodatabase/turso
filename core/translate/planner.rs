@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::plan::BoundSchemaExprs;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
@@ -2056,6 +2057,8 @@ fn parse_table(
                 } else {
                     program.table_reference_counter.next()
                 };
+                let schema_exprs =
+                    BoundSchemaExprs::from_schema(resolver, database_id, &outer_table, internal_id);
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
                     unmatched_right_rows_plan: None,
@@ -2069,6 +2072,7 @@ fn parse_table(
                     database_id,
                     indexed: None,
                     plan_estimate: None,
+                    schema_exprs,
                 });
             }
             return Ok(());
@@ -2094,6 +2098,8 @@ fn parse_table(
                 "Table type not supported".to_string(),
             ));
         };
+        let schema_exprs =
+            BoundSchemaExprs::from_schema(resolver, database_id, &tbl_ref, internal_id);
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             unmatched_right_rows_plan: None,
@@ -2107,6 +2113,7 @@ fn parse_table(
             database_id,
             indexed,
             plan_estimate: None,
+            schema_exprs,
         });
         return Ok(());
     };
@@ -2211,6 +2218,7 @@ fn parse_table(
             database_id,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: Default::default(),
         });
         return Ok(());
     }
@@ -2237,6 +2245,7 @@ fn parse_table(
                     database_id,
                     indexed: None,
                     plan_estimate: None,
+                    schema_exprs: Default::default(),
                 });
                 return Ok(());
             }

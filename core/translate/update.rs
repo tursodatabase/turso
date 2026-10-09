@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::plan::BoundSchemaExprs;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -276,10 +277,11 @@ fn prepare_update_plan(
 
     let table_name = table.get_name();
 
+    let target_table_id = program.table_reference_counter.next();
     let target_table = JoinedTable {
         table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
-        internal_id: program.table_reference_counter.next(),
+        internal_id: target_table_id,
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
         join_info: None,
@@ -289,6 +291,7 @@ fn prepare_update_plan(
         database_id,
         indexed,
         plan_estimate: None,
+        schema_exprs: BoundSchemaExprs::from_schema(resolver, database_id, &table, target_table_id),
     };
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];

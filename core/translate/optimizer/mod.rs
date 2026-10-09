@@ -19,8 +19,8 @@ use crate::{
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
-        rebase_schema_expr, BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn,
-        Schema, Table, Type, ROWID_SENTINEL,
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
+        ROWID_SENTINEL,
     },
     translate::{
         expr::{
@@ -249,13 +249,13 @@ pub(crate) fn plan_index_method_predicate<'a>(
             continue;
         };
         for index in indexes {
-            let Some(module) = &index.index_method else {
-                continue;
-            };
-            if index.is_backing_btree_index() {
+            if index.index_method.is_none() || index.is_backing_btree_index() {
                 continue;
             }
-            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
+            let Some(bound) = table.index_exprs(index) else {
+                continue;
+            };
+            for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
                 let Some(matched) = try_match_index_method_pattern(
                     pattern,
                     table,
@@ -332,18 +332,6 @@ fn try_match_index_method_pattern(
         }
         panic!("unexpected from clause");
     };
-
-    for column in columns.iter_mut() {
-        if let ast::ResultColumn::Expr(e, _) = column {
-            rebase_schema_expr(e, table.internal_id);
-        }
-    }
-    for column in pattern.order_by.iter_mut() {
-        rebase_schema_expr(&mut column.expr, table.internal_id);
-    }
-    if let Some(pattern_where) = pattern_where_clause {
-        rebase_schema_expr(pattern_where, table.internal_id);
-    }
 
     if name.name.as_str() != table.table.get_name() {
         return None;
@@ -533,8 +521,10 @@ fn collect_index_method_candidates(
                 continue;
             }
 
-            let definition = module.definition();
-            for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            let Some(bound) = table.index_exprs(index) else {
+                continue;
+            };
+            for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
                 // Use shared helper for pattern matching
                 let Some(pattern_match) = try_match_index_method_pattern(
                     pattern,
@@ -1903,8 +1893,10 @@ fn optimize_table_access_with_custom_modules(
         if index.is_backing_btree_index() {
             continue;
         }
-        let definition = module.definition();
-        'patterns: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+        let Some(bound) = table.index_exprs(index) else {
+            continue;
+        };
+        'patterns: for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
                 table,

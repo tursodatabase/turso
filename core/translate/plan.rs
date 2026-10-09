@@ -2,9 +2,9 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
-        ROWID_SENTINEL,
+        rebase_schema_expr, BTreeTable, ColDef, Column, FromClauseSubquery, Index,
+        ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility, PseudoCursorType,
+        RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -13,7 +13,7 @@ use crate::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
-        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
+        expression_index::single_table_column_usage,
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
@@ -1772,6 +1772,110 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The stored expressions of the table, bound to this reference.
+    pub schema_exprs: BoundSchemaExprs,
+}
+
+/// The index key expressions, partial-index predicates, index-method
+/// patterns and CHECK constraints of a table, with their column references
+/// pointed at one table reference of a statement. The schema stores them
+/// as positions in the table; a statement that references the table twice
+/// needs one copy per reference.
+#[derive(Debug, Clone, Default)]
+pub struct BoundSchemaExprs {
+    /// The CHECK constraints, in the order of the table definition.
+    pub checks: Vec<ast::Expr>,
+    /// The expressions of each index, by index name.
+    pub indexes: HashMap<String, BoundIndexExprs>,
+}
+
+/// The expressions of one index, bound to one table reference.
+#[derive(Debug, Clone, Default)]
+pub struct BoundIndexExprs {
+    /// One entry per index column: the key expression, or None for a column key.
+    pub columns: Vec<Option<ast::Expr>>,
+    /// The predicate of a partial index.
+    pub where_clause: Option<ast::Expr>,
+    /// The query patterns of an index method.
+    pub patterns: Vec<ast::Select>,
+}
+
+impl BoundSchemaExprs {
+    /// Bind the stored expressions of `table` for the reference `internal_id`,
+    /// with the indexes of the table read from the schema of `database_id`.
+    pub fn from_schema(
+        resolver: &Resolver,
+        database_id: usize,
+        table: &Table,
+        internal_id: TableInternalId,
+    ) -> Self {
+        if table.btree().is_none() {
+            return Self::default();
+        }
+        resolver.with_schema(database_id, |schema| {
+            Self::new(
+                table,
+                schema
+                    .get_indices(table.get_name())
+                    .map(|index| index.as_ref()),
+                internal_id,
+            )
+        })
+    }
+
+    pub fn new<'a>(
+        table: &Table,
+        indexes: impl IntoIterator<Item = &'a Index>,
+        internal_id: TableInternalId,
+    ) -> Self {
+        let checks = match table.btree() {
+            Some(btree) => btree
+                .check_constraints
+                .iter()
+                .map(|check| rebase(&check.bound, internal_id))
+                .collect(),
+            None => Vec::new(),
+        };
+        let indexes = indexes
+            .into_iter()
+            .map(|index| (index.name.clone(), BoundIndexExprs::new(index, internal_id)))
+            .collect();
+        Self { checks, indexes }
+    }
+}
+
+impl BoundIndexExprs {
+    pub fn new(index: &Index, internal_id: TableInternalId) -> Self {
+        Self {
+            columns: index
+                .columns
+                .iter()
+                .map(|column| column.expr.as_deref().map(|expr| rebase(expr, internal_id)))
+                .collect(),
+            where_clause: index
+                .where_clause
+                .as_deref()
+                .map(|expr| rebase(expr, internal_id)),
+            patterns: index
+                .index_method
+                .as_ref()
+                .map(|method| {
+                    method
+                        .definition()
+                        .patterns
+                        .iter()
+                        .map(|pattern| crate::index_method::bind_pattern(pattern, internal_id))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn rebase(expr: &ast::Expr, internal_id: TableInternalId) -> ast::Expr {
+    let mut bound = expr.clone();
+    rebase_schema_expr(&mut bound, internal_id);
+    bound
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -2022,14 +2126,13 @@ impl TableReferences {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
             return;
         };
-        let Some(table_ref) = self
+        if !self
             .joined_tables()
             .iter()
-            .find(|t| t.internal_id == table_id)
-        else {
+            .any(|t| t.internal_id == table_id)
+        {
             return;
-        };
-        let normalized = normalize_expr_for_index_matching(expr, table_ref);
+        }
         let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
@@ -2037,7 +2140,7 @@ impl TableReferences {
             .find(|t| t.internal_id == table_id)
         {
             table_ref_mut.register_expression_index_usage(
-                normalized,
+                expr.clone(),
                 columns_mask,
                 may_be_null_row,
             );
@@ -2757,9 +2860,8 @@ impl<T> TryFrom<u128> for BitSet<T> {
 
 #[derive(Clone, Debug)]
 pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
-    /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    /// The bound query expression. Example: `lower(name)` for INDEX ON t(lower(name)).
+    pub expr: Box<ast::Expr>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -3175,6 +3277,7 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::default(),
         })
     }
 
@@ -3224,6 +3327,7 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::default(),
         })
     }
 
@@ -3258,6 +3362,7 @@ impl JoinedTable {
             database_id: MAIN_DB_ID,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::default(),
         })
     }
 
@@ -3308,7 +3413,7 @@ impl JoinedTable {
     /// covered by expression keys.
     pub fn register_expression_index_usage(
         &mut self,
-        normalized_expr: ast::Expr,
+        expr: ast::Expr,
         columns_mask: ColumnUsedMask,
         may_be_null_row: bool,
     ) {
@@ -3318,15 +3423,55 @@ impl JoinedTable {
         if self
             .expression_index_usages
             .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+            .any(|usage| exprs_are_equivalent(&usage.expr, &expr))
         {
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
-            normalized_expr: Box::new(normalized_expr),
+            expr: Box::new(expr),
             columns_mask,
             may_be_null_row,
         });
+    }
+
+    /// A copy of this reference with no access path, for expressions that
+    /// are evaluated against a row image in registers instead of a cursor.
+    /// Such an expression must not read its value from an index key.
+    pub fn without_access_path(&self) -> JoinedTable {
+        let mut table = self.clone();
+        table.op = Operation::default_scan_for(&table.table);
+        table.expression_index_usages.clear();
+        table
+    }
+
+    /// The expressions of `index`, bound to this reference. None for an index
+    /// that is not in the schema, such as an automatic index built for this
+    /// statement.
+    pub fn index_exprs(&self, index: &Index) -> Option<&BoundIndexExprs> {
+        self.schema_exprs.indexes.get(&index.name)
+    }
+
+    /// The key expression of index column `position`, bound to this reference.
+    pub fn index_column_expr(&self, index: &Index, position: usize) -> Option<&ast::Expr> {
+        self.index_exprs(index)?.columns.get(position)?.as_ref()
+    }
+
+    /// The predicate of a partial index, bound to this reference. An index
+    /// built for this statement keeps its own, already bound, predicate.
+    pub fn index_where_expr<'a>(&'a self, index: &'a Index) -> Option<&'a ast::Expr> {
+        match self.index_exprs(index) {
+            Some(bound) => bound.where_clause.as_ref(),
+            None => index.where_clause.as_deref(),
+        }
+    }
+
+    /// The position of the index column whose key expression is `expr`, a
+    /// bound query expression.
+    pub fn expression_index_position(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
+        self.index_exprs(index)?.columns.iter().position(|key| {
+            key.as_ref()
+                .is_some_and(|key| exprs_are_equivalent(key, expr))
+        })
     }
 
     /// Provided an index that may contain expression keys, remove any
@@ -3346,16 +3491,12 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
+            let matches_where_clause = self
+                .index_where_expr(index)
+                .is_some_and(|where_clause| exprs_are_equivalent(where_clause, &usage.expr));
 
             let index_key_covers_columns = !usage.may_be_null_row
-                && index
-                    .expression_to_index_pos(&usage.normalized_expr)
-                    .is_some();
+                && self.expression_index_position(index, &usage.expr).is_some();
             if index_key_covers_columns || matches_where_clause {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {

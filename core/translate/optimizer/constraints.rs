@@ -2,14 +2,13 @@ use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
-    schema::{rebase_schema_expr, Column, Index, Schema},
+    schema::{Column, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
             WalkControl,
         },
-        expression_index::normalize_expr_for_index_matching,
         plan::{
             is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
             NonFromClauseSubquery, Plan, SubqueryState, TableReferences, WhereTerm,
@@ -1276,10 +1275,10 @@ pub fn constraints_from_where_clause(
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
-                    None => constraint.expr.as_ref().and_then(|e| {
-                        let normalized = normalize_expr_for_index_matching(e, table_reference);
-                        index.expression_to_index_pos(&normalized)
-                    }),
+                    None => constraint
+                        .expr
+                        .as_ref()
+                        .and_then(|e| table_reference.expression_index_position(index, e)),
                 } {
                     turso_assert!(
                         constraint.usable,
@@ -1704,9 +1703,8 @@ pub(super) fn partial_index_predicate_terms(
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
 ) -> Option<SmallVec<[usize; 4]>> {
-    let index_where = index
-        .where_clause
-        .as_ref()
+    let index_where = table_reference
+        .index_where_expr(index)
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
@@ -1721,12 +1719,11 @@ pub(super) fn partial_index_predicate_terms(
         }
         true
     };
-    // Point the index WHERE expression's column references at this query's
-    // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must be implied by some
-    // query WHERE term for the partial index to be safe to use.
-    let mut bound = (**index_where).clone();
-    rebase_schema_expr(&mut bound, table_reference.internal_id);
+    // The index WHERE expression is bound to this query's table reference, so
+    // it compares symmetrically against the bound query WHERE terms. Each
+    // conjunct of the index WHERE must be implied by some query WHERE term for
+    // the partial index to be safe to use.
+    let mut bound = index_where.clone();
     rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
@@ -1767,19 +1764,26 @@ pub(super) fn can_use_partial_index(
 
 /// Estimate the selectivity of a partial index's WHERE clause, i.e. what
 /// fraction of the table's rows pass the predicate (and therefore appear in
-/// the partial index). The expression is bound to the table's column space
-/// first so that leaf comparisons can dispatch through the standard
-/// `estimate_selectivity` path — picking up ANALYZE stats when available.
+/// the partial index). The predicate is bound to the table reference, so leaf
+/// comparisons dispatch through the standard `estimate_selectivity` path —
+/// picking up ANALYZE stats when available.
 pub fn estimate_partial_index_where_selectivity(
-    where_expr: &ast::Expr,
+    index: &Index,
     table_reference: &JoinedTable,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
-    let mut bound = where_expr.clone();
-    rebase_schema_expr(&mut bound, table_reference.internal_id);
-    estimate_bound_expr_selectivity(&bound, table_reference, schema, available_indexes, params)
+    let Some(where_expr) = table_reference.index_where_expr(index) else {
+        return 1.0;
+    };
+    estimate_bound_expr_selectivity(
+        where_expr,
+        table_reference,
+        schema,
+        available_indexes,
+        params,
+    )
 }
 
 fn estimate_bound_expr_selectivity(

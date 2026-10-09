@@ -615,14 +615,15 @@ fn emit_delete_insns<'a>(
             program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+        for reg_offset in 0..index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
                 table_references,
                 main_table_cursor_id,
-                internal_id,
-                column_index,
+                unsafe { &*table_reference },
+                index,
+                reg_offset,
                 start_reg + reg_offset,
             )?;
         }
@@ -648,7 +649,6 @@ fn emit_delete_insns<'a>(
         main_table_cursor_id,
         iteration_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
-        resolver,
         returning_buffer,
     )?;
 
@@ -686,7 +686,6 @@ fn emit_delete_row_common(
     main_table_cursor_id: usize,
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
     virtual_table_cursor_id: Option<usize>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
@@ -770,8 +769,9 @@ fn emit_delete_row_common(
 
         for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
-                let where_copy = index
-                    .bind_where_expr(table_references, resolver)?
+                let where_copy = table_references
+                    .find_joined_table_by_internal_id(internal_id)
+                    .and_then(|table| table.index_where_expr(&index).cloned())
                     .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
@@ -794,14 +794,15 @@ fn emit_delete_row_common(
             };
             let num_regs = index.columns.len() + 1;
             let start_reg = program.alloc_registers(num_regs);
-            for (reg_offset, column_index) in index.columns.iter().enumerate() {
+            for reg_offset in 0..index.columns.len() {
                 emit_index_column_value_old_image(
                     program,
                     &t_ctx.resolver,
                     table_references,
                     main_table_cursor_id,
-                    internal_id,
-                    column_index,
+                    unsafe { &*table_reference },
+                    &index,
+                    reg_offset,
                     start_reg + reg_offset,
                 )?;
             }
@@ -1052,7 +1053,6 @@ fn emit_delete_insns_when_triggers_present(
         main_table_cursor_id,
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
-        resolver,
         returning_buffer,
     )?;
 

@@ -181,6 +181,7 @@ pub fn emit_program_for_update(
                 database_id: MAIN_DB_ID,
                 indexed: None,
                 plan_estimate: None,
+                schema_exprs: Default::default(),
             }],
             vec![],
         );
@@ -454,7 +455,6 @@ pub fn emit_program_for_update(
         &all_index_cursors,
         target_table_cursor_id,
         target_table,
-        resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
     )?;
@@ -681,7 +681,6 @@ fn emit_replace_delete<'a>(
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
     let table_name = target_table.table.get_name();
-    let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
             s.any_resolved_fks_referencing(table_name)
@@ -724,14 +723,15 @@ fn emit_replace_delete<'a>(
         let other_num_regs = other_index.columns.len() + 1;
         let other_start_reg = program.alloc_registers(other_num_regs);
 
-        for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+        for reg_offset in 0..other_index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
                 table_references,
                 target_table_cursor_id,
-                internal_id,
-                column_index,
+                target_table,
+                other_index,
+                reg_offset,
                 other_start_reg + reg_offset,
             )?;
         }
@@ -1075,7 +1075,6 @@ fn emit_update_insns<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
@@ -1762,7 +1761,7 @@ fn emit_update_insns<'a>(
                 .collect();
 
             let check_constraint_tables =
-                TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
+                TableReferences::new(vec![target_table.without_access_path()], vec![]);
             emit_check_constraints(
                 program,
                 &relevant_checks,
@@ -1814,13 +1813,17 @@ fn emit_update_insns<'a>(
     let mut idx_phase_ctxs: Vec<IndexUpdatePhaseCtx> = Vec::with_capacity(indexes_to_update.len());
 
     // ---- Phase 1: Constraint checks + new key build ----
+    // The index expressions of the target table are evaluated against the
+    // new row image with the target table as the only table in scope.
+    let index_expr_tables = TableReferences::new(vec![target_table.without_access_path()], vec![]);
     let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
-            // This means that we need to bind the column references to a copy of the index Expr,
-            // so we can emit Insn::Column instructions and refer to the old values.
-            let where_clause = index
-                .bind_where_expr(table_references, resolver)?
+            // The predicate is bound to the target table reference, so it reads the
+            // old values through the table cursor.
+            let where_clause = target_table
+                .index_where_expr(index)
+                .cloned()
                 .expect("index.where_clause was checked to be Some above");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
@@ -1833,15 +1836,6 @@ fn emit_update_insns<'a>(
             )?;
 
             // Evaluate the partial index predicate against the NEW row image.
-            // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
-            // allowing resolve_union_from_column to find type definitions for custom type
-            // functions like union_tag() in the WHERE clause.
-            let new_where_expr = index
-                .where_clause
-                .as_ref()
-                .expect("checked where clause to exist")
-                .as_ref()
-                .clone();
             let columns = target_table.table.columns();
             let mut column_regs: Vec<usize> = columns
                 .iter()
@@ -1858,8 +1852,10 @@ fn emit_update_insns<'a>(
             let bt = target_table.table.require_btree()?;
             emit_dml_expr_index_value(
                 program,
-                &t_ctx.resolver,
-                new_where_expr,
+                &mut t_ctx.resolver,
+                &index_expr_tables,
+                target_table.internal_id,
+                &where_clause,
                 columns,
                 &mut column_regs,
                 effective_rowid_reg,
@@ -1880,14 +1876,17 @@ fn emit_update_insns<'a>(
         let idx_start_reg = program.alloc_registers(num_cols + 1);
         let rowid_reg = effective_rowid_reg;
 
-        for (i, col) in index.columns.iter().enumerate() {
+        for i in 0..index.columns.len() {
             emit_index_column_value_new_image(
                 program,
-                &t_ctx.resolver,
+                &mut t_ctx.resolver,
+                &index_expr_tables,
+                target_table.as_ref(),
                 target_table.table.columns(),
                 start,
                 rowid_reg,
-                col,
+                index,
+                i,
                 idx_start_reg + i,
                 &layout,
                 &target_table
@@ -2223,14 +2222,15 @@ fn emit_update_insns<'a>(
 
         let num_regs = index.columns.len() + 1;
         let delete_start_reg = program.alloc_registers(num_regs);
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+        for reg_offset in 0..index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
                 table_references,
                 target_table_cursor_id,
-                internal_id,
-                column_index,
+                target_table.as_ref(),
+                index,
+                reg_offset,
                 delete_start_reg + reg_offset,
             )?;
         }

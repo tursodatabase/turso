@@ -1,4 +1,4 @@
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 use crate::{schema::Index, sync::Arc, Result};
 use turso_parser::ast;
@@ -14,47 +14,8 @@ pub fn selected_expression_index<'a>(
     let (table_id, _) = single_table_column_usage(expr)?;
     let table = table_references.find_joined_table_by_internal_id(table_id)?;
     let index = table.op.index()?;
-    let normalized = normalize_expr_for_index_matching(expr, table);
-    let expression_position = index.expression_to_index_pos(&normalized)?;
+    let expression_position = table.expression_index_position(index, expr)?;
     Some((table, index, expression_position))
-}
-
-/// Normalize a query expression so it can be compared with an
-/// expression stored on an index definition.
-///
-/// Index definitions store their expressions with the column references of
-/// the indexed table resolved to `Expr::Column { table: SELF_TABLE }`. The
-/// query expression is bound to the table reference of this statement, so
-/// its references to that table are rewritten to the same stored form:
-///
-/// - `CREATE INDEX idx ON t(a + b)` stores `Column(SELF_TABLE, 0) + Column(SELF_TABLE, 1)`
-/// - `SELECT * FROM t WHERE a + b = 10` binds `Column(t, 0) + Column(t, 1)`
-///
-/// After normalization, both sides are equal, allowing an equality check to
-/// spot the match.
-pub fn normalize_expr_for_index_matching(
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-) -> ast::Expr {
-    let mut expr = expr.clone();
-    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Column {
-                database, table, ..
-            } if *table == table_reference.internal_id => {
-                *database = None;
-                *table = TableInternalId::SELF_TABLE;
-            }
-            ast::Expr::RowId { database, table } if *table == table_reference.internal_id => {
-                *database = None;
-                *table = TableInternalId::SELF_TABLE;
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    };
-    let _ = walk_expr_mut(&mut expr, &mut normalize);
-    expr
 }
 
 /// Determine whether an expression references columns from exactly one table

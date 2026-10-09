@@ -1,3 +1,5 @@
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::plan::JoinedTable;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -7,10 +9,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{
-    resolve_schema_expr_columns, BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL,
-    ROWID_SENTINEL,
-};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -261,22 +260,49 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
     });
 }
 
-/// Resolve the column names of an ON CONFLICT target expression the same way
-/// the schema resolves the stored index expressions it is compared with.
-fn bind_conflict_target_expr(expr: &mut ast::Expr, table: &Table) {
-    if let Some(btree) = table.btree() {
-        resolve_schema_expr_columns(expr, &btree);
-    }
+/// The expressions of an ON CONFLICT target, bound to the target table
+/// reference like the index expressions they are compared with.
+struct BoundConflictTarget {
+    /// One entry per target: the bound expression of an expression target,
+    /// None for a column target.
+    targets: Vec<Option<ast::Expr>>,
+    where_clause: Option<ast::Expr>,
 }
 
-fn partial_index_where_clauses_match(
-    target_where: &ast::Expr,
-    index_where: &ast::Expr,
-    table: &Table,
-) -> bool {
-    let mut target_where = target_where.clone();
-    bind_conflict_target_expr(&mut target_where, table);
-    exprs_are_equivalent(&target_where, index_where)
+fn bind_conflict_target(
+    target: &ast::UpsertIndex,
+    target_table: &JoinedTable,
+    resolver: &Resolver,
+) -> crate::Result<BoundConflictTarget> {
+    let mut scope = TableReferences::new(vec![target_table.clone()], vec![]);
+    let mut bind = |expr: &ast::Expr| -> crate::Result<ast::Expr> {
+        let mut bound = expr.clone();
+        bind_and_rewrite_expr(
+            &mut bound,
+            Some(&mut scope),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        Ok(bound)
+    };
+    let mut targets = Vec::with_capacity(target.targets.len());
+    for te in &target.targets {
+        if extract_conflict_target(&te.expr).is_some() {
+            targets.push(None);
+        } else {
+            let (expr, _) = extract_target_expr(&te.expr);
+            targets.push(Some(bind(expr)?));
+        }
+    }
+    let where_clause = match &target.where_clause {
+        Some(where_clause) => Some(bind(where_clause)?),
+        None => None,
+    };
+    Ok(BoundConflictTarget {
+        targets,
+        where_clause,
+    })
 }
 
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
@@ -284,18 +310,25 @@ fn partial_index_where_clauses_match(
 /// column, the collation must match the index column's effective collation.
 /// If the target omits collation, any index collation is accepted.
 /// Partial indexes require a matching conflict-target WHERE clause.
-pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bool {
+fn upsert_matches_index(
+    upsert: &Upsert,
+    bound: &BoundConflictTarget,
+    index: &Index,
+    table: &Table,
+    target_table: &JoinedTable,
+) -> bool {
     let Some(target) = upsert.index.as_ref() else {
         return true;
     };
 
-    let partial_index_predicate_matches = match (&index.where_clause, &target.where_clause) {
-        (Some(index_where), Some(target_where)) => {
-            partial_index_where_clauses_match(target_where.as_ref(), index_where.as_ref(), table)
-        }
-        (Some(_), None) => false,
-        (None, _) => true,
-    };
+    let partial_index_predicate_matches =
+        match (target_table.index_where_expr(index), &bound.where_clause) {
+            (Some(index_where), Some(target_where)) => {
+                exprs_are_equivalent(target_where, index_where)
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
 
     if !index.unique
         || !partial_index_predicate_matches
@@ -307,7 +340,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
     // Track which index columns have been matched (consumed).
     let mut matched = ColumnMask::default();
 
-    for te in &target.targets {
+    for (target_position, te) in target.targets.iter().enumerate() {
         let mut found = None;
 
         if let Some(conflict_target) = extract_conflict_target(&te.expr) {
@@ -332,15 +365,16 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         } else {
             // Expression target (e.g. lower(val)): match against expression index
             // columns using semantic equivalence.
-            let (target_expr, target_collate) = extract_target_expr(&te.expr);
-            let mut target_expr = target_expr.clone();
-            bind_conflict_target_expr(&mut target_expr, table);
+            let (_, target_collate) = extract_target_expr(&te.expr);
+            let target_expr = bound.targets[target_position]
+                .as_ref()
+                .expect("an expression target is bound");
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
                     continue;
                 }
-                if let Some(idx_expr) = &ic.expr {
-                    if exprs_are_equivalent(&target_expr, idx_expr) {
+                if let Some(idx_expr) = target_table.index_column_expr(index, i) {
+                    if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
                             let icoll = effective_collation_for_index_col(ic, table);
@@ -379,6 +413,8 @@ pub fn resolve_upsert_target(
     schema: &Schema,
     table: &Table,
     upsert: &Upsert,
+    target_table: &JoinedTable,
+    resolver: &Resolver,
 ) -> crate::Result<ResolvedUpsertTarget> {
     // Omitted target, catch-all
     let Some(target) = upsert.index.as_ref() else {
@@ -394,8 +430,9 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
+    let bound = bind_conflict_target(target, target_table, resolver)?;
     for idx in schema.get_indices(table.get_name()) {
-        if idx.unique && upsert_matches_index(upsert, idx, table) {
+        if idx.unique && upsert_matches_index(upsert, &bound, idx, table, target_table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
     }
@@ -1062,6 +1099,7 @@ pub fn emit_upsert(
 
             let before_pred_reg = eval_partial_pred_for_row_image(
                 program,
+                table_references,
                 table,
                 &idx_meta,
                 before,
@@ -1070,7 +1108,14 @@ pub fn emit_upsert(
                 &layout,
             );
             let new_pred_reg = eval_partial_pred_for_row_image(
-                program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
+                program,
+                table_references,
+                table,
+                &idx_meta,
+                new_start,
+                new_rowid,
+                resolver,
+                &layout,
             );
 
             // Skip key computation and probe if NEW predicate false/NULL:
@@ -1093,8 +1138,10 @@ pub fn emit_upsert(
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
+                        table_references,
                         table,
-                        ic,
+                        &idx_meta,
+                        i,
                         new_start,
                         new_rowid,
                         ins + i,
@@ -1215,8 +1262,10 @@ pub fn emit_upsert(
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
+                        table_references,
                         table,
-                        ic,
+                        &pending.idx_meta,
+                        i,
                         before,
                         ctx.conflict_rowid_reg,
                         del + i,
@@ -1594,19 +1643,19 @@ pub fn collect_set_clauses_for_upsert(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_partial_pred_for_row_image(
     prg: &mut ProgramBuilder,
+    table_references: &TableReferences,
     table: &Table,
     idx: &Index,
     row_start: usize, // base of CURRENT or NEW image
     rowid_reg: usize, // rowid for that image
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     layout: &ColumnLayout,
 ) -> Option<usize> {
-    let Some(where_expr) = &idx.where_clause else {
-        return None;
-    };
-    let expr = where_expr.as_ref().clone();
+    let target = table_references.joined_tables().first()?;
+    let expr = target.index_where_expr(idx)?.clone();
     let columns = table.columns();
     let bt = table.require_btree().ok()?;
 
@@ -1626,7 +1675,9 @@ fn eval_partial_pred_for_row_image(
     crate::translate::expr::emit_dml_expr_index_value(
         prg,
         resolver,
-        expr,
+        table_references,
+        target.internal_id,
+        &expr,
         columns,
         &mut column_regs,
         rowid_reg,
@@ -1640,16 +1691,24 @@ fn eval_partial_pred_for_row_image(
 #[allow(clippy::too_many_arguments)]
 fn emit_upsert_expr_index_value(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
     table: &Table,
-    idx_col: &IndexColumn,
+    index: &Index,
+    position: usize,
     row_start: usize,
     rowid_reg: usize,
     dest_reg: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
-    let expr = expr.as_ref().clone();
+    let target = table_references
+        .joined_tables()
+        .first()
+        .expect("an UPSERT has one target table");
+    let expr = target
+        .index_column_expr(index, position)
+        .cloned()
+        .expect("caller checked that the index column is an expression");
     let columns = table.columns();
     let bt = table.require_btree()?;
 
@@ -1667,7 +1726,9 @@ fn emit_upsert_expr_index_value(
     crate::translate::expr::emit_dml_expr_index_value(
         program,
         resolver,
-        expr,
+        table_references,
+        target.internal_id,
+        &expr,
         columns,
         &mut column_regs,
         rowid_reg,

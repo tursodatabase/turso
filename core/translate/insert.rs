@@ -1,10 +1,11 @@
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
+use crate::translate::plan::BoundSchemaExprs;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, ColDefFlags, Column, Index, ResolvedFkRef, Table,
         EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
@@ -311,6 +312,31 @@ pub fn translate_insert(
         );
     };
 
+    let target_table_id = program.table_reference_counter.next();
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(btree_table.clone()),
+            identifier: normalize_ident(table_name.as_str()),
+            internal_id: target_table_id,
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+            plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::from_schema(
+                resolver,
+                database_id,
+                &table,
+                target_table_id,
+            ),
+        }],
+        vec![],
+    );
+
     let BoundInsertResult {
         mut values,
         mut upsert_actions,
@@ -319,6 +345,7 @@ pub fn translate_insert(
         program,
         resolver,
         &table,
+        &table_references,
         &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
@@ -336,27 +363,6 @@ pub fn translate_insert(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: Table::BTree(
-                table
-                    .btree()
-                    .expect("we shouldn't have got here without a BTree table"),
-            ),
-            identifier: normalize_ident(table_name.as_str()),
-            internal_id: program.table_reference_counter.next(),
-            op: Operation::default_scan_for(&table),
-            unmatched_right_rows_plan: None,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id,
-            indexed: None,
-            plan_estimate: None,
-        }],
-        vec![],
-    );
     let excluded_table_id = program.table_reference_counter.next();
     bind_upsert_actions(
         &mut upsert_actions,
@@ -978,7 +984,14 @@ pub fn translate_insert(
     let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
     let skip_replace_indexes = has_ddl_replace && !statement_replace;
     if has_upsert || !statement_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
+        emit_commit_phase(
+            program,
+            resolver,
+            &table_references,
+            &insertion,
+            &ctx,
+            skip_replace_indexes,
+        )?;
     }
 
     resolver.register_affinities.clear();
@@ -1349,15 +1362,16 @@ fn emit_epilogue(
 /// or None if there was no WHERE clause.
 fn emit_partial_index_check(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
     index: &Index,
     insertion: &Insertion,
     table: &Arc<BTreeTable>,
 ) -> Result<Option<BranchOffset>> {
-    let Some(where_clause) = &index.where_clause else {
+    let target = &table_references.joined_tables()[0];
+    let Some(expr) = target.index_where_expr(index).cloned() else {
         return Ok(None);
     };
-    let expr = where_clause.as_ref().clone();
     let columns: Vec<Column> = insertion
         .col_mappings
         .iter()
@@ -1378,7 +1392,9 @@ fn emit_partial_index_check(
     crate::translate::expr::emit_dml_expr_index_value(
         program,
         resolver,
-        expr,
+        table_references,
+        target.internal_id,
+        &expr,
         &columns,
         &mut column_regs,
         insertion.key_register(),
@@ -1400,7 +1416,8 @@ fn emit_partial_index_check(
 // already guaranteed non-conflict.
 fn emit_commit_phase(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
     skip_replace_indexes: bool,
@@ -1423,20 +1440,28 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label =
-            emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
+        let commit_skip_label = emit_partial_index_check(
+            program,
+            resolver,
+            table_references,
+            index,
+            insertion,
+            ctx.table,
+        )?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
 
         // Build [key cols..., rowid] from insertion registers
-        for (i, idx_col) in index.columns.iter().enumerate() {
+        for i in 0..index.columns.len() {
             emit_index_column_value_for_insert(
                 program,
                 resolver,
+                table_references,
                 insertion,
                 ctx.table,
-                idx_col,
+                index,
+                i,
                 idx_start_reg + i,
             )?;
         }
@@ -2005,11 +2030,13 @@ fn resolve_defaults_in_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table: &Table,
+    table_references: &TableReferences,
     columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
@@ -2125,7 +2152,13 @@ fn bind_insert(
         upsert_actions.push((
             // resolve the constrained target for UPSERT in the chain
             resolver.with_schema(database_id, |s| {
-                resolve_upsert_target(s, table, &upsert_opt)
+                resolve_upsert_target(
+                    s,
+                    table,
+                    &upsert_opt,
+                    &table_references.joined_tables()[0],
+                    resolver,
+                )
             })?,
             program.allocate_label(),
             upsert_opt,
@@ -3089,8 +3122,14 @@ fn emit_index_uniqueness_check(
         .expect("no cursor found for index");
 
     // For partial indexes, evaluate the WHERE clause and skip if false
-    let maybe_skip_probe_label =
-        emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
+    let maybe_skip_probe_label = emit_partial_index_check(
+        program,
+        resolver,
+        preflight.table_references,
+        index,
+        insertion,
+        ctx.table,
+    )?;
 
     let num_cols = index.columns.len();
     // allocate scratch registers for the index columns plus rowid
@@ -3098,13 +3137,15 @@ fn emit_index_uniqueness_check(
 
     // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
     // copy each index column from the table's column registers into these scratch regs
-    for (i, idx_col) in index.columns.iter().enumerate() {
+    for i in 0..index.columns.len() {
         emit_index_column_value_for_insert(
             program,
             resolver,
+            preflight.table_references,
             insertion,
             ctx.table,
-            idx_col,
+            index,
+            i,
             idx_start_reg + i,
         )?;
     }
@@ -3616,16 +3657,24 @@ pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
     insertion: &Insertion,
     table: &Arc<BTreeTable>,
-    idx_col: &IndexColumn,
+    index: &Index,
+    position: usize,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    let idx_col = &index.columns[position];
+    if idx_col.expr.is_some() {
+        let target = &table_references.joined_tables()[0];
+        let expr = target
+            .index_column_expr(index, position)
+            .cloned()
+            .expect("the table reference holds the expressions of its indexes");
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
@@ -3645,7 +3694,9 @@ fn emit_index_column_value_for_insert(
         crate::translate::expr::emit_dml_expr_index_value(
             program,
             resolver,
-            expr,
+            table_references,
+            target.internal_id,
+            &expr,
             &columns,
             &mut column_regs,
             insertion.key_register(),
@@ -3924,8 +3975,9 @@ fn emit_replace_delete_conflicting_row(
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
-            let where_copy = index
-                .bind_where_expr(table_references, resolver)?
+            let where_copy = table_references.joined_tables()[0]
+                .index_where_expr(&index)
+                .cloned()
                 .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
@@ -3950,15 +4002,15 @@ fn emit_replace_delete_conflicting_row(
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
 
-        let table_internal_id = table_references.joined_tables()[0].internal_id;
-        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+        for reg_offset in 0..index.columns.len() {
             emit_index_column_value_old_image(
                 program,
                 resolver,
                 table_references,
                 main_cursor_id,
-                table_internal_id,
-                column_index,
+                &table_references.joined_tables()[0],
+                &index,
+                reg_offset,
                 start_reg + reg_offset,
             )?;
         }

@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -319,36 +320,27 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
+/// Evaluate an index expression or a partial-index predicate of the DML
+/// target table against the row image in `column_regs` and `rowid_reg`
+/// (INSERT/UPDATE/UPSERT).
 ///
-/// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
-///
-/// The caller must:
-/// 1. Clone the expression from `idx_col.expr`
-/// 2. Build the initial `column_regs` mapping (before decode)
-///
-/// The expression keeps its stored `SELF_TABLE` positions, which read the
-/// registers in `column_regs` and `rowid_reg`. Custom-type columns are decoded
-/// in-place in `column_regs`.
+/// `expr` is bound to the table reference `table_internal_id`. Custom-type
+/// columns are decoded in place in `column_regs` first, so the expression
+/// sees user-facing values. The registers are then mapped to the column
+/// references of the table through the expression register cache.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    mut expr: ast::Expr,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    table_internal_id: ast::TableInternalId,
+    expr: &ast::Expr,
     columns: &[Column],
     column_regs: &mut [usize],
     rowid_reg: usize,
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
-    crate::schema::bind_schema_expr_in_place(
-        &mut expr,
-        ast::TableInternalId::SELF_TABLE,
-        resolver,
-    )?;
-
     let is_strict = table.is_strict;
     for (i, col) in columns.iter().enumerate() {
         if col.is_rowid_alias() {
@@ -364,15 +356,35 @@ pub(crate) fn emit_dml_expr_index_value(
         }
     }
 
-    let pairs = columns.iter().zip(column_regs.iter().copied());
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, rowid_reg),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
-        Ok(())
-    })?;
+    let cache_len = resolver.expr_to_reg_cache.len();
+    let cache_enabled = resolver.expr_to_reg_cache_enabled;
+    resolver.cache_expr_reg(
+        Cow::Owned(ast::Expr::RowId {
+            database: None,
+            table: table_internal_id,
+        }),
+        rowid_reg,
+        false,
+        None,
+    );
+    for (i, col) in columns.iter().enumerate() {
+        resolver.cache_expr_reg(
+            Cow::Owned(ast::Expr::Column {
+                database: None,
+                table: table_internal_id,
+                column: i,
+                is_rowid_alias: col.is_rowid_alias(),
+            }),
+            column_regs[i],
+            false,
+            Some((col.collation(), false)),
+        );
+    }
+    resolver.enable_expr_to_reg_cache();
+    let result = translate_expr(program, Some(table_references), expr, dest_reg, resolver);
+    resolver.expr_to_reg_cache.truncate(cache_len);
+    resolver.expr_to_reg_cache_enabled = cache_enabled;
+    result?;
     Ok(())
 }
 

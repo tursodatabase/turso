@@ -16,7 +16,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -104,7 +104,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -4402,56 +4402,6 @@ pub fn rebase_schema_expr(expr: &mut Expr, internal_id: TableInternalId) {
     });
 }
 
-/// Copy a stored schema expression for one table reference of a statement.
-/// A name that schema load could not resolve is handled like an unknown
-/// column in a query: it becomes a string when double-quoted strings are
-/// enabled, otherwise it is an error.
-pub fn bind_schema_expr(
-    expr: &Expr,
-    internal_id: TableInternalId,
-    resolver: &Resolver,
-) -> Result<Expr> {
-    let mut bound = expr.clone();
-    bind_schema_expr_in_place(&mut bound, internal_id, resolver)?;
-    Ok(bound)
-}
-
-/// Same as [bind_schema_expr], on an expression the caller already owns.
-pub fn bind_schema_expr_in_place(
-    expr: &mut Expr,
-    internal_id: TableInternalId,
-    resolver: &Resolver,
-) -> Result<()> {
-    walk_expr_mut(expr, &mut |e| {
-        match e {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } if table.is_self_table() => {
-                *table = internal_id;
-            }
-            Expr::Id(name) | Expr::Name(name) => {
-                if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
-                    *e = Expr::Literal(ast::Literal::String(name.as_literal()));
-                } else {
-                    bail_parse_error!("no such column: {}", name.as_str());
-                }
-            }
-            Expr::Qualified(namespace, name) => {
-                bail_parse_error!("no such column: {}.{}", namespace.as_str(), name.as_str());
-            }
-            Expr::DoublyQualified(database, namespace, name) => {
-                bail_parse_error!(
-                    "no such column: {}.{}.{}",
-                    database.as_str(),
-                    namespace.as_str(),
-                    name.as_str()
-                );
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
 /// True when a stored schema expression reads the table column at `column_index`.
 pub fn schema_expr_references_column(expr: &Expr, column_index: usize) -> bool {
     let mut found = false;
@@ -6323,17 +6273,6 @@ impl Index {
             .position(|c| c.pos_in_table == table_pos && c.expr.is_none())
     }
 
-    /// Given an expression, return the position in the index if it matches an expression index column.
-    /// Expression index matching is textual (after binding), so the caller should normalize the query
-    /// expression to resemble the stored index expression (e.g. unqualified column names).
-    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
-        self.columns.iter().position(|c| {
-            c.expr
-                .as_ref()
-                .is_some_and(|e| exprs_are_equivalent(e, expr))
-        })
-    }
-
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
     pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
@@ -6417,52 +6356,6 @@ impl Index {
             })
         });
         ok
-    }
-
-    /// Copy this index's WHERE clause for the statement's reference to the
-    /// indexed table.
-    ///
-    /// Returns `Ok(None)` when the index has no WHERE clause. Errors are
-    /// propagated, never swallowed: callers must not treat `None` as a failure.
-    pub fn bind_where_expr(
-        &self,
-        table_refs: &TableReferences,
-        resolver: &Resolver,
-    ) -> crate::Result<Option<ast::Expr>> {
-        let Some(where_clause) = &self.where_clause else {
-            return Ok(None);
-        };
-        // Only a real b-tree table can be the DML target that owns this index.
-        // A CTE or subquery sharing the table's name (e.g. `WITH t AS ...
-        // UPDATE t ...`) must not be picked, so match on b-tree identity.
-        let mut matches = table_refs
-            .joined_tables()
-            .iter()
-            .map(|jt| (jt.internal_id, &jt.table))
-            .chain(
-                table_refs
-                    .outer_query_refs()
-                    .iter()
-                    .map(|r| (r.internal_id, &r.table)),
-            )
-            .filter(|(_, table)| {
-                table
-                    .btree()
-                    .is_some_and(|bt| normalize_ident(&bt.name) == self.table_name)
-            })
-            .map(|(internal_id, _)| internal_id);
-        let Some(internal_id) = matches.next() else {
-            return Err(LimboError::InternalError(format!(
-                "no table reference matches the table of partial index {}",
-                self.name
-            )));
-        };
-        assert!(
-            matches.next().is_none(),
-            "multiple table references match the table of partial index {}",
-            self.name
-        );
-        Ok(Some(bind_schema_expr(where_clause, internal_id, resolver)?))
     }
 }
 
@@ -7384,6 +7277,49 @@ mod tests {
             .as_deref()
             .expect("partial index predicate");
         assert_eq!(stored_expr_leaves(predicate), (vec![1], 1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn bound_schema_exprs_point_at_the_table_reference() -> Result<()> {
+        use crate::translate::plan::BoundSchemaExprs;
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 0 AND b < rowid))",
+            2,
+        )?;
+        let index = Index::from_sql(
+            &SymbolTable::default(),
+            "CREATE INDEX i ON t (a + b, b) WHERE b > rowid",
+            3,
+            &table,
+        )?;
+        let reference = TableInternalId::from(7);
+        let bound = BoundSchemaExprs::new(
+            &Table::BTree(Arc::new(table)),
+            std::iter::once(&index),
+            reference,
+        );
+        let leaves_of = |expr: &Expr| {
+            let mut tables = Vec::new();
+            let _ = walk_expr(expr, &mut |e| {
+                if let Expr::Column { table, .. } | Expr::RowId { table, .. } = e {
+                    tables.push(*table);
+                }
+                Ok(WalkControl::Continue)
+            });
+            tables
+        };
+        assert_eq!(leaves_of(&bound.checks[0]), vec![reference; 3]);
+        let index_exprs = &bound.indexes["i"];
+        assert_eq!(
+            leaves_of(index_exprs.columns[0].as_ref().expect("key expression")),
+            vec![reference; 2]
+        );
+        assert!(index_exprs.columns[1].is_none());
+        assert_eq!(
+            leaves_of(index_exprs.where_clause.as_ref().expect("predicate")),
+            vec![reference; 2]
+        );
         Ok(())
     }
 

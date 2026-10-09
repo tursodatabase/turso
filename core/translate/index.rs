@@ -6,10 +6,11 @@ use crate::index_method::{
 };
 use crate::numeric::Numeric;
 use crate::schema::{
-    bind_schema_expr, resolve_schema_expr_columns, Column, GeneratedType, Table,
-    EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+    resolve_schema_expr_columns, Column, GeneratedType, Table, EXPR_INDEX_SENTINEL,
+    RESERVED_TABLE_PREFIXES,
 };
 use crate::sync::Arc;
+use crate::translate::plan::BoundSchemaExprs;
 use crate::translate::{
     collate::CollationSeq,
     emitter::{
@@ -23,7 +24,7 @@ use crate::translate::{
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
@@ -349,7 +350,7 @@ pub(crate) fn emit_refill_index(
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
 
-    let mut table_references = TableReferences::new(
+    let table_references = TableReferences::new(
         vec![JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -366,10 +367,17 @@ pub(crate) fn emit_refill_index(
             database_id,
             indexed: None,
             plan_estimate: None,
+            schema_exprs: BoundSchemaExprs::new(
+                &Table::BTree(tbl.clone()),
+                std::iter::once(idx.as_ref()),
+                table_ref,
+            ),
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(&table_references, resolver)?;
+    let where_clause = table_references.joined_tables()[0]
+        .index_where_expr(idx)
+        .cloned();
 
     if idx
         .index_method
@@ -417,14 +425,15 @@ pub(crate) fn emit_refill_index(
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
+        for i in 0..columns.len() {
             emit_index_column_value_from_cursor(
                 program,
                 resolver,
-                &mut table_references,
+                &table_references,
                 table_cursor_id,
                 tbl,
-                col,
+                idx,
+                i,
                 start_reg + i,
             )?;
         }
@@ -518,14 +527,15 @@ pub(crate) fn emit_refill_index(
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
+        for i in 0..columns.len() {
             emit_index_column_value_from_cursor(
                 program,
                 resolver,
-                &mut table_references,
+                &table_references,
                 table_cursor_id,
                 tbl,
-                col,
+                idx,
+                i,
                 start_reg + i,
             )?;
         }
@@ -1139,34 +1149,26 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     ok
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_from_cursor(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    table_references: &mut TableReferences,
+    table_references: &TableReferences,
     table_cursor_id: usize,
     table: &BTreeTable,
-    idx_col: &IndexColumn,
+    index: &Index,
+    position: usize,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let table_internal_id = table_references
+    let idx_col = &index.columns[position];
+    if idx_col.expr.is_some() {
+        let expr = table_references
             .joined_tables()
             .first()
-            .expect("an index is filled from one table reference")
-            .internal_id;
-        let expr = bind_schema_expr(expr, table_internal_id, resolver)?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
+            .and_then(|table| table.index_column_expr(index, position))
+            .cloned()
+            .expect("an index is filled from one table reference that holds its expressions");
+        translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

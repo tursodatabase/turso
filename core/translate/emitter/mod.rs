@@ -1,3 +1,4 @@
+use crate::schema::Index;
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
@@ -2053,33 +2054,32 @@ pub(crate) fn emit_columns_and_dependencies(
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
 /// Handling expression indexes and regular columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_index_column_value_old_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    table_references: &mut TableReferences,
+    table_references: &TableReferences,
     table_cursor_id: usize,
-    table_internal_id: TableInternalId,
-    idx_col: &IndexColumn,
+    target_table: &JoinedTable,
+    index: &Index,
+    position: usize,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = crate::schema::bind_schema_expr(expr, table_internal_id, resolver)?;
-
-        let self_table_context = SelfTableContext::ForSelect {
-            table_ref_id: table_internal_id,
-            referenced_tables: table_references.clone(),
-        };
-        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
-        })?;
+    let table_internal_id = target_table.internal_id;
+    let idx_col = &index.columns[position];
+    if idx_col.expr.is_some() {
+        let expr = target_table
+            .index_column_expr(index, position)
+            .cloned()
+            .expect("the table reference holds the expressions of its indexes");
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
@@ -2131,17 +2131,24 @@ fn generated_column(
 #[allow(clippy::too_many_arguments)]
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    target_table: &JoinedTable,
     columns: &[Column],
     columns_start_reg: usize,
     rowid_reg: usize,
-    idx_col: &IndexColumn,
+    index: &Index,
+    position: usize,
     dest_reg: usize,
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    let idx_col = &index.columns[position];
+    if idx_col.expr.is_some() {
+        let expr = target_table
+            .index_column_expr(index, position)
+            .cloned()
+            .expect("the table reference holds the expressions of its indexes");
         let mut column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -2156,7 +2163,9 @@ fn emit_index_column_value_new_image(
         crate::translate::expr::emit_dml_expr_index_value(
             program,
             resolver,
-            expr,
+            table_references,
+            target_table.internal_id,
+            &expr,
             columns,
             &mut column_regs,
             rowid_reg,
@@ -2209,18 +2218,23 @@ fn emit_check_constraint_bytecode(
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
+    let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
-        let rewritten_expr =
-            match referenced_tables.and_then(|tables| tables.joined_tables().first()) {
-                Some(joined_table) => crate::schema::bind_schema_expr(
-                    &check_constraint.bound,
-                    joined_table.internal_id,
-                    resolver,
-                )?,
-                None => check_constraint.bound.clone(),
-            };
+        // A constraint of the target table is evaluated through the copy that
+        // is bound to the table reference. A constraint that is not on the
+        // table yet (ALTER TABLE ADD COLUMN) keeps its written names, which
+        // the caller mapped to registers.
+        let rewritten_expr = joined_table
+            .and_then(|joined_table| {
+                let btree = joined_table.btree()?;
+                let position = btree.check_constraints.iter().position(|check| {
+                    exprs_are_equivalent(&check.bound, &check_constraint.bound)
+                })?;
+                joined_table.schema_exprs.checks.get(position).cloned()
+            })
+            .unwrap_or_else(|| check_constraint.bound.clone());
 
         translate_expr_no_constant_opt(
             program,

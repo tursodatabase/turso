@@ -1,12 +1,10 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
 use crate::translate::expr::emit_table_column;
+use crate::translate::plan::BoundSchemaExprs;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{
-        bind_schema_expr, BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL,
-    },
+    schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
         emitter::Resolver,
         expr::{
@@ -155,19 +153,6 @@ fn emit_row_missing_from_index_error(
     emit_integrity_result_row(program, registers);
 }
 
-fn bind_expr_for_table(
-    expr: &ast::Expr,
-    table_references: &TableReferences,
-    resolver: &Resolver,
-) -> crate::Result<ast::Expr> {
-    let table_internal_id = table_references
-        .joined_tables()
-        .first()
-        .expect("integrity check scans one table")
-        .internal_id;
-    bind_schema_expr(expr, table_internal_id, resolver)
-}
-
 fn translate_integrity_check_for_schema(
     schema: &Schema,
     program: &mut ProgramBuilder,
@@ -298,6 +283,13 @@ fn translate_integrity_check_for_schema(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
+                schema_exprs: BoundSchemaExprs::new(
+                    &Table::BTree(btree_table.clone()),
+                    schema
+                        .get_indices(&btree_table.name)
+                        .map(|index| index.as_ref()),
+                    table_ref_id,
+                ),
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -321,25 +313,20 @@ fn translate_integrity_check_for_schema(
                 let expected_count_reg = program.alloc_register();
                 program.emit_int(0, expected_count_reg);
 
-                let mut where_expr = None;
-                if let Some(pred) = index.where_clause.as_deref() {
-                    where_expr = Some(bind_expr_for_table(pred, &table_references, resolver)?);
-                }
+                let scanned_table = &table_references.joined_tables()[0];
+                let where_expr = scanned_table.index_where_expr(index).cloned();
 
                 let mut columns = Vec::with_capacity(index.columns.len());
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
-                for col in &index.columns {
-                    if let Some(expr) = col.expr.as_deref() {
+                for (position, col) in index.columns.iter().enumerate() {
+                    if let Some(expr) = scanned_table.index_column_expr(index, position) {
                         let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
                             Some(btree_table.columns()[col.pos_in_table].affinity())
                         } else {
                             // expression indexes don't apply affinity from the basae table
                             None
                         };
-                        columns.push(BoundIndexColumn::Expr(
-                            Box::new(bind_expr_for_table(expr, &table_references, resolver)?),
-                            affinity,
-                        ));
+                        columns.push(BoundIndexColumn::Expr(Box::new(expr.clone()), affinity));
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
@@ -358,14 +345,10 @@ fn translate_integrity_check_for_schema(
             }
         }
 
-        let mut bound_checks = Vec::with_capacity(btree_table.check_constraints.len());
-        for check in &btree_table.check_constraints {
-            bound_checks.push(bind_expr_for_table(
-                &check.bound,
-                &table_references,
-                resolver,
-            )?);
-        }
+        let bound_checks = table_references.joined_tables()[0]
+            .schema_exprs
+            .checks
+            .clone();
 
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);
@@ -394,8 +377,13 @@ fn translate_integrity_check_for_schema(
             .filter(|(_, c)| c.notnull() || btree_table.is_strict)
             .map(|(idx, col)| {
                 let col_ref = match col.generated_type() {
-                    GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
-                        Box::new(bind_expr_for_table(expr, &table_references, resolver)?),
+                    GeneratedType::Virtual { .. } => BoundIndexColumn::Expr(
+                        Box::new(ast::Expr::Column {
+                            database: None,
+                            table: table_ref_id,
+                            column: idx,
+                            is_rowid_alias: false,
+                        }),
                         Some(col.affinity()),
                     ),
                     GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
@@ -505,28 +493,13 @@ fn translate_integrity_check_for_schema(
                         )?;
                     }
                     BoundIndexColumn::Expr(expr, affinity) => {
-                        let self_table_context =
-                            table_references.joined_tables().first().map(|jt| {
-                                SelfTableContext::ForSelect {
-                                    table_ref_id: jt.internal_id,
-                                    referenced_tables: table_references.clone(),
-                                }
-                            });
-
-                        resolver.with_self_table_context(
+                        translate_expr_no_constant_opt(
                             program,
-                            self_table_context.as_ref(),
-                            |program, _| {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(&table_references),
-                                    expr,
-                                    target,
-                                    resolver,
-                                    NoConstantOptReason::RegisterReuse,
-                                )?;
-                                Ok(())
-                            },
+                            Some(&table_references),
+                            expr,
+                            target,
+                            resolver,
+                            NoConstantOptReason::RegisterReuse,
                         )?;
                         if let Some(aff) = affinity {
                             program.emit_column_affinity(target, *aff);
@@ -771,32 +744,17 @@ fn emit_column(
             program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
         }
         BoundIndexColumn::Expr(expr, affinity) => {
-            let self_table_context =
-                table_references
-                    .joined_tables()
-                    .first()
-                    .map(|jt| SelfTableContext::ForSelect {
-                        table_ref_id: jt.internal_id,
-                        referenced_tables: table_references.clone(),
-                    });
-            resolver.with_self_table_context(
+            translate_expr_no_constant_opt(
                 program,
-                self_table_context.as_ref(),
-                |program, _| {
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(table_references),
-                        expr,
-                        col_value_reg,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    if let Some(affinity) = affinity {
-                        program.emit_column_affinity(col_value_reg, *affinity);
-                    }
-                    Ok(())
-                },
+                Some(table_references),
+                expr,
+                col_value_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
             )?;
+            if let Some(affinity) = affinity {
+                program.emit_column_affinity(col_value_reg, *affinity);
+            }
         }
     }
     Ok(col_value_reg)

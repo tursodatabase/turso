@@ -1,10 +1,10 @@
+use crate::schema::rebase_schema_expr;
 use crate::schema::{impl_effective_nulls_order, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
-        expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
@@ -804,12 +804,10 @@ fn target_matches_order_column(
             if exprs_are_equivalent(target_expr, idx_expr) {
                 return true;
             }
-            // Expression indexes are compared against the normalized form that
-            // was stored in the schema. A query may write the same expression in
-            // a slightly different but equivalent way, so normalize before the
-            // final comparison.
-            let normalized = normalize_expr_for_index_matching(target_expr, table_ref);
-            exprs_are_equivalent(&normalized, idx_expr)
+            // A virtual generated column keeps its expression in the stored form.
+            let mut generated = idx_expr.clone();
+            rebase_schema_expr(&mut generated, table_ref.internal_id);
+            exprs_are_equivalent(target_expr, &generated)
         }
         _ => false,
     }
@@ -901,13 +899,17 @@ pub(super) fn btree_access_order_consumed(
             target_columns,
             schema,
             equality_prefix_scope,
-            index.columns.iter().map(|column| IndexOrderColumn {
-                pos_in_table: column.pos_in_table,
-                order: column.order,
-                nulls_order: column.nulls_order,
-                collation: column.collation,
-                expr: column.expr.as_deref(),
-            }),
+            index
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(position, column)| IndexOrderColumn {
+                    pos_in_table: column.pos_in_table,
+                    order: column.order,
+                    nulls_order: column.nulls_order,
+                    collation: column.collation,
+                    expr: table_ref.index_column_expr(index, position),
+                }),
             index.columns.len(),
             index.has_rowid,
             rowid_alias_col,

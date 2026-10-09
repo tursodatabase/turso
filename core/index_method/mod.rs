@@ -8,7 +8,7 @@ use turso_parser::ast;
 
 use crate::{
     mvcc::cursor::MvccCursorType,
-    schema::{resolve_schema_expr_columns, BTreeTable, IndexColumn},
+    schema::{rebase_schema_expr, resolve_schema_expr_columns, BTreeTable, IndexColumn},
     storage::{
         btree::{BTreeCursor, CursorTrait},
         journal_mode::JournalMode,
@@ -167,6 +167,30 @@ fn resolve_pattern(pattern: &ast::Select, table: &BTreeTable) -> ast::Select {
         if let Some(where_clause) = where_clause {
             resolve(where_clause);
         }
+    }
+    pattern
+}
+
+/// Copy a resolved pattern for one table reference of a statement.
+pub fn bind_pattern(pattern: &ast::Select, internal_id: ast::TableInternalId) -> ast::Select {
+    let mut pattern = pattern.clone();
+    if let ast::OneSelect::Select {
+        columns,
+        where_clause,
+        ..
+    } = &mut pattern.body.select
+    {
+        for column in columns.iter_mut() {
+            if let ast::ResultColumn::Expr(expr, _) = column {
+                rebase_schema_expr(expr, internal_id);
+            }
+        }
+        if let Some(where_clause) = where_clause {
+            rebase_schema_expr(where_clause, internal_id);
+        }
+    }
+    for sorted_column in pattern.order_by.iter_mut() {
+        rebase_schema_expr(&mut sorted_column.expr, internal_id);
     }
     pattern
 }
