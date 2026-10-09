@@ -1,4 +1,5 @@
 use chumsky::{error::EmptyErr, prelude::*};
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -347,6 +348,40 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
     conn.context::<PgSessionState>()
         .and_then(|state| state.lock().unwrap().search_path_setting.clone())
+}
+
+pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Result<Vec<String>> {
+    let state = conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })?;
+    let search_path = state
+        .lock()
+        .unwrap()
+        .search_path
+        .clone()
+        .unwrap_or_else(|| vec!["$user".to_string(), "public".to_string()]);
+    let mut available = conn
+        .list_attached_databases()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    available.extend([
+        "pg_catalog".to_string(),
+        "public".to_string(),
+        "information_schema".to_string(),
+    ]);
+    let has_explicit_pg_catalog = search_path.iter().any(|name| name == "pg_catalog");
+    let mut seen = HashSet::new();
+    let mut schemas = Vec::new();
+    if include_implicit && !has_explicit_pg_catalog {
+        seen.insert("pg_catalog".to_string());
+        schemas.push("pg_catalog".to_string());
+    }
+    for name in search_path {
+        if available.contains(&name) && name != "$user" && seen.insert(name.clone()) {
+            schemas.push(name);
+        }
+    }
+    Ok(schemas)
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
