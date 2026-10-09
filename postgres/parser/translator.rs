@@ -88,7 +88,8 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
-            | "pg_tables" => table_name.to_string(),
+            | "pg_tables"
+            | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
