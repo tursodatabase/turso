@@ -507,10 +507,12 @@ pub struct Statement(*mut Stmt);
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        if self.0.is_null() {
+        let stmt = self.0;
+        self.0 = std::ptr::null_mut();
+        if stmt.is_null() {
             return;
         }
-        unsafe { (*self.0).close() }
+        unsafe { Stmt::close(stmt) }
     }
 }
 
@@ -586,10 +588,7 @@ impl Statement {
 
     /// Close the statement and clean up resources.
     pub fn close(self) {
-        if self.0.is_null() {
-            return;
-        }
-        unsafe { (*self.0).close() }
+        drop(self);
     }
 }
 
@@ -637,14 +636,15 @@ impl Stmt {
         }
     }
 
-    /// Close the statement
-    pub fn close(&mut self) {
-        // null check to prevent double free
-        if self._ctx.is_null() {
+    /// Close the statement. Core frees the `Stmt` itself, so the pointer is dead after this call.
+    ///
+    /// # Safety
+    /// `stmt` must come from `Conn::prepare_stmt` and must not have been closed before.
+    pub unsafe fn close(stmt: *mut Stmt) {
+        if stmt.is_null() {
             return;
         }
-        unsafe { (self._close)(self as *const Stmt as *mut Stmt) };
-        self._ctx = std::ptr::null_mut();
+        ((*stmt)._close)(stmt);
     }
 
     /// # Safety
@@ -741,4 +741,62 @@ pub unsafe fn free_column_names(names: *mut *mut c_char, count: i32) {
         }
     }
     let _ = Box::from_raw(names);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CLOSED_BY_CORE: Cell<Option<Box<Stmt>>> = const { Cell::new(None) };
+    }
+
+    unsafe extern "C" fn bind(_: *mut Stmt, _: i32, _: Value) -> ResultCode {
+        ResultCode::OK
+    }
+
+    unsafe extern "C" fn step(_: *mut Stmt) -> ResultCode {
+        ResultCode::EOF
+    }
+
+    unsafe extern "C" fn get_row(_: *mut Stmt) {}
+
+    unsafe extern "C" fn column_names(_: *mut Stmt, _: *mut i32) -> *mut *mut c_char {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn free_row(_: *mut Stmt) {}
+
+    unsafe extern "C" fn close(stmt: *mut Stmt) {
+        CLOSED_BY_CORE.with(|closed| {
+            assert!(
+                closed.take().is_none(),
+                "core was asked to close the statement twice"
+            );
+            closed.set(Some(Box::from_raw(stmt)));
+        });
+    }
+
+    #[test]
+    fn close_hands_the_statement_to_core_once_and_does_not_touch_it_again() {
+        let ctx = 0x10 as *mut c_void;
+        let stmt = Box::into_raw(Box::new(Stmt::new(
+            std::ptr::null_mut(),
+            ctx,
+            bind,
+            step,
+            get_row,
+            column_names,
+            free_row,
+            close,
+        )));
+
+        Statement(stmt).close();
+
+        let closed = CLOSED_BY_CORE
+            .with(|closed| closed.take())
+            .expect("core was asked to close the statement");
+        assert_eq!(closed._ctx, ctx);
+    }
 }
