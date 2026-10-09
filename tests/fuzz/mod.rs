@@ -39,6 +39,16 @@ mod fuzz_tests {
     use super::grammar_generator::SymbolHandle;
 
     #[turso_macros::test(mvcc)]
+    pub fn builder_from_db_keeps_journal_mode(db: TempDatabase) {
+        let expected = limbo_exec_rows(&db.connect_limbo(), "PRAGMA journal_mode");
+        let copy = helpers::builder_from_db(&db).build();
+        assert_eq!(
+            limbo_exec_rows(&copy.connect_limbo(), "PRAGMA journal_mode"),
+            expected
+        );
+    }
+
+    #[turso_macros::test(mvcc)]
     pub fn arithmetic_expression_fuzz_ex1(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -652,6 +662,23 @@ mod fuzz_tests {
             .iter()
             .map(|ddl| builder.clone().with_init_sql(ddl).build())
             .collect();
+        // SQLite cannot open a file in MVCC mode. Then SQLite gets its own copy
+        // of each table, and the seed rows below go through both engines.
+        let is_mvcc = db.enable_mvcc;
+        let sqlite_copies: Vec<TempDatabase> = if is_mvcc {
+            let sqlite_builder = helpers::sqlite_builder_from_db(&db);
+            table_defs
+                .iter()
+                .map(|ddl| sqlite_builder.clone().with_init_sql(ddl).build())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sqlite_paths: Vec<_> = if is_mvcc {
+            sqlite_copies.iter().map(|db| db.path.clone()).collect()
+        } else {
+            dbs.iter().map(|db| db.path.clone()).collect()
+        };
 
         // Seed data focuses on case and trailing spaces to exercise NOCASE and RTRIM semantics.
         const STR_POOL: [&str; 36] = [
@@ -662,8 +689,9 @@ mod fuzz_tests {
 
         // Insert rows into the SQLite side (shared file) and ignore uniqueness errors to keep seeding going.
         let row_target = 800usize;
-        for db in dbs.iter() {
-            let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        for (db, sqlite_path) in dbs.iter().zip(sqlite_paths.iter()) {
+            let sqlite_conn = rusqlite::Connection::open(sqlite_path).unwrap();
+            let limbo_conn = db.connect_limbo();
             for _ in 0..row_target {
                 let a = STR_POOL[rng.random_range(0..STR_POOL.len())];
                 let b = STR_POOL[rng.random_range(0..STR_POOL.len())];
@@ -674,15 +702,22 @@ mod fuzz_tests {
                     b.replace("'", "''"),
                     c.replace("'", "''"),
                 );
-                let _ = sqlite_conn.execute(&insert, params![]);
+                let sqlite_ok = sqlite_conn.execute(&insert, params![]).is_ok();
+                if is_mvcc {
+                    let limbo_ok = limbo_conn.execute(&insert).is_ok();
+                    assert_eq!(
+                        limbo_ok, sqlite_ok,
+                        "seed insert succeeded in one engine only (seed: {seed}): {insert}"
+                    );
+                }
             }
             sqlite_conn.close().unwrap();
         }
 
         // Open connections for query phase
-        let sqlite_conns: Vec<rusqlite::Connection> = dbs
+        let sqlite_conns: Vec<rusqlite::Connection> = sqlite_paths
             .iter()
-            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .map(|path| rusqlite::Connection::open(path).unwrap())
             .collect();
         let limbo_conns: Vec<_> = dbs.iter().map(|db| db.connect_limbo()).collect();
 
@@ -742,6 +777,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_deferred_constraints_and_triggers_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
@@ -754,7 +790,7 @@ mod fuzz_tests {
             );
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1222,6 +1258,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_single_pk_mutation_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -1230,7 +1267,7 @@ mod fuzz_tests {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1522,6 +1559,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_edgecases_minifuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -1553,7 +1591,7 @@ mod fuzz_tests {
         // parent rowid, child textified integers -> MustBeInt coercion path
         for outer in 0..OUTER_ITERS {
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1619,7 +1657,7 @@ mod fuzz_tests {
         // slf-referential rowid FK
         for outer in 0..OUTER_ITERS {
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1682,7 +1720,7 @@ mod fuzz_tests {
         // self-referential UNIQUE(u,v) parent (fast-path for composite)
         for outer in 0..OUTER_ITERS {
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1762,7 +1800,7 @@ mod fuzz_tests {
         // parent TEXT UNIQUE(u,v), child types differ; rely on parent-index affinities
         for outer in 0..OUTER_ITERS {
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1878,6 +1916,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_cascade_actions_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 50;
         const INNER_ITERS: usize = 200;
@@ -1886,7 +1925,7 @@ mod fuzz_tests {
             println!("fk_cascade_actions_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2270,6 +2309,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_recursive_fk_action_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 25;
         const INNER_ITERS: usize = 200;
@@ -2278,7 +2318,7 @@ mod fuzz_tests {
             println!("fk_recursive_fk_action_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2619,6 +2659,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("fk_composite_pk_mutation_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
@@ -2631,7 +2672,7 @@ mod fuzz_tests {
             );
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2931,6 +2972,7 @@ mod fuzz_tests {
         let (mut rng, seed) = helpers::init_fuzz_test("table_index_mutation_fuzz");
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         let outer_iterations = helpers::fuzz_iterations(30);
         for i in 0..outer_iterations {
@@ -2940,8 +2982,7 @@ mod fuzz_tests {
                 outer_iterations
             );
             let limbo_db = builder.clone().build();
-            // For the sqlite comparison database, use a separate builder without MVCC init_sql
-            let sqlite_db = helpers::builder_from_db(&db).build();
+            let sqlite_db = sqlite_builder.clone().build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -3380,6 +3421,7 @@ mod fuzz_tests {
         const INNER_ITERS: usize = 500;
 
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
         // we want to hit unique constraints fairly often so limit the insert values
         const K_POOL: [&str; 35] = [
             "a", "aa", "abc", "A", "B", "zzz", "foo", "bar", "baz", "fizz", "buzz", "bb", "cc",
@@ -3396,7 +3438,7 @@ mod fuzz_tests {
 
             // Columns: id (rowid PK), plus a few data columns we can reference in predicates/keys.
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -4104,19 +4146,25 @@ mod fuzz_tests {
             limbo_exec_rows(&conn, &create_sql);
             do_flush(&conn, &db).unwrap();
 
-            // Open with rusqlite and verify integrity_check returns OK
-            let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
-            let rows = sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check");
-            assert!(
-                !rows.is_empty(),
-                "integrity_check returned no rows (seed: {seed})"
-            );
-            match &rows[0][0] {
-                Value::Text(s) => assert!(
-                    s.eq_ignore_ascii_case("ok"),
-                    "integrity_check failed (seed: {seed}): {rows:?}",
-                ),
-                other => panic!("unexpected integrity_check result (seed: {seed}): {other:?}",),
+            // Open with rusqlite and verify integrity_check returns OK.
+            // SQLite cannot open a file in MVCC mode, so the MVCC variant only
+            // checks the stored SQL below.
+            if !db.enable_mvcc {
+                let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+                let rows = sqlite_exec_rows(&sqlite_conn, "PRAGMA integrity_check");
+                assert!(
+                    !rows.is_empty(),
+                    "integrity_check returned no rows (seed: {seed})"
+                );
+                match &rows[0][0] {
+                    Value::Text(s) => assert!(
+                        s.eq_ignore_ascii_case("ok"),
+                        "integrity_check failed (seed: {seed}): {rows:?}",
+                    ),
+                    other => {
+                        panic!("unexpected integrity_check result (seed: {seed}): {other:?}",)
+                    }
+                }
             }
 
             // Verify the stored SQL matches the create table statement
