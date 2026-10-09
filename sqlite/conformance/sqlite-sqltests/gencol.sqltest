@@ -6930,3 +6930,57 @@ test gencol_strict_alter_add_virtual_check_error_when_type_passes {
 expect error {
     CHECK constraint failed
 }
+
+test gencol_update_not_null_virtual_column_sees_column_affinity {
+    CREATE TABLE t(a INTEGER, c AS (nullif(typeof(a), 'text')) NOT NULL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = '5';
+    SELECT a, c FROM t;
+}
+expect {
+    5|integer
+}
+
+test gencol_update_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 0;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# The BEFORE UPDATE trigger changes a, which the SET clause does not change,
+# so c is NULL only after the trigger.
+test gencol_upsert_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(k INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (nullif(a + b, 0)) NOT NULL);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN UPDATE t SET a = 5 WHERE k = NEW.k; END;
+    INSERT INTO t(k, a, b) VALUES (1, 1, 1);
+    INSERT INTO t(k, a, b) VALUES (1, 1, 1) ON CONFLICT(k) DO UPDATE SET b = -5;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_update_not_null_ignore_virtual_column_skips_row {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET a = a - 1;
+    SELECT a, c FROM t;
+}
+expect {
+    1|1
+    1|1
+}
+
+setup gencol_virtual_columns_update {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_update
+snapshot gencol_update_computes_virtual_columns_once {
+    UPDATE t SET a = 5 WHERE b = 3;
+}
