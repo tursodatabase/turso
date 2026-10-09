@@ -1839,6 +1839,58 @@ fn test_logical_primary_key_catalog_and_restore_definitions(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn test_dump_named_constraints_survive_reopen_and_rename(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE dump_constraints (id INTEGER NOT NULL, code TEXT, amount INTEGER NOT NULL,
+        CONSTRAINT \"kept pk\" PRIMARY KEY(id), CONSTRAINT \"kept unique\" UNIQUE(code),
+        CONSTRAINT \"kept check\" CHECK(amount BETWEEN -4 AND 7))",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE inline_constraints (id INTEGER CONSTRAINT \"inline pk\" PRIMARY KEY,
+        code TEXT CONSTRAINT \"inline unique\" UNIQUE, amount INTEGER CONSTRAINT \"inline check\" CHECK(amount>2))").unwrap();
+    conn.execute("CREATE TABLE text_keys (id TEXT CONSTRAINT \"text pk\" PRIMARY KEY)")
+        .unwrap();
+    let query = "SELECT conname FROM pg_constraint ORDER BY conname";
+    let expected = [
+        "inline check",
+        "inline pk",
+        "inline unique",
+        "kept check",
+        "kept pk",
+        "kept unique",
+        "text pk",
+    ]
+    .map(|name| vec![Value::build_text(name)])
+    .to_vec();
+    assert_eq!(
+        conn.prepare(query).unwrap().run_collect_rows().unwrap(),
+        expected
+    );
+    conn.execute("ALTER TABLE dump_constraints RENAME COLUMN code TO renamed_code")
+        .unwrap();
+    conn.execute("ALTER TABLE inline_constraints RENAME COLUMN code TO renamed_code")
+        .unwrap();
+    let io = db.io.clone();
+    let path = db.path.clone();
+    conn.close().unwrap();
+    drop(conn);
+    drop(db);
+    let database = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&database).unwrap();
+    assert_eq!(
+        conn.prepare(query).unwrap().run_collect_rows().unwrap(),
+        expected
+    );
+}
+
 #[turso_macros::test(views)]
 fn test_dump_catalogs_include_schema_qualified_objects(db: TempDatabase) {
     let conn = db.connect_postgres();

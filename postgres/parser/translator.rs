@@ -307,7 +307,8 @@ impl PostgreSQLTranslator {
                         ConstrType::ConstrPrimary => {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: (!constraint.conname.is_empty())
+                                    .then(|| ast::Name::exact(constraint.conname.clone())),
                                 constraint: ast::TableConstraint::PrimaryKey {
                                     columns: pk_cols
                                         .into_iter()
@@ -327,7 +328,8 @@ impl PostgreSQLTranslator {
                         ConstrType::ConstrUnique => {
                             let unique_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: (!constraint.conname.is_empty())
+                                    .then(|| ast::Name::exact(constraint.conname.clone())),
                                 constraint: ast::TableConstraint::Unique {
                                     columns: unique_cols
                                         .into_iter()
@@ -354,7 +356,8 @@ impl PostgreSQLTranslator {
                             if let Some(ref raw_expr) = constraint.raw_expr {
                                 let expr = self.translate_expr(raw_expr)?;
                                 table_constraints.push(ast::NamedTableConstraint {
-                                    name: None,
+                                    name: (!constraint.conname.is_empty())
+                                        .then(|| ast::Name::exact(constraint.conname.clone())),
                                     constraint: ast::TableConstraint::Check {
                                         expr: Box::new(expr),
                                         source: None,
@@ -438,6 +441,8 @@ impl PostgreSQLTranslator {
         let mut is_primary_key = false;
         let mut is_not_null = col_def.is_not_null || is_serial;
         let mut is_unique = false;
+        let mut primary_key_name = None;
+        let mut unique_name = None;
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
@@ -448,9 +453,17 @@ impl PostgreSQLTranslator {
             };
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
-                ConstrType::ConstrPrimary => is_primary_key = true,
+                ConstrType::ConstrPrimary => {
+                    is_primary_key = true;
+                    primary_key_name = (!constraint.conname.is_empty())
+                        .then(|| ast::Name::exact(constraint.conname.clone()));
+                }
                 ConstrType::ConstrNotnull => is_not_null = true,
-                ConstrType::ConstrUnique => is_unique = true,
+                ConstrType::ConstrUnique => {
+                    is_unique = true;
+                    unique_name = (!constraint.conname.is_empty())
+                        .then(|| ast::Name::exact(constraint.conname.clone()));
+                }
                 ConstrType::ConstrDefault => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
                         default_expr = Some(self.translate_expr(raw_expr)?);
@@ -524,7 +537,7 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: primary_key_name,
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -547,7 +560,7 @@ impl PostgreSQLTranslator {
         // UNIQUE
         if is_unique {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: unique_name,
                 constraint: ast::ColumnConstraint::Unique(None),
             });
         }
