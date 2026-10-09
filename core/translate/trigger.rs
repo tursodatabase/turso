@@ -477,7 +477,7 @@ fn check_select_table_ref(
         ast::SelectTable::Table(qname, ..) => {
             check_qname(qname)?;
         }
-        ast::SelectTable::TableCall(qname, args, _) => {
+        ast::SelectTable::TableCall(qname, args, ..) => {
             check_qname(qname)?;
             for arg in args {
                 check_expr(arg)?;

@@ -711,7 +711,7 @@ fn walk_from(
 fn walk_select_table(table: &mut SelectTable, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
     match table {
         SelectTable::Table(..) => false,
-        SelectTable::TableCall(_, args, _) => {
+        SelectTable::TableCall(_, args, ..) => {
             for a in args {
                 if walk_expr(a, f) {
                     return true;
