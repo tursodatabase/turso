@@ -13,6 +13,7 @@ path = "lib.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
+bytes = "1"
 futures = { workspace = true }
 pgwire = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
@@ -21,6 +22,10 @@ turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
 ] }
 turso_pg = { workspace = true }
+turso_pg_parser = { workspace = true }
+
+[dev-dependencies]
+turso_pg_client = { workspace = true }
 
 [lints]
 workspace = true
