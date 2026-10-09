@@ -287,6 +287,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
 /// Build FieldInfo metadata from a prepared statement's column information.
 fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+    if is_pg_non_query(stmt.get_sql()) {
+        return vec![];
+    }
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
@@ -639,6 +642,7 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("SET")
+        || upper.starts_with("LOCK")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
@@ -692,6 +696,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("LOCK") {
+        Tag::new("LOCK TABLE")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -807,6 +813,44 @@ mod tests {
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn test_access_share_lock_is_non_query() {
+        assert!(is_pg_non_query(
+            "LOCK TABLE public.items IN ACCESS SHARE MODE"
+        ));
+        assert!(is_pg_non_query("  lock\ntable items in access share mode"));
+        assert!(!is_pg_non_query("SELECT 'LOCK TABLE items'"));
+    }
+
+    #[test]
+    fn test_access_share_lock_command_tag() {
+        assert_eq!(
+            command_tag("LOCK TABLE items IN ACCESS SHARE MODE", 0),
+            Tag::new("LOCK TABLE")
+        );
+    }
+
+    #[test]
+    fn test_access_share_lock_has_no_result_fields() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
+        let stmt = conn
+            .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
+            .unwrap();
+        for format in [Format::UnifiedText, Format::UnifiedBinary] {
+            assert!(build_field_info(&stmt, &format).is_empty());
+        }
+        let query = conn.prepare("SELECT 'LOCK TABLE items'").unwrap();
+        assert_eq!(build_field_info(&query, &Format::UnifiedText).len(), 1);
     }
 
     #[test]
