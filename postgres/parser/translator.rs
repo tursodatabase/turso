@@ -564,7 +564,7 @@ impl PostgreSQLTranslator {
         if let Some(ref fk) = foreign_key {
             let clause = self.pg_fk_to_fk_clause(fk);
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: fk.name.as_ref().map(ast::Name::from_string),
                 constraint: ast::ColumnConstraint::ForeignKey {
                     clause,
                     defer_clause: None,
@@ -630,7 +630,7 @@ impl PostgreSQLTranslator {
             .collect();
 
         ast::NamedTableConstraint {
-            name: None,
+            name: fk.name.as_ref().map(ast::Name::from_string),
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
@@ -4460,6 +4460,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
 
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
 struct PgForeignKey {
+    name: Option<String>,
     ref_table: String,
     ref_columns: Vec<String>,
     on_delete: Option<String>,
@@ -4725,6 +4726,7 @@ fn extract_foreign_key(constraint: &pg_query::protobuf::Constraint) -> Option<Pg
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action);
 
     Some(PgForeignKey {
+        name: (!constraint.conname.is_empty()).then(|| constraint.conname.clone()),
         ref_table,
         ref_columns,
         on_delete,

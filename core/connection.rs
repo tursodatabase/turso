@@ -3001,6 +3001,15 @@ impl Connection {
         self.schema.read().clone()
     }
 
+    pub fn schema_for_database(&self, name: &str) -> Result<Arc<Schema>> {
+        let database_id = self.get_database_id_by_name(name)?;
+        Ok(if database_id == crate::MAIN_DB_ID {
+            self.current_schema()
+        } else {
+            self.cached_non_main_schema(database_id)
+        })
+    }
+
     pub fn attached_database_names(&self) -> Vec<String> {
         self.attached_databases
             .read()

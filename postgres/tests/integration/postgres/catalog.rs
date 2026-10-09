@@ -1629,8 +1629,14 @@ fn test_logical_primary_key_catalog_and_restore_definitions(db: TempDatabase) {
     .unwrap();
     conn.execute("CREATE INDEX payload_index ON parent_table(payload)")
         .unwrap();
-    conn.execute("CREATE TABLE child_table (parent_id INTEGER REFERENCES parent_table(id))")
+    conn.execute("CREATE TABLE child_table (parent_id INTEGER, CONSTRAINT named_fk FOREIGN KEY (parent_id) REFERENCES parent_table(id) ON DELETE CASCADE)")
         .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT c.relhastriggers, k.conname, k.confdeltype FROM pg_class c
+            JOIN pg_constraint k ON k.conrelid=c.oid WHERE c.relname='child_table' AND k.contype='f'")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(1), Value::build_text("named_fk"),Value::build_text("c")]]
+    );
 
     assert_eq!(
         conn.prepare(
@@ -1702,7 +1708,7 @@ fn test_logical_primary_key_catalog_and_restore_definitions(db: TempDatabase) {
         .run_collect_rows()
         .unwrap(),
         vec![vec![Value::build_text(
-            "FOREIGN KEY (parent_id) REFERENCES public.parent_table(id)"
+            "FOREIGN KEY (parent_id) REFERENCES public.parent_table(id) ON DELETE CASCADE"
         )]]
     );
 
@@ -1799,6 +1805,64 @@ fn test_logical_primary_key_catalog_and_restore_definitions(db: TempDatabase) {
                 Value::build_text("sqlite_autoindex_physical_keys_2")
             ]
         ]
+    );
+}
+
+#[turso_macros::test(views)]
+fn test_dump_catalogs_include_schema_qualified_objects(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE public.dump_probe (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE SCHEMA dump_extra").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE dump_extra.dump_probe (payload TEXT DEFAULT 'extra', extra_id BIGINT PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE dump_extra.dump_audit (entry TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("CREATE SEQUENCE public.dump_counter START 41 INCREMENT 3 MAXVALUE 999")
+        .unwrap();
+    conn.execute("CREATE VIEW public.dump_names AS SELECT name FROM public.dump_probe")
+        .unwrap();
+    conn.execute("CREATE TABLE public.pg_user_data (id INTEGER)")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE c.relkind IN ('r','v','S') ORDER BY n.nspname, c.relname").unwrap().run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("dump_extra"),Value::build_text("dump_audit"),Value::build_text("r")],
+            vec![Value::build_text("dump_extra"),Value::build_text("dump_probe"),Value::build_text("r")],
+            vec![Value::build_text("public"),Value::build_text("dump_counter"),Value::build_text("S")],
+            vec![Value::build_text("public"),Value::build_text("dump_names"),Value::build_text("v")],
+            vec![Value::build_text("public"),Value::build_text("dump_probe"),Value::build_text("r")],
+            vec![Value::build_text("public"),Value::build_text("pg_user_data"),Value::build_text("r")],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT n.nspname, a.attname, format_type(a.atttypid,a.atttypmod), a.attnotnull, a.atthasdef
+            FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE c.relname='dump_probe' ORDER BY n.nspname, a.attnum").unwrap().run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("dump_extra"),Value::build_text("payload"),Value::build_text("text"),Value::from_i64(0),Value::from_i64(1)],
+            vec![Value::build_text("dump_extra"),Value::build_text("extra_id"),Value::build_text("bigint"),Value::from_i64(1),Value::from_i64(0)],
+            vec![Value::build_text("public"),Value::build_text("id"),Value::build_text("integer"),Value::from_i64(1),Value::from_i64(0)],
+            vec![Value::build_text("public"),Value::build_text("name"),Value::build_text("text"),Value::from_i64(0),Value::from_i64(0)],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT n.nspname, i.indkey, pg_get_constraintdef(k.oid), pg_get_indexdef(i.indexrelid)
+            FROM pg_constraint k JOIN pg_index i ON i.indexrelid=k.conindid JOIN pg_class c ON c.oid=k.conrelid
+            JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='dump_probe' AND k.contype='p' ORDER BY n.nspname").unwrap().run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("dump_extra"),Value::build_text("2"),Value::build_text("PRIMARY KEY (extra_id)"),Value::build_text("CREATE UNIQUE INDEX sqlite_autoindex_dump_probe_1 ON dump_extra.dump_probe USING btree (extra_id)")],
+            vec![Value::build_text("public"),Value::build_text("1"),Value::build_text("PRIMARY KEY (id)"),Value::build_text("CREATE UNIQUE INDEX dump_probe_pkey ON public.dump_probe USING btree (id)")],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT n.nspname, a.adnum, pg_get_expr(a.adbin,a.adrelid) FROM pg_attrdef a
+            JOIN pg_class c ON c.oid=a.adrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='dump_probe'").unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("dump_extra"), Value::from_i64(1),Value::build_text("'extra'")]]
     );
 }
 
