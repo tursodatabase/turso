@@ -559,6 +559,24 @@ impl<'a> Resolver<'a> {
             .unwrap_or_default()
     }
 
+    /// Number of aggregates moved up so far to the innermost collecting query.
+    pub(crate) fn count_aggregates_moved_from_subqueries(&self) -> usize {
+        self.enclosing_query_aggregates
+            .borrow()
+            .last()
+            .map_or(0, Vec::len)
+    }
+
+    /// The function name of the aggregate at `index` among those moved up to
+    /// the innermost collecting query, if there is one.
+    pub(crate) fn aggregate_moved_from_subqueries(&self, index: usize) -> Option<String> {
+        self.enclosing_query_aggregates
+            .borrow()
+            .last()
+            .and_then(|collected| collected.get(index))
+            .map(|agg| agg.func.to_string())
+    }
+
     /// Move an aggregate up to the innermost enclosing query that is
     /// collecting. Returns false when there is none — the aggregate then stays
     /// with the query that resolved it.
