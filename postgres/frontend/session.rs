@@ -68,8 +68,8 @@ pub fn open_database_with_io(
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
-        let state = Arc::new(PgSessionState::default());
-        let conn = db.connect_with_state(state)?;
+        let context = Arc::new(PgSessionState::default());
+        let conn = db.connect_with_context(context)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -183,7 +183,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     let options = {
         let state = pg_conn
             .conn
-            .state::<PgSessionState>()
+            .context::<PgSessionState>()
             .expect("PostgreSQL connections have session state")
             .lock()
             .unwrap();
@@ -326,7 +326,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
 
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
     let path = value.map(parse_search_path).transpose()?;
-    let state = conn.state::<PgSessionState>().ok_or_else(|| {
+    let state = conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
     state.lock().unwrap().search_path = path;
