@@ -282,8 +282,10 @@ impl SnapshotRows for PgClassTable {
             relminmxid INTEGER,
             relacl TEXT,
             reloptions TEXT,
-            relpartbound TEXT
+            relpartbound TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -406,8 +408,10 @@ impl SnapshotRows for PgNamespaceTable {
             oid INTEGER,
             nspname TEXT,
             nspowner INTEGER,
-            nspacl TEXT
+            nspacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -481,8 +485,10 @@ impl SnapshotRows for PgAttributeTable {
             attacl TEXT,
             attoptions TEXT,
             attfdwoptions TEXT,
-            attmissingval TEXT
+            attmissingval TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1249);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -560,6 +566,7 @@ impl SnapshotRows for PgRolesTable {
             rolbypassrls INTEGER,
             rolconfig TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -619,8 +626,10 @@ impl SnapshotRows for PgProcTable {
             probin TEXT,
             prosqlbody TEXT,
             proconfig TEXT,
-            proacl TEXT
+            proacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1255);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -737,8 +746,10 @@ impl SnapshotRows for PgDatabaseTable {
             datctype TEXT,
             daticulocale TEXT,
             daticurules TEXT,
-            datacl TEXT
+            datacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1262);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -785,8 +796,10 @@ impl SnapshotRows for PgAmTable {
             oid INTEGER,
             amname TEXT,
             amhandler TEXT,
-            amtype TEXT
+            amtype TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -899,6 +912,7 @@ impl SnapshotRows for PgTablesTable {
             hastriggers INTEGER,
             rowsecurity INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -1221,13 +1235,14 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (3807, "_jsonb", 3802),
 ];
 
-const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
+const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
+    const TABLE_OID: Option<i64> = Some(1247);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1348,13 +1363,14 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
+    const TABLE_OID: Option<i64> = Some(2610);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1445,13 +1461,14 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT)";
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
+    const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1728,13 +1745,14 @@ impl SnapshotRows for PgConstraintTable {
 // ──────────────────────────────────────────────────────────────────────
 
 const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT)";
+    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
+    const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1791,6 +1809,7 @@ impl SnapshotRows for PgSequencesTable {
             cache_size INTEGER,
             last_value INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
@@ -1977,6 +1996,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
     const SCHEMA: &'static str;
+    const TABLE_OID: Option<i64>;
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
@@ -2009,6 +2029,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
+            table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
         })
@@ -2041,6 +2062,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 struct SnapshotCursor {
     conn: Arc<Connection>,
     load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -2056,11 +2078,17 @@ impl VirtualTableCursor for SnapshotCursor {
     }
 
     fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
-        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
-        } else {
-            Ok(IOResult::Done(Value::Null))
+        if self.current_row < self.rows.len() {
+            if column < self.rows[self.current_row].len() {
+                return Ok(IOResult::Done(self.rows[self.current_row][column].clone()));
+            }
+            if column == self.rows[self.current_row].len() {
+                if let Some(table_oid) = self.table_oid {
+                    return Ok(IOResult::Done(Value::from_i64(table_oid)));
+                }
+            }
         }
+        Ok(IOResult::Done(Value::Null))
     }
 
     fn filter(
