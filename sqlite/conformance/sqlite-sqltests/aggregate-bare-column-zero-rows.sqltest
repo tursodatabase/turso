@@ -74,3 +74,45 @@ test sum-matching-rows-bare-col {
 expect {
     1|hello
 }
+
+# A correlated aggregate subquery that finds no rows must read the outer column
+# of the current outer row, not the value from an earlier outer row.
+setup outer-and-inner {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    INSERT INTO t1 VALUES (1,'p'),(2,'q'),(3,'r'),(4,'s');
+    INSERT INTO t2 VALUES (1,10,'x'),(2,20,'y'),(2,30,'z'),(3,40,'w'),(5,50,'v');
+}
+
+@setup outer-and-inner
+test correlated-aggregate-zero-rows-reads-current-outer-column {
+    SELECT t1.a, (SELECT coalesce(max(c), t1.a) FROM t2 WHERE t2.a = t1.a) FROM t1 ORDER BY 1;
+}
+expect {
+    1|10
+    2|30
+    3|40
+    4|4
+}
+
+@setup outer-and-inner
+test correlated-count-zero-rows-reads-current-outer-column {
+    SELECT t1.a, (SELECT count(*) || '-' || t1.b FROM t2 WHERE t2.a = t1.a) FROM t1 ORDER BY 1;
+}
+expect {
+    1|1-p
+    2|2-q
+    3|1-r
+    4|0-s
+}
+
+@setup outer-and-inner
+test correlated-count-false-where-reads-outer-column {
+    SELECT t1.a, (SELECT count(*) || '-' || t1.b FROM t2 WHERE 0) FROM t1 ORDER BY 1;
+}
+expect {
+    1|0-p
+    2|0-q
+    3|0-r
+    4|0-s
+}
