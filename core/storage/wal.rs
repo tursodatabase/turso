@@ -203,6 +203,14 @@ impl WalSnapshot {
     const fn min_frame(self) -> u64 {
         self.nbackfills + 1
     }
+
+    const fn has_same_page_contents_as(self, other: WalSnapshot) -> bool {
+        self.max_frame == other.max_frame
+            && self.last_checksum.0 == other.last_checksum.0
+            && self.last_checksum.1 == other.last_checksum.1
+            && self.checkpoint_seq == other.checkpoint_seq
+            && self.transaction_count == other.transaction_count
+    }
 }
 
 /// Which read-mark, if any, currently protects this connection's snapshot.
@@ -3432,7 +3440,8 @@ impl WalFile {
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
+        let db_changed =
+            !shared_snapshot.has_same_page_contents_as(self.connection_state().snapshot);
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
@@ -3547,8 +3556,9 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            let db_changed = !self
+                .load_coordination_snapshot()
+                .has_same_page_contents_as(self.connection_state().snapshot);
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
@@ -10607,7 +10617,7 @@ pub mod test {
         bulk_inserts(&conn_writer, 3, 5);
 
         let conn1 = &db.connect().unwrap();
-        let (r1_frame, _stmt) = start_reader(conn1); // reader 1
+        let (r1_frame, stmt1) = start_reader(conn1); // reader 1
 
         bulk_inserts(&conn_writer, 3, 5);
 
@@ -10634,6 +10644,7 @@ pub mod test {
         assert_eq!(result1.wal_total_backfilled, r1_frame);
 
         // finish reader‑1
+        drop(stmt1);
         conn1.execute("COMMIT").unwrap();
 
         // passive checkpoint #2
