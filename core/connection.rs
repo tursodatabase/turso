@@ -384,7 +384,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
-    pub(super) state: Option<Arc<dyn Any + Send + Sync>>,
+    pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -634,8 +634,8 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub fn state<S: Any>(&self) -> Option<&S> {
-        self.state.as_deref()?.downcast_ref()
+    pub fn context<C: Any>(&self) -> Option<&C> {
+        self.context.as_deref()?.downcast_ref()
     }
 
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {

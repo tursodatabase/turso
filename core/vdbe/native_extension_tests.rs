@@ -121,43 +121,43 @@ fn native_scalar_receives_each_executing_connection() {
 }
 
 #[test]
-fn native_scalar_connection_state_survives_io_and_helper_queries() {
+fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let plain = connection(
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
-                "connection_state_read".into(),
+                "connection_context_read".into(),
                 FunctionArity::Exact(1),
                 false,
-                ConnectionStateRead {
+                ConnectionContextRead {
                     queue: queue.clone(),
                 },
             )
             .unwrap(),
         ),
     );
-    let state = Arc::new(AtomicI64::new(7));
-    let first = plain.db.connect_with_state(state.clone()).unwrap();
+    let context = Arc::new(AtomicI64::new(7));
+    let first = plain.db.connect_with_context(context.clone()).unwrap();
     let second = plain
         .db
-        .connect_with_state(Arc::new(AtomicI64::new(19)))
+        .connect_with_context(Arc::new(AtomicI64::new(19)))
         .unwrap();
-    let mut statement = first.prepare("SELECT connection_state_read(1)").unwrap();
+    let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
-    state.store(13, Ordering::SeqCst);
+    context.store(13, Ordering::SeqCst);
     assert_eq!(
         collect(&mut statement, &queue),
         vec![vec![Value::from_i64(16)]]
     );
     statement.reset().unwrap();
-    state.store(17, Ordering::SeqCst);
+    context.store(17, Ordering::SeqCst);
     assert_eq!(
         collect(&mut statement, &queue),
         vec![vec![Value::from_i64(20)]]
     );
     assert_eq!(
         collect(
-            &mut second.prepare("SELECT connection_state_read(1)").unwrap(),
+            &mut second.prepare("SELECT connection_context_read(1)").unwrap(),
             &queue
         ),
         vec![vec![Value::from_i64(22)]]
@@ -165,7 +165,7 @@ fn native_scalar_connection_state_survives_io_and_helper_queries() {
     assert!(!first.is_nested_stmt());
     assert!(!second.is_nested_stmt());
     let error = plain
-        .prepare("SELECT connection_state_read(0)")
+        .prepare("SELECT connection_context_read(0)")
         .unwrap()
         .run_collect_rows()
         .unwrap_err();
@@ -173,15 +173,15 @@ fn native_scalar_connection_state_survives_io_and_helper_queries() {
 }
 
 #[derive(Debug)]
-struct ConnectionStateRead {
+struct ConnectionContextRead {
     queue: Arc<Mutex<Vec<Completion>>>,
 }
 
-impl ScalarFunction for ConnectionStateRead {
-    type Call = ConnectionStateCall;
+impl ScalarFunction for ConnectionContextRead {
+    type Call = ConnectionContextCall;
 
     fn create_call(&self) -> Result<Self::Call> {
-        Ok(ConnectionStateCall {
+        Ok(ConnectionContextCall {
             statement: None,
             total: 0,
             gate: Gate::new(self.queue.clone()),
@@ -189,25 +189,25 @@ impl ScalarFunction for ConnectionStateRead {
     }
 }
 
-struct ConnectionStateCall {
+struct ConnectionContextCall {
     statement: Option<Statement>,
     total: i64,
     gate: Gate,
 }
 
-impl ScalarCall for ConnectionStateCall {
+impl ScalarCall for ConnectionContextCall {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
-            let state = connection
-                .state::<AtomicI64>()
-                .ok_or_else(|| LimboError::ExtensionError("connection state is required".into()))?;
+            let context = connection.context::<AtomicI64>().ok_or_else(|| {
+                LimboError::ExtensionError("connection context is required".into())
+            })?;
             return Ok(IOResult::Done(Value::from_i64(
-                state.load(Ordering::SeqCst),
+                context.load(Ordering::SeqCst),
             )));
         }
         if self.statement.is_none() {
             self.statement =
-                Some(connection.prepare_internal("SELECT connection_state_read(0) + 3")?);
+                Some(connection.prepare_internal("SELECT connection_context_read(0) + 3")?);
         }
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
