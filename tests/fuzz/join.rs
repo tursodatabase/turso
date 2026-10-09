@@ -11,8 +11,10 @@ mod join_fuzz_tests {
             helpers::init_fuzz_test("join_fuzz_inner (add_indexes={add_indexes})");
 
         let builder = helpers::builder_from_db(&db);
+
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
         let limbo_db = builder.clone().build();
-        let sqlite_db = builder.clone().build();
+        let sqlite_db = sqlite_builder.clone().build();
         let limbo_conn = limbo_db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
