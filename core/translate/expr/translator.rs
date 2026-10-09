@@ -2361,7 +2361,7 @@ fn translate_self_table_column_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 };
                 let src_reg = dml_ctx.to_column_reg(*column);
-                if table_column.is_virtual_generated() || dml_ctx.holds_encoded_value(*column) {
+                if table_column.is_virtual_generated() || dml_ctx.is_encoded_value(*column) {
                     emit_user_facing_column_value(
                         program,
                         src_reg,
