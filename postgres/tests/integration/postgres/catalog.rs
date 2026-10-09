@@ -2,6 +2,89 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_pg_function_support_catalogs_have_no_user_objects(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for (table, columns, projection) in [
+        (
+            "pg_init_privs",
+            5,
+            "objoid, classoid, objsubid, privtype, initprivs, tableoid",
+        ),
+        (
+            "pg_cast",
+            6,
+            "oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid",
+        ),
+        (
+            "pg_transform",
+            5,
+            "oid, trftype, trflang, trffromsql, trftosql, tableoid",
+        ),
+    ] {
+        for name in [table.to_owned(), format!("pg_catalog.{table}")] {
+            let mut stmt = conn.prepare(format!("SELECT * FROM {name}")).unwrap();
+            assert_eq!(stmt.num_columns(), columns, "{name}");
+            assert!(stmt.run_collect_rows().unwrap().is_empty(), "{name}");
+            assert!(conn
+                .prepare(format!("SELECT {projection} FROM {name}"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .is_empty());
+        }
+        assert!(conn.prepare(format!("DELETE FROM {table}")).is_err());
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_dump_does_not_treat_engine_functions_as_user_functions(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT p.proname, n.nspname FROM pg_proc p
+             JOIN pg_namespace n ON p.pronamespace = n.oid
+             WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::build_text("abs"), Value::build_text("pg_catalog")],
+            vec![
+                Value::build_text("pg_is_in_recovery"),
+                Value::build_text("pg_catalog")
+            ],
+        ]
+    );
+    assert!(conn
+        .prepare(
+            "SELECT p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes,
+                    p.prorettype, p.proacl, acldefault('f', p.proowner) AS acldefault,
+                    p.pronamespace, p.proowner
+             FROM pg_proc p LEFT JOIN pg_init_privs pip
+               ON (p.oid = pip.objoid AND pip.classoid = 'pg_proc'::regclass AND pip.objsubid = 0)
+             WHERE p.prokind <> 'a'
+               AND NOT EXISTS (SELECT 1 FROM pg_depend
+                   WHERE classid = 'pg_proc'::regclass AND objid = p.oid AND deptype = 'i')
+               AND (pronamespace != (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')
+                    OR EXISTS (SELECT 1 FROM pg_cast
+                        WHERE pg_cast.oid > 16383 AND p.oid = pg_cast.castfunc)
+                    OR EXISTS (SELECT 1 FROM pg_transform
+                        WHERE pg_transform.oid > 16383
+                          AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))
+                    OR p.proacl IS DISTINCT FROM pip.initprivs)",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .is_empty());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_depend_tracks_live_objects(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE dep_parent (id TEXT UNIQUE)")
