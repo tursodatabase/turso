@@ -230,8 +230,8 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 Expr::Qualified(tbl, id) => {
                     crate::stack::trace_stack!("bind_qualified");
-                    // A qualifier without the requested column does not hide
-                    // a matching column in an outer scope.
+                    // In SQLite, a qualifier without the requested column does
+                    // not hide a matching column in an outer scope.
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -248,6 +248,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     let qualified_match = resolve_qualified_name(
                         referenced_tables,
+                        resolver,
                         None,
                         &normalized_table_name,
                         &normalized_id,
@@ -367,6 +368,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     if let Ok(database_id) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
+                            resolver,
                             Some(*database_id),
                             &tbl_name_str,
                             &normalized_col_name,
@@ -700,10 +702,12 @@ pub(in crate::translate) fn lookup_unqualified_column(
 /// Search the current query first, then search the nearest outer query.
 fn resolve_qualified_name(
     table_references: &TableReferences,
+    resolver: &Resolver<'_>,
     database_id: Option<usize>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
+    let use_nearest_table_only = resolver.dialect.qualified_column_uses_nearest_table_only();
     let mut table_found = false;
     let mut found = None;
     for joined_table in table_references.joined_tables() {
@@ -745,6 +749,9 @@ fn resolve_qualified_name(
     if let Some((table_id, column)) = found {
         return Ok(QualifiedNameMatch::Found(table_id, column));
     }
+    if table_found && use_nearest_table_only {
+        return Ok(QualifiedNameMatch::NoColumn);
+    }
 
     let mut nearest_scope = None;
     let mut ambiguous = false;
@@ -763,7 +770,7 @@ fn resolve_qualified_name(
             table_name,
             column_name,
         )?;
-        if matches!(candidate, QualifiedTableMatch::NoColumn) {
+        if matches!(candidate, QualifiedTableMatch::NoColumn) && !use_nearest_table_only {
             table_found = true;
             continue;
         }
