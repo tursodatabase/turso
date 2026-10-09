@@ -289,7 +289,7 @@ impl SnapshotRows for PgClassTable {
             relpartbound TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_class");
+    const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -415,7 +415,7 @@ impl SnapshotRows for PgNamespaceTable {
             nspacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_namespace");
+    const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -492,7 +492,7 @@ impl SnapshotRows for PgAttributeTable {
             attmissingval TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_attribute");
+    const TABLE_OID: Option<i64> = Some(1249);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -573,6 +573,7 @@ impl SnapshotRows for PgRolesTable {
             rolbypassrls INTEGER,
             rolconfig TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -635,7 +636,7 @@ impl SnapshotRows for PgProcTable {
             proacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_proc");
+    const TABLE_OID: Option<i64> = Some(1255);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -755,7 +756,7 @@ impl SnapshotRows for PgDatabaseTable {
             datacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_database");
+    const TABLE_OID: Option<i64> = Some(1262);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -805,7 +806,7 @@ impl SnapshotRows for PgAmTable {
             amtype TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_NAME: Option<&'static str> = Some("pg_am");
+    const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -918,6 +919,7 @@ impl SnapshotRows for PgTablesTable {
             hastriggers INTEGER,
             rowsecurity INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -953,6 +955,7 @@ impl SnapshotRows for PgIndexesTable {
             tablespace TEXT,
             indexdef TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1284,7 +1287,7 @@ struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
-    const TABLE_NAME: Option<&'static str> = Some("pg_type");
+    const TABLE_OID: Option<i64> = Some(1247);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1427,7 +1430,7 @@ struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
-    const TABLE_NAME: Option<&'static str> = Some("pg_index");
+    const TABLE_OID: Option<i64> = Some(2610);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1525,7 +1528,7 @@ struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
-    const TABLE_NAME: Option<&'static str> = Some("pg_constraint");
+    const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1809,7 +1812,7 @@ struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
-    const TABLE_NAME: Option<&'static str> = Some("pg_attrdef");
+    const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1866,6 +1869,7 @@ impl SnapshotRows for PgSequencesTable {
             cache_size INTEGER,
             last_value INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
@@ -2057,7 +2061,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
     const SCHEMA: &'static str;
-    const TABLE_NAME: Option<&'static str> = None;
+    const TABLE_OID: Option<i64>;
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
@@ -2090,9 +2094,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
-            table_oid: T::TABLE_NAME.map(|name| {
-                catalog_table_oid(name).expect("physical PostgreSQL catalogs have known OIDs")
-            }),
+            table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
         })
@@ -2120,22 +2122,6 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
             constraint_usages,
         })
     }
-}
-
-fn catalog_table_oid(name: &str) -> Option<i64> {
-    Some(match name {
-        "pg_type" => 1247,
-        "pg_attribute" => 1249,
-        "pg_proc" => 1255,
-        "pg_class" => 1259,
-        "pg_database" => 1262,
-        "pg_am" => 2601,
-        "pg_attrdef" => 2604,
-        "pg_constraint" => 2606,
-        "pg_index" => 2610,
-        "pg_namespace" => 2615,
-        _ => return None,
-    })
 }
 
 struct SnapshotCursor {
