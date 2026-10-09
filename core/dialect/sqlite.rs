@@ -44,14 +44,17 @@ impl super::Dialect for SqliteDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+        reject_postgres_table_sql(sql)?;
         BTreeTable::from_sql(sql, root_page)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        reject_postgres_table_sql(sql)?;
         parse_table_sql_ast(sql)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        reject_postgres_table_sql(sql)?;
         table_sql_for_replay(sql)
     }
 
@@ -84,6 +87,17 @@ impl super::Dialect for SqliteDialect {
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
         resolve_builtin_function(name, arg_count)
     }
+}
+
+/// The SQL comment is valid SQLite syntax, so without this check the SQLite
+/// parser would accept the PostgreSQL DDL with SQLite column semantics.
+fn reject_postgres_table_sql(sql: &str) -> crate::Result<()> {
+    if sql.starts_with(super::POSTGRES_TABLE_SQL_PREFIX) {
+        return Err(crate::LimboError::Corrupt(format!(
+            "malformed database schema: table was created by the postgres frontend: {sql}"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse the first SQLite statement in `sql` and return its consumed byte count.
