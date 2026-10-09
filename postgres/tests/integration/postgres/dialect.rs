@@ -2,6 +2,36 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_set_transaction_preserves_transaction(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("BEGIN").unwrap();
+    for sql in [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+        "SET TRANSACTION READ WRITE",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert!(stmt.run_collect_rows().unwrap().is_empty());
+        assert!(!conn.inner().get_auto_commit());
+    }
+    assert_eq!(
+        conn.prepare("SELECT 17")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17)]]
+    );
+    assert!(conn
+        .prepare("SET TRANSACTION SNAPSHOT '00000003-0000001B-1'")
+        .is_err());
+    assert!(conn
+        .prepare("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .is_err());
+    conn.execute("ROLLBACK").unwrap();
+    assert!(conn.inner().get_auto_commit());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_frontend_rejects_pragma(db: TempDatabase) {
     let conn = db.connect_postgres();
 
