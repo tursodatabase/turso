@@ -272,6 +272,7 @@ fn emit_loop_source<'a>(
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                         comparator,
                         collation: Some(arg_collation),
+                        exact_numeric: false,
                     }),
                 });
                 program.emit_insn(Insn::Goto {

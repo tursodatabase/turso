@@ -931,9 +931,9 @@ test order-by-group-by-numeric {
     SELECT category, SUM(val) as total FROM t1 GROUP BY category ORDER BY total;
 }
 expect {
-    c|-5.0
-    b|70.0
-    a|109.0
+    c|-5.00
+    b|70.00
+    a|109.00
 }
 
 # GROUP BY decodes values for grouping, so ORDER BY in this context
@@ -1695,7 +1695,7 @@ test filter-sum-numeric {
     SELECT SUM(val), SUM(val) FILTER (WHERE grp = 'a') FROM t1;
 }
 expect {
-    154.0|150.0
+    154.00|150.00
 }
 
 @requires strict "uses STRICT tables"
@@ -1715,7 +1715,7 @@ test filter-avg-numeric {
     SELECT AVG(val), AVG(val) FILTER (WHERE grp = 'b') FROM t1;
 }
 expect {
-    25.0|35.0
+    25.0000000000000000|35.0000000000000000
 }
 
 @requires strict "uses STRICT tables"
@@ -1756,7 +1756,7 @@ test filter-numeric-with-nulls {
     SELECT COUNT(val) FILTER (WHERE flag = 1), SUM(val) FILTER (WHERE flag = 1) FROM t1;
 }
 expect {
-    1|10.0
+    1|10.00
 }
 
 @requires strict "uses STRICT tables"
@@ -1767,7 +1767,7 @@ test filter-numeric-with-having {
     SELECT grp, SUM(val) FILTER (WHERE flag = 1) AS s FROM t1 GROUP BY grp HAVING s > 0;
 }
 expect {
-    a|40.0
+    a|40.00
 }
 
 @requires strict "uses STRICT tables"
@@ -1777,8 +1777,8 @@ test filter-numeric-order-by-filtered-agg {
     SELECT grp, SUM(val) FILTER (WHERE val > 15) AS s FROM t1 GROUP BY grp ORDER BY s;
 }
 expect {
-    b|60.0
-    a|80.0
+    b|60.00
+    a|80.00
 }
 
 @requires strict "uses STRICT tables"
@@ -1817,7 +1817,7 @@ test filter-numeric-multiple-different-conditions {
     FROM t1;
 }
 expect {
-    3|2|12.0
+    3|2|12.00
 }
 
 @requires strict "uses STRICT tables"
@@ -1827,7 +1827,7 @@ test filter-numeric-condition-on-custom-col {
     SELECT COUNT(*) FILTER (WHERE val > 10), SUM(val) FILTER (WHERE val > 10) FROM t1;
 }
 expect {
-    2|150.0
+    2|150.00
 }
 
 @requires strict "uses STRICT tables"

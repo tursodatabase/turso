@@ -335,6 +335,48 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-sum-avg {
+    CREATE TABLE t1(grp INTEGER, val numeric(12,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '1.50'), (1, '2.50'), (1, NULL);
+    INSERT INTO t1 VALUES (2, '3.99'), (2, '0.01'), (2, '-0.01');
+    INSERT INTO t1 VALUES (3, '-0.01');
+    INSERT INTO t1 VALUES (4, NULL);
+    SELECT grp, sum(val), avg(val) FROM t1 GROUP BY grp;
+}
+expect {
+    1|4.00|2.0000000000000000
+    2|3.99|1.33000000000000000000
+    3|-0.01|-0.01000000000000000000
+    4||
+}
+
+@requires strict "uses STRICT tables"
+test numeric-sum-avg-no-rows {
+    CREATE TABLE t1(val numeric(12,2)) STRICT;
+    SELECT sum(val), avg(val), count(val) FROM t1;
+}
+expect {
+    ||0
+}
+
+@requires strict "uses STRICT tables"
+test numeric-aggregate-order-by-and-having {
+    CREATE TABLE t1(grp TEXT, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('a', 100), ('a', 9), ('b', 20), ('b', 50), ('c', -5);
+    SELECT grp, max(val) AS m FROM t1 GROUP BY grp ORDER BY m;
+    SELECT grp, sum(val) AS s FROM t1 GROUP BY grp HAVING s > 100;
+    SELECT grp FROM t1 GROUP BY grp HAVING avg(val) < 50 ORDER BY sum(val) DESC;
+}
+expect {
+    c|-5.00
+    b|50.00
+    a|100.00
+    a|109.00
+    b
+    c
+}
+
+@requires strict "uses STRICT tables"
 test numeric-less-than {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES ('1.00');
