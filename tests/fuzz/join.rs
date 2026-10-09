@@ -56,7 +56,21 @@ mod join_fuzz_tests {
         let tables = ["t1", "t2", "t3", "t4"];
         let mut all_inserts: Vec<String> = Vec::new();
         for (t_idx, tname) in tables.iter().enumerate() {
+            // Checkpoint halfway through some tables, so that under MVCC part of
+            // the rows are in the B-tree and the rest only in the MVCC store.
+            // Seeks then have to merge both sources.
+            let checkpoint_after_half = rng.random_bool(0.5);
+            // In some tables, column a counts up through the value range as the
+            // rowid grows. A scan of such a table visits the keys in index order,
+            // so each join seek follows a seek for the previous key. Random
+            // values almost never produce that order.
+            let a_follows_rowid = rng.random_bool(0.5);
             for i in 0..rows {
+                if checkpoint_after_half && i == rows / 2 {
+                    limbo_conn
+                        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .unwrap();
+                }
                 let id = i + 1 + (t_idx as i64) * 10_000;
 
                 // 25% chance of NULL per column.
@@ -67,7 +81,11 @@ mod join_fuzz_tests {
                         Some(rng.random_range(-10..=20))
                     }
                 };
-                let a = gen_val(&mut rng);
+                let a = if a_follows_rowid {
+                    Some((i * 31 / rows) as i32 - 10)
+                } else {
+                    gen_val(&mut rng)
+                };
                 let b = gen_val(&mut rng);
                 let c = gen_val(&mut rng);
                 let d = gen_val(&mut rng);
@@ -298,9 +316,14 @@ mod join_fuzz_tests {
                         let not = if kind == 6 { "NOT " } else { "" };
                         let target_table = tables[rng.random_range(0..tables.len())];
                         let sub_col = ["a", "b", "c", "d"][rng.random_range(0..4)];
+                        // The extra filter may be on another column. Then the
+                        // subquery can stop on a later row of the key, not
+                        // the first one, which is a different cursor position
+                        // for the next outer row's seek.
                         let extra = if rng.random_bool(0.3) {
+                            let extra_col = ["a", "b", "c", "d"][rng.random_range(0..4)];
                             let val = rng.random_range(-10..=20);
-                            format!(" AND {target_table}.{sub_col} > {val}")
+                            format!(" AND {target_table}.{extra_col} > {val}")
                         } else {
                             String::new()
                         };
