@@ -2267,14 +2267,26 @@ impl PostgreSQLTranslator {
                 self.translate_case_expr(case_expr)
             }
             Some(pg_query::protobuf::node::Node::CollateClause(collate)) => {
-                // Strip COLLATE clause, just translate the inner expression
-                if let Some(arg) = &collate.arg {
-                    self.translate_expr(arg)
-                } else {
-                    Err(ParseError::ParseError(
-                        "COLLATE clause missing inner expression".to_string(),
-                    ))
-                }
+                let arg = collate.arg.as_ref().ok_or_else(|| {
+                    ParseError::ParseError("COLLATE clause missing inner expression".to_string())
+                })?;
+                let name = collate
+                    .collname
+                    .iter()
+                    .filter_map(|node| match &node.node {
+                        Some(pg_query::protobuf::node::Node::String(name)) => {
+                            Some(name.sval.as_str())
+                        }
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| {
+                        ParseError::ParseError("COLLATE clause missing name".to_string())
+                    })?;
+                Ok(ast::Expr::Collate(
+                    Box::new(self.translate_expr(arg)?),
+                    ast::Name::from_string(name),
+                ))
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
@@ -3278,7 +3290,15 @@ impl PostgreSQLTranslator {
             }
         }
 
-        let translated_order = self.translate_order_by(&func_call.agg_order)?;
+        let mut translated_order = self.translate_order_by(&func_call.agg_order)?;
+        if func_name.eq_ignore_ascii_case("array_agg") && !func_call.agg_within_group {
+            for term in &mut translated_order {
+                term.nulls.get_or_insert(match term.order {
+                    Some(ast::SortOrder::Desc) => ast::NullsOrder::First,
+                    _ => ast::NullsOrder::Last,
+                });
+            }
+        }
         let (order_by, within_group) = if func_call.agg_within_group {
             (vec![], translated_order)
         } else {

@@ -3872,6 +3872,7 @@ pub struct IndexMethodQuery {
 pub struct Aggregate {
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
+    pub order_by: Vec<(ast::SortOrder, Option<ast::NullsOrder>)>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
     pub filter_expr: Option<ast::Expr>,
@@ -3889,9 +3890,21 @@ impl Aggregate {
         distinctness: Distinctness,
         filter_expr: Option<ast::Expr>,
     ) -> Self {
+        let mut args: Vec<_> = args.iter().map(|arg| *arg.clone()).collect();
+        let mut order_by = Vec::new();
+        if let Expr::FunctionCall {
+            order_by: terms, ..
+        } = expr
+        {
+            for term in terms {
+                args.push(*term.expr.clone());
+                order_by.push((term.order.unwrap_or(ast::SortOrder::Asc), term.nulls));
+            }
+        }
         Aggregate {
             func,
-            args: args.iter().map(|arg| *arg.clone()).collect(),
+            args,
+            order_by,
             original_expr: expr.clone(),
             distinctness,
             filter_expr,

@@ -8915,6 +8915,29 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
+    if !data.order_by.is_empty() {
+        assert!(matches!(data.func, AccumulatorFunc::Agg(AggFunc::ArrayAgg)));
+        if matches!(state.registers[data.acc_reg], Register::Value(Value::Null)) {
+            state.registers[data.acc_reg] = Register::Aggregate(AggContext::OrderedArray {
+                keys: data.order_by.iter().map(|(_, key)| *key).try_collect()?,
+                rows: Vec::new(),
+            });
+        }
+        let keys = data
+            .order_by
+            .iter()
+            .map(|(reg, _)| state.registers[*reg].get_value().clone())
+            .try_collect()?;
+        let value = state.registers[data.col].get_value().clone();
+        let Register::Aggregate(AggContext::OrderedArray { rows, .. }) =
+            &mut state.registers[data.acc_reg]
+        else {
+            unreachable!("ordered array_agg must have an ordered accumulator");
+        };
+        rows.try_push((keys, value))?;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // Fast paths for the common numeric cases of count, sum, avg and min/max
     // over an initialized accumulator. The slow path keeps every other
     // function and value type, the first-row initialization and the error
@@ -9061,6 +9084,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         func,
         comparator,
         collation,
+        order_by: _,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9210,6 +9234,28 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    if let Register::Aggregate(AggContext::OrderedArray { keys, rows }) =
+        &mut state.registers[acc_reg]
+    {
+        assert!(matches!(func, AggFunc::ArrayAgg));
+        rows.sort_by(|(a, _), (b, _)| {
+            a.iter()
+                .zip(b)
+                .zip(keys.iter())
+                .map(|((a, b), key)| {
+                    crate::types::cmp_in_column(&a.as_value_ref(), &b.as_value_ref(), key)
+                })
+                .find(|order| !order.is_eq())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let values: Vec<_> = rows.iter().map(|(_, value)| value.clone()).try_collect()?;
+        let value =
+            Value::Blob(ImmutableRecord::from_values(&values, values.len())?.into_payload());
+        state.registers[dest_reg].set_value(value);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     if let AggFunc::External(ext_func) = func {
         let value = return_if_io!(
             state,
@@ -9225,6 +9271,9 @@ pub fn op_agg_final(
             let value = match agg {
                 AggContext::External(_) | AggContext::Native(_) => {
                     unreachable!("external aggregates are finalized above")
+                }
+                AggContext::OrderedArray { .. } => {
+                    unreachable!("ordered arrays are finalized above")
                 }
                 AggContext::Builtin(payload) => match func {
                     AggFunc::Count | AggFunc::Count0 => {
