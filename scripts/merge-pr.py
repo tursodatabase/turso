@@ -63,8 +63,10 @@ def get_pr_info(pr_number):
         print(f"Error fetching PR #{pr_number}: {error}")
         sys.exit(1)
 
-    pr_data = json.loads(output)
+    return parse_pr_info(json.loads(output))
 
+
+def parse_pr_info(pr_data):
     reviewed_by = []
     for review in pr_data.get("reviews", []):
         if review["state"] == "APPROVED":
@@ -363,6 +365,21 @@ def merge_pr(pr_number, use_api=True):
     pr_info = get_pr_info(pr_number)
     print(f"PR found: '{pr_info['title']}' by {pr_info['author']}")
 
+    commit_title, commit_message, commit_body_for_api = build_commit_message(pr_info)
+    if use_api:
+        merge_remote(pr_number, commit_body_for_api, commit_title)
+    else:
+        merge_local(pr_number, commit_message)
+
+
+def print_commit_message(pr_json_path):
+    with open(pr_json_path, "r", encoding="utf-8") as f:
+        pr_info = parse_pr_info(json.load(f))
+    commit_title, _, commit_body_for_api = build_commit_message(pr_info)
+    print(json.dumps({"commit_title": commit_title, "commit_message": commit_body_for_api}, indent=2))
+
+
+def build_commit_message(pr_info):
     commit_title = f"Merge '{pr_info['title']}' from {pr_info['author_name']}"
     body = pr_info["body"]
     body = truncate_body_at_marker(body)
@@ -381,13 +398,9 @@ def merge_pr(pr_number, use_api=True):
     commit_message_parts.append("")  # Empty line before Closes
     commit_message_parts.append(f"Closes #{pr_info['number']}")
     commit_message = "\n".join(commit_message_parts)
-
-    if use_api:
-        # For remote merge, we need to separate title from body
-        commit_body_for_api = "\n".join(commit_message_parts[2:])
-        merge_remote(pr_number, commit_body_for_api, commit_title)
-    else:
-        merge_local(pr_number, commit_message)
+    # For remote merge, we need to separate title from body
+    commit_body_for_api = "\n".join(commit_message_parts[2:])
+    return commit_title, commit_message, commit_body_for_api
 
 
 def check_gh_auth():
@@ -402,9 +415,19 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Merge a pull request with a nice merge commit using GitHub CLI")
-    parser.add_argument("pr_number", type=str, help="Pull request number to merge")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("pr_number", type=str, nargs="?", help="Pull request number to merge")
+    target.add_argument(
+        "--message-from",
+        metavar="PR_JSON",
+        help="Do not merge. Print the merge commit title and message as JSON for the PR in PR_JSON, "
+        "which has the format of `gh pr view --json number,title,author,headRefName,body,reviews`",
+    )
     parser.add_argument("--local", action="store_true", help="Use local git commands instead of GitHub API")
     args = parser.parse_args()
+    if args.message_from:
+        print_commit_message(args.message_from)
+        sys.exit(0)
     if not re.match(r"^\d+$", args.pr_number):
         print("Error: PR number must be a positive integer")
         sys.exit(1)
