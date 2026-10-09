@@ -270,6 +270,7 @@ fn emit_loop_source<'a>(
                         col: expr_reg,
                         delimiter: 0,
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
+                        order_by: Vec::new(),
                         comparator,
                         collation: Some(arg_collation),
                     }),
@@ -315,7 +316,12 @@ fn emit_loop_source<'a>(
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
-                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
+                    AggArgumentSource::new_from_expression(
+                        &agg.func,
+                        &agg.args,
+                        &agg.distinctness,
+                        &agg.order_by,
+                    ),
                     reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
