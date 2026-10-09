@@ -12,6 +12,384 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 
 #[test]
+fn native_scalar_accepts_only_declared_argument_counts() {
+    for arity in [
+        FunctionArity::OneOf(&[]),
+        FunctionArity::Exact(usize::MAX),
+        FunctionArity::OneOf(&[1, usize::MAX]),
+    ] {
+        assert!(matches!(
+            ExternalFunc::new_native_scalar("invalid".into(), arity, false, NullToNine),
+            Err(LimboError::InvalidArgument(_))
+        ));
+    }
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "null_to_nine".into(),
+                FunctionArity::OneOf(&[1, 3]),
+                false,
+                NullToNine,
+            )
+            .unwrap(),
+        ),
+    );
+    for sql in [
+        "SELECT null_to_nine(NULL)",
+        "SELECT null_to_nine(NULL, 2, 3)",
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(9)]]
+        );
+    }
+    for sql in [
+        "SELECT null_to_nine()",
+        "SELECT null_to_nine(NULL, 2)",
+        "SELECT null_to_nine(NULL, 2, 3, 4)",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    let mut signatures = conn
+        .get_syms_functions()
+        .into_iter()
+        .filter(|(name, _, _, _)| name == "null_to_nine")
+        .collect::<Vec<_>>();
+    signatures.sort();
+    assert_eq!(
+        signatures,
+        vec![
+            ("null_to_nine".into(), false, 1, false),
+            ("null_to_nine".into(), false, 3, false)
+        ]
+    );
+}
+
+#[test]
+fn native_scalar_borrows_the_same_registers_across_io() {
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let args = [
+        Register::Value(Value::from_i64(7)),
+        Register::Value(Value::from_i64(3)),
+    ];
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let function = ExternalFunc::new_native_scalar(
+        "register_probe".into(),
+        FunctionArity::Exact(2),
+        false,
+        RegisterProbe {
+            args_address: args.as_ptr() as usize,
+            queue: queue.clone(),
+        },
+    )
+    .unwrap();
+    let mut state = crate::native_ext::ExtensionState::None;
+    let value = finish(&queue, || {
+        function.func.call_scalar(&mut state, &conn, &args)
+    });
+    assert_eq!(value, Value::from_i64(73));
+    assert!(matches!(state, crate::native_ext::ExtensionState::None));
+}
+
+#[test]
+fn native_scalar_receives_each_executing_connection() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "connection_changes".into(),
+                FunctionArity::Exact(1),
+                false,
+                ConnectionChanges,
+            )
+            .unwrap(),
+        ),
+    );
+    let other = conn.db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    other.execute("INSERT INTO t VALUES (4)").unwrap();
+    for (connection, expected) in [(&conn, 37), (&other, 17)] {
+        assert_eq!(
+            connection
+                .prepare("SELECT connection_changes(7)")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(expected)]]
+        );
+    }
+}
+
+#[test]
+fn native_scalar_preserves_unmatched_outer_join_rows() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "null_to_nine".into(),
+                FunctionArity::Exact(1),
+                false,
+                NullToNine,
+            )
+            .unwrap(),
+        ),
+    );
+    conn.execute("CREATE TABLE lhs (id INTEGER)").unwrap();
+    conn.execute("CREATE TABLE rhs (id INTEGER, value INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO lhs VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO rhs VALUES (1, 0)").unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT lhs.id FROM lhs LEFT JOIN rhs ON rhs.id = lhs.id \
+         WHERE null_to_nine(rhs.value) = 9 ORDER BY lhs.id",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
+}
+
+#[test]
+fn native_scalar_helper_queries_resume_with_independent_call_state() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "nested_sum".into(),
+                FunctionArity::Exact(1),
+                false,
+                NestedSum {
+                    queue: queue.clone(),
+                },
+            )
+            .unwrap(),
+        ),
+    );
+    conn.execute("CREATE TABLE input_values(x)").unwrap();
+    conn.execute("INSERT INTO input_values VALUES (2), (13), (19)")
+        .unwrap();
+    let mut statement = conn
+        .prepare("SELECT nested_sum(5), nested_sum(11)")
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            collect(&mut statement, &queue),
+            vec![vec![Value::from_i64(39), Value::from_i64(45)]]
+        );
+        assert!(!conn.is_nested_stmt());
+        statement.reset().unwrap();
+    }
+}
+
+#[test]
+fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
+    for mode in ["wal", "mvcc"] {
+        for explicit in [false, true] {
+            for cancellation in ["reset", "drop", "error", "io_error", "interrupt"] {
+                let queue = Arc::new(Mutex::new(Vec::new()));
+                let conn = connection(
+                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                        ExternalFunc::new_native_scalar(
+                            "nested_sum".into(),
+                            FunctionArity::Exact(1),
+                            false,
+                            NestedSum {
+                                queue: queue.clone(),
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                );
+                conn.execute(format!("PRAGMA journal_mode = {mode}"))
+                    .unwrap();
+                conn.execute("CREATE TABLE input_values(x)").unwrap();
+                conn.execute("INSERT INTO input_values VALUES (2), (13), (19)")
+                    .unwrap();
+                conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute("INSERT INTO audit VALUES (501), (502)")
+                    .unwrap();
+                let offset = if cancellation == "error" { -7 } else { 5 };
+                conn.execute(format!(
+                    "CREATE TRIGGER child_insert AFTER INSERT ON child BEGIN \
+                     INSERT INTO audit VALUES (97); SELECT nested_sum({offset}); END"
+                ))
+                .unwrap();
+                conn.execute(
+                    "CREATE TRIGGER parent_insert AFTER INSERT ON parent BEGIN \
+                     INSERT INTO child VALUES (NEW.id + 20); END",
+                )
+                .unwrap();
+                if explicit {
+                    conn.execute("BEGIN").unwrap();
+                    conn.execute("INSERT INTO audit VALUES (503)").unwrap();
+                }
+                let mut statement = conn.prepare("INSERT INTO parent VALUES (7)").unwrap();
+                assert!(matches!(statement.step().unwrap(), StepResult::IO));
+                assert!(conn.is_nested_stmt());
+                match cancellation {
+                    "reset" => statement.reset().unwrap(),
+                    "drop" => drop(statement),
+                    "error" => {
+                        let mut result = statement.step();
+                        for _ in 0..20 {
+                            if !matches!(result, Ok(StepResult::IO)) {
+                                break;
+                            }
+                            for completion in queue.lock().drain(..) {
+                                completion.complete(0);
+                            }
+                            result = statement.step();
+                        }
+                        assert!(result.unwrap_err().to_string().contains("negative offset"));
+                    }
+                    "io_error" => {
+                        queue
+                            .lock()
+                            .pop()
+                            .unwrap()
+                            .error(crate::CompletionError::Aborted);
+                        assert!(matches!(
+                            statement.step().unwrap_err(),
+                            LimboError::CompletionError(crate::CompletionError::Aborted)
+                        ));
+                    }
+                    "interrupt" => {
+                        conn.interrupt();
+                        let mut result = statement.step();
+                        for _ in 0..20 {
+                            if !matches!(result, Ok(StepResult::IO)) {
+                                break;
+                            }
+                            for completion in queue.lock().drain(..) {
+                                completion.complete(0);
+                            }
+                            result = statement.step();
+                        }
+                        assert!(
+                            matches!(
+                                result,
+                                Ok(StepResult::Interrupt) | Err(LimboError::Interrupt)
+                            ),
+                            "{result:?}"
+                        );
+                        statement.reset().unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!conn.is_nested_stmt(), "{mode}: {explicit}: {cancellation}");
+                assert!(conn.executing_triggers.read().is_empty());
+                if explicit {
+                    conn.execute("COMMIT").unwrap();
+                }
+                conn.execute("INSERT INTO audit VALUES (504)").unwrap();
+                let other = conn.db.connect().unwrap();
+                for table in ["parent", "child"] {
+                    assert!(other
+                        .prepare(format!("SELECT id FROM {table}"))
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap()
+                        .is_empty());
+                }
+                let mut expected = vec![vec![Value::from_i64(501)], vec![Value::from_i64(502)]];
+                if explicit {
+                    expected.push(vec![Value::from_i64(503)]);
+                }
+                expected.push(vec![Value::from_i64(504)]);
+                assert_eq!(
+                    other
+                        .prepare("SELECT id FROM audit ORDER BY id")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegisterProbe {
+    args_address: usize,
+    queue: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl ScalarFunction for RegisterProbe {
+    type Call = RegisterProbeCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(RegisterProbeCall {
+            args_address: self.args_address,
+            gate: Gate::new(self.queue.clone()),
+        })
+    }
+}
+
+struct RegisterProbeCall {
+    args_address: usize,
+    gate: Gate,
+}
+
+impl ScalarCall for RegisterProbeCall {
+    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        assert_eq!(args.as_ptr() as usize, self.args_address);
+        if let Some(io) = self.gate.wait() {
+            return Ok(IOResult::IO(io));
+        }
+        Ok(IOResult::Done(Value::from_i64(
+            integer(args[0].get_value()) * 10 + integer(args[1].get_value()),
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionChanges;
+
+impl ScalarFunction for ConnectionChanges {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(Self)
+    }
+}
+
+impl ScalarCall for ConnectionChanges {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        Ok(IOResult::Done(Value::from_i64(
+            connection.changes() * 10 + integer(args[0].get_value()),
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct NullToNine;
+
+impl ScalarFunction for NullToNine {
+    type Call = NullToNineCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(NullToNineCall)
+    }
+}
+
+struct NullToNineCall;
+
+impl ScalarCall for NullToNineCall {
+    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        Ok(IOResult::Done(match args[0].get_value() {
+            Value::Null => Value::from_i64(9),
+            value => value.clone(),
+        }))
+    }
+}
+
+#[test]
 fn extension_constructors_validate_argument_counts() {
     for (argc, valid) in [(-2, false), (-1, true), (0, true), (2, true)] {
         let queue = Arc::new(Mutex::new(Vec::new()));
@@ -32,7 +410,10 @@ fn extension_constructors_validate_argument_counts() {
             ),
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
-                argc,
+                match argc {
+                    -1 => FunctionArity::Variadic,
+                    count => FunctionArity::Exact(count as usize),
+                },
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -52,13 +433,13 @@ fn extension_constructors_validate_argument_counts() {
         for result in functions {
             if valid {
                 let function = result.unwrap();
-                assert_eq!(function.func.arg_count(), argc);
+                assert_eq!(function.func.arg_counts(), vec![argc]);
                 let options =
                     OpenOptions::new(Arc::new(SqliteDialect)).extension_function(function);
                 assert_eq!(options.native_extensions.functions.len(), 1);
                 assert_eq!(
-                    options.native_extensions.functions[0].func.arg_count(),
-                    argc
+                    options.native_extensions.functions[0].func.arg_counts(),
+                    vec![argc]
                 );
             } else {
                 assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
@@ -157,7 +538,7 @@ fn scalar_calls_resume_independently_and_create_once() {
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "DeLaYeD".into(),
-                2,
+                FunctionArity::Exact(2),
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -194,7 +575,7 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
-                2,
+                FunctionArity::Exact(2),
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -222,7 +603,7 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
-                2,
+                FunctionArity::Exact(2),
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -251,7 +632,7 @@ fn failed_completion_releases_the_pending_scalar() {
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
-                2,
+                FunctionArity::Exact(2),
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -285,7 +666,7 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
             OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
                 ExternalFunc::new_native_scalar(
                     "delayed".into(),
-                    2,
+                    FunctionArity::Exact(2),
                     false,
                     DelayedScalar {
                         queue: queue.clone(),
@@ -1066,7 +1447,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
     let options = OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
         ExternalFunc::new_native_scalar(
             "delayed".into(),
-            2,
+            FunctionArity::Exact(2),
             false,
             DelayedScalar {
                 queue: queue.clone(),
@@ -1105,7 +1486,7 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
         OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
-                2,
+                FunctionArity::Exact(2),
                 false,
                 DelayedScalar {
                     queue: queue.clone(),
@@ -1386,10 +1767,9 @@ struct DelayedScalar {
 impl ScalarFunction for DelayedScalar {
     type Call = DelayedCall;
 
-    fn create_call(&self, args: Vec<Value>) -> Result<Self::Call> {
+    fn create_call(&self) -> Result<Self::Call> {
         self.created.fetch_add(1, Ordering::SeqCst);
         Ok(DelayedCall {
-            args,
             gate: Gate::new(self.queue.clone()),
             dropped: self.dropped.clone(),
         })
@@ -1397,22 +1777,21 @@ impl ScalarFunction for DelayedScalar {
 }
 
 struct DelayedCall {
-    args: Vec<Value>,
     gate: Gate,
     dropped: Arc<AtomicUsize>,
 }
 
 impl ScalarCall for DelayedCall {
-    fn step(&mut self) -> IOResultOr<Value> {
+    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
         }
-        let left = integer(&self.args[0]);
+        let left = integer(args[0].get_value());
         if left < 0 {
             return Err(LimboError::ExtensionError("negative first argument".into()).into());
         }
         Ok(IOResult::Done(Value::from_i64(
-            left * 10 + integer(&self.args[1]),
+            left * 10 + integer(args[1].get_value()),
         )))
     }
 }
@@ -1420,6 +1799,53 @@ impl ScalarCall for DelayedCall {
 impl Drop for DelayedCall {
     fn drop(&mut self) {
         self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct NestedSum {
+    queue: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl ScalarFunction for NestedSum {
+    type Call = NestedSumCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(NestedSumCall {
+            statement: None,
+            total: 0,
+            gate: Gate::new(self.queue.clone()),
+        })
+    }
+}
+
+struct NestedSumCall {
+    statement: Option<Statement>,
+    total: i64,
+    gate: Gate,
+}
+
+impl ScalarCall for NestedSumCall {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        if self.statement.is_none() {
+            self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);
+        }
+        if let Some(io) = self.gate.wait() {
+            return Ok(IOResult::IO(io));
+        }
+        crate::return_if_io!(self
+            .statement
+            .as_mut()
+            .unwrap()
+            .run_with_row_callback_nonblock(|row| {
+                self.total += integer(row.get_value(0));
+                Ok(())
+            }));
+        let offset = integer(args[0].get_value());
+        if offset < 0 {
+            return Err(LimboError::InvalidArgument("negative offset".into()).into());
+        }
+        Ok(IOResult::Done(Value::from_i64(self.total + offset)))
     }
 }
 

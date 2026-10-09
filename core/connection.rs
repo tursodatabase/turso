@@ -4584,14 +4584,16 @@ impl Connection {
             .read()
             .functions
             .values()
-            .map(|f| {
+            .flat_map(|f| {
                 let is_agg = f.func.is_aggregate();
-                (
-                    f.name.clone(),
-                    is_agg,
-                    f.func.arg_count(),
-                    function::Deterministic::is_deterministic(f.as_ref()),
-                )
+                f.func.arg_counts().into_iter().map(move |argc| {
+                    (
+                        f.name.clone(),
+                        is_agg,
+                        argc,
+                        function::Deterministic::is_deterministic(f.as_ref()),
+                    )
+                })
             })
             .collect()
     }
