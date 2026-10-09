@@ -908,6 +908,36 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     assert_eq!(rows, vec![(1, 2, 42)]);
 }
 
+#[test]
+fn insert_continues_sqlite_created_mixed_case_autoincrement_sequence() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(
+        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO T1(a, b) VALUES(40, 0); DELETE FROM T1",
+    )?;
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO T1(b) VALUES(1)")?;
+    conn.execute("INSERT INTO T1(b) VALUES(2), (3)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM T1 ORDER BY a");
+    assert_eq!(rows, vec![(41,), (42,), (43,)]);
+    drop(conn);
+    drop(db);
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let sequences: Vec<(String, i64)> = sqlite
+        .prepare("SELECT name, seq FROM sqlite_sequence")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(sequences, vec![("T1".to_string(), 43)]);
+    sqlite.execute("INSERT INTO T1(b) VALUES(4)", [])?;
+    let last: i64 = sqlite.query_row("SELECT max(a) FROM T1", [], |row| row.get(0))?;
+    assert_eq!(last, 44);
+    Ok(())
+}
+
 #[turso_macros::test]
 pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // Regression: qualified column refs in RETURNING (e.g. "users"."id")
