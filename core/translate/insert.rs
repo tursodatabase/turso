@@ -285,6 +285,8 @@ pub fn translate_insert(
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),
@@ -339,6 +341,7 @@ pub fn translate_insert(
             identifier: normalize_ident(table_name.as_str()),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),

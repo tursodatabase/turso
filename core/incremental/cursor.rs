@@ -1938,8 +1938,8 @@ mod tests {
                 Ok(IOResult::Done(false))
             }
 
-            fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
-                Ok(IOResult::Done(None))
+            fn clear_btree(&mut self) -> IOResultOr<u64> {
+                Ok(IOResult::Done(0))
             }
 
             fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {

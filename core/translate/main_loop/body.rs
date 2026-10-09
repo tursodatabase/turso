@@ -491,15 +491,30 @@ fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<
 /// by anything else are stale here: nothing refills them once the probe loop has
 /// exited. Skipping a condition whose columns are all readable silently drops it
 /// from the null-extended rows, letting through rows the query filtered out.
+///
+/// A correlated subquery result is readable only if every table the subquery
+/// reads is one of `allowed`. Otherwise the subquery runs inside the inner
+/// loop, and its result register still holds the value from an earlier row.
 fn condition_operands_are_available(
     expr: &Expr,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
     allowed: &TableMask,
     resolver: &Resolver,
     payload_regs: Range<usize>,
-) -> bool {
+) -> Result<bool> {
     let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { .. } = e {
+            if !allowed.contains_all_set_bits_of(&table_mask_from_expr(
+                e,
+                table_references,
+                subqueries,
+            )?) {
+                ok = false;
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = e else {
             return Ok(WalkControl::Continue);
         };
@@ -521,8 +536,8 @@ fn condition_operands_are_available(
         }
         // Outer query references are already in scope — allow them.
         Ok(WalkControl::Continue)
-    });
-    ok
+    })?;
+    Ok(ok)
 }
 
 /// Emit WHERE conditions and inner-loop entry for an unmatched hash build row.
@@ -587,7 +602,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .where_clause
         .iter()
         .enumerate()
-        .filter(|(_, condition)| !condition.consumed && condition.from_outer_join.is_none())
+        .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
     {
         if prefiltered_terms.contains(&condition_idx) {
             continue;
@@ -606,10 +621,11 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             && !condition_operands_are_available(
                 &condition.expr,
                 &plan.table_references,
+                &plan.non_from_clause_subqueries,
                 &allowed_tables,
                 &t_ctx.resolver,
                 payload_regs.clone(),
-            )
+            )?
         {
             continue;
         }

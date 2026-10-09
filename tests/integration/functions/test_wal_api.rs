@@ -1010,3 +1010,28 @@ fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
             .unwrap();
     }
 }
+
+#[turso_macros::test()]
+fn test_wal_watermark_read_page_out_of_range_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    let max_frame = conn.wal_state().unwrap().max_frame;
+    assert!(max_frame > 1);
+    let mut page = vec![0u8; 4096];
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame + 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+
+    conn.checkpoint(CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame - 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+}

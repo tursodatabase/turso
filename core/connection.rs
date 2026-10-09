@@ -6,7 +6,7 @@ use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
     },
     Arc, Mutex, RwLock,
 };
@@ -191,9 +191,6 @@ pub struct ReparseSchemaInner {
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
     fresh: Schema,
-    /// Built-in table-valued functions captured from the old schema; rehydrated
-    /// after the sqlite_schema scan since they don't survive re-parsing.
-    tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
@@ -404,9 +401,6 @@ pub struct Connection {
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
-    /// page size used for an uninitialized database or the next vacuum command.
-    /// it's not always equal to the current page size of the database
-    pub(super) page_size: AtomicU16,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -415,6 +409,7 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    pub(super) wal_autocheckpoint: AtomicU32,
     /// Whether MVCC commits should include portable logical-change metadata in
     /// the logical log.
     ///
@@ -660,6 +655,7 @@ impl Connection {
         )
         .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
 
@@ -780,8 +776,13 @@ impl Connection {
         })
     }
 
+    /// Returns true once the per-connection temp database has been created.
+    pub(crate) fn has_temp_database(&self) -> bool {
+        self.temp.database.read().is_some()
+    }
+
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
-        if self.temp.database.read().is_some() {
+        if self.has_temp_database() {
             return Ok(());
         }
 
@@ -1456,23 +1457,7 @@ impl Connection {
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
-        // Capture built-in table-valued functions (e.g. generate_series, json_each)
-        // before dropping the old schema. These are registered programmatically and
-        // don't survive re-parsing from sqlite_schema alone.
-        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        fresh.copy_table_valued_functions(&self.schema.read());
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1495,7 +1480,6 @@ impl Connection {
         Ok(ReparseSchemaInner {
             _guard: guard,
             fresh,
-            tvfs,
             preserved_sequences,
             phase: ReparsePhase::ParseSchema {
                 parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
@@ -1531,14 +1515,6 @@ impl Connection {
                         &attached_resolver,
                         self.db.dialect().as_ref(),
                     ));
-
-                    // Rehydrate built-in table-valued functions captured at init.
-                    for vtab in &inner.tvfs {
-                        let normalized = crate::util::normalize_ident(&vtab.name);
-                        inner.fresh.tables.entry(normalized).or_insert_with(|| {
-                            Arc::new(crate::schema::Table::Virtual(vtab.clone()))
-                        });
-                    }
 
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::PopulateSequences {
@@ -2333,6 +2309,7 @@ impl Connection {
                     .block(|| {
                         return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
+                            self.get_wal_autocheckpoint(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -2502,6 +2479,15 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn get_wal_autocheckpoint(&self) -> u32 {
+        self.wal_autocheckpoint.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_wal_autocheckpoint(&self, frames: u32) {
+        self.wal_autocheckpoint.store(frames, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     /// Publish the connection's current schema snapshot to the shared database
@@ -2744,8 +2730,7 @@ impl Connection {
         self.cdc_transaction_id.store(id, Ordering::SeqCst);
     }
     pub fn get_page_size(&self) -> PageSize {
-        let value = self.page_size.load(Ordering::SeqCst);
-        PageSize::new_from_header_u16(value).unwrap_or_default()
+        self.pager.load().get_page_size_unchecked()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2784,23 +2769,23 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
-    pub fn reset_page_size(&self, size: u32) -> Result<()> {
-        if self.db.initialized() {
+    pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
-        self.pager.load().set_initial_page_size(size)?;
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        pager.set_initial_page_size(size)?;
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
         // pager will write to disk; otherwise paths like op_open_ephemeral allocate buffers
         // sized to the connection's page_size but compute usable_space from the stale 4 KiB
         // global header, tripping the btree_init_page assertion.
-        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+        if let Some(mv_store) = self.mv_store_for_db(database_id).as_ref() {
             mv_store.set_global_page_size(size);
         }
         self.bump_prepare_context_generation();
@@ -4601,14 +4586,10 @@ impl Connection {
             .values()
             .map(|f| {
                 let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc,
-                    function::ExtFunc::Scalar { argc, .. } => *argc,
-                };
                 (
                     f.name.clone(),
                     is_agg,
-                    argc,
+                    f.func.arg_count(),
                     function::Deterministic::is_deterministic(f.as_ref()),
                 )
             })
@@ -4926,6 +4907,24 @@ impl Connection {
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
+    }
+
+    /// Finish a commit of this connection's own MVCC transaction that was
+    /// abandoned before it completed. The dropped `CommitStateMachine` rolls
+    /// back the MVCC transaction itself; this releases the read lock and
+    /// transaction state the connection holds for it, which the state machine
+    /// does not own. Nested transactions, such as the one `nextval()` opens
+    /// inside a user transaction, must not call this.
+    pub(crate) fn end_abandoned_mvcc_commit(&self, db_id: usize) {
+        self.get_pager_from_database_index(&db_id)
+            .expect("the database of an abandoned MVCC commit must still have its pager")
+            .end_read_tx();
+        // `transaction_state` tracks only the main database. An attached database
+        // records its transaction in `attached_mv_txs` and in its pager locks, and
+        // the dropped state machine has already cleared that slot.
+        if db_id == MAIN_DB_ID {
+            self.set_tx_state(TransactionState::None);
+        }
     }
 
     /// Returns true if the connection is currently in a write transaction.

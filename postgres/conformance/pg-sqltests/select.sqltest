@@ -149,3 +149,29 @@ test select-current-data-and-time {
 expect {
     ok
 }
+
+setup comma_and_join {
+    CREATE TABLE ca (x int);
+    CREATE TABLE cb (y int);
+    CREATE TABLE cc (z int);
+    INSERT INTO ca VALUES (1);
+    INSERT INTO cb VALUES (2), (4);
+    INSERT INTO cc VALUES (3);
+}
+
+@setup comma_and_join
+test join-after-a-comma-reads-the-item-after-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON cb.y < cc.z;
+}
+expect {
+    1|2|3
+}
+
+@setup comma_and_join
+test cross-join-after-a-comma-keeps-the-column-order {
+    SELECT * FROM ca, cb CROSS JOIN cc ORDER BY 2;
+}
+expect {
+    1|2|3
+    1|4|3
+}

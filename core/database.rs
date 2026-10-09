@@ -33,13 +33,13 @@ use crate::{
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
-        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut},
+        pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, SharedPagerState},
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
         self,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8,
             AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
@@ -49,7 +49,7 @@ use crate::{
     vdbe::metrics::ConnectionMetrics,
     AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
     Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
-    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, Page, PageCodec, PageCodecId,
+    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
@@ -224,6 +224,7 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
+    pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
@@ -238,17 +239,19 @@ impl OpenOptions {
     /// The dialect has no default: it is fixed at open time and shared by
     /// every user of the instance, so the caller must choose it explicitly.
     pub fn new(dialect: Arc<dyn Dialect>) -> Self {
-        Self {
+        let options = Self {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
+            native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
-            dialect,
-        }
+            dialect: dialect.clone(),
+        };
+        dialect.register_native_extensions(options)
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
@@ -629,7 +632,6 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
-    init_lock: Arc<Mutex<()>>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -646,8 +648,7 @@ pub struct Database<
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
 
-    /// In Memory Page 1 for Empty Dbs
-    init_page_1: Arc<ArcSwapOption<Page>>,
+    pager_state: Arc<SharedPagerState>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -666,10 +667,10 @@ impl fmt::Debug for Database {
             .field("open_flags", &self.open_flags);
 
         // Database state information
-        let db_state_value = match &*self.init_page_1.load() {
-            // If init_page1 exists, this means the DB is empty
-            Some(_) => "uninitialized",
-            None => "initialized",
+        let db_state_value = if self.initialized() {
+            "initialized"
+        } else {
+            "uninitialized"
         };
         debug_struct.field("db_state", &db_state_value);
 
@@ -680,10 +681,10 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("mv_store", &mv_store_status);
 
-        let init_lock_status = if self.init_lock.try_lock().is_some() {
-            "unlocked"
-        } else {
+        let init_lock_status = if self.pager_state.is_init_locked() {
             "locked"
+        } else {
+            "unlocked"
         };
         debug_struct.field("init_lock", &init_lock_status);
 
@@ -729,6 +730,7 @@ impl Database {
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -780,7 +782,6 @@ impl Database {
             dialect,
             io: io.clone(),
             open_flags: flags,
-            init_lock: Arc::new(Mutex::new(())),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -797,7 +798,7 @@ impl Database {
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
 
-            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
+            pager_state: Arc::new(SharedPagerState::new(init_page_1)),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -809,6 +810,7 @@ impl Database {
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
+        native_extensions.register(&db)?;
         Ok(db)
     }
 
@@ -1338,6 +1340,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         );
 
         match &result {
@@ -1415,6 +1418,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         )
     }
 
@@ -1435,6 +1439,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1456,6 +1461,7 @@ impl Database {
             page_codec,
             allocators,
             dialect,
+            native_extensions,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1477,6 +1483,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1505,6 +1512,7 @@ impl Database {
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1632,15 +1640,6 @@ impl Database {
                         Ok(IOResult::Done(())) => {
                             // Release the schema lock
                             state.schema_guard = None;
-                        }
-                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
-                            let LimboError::ExtensionError(e) = *err else {
-                                unreachable!()
-                            };
-                            // this means that a vtab exists and we no longer have the module loaded.
-                            // we print a warning to the user to load the module
-                            state.schema_guard = None;
-                            tracing::warn!("open warning, failed to load extension: {e}");
                         }
                         Err(e) => return Err(e),
                     }
@@ -2538,7 +2537,6 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
     ) -> Result<Arc<Connection>> {
-        let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
@@ -2554,8 +2552,8 @@ impl Database {
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
-            page_size: AtomicU16::new(page_size.get_raw()),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
+            wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
             #[cfg(feature = "conn_raw_api")]
@@ -3212,10 +3210,11 @@ impl Database {
             self.io.clone(),
             PageCache::default(),
             buffer_pool,
-            self.init_lock.clone(),
-            self.init_page_1.clone(),
+            self.pager_state.clone(),
         )?;
-        pager.set_page_size(page_size);
+        if self.initialized() {
+            pager.set_page_size(page_size);
+        }
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
         }
@@ -3323,7 +3322,7 @@ impl Database {
 
     #[inline]
     pub(crate) fn initialized(&self) -> bool {
-        self.init_page_1.load().is_none()
+        self.pager_state.initialized()
     }
 
     pub(crate) fn can_load_extensions(&self) -> bool {

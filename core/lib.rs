@@ -31,6 +31,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;

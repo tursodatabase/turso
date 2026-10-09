@@ -19,8 +19,7 @@ set ALL_TESTS 1
 #          file but with the short timeout (hang_timeout_seconds), so a
 #          run does not spend minutes on it. A run that sees it complete
 #          says so, without failing: whether it completes can depend on
-#          the machine (misc7 runs one test per available fd). The reason
-#          is noted next to each.
+#          the machine. The reason is noted next to each.
 #   skip - not run at all. For the meta-runner files that would source
 #          permutations.test and run the whole suite again, and for files
 #          that cannot run in CI yet. The reason is noted next to each.
@@ -189,7 +188,7 @@ set test_files {
   dbstatus             fail
   dbstatus2            fail
   delete               fail
-  delete2              fail
+  delete2              pass
   delete3              pass
   delete4            fail
   delete_db            fail
@@ -215,7 +214,7 @@ set test_files {
   e_reindex            fail
   e_resolve            fail
   e_select             fail
-  e_select2            fail
+  e_select2            pass
   e_totalchanges       fail
   e_update             fail
   e_uri                fail
@@ -330,13 +329,13 @@ set test_files {
   join6                pass
   join7                fail
   join8                fail
-  join9                fail
-  joinA                fail
-  joinB                fail
-  joinC                fail
+  join9                pass
+  joinA                pass
+  joinB                pass
+  joinC                pass
   joinD                fail
   joinE                pass
-  joinF                fail
+  joinF                pass
   joinH                fail
   journal1             fail
   journal2             fail
@@ -368,7 +367,7 @@ set test_files {
   lock                 fail
   lock2                fail
   lock3                fail
-  lock4                fail
+  lock4                hang {polls for a test2.db-journal file, which WAL mode never creates}
   lock5                fail
   lock6                fail
   lock7                fail
@@ -391,7 +390,7 @@ set test_files {
   misc4                fail
   misc5                fail
   misc6                fail
-  misc7                hang {fd-exhaustion loop runs one test per available fd; 524288 fds with modern ulimits}
+  misc7                fail
   misc8                fail
   misuse               fail
   mjournal             fail
@@ -596,7 +595,7 @@ set test_files {
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
   tkt-78e04e52ea       fail
-  tkt-7a31705a7e6      fail
+  tkt-7a31705a7e6      pass
   tkt-7bbfb7d442       pass
   tkt-80ba201079       fail
   tkt-80e031a00f       fail
@@ -604,7 +603,7 @@ set test_files {
   tkt-868145d012       pass
   tkt-8c63ff0ec        pass
   tkt-91e2e8ba6f       pass
-  tkt-99378177930f87bd fail
+  tkt-99378177930f87bd pass
   tkt-9a8b09f8e6       pass
   tkt-9d68c883         fail
   tkt-9f2eb3abac       pass
@@ -623,7 +622,7 @@ set test_files {
   tkt-cbd054fa6b       fail
   tkt-d11f09d36e       pass
   tkt-d635236375       pass
-  tkt-d82e3f3721       fail
+  tkt-d82e3f3721       pass
   tkt-f3e5abed55       fail
   tkt-f67b41381a       fail
   tkt-f777251dc7a      fail
@@ -641,7 +640,7 @@ set test_files {
   tkt1512              fail
   tkt1514              fail
   tkt1536              pass
-  tkt1537              fail
+  tkt1537              pass
   tkt1567              fail
   tkt1644              fail
   tkt1667              pass
@@ -706,7 +705,7 @@ set test_files {
   tkt3841              pass
   tkt3871              fail
   tkt3879              pass
-  tkt3911              fail
+  tkt3911              pass
   tkt3918              fail
   tkt3922              pass
   tkt3929              pass
@@ -757,7 +756,7 @@ set test_files {
   upfrom1              fail
   upfrom2              fail
   upfrom3              fail
-  upfrom4              fail
+  upfrom4              pass
   upsert1              fail
   upsert2              fail
   upsert3              pass
@@ -936,7 +935,13 @@ while {$__runner_i < [llength $test_files]} {
   set __runner_crashed 0
   set __runner_timed_out 0
   set __runner_out ""
-  set __runner_chan [open [list | [info nameofexecutable] \
+  #
+  # Upstream expects the usual soft limit of 1024 file descriptors. misc7
+  # opens files until none are left and then runs one test per descriptor
+  # it gives back, and Tcl takes over a second to close a channel when
+  # half a million are open, so a high limit turns it into a hang.
+  set __runner_chan [open [list | /bin/sh -c {ulimit -S -n 1024 2>/dev/null; exec "$0" "$@"} \
+      [info nameofexecutable] \
       $testdir/run_file.tcl $testdir/$__runner_name.test 2>@1] r]
   fconfigure $__runner_chan -blocking 0
   set __runner_pid [pid $__runner_chan]

@@ -16,9 +16,8 @@ public final class TursoConnection {
   private static final Logger logger = LoggerFactory.getLogger(TursoConnection.class);
 
   private final String url;
-  private final long connectionPtr;
+  private long connectionPtr;
   private final TursoDB database;
-  private boolean closed;
 
   // Transaction state fields
   private boolean autoCommit = true;
@@ -87,16 +86,21 @@ public final class TursoConnection {
       }
     }
 
-    this._close(this.connectionPtr);
-    this.closed = true;
+    synchronized (this) {
+      if (isClosed()) {
+        return;
+      }
+      _close(connectionPtr);
+      connectionPtr = 0;
+    }
   }
 
   private native void _close(long connectionPtr);
 
   private native boolean _getAutoCommit(long connectionPtr);
 
-  public boolean isClosed() throws SQLException {
-    return closed;
+  public synchronized boolean isClosed() throws SQLException {
+    return connectionPtr == 0;
   }
 
   public TursoDB getDatabase() {
@@ -134,7 +138,10 @@ public final class TursoConnection {
     if (sqlBytes == null) {
       throw new SQLException("Failed to convert " + sql + " into bytes");
     }
-    return new TursoStatement(sql, prepareUtf8(connectionPtr, sqlBytes));
+    synchronized (this) {
+      checkOpen();
+      return new TursoStatement(sql, prepareUtf8(connectionPtr, sqlBytes));
+    }
   }
 
   private native long prepareUtf8(long connectionPtr, byte[] sqlUtf8) throws SQLException;

@@ -17,7 +17,9 @@
 //! the same FTS index concurrently. In WAL mode the same format runs with
 //! degenerate concurrency: the pager write lock serializes writers.
 
-use crate::alloc::DynAllocator;
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecInExt;
+use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -57,14 +59,14 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
     TantivyDocument, Term, TERMINATED,
 };
-use turso_parser::ast::{Select, SortOrder};
+use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
 mod format;
 mod rows;
 
-use directory::{BuildDirectory, SnapshotDirectory};
+use directory::{BuildDirectory, FileBytes, SnapshotDirectory};
 use format::{
     alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
     segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
@@ -160,22 +162,22 @@ const FTS_MAX_CACHED_SEARCHERS: usize = 4;
 /// storage I/O.
 const FTS_MAX_RETAINED_CACHE_BYTES: usize = 192 * 1024 * 1024;
 
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 crate::thread::thread_local! {
     static FTS_RETAINED_CACHE_BYTES_OVERRIDE: core::cell::Cell<Option<usize>> =
         const { core::cell::Cell::new(None) };
 }
 
-/// Override the retained-cache budget for tests on the current thread, so
-/// budget eviction is reachable without multi-hundred-MiB indexes.
+/// Set the byte limit for cache data kept between statements on the current thread.
+/// Tests can reach the limit without indexes that use hundreds of MiB.
 /// Pass `None` to restore the default.
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 pub fn set_fts_retained_cache_bytes_for_test(bytes: Option<usize>) {
     FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.set(bytes));
 }
 
 fn fts_max_retained_cache_bytes() -> usize {
-    #[cfg(feature = "test_helper")]
+    #[cfg(any(feature = "test_helper", feature = "simulator"))]
     if let Some(bytes) = FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.get()) {
         return bytes;
     }
@@ -285,43 +287,6 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
         }
 
         result
-    })
-}
-
-/// Check if text matches a query by testing for any common terms.
-///
-/// Standalone function that can be used without an FTS index.
-/// It tokenizes both the query and text using Tantivy's default tokenizer,
-/// and returns true if any query terms appear in the text.
-pub fn fts_match(text: &str, query: &str) -> bool {
-    if text.is_empty() || query.is_empty() {
-        return false;
-    }
-
-    FTS_TOKENIZER.with(|tokenizer| {
-        let mut tokenizer = tokenizer.borrow_mut();
-
-        // Extract query terms (lowercased)
-        let query_terms: HashSet<String> = {
-            let mut terms = HashSet::default();
-            let mut query_stream = tokenizer.token_stream(query);
-            while let Some(token) = query_stream.next() {
-                terms.insert(token.text.to_string());
-            }
-            terms
-        };
-        if query_terms.is_empty() {
-            return false;
-        }
-
-        // Tokenize the text and check if any query terms appear
-        let mut text_stream = tokenizer.token_stream(text);
-        while let Some(token) = text_stream.next() {
-            if query_terms.contains(&token.text) {
-                return true;
-            }
-        }
-        false
     })
 }
 
@@ -449,6 +414,10 @@ impl SegmentByteCache {
     }
 
     fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
         let entry = self.entries.remove(position);
         let data = Arc::clone(&entry.1);
@@ -457,6 +426,10 @@ impl SegmentByteCache {
     }
 
     fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
+        if budget == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|(entry, _)| *entry != id);
         self.entries.push((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
@@ -506,6 +479,10 @@ struct SearcherCache {
 
 impl SearcherCache {
     fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(position);
         self.entries.push(entry);
@@ -513,6 +490,10 @@ impl SearcherCache {
     }
 
     fn put(&mut self, entry: SearcherCacheEntry) {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|existing| existing.key != entry.key);
         self.entries.push(entry);
         while self.entries.len() > FTS_MAX_CACHED_SEARCHERS {
@@ -834,6 +815,32 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(self)))
     }
+
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        let mut result = crate::util::try_substitute_parameters(pattern, parameters)?;
+        let ast::Expr::FunctionCall { name, args, .. } = result.as_mut() else {
+            return Some(result);
+        };
+        if !name.as_str().eq_ignore_ascii_case("fts_score") {
+            return Some(result);
+        }
+        let ast::Expr::Literal(ast::Literal::String(fields)) =
+            parameters.get(&crate::util::FTS_FIELD_PARAMETER)?
+        else {
+            return None;
+        };
+        let mut selected = Vec::new();
+        for field in fields.trim_matches('\'').split(',') {
+            selected.push(args.get(field.parse::<usize>().ok()?)?.clone());
+        }
+        selected.push(args.last()?.clone());
+        *args = selected;
+        Some(result)
+    }
 }
 
 /// Pattern indices for FTS queries
@@ -842,8 +849,8 @@ const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
 const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
 const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
 const FTS_PATTERN_COMBINED: i64 = 4;
-const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
-const FTS_PATTERN_MATCH: i64 = 6;
+pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
+pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
 
 fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     let live_docs = usize::try_from(live_docs).unwrap_or(usize::MAX);
@@ -1285,7 +1292,7 @@ impl FtsCursor {
             .read_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut files: HashMap<PathBuf, Arc<[u8]>> = HashMap::default();
+        let mut files: HashMap<PathBuf, FileBytes> = HashMap::default();
         for segment in &self.segments {
             for (name, data) in &segment.data.files {
                 files.insert(PathBuf::from(name), Arc::clone(data));
@@ -1294,19 +1301,21 @@ impl FtsCursor {
                 // Serve the tombstone set as the segment's `.del` file so
                 // the alive filter is enforced at the SegmentReader level
                 // and every query path honors it.
+                let bytes = with_tantivy_footer(alive_bitset_bytes(
+                    segment.descriptor.max_doc,
+                    &segment.deleted,
+                    &self.allocator,
+                )?)?;
                 files.insert(
                     PathBuf::from(tombstone_del_file_name(&segment.id())),
-                    Arc::from(with_tantivy_footer(alive_bitset_bytes(
-                        segment.descriptor.max_doc,
-                        &segment.deleted,
-                    ))?),
+                    Arc::new(bytes),
                 );
             }
         }
         let scratch = self.shared.scratch_index(&self.schema)?;
         let specs: Vec<SegmentMetaSpec> =
             self.segments.iter().map(LoadedSegment::meta_spec).collect();
-        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs)?;
+        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs, &self.allocator)?;
         let directory = SnapshotDirectory::new(files, meta_json);
         let index = Index::open(directory)
             .map_err(|e| LimboError::InternalError(format!("FTS snapshot open: {e}")))?;
@@ -1720,13 +1729,18 @@ impl FtsCursor {
                     }
                     if segment_done {
                         let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let files = assemble_segment_files(descriptor, std::mem::take(chunks))?;
+                        let files = assemble_segment_files(
+                            descriptor,
+                            std::mem::take(chunks),
+                            &self.allocator,
+                        )?;
                         let data = Arc::new(segment_data_from_files(
                             &self.shared,
                             &self.schema,
                             descriptor.segment_id,
                             descriptor.max_doc,
                             files,
+                            &self.allocator,
                         )?);
                         self.shared
                             .stats
@@ -2189,6 +2203,7 @@ impl FtsCursor {
                 segment_id,
                 merged_meta.max_doc(),
                 captured.clone(),
+                &self.allocator,
             )?;
             let (segment, rows) =
                 segment_rows_from_files(segment_id, merged_meta.max_doc(), captured, identities)?;
@@ -2440,7 +2455,8 @@ fn segment_data_from_files(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<String, Arc<[u8]>>,
+    files: HashMap<String, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentData> {
     let by_path = files
         .iter()
@@ -2452,6 +2468,7 @@ fn segment_data_from_files(
         segment_id,
         max_doc,
         by_path,
+        allocator,
     )?;
     Ok(SegmentData::new(files, identities))
 }
@@ -2465,11 +2482,13 @@ fn read_segment_identities(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
-    let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
-    let index = Index::open(SnapshotDirectory::new(files, meta_json))
+    let meta_json = synthesize_meta_json(scratch, schema, &[spec], allocator)?;
+    let directory = SnapshotDirectory::new(files, meta_json);
+    let index = Index::open(directory)
         .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
     let meta = index
         .searchable_segment_metas()
@@ -2512,8 +2531,9 @@ fn read_segment_identities(
 fn assemble_segment_files(
     descriptor: &SegmentDescriptor,
     mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<HashMap<String, Arc<[u8]>>> {
-    let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    allocator: &DynAllocator,
+) -> Result<HashMap<String, FileBytes>> {
+    let mut files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, entry) in descriptor.files.iter().enumerate() {
         let file_ord = file_ord as u32;
         let chunk_map = chunks.remove(&file_ord).ok_or_else(|| {
@@ -2531,7 +2551,7 @@ fn assemble_segment_files(
                 entry.num_chunks
             )));
         }
-        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map)?;
+        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map, allocator)?;
         if assembled.len() as u64 != entry.size {
             return Err(LimboError::Corrupt(format!(
                 "FTS segment file {} has {} bytes but the descriptor records {}",
@@ -2552,12 +2572,12 @@ fn assemble_segment_files(
 }
 
 /// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-///
-/// The chunks are written straight into the shared allocation: building a
-/// `Vec` first and converting it with `Arc::from` would copy every byte a
-/// second time and hold both copies at once. Each chunk is dropped as soon
-/// as it has been copied, so peak memory is the file plus one chunk.
-fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::AssembleBuffer)]
+fn assemble_chunks(
+    path: &std::path::Path,
+    mut chunks: HashMap<i64, Vec<u8>>,
+    allocator: &DynAllocator,
+) -> Result<FileBytes> {
     let max_chunk =
         chunks.keys().max().copied().ok_or_else(|| {
             LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
@@ -2568,10 +2588,12 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
             path.display()
         )));
     }
-    let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
-    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
-    let mut offset = 0;
+    let total = chunks.values().try_fold(0usize, |total, chunk| {
+        total
+            .checked_add(chunk.len())
+            .ok_or(LimboError::OutOfMemory)
+    })?;
+    let mut assembled = DynVec::try_with_capacity_in(total, allocator.clone())?;
     for chunk_no in 0..=max_chunk {
         let data = chunks.remove(&chunk_no).ok_or_else(|| {
             LimboError::Corrupt(format!(
@@ -2580,10 +2602,7 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
                 chunk_no
             ))
         })?;
-        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
-            slot.write(*byte);
-        }
-        offset += data.len();
+        assembled.try_extend(data)?;
     }
     if !chunks.is_empty() {
         // Keys outside `0..=max_chunk` (a negative chunk number next to
@@ -2595,14 +2614,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
         )));
     }
     turso_assert!(
-        offset == total,
+        assembled.len() == total,
         "FTS chunk assembly must write exactly the bytes it counted"
     );
-    // SAFETY: `total` is the sum of every chunk's length and every chunk was
-    // consumed by the loop above exactly once, writing `total` bytes
-    // contiguously from offset 0 (asserted), so every byte of the slice is
-    // initialized.
-    Ok(unsafe { assembled.assume_init() })
+    Ok(Arc::new(assembled))
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2611,10 +2626,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
 fn rename_segment_files(
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
     from: &SegmentId,
     to: &SegmentId,
-) -> Result<HashMap<PathBuf, Arc<[u8]>>> {
+) -> Result<HashMap<PathBuf, FileBytes>> {
     let from = from.uuid_string();
     let to = to.uuid_string();
     files
@@ -2637,7 +2652,7 @@ fn rename_segment_files(
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
-    captured: HashMap<PathBuf, Arc<[u8]>>,
+    captured: HashMap<PathBuf, FileBytes>,
     identities: SegmentIdentities,
 ) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
     let mut file_names: Vec<String> = captured
@@ -2648,7 +2663,7 @@ fn segment_rows_from_files(
     file_names.sort();
     let mut inserts = Vec::new();
     let mut entries = Vec::new();
-    let mut data_files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    let mut data_files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, name) in file_names.into_iter().enumerate() {
         let bytes = captured
             .get(std::path::Path::new(&name))
@@ -3078,10 +3093,43 @@ impl IndexMethodCursor for FtsCursor {
             query => query.to_string(),
         };
 
-        let parser = self
-            .cached_parser
-            .as_deref()
-            .expect("parser built with the searcher");
+        let fields = match values.last().map(Register::get_value) {
+            Some(Value::Text(fields)) => fields.as_str(),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "FTS query_start: missing indexed fields".into(),
+                )
+                .into())
+            }
+        };
+        let selected_fields = fields
+            .split(',')
+            .map(|field| {
+                field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.default_fields.get(i).copied())
+                    .ok_or_else(|| {
+                        LimboError::InternalError("FTS query_start: invalid field".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parser = if selected_fields.len() == self.default_fields.len() {
+            Arc::clone(
+                self.cached_parser
+                    .as_ref()
+                    .expect("parser built with the searcher"),
+            )
+        } else {
+            let mut parser = tantivy::query::QueryParser::for_index(
+                self.index.as_ref().expect("index built with the searcher"),
+                selected_fields,
+            );
+            for &(field, boost) in &self.field_boosts {
+                parser.set_field_boost(field, boost);
+            }
+            Arc::new(parser)
+        };
 
         // Bound the query string before it reaches Tantivy's recursive
         // parser: a few KiB of nested parentheses would otherwise burn
@@ -3255,9 +3303,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
-        // Column 0 = score for fts_score, or 1 (true) for fts_match
-        if idx != 0 {
-            return Err(LimboError::InternalError("FTS: only column 0 supported".into()).into());
+        // Column 0 is the score for score queries, or 1 (true) for match queries.
+        // Column 1 is the score for match queries.
+        if idx != 0
+            && !(idx == 1
+                && matches!(
+                    self.current_pattern,
+                    FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT
+                ))
+        {
+            return Err(LimboError::InternalError("FTS: column out of bounds".into()).into());
         }
 
         match self.current_pattern {
@@ -3273,8 +3328,15 @@ impl IndexMethodCursor for FtsCursor {
                     )
                     .into());
                 }
-                // For fts_match patterns, return 1 (true) - indicates this row matches
-                Ok(IOResult::Done(Value::from_i64(1)))
+                if idx == 0 {
+                    return Ok(IOResult::Done(Value::from_i64(1)));
+                }
+                let score = if let Some(stream) = &self.streaming_hits {
+                    stream.current.unwrap().0
+                } else {
+                    self.current_hits[self.hit_pos].0
+                };
+                Ok(IOResult::Done(Value::from_f64(score as f64)))
             }
             FTS_PATTERN_SCORE
             | FTS_PATTERN_COMBINED

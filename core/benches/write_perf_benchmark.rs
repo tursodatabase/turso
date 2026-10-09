@@ -11,8 +11,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -603,6 +601,81 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         });
     }
 
+    const DELETE_ALL_ROWS: usize = 50_000;
+    const DELETE_ALL_SCHEMA: &str =
+        "CREATE TABLE source (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER); \
+         CREATE TABLE clear_target (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER); \
+         CREATE INDEX clear_target_data ON clear_target(data); \
+         CREATE INDEX clear_target_bucket ON clear_target(bucket)";
+    let seed_source = format!(
+        "INSERT INTO source \
+         SELECT value, printf('data_%d', value), value % 1000 FROM generate_series(0, {})",
+        DELETE_ALL_ROWS - 1
+    );
+
+    group.throughput(Throughput::Elements(DELETE_ALL_ROWS as u64));
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db = setup_limbo_with_sync(
+        &temp_dir,
+        "CREATE TABLE source (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER)",
+        false,
+    );
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE clear_target (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX clear_target_data ON clear_target(data)")
+        .unwrap();
+    conn.execute("CREATE INDEX clear_target_bucket ON clear_target(bucket)")
+        .unwrap();
+    let mut seed = conn.query(&seed_source).unwrap().unwrap();
+    run_to_completion(&mut seed, &db).unwrap();
+    let mut refill = conn
+        .prepare("INSERT INTO clear_target SELECT * FROM source")
+        .unwrap();
+    let mut delete_all = conn.prepare("DELETE FROM clear_target").unwrap();
+
+    group.bench_function(BenchmarkId::new("limbo", "delete_all_three_btrees"), |b| {
+        iter_custom_or_iter!(b, |iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                run_to_completion(&mut refill, &db).unwrap();
+                refill.reset().unwrap();
+
+                let start = std::time::Instant::now();
+                run_to_completion(&mut delete_all, &db).unwrap();
+                total += start.elapsed();
+                delete_all.reset().unwrap();
+            }
+            total
+        });
+    });
+
+    if enable_rusqlite {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sqlite_conn = setup_rusqlite(&temp_dir, DELETE_ALL_SCHEMA);
+        sqlite_conn
+            .pragma_update(None, "synchronous", "OFF")
+            .unwrap();
+        rusqlite::vtab::series::load_module(&sqlite_conn).unwrap();
+        sqlite_conn.execute(&seed_source, []).unwrap();
+
+        group.bench_function(BenchmarkId::new("sqlite", "delete_all_three_btrees"), |b| {
+            iter_custom_or_iter!(b, |iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    sqlite_conn
+                        .execute("INSERT INTO clear_target SELECT * FROM source", [])
+                        .unwrap();
+
+                    let start = std::time::Instant::now();
+                    sqlite_conn.execute("DELETE FROM clear_target", []).unwrap();
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
+    }
+
     group.finish();
 }
 
@@ -837,16 +910,6 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = write_perf_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(50);
-    targets = bench_index_impact, bench_transaction_size, bench_key_pattern, bench_update_performance, bench_delete_performance, bench_large_transaction_commit, bench_fsync_overhead
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = write_perf_benches;
     config = Criterion::default().sample_size(50);

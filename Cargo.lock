@@ -74,19 +74,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ahash"
-version = "0.8.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e89da841a80418a9b391ebaea17f5c112ffaaa96f621d2c285b5174da76b9011"
-dependencies = [
- "cfg-if",
- "getrandom 0.2.15",
- "once_cell",
- "version_check",
- "zerocopy 0.7.35",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1203,7 +1190,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1232,7 +1219,7 @@ dependencies = [
  "turso_parser",
  "turso_sdk_kit",
  "twox-hash",
- "zerocopy 0.8.26",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1756,7 +1743,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "differential-fuzzer"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2258,7 +2245,7 @@ dependencies = [
  "anyhow",
  "clap",
  "memory-benchmark",
- "pprof 0.15.0",
+ "pprof",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -2529,7 +2516,7 @@ version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 dependencies = [
- "ahash 0.7.8",
+ "ahash",
 ]
 
 [[package]]
@@ -3145,24 +3132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inferno"
-version = "0.11.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "232929e1d75fe899576a3d5c7416ad0d88dbfbb3c3d6aa00873a7408a50ddb88"
-dependencies = [
- "ahash 0.8.11",
- "indexmap 2.11.1",
- "is-terminal",
- "itoa",
- "log",
- "num-format",
- "once_cell",
- "quick-xml 0.26.0",
- "rgb",
- "str_stack",
-]
-
-[[package]]
 name = "inotify"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3484,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3492,7 +3461,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3505,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3515,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3523,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3532,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3541,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3580,7 +3549,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "cc",
 ]
@@ -4110,16 +4079,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
-name = "num-format"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a652d9771a63711fd3c3deb670acfbe5c30a4072e664d7a3bf5a9e1056ac72c3"
-dependencies = [
- "arrayvec",
- "itoa",
-]
-
-[[package]]
 name = "num-integer"
 version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4442,7 +4401,7 @@ checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64",
  "indexmap 2.11.1",
- "quick-xml 0.41.0",
+ "quick-xml",
  "serde",
  "time",
 ]
@@ -4560,29 +4519,6 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pprof"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebbe2f8898beba44815fdc9e5a4ae9c929e21c5dc29b0c774a15555f7f58d6d0"
-dependencies = [
- "aligned-vec",
- "backtrace",
- "cfg-if",
- "criterion",
- "findshlibs",
- "inferno",
- "libc",
- "log",
- "nix 0.26.4",
- "once_cell",
- "parking_lot",
- "smallvec",
- "symbolic-demangle",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "pprof"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187"
@@ -4608,7 +4544,7 @@ version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
- "zerocopy 0.8.26",
+ "zerocopy",
 ]
 
 [[package]]
@@ -4824,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -4908,15 +4844,6 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
-
-[[package]]
-name = "quick-xml"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f50b1c63b38611e7d4d7f68b82d3ad0cc71a2ad2e7f61fc10f1328d917c93cd"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "quick-xml"
@@ -5332,15 +5259,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
-]
-
-[[package]]
-name = "rgb"
-version = "0.8.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57397d16646700483b67d2dd6511d79318f9d057fdbd21a4066aeac8b41d310a"
-dependencies = [
- "bytemuck",
 ]
 
 [[package]]
@@ -6138,7 +6056,7 @@ dependencies = [
 
 [[package]]
 name = "sql_gen"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -6159,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -6169,7 +6087,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -6255,12 +6173,6 @@ dependencies = [
  "approx",
  "num-traits",
 ]
-
-[[package]]
-name = "str_stack"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9091b6114800a5f2141aee1d1b9d6ca3592ac062dc5decb3764ec5895a47b4eb"
 
 [[package]]
 name = "strict"
@@ -7097,7 +7009,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7122,7 +7034,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dbhash"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "clap",
  "hex",
@@ -7133,7 +7045,7 @@ dependencies = [
 
 [[package]]
 name = "turso-java"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -7142,7 +7054,7 @@ dependencies = [
 
 [[package]]
 name = "turso-join-benchmark"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7152,7 +7064,7 @@ dependencies = [
 
 [[package]]
 name = "turso-txn-latency"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "clap",
  "libc",
@@ -7163,7 +7075,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7207,7 +7119,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "aegis",
  "aes",
@@ -7256,7 +7168,6 @@ dependencies = [
  "parking_lot",
  "pastey",
  "polling",
- "pprof 0.14.0",
  "quickcheck",
  "quickcheck_macros",
  "rand 0.9.4",
@@ -7281,6 +7192,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tantivy",
+ "tantivy-common",
  "tempfile",
  "test-log",
  "thiserror 2.0.16",
@@ -7297,7 +7209,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -7306,7 +7218,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -7317,7 +7229,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7326,7 +7238,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "napi",
@@ -7340,7 +7252,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -7348,7 +7260,6 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "memchr",
  "miette",
- "pprof 0.14.0",
  "serde",
  "strum",
  "strum_macros",
@@ -7358,7 +7269,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -7372,14 +7283,14 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_client"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "thiserror 2.0.16",
 ]
 
 [[package]]
 name = "turso_pg_parser"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "miette",
@@ -7390,7 +7301,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_regress"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7399,7 +7310,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_server"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7413,7 +7324,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_tests"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -7440,12 +7351,12 @@ dependencies = [
  "turso_pg",
  "turso_sdk_kit",
  "twox-hash",
- "zerocopy 0.8.26",
+ "zerocopy",
 ]
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -7461,7 +7372,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7484,7 +7395,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless_conformance"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "base64",
  "reqwest",
@@ -7495,7 +7406,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless_differential"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "hegeltest",
  "serde_json",
@@ -7507,11 +7418,12 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "cc",
  "env_logger",
  "libc",
+ "limbo_csv",
  "tempfile",
  "tracing",
  "tracing-appender",
@@ -7523,7 +7435,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -7544,7 +7456,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "base64",
  "bytes",
@@ -7572,7 +7484,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "genawaiter",
  "napi",
@@ -7587,7 +7499,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -7604,7 +7516,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7615,6 +7527,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sql_generation",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "turso_core",
@@ -7625,7 +7538,7 @@ dependencies = [
 
 [[package]]
 name = "tursopg"
-version = "0.8.0-pre.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -8650,31 +8563,11 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
-dependencies = [
- "zerocopy-derive 0.7.35",
-]
-
-[[package]]
-name = "zerocopy"
 version = "0.8.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1039dd0d3c310cf05de012d8a39ff557cb0d23087fd44cad61df08fc31907a2f"
 dependencies = [
- "zerocopy-derive 0.8.26",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.100",
+ "zerocopy-derive",
 ]
 
 [[package]]

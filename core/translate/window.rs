@@ -454,7 +454,7 @@ fn rewrite_expr_referencing_current_window(
         push_into_source_subquery(filter_expr, aggregates, ctx)?;
     }
     let filter_expr = filter_over.filter_clause.as_deref().cloned();
-    filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
+    filter_over.over_clause = Some(Box::new(Over::Name(Name::exact(window_name))));
     Ok(RewrittenWindowCall {
         expr: expr.clone(),
         filter_expr,

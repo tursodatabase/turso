@@ -53,6 +53,11 @@ This project depends on pastey, distributed by the pastey authors:
 * License: licenses/core/pastey-mit-license.md (MIT License)
 * Homepage: https://github.com/AS1100K/pastey
 
+This project depends on tantivy-common, distributed by the Tantivy project authors:
+
+* License: licenses/core/tantivy-common-mit-license.md (MIT License)
+* Homepage: https://github.com/quickwit-oss/tantivy
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)

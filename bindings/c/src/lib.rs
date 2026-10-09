@@ -239,6 +239,8 @@ impl sqlite3 {
         conn: Arc<turso_core::Connection>,
         filename: CString,
     ) -> Self {
+        #[cfg(feature = "csv")]
+        register_csv_module(&conn);
         let inner = sqlite3Inner {
             _io: io,
             _db: db,
@@ -293,6 +295,16 @@ pub struct sqlite3_stmt {
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
+}
+
+#[cfg(feature = "csv")]
+fn register_csv_module(conn: &Arc<turso_core::Connection>) {
+    unsafe {
+        let mut api = conn._build_turso_ext();
+        let registered = limbo_csv::register_extension_static(&mut api).is_ok();
+        conn._free_extension_ctx(api);
+        assert!(registered, "failed to register the csv module");
+    }
 }
 
 impl sqlite3_stmt {

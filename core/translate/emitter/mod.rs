@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -490,10 +490,11 @@ impl<'a> Resolver<'a> {
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    Arc::new(
+                    let mut schema =
                         Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed"),
-                    )
+                            .expect("built-in type definitions are malformed");
+                    schema.copy_table_valued_functions(self.schema);
+                    Arc::new(schema)
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
@@ -1047,9 +1048,13 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
-    /// mapping between table loop index and associated metadata (for left joins only)
-    /// this metadata exists for the right table in a given left join
+    /// Match state for each JOIN that keeps unmatched left rows.
+    ///
+    /// Left-row and right-row match state are separate because a FULL JOIN needs both.
+    /// This matches SQLite's `WhereLevel.iLeftJoin` and `WhereLevel.pRJ` fields.
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// Match state for each JOIN that keeps unmatched right rows.
+    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
     /// mapping between table loop index and associated metadata (for semi/anti joins)
     pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
     pub resolver: Resolver<'a>,
@@ -1074,6 +1079,7 @@ pub struct TranslateCtx<'a> {
     /// Only populated when GROUP BY uses a sorter, enabling deferred expression
     /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
     /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
+    /// An expression that the selected index stores is kept whole.
     pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
@@ -1109,6 +1115,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_right_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),

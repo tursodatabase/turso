@@ -16,6 +16,9 @@ pub enum AllocationSite {
 pub enum FtsAllocationSite {
     CaptureBuffer,
     AtomicMetadata,
+    AssembleBuffer,
+    SnapshotMetadata,
+    SnapshotTombstone,
 }
 
 impl From<FtsAllocationSite> for AllocationSite {
@@ -66,6 +69,7 @@ pub enum MvStoreAllocationSite {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SchemaAllocationSite {
     MakeMut,
+    FlatViewColumns,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -324,6 +324,88 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void PooledConnectionsDoNotShareConnectionState()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-state.db");
+        using (var first = new SqliteConnection($"Data Source={path}"))
+        {
+            first.Open();
+            first.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); PRAGMA foreign_keys = ON;");
+            first.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
+        }
+
+        using var second = new SqliteConnection($"Data Source={path}");
+        second.Open();
+        second.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(0);
+        second.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClosingPooledConnectionRollsBackOpenTransaction()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-rollback.db");
+        using (var setup = new SqliteConnection($"Data Source={path}"))
+        {
+            setup.Open();
+            setup.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER);");
+        }
+
+        using (var writer = new SqliteConnection($"Data Source={path}"))
+        {
+            writer.Open();
+            writer.ExecuteNonQuery("BEGIN; INSERT INTO Data VALUES (1);");
+        }
+
+        using var reader = new SqliteConnection($"Data Source={path}");
+        reader.Open();
+        reader.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClearPoolReleasesDatabaseFiles()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-clear.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1);");
+            connection.Close();
+            SqliteConnection.ClearPool(connection);
+        }
+
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
+    }
+
+    [Test]
+    public void FailedPooledOpenDoesNotKeepFileOpen()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-not-a-database.db");
+        var garbage = new byte[8192];
+        Array.Fill(garbage, (byte)0x5A);
+        File.WriteAllBytes(path, garbage);
+
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+            Assert.Throws<SqliteException>(() => connection.Open());
+
+        File.Delete(path);
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
+    }
+
+    [Test]
     public void StateChangeFiresForOpenAndClose()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1047,6 +1129,77 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueResolvesDeclaredTypesForEachResultSet()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a'), ('0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT Id FROM GuidIds; SELECT Id FROM TextIds;");
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().BeOfType<Guid>();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be(new Guid("0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a"));
+
+        reader.NextResult().Should().BeTrue();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+    }
+
+    [Test]
+    public void GetValueResolvesDeclaredTypesThroughAliasesAndJoins()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT t.Id AS TextId, g.Id AS GuidId FROM TextIds t JOIN GuidIds g ON g.Id = t.Id");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("GUID");
+        reader.GetValue(1).Should().Be(new Guid("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a"));
+        reader.Invoking(r => r.GetDataTypeName(2)).Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
+    public void GetValueUsesStorageTypeWhenNoDeclaredTypeIsAvailable()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE Items (Id GUID, Untyped);
+            INSERT INTO Items VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a', 'dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        // An expression over a GUID column and a column declared without a type have no declared type,
+        // so values are returned as stored instead of being converted to Guid.
+        using var reader = connection.ExecuteReader("SELECT lower(Id), Untyped, Id || '', 1 + 1 FROM Items");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("TEXT");
+        reader.GetValue(1).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(2).Should().Be("TEXT");
+        reader.GetValue(2).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(3).Should().Be("INTEGER");
+        reader.GetValue(3).Should().Be(2L);
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1184,6 +1337,7 @@ public class SqliteFacadeTests
 
         public void Dispose()
         {
+            SqliteConnection.ClearAllPools();
             if (Directory.Exists(Path))
                 Directory.Delete(Path, recursive: true);
         }

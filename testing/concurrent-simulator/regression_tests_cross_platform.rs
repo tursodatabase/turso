@@ -240,16 +240,16 @@ fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
     }
 }
 
-/// The FTS workloads must exercise the index, not `fts_match`'s scalar
-/// fallback, and a seeded run must replay: segment ids and index
-/// incarnations are drawn from the seeded IO, so two runs of one seed end
-/// with byte-identical database files. Before the fix the MVCC log of two
-/// same-seed runs differed in every `fts2/chunk/<uuid>` path.
+/// FTS workloads must use the index rather than scan the table.
+/// Two runs with the same seed must produce the same database file bytes.
+/// The simulator uses the seed to generate segment and index IDs.
+/// Before the fix, two runs with the same seed had different MVCC log paths
+/// for every `fts2/chunk/<uuid>` entry.
 #[test]
 fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     use turso_whopper::operations::Operation;
     use turso_whopper::properties::{
-        FtsSelfDifferentialProperty, IntegrityCheckProperty, Property,
+        FtsResultComparisonProperty, IntegrityCheckProperty, Property,
     };
     use turso_whopper::workloads::{
         BeginWorkload, CommitWorkload, FtsDeleteWorkload, FtsInsertWorkload, FtsMatchWorkload,
@@ -270,7 +270,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         ];
         let properties: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
-            Box::new(FtsSelfDifferentialProperty),
+            Box::new(FtsResultComparisonProperty),
         ];
         let opts = WhopperOpts {
             seed: Some(seed),
@@ -285,14 +285,14 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         let mut whopper = Whopper::new(opts).expect("create whopper");
         whopper
             .run()
-            .expect("FTS workloads must not violate a property");
+            .expect("FTS workloads failed a result comparison");
         (whopper.stats.clone(), whopper.db_file_bytes())
     }
 
     let (first_stats, first_files) = run(0xF75);
     assert!(
         first_stats.fts_checks > 0,
-        "no FTS differential completed, so the workloads tested nothing"
+        "no FTS result comparison completed"
     );
 
     let (second_stats, second_files) = run(0xF75);
@@ -303,13 +303,12 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         assert_eq!(name, other_name);
         assert!(
             first == second,
-            "{name} differs between two runs of one seed: something (FTS segment ids, index \
-             incarnations) is not drawn from the seeded IO, so seeds do not replay"
+            "{name} differs between two runs with the same seed. \
+             FTS segment and index IDs must come from the simulator's seeded random generator"
         );
     }
 
-    // The differential's `fts_match` side must be planned through the
-    // index method; the scalar fallback would make the comparison vacuous.
+    // The FTS search must use the index. Otherwise, both queries scan the table.
     let io = Arc::new(SimulatorIO::new(
         false,
         ChaCha8Rng::seed_from_u64(7),
@@ -329,14 +328,14 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     .expect("open db");
     let conn = db.connect().expect("connect");
     for (_, sql) in fts_sim_schema() {
-        conn.execute(&sql).expect("bootstrap FTS schema");
+        conn.execute(&sql).expect("create the FTS table and index");
     }
-    let differential = Operation::FtsMatchDifferential {
-        token: "alpha".to_string(),
+    let comparison_sql = Operation::CompareFtsResults {
+        word: "alpha".to_string(),
     }
     .sql();
     let mut stmt = conn
-        .prepare(format!("EXPLAIN {differential}"))
+        .prepare(format!("EXPLAIN {comparison_sql}"))
         .expect("prepare explain");
     let mut opcodes = Vec::new();
     loop {
@@ -352,7 +351,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     }
     assert!(
         opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
-        "the FTS differential is not planned through the index method: {opcodes:?}"
+        "the FTS search does not use the index: {opcodes:?}"
     );
 }
 

@@ -102,13 +102,19 @@ const GEN_EXPRS: &[GenExpr] = &[
 const WORKER_STACK: usize = 64 << 20;
 
 fn run_on_big_stack(sql: String) -> turso_core::Result<()> {
+    run_with_stack(WORKER_STACK, vec![sql])
+}
+
+fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Result<()> {
     std::thread::Builder::new()
-        .stack_size(WORKER_STACK)
+        .stack_size(stack_size)
         .spawn(move || -> turso_core::Result<()> {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
             let conn = db.connect()?;
-            conn.execute(&sql)?;
+            for sql in &statements {
+                conn.execute(sql)?;
+            }
             Ok(())
         })
         .expect("failed to spawn worker thread")
@@ -128,4 +134,58 @@ fn over_limit_is_a_graceful_depth_error() {
         run_on_big_stack((gen_expr.build)(MAX_EXPR_DEPTH - 1))
             .unwrap_or_else(|err| panic!("{}: under-limit query failed: {err:?}", gen_expr.name));
     }
+}
+
+/// Rust gives spawned threads a 2 MiB stack unless told otherwise.
+const DEFAULT_THREAD_STACK: usize = 2 << 20;
+
+#[test]
+fn longest_allowed_operator_chains_run_on_a_default_thread_stack() {
+    for gen_expr in GEN_EXPRS
+        .iter()
+        .filter(|g| ["or-chain", "and-chain", "arithmetic-chain"].contains(&g.name))
+    {
+        run_with_stack(
+            DEFAULT_THREAD_STACK,
+            vec![(gen_expr.build)(MAX_EXPR_DEPTH - 1)],
+        )
+        .unwrap_or_else(|err| panic!("{}: {err:?}", gen_expr.name));
+    }
+}
+
+/// ORMs generate this "update only if something changed" upsert: for every
+/// column, `typeof(x) IS NOT typeof(excluded.x) OR x IS NOT excluded.x`.
+/// See https://github.com/tursodatabase/turso/issues/9499.
+#[test]
+fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
+    let columns: Vec<String> = (0..14).map(|i| format!("c{i}")).collect();
+    let create = format!(
+        "CREATE TABLE t ({} PRIMARY KEY, {})",
+        columns[0],
+        columns[1..].join(", ")
+    );
+    let set = columns
+        .iter()
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let changed = columns
+        .iter()
+        .map(|c| {
+            format!(
+                "typeof({c}) IS NOT typeof(excluded.{c}) OR {c} IS NOT excluded.{c} COLLATE BINARY"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let values = (0..14)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let upsert = format!(
+        "INSERT INTO t VALUES ({values}) ON CONFLICT ({}) DO UPDATE SET {set} WHERE {changed}",
+        columns[0]
+    );
+
+    run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
 }

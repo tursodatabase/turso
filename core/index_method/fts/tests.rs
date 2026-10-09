@@ -81,6 +81,43 @@ fn test_attachment() -> FtsIndexAttachment {
 }
 
 #[test]
+fn score_result_uses_the_fields_selected_by_the_query() {
+    let attachment = test_attachment();
+    let pattern = &attachment.patterns[FTS_PATTERN_COMBINED as usize];
+    let ast::OneSelect::Select { columns, .. } = &pattern.body.select else {
+        panic!("expected a SELECT pattern");
+    };
+    let ast::ResultColumn::Expr(score, _) = &columns[0] else {
+        panic!("expected a score result");
+    };
+    let ast::Expr::FunctionCall { args, .. } = score.as_ref() else {
+        panic!("expected a score function");
+    };
+
+    for (fields, expected_columns) in [("1", &[1][..]), ("0", &[0][..]), ("0,1", &[0, 1][..])] {
+        let parameters = FxHashMap::from_iter([
+            (1, Expr::Literal(Literal::String("'needle'".to_string()))),
+            (
+                crate::util::FTS_FIELD_PARAMETER,
+                Expr::Literal(Literal::String(format!("'{fields}'"))),
+            ),
+        ]);
+        let result = attachment.result_column(score, &parameters).unwrap();
+        let Expr::FunctionCall {
+            args: result_args, ..
+        } = result.as_ref()
+        else {
+            panic!("expected a score function");
+        };
+        assert_eq!(result_args.len(), expected_columns.len() + 1);
+        for (&expected, actual) in expected_columns.iter().zip(result_args) {
+            assert_eq!(actual.as_ref(), args[expected].as_ref());
+        }
+        assert_eq!(result_args.last().unwrap().as_ref(), &parameters[&1]);
+    }
+}
+
+#[test]
 fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
     let attachment = test_attachment();
     for (_, field) in attachment.text_fields {
@@ -162,7 +199,9 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.insert(0, vec![1, 2, 3]);
     chunks.insert(1, vec![4, 5]);
     assert_eq!(
-        &*assemble_chunks(path, chunks.clone()).unwrap(),
+        assemble_chunks(path, chunks.clone(), &DynAllocator::default())
+            .unwrap()
+            .as_slice(),
         &[1, 2, 3, 4, 5]
     );
 
@@ -171,7 +210,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     // bytes or trip an assert.
     chunks.insert(-1, vec![9]);
     assert!(matches!(
-        assemble_chunks(path, chunks.clone()),
+        assemble_chunks(path, chunks.clone(), &DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
 
@@ -179,9 +218,52 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.remove(&-1);
     chunks.remove(&0);
     assert!(matches!(
-        assemble_chunks(path, chunks),
+        assemble_chunks(path, chunks, &DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
+}
+
+#[test]
+fn snapshot_directory_reads_shared_file_bytes_without_copying() {
+    use tantivy::directory::Directory;
+
+    let path = std::path::Path::new("segment.term");
+    let mut bytes = DynVec::new_in(DynAllocator::default());
+    bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
+    let data = Arc::new(bytes);
+    let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
+    let mut meta_json = DynVec::new_in(DynAllocator::default());
+    meta_json.try_extend(b"metadata".iter().copied()).unwrap();
+    let directory = SnapshotDirectory::new(files, meta_json);
+    assert!(directory.exists(path).unwrap());
+    assert!(directory.exists(std::path::Path::new("meta.json")).unwrap());
+    assert!(!directory
+        .exists(std::path::Path::new("missing.term"))
+        .unwrap());
+    assert_eq!(directory.atomic_read(path).unwrap(), &[3, 5, 7, 11, 13]);
+    assert_eq!(
+        directory
+            .atomic_read(std::path::Path::new("meta.json"))
+            .unwrap(),
+        b"metadata"
+    );
+    let handle = directory.get_file_handle(path).unwrap();
+    let read = handle.read_bytes(1..4).unwrap();
+
+    assert_eq!(read.as_slice(), &[5, 7, 11]);
+    assert_eq!(read.as_slice().as_ptr(), data[1..].as_ptr());
+    let meta = directory
+        .get_file_handle(std::path::Path::new("meta.json"))
+        .unwrap()
+        .read_bytes(1..5)
+        .unwrap();
+    assert_eq!(meta.as_slice(), b"etad");
+    let other_meta = directory
+        .get_file_handle(std::path::Path::new("meta.json"))
+        .unwrap()
+        .read_bytes(1..5)
+        .unwrap();
+    assert_eq!(meta.as_slice().as_ptr(), other_meta.as_slice().as_ptr());
 }
 
 #[test]
@@ -257,7 +339,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
     assert_ne!(segment.id(), minted);
 
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, FileBytes> = segment
         .data
         .files
         .iter()
@@ -298,7 +380,10 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     // A file that is not named after the source segment is a bug, not
     // something to rename silently.
     let mut stray = files;
-    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    stray.insert(
+        PathBuf::from("meta.json"),
+        Arc::new(DynVec::new_in(DynAllocator::default())),
+    );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
         Err(LimboError::InternalError(_))
@@ -388,7 +473,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
 
     // A segment loaded from storage reads its identities from the fast
     // field. A merged segment and every cache miss do the same.
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, FileBytes> = segment
         .data
         .files
         .iter()
@@ -401,6 +486,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
         segment.id(),
         segment.descriptor.max_doc,
         files,
+        &DynAllocator::default(),
     )
     .unwrap();
     assert_eq!(read_back, segment.data.identities);
@@ -461,6 +547,7 @@ fn segment_load_rejects_the_old_identity_field() {
         id,
         1,
         directory.captured_files(),
+        &DynAllocator::default(),
     )
     .unwrap_err();
     assert!(matches!(&error, LimboError::Corrupt(_)));
@@ -574,7 +661,9 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let mut cache = SegmentByteCache::default();
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
-        files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
+        let mut data = DynVec::try_with_capacity_in(bytes, DynAllocator::default()).unwrap();
+        data.try_extend(std::iter::repeat_n(0u8, bytes)).unwrap();
+        files.insert("f".to_string(), Arc::new(data));
         Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
     };
     let a = SegmentId::generate_random();
@@ -593,6 +682,53 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&a).is_some());
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
+
+    cache.put(b, make_data(100), 0);
+    assert!(cache.get(&a).is_none());
+    assert!(cache.get(&b).is_none());
+}
+
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
+#[test]
+fn zero_cache_limit_removes_searchers_and_segment_bytes() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(&attachment, &[(7, "alpha"), (11, "bravo")]);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment.clone()];
+    cursor.snapshot_loaded = true;
+    cursor.ensure_searcher().unwrap();
+    let key = searcher_key(&cursor.segments);
+    assert!(cursor.shared.searchers.lock().get(&key).is_some());
+    cursor
+        .shared
+        .segment_bytes
+        .lock()
+        .put(segment.id(), segment.data.clone(), usize::MAX);
+
+    set_fts_retained_cache_bytes_for_test(Some(0));
+    let old_searcher_removed = cursor.shared.searchers.lock().get(&key).is_none();
+    let cached_segment_bytes = cursor.shared.segment_bytes.lock().get(&segment.id());
+    cursor.invalidate_snapshot_view();
+    let rebuild_result = cursor.ensure_searcher();
+    let new_searcher_not_cached = cursor.shared.searchers.lock().get(&key).is_none();
+    set_fts_retained_cache_bytes_for_test(None);
+
+    assert!(old_searcher_removed);
+    assert!(cached_segment_bytes.is_none());
+    rebuild_result.unwrap();
+    assert!(new_searcher_not_cached);
+    assert_eq!(cursor.searcher.as_ref().unwrap().num_docs(), 2);
+}
+
+#[test]
+fn segment_byte_cache_counts_spare_file_capacity() {
+    let mut bytes = DynVec::try_with_capacity_in(128, DynAllocator::default()).unwrap();
+    bytes.try_extend([1, 2]).unwrap();
+    let files = HashMap::from_iter([("f".to_string(), Arc::new(bytes))]);
+    let segment = SegmentData::new(files, SegmentIdentities::new(Vec::new()));
+
+    assert_eq!(segment.files["f"].len(), 2);
+    assert_eq!(segment.total_bytes, 128);
 }
 
 #[test]
@@ -674,6 +810,7 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
         Register::Value(Value::from_i64(pattern)),
         Register::Value(Value::from_text(query.to_owned())),
         Register::Value(Value::from_i64(limit)),
+        Register::Value(Value::from_text("0,1".to_owned())),
     ];
     let mut hits = Vec::new();
     let mut next = cursor.query_start(&values).unwrap();
@@ -763,7 +900,15 @@ mod allocation_failures {
         assert!(!directory.exists(path).unwrap());
         writer.get_mut().write_all(b"suffix").unwrap();
         writer.terminate().unwrap();
-        assert_eq!(&*directory.captured_files()[path], b"prefixsuffix");
+        let captured = directory.captured_files();
+        assert_eq!(captured[path].as_slice(), b"prefixsuffix");
+        let read = directory
+            .get_file_handle(path)
+            .unwrap()
+            .read_bytes(2..8)
+            .unwrap();
+        assert_eq!(read.as_slice(), b"efixsu");
+        assert_eq!(read.as_slice().as_ptr(), captured[path][2..].as_ptr());
 
         let abandoned = std::path::Path::new("abandoned.idx");
         let mut writer = directory.open_write(abandoned).unwrap();
@@ -772,6 +917,101 @@ mod allocation_failures {
         assert!(writer.get_mut().write_all(&suffix).is_err());
         drop(writer);
         assert!(!directory.exists(abandoned).unwrap());
+    }
+
+    #[test]
+    fn chunk_assembly_failure_returns_oom_and_retry_reads_the_same_bytes() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::AssembleBuffer.into()),
+            ..Default::default()
+        };
+        let path = std::path::Path::new("segment.term");
+        let chunks = HashMap::from_iter([(0, vec![1, 2, 3]), (1, vec![4, 5])]);
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+
+        allocator.fail_after(0);
+        assert!(matches!(
+            assemble_chunks(path, chunks.clone(), &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        assert_eq!(
+            assemble_chunks(path, chunks, &dyn_allocator)
+                .unwrap()
+                .as_slice(),
+            &[1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_failure_returns_oom() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotMetadata.into()),
+            ..Default::default()
+        };
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+        let attachment = test_attachment();
+        let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
+        allocator.fail_after(0);
+        assert!(matches!(
+            synthesize_meta_json(&scratch, &attachment.schema, &[], &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        let meta_json =
+            synthesize_meta_json(&scratch, &attachment.schema, &[], &dyn_allocator).unwrap();
+        let directory = SnapshotDirectory::new(HashMap::default(), meta_json);
+        let bytes = directory
+            .atomic_read(std::path::Path::new("meta.json"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["segments"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn snapshot_tombstone_failure_returns_oom() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotTombstone.into()),
+            ..Default::default()
+        };
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+        let deleted = std::collections::BTreeSet::from([0, 64, 129]);
+
+        allocator.fail_after(0);
+        assert!(matches!(
+            alive_bitset_bytes(130, &deleted, &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        let body = alive_bitset_bytes(130, &deleted, &dyn_allocator).unwrap();
+        allocator.fail_after(0);
+        assert!(matches!(
+            with_tantivy_footer(body),
+            Err(LimboError::OutOfMemory)
+        ));
+        let body = alive_bitset_bytes(130, &deleted, &dyn_allocator).unwrap();
+        let body_len = body.len();
+        let crc = crc32fast::hash(&body);
+        let bytes = with_tantivy_footer(body).unwrap();
+        let expected_body = [
+            130u32.to_le_bytes().as_slice(),
+            (u64::MAX - 1).to_le_bytes().as_slice(),
+            (u64::MAX - 1).to_le_bytes().as_slice(),
+            1u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert_eq!(&bytes[..body_len], expected_body);
+        assert_eq!(&bytes[bytes.len() - 4..], &1337u32.to_le_bytes());
+        let footer_len =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                as usize;
+        let footer: serde_json::Value =
+            serde_json::from_slice(&bytes[body_len..body_len + footer_len]).unwrap();
+        assert_eq!(footer["crc"], crc);
+        assert_eq!(
+            footer["version"],
+            serde_json::to_value(tantivy::version()).unwrap()
+        );
     }
 
     #[test]

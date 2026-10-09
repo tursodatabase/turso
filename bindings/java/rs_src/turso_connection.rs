@@ -41,10 +41,15 @@ pub fn to_turso_connection(ptr: jlong) -> Result<&'static mut TursoConnection> {
 
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoConnection__1close<'local>(
-    _env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
     connection_ptr: jlong,
 ) {
+    if connection_ptr == 0 {
+        let e = TursoError::InvalidConnectionPointer;
+        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+        return;
+    }
     TursoConnection::drop(connection_ptr);
 }
 

@@ -323,3 +323,46 @@ test pragma-page-size-set-uninitialized-db {
 expect {
     1024
 }
+
+test pragma-wal-autocheckpoint-default {
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    1000
+}
+
+test pragma-wal-autocheckpoint-update {
+    PRAGMA wal_autocheckpoint = 100;
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    100
+    100
+}
+
+test pragma-wal-autocheckpoint-zero {
+    PRAGMA wal_autocheckpoint = 0;
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    0
+    0
+}
+
+test pragma-wal-autocheckpoint-negative-value-reads-back-as-zero {
+    PRAGMA wal_autocheckpoint = -5;
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    0
+    0
+}
+
+test pragma-wal-autocheckpoint-value-above-int-range-reads-back-as-zero {
+    PRAGMA wal_autocheckpoint = 2147483648;
+    PRAGMA wal_autocheckpoint;
+}
+expect {
+    0
+    0
+}

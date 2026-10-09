@@ -10,11 +10,17 @@ version = "0.1.0"
 [tool.uv]
 package = false
 
+[dependency-groups]
+# Runs the Antithesis test templates locally: uv run --group antithesis thesis run testing/antithesis/<template>
+antithesis = ["antithesis>=0.1.17", "pyturso", "thesis"]
+
 [tool.uv.sources]
 limbo_test = { workspace = true }
+pyturso = { workspace = true }
+thesis = { workspace = true }
 
 [tool.uv.workspace]
-members = ["testing", "scripts", "bindings/python"]
+members = ["testing", "scripts", "bindings/python", "tools/thesis"]
 
 [tool.ruff]
 line-length = 120

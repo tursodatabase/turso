@@ -15,7 +15,7 @@
 //!
 //! You can find a full list of SQLite opcodes at:
 //!
-//! https://www.sqlite.org/opcode.html
+//! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
@@ -34,6 +34,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+#[cfg(test)]
+mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -58,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -271,7 +273,7 @@ impl CommitState {
     }
 
     fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
-        match self {
+        let db_id = match self {
             CommitState::CommittingAttachedMvcc {
                 state_machine,
                 db_id: attached_db_id,
@@ -285,8 +287,11 @@ impl CommitState {
                 {
                     connection.bump_prepare_context_generation();
                 }
+                *attached_db_id
             }
-            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {
+                crate::MAIN_DB_ID
+            }
             _ => return, // no-op for already-finalized state machines and non-MVCC commit states
         };
 
@@ -299,6 +304,7 @@ impl CommitState {
         // The locks/exclusive slot the SM acquired are released by the same
         // cleanup path on drop.
         *self = CommitState::Ready;
+        connection.end_abandoned_mvcc_commit(db_id);
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
@@ -307,7 +313,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -320,7 +326,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
-            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
                 RecordBuf::alloc(),
@@ -351,7 +357,7 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+            (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
     }
@@ -609,7 +615,7 @@ pub struct OpHashProbeState {
 }
 
 // repr(u8): with the tag in its own byte, the idle test that every Column
-// and RowId runs is one byte compare instead of a niche computation on a
+// runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
 enum ActiveOpState {
@@ -626,7 +632,6 @@ enum ActiveOpState {
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -652,7 +657,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -784,7 +788,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState::Start
     );
     active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -840,6 +843,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {
@@ -878,6 +883,7 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -900,7 +906,7 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
-    pre_op_registers: Option<Box<[Register]>>,
+    pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -982,7 +988,7 @@ pub struct ProgramState {
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
     ///
-    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// capture_data_changes has type `Option<CaptureDataChangesInfo>` (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
@@ -1044,11 +1050,15 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
+        let registers = (0..max_registers)
+            .map(|_| Register::Value(Value::Null))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
@@ -1161,6 +1171,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -1273,6 +1284,11 @@ impl ProgramState {
     pub(crate) fn record_statement_change(&self) {
         bump_change_count(&self.n_change);
         bump_change_count(&self.n_total_change);
+    }
+
+    pub(crate) fn record_statement_changes(&self, count: i64) {
+        add_to_change_count(&self.n_change, count);
+        add_to_change_count(&self.n_total_change, count);
     }
 
     pub(crate) fn record_total_change(&self) {
@@ -1594,6 +1610,9 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
                     Ok(())
                 } else if self.uses_subjournal || !attached_pagers.is_empty() {
                     if self.uses_subjournal {
@@ -1625,6 +1644,13 @@ impl ProgramState {
                             }
                         }
                     });
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                        }
+                    }
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
@@ -1835,7 +1861,7 @@ pub struct PreparedProgram {
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
-    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -1846,7 +1872,7 @@ pub struct PreparedProgram {
     pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -2213,20 +2239,24 @@ impl Program {
         if !vdbe_trace {
             return;
         }
+        let snapshots: Box<[_]> = state
+            .registers
+            .iter()
+            .map(|register| format!("{register:?}"))
+            .collect();
         // Diff registers from PREVIOUS opcode
         // The last opcode (Halt) won't have its diff printed, but Halt
         // doesn't write to any registers
-        if let Some(ref old) = state.pre_op_registers {
-            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+        if let Some(old) = state.pre_op_registers.take() {
+            for (i, (old_reg, new_reg)) in old.iter().zip(snapshots.iter()).enumerate() {
                 if old_reg != new_reg {
-                    match new_reg {
+                    match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
                 }
             }
-            state.pre_op_registers = None;
         }
 
         // Print CURRENT opcode
@@ -2244,7 +2274,7 @@ impl Program {
             )
         );
         // Snapshot for next iteration
-        state.pre_op_registers = Some(state.registers.clone());
+        state.pre_op_registers = Some(snapshots);
     }
 
     /// Step in [QueryMode::Normal]
@@ -2266,6 +2296,7 @@ impl Program {
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
+                crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
             }
             ProgramStep::Interrupt => {
@@ -3181,6 +3212,7 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
+                        connection.get_wal_autocheckpoint(),
                         connection.get_sync_mode_for_database(db_id)?,
                         connection.get_data_sync_retry(),
                     ) {
@@ -3245,7 +3277,7 @@ impl Program {
     /// Statement teardown passes its actual counted state: a statement that
     /// already finished was released on Done or on its step error, so the
     /// counted statements are all siblings (see
-    /// [`ProgramState::can_autocommit_now`]).
+    /// `ProgramState::can_autocommit_now`).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,
@@ -3265,6 +3297,11 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        if let Err(err) = execute::abort_active_subprogram(self, state, err) {
+            capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
+        }
+        state.extension_state = crate::native_ext::ExtensionState::None;
+        crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -3633,6 +3670,18 @@ impl Program {
                     }
                 },
             }
+            if (must_rollback_tx_if_needed || inside_explicit_transaction)
+                && !keeps_prior_changes
+                && self.connection.get_auto_commit()
+            {
+                if let Err(err) = execute::vtab_rollback_all(&self.connection) {
+                    capture_abort_error(
+                        &mut abort_error,
+                        err,
+                        "Failed to rollback virtual tables during abort",
+                    );
+                }
+            }
         }
         if state.uses_subjournal {
             pager.stop_use_subjournal();
@@ -3703,8 +3752,13 @@ impl Deref for Program {
 
 #[inline(always)]
 fn bump_change_count(count: &AtomicI64) {
+    add_to_change_count(count, 1);
+}
+
+#[inline(always)]
+fn add_to_change_count(count: &AtomicI64, amount: i64) {
     count.store(
-        count.load(Ordering::Relaxed).wrapping_add(1),
+        count.load(Ordering::Relaxed).wrapping_add(amount),
         Ordering::Relaxed,
     );
 }
@@ -4324,12 +4378,10 @@ mod tests {
     }
 
     #[test]
-    fn register_try_clone_copies_each_variant() {
+    fn register_try_clone_copies_values_and_records() {
         let record_values = [Value::from_i64(1), Value::build_text("record payload")];
-        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
         let registers = [
             Register::Value(Value::build_text("value")),
-            Register::Aggregate(AggContext::Builtin(aggregate_values)),
             Register::Record(
                 ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
             ),
@@ -4378,14 +4430,6 @@ mod tests {
             Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
             _ => unreachable!(),
         }
-
-        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
-            Value::build_text("agg state"),
-            Value::from_i64(2),
-        ]));
-        let mut dst = Register::Value(Value::Null);
-        dst.try_clone_from(&src).unwrap();
-        assert_eq!(dst, src);
     }
 
     #[test]

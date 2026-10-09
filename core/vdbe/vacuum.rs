@@ -317,7 +317,7 @@ pub(crate) fn open_vacuum_temp_db(
         Some(codec) => db.connect_with_page_codec(codec)?,
         None => db.connect_with_encryption(encryption_key)?,
     };
-    conn.reset_page_size(page_size)?;
+    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 

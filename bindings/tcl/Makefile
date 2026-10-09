@@ -40,7 +40,7 @@ docker-build:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build --release -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 --features csv 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
 	        -I bindings/c/include \
@@ -63,7 +63,7 @@ docker-test:
 	  bash -c '\
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
-	    cargo build --release -p turso_sqlite3 2>&1 && \
+	    cargo build --release -p turso_sqlite3 --features csv 2>&1 && \
 	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
 	        bindings/tcl/turso_tcl.c \
 	        -I bindings/c/include \
@@ -97,7 +97,7 @@ endif
 
 .PHONY: build
 build:
-	cargo build --release -p turso_sqlite3
+	cargo build --release -p turso_sqlite3 --features csv
 	gcc $(SHARED_FLAG) -o $(TARGET) \
 	    $(SRC) \
 	    $(TCL_INCLUDE) \

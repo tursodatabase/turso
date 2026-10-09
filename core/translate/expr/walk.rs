@@ -1,5 +1,5 @@
 use super::*;
-use crate::function::{Deterministic, ExtFunc};
+use crate::function::Deterministic;
 
 pub enum WalkControl {
     Continue,     // Visit children
@@ -111,6 +111,11 @@ where
                             stack.push(WalkItem::Expr(filter_clause));
                         }
                     }
+                    ast::Expr::MergedColumn(columns) => {
+                        for column in columns.iter().rev() {
+                            stack.push(WalkItem::Expr(column));
+                        }
+                    }
                     ast::Expr::InList { lhs, rhs, .. } => {
                         for expr in rhs.iter().rev() {
                             stack.push(WalkItem::Expr(expr));
@@ -218,7 +223,7 @@ pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableRef
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
-            has_outer_ref = table_references
+            has_outer_ref |= table_references
                 .find_outer_query_ref_by_internal_id(*table)
                 .is_some();
         }
@@ -297,7 +302,7 @@ pub fn expr_contains_nondeterministic_scalar_function(
             // built-in aggregates: two copies of `myagg(x) OVER w` should
             // share one window entry when `x` and the FILTER/OVER clauses are
             // stable.
-            Func::External(external) if matches!(external.func, ExtFunc::Aggregate { .. }) => false,
+            Func::External(external) if external.func.is_aggregate() => false,
 
             _ => !func.is_deterministic(),
         }
@@ -439,6 +444,11 @@ where
                         }
                         if let Some(filter_clause) = &mut filter_over.filter_clause {
                             stack.push(WalkItem::Expr(filter_clause));
+                        }
+                    }
+                    ast::Expr::MergedColumn(columns) => {
+                        for column in columns.iter_mut().rev() {
+                            stack.push(WalkItem::Expr(column));
                         }
                     }
                     ast::Expr::InList { lhs, rhs, .. } => {
