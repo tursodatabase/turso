@@ -2008,6 +2008,22 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
     );
+    options = options.native_module(
+        "pg_depend",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgDependTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_tablespace",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_tablespace (
+                oid INTEGER, spcname TEXT, spcowner INTEGER, spcacl TEXT[], spcoptions TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
     options
 }
 
@@ -2069,6 +2085,141 @@ impl SnapshotRows for PgSettingsTable {
             Value::from_i64(0),
         ]]
     }
+}
+
+#[derive(Debug)]
+struct PgDependTable;
+
+impl SnapshotRows for PgDependTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_depend (
+        classid INTEGER, objid INTEGER, objsubid INTEGER,
+        refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2608);
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        let constraints = PgConstraintTable::load_rows(conn);
+        let indexes = PgIndexTable::load_rows(conn);
+        let relations = PgClassTable::load_rows(conn);
+
+        for relation in &relations {
+            if !matches!(&relation[16], Value::Text(kind) if kind.as_str() == "r") {
+                continue;
+            }
+            let oid = relation[0].as_int().expect("catalog OIDs are integers");
+            let namespace = relation[2].as_int().expect("catalog OIDs are integers");
+            rows.push(dependency_row([1259, oid, 0], [2615, namespace, 0], "n"));
+            let access_method = relation[6].as_int().expect("catalog OIDs are integers");
+            if access_method != 0 {
+                rows.push(dependency_row(
+                    [1259, oid, 0],
+                    [2601, access_method, 0],
+                    "n",
+                ));
+            }
+        }
+
+        for index in &indexes {
+            let oid = index[0].as_int().expect("catalog OIDs are integers");
+            let table = index[1].as_int().expect("catalog OIDs are integers");
+            let columns = catalog_column_numbers(&index[14]);
+            let automatic = relations.iter().any(|relation| {
+                relation[0].as_int() == Some(oid)
+                    && matches!(&relation[1], Value::Text(name) if name.as_str().starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX))
+            });
+            let constraint = if automatic {
+                constraints.iter().find(|constraint| {
+                    matches!(&constraint[3], Value::Text(kind) if matches!(kind.as_str(), "p" | "u"))
+                        && constraint[7].as_int() == Some(table)
+                        && catalog_column_numbers(&constraint[18]) == columns
+                })
+            } else {
+                None
+            };
+            if let Some(constraint) = constraint {
+                let constraint_oid = constraint[0].as_int().expect("catalog OIDs are integers");
+                rows.push(dependency_row(
+                    [1259, oid, 0],
+                    [2606, constraint_oid, 0],
+                    "i",
+                ));
+            } else {
+                for column in columns {
+                    rows.push(dependency_row([1259, oid, 0], [1259, table, column], "a"));
+                }
+            }
+        }
+
+        for constraint in &constraints {
+            let oid = constraint[0].as_int().expect("catalog OIDs are integers");
+            let table = constraint[7].as_int().expect("catalog OIDs are integers");
+            for column in catalog_column_numbers(&constraint[18]) {
+                rows.push(dependency_row([2606, oid, 0], [1259, table, column], "a"));
+            }
+            let referenced_table = constraint[11].as_int().expect("catalog OIDs are integers");
+            if referenced_table != 0 {
+                let referenced_columns = catalog_column_numbers(&constraint[19]);
+                for &column in &referenced_columns {
+                    rows.push(dependency_row(
+                        [2606, oid, 0],
+                        [1259, referenced_table, column],
+                        "n",
+                    ));
+                }
+                if let Some(index) = indexes.iter().find(|index| {
+                    index[1].as_int() == Some(referenced_table)
+                        && index[4].as_int() == Some(1)
+                        && catalog_column_numbers(&index[14]) == referenced_columns
+                }) {
+                    let index_oid = index[0].as_int().expect("catalog OIDs are integers");
+                    rows.push(dependency_row([2606, oid, 0], [1259, index_oid, 0], "n"));
+                }
+            }
+        }
+
+        for default in PgAttrdefTable::load_rows(conn) {
+            let oid = default[0].as_int().expect("catalog OIDs are integers");
+            let table = default[1].as_int().expect("catalog OIDs are integers");
+            let column = default[2]
+                .as_int()
+                .expect("catalog column numbers are integers");
+            rows.push(dependency_row([2604, oid, 0], [1259, table, column], "a"));
+        }
+        rows
+    }
+}
+
+fn catalog_column_numbers(value: &Value) -> Vec<i64> {
+    match value {
+        Value::Null => vec![0],
+        Value::Text(text) => {
+            let mut columns: Vec<i64> = text
+                .as_str()
+                .split_ascii_whitespace()
+                .map(|column| column.parse().expect("catalog column numbers are integers"))
+                .collect();
+            if columns.is_empty() {
+                columns.push(0);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            columns
+        }
+        _ => unreachable!("catalog column lists are text or null"),
+    }
+}
+
+fn dependency_row(dependent: [i64; 3], referenced: [i64; 3], kind: &'static str) -> Vec<Value> {
+    dependent
+        .into_iter()
+        .chain(referenced)
+        .map(Value::from_i64)
+        .chain(std::iter::once(Value::build_text(kind)))
+        .collect()
 }
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
