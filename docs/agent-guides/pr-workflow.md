@@ -18,7 +18,7 @@ Learn `git rebase -i` for clean history.
 - Make your fixes surgical, try to minimize the diffs when you can.
 - Run relevant tests before submitting
 - Each commit tells part of the story
-- Do not include test plans in PR descriptions
+- Do not include test plans in PR descriptions. Do not name the tests that were added. Do not say how many tests passed. CI will contain that information. 
 
 ## CI Environment Notes
 
