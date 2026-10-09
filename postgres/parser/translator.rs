@@ -4965,6 +4965,59 @@ pub struct PgCopyFromStmt {
     pub null_string: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgCopyToStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+}
+
+pub fn try_extract_copy_to(parse_result: &ParseResult) -> Result<Option<PgCopyToStmt>, String> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return Ok(None);
+    };
+    let NodeRef::CopyStmt(copy) = &node.0 else {
+        return Ok(None);
+    };
+    if copy.is_from {
+        return Ok(None);
+    }
+    if copy.is_program {
+        return Err("COPY TO PROGRAM is not supported".to_owned());
+    }
+    if !copy.filename.is_empty() {
+        return Err("COPY TO a file is not supported".to_owned());
+    }
+    if !copy.options.is_empty() {
+        return Err("COPY TO options are not supported; only text format is supported".to_owned());
+    }
+    let relation = copy
+        .relation
+        .as_ref()
+        .ok_or_else(|| "COPY TO only supports a table".to_owned())?;
+    let columns = if copy.attlist.is_empty() {
+        None
+    } else {
+        Some(
+            copy.attlist
+                .iter()
+                .map(|node| match &node.node {
+                    Some(pg_query::protobuf::node::Node::String(value)) => Ok(value.sval.clone()),
+                    _ => Err("COPY TO has an invalid column name".to_owned()),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    };
+    Ok(Some(PgCopyToStmt {
+        table_name: relation.relname.clone(),
+        schema_name: (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        columns,
+    }))
+}
+
 /// Try to extract a COPY FROM file statement from pg_query parse output.
 /// Returns None if the statement is not a COPY FROM with a filename.
 pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
@@ -7709,6 +7762,31 @@ mod tests {
         let copy = try_extract_copy_from(&parsed).unwrap();
         let cols = copy.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_try_extract_copy_to_stdout() {
+        let parsed =
+            crate::parse(r#"COPY "Odd Schema"."Odd Table" ("second", "first") TO STDOUT"#).unwrap();
+        let copy = try_extract_copy_to(&parsed).unwrap().unwrap();
+        assert_eq!(copy.schema_name.as_deref(), Some("Odd Schema"));
+        assert_eq!(copy.table_name, "Odd Table");
+        assert_eq!(copy.columns.unwrap(), vec!["second", "first"]);
+    }
+
+    #[test]
+    fn test_try_extract_copy_to_rejects_unsupported_destinations_and_options() {
+        for (sql, expected) in [
+            ("COPY users TO '/tmp/users'", "file"),
+            ("COPY users TO PROGRAM 'cat'", "PROGRAM"),
+            ("COPY users TO STDOUT WITH (FORMAT csv)", "options"),
+            ("COPY users TO STDOUT WITH (FORMAT binary)", "options"),
+            ("COPY (SELECT * FROM users) TO STDOUT", "table"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let error = try_extract_copy_to(&parsed).unwrap_err();
+            assert!(error.contains(expected), "{sql}: {error}");
+        }
     }
 
     #[test]
