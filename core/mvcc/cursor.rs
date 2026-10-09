@@ -475,7 +475,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         table_id: MVTableId,
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
-    ) -> bool {
+    ) -> Result<bool> {
         // Read the epoch before (re)seeding. If a key insert races past this
         // load, the next shadow check observes the mismatch and reseeds.
         let epoch = db.index_rows_epoch();
@@ -509,7 +509,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         loop {
             match &self.state {
                 // No version at or after this key -> B-tree row is visible.
-                IndexShadowScanState::Exhausted => return true,
+                IndexShadowScanState::Exhausted => return Ok(true),
                 IndexShadowScanState::Uninitialized => unreachable!("created just above"),
                 IndexShadowScanState::Peeked {
                     key: scan_key,
@@ -517,11 +517,11 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
                     ..
                 } => match scan_key.as_ref().cmp(key.as_ref()) {
                     // No version exactly at this key -> visible.
-                    std::cmp::Ordering::Greater => return true,
+                    std::cmp::Ordering::Greater => return Ok(true),
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return !db.index_chain_invalidates_btree(versions, tx_id);
+                        return Ok(!db.index_chain_invalidates_btree(versions, tx_id)?);
                     }
                     // Scan is behind the B-tree (a version-only key). Catch up below.
                     std::cmp::Ordering::Less => {}
@@ -647,13 +647,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
     /// cursors, the authoritative per-row lookup for table cursors.
-    fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> bool {
+    fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> Result<bool> {
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
         let valid =
             self.index_shadow_scan
-                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
+                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec)?;
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
@@ -663,10 +663,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.table_id,
                 &RowKey::Record(rec.clone()),
                 self.tx_id
-            ),
+            )?,
             "index shadow scan diverged from query_btree_version_is_valid"
         );
-        valid
+        Ok(valid)
     }
 
     /// Returns the current row as an immutable record.
@@ -844,7 +844,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         true
     }
 
-    fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
+    fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.tx_id)
     }
@@ -909,7 +909,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.btree_row_is_valid_forward(&k) => {
+                        Some(k) if self.btree_row_is_valid_forward(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -943,7 +943,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
-                        if self.btree_row_is_valid_forward(&key) {
+                        if self.btree_row_is_valid_forward(&key)? {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
@@ -997,7 +997,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k) if self.query_btree_version_is_valid(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1031,7 +1031,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k) if self.query_btree_version_is_valid(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1206,7 +1206,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k) if self.query_btree_version_is_valid(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1625,7 +1625,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // a stale SkipMap read here would hide later checkpointed
                     // updates and change scan totals.
                     let visible = if *in_btree {
-                        self.query_btree_version_is_valid(&row_id.row_id)
+                        self.query_btree_version_is_valid(&row_id.row_id)?
                     } else {
                         self.db
                             .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
@@ -2035,7 +2035,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // MVCC doesn't have it, but we need to check B-tree too
             if self.is_btree_allocated() {
                 // Check if the B-tree version is valid (not shadowed/deleted by MVCC)
-                let btree_is_valid = self.query_btree_version_is_valid(&RowKey::Int(*int_key));
+                let btree_is_valid = self.query_btree_version_is_valid(&RowKey::Int(*int_key))?;
 
                 // If B-tree is invalid (row is deleted or shadowed), don't check B-tree
                 if !btree_is_valid {
@@ -2072,7 +2072,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let row_key = RowKey::Int(int_key);
 
             // Check if this B-tree row is shadowed (deleted/updated) in MVCC
-            let is_valid = self.query_btree_version_is_valid(&row_key);
+            let is_valid = self.query_btree_version_is_valid(&row_key)?;
 
             if is_valid {
                 // B-tree row is visible (not shadowed), update dual_peek
