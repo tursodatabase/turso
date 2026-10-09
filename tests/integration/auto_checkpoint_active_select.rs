@@ -2,7 +2,7 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
-use turso_core::{Connection, LimboError, Statement, StepResult, Value};
+use turso_core::{Connection, DatabaseOpts, LimboError, Statement, StepResult, Value};
 
 const ROWS: i64 = 2000;
 
@@ -290,4 +290,94 @@ fn test_open_blob_handle_keeps_read_transaction_open_after_sibling_finishes() {
         rusqlite::types::Value::Integer(0),
         "closing the blob handle must end the read transaction"
     );
+}
+
+fn assert_scan_keeps_snapshot_while_both_connections_write(scan_db: &str, write_db: &str) {
+    for order in ["ASC", "DESC"] {
+        let mut expected: Vec<i64> = (1..=ROWS).collect();
+        if order == "DESC" {
+            expected.reverse();
+        }
+        assert_eq!(
+            scan_while_both_connections_write(scan_db, write_db, order),
+            expected,
+            "{order} scan of {scan_db}.t while the same connection writes {write_db}"
+        );
+    }
+}
+
+fn scan_while_both_connections_write(scan_db: &str, write_db: &str, order: &str) -> Vec<i64> {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_attach(true))
+        .build();
+    let aux_path = tmp_db.path.with_extension("aux.db");
+    let attach = format!("ATTACH '{}' AS aux", aux_path.display());
+    let conn = tmp_db.connect_limbo();
+    let other_conn = tmp_db.connect_limbo();
+    conn.execute(&attach).unwrap();
+    other_conn.execute(&attach).unwrap();
+    for db in ["main", "aux"] {
+        conn.execute(format!("CREATE TABLE {db}.t(id INTEGER PRIMARY KEY)"))
+            .unwrap();
+        conn.execute(format!(
+            "CREATE TABLE {db}.other(id INTEGER PRIMARY KEY, v INTEGER)"
+        ))
+        .unwrap();
+    }
+    conn.execute(format!(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {ROWS}) \
+         INSERT INTO {scan_db}.t SELECT x FROM c"
+    ))
+    .unwrap();
+
+    let mut select = conn
+        .prepare(format!("SELECT id FROM {scan_db}.t ORDER BY id {order}"))
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut new_id = ROWS;
+    while let Some(id) = next_id(&mut select) {
+        ids.push(id);
+        new_id += 1;
+        conn.execute(format!("INSERT INTO {write_db}.other(v) VALUES ({id})"))
+            .unwrap();
+        if write_db != scan_db {
+            other_conn
+                .execute(format!("INSERT INTO {scan_db}.t VALUES ({new_id})"))
+                .unwrap();
+        }
+        assert_eq!(
+            limbo_exec_rows(
+                &other_conn,
+                &format!("PRAGMA {scan_db}.wal_checkpoint(TRUNCATE)")
+            )[0][0],
+            rusqlite::types::Value::Integer(1),
+            "the scan must keep its read lock on {scan_db}"
+        );
+    }
+    for db in ["main", "aux"] {
+        assert_eq!(
+            limbo_exec_rows(
+                &other_conn,
+                &format!("PRAGMA {db}.wal_checkpoint(TRUNCATE)")
+            )[0][0],
+            rusqlite::types::Value::Integer(0),
+            "the finished scan must not keep a read lock on {db}"
+        );
+    }
+    ids
+}
+
+#[test]
+fn test_scan_of_main_keeps_snapshot_while_same_connection_writes_attached_database() {
+    assert_scan_keeps_snapshot_while_both_connections_write("main", "aux");
+}
+
+#[test]
+fn test_scan_of_attached_database_keeps_snapshot_while_same_connection_writes_main() {
+    assert_scan_keeps_snapshot_while_both_connections_write("aux", "main");
+}
+
+#[test]
+fn test_scan_of_attached_database_keeps_snapshot_while_same_connection_writes_it() {
+    assert_scan_keeps_snapshot_while_both_connections_write("aux", "aux");
 }

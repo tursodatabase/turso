@@ -10616,7 +10616,7 @@ pub mod test {
         bulk_inserts(&conn_writer, 3, 5);
 
         let conn1 = &db.connect().unwrap();
-        let (r1_frame, _stmt) = start_reader(conn1); // reader 1
+        let (r1_frame, stmt1) = start_reader(conn1); // reader 1
 
         bulk_inserts(&conn_writer, 3, 5);
 
@@ -10643,6 +10643,7 @@ pub mod test {
         assert_eq!(result1.wal_total_backfilled, r1_frame);
 
         // finish reader‑1
+        drop(stmt1);
         conn1.execute("COMMIT").unwrap();
 
         // passive checkpoint #2

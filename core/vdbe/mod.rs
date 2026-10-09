@@ -2929,6 +2929,8 @@ impl Program {
         let connection = self.connection.clone();
         let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
         let tx_state = connection.get_tx_state();
+        let other_statements_use_transaction =
+            program_state.other_statements_use_transaction(&connection);
         tracing::debug!(
             "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
             auto_commit,
@@ -2951,7 +2953,11 @@ impl Program {
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(
+                &connection,
+                rollback,
+                other_statements_use_transaction,
+            )? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock()
@@ -2959,7 +2965,7 @@ impl Program {
                     {
                         pager.end_read_tx();
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(&connection, other_statements_use_transaction);
                     Ok(IOResult::Done(()))
                 }
                 IOResult::IO(io) => Ok(IOResult::IO(io)),
@@ -2970,31 +2976,43 @@ impl Program {
                     self.step_end_write_txn(&pager, &connection, program_state, rollback)
                 }
                 TransactionState::Read => {
-                    connection.set_tx_state(TransactionState::None);
+                    if !other_statements_use_transaction {
+                        connection.set_tx_state(TransactionState::None);
+                    }
                     // Commit any attached write transactions that were opened
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(
+                        &connection,
+                        rollback,
+                        other_statements_use_transaction,
+                    )? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
                             return Ok(IOResult::IO(io));
                         }
                     }
-                    pager.end_read_tx();
-                    self.end_attached_read_txns(&connection);
+                    if !other_statements_use_transaction {
+                        pager.end_read_tx();
+                    }
+                    self.end_attached_read_txns(&connection, other_statements_use_transaction);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => {
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(
+                        &connection,
+                        rollback,
+                        other_statements_use_transaction,
+                    )? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
                             return Ok(IOResult::IO(io));
                         }
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(&connection, other_statements_use_transaction);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::PendingUpgrade { .. } => {
@@ -3141,26 +3159,28 @@ impl Program {
         // Phase 3: Commit WAL transactions on attached databases that don't use MVCC.
         // When the main DB uses MVCC, we route through commit_txn_mvcc, but attached
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
+        let other_statements_use_transaction =
+            program_state.other_statements_use_transaction(&conn);
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(&conn, rollback, other_statements_use_transaction)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
-                    self.end_attached_read_txns(&conn);
+                    self.end_attached_read_txns(&conn, other_statements_use_transaction);
                     return Ok(IOResult::Done(()));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        match self.end_attached_write_txns(&conn, rollback, other_statements_use_transaction)? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
                 return Ok(IOResult::IO(io));
             }
         }
-        self.end_attached_read_txns(&conn);
+        self.end_attached_read_txns(&conn, other_statements_use_transaction);
 
         program_state.commit_state = CommitState::Ready;
         Ok(IOResult::Done(()))
@@ -3179,7 +3199,11 @@ impl Program {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
-            match self.end_attached_write_txns(connection, rollback)? {
+            match self.end_attached_write_txns(
+                connection,
+                rollback,
+                other_statements_use_transaction,
+            )? {
                 IOResult::Done(_) => {
                     *commit_state = CommitState::Ready;
                 }
@@ -3189,7 +3213,7 @@ impl Program {
             }
             // Release read locks on attached pagers that only had read transactions
             // (end_attached_write_txns only handles pagers with write locks).
-            self.end_attached_read_txns(connection);
+            self.end_attached_read_txns(connection, other_statements_use_transaction);
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
@@ -3207,7 +3231,11 @@ impl Program {
         match txn_finish_result? {
             IOResult::Done(_) => {
                 // Main pager commit done, now commit attached database pagers
-                match self.end_attached_write_txns(connection, rollback)? {
+                match self.end_attached_write_txns(
+                    connection,
+                    rollback,
+                    other_statements_use_transaction,
+                )? {
                     IOResult::Done(_) => {
                         *commit_state = CommitState::Ready;
                     }
@@ -3225,7 +3253,7 @@ impl Program {
         }
         // Release read locks on attached pagers that only had read transactions
         // (end_attached_write_txns only handles pagers with write locks).
-        self.end_attached_read_txns(connection);
+        self.end_attached_read_txns(connection, other_statements_use_transaction);
         Ok(IOResult::Done(()))
     }
 
@@ -3234,7 +3262,12 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
-    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> IOResultOr<()> {
+    fn end_attached_write_txns(
+        &self,
+        connection: &Connection,
+        rollback: bool,
+        other_statements_use_transaction: bool,
+    ) -> IOResultOr<()> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
                 let db_id = *db_id;
@@ -3268,7 +3301,9 @@ impl Program {
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);
                     attached_pager.end_write_tx();
-                    attached_pager.end_read_tx();
+                    if !other_statements_use_transaction {
+                        attached_pager.end_read_tx();
+                    }
                     attached_pager.commit_wal_end();
                 } else {
                     // Discard any local schema changes on rollback
@@ -3281,7 +3316,14 @@ impl Program {
     }
 
     /// End read transactions on all attached databases that had transactions started.
-    fn end_attached_read_txns(&self, connection: &Connection) {
+    fn end_attached_read_txns(
+        &self,
+        connection: &Connection,
+        other_statements_use_transaction: bool,
+    ) {
+        if other_statements_use_transaction {
+            return;
+        }
         connection.with_all_attached_pagers_with_index(|pagers| {
             pagers.iter().for_each(|(db_id, attached_pager)| {
                 if connection.mv_store_for_db(*db_id).is_some() {
