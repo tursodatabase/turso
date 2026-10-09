@@ -104,7 +104,7 @@ def truncate_body_at_marker(body: str) -> str:
 
     lines = body.split("\n")
     for i, line in enumerate(lines):
-        if line.strip() == "### Description of AI":
+        if re.match(r"#+\s+Description of AI\b", line.strip()):
             return "\n".join(lines[:i]).rstrip()
 
     return body.strip()

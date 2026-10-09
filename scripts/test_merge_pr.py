@@ -55,7 +55,7 @@ PR_9684 = {
 }
 
 
-def test_message_is_the_same_as_the_merge_commit_of_pr_9684():
+def test_message_for_pr_9684_leaves_out_the_ai_usage_section():
     message = commit_message_for(PR_9684)
     assert message == {
         "commit_title": "Merge 'core/translate: skip subqueries that read tables outside a hash build input' "
@@ -92,10 +92,6 @@ def test_message_is_the_same_as_the_merge_commit_of_pr_9684():
             "\n"
             "Fixes #9648\n"
             "\n"
-            "Autofixer wrote this change with Claude Code in an isolated sandbox. A\n"
-            "separate verifier agent tested and reviewed it in its own container\n"
-            "before this PR was opened. A maintainer must review it before merge.\n"
-            "\n"
             "Reviewed-by: Jussi Saurio <jussi.saurio@gmail.com>\n"
             "\n"
             "Closes #9684"
@@ -131,6 +127,6 @@ def commit_message_for(pr_data):
 
 
 if __name__ == "__main__":
-    test_message_is_the_same_as_the_merge_commit_of_pr_9684()
+    test_message_for_pr_9684_leaves_out_the_ai_usage_section()
     test_pr_without_body_or_approval_only_closes_the_pr()
     print("ok")
