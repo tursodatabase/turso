@@ -5,7 +5,7 @@ set -e
 # Usage: ./scripts/run-sqlancer.sh [--oracle ORACLE] [--timeout SECONDS] [--seed SEED]
 #
 # Options:
-#   --oracle ORACLE    SQLancer oracle to use (NoREC, PQS, TLP). Default: NoREC
+#   --oracle ORACLE    SQLancer oracle to use (NoREC, PQS, TLP, LATERAL_JSON). Default: NoREC
 #   --timeout SECONDS  Timeout in seconds. Default: 60
 #   --seed SEED        Random seed for reproducibility. If not set, uses random seed.
 #   --clean            Remove and re-clone SQLancer directory
@@ -20,7 +20,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIMBO_ROOT="$(dirname "$SCRIPT_DIR")"
 SQLANCER_REPO="https://github.com/sqlancer/sqlancer.git"
-SQLANCER_DIR="/tmp/sqlancer-limbo"
+SQLANCER_DIR="${SQLANCER_DIR:-/tmp/sqlancer-limbo}"
 MAVEN_VERSION="3.9.6"
 MAVEN_DIR="/tmp/apache-maven-$MAVEN_VERSION"
 ORACLE="${ORACLE:-NoREC}"
@@ -176,6 +176,12 @@ fi
 # Always copy latest LimboProvider.java
 echo "Updating Limbo provider..."
 cp "$LIMBO_ROOT/testing/sqlancer/patches/LimboProvider.java" "$LIMBO_PROVIDER_DIR/"
+
+echo "Updating Turso oracles..."
+cp -R "$LIMBO_ROOT/testing/sqlancer/patches/src/." src/
+if ! grep -q "LATERAL_JSON" src/sqlancer/sqlite3/SQLite3OracleFactory.java; then
+    patch -p1 < "$LIMBO_ROOT/testing/sqlancer/patches/SQLite3OracleFactory.patch"
+fi
 
 # Patch SQLite3Schema only on first setup
 if [[ "$FIRST_SETUP" -eq 1 ]]; then

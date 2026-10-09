@@ -10,6 +10,18 @@ Run [SQLancer](https://github.com/sqlancer/sqlancer) against Limbo to find bugs.
 ./scripts/run-sqlancer.sh --clean      # force rebuild
 ```
 
+## Oracles
+
+`--oracle` takes the SQLite oracles of SQLancer (default `NoREC`) and `LATERAL_JSON`.
+
+`LATERAL_JSON` compares a query that has LATERAL joins with the same query where some of the joins read
+`json_each` over `json_group_array`. It is a port of the `LateralMatchesJsonEach` property of the simulator,
+and it needs a Turso build that supports LATERAL joins.
+
+```bash
+./scripts/run-sqlancer.sh --oracle LATERAL_JSON --timeout 300
+```
+
 ## Requirements
 
 - Java 11+
@@ -24,3 +36,7 @@ Run [SQLancer](https://github.com/sqlancer/sqlancer) against Limbo to find bugs.
 Edit `patches/LimboProvider.java`:
 - Remove from `LIMBO_EXPECTED_ERRORS` when features are implemented
 - Add to `DEFAULT_PRAGMAS` when new pragmas are supported
+
+`patches/src/` has the oracles that upstream SQLancer does not have, in the directory layout of SQLancer.
+The scripts copy it into the SQLancer clone, and `patches/SQLite3OracleFactory.patch` adds `LATERAL_JSON`
+to the oracle list of SQLancer.

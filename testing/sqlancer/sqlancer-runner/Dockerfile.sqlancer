@@ -93,6 +93,8 @@ ENV LD_LIBRARY_PATH=/app/native:$LD_LIBRARY_PATH
 # Copy SQLancer patches
 COPY testing/sqlancer/patches/LimboProvider.java /app/LimboProvider.java
 COPY testing/sqlancer/patches/SQLite3Schema.patch /app/SQLite3Schema.patch
+COPY testing/sqlancer/patches/src /app/sqlancer-src
+COPY testing/sqlancer/patches/SQLite3OracleFactory.patch /app/SQLite3OracleFactory.patch
 
 # Copy corruption debug tools
 COPY scripts/corruption-debug-tools /app/corruption-debug-tools

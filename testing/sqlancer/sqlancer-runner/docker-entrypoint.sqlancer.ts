@@ -299,6 +299,12 @@ async function setupSqlancer(): Promise<void> {
 		fs.copyFileSync(limboProviderSrc, path.join(providerDir, "LimboProvider.java"));
 	}
 
+	const oracleSources = "/app/sqlancer-src";
+	if (fs.existsSync(oracleSources)) {
+		fs.cpSync(oracleSources, path.join(SQLANCER_DIR, "src"), { recursive: true });
+	}
+	await addTursoOracles();
+
 	// Apply patches if needed
 	await applyPatches();
 
@@ -333,6 +339,16 @@ async function setupSqlancer(): Promise<void> {
 	}
 
 	console.log("SQLancer setup complete");
+}
+
+async function addTursoOracles(): Promise<void> {
+	const factoryFile = path.join(SQLANCER_DIR, "src/sqlancer/sqlite3/SQLite3OracleFactory.java");
+	const patchFile = "/app/SQLite3OracleFactory.patch";
+	if (!fs.existsSync(patchFile) || fs.readFileSync(factoryFile, "utf-8").includes("LATERAL_JSON")) {
+		return;
+	}
+	console.log("Adding the LATERAL_JSON oracle to SQLite3OracleFactory...");
+	await runCommandSync("patch", ["-p1", "-i", patchFile], { cwd: SQLANCER_DIR });
 }
 
 /**
