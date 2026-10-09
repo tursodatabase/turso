@@ -27,9 +27,10 @@ pub(crate) fn emit_row_from_cursor(
     if !table.has_virtual_columns {
         return Ok(());
     }
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(columns.iter().zip(column_regs.iter().copied()))
-            .with_encoded_columns((0..columns.len()).try_collect()?);
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        columns.iter().zip(column_regs.iter().copied()),
+        (0..columns.len()).try_collect()?,
+    );
     compute_virtual_columns(
         program,
         &table.columns_topo_sort()?,
