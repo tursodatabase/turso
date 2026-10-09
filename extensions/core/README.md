@@ -4,15 +4,18 @@ The `turso_ext` crate simplifies the creation and registration of libraries mean
 like traditional `sqlite3` extensions, but are able to be written in much more ergonomic Rust.
 
 **Attention**
-If you wish to link with extensions dynamically, you will need to coordinate the allocator with each extension you would like to load at runtime by either using `MiMalloc` (the default) or setting your global allocator of choice in `macros/src/ext/mod.rs`. 
+A dynamically loaded extension is linked with its own copy of the allocator, and a copy only accepts the pointers it handed out itself.
+The host installs its allocator into the extension before calling `register_extension`, so module names, table schemas, returned values, virtual tables and VFS instances are allocated and freed by one allocator.
+
+The allocator in `macros/src/ext/mod.rs` is therefore only the fallback for a process that loads the extension without installing one. `MiMalloc` is the default.
 
 E.g
 ```diff
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(feature = "static"))]
 #[global_allocator]
-- static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-+ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc
+- static GLOBAL: ::turso_ext::HostAllocator<::mimalloc::MiMalloc> = ::turso_ext::HostAllocator(::mimalloc::MiMalloc);
++ static GLOBAL: ::turso_ext::HostAllocator<tikv_jemallocator::Jemalloc> = ::turso_ext::HostAllocator(tikv_jemallocator::Jemalloc);
 ```
 
 Then add the allocator to the extension you want to use
