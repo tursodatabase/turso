@@ -16,9 +16,11 @@ pub mod browser;
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, Weak};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -34,7 +36,8 @@ use turso_core::SqliteDialect;
 /// `Arc<Connection>` held inside `Program`, breaking the reference chain that
 /// would otherwise keep the `turso_core::Database` alive in the
 /// `DATABASE_MANAGER` registry.
-type StatementHandle = Arc<RefCell<Option<turso_core::Statement>>>;
+type StatementCell = RefCell<Option<Box<turso_core::Statement>>>;
+type StatementHandle = Arc<StatementCell>;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -65,10 +68,12 @@ pub struct DatabaseInner {
     io: Arc<dyn turso_core::IO>,
     connect: OnceLock<DatabaseConnect>,
     default_safe_integers: Mutex<bool>,
-    /// Weak refs to every shared statement handle created by this database.
-    /// `close()` upgrades each live handle and sets it to `None`, which
-    /// finalizes the statement and releases its `Arc<Connection>`.
-    stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
+    /// Weak refs to every live statement handle created by this database, keyed by
+    /// statement id. `close()` upgrades each live handle and sets it to `None`, which
+    /// finalizes the statement and releases its `Arc<Connection>`. A `Statement`
+    /// removes its own entry when dropped, so the map only holds live statements.
+    stmts: Mutex<HashMap<u64, Weak<StatementCell>>>,
+    next_stmt_id: AtomicU64,
 }
 
 pub struct DatabaseConnect {
@@ -411,7 +416,8 @@ impl Database {
                 io,
                 connect: OnceLock::new(),
                 default_safe_integers: Mutex::new(false),
-                stmts: Mutex::new(Vec::new()),
+                stmts: Mutex::new(HashMap::new()),
+                next_stmt_id: AtomicU64::new(0),
             })),
         })
     }
@@ -503,10 +509,17 @@ impl Database {
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
         #[allow(clippy::arc_with_non_send_sync)]
-        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
-        inner.stmts.lock().unwrap().push(Arc::downgrade(&stmt));
+        let stmt: StatementHandle = Arc::new(RefCell::new(Some(Box::new(stmt))));
+        let id = inner.next_stmt_id.fetch_add(1, Ordering::Relaxed);
+        inner
+            .stmts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(&stmt));
         Ok(Statement {
             stmt,
+            db: Arc::downgrade(inner),
+            id,
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
             safe_integers: Cell::new(*inner.default_safe_integers.lock().unwrap()),
@@ -586,7 +599,7 @@ impl Database {
             // DATABASE_MANAGER can still be upgraded after the file is renamed,
             // causing a stale Database to be returned on the next open().
             let mut stmts = inner.stmts.lock().unwrap();
-            for weak in stmts.drain(..) {
+            for (_, weak) in stmts.drain() {
                 if let Some(stmt) = weak.upgrade() {
                     *stmt.borrow_mut() = None;
                 }
@@ -674,7 +687,7 @@ impl BatchExecutor {
                     #[allow(clippy::arc_with_non_send_sync)]
                     Ok(Some((stmt, offset))) => {
                         self.position += offset;
-                        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
+                        let stmt: StatementHandle = Arc::new(RefCell::new(Some(Box::new(stmt))));
                         stmt.borrow_mut()
                             .as_mut()
                             .unwrap()
@@ -707,9 +720,19 @@ impl BatchExecutor {
 #[napi]
 pub struct Statement {
     stmt: StatementHandle,
+    db: Weak<DatabaseInner>,
+    id: u64,
     column_names: Vec<std::ffi::CString>,
     mode: RefCell<PresentationMode>,
     safe_integers: Cell<bool>,
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        if let Some(db) = self.db.upgrade() {
+            db.stmts.lock().unwrap().remove(&self.id);
+        }
+    }
 }
 
 #[napi]

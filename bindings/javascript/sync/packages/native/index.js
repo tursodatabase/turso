@@ -508,7 +508,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { BatchExecutor, Database, Statement, EncryptionCipher, GeneratorHolder, JsDataCompletion, JsProtocolIo, JsProtocolRequestBytes, SyncEngine, SyncEngineChanges, DatabaseChangeTypeJs, SyncEngineProtocolVersion } = nativeBinding
+const { BatchExecutor, Database, Statement, EncryptionCipher, GeneratorHolder, JsDataCompletion, JsProtocolIo, JsProtocolRequestBytes, SyncEngine, SyncEngineChanges, DatabaseChangeTypeJs, nativeAllocatedBytes, SyncEngineProtocolVersion } = nativeBinding
 export { BatchExecutor }
 export { Database }
 export { Statement }
@@ -520,4 +520,5 @@ export { JsProtocolRequestBytes }
 export { SyncEngine }
 export { SyncEngineChanges }
 export { DatabaseChangeTypeJs }
+export { nativeAllocatedBytes }
 export { SyncEngineProtocolVersion }
