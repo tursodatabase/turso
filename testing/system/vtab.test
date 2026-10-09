@@ -84,6 +84,64 @@ do_execsql_test_in_memory_error_content trigger-select-from-vtab-unsafe {
     INSERT INTO t1 VALUES ('k1');
 } {unsafe use of virtual table}
 
+do_execsql_test_in_memory_error_content trigger-delete-where-subquery-reads-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+        DELETE FROM t2 WHERE id IN (SELECT key FROM v);
+    END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-update-set-subquery-reads-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+        UPDATE t2 SET id = (SELECT value FROM v WHERE key = NEW.id);
+    END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-select-where-subquery-reads-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+        SELECT id FROM t2 WHERE EXISTS (SELECT 1 FROM v WHERE key = t2.id);
+    END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-cte-reads-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 WITH keys AS (SELECT key FROM v) SELECT key FROM keys;
+    END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_in_memory_error_content trigger-view-reads-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    CREATE VIEW vv AS SELECT key FROM v;
+    CREATE TABLE t1(id TEXT);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT key FROM vv; END;
+    INSERT INTO t1 VALUES ('k1');
+} {unsafe use of virtual table}
+
+do_execsql_test_on_specific_db {:memory:} trigger-may-read-innocuous-vtab {
+    CREATE TABLE t1(id TEXT);
+    CREATE TABLE t2(n INTEGER);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 SELECT value FROM json_each('[1,2,3]');
+    END;
+    INSERT INTO t1 VALUES ('k1');
+    SELECT count(*) FROM t2;
+} {3}
+
 do_execsql_test_on_specific_db {:memory:} select-hidden-column {
     create virtual table t using kv_store;
     insert into t(key, value) values ('k0', 'v0');
