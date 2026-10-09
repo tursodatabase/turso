@@ -1818,7 +1818,11 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
-        Ok(ast::SelectTable::Select(select, alias))
+        Ok(ast::SelectTable::Select {
+            select,
+            alias,
+            lateral: range_sub.lateral,
+        })
     }
 
     fn translate_range_function(
@@ -1930,7 +1934,11 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             };
-            return Ok(ast::SelectTable::Select(select, alias));
+            return Ok(ast::SelectTable::Select {
+                select,
+                alias,
+                lateral: false,
+            });
         }
 
         Ok(ast::SelectTable::TableCall(
@@ -6176,6 +6184,33 @@ mod tests {
                 "SELECT * FROM a, b CROSS JOIN c",
                 "SELECT * FROM a, b INNER JOIN c",
             ),
+            (
+                "SELECT * FROM a, b CROSS JOIN LATERAL (SELECT a.x, b.y) s",
+                "SELECT * FROM a, b INNER JOIN LATERAL (SELECT a.x, b.y) s",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lateral_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+            ),
+            (
+                "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+            ),
+            (
+                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT 1) s",
+            ),
         ] {
             let parsed = crate::parse(sql).unwrap();
             let translated = translator.translate(&parsed).unwrap();
@@ -6215,7 +6250,10 @@ mod tests {
                 assert_eq!(from_clause.joins.len(), 1, "Should have one join");
                 let join = &from_clause.joins[0];
                 assert!(
-                    matches!(join.table.as_ref(), ast::SelectTable::Select(_, Some(_))),
+                    matches!(
+                        join.table.as_ref(),
+                        ast::SelectTable::Select { alias: Some(_), .. }
+                    ),
                     "Join RHS should be a subquery with alias"
                 );
             } else {

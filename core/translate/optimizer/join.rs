@@ -35,7 +35,7 @@ use crate::{
             HashJoinKey, HashJoinType, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
             NonFromClauseSubquery, SubqueryOrigin, SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{table_mask_from_expr, TableMask},
+        planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
     },
     LimboError, Result,
 };
@@ -870,6 +870,7 @@ fn join_lhs_and_rhs<'a>(
                     probe_multiplier,
                     hash_can_replace_build_index,
                     subqueries,
+                    joined_tables,
                     params,
                 )? {
                     let mut hash_join_method = hash_join_method;
@@ -903,10 +904,19 @@ fn join_lhs_and_rhs<'a>(
                         let build_is_eligible =
                             build_am_is_plain_table_scan || needs_materialization;
 
+                        let materialization_reads_an_outer_query = needs_materialization
+                            && materialized_build_input_reads_an_outer_query(
+                                where_clause,
+                                table_references,
+                                subqueries,
+                                &lhs_mask,
+                            )?;
+
                         hash_join_allowed = build_is_eligible
                             && (!needs_materialization || build_has_rowid)
                             && (!materialization_too_large
-                                || *join_type == HashJoinType::FullOuter);
+                                || *join_type == HashJoinType::FullOuter)
+                            && !materialization_reads_an_outer_query;
 
                         if hash_join_allowed {
                             let should_materialize = needs_materialization && build_has_rowid;
@@ -1094,6 +1104,23 @@ fn join_lhs_and_rhs<'a>(
         cost,
         prefix_cardinalities,
     }))
+}
+
+fn materialized_build_input_reads_an_outer_query(
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    build_input_mask: &TableMask,
+) -> Result<bool> {
+    for term in where_clause.iter() {
+        let term_mask = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+        if build_input_mask.contains_all_set_bits_of(&term_mask)
+            && expr_reads_an_outer_query(&term.expr, table_references, subqueries)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn can_replace_build_index_with_hash(
@@ -2496,6 +2523,7 @@ mod tests {
                 join_type: JoinType::Inner,
                 using: vec![],
                 no_reorder: false,
+                lateral: false,
             }),
             table_id_counter.next(),
         );
@@ -2817,6 +2845,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3140,6 +3169,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3261,6 +3291,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3270,6 +3301,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3456,6 +3488,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3465,6 +3498,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3597,6 +3631,7 @@ mod tests {
                         join_type: JoinType::Inner,
                         using: vec![],
                         no_reorder: false,
+                        lateral: false,
                     }),
                     table_id_counter.next(),
                 )
@@ -3607,6 +3642,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ));
@@ -4348,6 +4384,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4471,6 +4508,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4512,6 +4550,7 @@ mod tests {
             1.0,
             true,
             &[],
+            table_references.joined_tables(),
             &DEFAULT_PARAMS,
         )
         .unwrap()

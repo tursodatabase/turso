@@ -1241,7 +1241,7 @@ where
                 rewrite_expression_tree(arg, rewrite_expr)?;
             }
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             rewrite_select_expressions(select, rewrite_expr)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {

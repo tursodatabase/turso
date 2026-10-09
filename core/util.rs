@@ -1710,7 +1710,7 @@ where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
     match select_table {
-        ast::SelectTable::Select(select, _) => walk_select_expressions_inner(select, func),
+        ast::SelectTable::Select { select, .. } => walk_select_expressions_inner(select, func),
         ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
         ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
@@ -1853,7 +1853,7 @@ fn validate_select_table_no_cross_db(
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
             reject_cross_db_qualified_name(name, view_db_name)?;
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             validate_no_cross_db_references(select, view_db_name)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -1981,7 +1981,7 @@ fn view_source_from_select_table(
                 join_info: None,
             })
         }
-        ast::SelectTable::Select(select, alias) => {
+        ast::SelectTable::Select { select, alias, .. } => {
             let derived = extract_view_columns_inner(select, schema, ctes)?;
             Ok(ViewSource {
                 qualifiers: alias
@@ -2138,6 +2138,7 @@ fn view_sources_from_clause(
                     ast::JoinOperator::TypedJoin(Some(join_type))
                         if join_type.contains(ast::JoinType::CROSS)
                 ),
+                lateral: false,
             }),
             ..right
         });
@@ -3166,10 +3167,25 @@ mod rename_column_view {
                     db_name: table_db_norm,
                 })
             }
-            ast::SelectTable::Select(select, alias) => {
+            ast::SelectTable::Select {
+                select,
+                alias,
+                lateral,
+            } => {
                 let before_cols = select_output_columns(select, ctx, false)?;
-                *changed |=
-                    rewrite_view_select_for_column_rename(select, ctx, &[], visiting_views)?;
+                let lateral_scopes: Vec<&[ViewSourceInfo]> = if *lateral {
+                    std::iter::once(visible_sources)
+                        .chain(outer_scopes.iter().copied())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                *changed |= rewrite_view_select_for_column_rename(
+                    select,
+                    ctx,
+                    &lateral_scopes,
+                    visiting_views,
+                )?;
                 let after_cols = select_output_columns(select, ctx, true)?;
                 let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
                 let qualifiers = alias
@@ -4270,7 +4286,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 );
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select { ref mut select, .. } => {
             rewrite_select_column_refs_scoped(
                 select,
                 target_table,
@@ -4618,7 +4634,7 @@ fn select_table_still_references_renamed_column(
                 target_qualifiers,
             )
         }),
-        ast::SelectTable::Select(select, _) => select_still_references_renamed_column(
+        ast::SelectTable::Select { select, .. } => select_still_references_renamed_column(
             select,
             target_table,
             trigger_table,
@@ -5157,7 +5173,7 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
                 rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select { ref mut select, .. } => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
         ast::SelectTable::Sub(ref mut from, _) => {

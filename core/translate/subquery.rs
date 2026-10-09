@@ -6,12 +6,13 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{Resolver, TranslateCtx},
+    emitter::{OperationMode, Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
+use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
@@ -600,63 +601,13 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    // Most subqueries can reference columns from the outer query,
-    // including nested cases where a subquery inside a subquery references columns from its parent's parent
-    // and so on.
-    let get_outer_query_refs = |referenced_tables: &TableReferences| {
-        let outer_refs = referenced_tables
-            .joined_tables()
-            .iter()
-            .map(|t| {
-                // Extract cte_id from FromClauseSubquery if this is a CTE reference
-                let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id(),
-                    _ => None,
-                };
-                let outer_ref = OuterQueryReference {
-                    table: t.table.clone(),
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    join_info: t.join_info.clone(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: Vec::new(),
-                    cte_id,
-                    cte_definition_only: false,
-                    rowid_referenced: false,
-                    outer_join_may_null_extend: referenced_tables
-                        .outer_join_may_null_extend(t.internal_id),
-                    scope_depth: 0,
-                };
-                Ok::<_, crate::LimboError>(outer_ref)
-            })
-            .chain(referenced_tables.outer_query_refs().iter().map(|t| {
-                Ok(OuterQueryReference {
-                    table: t.table.clone(),
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    join_info: t.join_info.clone(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: t.cte_select.clone(),
-                    cte_explicit_columns: t.cte_explicit_columns.clone(),
-                    cte_id: t.cte_id, // Preserve CTE ID from outer query refs
-                    cte_definition_only: t.cte_definition_only,
-                    rowid_referenced: false,
-                    outer_join_may_null_extend: t.outer_join_may_null_extend,
-                    scope_depth: t.scope_depth + 1,
-                })
-            }))
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
-        Ok(outer_refs)
-    };
-
     let mut subquery_parser = get_subquery_parser(
         program,
         out_subqueries,
         referenced_tables,
         resolver,
         connection,
-        get_outer_query_refs,
+        outer_query_refs_for_correlated_subquery,
         position,
         origin,
         allow_correlated,
@@ -669,6 +620,58 @@ fn plan_subqueries_with_outer_query_access<'a>(
     }
 
     Ok(())
+}
+
+/// Most subqueries can reference columns from the outer query,
+/// including nested cases where a subquery inside a subquery references columns from its parent's parent
+/// and so on.
+pub(crate) fn outer_query_refs_for_correlated_subquery(
+    referenced_tables: &TableReferences,
+) -> Result<crate::alloc::Vec<OuterQueryReference>> {
+    let outer_refs = referenced_tables
+        .joined_tables()
+        .iter()
+        .map(|t| {
+            // Extract cte_id from FromClauseSubquery if this is a CTE reference
+            let cte_id = match &t.table {
+                Table::FromClauseSubquery(subq) => subq.cte_id(),
+                _ => None,
+            };
+            let outer_ref = OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                join_info: t.join_info.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: Vec::new(),
+                cte_id,
+                cte_definition_only: false,
+                rowid_referenced: false,
+                outer_join_may_null_extend: referenced_tables
+                    .outer_join_may_null_extend(t.internal_id),
+                scope_depth: 0,
+            };
+            Ok::<_, crate::LimboError>(outer_ref)
+        })
+        .chain(referenced_tables.outer_query_refs().iter().map(|t| {
+            Ok(OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                join_info: t.join_info.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: t.cte_select.clone(),
+                cte_explicit_columns: t.cte_explicit_columns.clone(),
+                cte_id: t.cte_id, // Preserve CTE ID from outer query refs
+                cte_definition_only: t.cte_definition_only,
+                rowid_referenced: false,
+                outer_join_may_null_extend: t.outer_join_may_null_extend,
+                scope_depth: t.scope_depth + 1,
+            })
+        }))
+        .try_collect::<Result<crate::alloc::Vec<_>>>()??;
+    Ok(outer_refs)
 }
 
 /// Collect every scalar-subquery (`ast::Expr::Subquery`) node that appears anywhere in `exprs`.
@@ -1492,6 +1495,7 @@ pub fn emit_from_clause_subqueries(
         .try_collect()?;
 
     for table_index in visit_order {
+        allocate_cursors_read_by_lateral_subquery(program, t_ctx, tables, join_order, table_index)?;
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -1674,6 +1678,46 @@ pub fn emit_from_clause_subqueries(
             emit_explain!(program, false, scan);
             program.pop_current_parent_explain();
         }
+    }
+    Ok(())
+}
+
+fn allocate_cursors_read_by_lateral_subquery(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    tables: &TableReferences,
+    join_order: &[JoinOrderMember],
+    table_index: usize,
+) -> Result<()> {
+    let table = &tables.joined_tables()[table_index];
+    if !table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.lateral)
+    {
+        return Ok(());
+    }
+    let Table::FromClauseSubquery(subquery) = &table.table else {
+        unreachable!("only a FROM-clause subquery can be a LATERAL join");
+    };
+    let join_position = |internal_id: TableInternalId| {
+        join_order
+            .iter()
+            .position(|member| member.table_id == internal_id)
+    };
+    for read_table_id in subquery.plan.used_outer_query_ref_ids() {
+        let Some(read_table) = tables.find_joined_table_by_internal_id(read_table_id) else {
+            continue;
+        };
+        turso_assert!(
+            matches!(
+                (join_position(read_table_id), join_position(table.internal_id)),
+                (Some(read_table_position), Some(lateral_position))
+                    if read_table_position < lateral_position
+            ),
+            "a LATERAL subquery must come after the tables it reads in the join order"
+        );
+        read_table.open_cursors(program, OperationMode::SELECT, t_ctx.resolver.schema())?;
     }
     Ok(())
 }

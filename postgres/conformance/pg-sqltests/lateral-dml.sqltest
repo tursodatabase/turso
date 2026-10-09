@@ -1,0 +1,475 @@
+@database :memory:
+
+# LATERAL subqueries in INSERT, UPDATE, DELETE, RETURNING, views,
+# triggers and after ALTER TABLE ... RENAME.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    CREATE TABLE t4(a INT PRIMARY KEY, v INT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z'), (3, 40, 'w'), (5, 50, 'v');
+    INSERT INTO t4 VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+}
+
+setup log {
+    CREATE TABLE log(a INT, c INT);
+}
+
+@setup data
+test insert-select-with-lateral {
+    CREATE TABLE t5(a INT, c INT);
+    INSERT INTO t5 SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT a, c FROM t5 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test insert-select-with-left-join-lateral {
+    CREATE TABLE t5(a INT, c INT);
+    INSERT INTO t5 SELECT t1.a, s.c FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
+    SELECT a, c FROM t5 ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|
+}
+
+@setup data
+test insert-select-with-lateral-aggregate {
+    CREATE TABLE t5(a INT, n INT, total INT);
+    INSERT INTO t5 SELECT t1.a, s.n, s.total FROM t1, LATERAL (SELECT count(*) AS n, sum(c) AS total FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT a, n, total FROM t5 ORDER BY 1;
+}
+expect {
+    1|1|10
+    2|2|50
+    3|1|40
+    4|0|
+}
+
+@setup data
+test insert-select-with-lateral-limit {
+    CREATE TABLE t5(a INT, c INT);
+    INSERT INTO t5 SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s;
+    SELECT a, c FROM t5 ORDER BY 1;
+}
+expect {
+    1|10
+    2|30
+    3|40
+}
+
+@setup data
+test insert-select-with-column-list-and-lateral {
+    CREATE TABLE t5(x INT, y TEXT, z INT);
+    INSERT INTO t5(z, y) SELECT s.c, t1.b FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT x, y, z FROM t5 ORDER BY 3;
+}
+expect {
+    |p|10
+    |q|20
+    |q|30
+    |r|40
+}
+
+@setup data
+test insert-select-lateral-reads-the-target-table {
+    INSERT INTO t1 SELECT s.v, t1.b || '2' FROM t1, LATERAL (SELECT t1.a + 10 AS v) AS s;
+    SELECT a, b FROM t1 ORDER BY 1;
+}
+expect {
+    1|p
+    2|q
+    3|r
+    4|s
+    11|p2
+    12|q2
+    13|r2
+    14|s2
+}
+
+@setup data
+test insert-select-with-lateral-in-a-cte {
+    CREATE TABLE t5(a INT, c INT);
+    WITH w AS (SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s)
+    INSERT INTO t5 SELECT a, c FROM w WHERE c > 15;
+    SELECT a, c FROM t5 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test insert-values-with-lateral-scalar-subquery {
+    CREATE TABLE t5(a INT, c INT);
+    INSERT INTO t5 VALUES (2, (SELECT sum(s.c) FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = 2));
+    SELECT a, c FROM t5;
+}
+expect {
+    2|50
+}
+
+@setup data
+test insert-returning-with-lateral-scalar-subquery {
+    INSERT INTO t4 VALUES (5, 1) RETURNING a, (SELECT max(s.c) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s);
+}
+expect {
+    5|50
+}
+
+@setup data
+test insert-returning-with-lateral-reading-a-table {
+    INSERT INTO t4 VALUES (6, 2) RETURNING a, (SELECT count(*) FROM t2, LATERAL (SELECT t2.c WHERE t2.c > t4.a * 5) AS s);
+}
+expect {
+    6|2
+}
+
+@setup data
+test update-set-subquery-with-lateral {
+    UPDATE t4 SET v = (SELECT sum(s.c) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|10
+    2|50
+    3|40
+    4|
+}
+
+@setup data
+test update-set-subquery-with-lateral-reads-a-table {
+    UPDATE t4 SET v = (SELECT max(s.v) FROM t2, LATERAL (SELECT t2.c + t4.a AS v) AS s WHERE t2.a <= t4.a);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|11
+    2|32
+    3|43
+    4|44
+}
+
+@setup data
+test update-set-two-columns-from-lateral-subqueries {
+    CREATE TABLE t5(a INT, n INT, m INT);
+    INSERT INTO t5 VALUES (1, 0, 0), (2, 0, 0), (9, 0, 0);
+    UPDATE t5 SET n = (SELECT count(*) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t5.a) AS s), m = (SELECT min(s.c) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t5.a) AS s);
+    SELECT a, n, m FROM t5 ORDER BY 1;
+}
+expect {
+    1|1|10
+    2|2|20
+    9|0|
+}
+
+@setup data
+test update-where-subquery-with-lateral {
+    UPDATE t4 SET v = 1 WHERE EXISTS (SELECT 1 FROM t2, LATERAL (SELECT t2.c WHERE t2.a = t4.a AND t2.c > 25) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|1
+    3|1
+    4|0
+}
+
+@setup data
+test update-where-in-subquery-with-lateral {
+    UPDATE t4 SET v = 9 WHERE a IN (SELECT t1.a FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a) AS s WHERE s.n = 0);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|0
+    4|9
+}
+
+@setup data
+test update-from-with-lateral {
+    UPDATE t4 SET v = s.total FROM t1, LATERAL (SELECT sum(c) AS total FROM t2 WHERE t2.a = t1.a) AS s WHERE t1.a = t4.a;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|10
+    2|50
+    3|40
+    4|
+}
+
+@setup data
+test update-from-with-lateral-limit {
+    UPDATE t4 SET v = s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS s WHERE t1.a = t4.a;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|10
+    2|30
+    3|40
+    4|0
+}
+
+@setup data
+test update-from-with-lateral-chain {
+    UPDATE t4 SET v = y.w FROM t1, LATERAL (SELECT t1.a * 10 AS v) AS x, LATERAL (SELECT x.v + 1 AS w) AS y WHERE t1.a = t4.a AND t1.a > 2;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|31
+    4|41
+}
+
+@setup data
+test update-from-lateral-as-first-item {
+    UPDATE t4 SET v = s.x FROM LATERAL (SELECT 5 AS x) AS s WHERE t4.a = 3;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|5
+    4|0
+}
+
+@setup data
+test update-returning-with-lateral-scalar-subquery {
+    UPDATE t4 SET v = 3 WHERE a = 2 RETURNING a, v, (SELECT count(*) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s);
+}
+expect {
+    2|3|2
+}
+
+@setup data
+test delete-where-in-subquery-with-lateral {
+    DELETE FROM t4 WHERE a IN (SELECT t1.a FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s WHERE s.c > 25);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    4|0
+}
+
+@setup data
+test delete-where-exists-lateral-reads-the-target {
+    DELETE FROM t4 WHERE EXISTS (SELECT 1 FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    4|0
+}
+
+@setup data
+test delete-where-not-exists-lateral-reads-the-target {
+    DELETE FROM t4 WHERE NOT EXISTS (SELECT 1 FROM t2, LATERAL (SELECT t2.c WHERE t2.a = t4.a) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|0
+}
+
+@setup data
+test delete-where-scalar-subquery-with-lateral {
+    DELETE FROM t4 WHERE (SELECT count(*) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s) = 1;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    2|0
+    4|0
+}
+
+@setup data
+test view-with-lateral-then-insert-into-base-table {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    INSERT INTO t2 VALUES (4, 70, 'u');
+    SELECT a, c FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+    4|70
+}
+
+@setup data
+test view-with-column-list-and-lateral {
+    CREATE VIEW v1(x, y) AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    SELECT x, y FROM v1 WHERE y > 15 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test view-with-nested-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.v FROM t1, LATERAL (SELECT u.v FROM t2, LATERAL (SELECT t2.c + t1.a AS v) AS u WHERE t2.a = t1.a) AS s;
+    SELECT a, v FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|11
+    2|22
+    2|32
+    3|43
+}
+
+@setup data
+test insert-select-from-a-view-with-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    CREATE TABLE t5(a INT, c INT);
+    INSERT INTO t5 SELECT a, c FROM v1 WHERE a = 2;
+    SELECT a, c FROM t5 ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|30
+}
+
+@setup data
+test rename-left-column-read-by-a-view-with-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    ALTER TABLE t1 RENAME COLUMN a TO k;
+    SELECT * FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test rename-inner-column-read-by-a-view-with-lateral {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s;
+    ALTER TABLE t2 RENAME COLUMN c TO m;
+    SELECT * FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|30
+    3|40
+}
+
+@setup data
+test update-from-lateral-cannot-read-the-target-table {
+    UPDATE t4 SET v = s.x FROM LATERAL (SELECT t4.a * 2 AS x) AS s;
+}
+expect error {
+    no such table: t4
+}
+
+@setup data
+test delete-where-in-lateral-that-filters-on-the-outer-row {
+    DELETE FROM t4 WHERE a IN (SELECT s.v FROM t1, LATERAL (SELECT t1.a AS v WHERE t1.a > 2) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+}
+
+@setup data
+test delete-with-index-on-the-target-and-lateral-in-where {
+    CREATE INDEX t4_v ON t4(v);
+    UPDATE t4 SET v = a % 2;
+    DELETE FROM t4 WHERE v = 0 AND EXISTS (SELECT 1 FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a AND c > 25) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|1
+    3|1
+    4|0
+}
+
+@setup data
+test update-set-reads-the-old-value-inside-lateral {
+    UPDATE t4 SET v = a * 100;
+    UPDATE t4 SET v = v + (SELECT count(*) FROM t2, LATERAL (SELECT t2.c WHERE t2.c < t4.v / 10) AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|100
+    2|201
+    3|302
+    4|403
+}
+
+@setup data
+test update-by-primary-key-with-lateral-subquery {
+    UPDATE t4 SET v = (SELECT max(s.c) FROM LATERAL (SELECT c FROM t2 WHERE t2.a = t4.a) AS s) WHERE a = 2;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|30
+    3|0
+    4|0
+}
+
+@setup data
+test update-by-range-with-lateral-subquery {
+    UPDATE t4 SET v = (SELECT count(*) FROM t2, LATERAL (SELECT t2.c WHERE t2.a >= t4.a) AS s) WHERE a BETWEEN 2 AND 3;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|4
+    3|2
+    4|0
+}
+
+@setup data
+test insert-on-conflict-do-nothing-from-lateral {
+    INSERT INTO t4 SELECT t1.a + 2, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c LIMIT 1) AS s WHERE true ON CONFLICT (a) DO NOTHING;
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|0
+    4|0
+    5|40
+}
+
+@setup data
+test insert-select-with-nested-lateral {
+    CREATE TABLE t5(a INT, v INT);
+    INSERT INTO t5 SELECT t1.a, s.v FROM t1, LATERAL (SELECT u.v FROM t2, LATERAL (SELECT t2.c + t1.a AS v) AS u WHERE t2.a = t1.a) AS s;
+    SELECT a, v FROM t5 ORDER BY 1, 2;
+}
+expect {
+    1|11
+    2|22
+    2|32
+    3|43
+}
+
+@setup data
+test delete-where-in-lateral-with-index-on-the-target {
+    CREATE INDEX t4_v ON t4(v);
+    DELETE FROM t4 WHERE v = 0 AND a IN (SELECT s.v FROM t1, LATERAL (SELECT t1.a AS v WHERE t1.b > 'p') AS s);
+    SELECT a, v FROM t4 ORDER BY 1;
+}
+expect {
+    1|0
+}
