@@ -161,6 +161,10 @@ pub trait Dialect: Send + Sync + 'static {
     fn requires_custom_types(&self) -> bool {
         false
     }
+
+    fn uses_rowid_alias_defaults(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
