@@ -3,6 +3,7 @@ use sql_generation::generation::GenerationContext;
 
 use crate::runner::env::ShadowTablesMut;
 
+mod lateral;
 pub mod plan;
 pub mod property;
 pub mod query;

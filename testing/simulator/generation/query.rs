@@ -241,6 +241,9 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
+            QueryDiscriminants::LateralSelect => {
+                unreachable!("only the LateralMatchesJsonEach property generates LATERAL selects")
+            }
         }
     }
 
@@ -272,6 +275,9 @@ impl QueryDiscriminants {
             }
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
+            }
+            QueryDiscriminants::LateralSelect => {
+                unreachable!("only the LateralMatchesJsonEach property generates LATERAL selects")
             }
         }
     }
