@@ -4064,6 +4064,9 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_extension"
             | "pg_depend"
             | "pg_tablespace"
+            | "pg_init_privs"
+            | "pg_cast"
+            | "pg_transform"
             | "pg_tables"
     )
 }

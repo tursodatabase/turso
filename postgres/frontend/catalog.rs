@@ -651,7 +651,7 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),               // oid
                 Value::build_text(entry.name),      // proname
-                Value::from_i64(2200),              // pronamespace (public)
+                Value::from_i64(11),                // pronamespace (pg_catalog)
                 Value::from_i64(10),                // proowner
                 Value::from_i64(14),                // prolang (SQL)
                 Value::from_f64(1.0),               // procost
@@ -690,7 +690,7 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),       // oid
                 Value::build_text(name),    // proname
-                Value::from_i64(2200),      // pronamespace (public)
+                Value::from_i64(11),        // pronamespace (pg_catalog)
                 Value::from_i64(10),        // proowner
                 Value::from_i64(13),        // prolang (C)
                 Value::from_f64(1.0),       // procost
@@ -2020,6 +2020,39 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             create_sql: "CREATE TABLE pg_tablespace (
                 oid INTEGER, spcname TEXT, spcowner INTEGER, spcacl TEXT[], spcoptions TEXT[],
                 tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_init_privs",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_init_privs (
+                objoid INTEGER, classoid INTEGER, objsubid INTEGER, privtype TEXT,
+                initprivs TEXT[], tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_cast",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_cast (
+                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_transform",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_transform (
+                oid INTEGER, trftype INTEGER, trflang INTEGER, trffromsql INTEGER,
+                trftosql INTEGER, tableoid INTEGER HIDDEN
             )"
             .to_string(),
         },
