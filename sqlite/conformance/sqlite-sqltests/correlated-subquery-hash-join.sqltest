@@ -130,3 +130,54 @@ expect {
     3|0
 }
 
+
+# A correlated subquery in WHERE reads a table that is not part of the
+# materialized hash build input, so it must not run while building that input.
+setup materialized-build-input-schema {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE TABLE t4(a, c);
+    CREATE INDEX t4_c ON t4(c);
+    INSERT INTO t1 VALUES (1, 2);
+    INSERT INTO t2 VALUES (3, 2);
+    INSERT INTO t4 VALUES (3, 10);
+}
+
+@setup materialized-build-input-schema
+test correlated-exists-reads-table-outside-materialized-build-input {
+    SELECT 1 FROM t1 AS s, t2, t4
+    WHERE s.b = t2.b AND t2.a = t4.a AND EXISTS (SELECT 1 FROM t1 AS x WHERE x.a = s.a) AND t4.c = 10
+    LIMIT 1;
+}
+expect {
+    1
+}
+
+@setup materialized-build-input-schema
+test correlated-exists-reads-from-subquery-outside-materialized-build-input {
+    SELECT 1 FROM (SELECT a, b FROM t1) AS s, t2, t4
+    WHERE s.b = t2.b AND t2.a = t4.a AND EXISTS (SELECT 1 FROM t1 AS x WHERE x.a = s.a) AND t4.c = 10
+    LIMIT 1;
+}
+expect {
+    1
+}
+
+@setup materialized-build-input-schema
+test correlated-not-exists-reads-table-outside-materialized-build-input {
+    SELECT 1 FROM t1 AS s, t2, t4
+    WHERE s.b = t2.b AND t2.a = t4.a AND NOT EXISTS (SELECT 1 FROM t1 AS x WHERE x.a = s.a) AND t4.c = 10
+    LIMIT 1;
+}
+expect {
+}
+
+@setup materialized-build-input-schema
+test correlated-scalar-subquery-reads-table-outside-materialized-build-input {
+    SELECT 1 FROM t1 AS s, t2, t4
+    WHERE s.b = t2.b AND t2.a = t4.a AND (SELECT count(*) FROM t1 AS x WHERE x.a = s.a) > 0 AND t4.c = 10
+    LIMIT 1;
+}
+expect {
+    1
+}
