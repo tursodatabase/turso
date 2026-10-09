@@ -807,6 +807,237 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     Ok(())
 }
 
+pub(crate) fn emit_autoincrement_sequences_resync(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        return Ok(());
+    };
+    let autoincrement_tables: Vec<Arc<BTreeTable>> = resolver.with_schema(database_id, |s| {
+        s.tables
+            .values()
+            .filter_map(|table| table.btree())
+            .filter(|table| table.has_autoincrement)
+            .collect()
+    });
+    for table in autoincrement_tables {
+        let seq_name = crate::schema::autoincrement_sequence_name(&table.name);
+        let seq = resolver
+            .with_schema(database_id, |s| s.get_sequence(&seq_name).cloned())
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                    table.name
+                ))
+            })?;
+        let backing_table = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(&sequence_backing_table_name(&seq_name))
+            })
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing backing table for sequence \"{seq_name}\""
+                ))
+            })?;
+
+        let value_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: value_reg,
+            value: 0,
+        });
+
+        let sseq_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: sseq_cursor,
+            root_page: sqlite_sequence.root_page,
+            db: database_id,
+        });
+        let name_reg = program.emit_string8_new_reg(table.name.clone());
+        let sseq_done_label = program.allocate_label();
+        let sseq_loop_label = program.allocate_label();
+        let sseq_next_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: sseq_cursor,
+            pc_if_empty: sseq_done_label,
+        });
+        program.preassign_label_to_next_insn(sseq_loop_label);
+        let row_name_reg = program.alloc_register();
+        program.emit_column_or_rowid(sseq_cursor, 0, row_name_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: row_name_reg,
+            rhs: name_reg,
+            target_pc: sseq_next_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        let row_seq_reg = program.alloc_register();
+        program.emit_column_or_rowid(sseq_cursor, 1, row_seq_reg);
+        program.emit_insn(Insn::MemMax {
+            dest_reg: value_reg,
+            src_reg: row_seq_reg,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: sseq_done_label,
+        });
+        program.preassign_label_to_next_insn(sseq_next_label);
+        program.emit_insn(Insn::Next {
+            cursor_id: sseq_cursor,
+            pc_if_next: sseq_loop_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(sseq_done_label);
+        program.emit_insn(Insn::Close {
+            cursor_id: sseq_cursor,
+        });
+
+        let unchanged_label = program.allocate_label();
+        let write_label = program.allocate_label();
+        let backing_cursor = program.alloc_cursor_id(CursorType::BTreeTable(backing_table.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: backing_cursor,
+            root_page: backing_table.root_page,
+            db: database_id,
+        });
+        program.emit_insn(Insn::Last {
+            cursor_id: backing_cursor,
+            pc_if_empty: write_label,
+        });
+        let backing_value_reg = program.alloc_register();
+        let backing_is_called_reg = program.alloc_register();
+        program.emit_column_or_rowid(backing_cursor, 0, backing_value_reg);
+        program.emit_column_or_rowid(backing_cursor, 1, backing_is_called_reg);
+        let called_label = program.allocate_label();
+        program.emit_insn(Insn::If {
+            reg: backing_is_called_reg,
+            target_pc: called_label,
+            jump_if_null: false,
+        });
+        let next_value_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: value_reg,
+            dst_reg: next_value_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::AddImm {
+            register: next_value_reg,
+            value: 1,
+        });
+        program.emit_insn(Insn::Eq {
+            lhs: backing_value_reg,
+            rhs: next_value_reg,
+            target_pc: unchanged_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: write_label,
+        });
+        program.preassign_label_to_next_insn(called_label);
+        program.emit_insn(Insn::Eq {
+            lhs: backing_value_reg,
+            rhs: value_reg,
+            target_pc: unchanged_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.preassign_label_to_next_insn(write_label);
+
+        let is_called_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: is_called_reg,
+            value: 1,
+        });
+        emit_disk_set_watermark(
+            program,
+            database_id,
+            backing_table,
+            &seq_name,
+            &seq,
+            value_reg,
+            is_called_reg,
+        );
+        program.preassign_label_to_next_insn(unchanged_label);
+        program.emit_insn(Insn::Close {
+            cursor_id: backing_cursor,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_disk_set_watermark(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    backing_table: Arc<BTreeTable>,
+    seq_name: &str,
+    seq: &Sequence,
+    value_reg: usize,
+    is_called_reg: usize,
+) {
+    let root_page = backing_table.root_page;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(root_page),
+        db: database_id,
+    });
+
+    let empty_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: empty_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: seq_name.to_string(),
+        // Sequence storage is internal bookkeeping, not a SQL row change.
+        is_part_of_update: true,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(empty_label);
+
+    let col_base = program.alloc_registers(7);
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: col_base,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: is_called_reg,
+        dst_reg: col_base + 1,
+        extra_amount: 0,
+    });
+    emit_sequence_descriptor_literals(program, seq, col_base + 2);
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(col_base),
+        count: 7,
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: value_reg,
+        record_reg,
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        table_name: seq_name.to_string(),
+    });
+    program.emit_insn(Insn::Close { cursor_id });
+}
+
 /// Emit five `Insn::Integer` literals — start, increment, min, max, cycle —
 /// to populate the immutable suffix of a backing-table row. Shared between
 /// `emit_disk_read_nextval`, `emit_disk_advance_past`, and the setval

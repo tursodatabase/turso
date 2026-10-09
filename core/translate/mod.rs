@@ -219,6 +219,19 @@ pub fn translate_inner(
         None
     };
 
+    let sqlite_sequence_write = match &stmt {
+        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name),
+        ast::Stmt::Update(update) => Some(&update.tbl_name),
+        _ => None,
+    }
+    .filter(|tbl_name| {
+        tbl_name
+            .name
+            .as_str()
+            .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+    })
+    .cloned();
+
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -487,6 +500,13 @@ pub fn translate_inner(
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
     };
+
+    if let Some(tbl_name) = sqlite_sequence_write {
+        let database_id = resolver.resolve_database_id(&tbl_name)?;
+        if connection.mv_store_for_db(database_id).is_some() {
+            sequence::emit_autoincrement_sequences_resync(program, resolver, database_id)?;
+        }
+    }
 
     if is_write {
         if is_dml {

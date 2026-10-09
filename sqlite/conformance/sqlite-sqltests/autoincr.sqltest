@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
 #
@@ -286,6 +285,7 @@ expect error {
 
 # Test: An empty INSERT...SELECT does not damage the sequence table. (Ticket #3148)
 @cross-check-integrity
+@skip-if mvcc "MVCC creates the sqlite_sequence row only when it hands out or records an id"
 test autoinc-empty-insert-select-is-safe {
     CREATE TABLE t2(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t2 VALUES(NULL, 1);
@@ -313,6 +313,7 @@ expect {
 
 # Test: AUTOINCREMENT works correctly with UPSERT.
 @cross-check-integrity
+@skip-if mvcc "MVCC advances sqlite_sequence when an upsert DO UPDATE raises the rowid"
 test autoinc-with-upsert {
     CREATE TABLE t11(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE);
     INSERT INTO t11(a,b) VALUES(2,3),(5,6),(4,3),(1,2)
@@ -342,6 +343,7 @@ expect {
 
 # https://github.com/tursodatabase/turso/issues/3664
 @cross-check-integrity
+@skip-if mvcc "MVCC advances sqlite_sequence when an UPDATE raises the rowid"
 test autoinc-skips-manually-updated-pk {
     CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
     INSERT INTO t DEFAULT VALUES;
@@ -368,6 +370,7 @@ expect error {
 }
 
 # regression test for https://github.com/tursodatabase/turso/issues/5703
+@skip-if mvcc "MVCC creates the sqlite_sequence row only when it hands out or records an id"
 test autoinc-expicit-negative-rowid-initializes-seq-table {
 	CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT);
 	INSERT OR IGNORE INTO t(id,payload) VALUES (-42, 'tx_explicit_0');
@@ -526,4 +529,67 @@ expect {
 	1
 	3
 	blob|5a
+}
+
+# Test: Resetting the sequence after emptying the table restarts ids at 1, and
+# an edit inside a rolled-back transaction leaves the sequence as it was.
+@cross-check-integrity
+test autoinc-sequence-edits-follow-transactions {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES ('a'), ('b');
+    DELETE FROM t;
+    DELETE FROM sqlite_sequence WHERE name = 't';
+    INSERT INTO t(v) VALUES ('c');
+    BEGIN;
+    UPDATE sqlite_sequence SET seq = 500 WHERE name = 't';
+    INSERT INTO t(v) VALUES ('d');
+    ROLLBACK;
+    INSERT INTO t(v) VALUES ('e');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|c
+    2|e
+}
+
+# Test: The next id uses the table's largest rowid at insert time, so the
+# order of resetting the sequence and emptying the table does not matter.
+@cross-check-integrity
+test autoinc-sequence-reset-before-emptying-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
+    BEGIN;
+    DELETE FROM sqlite_sequence WHERE name = 't';
+    DELETE FROM t;
+    COMMIT;
+    INSERT INTO t(v) VALUES ('d');
+    INSERT INTO t(v) VALUES ('e'), ('f'), ('g');
+    UPDATE sqlite_sequence SET seq = 2 WHERE name = 't';
+    INSERT INTO t(v) VALUES ('h');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|d
+    2|e
+    3|f
+    4|g
+    5|h
+}
+
+# Test: A trigger that writes sqlite_sequence moves the next id.
+@cross-check-integrity
+test autoinc-sequence-edit-from-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON log BEGIN
+        UPDATE sqlite_sequence SET seq = 1000 WHERE name = 't';
+    END;
+    INSERT INTO t(v) VALUES ('a');
+    INSERT INTO log VALUES (1);
+    INSERT INTO t(v) VALUES ('b');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    1001|b
 }

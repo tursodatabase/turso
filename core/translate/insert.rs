@@ -1522,6 +1522,61 @@ fn emit_rowid_generation(
             insertion.key_register(),
             None,
         )?;
+        let key_is_past_table_label = program.allocate_label();
+        let max_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::Last {
+            cursor_id: ctx.cursor_id,
+            pc_if_empty: key_is_past_table_label,
+        });
+        program.emit_insn(Insn::RowId {
+            cursor_id: ctx.cursor_id,
+            dest: max_rowid_reg,
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: insertion.key_register(),
+            rhs: max_rowid_reg,
+            target_pc: key_is_past_table_label,
+            flags: Default::default(),
+            collation: None,
+        });
+        let not_full_label = program.allocate_label();
+        let max_i64_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: max_i64_reg,
+            value: i64::MAX,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: max_rowid_reg,
+            rhs: max_i64_reg,
+            target_pc: not_full_label,
+            flags: Default::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_FULL,
+            description: "database or disk is full".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(not_full_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: max_rowid_reg,
+            dst_reg: insertion.key_register(),
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::AddImm {
+            register: insertion.key_register(),
+            value: 1,
+        });
+        crate::translate::sequence::emit_disk_advance_past(
+            program,
+            resolver,
+            ctx.database_id,
+            &seq_name,
+            &seq,
+            insertion.key_register(),
+        )?;
+        program.preassign_label_to_next_insn(key_is_past_table_label);
     } else if let Some(AutoincMeta {
         r_seq,
         seq_cursor_id,
