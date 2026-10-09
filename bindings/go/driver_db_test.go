@@ -12,6 +12,7 @@ import (
 	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -413,6 +414,39 @@ func TestDriverRowsErrorMessages(t *testing.T) {
 		t.Fatalf("expected error scanning wrong type: %v", err)
 	}
 	t.Log("Rows error behavior test passed")
+}
+
+func TestRowsCloseReportsFailureWhileFinishingStatement(t *testing.T) {
+	db := openMem(t)
+	if _, err := db.Exec(`CREATE TABLE t (doc TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO t VALUES ('{"a":1}'), ('{"a":2}'), ('{')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT json(doc) FROM t`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("expected a first row, got %v", rows.Err())
+	}
+	err = rows.Close()
+	if err == nil {
+		t.Fatalf("rows.Close returned nil although the statement failed on the malformed JSON row")
+	}
+	if !strings.Contains(err.Error(), "malformed JSON") {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("connection unusable after failed close: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 rows, got %d", n)
+	}
 }
 
 func TestTransaction(t *testing.T) {
