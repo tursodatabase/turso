@@ -143,7 +143,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         return Ok(Value::Null);
     }
 
-    let kind = match args[0].get_value() {
+    let kind_code = match args[0].get_value() {
         Value::Text(value) => value.as_str(),
         _ => "",
     };
@@ -155,44 +155,12 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
             "acldefault owner must be an OID".to_string(),
         ));
     }
-    let no_privileges = AclPrivileges::empty();
-    let (public_privileges, owner_privileges) = match kind {
-        "c" => (no_privileges, no_privileges),
-        "r" => (
-            no_privileges,
-            AclPrivileges::INSERT
-                | AclPrivileges::SELECT
-                | AclPrivileges::UPDATE
-                | AclPrivileges::DELETE
-                | AclPrivileges::TRUNCATE
-                | AclPrivileges::REFERENCES
-                | AclPrivileges::TRIGGER,
-        ),
-        "s" => (
-            no_privileges,
-            AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
-        ),
-        "d" => (
-            AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
-            AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
-        ),
-        "f" => (AclPrivileges::EXECUTE, AclPrivileges::EXECUTE),
-        "l" => (AclPrivileges::USAGE, AclPrivileges::USAGE),
-        "L" => (no_privileges, AclPrivileges::SELECT | AclPrivileges::UPDATE),
-        "n" => (no_privileges, AclPrivileges::USAGE | AclPrivileges::CREATE),
-        "p" => (
-            no_privileges,
-            AclPrivileges::SET | AclPrivileges::ALTER_SYSTEM,
-        ),
-        "t" => (no_privileges, AclPrivileges::CREATE),
-        "F" | "S" => (no_privileges, AclPrivileges::USAGE),
-        "T" => (AclPrivileges::USAGE, AclPrivileges::USAGE),
-        _ => {
-            return Err(LimboError::InvalidArgument(format!(
-                "unrecognized object type abbreviation: {kind}"
-            )));
-        }
-    };
+    let kind = kind_code.parse::<AclObjectKind>().map_err(|_| {
+        LimboError::InvalidArgument(format!(
+            "unrecognized object type abbreviation: {kind_code}"
+        ))
+    })?;
+    let (public_privileges, owner_privileges) = kind.default_privileges();
 
     let role = if owner == 10 {
         "turso".to_string()
@@ -208,6 +176,74 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
     Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
+}
+
+#[derive(strum::EnumString)]
+enum AclObjectKind {
+    #[strum(serialize = "c")]
+    Column,
+    #[strum(serialize = "r")]
+    Table,
+    #[strum(serialize = "s")]
+    Sequence,
+    #[strum(serialize = "d")]
+    Database,
+    #[strum(serialize = "f")]
+    Function,
+    #[strum(serialize = "l")]
+    Language,
+    #[strum(serialize = "L")]
+    LargeObject,
+    #[strum(serialize = "n")]
+    Schema,
+    #[strum(serialize = "p")]
+    Parameter,
+    #[strum(serialize = "t")]
+    Tablespace,
+    #[strum(serialize = "F")]
+    ForeignDataWrapper,
+    #[strum(serialize = "S")]
+    ForeignServer,
+    #[strum(serialize = "T")]
+    Type,
+}
+
+impl AclObjectKind {
+    fn default_privileges(&self) -> (AclPrivileges, AclPrivileges) {
+        let no_privileges = AclPrivileges::empty();
+        match self {
+            Self::Column => (no_privileges, no_privileges),
+            Self::Table => (
+                no_privileges,
+                AclPrivileges::INSERT
+                    | AclPrivileges::SELECT
+                    | AclPrivileges::UPDATE
+                    | AclPrivileges::DELETE
+                    | AclPrivileges::TRUNCATE
+                    | AclPrivileges::REFERENCES
+                    | AclPrivileges::TRIGGER,
+            ),
+            Self::Sequence => (
+                no_privileges,
+                AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
+            ),
+            Self::Database => (
+                AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+                AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+            ),
+            Self::Function => (AclPrivileges::EXECUTE, AclPrivileges::EXECUTE),
+            Self::Language => (AclPrivileges::USAGE, AclPrivileges::USAGE),
+            Self::LargeObject => (no_privileges, AclPrivileges::SELECT | AclPrivileges::UPDATE),
+            Self::Schema => (no_privileges, AclPrivileges::USAGE | AclPrivileges::CREATE),
+            Self::Parameter => (
+                no_privileges,
+                AclPrivileges::SET | AclPrivileges::ALTER_SYSTEM,
+            ),
+            Self::Tablespace => (no_privileges, AclPrivileges::CREATE),
+            Self::ForeignDataWrapper | Self::ForeignServer => (no_privileges, AclPrivileges::USAGE),
+            Self::Type => (AclPrivileges::USAGE, AclPrivileges::USAGE),
+        }
+    }
 }
 
 bitflags::bitflags! {

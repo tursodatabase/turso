@@ -294,13 +294,17 @@ fn test_pg_acl_default_null_and_invalid_arguments(db: TempDatabase) {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
     }
 
-    let error = conn.execute("SELECT acldefault('?', 10)").unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("unrecognized object type abbreviation: ?"),
-        "{error}"
-    );
+    for kind in ["?", "", "rr", "r ", " r", "R", "Table", "é"] {
+        let error = conn
+            .execute(format!("SELECT acldefault('{kind}', 10)"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unrecognized object type abbreviation: {kind}")),
+            "object kind {kind:?}: {error}"
+        );
+    }
 }
 
 #[turso_macros::test(mvcc)]
