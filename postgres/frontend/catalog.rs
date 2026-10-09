@@ -653,7 +653,7 @@ impl SnapshotRows for PgProcTable {
                 Value::build_text(entry.name),      // proname
                 Value::from_i64(11),                // pronamespace (pg_catalog)
                 Value::from_i64(10),                // proowner
-                Value::from_i64(14),                // prolang (SQL)
+                Value::from_i64(12),                // prolang (internal)
                 Value::from_f64(1.0),               // procost
                 Value::from_f64(0.0),               // prorows
                 Value::from_i64(0),                 // provariadic
@@ -2057,7 +2057,183 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
             .to_string(),
         },
     );
+    options = options.native_module(
+        "pg_language",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgLanguageTable>(PhantomData),
+    );
+    for (name, create_sql) in [
+        (
+            "pg_operator",
+            "CREATE TABLE pg_operator (
+            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opclass",
+            "CREATE TABLE pg_opclass (
+            oid INTEGER, opcmethod INTEGER, opcname TEXT, opcnamespace INTEGER,
+            opcowner INTEGER, opcfamily INTEGER, opcintype INTEGER, opcdefault BOOLEAN,
+            opckeytype INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opfamily",
+            "CREATE TABLE pg_opfamily (
+            oid INTEGER, opfmethod INTEGER, opfname TEXT, opfnamespace INTEGER,
+            opfowner INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_parser",
+            "CREATE TABLE pg_ts_parser (
+            oid INTEGER, prsname TEXT, prsnamespace INTEGER, prsstart INTEGER,
+            prstoken INTEGER, prsend INTEGER, prsheadline INTEGER, prslextype INTEGER,
+            tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_template",
+            "CREATE TABLE pg_ts_template (
+            oid INTEGER, tmplname TEXT, tmplnamespace INTEGER, tmplinit INTEGER,
+            tmpllexize INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_dict",
+            "CREATE TABLE pg_ts_dict (
+            oid INTEGER, dictname TEXT, dictnamespace INTEGER, dictowner INTEGER,
+            dicttemplate INTEGER, dictinitoption TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_config",
+            "CREATE TABLE pg_ts_config (
+            oid INTEGER, cfgname TEXT, cfgnamespace INTEGER, cfgowner INTEGER,
+            cfgparser INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_data_wrapper",
+            "CREATE TABLE pg_foreign_data_wrapper (
+            oid INTEGER, fdwname TEXT, fdwowner INTEGER, fdwhandler INTEGER,
+            fdwvalidator INTEGER, fdwacl TEXT[], fdwoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_server",
+            "CREATE TABLE pg_foreign_server (
+            oid INTEGER, srvname TEXT, srvowner INTEGER, srvfdw INTEGER, srvtype TEXT,
+            srvversion TEXT, srvacl TEXT[], srvoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_default_acl",
+            "CREATE TABLE pg_default_acl (
+            oid INTEGER, defaclrole INTEGER, defaclnamespace INTEGER, defaclobjtype TEXT,
+            defaclacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_conversion",
+            "CREATE TABLE pg_conversion (
+            oid INTEGER, conname TEXT, connamespace INTEGER, conowner INTEGER,
+            conforencoding INTEGER, contoencoding INTEGER, conproc INTEGER,
+            condefault BOOLEAN, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_range",
+            "CREATE TABLE pg_range (
+            rngtypid INTEGER, rngsubtype INTEGER, rngmultitypid INTEGER,
+            rngcollation INTEGER, rngsubopc INTEGER, rngcanonical INTEGER,
+            rngsubdiff INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_event_trigger",
+            "CREATE TABLE pg_event_trigger (
+            oid INTEGER, evtname TEXT, evtevent TEXT, evtowner INTEGER, evtfoid INTEGER,
+            evtenabled TEXT, evttags TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_subscription",
+            "CREATE TABLE pg_subscription (
+            oid INTEGER, subdbid INTEGER, subskiplsn TEXT, subname TEXT, subowner INTEGER,
+            subenabled BOOLEAN, subbinary BOOLEAN, substream TEXT, subtwophasestate TEXT,
+            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN,
+            subconninfo TEXT, subslotname TEXT, subsynccommit TEXT, subpublications TEXT[],
+            suborigin TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_largeobject_metadata",
+            "CREATE TABLE pg_largeobject_metadata (
+            oid INTEGER, lomowner INTEGER, lomacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amop",
+            "CREATE TABLE pg_amop (
+            oid INTEGER, amopfamily INTEGER, amoplefttype INTEGER, amoprighttype INTEGER,
+            amopstrategy INTEGER, amoppurpose TEXT, amopopr INTEGER, amopmethod INTEGER,
+            amopsortfamily INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amproc",
+            "CREATE TABLE pg_amproc (
+            oid INTEGER, amprocfamily INTEGER, amproclefttype INTEGER, amprocrighttype INTEGER,
+            amprocnum INTEGER, amproc INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+    ] {
+        options = options.native_module(
+            name,
+            VTabKind::TableValuedFunction,
+            EmptyPgCatalogTable {
+                create_sql: create_sql.to_owned(),
+            },
+        );
+    }
     options
+}
+
+#[derive(Debug)]
+struct PgLanguageTable;
+
+impl SnapshotRows for PgLanguageTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_language (
+        oid INTEGER, lanname TEXT, lanowner INTEGER, lanispl BOOLEAN,
+        lanpltrusted BOOLEAN, lanplcallfoid INTEGER, laninline INTEGER,
+        lanvalidator INTEGER, lanacl TEXT[], tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2612);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        [(12, "internal"), (13, "c")]
+            .into_iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::build_text(name),
+                    Value::from_i64(10),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::Null,
+                ]
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
