@@ -24,3 +24,7 @@ turso_pg = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+turso_pg_client = { workspace = true }
