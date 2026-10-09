@@ -1,6 +1,6 @@
 ---
 name: merge-pr
-description: Merge a pull request with the Turso merge commit format ("Merge '<title>' from <author>"). Use when the user asks you to merge a PR. Works on a local machine with the gh CLI and in a Claude Code cloud sandbox with the GitHub MCP tools.
+description: Merge a pull request with the Turso merge commit format ("Merge '<title>' from <author>"). Use when the user asks you to merge a PR from a Claude Code cloud sandbox. Uses the GitHub MCP tools.
 argument-hint: <pr-number>
 ---
 # Merge a Pull Request
@@ -14,50 +14,16 @@ Turso merges each PR with a merge commit. `scripts/merge-pr.py` makes the commit
 - Each approval adds a `Reviewed-by:` line.
 - The last line is `Closes #<PR number>`.
 
-Rules for both paths:
+Rules:
 
 - Merge only the PR that the user named.
 - Use only the merge method `merge`. Do not squash or rebase.
 - Do not change the commit title or message that the script makes.
 - If GitHub refuses the merge, give the error to the user. Do not try to bypass branch protection.
 
-## Step 1: Select the path
-
-Read the `CLAUDE_CODE_REMOTE` variable:
-
-```bash
-echo "${CLAUDE_CODE_REMOTE:-false}"
-```
-
-- If the value is `true`, you are in a Claude Code cloud sandbox. Use the sandbox path.
-- If the value is not `true`, use the local path.
-
-## Local path
-
-On a local machine, the script does the merge.
-
-1. Run `gh auth status`. If `gh` is not logged in, stop. Tell the user to run `gh auth login --scopes repo,workflow`.
-2. Run `gh pr checks <PR number>` to get the CI state.
-3. If a check failed or is pending, stop. Tell the user the names of these checks. Continue only if the user tells you to merge.
-4. From the repository root, run the script:
-
-   ```bash
-   uv run scripts/merge-pr.py <PR number>
-   ```
-
-5. If a check failed or is pending, the script asks `Do you want to proceed with the merge? (y/N)`. Send the answer on stdin:
-
-   ```bash
-   printf 'y\n' | uv run scripts/merge-pr.py <PR number>
-   ```
-
-6. Give the user the merge commit SHA and the commit message that the script prints.
-
-Do not use `make merge-pr`. This target can start `gh auth login`, which waits for input from a terminal.
-
-## Sandbox path
-
 In the cloud sandbox, the proxy blocks GitHub GraphQL. `gh pr view` and `gh pr checks` use GraphQL, thus the script cannot merge. Use the GitHub MCP tools for all GitHub calls. Use the script only to make the commit message.
+
+## Procedure
 
 For each MCP call, use `owner: tursodatabase` and `repo: turso`.
 
@@ -114,5 +80,5 @@ For each MCP call, use `owner: tursodatabase` and `repo: turso`.
 
 Notes:
 
-- In the sandbox, the script cannot get a GitHub profile. For an author that is not in `.github.json`, the title uses the login, not the full name.
+- The script cannot get a GitHub profile in the sandbox. For an author that is not in `.github.json`, the title uses the login, not the full name.
 - For a reviewer that is not in `.github.json`, the `Reviewed-by:` line uses the address `<login>@users.noreply.github.com`.
