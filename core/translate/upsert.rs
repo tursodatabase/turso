@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_virtual_columns;
+use super::emitter::gencol::{compute_virtual_columns, emit_row_from_cursor};
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -502,20 +502,10 @@ pub fn emit_upsert(
         .expect("upsert must have a target table")
         .internal_id;
     let current_start = program.alloc_registers(num_cols);
-    for i in 0..num_cols {
-        let col = &table.columns()[i];
-        let reg = layout.to_register(current_start, i);
-        emit_table_column(
-            program,
-            ctx.cursor_id,
-            table_ref_id,
-            table_references,
-            col,
-            i,
-            reg,
-            resolver,
-        )?;
-    }
+    let current_regs: Vec<usize> = (0..num_cols)
+        .map(|i| layout.to_register(current_start, i))
+        .collect();
+    emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &current_regs, resolver)?;
 
     // BEFORE for index maintenance / CDC
     let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
@@ -889,18 +879,10 @@ pub fn emit_upsert(
             // index deletion must use the row as it is on disk now, or the
             // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
+                let before_regs: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(before, i))
+                    .collect();
+                emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &before_regs, resolver)?;
             }
 
             // Same for the NEW image: like SQLite, columns not in the SET list
