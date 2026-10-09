@@ -1,6 +1,56 @@
 use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
+#[turso_macros::test(mvcc)]
+fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE DEFAULT 'a')")
+        .unwrap();
+    for (catalog, oid) in [
+        ("pg_class", 1259),
+        ("pg_namespace", 2615),
+        ("pg_attribute", 1249),
+        ("pg_proc", 1255),
+        ("pg_database", 1262),
+        ("pg_am", 2601),
+        ("pg_type", 1247),
+        ("pg_index", 2610),
+        ("pg_constraint", 2606),
+        ("pg_attrdef", 2604),
+    ] {
+        assert_eq!(
+            conn.prepare(format!("SELECT tableoid FROM pg_catalog.{catalog} LIMIT 1"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(oid)]],
+            "{catalog}"
+        );
+    }
+    assert_eq!(
+        conn.prepare("SELECT * FROM pg_class")
+            .unwrap()
+            .num_columns(),
+        33
+    );
+    assert_eq!(
+        conn.prepare("SELECT * FROM pg_namespace")
+            .unwrap()
+            .num_columns(),
+        4
+    );
+
+    conn.execute("CREATE TABLE refresh_schema (value TEXT)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT tableoid FROM pg_namespace LIMIT 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2615)]]
+    );
+}
+
 #[turso_macros::test]
 fn test_postgres_pg_namespace(db: TempDatabase) {
     let conn = db.connect_postgres();
