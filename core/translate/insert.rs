@@ -520,8 +520,8 @@ pub fn translate_insert(
         &btree_table,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    let column_reg_mapping = || {
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -530,14 +530,15 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        })
+    };
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            &DmlColumnContext::from_column_reg_mapping(column_reg_mapping(), ColumnMask::default()),
             resolver,
             &btree_table,
         )?;
@@ -822,7 +823,7 @@ pub fn translate_insert(
             &ctx.table
                 .columns_topo_sort()?
                 .retain_columns(&columns_to_compute),
-            &dml_ctx.with_encoded_columns(encoded_columns),
+            &DmlColumnContext::from_column_reg_mapping(column_reg_mapping(), encoded_columns),
             resolver,
             &btree_table,
         )?;

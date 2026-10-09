@@ -146,6 +146,7 @@ impl DmlColumnContext {
         base_reg: usize,
         rowid_reg: usize,
         layout: ColumnLayout,
+        encoded_columns: ColumnMask,
     ) -> Self {
         let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
@@ -156,11 +157,14 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
-            encoded_columns: ColumnMask::default(),
+            encoded_columns,
         }
     }
 
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+    pub fn from_column_reg_mapping<'a>(
+        pairs: impl Iterator<Item = (&'a Column, usize)>,
+        encoded_columns: ColumnMask,
+    ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -172,16 +176,11 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
-            encoded_columns: ColumnMask::default(),
+            encoded_columns,
         }
     }
 
-    pub fn with_encoded_columns(mut self, encoded_columns: ColumnMask) -> Self {
-        self.encoded_columns = encoded_columns;
-        self
-    }
-
-    pub fn holds_encoded_value(&self, col_idx: usize) -> bool {
+    pub fn is_encoded_value(&self, col_idx: usize) -> bool {
         self.encoded_columns.get(col_idx)
     }
 
