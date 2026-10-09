@@ -1,18 +1,19 @@
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
 
 pub(crate) struct Coro<Yield> {
-    bridge: Arc<Mutex<Bridge<Yield>>>,
+    bridge: Rc<Cell<Bridge<Yield>>>,
 }
 
 impl<Yield> Coro<Yield> {
     pub(crate) async fn yield_(&mut self, value: Yield) -> Result<()> {
-        *self.bridge.lock() = Bridge::Yielded(value);
+        self.bridge.set(Bridge::Yielded(value));
         Resumed {
             bridge: &self.bridge,
         }
@@ -44,16 +45,16 @@ pub(crate) enum CoroResume<Yield, Output> {
 }
 
 pub(crate) struct CoroRunner<Yield, Output> {
-    bridge: Arc<Mutex<Bridge<Yield>>>,
-    future: Option<Pin<Box<dyn Future<Output = Output> + Send + Sync>>>,
+    bridge: Rc<Cell<Bridge<Yield>>>,
+    future: Option<Pin<Box<dyn Future<Output = Output>>>>,
 }
 
 impl<Yield, Output> CoroRunner<Yield, Output> {
     pub(crate) fn new<F>(function: impl FnOnce(Coro<Yield>) -> F) -> Self
     where
-        F: Future<Output = Output> + Send + Sync + 'static,
+        F: Future<Output = Output> + 'static,
     {
-        let bridge = Arc::new(Mutex::new(Bridge::Empty));
+        let bridge = Rc::new(Cell::new(Bridge::Empty));
         let future = Box::pin(function(Coro {
             bridge: bridge.clone(),
         }));
@@ -80,7 +81,7 @@ impl<Yield, Output> CoroRunner<Yield, Output> {
             .future
             .take()
             .expect("coroutine must not run after it returned");
-        *self.bridge.lock() = Bridge::Resumed(resume);
+        self.bridge.set(Bridge::Resumed(resume));
         match future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -88,7 +89,7 @@ impl<Yield, Output> CoroRunner<Yield, Output> {
             Poll::Ready(output) => CoroResume::Completed(output),
             Poll::Pending => {
                 self.future = Some(future);
-                match std::mem::replace(&mut *self.bridge.lock(), Bridge::Empty) {
+                match self.bridge.replace(Bridge::Empty) {
                     Bridge::Yielded(value) => CoroResume::Yielded(value),
                     Bridge::Empty | Bridge::Resumed(_) => {
                         panic!("coroutine must pause only through Coro::yield_")
@@ -111,19 +112,18 @@ enum Resume {
 }
 
 struct Resumed<'a, Yield> {
-    bridge: &'a Mutex<Bridge<Yield>>,
+    bridge: &'a Cell<Bridge<Yield>>,
 }
 
 impl<Yield> Future for Resumed<'_, Yield> {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-        let mut bridge = self.bridge.lock();
-        match std::mem::replace(&mut *bridge, Bridge::Empty) {
+        match self.bridge.replace(Bridge::Empty) {
             Bridge::Resumed(Resume::Continue) => Poll::Ready(Ok(())),
             Bridge::Resumed(Resume::Cancel(err)) => Poll::Ready(Err(err)),
             not_resumed => {
-                *bridge = not_resumed;
+                self.bridge.set(not_resumed);
                 Poll::Pending
             }
         }
