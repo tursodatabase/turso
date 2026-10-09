@@ -165,6 +165,10 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
+
+    fn uses_rowid_alias_defaults(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -1746,7 +1750,8 @@ impl SnapshotRows for PgAttrdefTable {
         // Use a high base to avoid collisions
         let mut attrdef_oid: i64 = 50000;
 
-        for relation in catalog_relations(conn) {
+        let relations = catalog_relations(conn);
+        for relation in &relations {
             let btree = match &relation.kind {
                 CatalogRelationKind::Table(table) => table,
                 _ => continue,
@@ -1758,7 +1763,7 @@ impl SnapshotRows for PgAttrdefTable {
                         Value::from_i64(attrdef_oid), // oid
                         Value::from_i64(relation.oid),
                         Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::build_text(pg_default_expr(default_expr, &relations).0), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -2813,6 +2818,20 @@ impl SnapshotRows for PgDependTable {
                 .as_int()
                 .expect("catalog column numbers are integers");
             rows.push(dependency_row([2604, oid, 0], [1259, table, column], "a"));
+            let relation = objects
+                .iter()
+                .find(|relation| relation.oid == table)
+                .expect("defaults refer to catalog relations");
+            let CatalogRelationKind::Table(btree) = &relation.kind else {
+                unreachable!("defaults belong to tables")
+            };
+            let expr = btree.columns()[column as usize - 1]
+                .default
+                .as_ref()
+                .expect("default columns have default expressions");
+            for sequence_oid in pg_default_expr(expr, &objects).1 {
+                rows.push(dependency_row([2604, oid, 0], [1259, sequence_oid, 0], "n"));
+            }
         }
         rows
     }
@@ -3844,6 +3863,71 @@ fn postgres_view_expr(expr: &mut ast::Expr) {
             _ => (),
         }
     }
+}
+
+fn pg_default_expr(expr: &ast::Expr, relations: &[CatalogRelation]) -> (String, Vec<i64>) {
+    let mut expr = expr.clone();
+    let mut dependencies = Vec::new();
+    turso_core::walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if name.as_str().eq_ignore_ascii_case("nextval") {
+                if let Some(ast::Expr::Literal(ast::Literal::String(value))) =
+                    args.first().map(|arg| arg.as_ref())
+                {
+                    let sequence_name = value
+                        .strip_prefix('\'')
+                        .and_then(|name| name.strip_suffix('\''))
+                        .expect("string literals are quoted")
+                        .replace("''", "'");
+                    let (sequence_namespace, sequence_name) = sequence_name
+                        .split_once('.')
+                        .unwrap_or(("main", &sequence_name));
+                    let sequence_namespace = sequence_namespace.to_ascii_lowercase();
+                    let sequence_namespace = if sequence_namespace == "main" {
+                        "public"
+                    } else {
+                        &sequence_namespace
+                    };
+                    let sequence_name = sequence_name.to_ascii_lowercase();
+                    if let Some(sequence) = relations.iter().find(|relation| {
+                        relation.namespace == sequence_namespace
+                            && relation.name == sequence_name
+                            && matches!(relation.kind, CatalogRelationKind::Sequence(_))
+                    }) {
+                        let qualified_name = format!(
+                            "{}.{}",
+                            quote_identifier(&sequence.namespace),
+                            quote_identifier(&sequence.name)
+                        );
+                        args[0] = Box::new(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                                "'{}'",
+                                qualified_name.replace('\'', "''")
+                            )))),
+                            type_name: Some(ast::Type {
+                                name: "regclass".to_string(),
+                                size: None,
+                                array_dimensions: 0,
+                            }),
+                        });
+                        if !dependencies.contains(&sequence.oid) {
+                            dependencies.push(sequence.oid);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(turso_core::WalkControl::Continue)
+    })
+    .expect("stored default expressions can be visited");
+    visit_relation_expr(
+        &mut expr,
+        &HashSet::new(),
+        &mut |_, _| Ok(()),
+        postgres_view_expr,
+    )
+    .expect("stored default expressions can be visited");
+    (expr.to_string(), dependencies)
 }
 
 struct CatalogIndex {
