@@ -12,7 +12,7 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
-        plan::{ResultSetColumn, TableReferences},
+        plan::{ColumnMask, ResultSetColumn, TableReferences},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -137,6 +137,7 @@ enum DmlColumnRegisters {
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
+    encoded_columns: ColumnMask,
 }
 
 impl DmlColumnContext {
@@ -145,6 +146,7 @@ impl DmlColumnContext {
         base_reg: usize,
         rowid_reg: usize,
         layout: ColumnLayout,
+        encoded_columns: ColumnMask,
     ) -> Self {
         let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
@@ -155,10 +157,14 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
+            encoded_columns,
         }
     }
 
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+    pub fn from_column_reg_mapping<'a>(
+        pairs: impl Iterator<Item = (&'a Column, usize)>,
+        encoded_columns: ColumnMask,
+    ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -170,7 +176,12 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
+            encoded_columns,
         }
+    }
+
+    pub fn is_encoded_value(&self, col_idx: usize) -> bool {
+        self.encoded_columns.get(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {

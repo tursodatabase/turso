@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -319,47 +320,33 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
+/// Emit bytecode that computes `expr` for one row of `table` and writes the result to
+/// `dest_reg`. INSERT, UPDATE, and UPSERT use this function for the key expressions of an
+/// index and for the WHERE clause of a partial index.
 ///
-/// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
+/// Preconditions:
+/// - `expr` refers to columns by their names in `columns`.
+/// - `column_regs[i]` is the register that holds the value of `columns[i]`.
+/// - Each value is in the format that the table stores. For a custom type column, this is
+///   the value after ENCODE.
 ///
-/// The caller must:
-/// 1. Clone the expression from `idx_col.expr`
-/// 2. Build the initial `column_regs` mapping (before decode)
-///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
-/// columns are decoded in-place in `column_regs`.
+/// When `expr` reads a column, the bytecode applies DECODE to the value before `expr`
+/// uses it. Thus `expr` gets the same value that a SELECT gets for this column.
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut expr: ast::Expr,
     columns: &[Column],
-    column_regs: &mut [usize],
+    column_regs: &[usize],
     table: &Arc<BTreeTable>,
     dest_reg: usize,
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
-    let is_strict = table.is_strict;
-    for (i, col) in columns.iter().enumerate() {
-        if col.is_rowid_alias() {
-            continue;
-        }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-            if type_def.decode().is_some() {
-                let src_reg = column_regs[i];
-                let tmp = program.alloc_register();
-                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-                column_regs[i] = tmp;
-            }
-        }
-    }
-
     let pairs = columns.iter().zip(column_regs.iter().copied());
+    let encoded_columns: ColumnMask = (0..columns.len()).try_collect()?;
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, encoded_columns),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
