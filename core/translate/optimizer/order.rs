@@ -1,4 +1,4 @@
-use crate::schema::rebase_schema_expr;
+use crate::schema::bind_schema_expr;
 use crate::schema::{impl_effective_nulls_order, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
@@ -804,9 +804,7 @@ fn target_matches_order_column(
             if exprs_are_equivalent(target_expr, idx_expr) {
                 return true;
             }
-            // A virtual generated column keeps its expression in the stored form.
-            let mut generated = idx_expr.clone();
-            rebase_schema_expr(&mut generated, table_ref.internal_id);
+            let generated = bind_schema_expr(idx_expr, table_ref.internal_id);
             exprs_are_equivalent(target_expr, &generated)
         }
         _ => false,

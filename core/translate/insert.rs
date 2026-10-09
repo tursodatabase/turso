@@ -553,7 +553,8 @@ pub fn translate_insert(
             &ctx.table.columns_topo_sort()?,
             &dml_ctx,
             resolver,
-            &btree_table,
+            &table_references,
+            target_table_id,
         )?;
 
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
@@ -819,7 +820,8 @@ pub fn translate_insert(
             &ctx.table.columns_topo_sort()?,
             &dml_ctx,
             resolver,
-            &btree_table,
+            &table_references,
+            target_table_id,
         )?;
 
         if let Some(type_check_table) = maybe_type_check_table {
@@ -1022,7 +1024,8 @@ pub fn translate_insert(
             &ctx.table.columns_topo_sort()?,
             &dml_ctx,
             resolver,
-            &btree_table,
+            &table_references,
+            target_table_id,
         )?;
 
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;

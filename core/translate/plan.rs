@@ -2,7 +2,7 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        rebase_schema_expr, BTreeTable, CheckConstraint, ColDef, Column, FromClauseSubquery, Index,
+        bind_schema_expr, BTreeTable, CheckConstraint, ColDef, Column, FromClauseSubquery, Index,
         ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility, PseudoCursorType,
         RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
@@ -3142,6 +3142,31 @@ impl JoinedTable {
     }
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
+    /// A reference to a table that a statement reads outside its FROM clause,
+    /// such as the parent table of a foreign key.
+    pub fn new_btree(
+        table: Arc<BTreeTable>,
+        internal_id: TableInternalId,
+        database_id: usize,
+    ) -> Self {
+        let identifier = table.name.clone();
+        let table = Table::BTree(table);
+        Self {
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+            plan_estimate: None,
+        }
+    }
+
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
@@ -3339,19 +3364,19 @@ impl JoinedTable {
 
     /// The CHECK constraint `check` of the table, bound to this reference.
     pub fn check_constraint_expr(&self, check: &CheckConstraint) -> ast::Expr {
-        rebase(&check.bound, self.internal_id)
+        bind_schema_expr(&check.bound, self.internal_id)
     }
 
     /// The key expression of index column `position`, bound to this reference.
     pub fn index_column_expr(&self, index: &Index, position: usize) -> Option<ast::Expr> {
         let expr = index.columns.get(position)?.expr.as_deref()?;
-        Some(rebase(expr, self.internal_id))
+        Some(bind_schema_expr(expr, self.internal_id))
     }
 
     /// The predicate of a partial index, bound to this reference.
     pub fn index_where_expr(&self, index: &Index) -> Option<ast::Expr> {
         let expr = index.where_clause.as_deref()?;
-        Some(rebase(expr, self.internal_id))
+        Some(bind_schema_expr(expr, self.internal_id))
     }
 
     /// A query pattern of an index method, bound to this reference.
@@ -3363,10 +3388,9 @@ impl JoinedTable {
     /// bound query expression.
     pub fn expression_index_position(&self, index: &Index, expr: &ast::Expr) -> Option<usize> {
         index.columns.iter().position(|column| {
-            column
-                .expr
-                .as_deref()
-                .is_some_and(|key| exprs_are_equivalent(&rebase(key, self.internal_id), expr))
+            column.expr.as_deref().is_some_and(|key| {
+                exprs_are_equivalent(&bind_schema_expr(key, self.internal_id), expr)
+            })
         })
     }
 
@@ -3637,12 +3661,6 @@ impl JoinedTable {
     pub fn column_is_used(&self, index: usize) -> bool {
         self.col_used_mask.get(index)
     }
-}
-
-fn rebase(expr: &ast::Expr, internal_id: TableInternalId) -> ast::Expr {
-    let mut bound = expr.clone();
-    rebase_schema_expr(&mut bound, internal_id);
-    bound
 }
 
 /// A definition of a rowid/index search.

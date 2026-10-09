@@ -1,9 +1,9 @@
-use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
+use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct, TableInternalId};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
-use crate::translate::plan::ColumnMask;
+use crate::translate::plan::{ColumnMask, JoinedTable, TableReferences};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
@@ -702,29 +702,34 @@ pub fn emit_parent_index_key_change_checks(
 
     let old_key = program.alloc_registers(idx_len);
     let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
-    let dml_ctx = some_idx_columns_are_virtual
+    let row_image = some_idx_columns_are_virtual
         .then(|| {
-            emit_columns_and_dependencies(
+            let (table_references, table_id) = table_scope(program, table_btree, database_id);
+            let registers = emit_columns_and_dependencies(
                 program,
                 table_btree,
                 cursor_id,
                 old_rowid_reg,
                 idx_target_cols,
                 resolver,
-            )
+                &table_references,
+                table_id,
+            )?;
+            Ok::<_, crate::LimboError>((table_references, table_id, registers))
         })
         .transpose()?;
     for (i, index_col) in index.columns.iter().enumerate() {
-        if let Some(ref ctx) = dml_ctx {
+        if let Some((table_references, table_id, registers)) = &row_image {
             emit_table_column_for_dml(
                 program,
                 cursor_id,
-                ctx.clone(),
+                registers,
+                *table_id,
+                table_references,
                 &table_btree.columns()[index_col.pos_in_table],
                 index_col.pos_in_table,
                 old_key + i,
                 resolver,
-                &Arc::new(table_btree.clone()),
             )?;
         } else {
             program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
@@ -985,6 +990,7 @@ fn emit_fk_parent_key_probe(
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.
 /// Handles rowid aliasing and explicit ROWID names; uses current row for non-rowid columns.
+#[allow(clippy::too_many_arguments)]
 fn build_parent_key(
     program: &mut ProgramBuilder,
     parent_bt: &BTreeTable,
@@ -992,6 +998,7 @@ fn build_parent_key(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
+    database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     let some_fk_cols_are_virtual = parent_cols.iter().any(|pcol| {
@@ -1003,16 +1010,20 @@ fn build_parent_key(
     let fk_target_cols = parent_cols
         .iter()
         .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
-    let ctx = some_fk_cols_are_virtual
+    let row_image = some_fk_cols_are_virtual
         .then(|| {
-            emit_columns_and_dependencies(
+            let (table_references, table_id) = table_scope(program, parent_bt, database_id);
+            let registers = emit_columns_and_dependencies(
                 program,
                 parent_bt,
                 parent_cursor_id,
                 parent_rowid_reg,
                 fk_target_cols,
                 resolver,
-            )
+                &table_references,
+                table_id,
+            )?;
+            Ok::<_, crate::LimboError>((table_references, table_id, registers))
         })
         .transpose()?;
 
@@ -1030,18 +1041,17 @@ fn build_parent_key(
             return Err(LimboError::InternalError(format!("col {pcol} missing")));
         };
 
-        if some_fk_cols_are_virtual {
-            // the virtual column will need the registers we previously copied
+        if let Some((table_references, table_id, registers)) = &row_image {
             emit_table_column_for_dml(
                 program,
                 parent_cursor_id,
-                ctx.clone()
-                    .expect("ctx is always computed if some fk cols are virtual"),
+                registers,
+                *table_id,
+                table_references,
                 col,
                 pos,
                 dest_start + i,
                 resolver,
-                &Arc::new(parent_bt.clone()),
             )?;
         } else {
             program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);
@@ -1087,6 +1097,7 @@ pub fn emit_fk_child_update_counters(
             .filter_map(|col_name| child_tbl.get_column(col_name).map(|(pos, _)| pos))
             .collect();
 
+        let (table_references, table_id) = table_scope(program, child_tbl, database_id);
         let dml_ctx = emit_columns_and_dependencies(
             program,
             child_tbl,
@@ -1094,6 +1105,8 @@ pub fn emit_fk_child_update_counters(
             old_rowid_reg,
             fk_col_positions.clone(),
             resolver,
+            &table_references,
+            table_id,
         )?;
 
         for &pos in &fk_col_positions {
@@ -1403,6 +1416,7 @@ fn emit_fk_delete_parent_existence_check_single(
         parent_cursor_id,
         parent_rowid_reg,
         parent_key_start,
+        database_id,
         resolver,
     )?;
 
@@ -2135,6 +2149,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 parent_cursor_id,
                 parent_rowid_reg,
                 key_regs_start,
+                database_id,
                 resolver,
             )?;
 
@@ -2510,6 +2525,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             key_regs_start,
+            database_id,
             resolver,
         )?;
 
@@ -2553,6 +2569,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             parent_key_start,
+            database_id,
             resolver,
         )?;
 
@@ -2647,6 +2664,25 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+/// A scope with one reference to `table`, for the row of a table that the
+/// statement reads outside its FROM clause.
+fn table_scope(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    database_id: usize,
+) -> (TableReferences, TableInternalId) {
+    let table_id = program.table_reference_counter.next();
+    let table_references = TableReferences::new(
+        vec![JoinedTable::new_btree(
+            Arc::new(table.clone()),
+            table_id,
+            database_id,
+        )],
+        vec![],
+    );
+    (table_references, table_id)
 }
 
 #[cfg(test)]

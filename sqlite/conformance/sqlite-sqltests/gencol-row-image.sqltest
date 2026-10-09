@@ -1,0 +1,191 @@
+@database :memory:
+
+# A virtual generated column is computed from the row of its table reference:
+# from a cursor when the statement reads the table, and from registers when a
+# DML statement holds the row in registers (INSERT, UPDATE, UPSERT, triggers,
+# RETURNING, foreign keys and ALTER TABLE ADD COLUMN).
+
+test virtual-column-comparison-uses-the-collation-of-its-column {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT, c AS (a = b), d AS (b = a));
+    INSERT INTO t(a, b) VALUES ('x', 'X');
+    SELECT c, d FROM t;
+}
+expect {
+    1|0
+}
+
+test nested-virtual-columns-are-read-from-the-cursor {
+    CREATE TABLE t(a INTEGER, b AS (a + 1), c AS (b * 2), d AS (c + b));
+    INSERT INTO t(a) VALUES (1), (10);
+    SELECT a, b, c, d FROM t ORDER BY a;
+}
+expect {
+    1|2|4|6
+    10|11|22|33
+}
+
+test insert-checks-a-nested-virtual-column {
+    CREATE TABLE t(a INTEGER, b AS (a + 1), c AS (b * 2) NOT NULL CHECK (c < 100));
+    INSERT INTO t(a) VALUES (1);
+    INSERT INTO t(a) VALUES (60);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test insert-rejects-a-null-nested-virtual-column {
+    CREATE TABLE t(a INTEGER, b AS (a + 1), c AS (b * 2) NOT NULL);
+    INSERT INTO t(a) VALUES (NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test update-recomputes-nested-virtual-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b AS (a + 1), c AS (b * 2));
+    INSERT INTO t(id, a) VALUES (1, 1), (2, 2);
+    UPDATE t SET a = a + 10 WHERE id = 2 RETURNING id, b, c;
+    SELECT id, b, c FROM t ORDER BY id;
+}
+expect {
+    2|13|26
+    1|2|4
+    2|13|26
+}
+
+test upsert-recomputes-nested-virtual-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b AS (a + 1), c AS (b * 2));
+    INSERT INTO t(id, a) VALUES (1, 1);
+    INSERT INTO t(id, a) VALUES (1, 5) ON CONFLICT(id) DO UPDATE SET a = excluded.a + c RETURNING a, b, c;
+    SELECT a, b, c FROM t;
+}
+expect {
+    9|10|20
+    9|10|20
+}
+
+test triggers-read-nested-virtual-columns-of-new-and-old {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b AS (a + 1), c AS (b * 2));
+    CREATE TABLE log(what TEXT, old_c, new_c);
+    CREATE TRIGGER ti AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ('insert', NULL, NEW.c);
+    END;
+    CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('update', OLD.c, NEW.c);
+    END;
+    CREATE TRIGGER td BEFORE DELETE ON t BEGIN
+        INSERT INTO log VALUES ('delete', OLD.c, NULL);
+    END;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE t SET a = 3 WHERE id = 1;
+    DELETE FROM t WHERE id = 1;
+    SELECT what, old_c, new_c FROM log ORDER BY rowid;
+}
+expect {
+    insert||4
+    update|4|8
+    delete|8|
+}
+
+test foreign-key-parent-key-on-a-virtual-column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES p(v) ON DELETE CASCADE ON UPDATE CASCADE);
+    INSERT INTO p(id, a) VALUES (1, 1), (2, 2);
+    INSERT INTO c(id, pv) VALUES (10, 2), (20, 4);
+    UPDATE p SET a = 5 WHERE id = 1;
+    DELETE FROM p WHERE id = 2;
+    SELECT id, pv FROM c ORDER BY id;
+}
+expect {
+    10|10
+}
+
+test foreign-key-parent-key-on-a-virtual-column-rejects-an-orphan {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES p(v));
+    INSERT INTO p(id, a) VALUES (1, 1);
+    INSERT INTO c(id, pv) VALUES (10, 3);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test foreign-key-child-key-on-a-virtual-column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER, v AS (a + 1) REFERENCES p(id));
+    INSERT INTO p(id) VALUES (2), (3);
+    INSERT INTO c(id, a) VALUES (1, 1);
+    UPDATE c SET a = 2 WHERE id = 1;
+    UPDATE c SET a = 5 WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test add-column-virtual-with-check-validates-existing-rows {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (60);
+    ALTER TABLE t ADD COLUMN v AS (a * 2) CHECK (v < 100);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-virtual-reads-existing-rows {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN v AS (a * 2) CHECK (v < 100);
+    ALTER TABLE t ADD COLUMN w AS (v + a);
+    SELECT a, v, w FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    2|4|6
+}
+
+test virtual-column-in-a-join-payload {
+    CREATE TABLE t1(k INTEGER, a INTEGER, v AS (a * 10));
+    CREATE TABLE t2(k INTEGER, b INTEGER, w AS (b + 1));
+    INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 3);
+    INSERT INTO t2 VALUES (1, 100), (2, 200), (4, 400);
+    SELECT t1.v, t2.w FROM t1 JOIN t2 ON t1.k = t2.k ORDER BY t1.k;
+}
+expect {
+    10|101
+    20|201
+}
+
+test virtual-column-read-from-a-covering-index {
+    CREATE TABLE t(a INTEGER, b INTEGER, v AS (a * 10));
+    CREATE INDEX i ON t(v, a);
+    INSERT INTO t(a, b) VALUES (1, 5), (2, 6);
+    SELECT v FROM t WHERE v > 0 ORDER BY v;
+    SELECT v, b FROM t WHERE v > 0 ORDER BY v;
+}
+expect {
+    10
+    20
+    10|5
+    20|6
+}
+
+@cross-check-integrity
+test indexes-on-virtual-column-expressions-follow-updates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 10));
+    CREATE INDEX i1 ON t(v + 1);
+    CREATE INDEX i2 ON t(a) WHERE v > 15;
+    INSERT INTO t(id, a) VALUES (1, 1), (2, 2);
+    UPDATE t SET a = 3 WHERE id = 1;
+    DELETE FROM t WHERE id = 2;
+    SELECT id FROM t WHERE v + 1 = 31;
+    SELECT id FROM t WHERE a = 3 AND v > 15;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    1
+    ok
+}

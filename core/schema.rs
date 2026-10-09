@@ -4388,6 +4388,13 @@ fn schema_expr_leaf(name: &str, columns: &[Column], has_rowid: bool) -> Option<E
     None
 }
 
+/// A copy of a stored schema expression, pointed at one table reference.
+pub fn bind_schema_expr(expr: &Expr, internal_id: TableInternalId) -> Expr {
+    let mut bound = expr.clone();
+    rebase_schema_expr(&mut bound, internal_id);
+    bound
+}
+
 /// Point the SELF_TABLE references of a stored schema expression at one table
 /// reference of a statement.
 pub fn rebase_schema_expr(expr: &mut Expr, internal_id: TableInternalId) {

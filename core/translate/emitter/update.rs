@@ -5,7 +5,6 @@ use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -848,23 +847,28 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
+                    let target_table_id = column_ctx.target_table.internal_id;
+                    let generated_expr = match table_column.generated_type() {
+                        GeneratedType::Virtual { .. } => {
+                            Some(crate::schema::bind_schema_expr(expr, target_table_id))
+                        }
                         GeneratedType::NotGenerated => None,
                     };
+                    let row_image = generated_expr.as_ref().map(|_| {
+                        DmlColumnContext::layout(
+                            column_ctx.target_table.table.columns(),
+                            column_ctx.start,
+                            column_ctx.rowid_reg,
+                            column_ctx.layout.clone(),
+                        )
+                    });
+                    let expr = generated_expr.as_ref().unwrap_or(expr);
 
-                    t_ctx.resolver.with_self_table_context(
+                    t_ctx.resolver.with_row_image(
                         program,
-                        self_table_context.as_ref(),
-                        |program, _| {
+                        target_table_id,
+                        row_image.as_ref(),
+                        |program| {
                             // Save/restore target_union_type so union_value() resolves tags
                             // against this column's union type. See ProgramBuilder::target_union_type.
                             let union_td = t_ctx
@@ -1415,7 +1419,8 @@ fn emit_update_insns<'a>(
                         &btree.columns_topo_sort()?,
                         &new_ctx,
                         &t_ctx.resolver,
-                        btree,
+                        table_references,
+                        target_table.internal_id,
                     )?;
                 }
 
@@ -1618,7 +1623,8 @@ fn emit_update_insns<'a>(
                 &btree.columns_topo_sort()?,
                 &dml_ctx,
                 &t_ctx.resolver,
-                btree,
+                table_references,
+                target_table.internal_id,
             )?;
         }
     }
@@ -2595,18 +2601,14 @@ fn emit_update_insns<'a>(
 
                     // Compute VIRTUAL columns for NEW values
                     //TODO only emit required virtual columns
-                    let bt = target_table.table.btree().ok_or_else(|| {
-                        crate::LimboError::InternalError(
-                            "UPDATE on virtual table has no btree".into(),
-                        )
-                    })?;
                     let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
                     compute_virtual_columns(
                         program,
                         &btree_table.columns_topo_sort()?,
                         &new_ctx,
                         &t_ctx.resolver,
-                        &bt,
+                        table_references,
+                        target_table.internal_id,
                     )?;
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
@@ -2619,7 +2621,8 @@ fn emit_update_insns<'a>(
                             &btree_table.columns_topo_sort()?,
                             &old_ctx,
                             &t_ctx.resolver,
-                            &bt,
+                            table_references,
+                            target_table.internal_id,
                         )?;
                     }
 

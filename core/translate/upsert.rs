@@ -728,6 +728,7 @@ pub fn emit_upsert(
         new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
         &layout,
         resolver,
+        table_references,
     )?;
 
     if let Some(bt) = table.btree() {
@@ -916,6 +917,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 &layout,
                 resolver,
+                table_references,
             )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1552,6 +1554,7 @@ pub fn emit_upsert(
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             &layout,
             resolver,
+            table_references,
         )?;
     }
 
@@ -1582,18 +1585,21 @@ fn compute_new_row_virtual_columns(
     rowid_reg: usize,
     layout: &ColumnLayout,
     resolver: &Resolver,
+    table_references: &TableReferences,
 ) -> crate::Result<()> {
     if !ctx.table.has_virtual_columns {
         return Ok(());
     }
     let dml_ctx =
         DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+    let target_table_id = table_references.joined_tables()[0].internal_id;
     compute_virtual_columns(
         program,
         &ctx.table.columns_topo_sort()?,
         &dml_ctx,
         resolver,
-        ctx.table,
+        table_references,
+        target_table_id,
     )
 }
 

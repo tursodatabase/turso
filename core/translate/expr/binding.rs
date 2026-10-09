@@ -894,14 +894,7 @@ pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> 
     }
 }
 
-/// Resolve the UnionDef for a column expression. Returns the variant names list
-/// and optionally resolves a tag name to its numeric index.
-/// Used by union_value, union_tag, union_extract function translation.
-///
-/// In the DML index-maintenance path (INSERT with expression indexes),
-/// `referenced_tables` is `None` and columns use `SELF_TABLE`. We fall back
-/// to the Resolver's `SelfTableContext::ForDML` to obtain column metadata.
-/// Resolve the TypeDef for a column expression (Column or DML self-table column).
+/// Resolve the TypeDef for a column expression.
 pub(super) fn resolve_typedef_from_column(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
@@ -909,7 +902,7 @@ pub(super) fn resolve_typedef_from_column(
 ) -> Option<Arc<TypeDef>> {
     let ty_str = match expr {
         ast::Expr::Column { table, column, .. } => {
-            resolve_column_type_str(*table, *column, referenced_tables, resolver)?
+            resolve_column_type_str(*table, *column, referenced_tables)?
         }
         ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
         _ => return None,
@@ -984,17 +977,9 @@ pub(super) fn resolve_column_type_str(
     table: ast::TableInternalId,
     column: usize,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
 ) -> Option<String> {
-    if let Some(rt) = referenced_tables {
-        if let Some((_, tbl)) = rt.find_table_by_internal_id(table) {
-            return Some(tbl.columns().get(column)?.ty_str.clone());
-        }
-    }
-    if table.is_self_table() {
-        return resolver.self_table_column_type_str(column);
-    }
-    None
+    let (_, tbl) = referenced_tables?.find_table_by_internal_id(table)?;
+    Some(tbl.columns().get(column)?.ty_str.clone())
 }
 
 /// Result of finding a column with a custom (struct/union) type across joined tables.

@@ -51,13 +51,6 @@ pub(crate) fn get_expr_affinity(
 ) -> Affinity {
     match expr {
         ast::Expr::Column { table, column, .. } => {
-            if table.is_self_table() {
-                if let Some(resolver) = resolver {
-                    if let Some(aff) = resolver.self_table_affinity(*column) {
-                        return aff;
-                    }
-                }
-            }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {

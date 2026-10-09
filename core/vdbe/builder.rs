@@ -107,19 +107,6 @@ impl CursorKey {
     }
 }
 
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
-}
-
 #[derive(Clone)]
 enum DmlColumnRegisters {
     // Used to compute column registers lazily

@@ -4,7 +4,6 @@ use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::plan::ColumnUsedMask;
-use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -372,22 +371,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     Some(GeneratedType::Virtual { expr, .. })
                         if !config.uses_materialized_keys_and_payload =>
                     {
-                        planner.t_ctx.resolver.with_self_table_context(
+                        let expr = crate::schema::bind_schema_expr(expr, build_table.internal_id);
+                        translate_expr(
                             planner.program,
-                            Some(&SelfTableContext::ForSelect {
-                                table_ref_id: build_table.internal_id,
-                                referenced_tables: planner.table_references.clone(),
-                            }),
-                            |program, _| -> Result<()> {
-                                translate_expr(
-                                    program,
-                                    Some(planner.table_references),
-                                    expr,
-                                    payload_reg + i,
-                                    &planner.t_ctx.resolver,
-                                )?;
-                                Ok(())
-                            },
+                            Some(planner.table_references),
+                            &expr,
+                            payload_reg + i,
+                            &planner.t_ctx.resolver,
                         )?;
 
                         planner.program.emit_column_affinity(

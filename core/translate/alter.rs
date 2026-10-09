@@ -19,7 +19,7 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::ColumnMask,
+        plan::{ColumnMask, JoinedTable, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -643,13 +643,22 @@ fn emit_add_virtual_column_validation(
 
     let dml_ctx =
         DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    let resolved_table_arc = Arc::new(resolved_table.clone());
+    let table_id = program.table_reference_counter.next();
+    let table_references = TableReferences::new(
+        vec![JoinedTable::new_btree(
+            Arc::new(resolved_table.clone()),
+            table_id,
+            database_id,
+        )],
+        vec![],
+    );
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,
         &dml_ctx,
         resolver,
-        &resolved_table_arc,
+        &table_references,
+        table_id,
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
