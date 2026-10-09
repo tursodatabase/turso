@@ -122,6 +122,24 @@ fn test_pg_function_column_alias_view_survives_reopen() {
                 .unwrap(),
             expected
         );
+        conn.execute("SELECT set_config('search_path','',false)")
+            .unwrap();
+        let definition = conn
+            .prepare("SELECT pg_get_viewdef(oid) FROM pg_class WHERE relname='dump_values'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let Value::Text(sql) = &definition[0][0] else {
+            panic!("expected view SQL")
+        };
+        assert!(sql.as_str().contains("pg_catalog.unnest"), "{sql}");
+        assert_eq!(
+            conn.prepare(sql.as_str())
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            expected
+        );
     }
 }
 

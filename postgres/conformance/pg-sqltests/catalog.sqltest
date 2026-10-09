@@ -621,10 +621,18 @@ expect {
 test pg-type-array-elements {
     SELECT typname, oid, typelem FROM pg_type
     WHERE typname IN ('_int4', '_text') ORDER BY typname;
+    CREATE TABLE dump_arrays (id INTEGER PRIMARY KEY, vals INTEGER[]);
+    SELECT a.attname, a.atttypid, a.attndims, a.attlen,
+           CASE WHEN a.attbyval THEN 1 ELSE 0 END,
+           pg_catalog.format_type(a.atttypid, a.atttypmod)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'dump_arrays' AND a.attnum > 0 ORDER BY a.attnum;
 }
 expect {
     _int4|1007|23
     _text|1009|25
+    id|23|0|4|1|integer
+    vals|1007|1|-1|0|integer[]
 }
 
 test pg-indexes-lists-index-definitions {
