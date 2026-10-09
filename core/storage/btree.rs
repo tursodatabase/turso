@@ -14776,8 +14776,8 @@ mod tests {
             use crate::storage::pager::CreateBTreeFlags;
 
             fn index_key(n: u32) -> ImmutableRecord {
-                let mut blob = n.to_be_bytes().to_vec();
-                blob.resize(300, b'x');
+                let mut blob = crate::alloc::vec![b'x'; 300];
+                blob[..4].copy_from_slice(&n.to_be_bytes());
                 let regs = [Register::Value(Value::Blob(blob))];
                 ImmutableRecord::from_registers(&regs, regs.len()).unwrap()
             }
