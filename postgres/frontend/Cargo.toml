@@ -11,6 +11,7 @@ description = "PostgreSQL frontend for Turso"
 path = "lib.rs"
 
 [dependencies]
+bitflags = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 chumsky = { version = "0.13", default-features = false, features = ["std"] }
 parking_lot = { workspace = true }
