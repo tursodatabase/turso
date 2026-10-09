@@ -820,6 +820,16 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    /// A trigger or foreign key action shares the immediate foreign key
+    /// violation count of the statement that runs it, like SQLite's frames.
+    pub(crate) fn fk_immediate_violations(&self) -> isize {
+        self.state.get_fk_immediate_violations_during_stmt()
+    }
+
+    pub(crate) fn set_fk_immediate_violations(&mut self, v: isize) {
+        self.state.set_fk_immediate_violations_during_stmt(v);
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;

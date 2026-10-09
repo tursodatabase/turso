@@ -1749,6 +1749,11 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
     }
+
+    pub fn set_fk_immediate_violations_during_stmt(&self, v: isize) {
+        self.fk_immediate_violations_during_stmt
+            .store(v, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

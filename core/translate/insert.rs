@@ -21,9 +21,8 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
+            build_index_affinity_string, emit_fk_parent_new_key_repay, emit_fk_restrict_halt,
+            emit_fk_violation, index_probe, open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -931,16 +930,31 @@ pub fn translate_insert(
         insertion.record_register(),
     );
 
+    // Like SQLite's isMultiWrite: only a statement that can write more than
+    // this row (several rows, REPLACE, INSERT triggers, or inside a trigger)
+    // can repair a violation later; otherwise a missing parent halts at once.
+    let counts_immediate_fk_violations = inserting_multiple_rows
+        || on_replace
+        || program.flags.is_subprogram()
+        || has_triggers_including_temp(
+            resolver,
+            database_id,
+            TriggerEvent::Insert,
+            None,
+            &btree_table,
+        );
+
     if has_fks {
-        // Child-side FK check must run before any writes (IdxInsert / Insert).
-        // For immediate FKs this emits a direct Halt, so no index entry is written
-        // when the parent is missing — matching SQLite's bytecode order.
+        // Child-side FK check must run before any writes (IdxInsert / Insert),
+        // so an immediate halt writes no index entry, matching SQLite's
+        // bytecode order.
         let fk_layout = btree_table.column_layout()?;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
             insertion.first_col_register(),
             insertion.key_register(),
+            counts_immediate_fk_violations,
             resolver,
             database_id,
             &fk_layout,
@@ -1055,14 +1069,13 @@ pub fn translate_insert(
     }
 
     if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
+        // After the row is present, repay the violations of children that
+        // reference this NEW parent key.
         emit_parent_side_fk_decrement_on_insert(
             program,
             &btree_table,
             &insertion,
-            on_replace,
+            counts_immediate_fk_violations,
             resolver,
             database_id,
         )?;
@@ -3834,7 +3847,9 @@ fn emit_replace_delete_conflicting_row(
             None,
             ctx.database_id,
         )?;
-        if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
+        if resolver.with_schema(ctx.database_id, |s| {
+            s.has_child_fks(ctx.table.name.as_str())
+        }) {
             emit_fk_child_decrement_on_delete(
                 program,
                 ctx.table.as_ref(),
@@ -3958,16 +3973,27 @@ fn emit_replace_delete_conflicting_row(
 
 /// Child-side FK checks for INSERT of a single row:
 /// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
-/// verify that the referenced parent key exists.
+/// verify that the referenced parent key exists. A missing parent is counted for
+/// a deferred key, and for an immediate key when `counts_immediate_fk_violations`;
+/// otherwise it halts at once.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_insert_checks(
     program: &mut ProgramBuilder,
     child_tbl: &BTreeTable,
     new_start_reg: usize,
     new_rowid_reg: usize,
+    counts_immediate_fk_violations: bool,
     resolver: &Resolver,
     database_id: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
+    let emit_missing_parent = |p: &mut ProgramBuilder, deferred: bool| -> crate::Result<()> {
+        if deferred || counts_immediate_fk_violations {
+            emit_fk_violation(p, deferred)
+        } else {
+            emit_fk_restrict_halt(p)
+        }
+    };
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
     {
@@ -4034,14 +4060,11 @@ pub fn emit_fk_child_insert_checks(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
-            // Missing parent: immediate → Halt before Insert; deferred → counter
+            // Missing parent: count the violation (a later row of the statement
+            // or transaction can still insert it) or halt before the write.
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred {
-                emit_fk_violation(program, &fk_ref.fk)?;
-            } else {
-                emit_fk_restrict_halt(program)?;
-            }
+            emit_missing_parent(program, fk_ref.fk.deferred)?;
             program.preassign_label_to_next_insn(fk_ok);
         } else {
             let idx = fk_ref
@@ -4135,15 +4158,8 @@ pub fn emit_fk_child_insert_checks(
                 ncols,
                 // on_found: parent exists, FK satisfied
                 |_p| Ok(()),
-                // on_not_found: immediate → Halt; deferred → counter
-                |p| {
-                    if fk_ref.fk.deferred {
-                        emit_fk_violation(p, &fk_ref.fk)?;
-                    } else {
-                        emit_fk_restrict_halt(p)?;
-                    }
-                    Ok(())
-                },
+                // on_not_found: count the violation or halt
+                |p| emit_missing_parent(p, fk_ref.fk.deferred),
             )?;
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
             program.preassign_label_to_next_insn(fk_ok);
@@ -4225,139 +4241,25 @@ fn build_parent_key_image_for_insert(
     Ok((start, ncols))
 }
 
-/// Parent-side: when inserting into the parent, decrement the counter
-/// if any child rows reference the NEW parent key.
-/// We *always* do this for deferred FKs, and we *also* do it for
-/// self-referential FKs (even if immediate) because the insert can
-/// “repair” a prior child-insert count recorded earlier in the same statement.
+/// Parent-side: the inserted row repays the violations of children that
+/// reference its key. Immediate keys are skipped unless `repays_immediate_keys`.
 pub fn emit_parent_side_fk_decrement_on_insert(
     program: &mut ProgramBuilder,
     parent_table: &BTreeTable,
     insertion: &Insertion,
-    force_immediate: bool,
+    repays_immediate_keys: bool,
     resolver: &Resolver,
     database_id: usize,
 ) -> crate::Result<()> {
     for pref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&parent_table.name)
     })? {
-        let is_self_ref = pref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name);
-        // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
+        if !pref.fk.deferred && !repays_immediate_keys {
             continue;
         }
-        // Nothing to do if the parent counter is 0
-        let skip_fk = program.allocate_label();
-        program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
-            target_pc: skip_fk,
-        });
-
         let (new_pk_start, n_cols) =
             build_parent_key_image_for_insert(program, parent_table, &pref, insertion)?;
-
-        // Nothing to do if the key contains NULLs, because a NULL parent key
-        // never matches any child row (SQL NULL semantics)
-        emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
-
-        let child_tbl = &pref.child_table;
-        let child_cols = &pref.fk.child_columns;
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&child_tbl.name).cloned().collect()
-        });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
-
-        if let Some(ix) = idx {
-            let icur = open_read_index(program, ix, database_id);
-            // Copy key into probe regs and apply child-index affinities
-            let probe_start = program.alloc_registers(n_cols);
-            for i in 0..n_cols {
-                program.emit_insn(Insn::Copy {
-                    src_reg: new_pk_start + i,
-                    dst_reg: probe_start + i,
-                    extra_amount: 0,
-                });
-            }
-            if let Some(count) = NonZeroUsize::new(n_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: probe_start,
-                    count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
-                });
-            }
-
-            // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
-                let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                p.preassign_label_to_next_insn(next);
-                Ok(())
-            })?;
-        } else {
-            // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-                fullscan: false,
-                is_index: false,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
-        }
-        program.preassign_label_to_next_insn(skip_fk);
+        emit_fk_parent_new_key_repay(program, &pref, new_pk_start, n_cols, database_id, resolver)?;
     }
     Ok(())
 }

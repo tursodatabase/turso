@@ -185,6 +185,35 @@ fn insert_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// A single-row INSERT that counts its foreign key violation instead of halting
+/// before the write (REPLACE, or an INSERT inside a trigger) writes the row
+/// first, so the statement must roll it back when the count is checked.
+#[turso_macros::test]
+fn counted_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child (id UNIQUE, pid INT, FOREIGN KEY(pid) REFERENCES parent(id))",
+    )?;
+    conn.execute("CREATE TABLE src (x)")?;
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO child VALUES (new.x, 999); END",
+    )?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+
+    conn.execute("BEGIN")?;
+    assert!(conn
+        .execute("INSERT OR REPLACE INTO child VALUES (100, 999)")
+        .is_err());
+    assert!(conn.execute("INSERT INTO src VALUES (200)").is_err());
+    conn.execute("COMMIT")?;
+
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM child"), vec!["0"]);
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM src"), vec!["0"]);
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────
 // UPDATE
 // ──────────────────────────────────────────────────────────
