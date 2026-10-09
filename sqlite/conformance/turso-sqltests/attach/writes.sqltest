@@ -1312,6 +1312,18 @@ expect {
     1|99
 }
 
+test attach-write-fk-child-update-to-missing-parent {
+    ATTACH ':memory:' AS aux;
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO aux.parent VALUES (1);
+    INSERT INTO aux.child VALUES (1, 1);
+    UPDATE aux.child SET parent_id = 99 WHERE id = 1;
+}
+expect error {
+}
+
 test attach-write-fk-set-null-delete {
     ATTACH ':memory:' AS aux;
     PRAGMA foreign_keys = ON;

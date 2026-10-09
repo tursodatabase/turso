@@ -17,7 +17,7 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
-            open_read_table, ForeignKeyActions,
+            open_read_table, ForeignKeyActions, PreparedFkDeleteAction,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -368,9 +368,6 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
@@ -441,7 +438,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -488,7 +485,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -635,7 +632,7 @@ fn emit_delete_insns<'a>(
         None
     };
 
-    emit_delete_row_common(
+    let prepared_fk_actions = emit_delete_row_common(
         connection,
         program,
         t_ctx,
@@ -662,7 +659,13 @@ fn emit_delete_insns<'a>(
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
     }
-    Ok(())
+    fire_fk_delete_actions(
+        connection,
+        program,
+        t_ctx,
+        table_reference,
+        prepared_fk_actions,
+    )
 }
 
 /// Common deletion logic shared between normal DELETE and RowSet-based DELETE.
@@ -688,7 +691,7 @@ fn emit_delete_row_common(
     virtual_table_cursor_id: Option<usize>,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
-) -> Result<()> {
+) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
     let internal_id = unsafe { (*table_reference).internal_id };
     let table_name = unsafe { &*table_reference }.table.get_name();
 
@@ -903,20 +906,28 @@ fn emit_delete_row_common(
         )?;
     }
 
-    // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
-    // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
-    // so triggers during cascade see the parent row as already deleted.
-    {
-        let delete_db_id = unsafe { (*table_reference).database_id };
-        prepared_fk_actions.fire_prepared_fk_delete_actions(
-            program,
-            &mut t_ctx.resolver,
-            connection,
-            delete_db_id,
-        )?;
-    }
+    Ok(prepared_fk_actions)
+}
 
-    Ok(())
+/// Phase 2 of a parent DELETE: fire CASCADE/SET NULL/SET DEFAULT actions.
+/// Per SQLite, the parent row and all its index entries must be gone first:
+/// the action's child-side checks look the parent up, and a parent still
+/// found in an index would keep them from repaying the violation counted
+/// for that child.
+fn fire_fk_delete_actions(
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_reference: *const JoinedTable,
+    prepared_fk_actions: ForeignKeyActions<PreparedFkDeleteAction>,
+) -> Result<()> {
+    let delete_db_id = unsafe { (*table_reference).database_id };
+    prepared_fk_actions.fire_prepared_fk_delete_actions(
+        program,
+        &mut t_ctx.resolver,
+        connection,
+        delete_db_id,
+    )
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1039,7 +1050,7 @@ fn emit_delete_insns_when_triggers_present(
         target_pc: skip_not_found_label,
     });
 
-    emit_delete_row_common(
+    let prepared_fk_actions = emit_delete_row_common(
         connection,
         program,
         t_ctx,
@@ -1054,6 +1065,13 @@ fn emit_delete_insns_when_triggers_present(
         None, // Use main_table_cursor_id for virtual tables
         resolver,
         returning_buffer,
+    )?;
+    fire_fk_delete_actions(
+        connection,
+        program,
+        t_ctx,
+        table_reference,
+        prepared_fk_actions,
     )?;
 
     // Fire AFTER DELETE triggers

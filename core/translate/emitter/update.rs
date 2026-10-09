@@ -31,7 +31,7 @@ use crate::{
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
-            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
+            emit_fk_parent_new_key_probes_after_write, emit_fk_update_parent_actions,
             fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
             ParentKeyNewProbeMode,
         },
@@ -2144,7 +2144,7 @@ fn emit_update_insns<'a>(
     // pre-rewrite table image. Self-referential rows therefore need explicit
     // handling: table scans see OLD values, while the NEW parent/child keys
     // live in registers until the rewrite.
-    let mut deferred_new_key_plans = Vec::new();
+    let mut after_write_new_key_plans = Vec::new();
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
@@ -2164,7 +2164,7 @@ fn emit_update_insns<'a>(
                 } else {
                     ParentKeyNewProbeMode::BeforeWrite
                 };
-                deferred_new_key_plans = emit_fk_update_parent_actions(
+                after_write_new_key_plans = emit_fk_update_parent_actions(
                     program,
                     &table_btree,
                     &affected_parent_fks,
@@ -2189,7 +2189,10 @@ fn emit_update_insns<'a>(
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
+            if t_ctx
+                .resolver
+                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+            {
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -2414,9 +2417,9 @@ fn emit_update_insns<'a>(
             }
 
             if connection.foreign_keys_enabled() {
-                emit_fk_parent_deferred_new_key_probes(
+                emit_fk_parent_new_key_probes_after_write(
                     program,
-                    &deferred_new_key_plans,
+                    &after_write_new_key_plans,
                     update_database_id,
                     &t_ctx.resolver,
                 )?;
