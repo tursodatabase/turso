@@ -212,12 +212,13 @@ impl CliDatabaseInstance {
 
         for prefix in PREFIXES {
             if let Some(rest) = line.strip_prefix(prefix)
-                && let Some(paren_idx) = rest.find('(') {
-                    let name_part = &rest[..paren_idx];
-                    if !name_part.ends_with(' ') {
-                        return format!("{prefix}{name_part} {}", &rest[paren_idx..]);
-                    }
+                && let Some(paren_idx) = rest.find('(')
+            {
+                let name_part = &rest[..paren_idx];
+                if !name_part.ends_with(' ') {
+                    return format!("{prefix}{name_part} {}", &rest[paren_idx..]);
                 }
+            }
         }
 
         line.to_string()
@@ -355,11 +356,14 @@ impl CliDatabaseInstance {
             let mut rows = parse_list_output(&stdout);
 
             // Filter out MVCC pragma output if present
-            if self.mvcc && !rows.is_empty()
+            if self.mvcc
+                && !rows.is_empty()
                 && let Some(first_row) = rows.first()
-                    && first_row.len() == 1 && first_row[0] == "mvcc" {
-                        rows.remove(0);
-                    }
+                && first_row.len() == 1
+                && first_row[0] == "mvcc"
+            {
+                rows.remove(0);
+            }
 
             Ok(QueryResult::success(rows))
         }
@@ -467,9 +471,11 @@ fn strip_shell_error_prefix<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
 fn strip_result_code(message: &str) -> &str {
     if let Some(open) = message.rfind(" (")
         && let Some(code) = message[open + 2..].strip_suffix(')')
-            && !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) {
-                return &message[..open];
-            }
+        && !code.is_empty()
+        && code.bytes().all(|b| b.is_ascii_digit())
+    {
+        return &message[..open];
+    }
     message
 }
 

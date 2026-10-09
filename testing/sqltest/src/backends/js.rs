@@ -208,11 +208,14 @@ impl JsDatabaseInstance {
         let mut rows = parse_list_output(&stdout);
 
         // Filter out MVCC pragma output if present
-        if self.mvcc && !rows.is_empty()
+        if self.mvcc
+            && !rows.is_empty()
             && let Some(first_row) = rows.first()
-                && first_row.len() == 1 && first_row[0] == "mvcc" {
-                    rows.remove(0);
-                }
+            && first_row.len() == 1
+            && first_row[0] == "mvcc"
+        {
+            rows.remove(0);
+        }
 
         Ok(QueryResult::success(rows))
     }
