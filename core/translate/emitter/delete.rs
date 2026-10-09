@@ -771,7 +771,7 @@ fn emit_delete_row_common(
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = table_references
                     .find_joined_table_by_internal_id(internal_id)
-                    .and_then(|table| table.index_where_expr(&index).cloned())
+                    .and_then(|table| table.index_where_expr(&index))
                     .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();

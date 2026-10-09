@@ -7281,49 +7281,6 @@ mod tests {
     }
 
     #[test]
-    fn bound_schema_exprs_point_at_the_table_reference() -> Result<()> {
-        use crate::translate::plan::BoundSchemaExprs;
-        let table = BTreeTable::from_sql(
-            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 0 AND b < rowid))",
-            2,
-        )?;
-        let index = Index::from_sql(
-            &SymbolTable::default(),
-            "CREATE INDEX i ON t (a + b, b) WHERE b > rowid",
-            3,
-            &table,
-        )?;
-        let reference = TableInternalId::from(7);
-        let bound = BoundSchemaExprs::new(
-            &Table::BTree(Arc::new(table)),
-            std::iter::once(&index),
-            reference,
-        );
-        let leaves_of = |expr: &Expr| {
-            let mut tables = Vec::new();
-            let _ = walk_expr(expr, &mut |e| {
-                if let Expr::Column { table, .. } | Expr::RowId { table, .. } = e {
-                    tables.push(*table);
-                }
-                Ok(WalkControl::Continue)
-            });
-            tables
-        };
-        assert_eq!(leaves_of(&bound.checks[0]), vec![reference; 3]);
-        let index_exprs = &bound.indexes["i"];
-        assert_eq!(
-            leaves_of(index_exprs.columns[0].as_ref().expect("key expression")),
-            vec![reference; 2]
-        );
-        assert!(index_exprs.columns[1].is_none());
-        assert_eq!(
-            leaves_of(index_exprs.where_clause.as_ref().expect("predicate")),
-            vec![reference; 2]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn schema_load_keeps_unknown_names_in_stored_expressions() -> Result<()> {
         let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER)", 2)?;
         let index = Index::from_sql(

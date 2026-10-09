@@ -3841,7 +3841,6 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             plan_estimate: None,
-            schema_exprs: Default::default(),
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -3940,7 +3939,6 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             plan_estimate: None,
-            schema_exprs: Default::default(),
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4056,7 +4054,6 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             plan_estimate: None,
-            schema_exprs: Default::default(),
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4251,7 +4248,6 @@ mod tests {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             plan_estimate: None,
-            schema_exprs: Default::default(),
             indexed: None,
         }
     }

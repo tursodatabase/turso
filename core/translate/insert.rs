@@ -1,6 +1,5 @@
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
-use crate::translate::plan::BoundSchemaExprs;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -327,12 +326,6 @@ pub fn translate_insert(
             database_id,
             indexed: None,
             plan_estimate: None,
-            schema_exprs: BoundSchemaExprs::from_schema(
-                resolver,
-                database_id,
-                &table,
-                target_table_id,
-            ),
         }],
         vec![],
     );
@@ -1369,7 +1362,7 @@ fn emit_partial_index_check(
     table: &Arc<BTreeTable>,
 ) -> Result<Option<BranchOffset>> {
     let target = &table_references.joined_tables()[0];
-    let Some(expr) = target.index_where_expr(index).cloned() else {
+    let Some(expr) = target.index_where_expr(index) else {
         return Ok(None);
     };
     let columns: Vec<Column> = insertion
@@ -3673,8 +3666,7 @@ fn emit_index_column_value_for_insert(
         let target = &table_references.joined_tables()[0];
         let expr = target
             .index_column_expr(index, position)
-            .cloned()
-            .expect("the table reference holds the expressions of its indexes");
+            .expect("caller checked that the index column is an expression");
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
@@ -3977,7 +3969,6 @@ fn emit_replace_delete_conflicting_row(
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = table_references.joined_tables()[0]
                 .index_where_expr(&index)
-                .cloned()
                 .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();

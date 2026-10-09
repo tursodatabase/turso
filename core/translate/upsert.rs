@@ -324,7 +324,7 @@ fn upsert_matches_index(
     let partial_index_predicate_matches =
         match (target_table.index_where_expr(index), &bound.where_clause) {
             (Some(index_where), Some(target_where)) => {
-                exprs_are_equivalent(target_where, index_where)
+                exprs_are_equivalent(target_where, &index_where)
             }
             (Some(_), None) => false,
             (None, _) => true,
@@ -374,7 +374,7 @@ fn upsert_matches_index(
                     continue;
                 }
                 if let Some(idx_expr) = target_table.index_column_expr(index, i) {
-                    if exprs_are_equivalent(target_expr, idx_expr) {
+                    if exprs_are_equivalent(target_expr, &idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
                             let icoll = effective_collation_for_index_col(ic, table);
@@ -1655,7 +1655,7 @@ fn eval_partial_pred_for_row_image(
     layout: &ColumnLayout,
 ) -> Option<usize> {
     let target = table_references.joined_tables().first()?;
-    let expr = target.index_where_expr(idx)?.clone();
+    let expr = target.index_where_expr(idx)?;
     let columns = table.columns();
     let bt = table.require_btree().ok()?;
 
@@ -1707,7 +1707,6 @@ fn emit_upsert_expr_index_value(
         .expect("an UPSERT has one target table");
     let expr = target
         .index_column_expr(index, position)
-        .cloned()
         .expect("caller checked that the index column is an expression");
     let columns = table.columns();
     let bt = table.require_btree()?;

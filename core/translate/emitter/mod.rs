@@ -2070,8 +2070,7 @@ pub(crate) fn emit_index_column_value_old_image(
     if idx_col.expr.is_some() {
         let expr = target_table
             .index_column_expr(index, position)
-            .cloned()
-            .expect("the table reference holds the expressions of its indexes");
+            .expect("caller checked that the index column is an expression");
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
@@ -2147,8 +2146,7 @@ fn emit_index_column_value_new_image(
     if idx_col.expr.is_some() {
         let expr = target_table
             .index_column_expr(index, position)
-            .cloned()
-            .expect("the table reference holds the expressions of its indexes");
+            .expect("caller checked that the index column is an expression");
         let mut column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -2222,18 +2220,10 @@ fn emit_check_constraint_bytecode(
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 
-        // A constraint of the target table is evaluated through the copy that
-        // is bound to the table reference. A constraint that is not on the
-        // table yet (ALTER TABLE ADD COLUMN) keeps its written names, which
-        // the caller mapped to registers.
+        // A constraint that is not on the table yet (ALTER TABLE ADD COLUMN)
+        // keeps its written names, which the caller mapped to registers.
         let rewritten_expr = joined_table
-            .and_then(|joined_table| {
-                let btree = joined_table.btree()?;
-                let position = btree.check_constraints.iter().position(|check| {
-                    exprs_are_equivalent(&check.bound, &check_constraint.bound)
-                })?;
-                joined_table.schema_exprs.checks.get(position).cloned()
-            })
+            .map(|joined_table| joined_table.check_constraint_expr(check_constraint))
             .unwrap_or_else(|| check_constraint.bound.clone());
 
         translate_expr_no_constant_opt(

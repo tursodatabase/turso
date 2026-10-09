@@ -249,13 +249,13 @@ pub(crate) fn plan_index_method_predicate<'a>(
             continue;
         };
         for index in indexes {
-            if index.index_method.is_none() || index.is_backing_btree_index() {
-                continue;
-            }
-            let Some(bound) = table.index_exprs(index) else {
+            let Some(module) = &index.index_method else {
                 continue;
             };
-            for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
+            if index.is_backing_btree_index() {
+                continue;
+            }
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
                 let Some(matched) = try_match_index_method_pattern(
                     pattern,
                     table,
@@ -302,7 +302,7 @@ fn try_match_index_method_pattern(
     pattern_idx: usize,
     soft_bind_errors: bool,
 ) -> Option<IndexMethodPatternMatch> {
-    let mut pattern = pattern.clone();
+    let mut pattern = table.index_method_pattern(pattern);
     if pattern.with.is_some() || !pattern.body.compounds.is_empty() {
         return None;
     }
@@ -521,10 +521,7 @@ fn collect_index_method_candidates(
                 continue;
             }
 
-            let Some(bound) = table.index_exprs(index) else {
-                continue;
-            };
-            for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
                 // Use shared helper for pattern matching
                 let Some(pattern_match) = try_match_index_method_pattern(
                     pattern,
@@ -1893,10 +1890,7 @@ fn optimize_table_access_with_custom_modules(
         if index.is_backing_btree_index() {
             continue;
         }
-        let Some(bound) = table.index_exprs(index) else {
-            continue;
-        };
-        'patterns: for (pattern_idx, pattern) in bound.patterns.iter().enumerate() {
+        'patterns: for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
                 table,

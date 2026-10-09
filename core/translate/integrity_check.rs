@@ -1,7 +1,6 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
 use crate::translate::expr::emit_table_column;
-use crate::translate::plan::BoundSchemaExprs;
 use crate::vdbe::affinity::Affinity;
 use crate::{
     schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
@@ -283,13 +282,6 @@ fn translate_integrity_check_for_schema(
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,
-                schema_exprs: BoundSchemaExprs::new(
-                    &Table::BTree(btree_table.clone()),
-                    schema
-                        .get_indices(&btree_table.name)
-                        .map(|index| index.as_ref()),
-                    table_ref_id,
-                ),
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -314,7 +306,7 @@ fn translate_integrity_check_for_schema(
                 program.emit_int(0, expected_count_reg);
 
                 let scanned_table = &table_references.joined_tables()[0];
-                let where_expr = scanned_table.index_where_expr(index).cloned();
+                let where_expr = scanned_table.index_where_expr(index);
 
                 let mut columns = Vec::with_capacity(index.columns.len());
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
@@ -326,7 +318,7 @@ fn translate_integrity_check_for_schema(
                             // expression indexes don't apply affinity from the basae table
                             None
                         };
-                        columns.push(BoundIndexColumn::Expr(Box::new(expr.clone()), affinity));
+                        columns.push(BoundIndexColumn::Expr(Box::new(expr), affinity));
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
@@ -345,10 +337,12 @@ fn translate_integrity_check_for_schema(
             }
         }
 
-        let bound_checks = table_references.joined_tables()[0]
-            .schema_exprs
-            .checks
-            .clone();
+        let scanned_table = &table_references.joined_tables()[0];
+        let bound_checks: Vec<_> = btree_table
+            .check_constraints
+            .iter()
+            .map(|check| scanned_table.check_constraint_expr(check))
+            .collect();
 
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);

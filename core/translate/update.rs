@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-use crate::translate::plan::BoundSchemaExprs;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -291,7 +290,6 @@ fn prepare_update_plan(
         database_id,
         indexed,
         plan_estimate: None,
-        schema_exprs: BoundSchemaExprs::from_schema(resolver, database_id, &table, target_table_id),
     };
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];

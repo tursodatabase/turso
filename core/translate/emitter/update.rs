@@ -181,7 +181,6 @@ pub fn emit_program_for_update(
                 database_id: MAIN_DB_ID,
                 indexed: None,
                 plan_estimate: None,
-                schema_exprs: Default::default(),
             }],
             vec![],
         );
@@ -1823,7 +1822,6 @@ fn emit_update_insns<'a>(
             // old values through the table cursor.
             let where_clause = target_table
                 .index_where_expr(index)
-                .cloned()
                 .expect("index.where_clause was checked to be Some above");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(

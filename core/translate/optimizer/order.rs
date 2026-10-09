@@ -891,29 +891,34 @@ pub(super) fn btree_access_order_consumed(
                 includes_rowid: correct_order,
             }
         }
-        Some(index) => index_columns_order_consumed(
-            table_ref,
-            iter_dir,
-            constraint_refs,
-            order_target,
-            target_columns,
-            schema,
-            equality_prefix_scope,
-            index
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(position, column)| IndexOrderColumn {
-                    pos_in_table: column.pos_in_table,
-                    order: column.order,
-                    nulls_order: column.nulls_order,
-                    collation: column.collation,
-                    expr: table_ref.index_column_expr(index, position),
-                }),
-            index.columns.len(),
-            index.has_rowid,
-            rowid_alias_col,
-        ),
+        Some(index) => {
+            let key_exprs: Vec<Option<ast::Expr>> = (0..index.columns.len())
+                .map(|position| table_ref.index_column_expr(index, position))
+                .collect();
+            index_columns_order_consumed(
+                table_ref,
+                iter_dir,
+                constraint_refs,
+                order_target,
+                target_columns,
+                schema,
+                equality_prefix_scope,
+                index
+                    .columns
+                    .iter()
+                    .zip(&key_exprs)
+                    .map(|(column, expr)| IndexOrderColumn {
+                        pos_in_table: column.pos_in_table,
+                        order: column.order,
+                        nulls_order: column.nulls_order,
+                        collation: column.collation,
+                        expr: expr.as_ref(),
+                    }),
+                index.columns.len(),
+                index.has_rowid,
+                rowid_alias_col,
+            )
+        }
     }
 }
 
