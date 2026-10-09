@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
@@ -52,6 +52,7 @@ macro_rules! scalar_functions {
 }
 
 scalar_functions! {
+    Acldefault(FunctionArity::Exact(2), true),
     PgGetUserbyid(FunctionArity::Exact(1), true),
     PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true),
     PgEncodingToChar(FunctionArity::Exact(1), true),
@@ -90,6 +91,7 @@ impl ScalarFunction for PgScalarFunction {
 impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
+            Self::Acldefault => exec_acl_default(args)?,
             Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(args, 0, 0)),
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
                 exec_pg_is_visible(int_arg(args, 0, 0))
@@ -133,6 +135,160 @@ impl ScalarCall for PgScalarFunction {
             }
         };
         Ok(IOResult::Done(value))
+    }
+}
+
+fn exec_acl_default(args: &[Register]) -> Result<Value> {
+    if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let kind_code = match args[0].get_value() {
+        Value::Text(value) => value.as_str(),
+        _ => "",
+    };
+    let owner = args[1].get_value().as_int().ok_or_else(|| {
+        LimboError::InvalidArgument("acldefault owner must be an OID".to_string())
+    })?;
+    if !(0..=u32::MAX as i64).contains(&owner) {
+        return Err(LimboError::InvalidArgument(
+            "acldefault owner must be an OID".to_string(),
+        ));
+    }
+    let kind = kind_code.parse::<AclObjectKind>().map_err(|_| {
+        LimboError::InvalidArgument(format!(
+            "unrecognized object type abbreviation: {kind_code}"
+        ))
+    })?;
+    let (public_privileges, owner_privileges) = kind.default_privileges();
+
+    let role = if owner == 10 {
+        "turso".to_string()
+    } else {
+        owner.to_string()
+    };
+    let mut entries = Vec::with_capacity(2);
+    if !public_privileges.is_empty() {
+        entries.push(format!("={public_privileges}/{role}"));
+    }
+    if !owner_privileges.is_empty() {
+        let grantee = if owner == 0 { "" } else { &role };
+        entries.push(format!("{grantee}={owner_privileges}/{role}"));
+    }
+    Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
+}
+
+#[derive(strum::EnumString)]
+enum AclObjectKind {
+    #[strum(serialize = "c")]
+    Column,
+    #[strum(serialize = "r")]
+    Table,
+    #[strum(serialize = "s")]
+    Sequence,
+    #[strum(serialize = "d")]
+    Database,
+    #[strum(serialize = "f")]
+    Function,
+    #[strum(serialize = "l")]
+    Language,
+    #[strum(serialize = "L")]
+    LargeObject,
+    #[strum(serialize = "n")]
+    Schema,
+    #[strum(serialize = "p")]
+    Parameter,
+    #[strum(serialize = "t")]
+    Tablespace,
+    #[strum(serialize = "F")]
+    ForeignDataWrapper,
+    #[strum(serialize = "S")]
+    ForeignServer,
+    #[strum(serialize = "T")]
+    Type,
+}
+
+impl AclObjectKind {
+    fn default_privileges(&self) -> (AclPrivileges, AclPrivileges) {
+        let no_privileges = AclPrivileges::empty();
+        match self {
+            Self::Column => (no_privileges, no_privileges),
+            Self::Table => (
+                no_privileges,
+                AclPrivileges::INSERT
+                    | AclPrivileges::SELECT
+                    | AclPrivileges::UPDATE
+                    | AclPrivileges::DELETE
+                    | AclPrivileges::TRUNCATE
+                    | AclPrivileges::REFERENCES
+                    | AclPrivileges::TRIGGER,
+            ),
+            Self::Sequence => (
+                no_privileges,
+                AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
+            ),
+            Self::Database => (
+                AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+                AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
+            ),
+            Self::Function => (AclPrivileges::EXECUTE, AclPrivileges::EXECUTE),
+            Self::Language => (AclPrivileges::USAGE, AclPrivileges::USAGE),
+            Self::LargeObject => (no_privileges, AclPrivileges::SELECT | AclPrivileges::UPDATE),
+            Self::Schema => (no_privileges, AclPrivileges::USAGE | AclPrivileges::CREATE),
+            Self::Parameter => (
+                no_privileges,
+                AclPrivileges::SET | AclPrivileges::ALTER_SYSTEM,
+            ),
+            Self::Tablespace => (no_privileges, AclPrivileges::CREATE),
+            Self::ForeignDataWrapper | Self::ForeignServer => (no_privileges, AclPrivileges::USAGE),
+            Self::Type => (AclPrivileges::USAGE, AclPrivileges::USAGE),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy)]
+    struct AclPrivileges: u16 {
+        const INSERT = 1 << 0;
+        const SELECT = 1 << 1;
+        const UPDATE = 1 << 2;
+        const DELETE = 1 << 3;
+        const TRUNCATE = 1 << 4;
+        const REFERENCES = 1 << 5;
+        const TRIGGER = 1 << 6;
+        const EXECUTE = 1 << 7;
+        const USAGE = 1 << 8;
+        const CREATE = 1 << 9;
+        const TEMPORARY = 1 << 10;
+        const CONNECT = 1 << 11;
+        const SET = 1 << 12;
+        const ALTER_SYSTEM = 1 << 13;
+    }
+}
+
+impl fmt::Display for AclPrivileges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (privilege, letter) in [
+            (Self::INSERT, "a"),
+            (Self::SELECT, "r"),
+            (Self::UPDATE, "w"),
+            (Self::DELETE, "d"),
+            (Self::TRUNCATE, "D"),
+            (Self::REFERENCES, "x"),
+            (Self::TRIGGER, "t"),
+            (Self::EXECUTE, "X"),
+            (Self::USAGE, "U"),
+            (Self::CREATE, "C"),
+            (Self::TEMPORARY, "T"),
+            (Self::CONNECT, "c"),
+            (Self::SET, "s"),
+            (Self::ALTER_SYSTEM, "A"),
+        ] {
+            if self.contains(privilege) {
+                f.write_str(letter)?;
+            }
+        }
+        Ok(())
     }
 }
 
