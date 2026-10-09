@@ -375,6 +375,9 @@ fn emit_loop_source<'a>(
             // They are cached in expr_to_reg_cache so that when the full
             // expression is evaluated after AggFinal, translate_expr finds
             // the cached values instead of reading from the exhausted cursor.
+            // Columns of an outer query are not pre-read: the outer cursor does
+            // not move while this loop runs, and a value read here would be stale
+            // for an outer row where this loop finds no rows.
             for rc in plan
                 .result_columns
                 .iter()
@@ -382,6 +385,14 @@ fn emit_loop_source<'a>(
             {
                 walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
+                        Expr::Column { table, .. } | Expr::RowId { table, .. }
+                            if plan
+                                .table_references
+                                .find_joined_table_by_internal_id(*table)
+                                .is_none() =>
+                        {
+                            Ok(WalkControl::SkipChildren)
+                        }
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
                             translate_expr(
