@@ -68,10 +68,10 @@ impl InteractionPlan {
                     }) = query
                         && (depending_tables.contains(new_name)
                             || depending_tables.contains(table_name))
-                        {
-                            depending_tables.insert(new_name.clone());
-                            depending_tables.insert(table_name.clone());
-                        }
+                    {
+                        depending_tables.insert(new_name.clone());
+                        depending_tables.insert(table_name.clone());
+                    }
                 }
                 _ => {}
             });
@@ -321,14 +321,15 @@ impl InteractionPlan {
             let iter = range_transactions.get_mut(&interactions.connection_index);
 
             if let Some(iter) = iter
-                && let Some(txn_interaction_idx) = iter.peek().copied() {
-                    if txn_interaction_idx == idx {
-                        iter.next();
-                    }
-                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
-                        retain = false;
-                    }
+                && let Some(txn_interaction_idx) = iter.peek().copied()
+            {
+                if txn_interaction_idx == idx {
+                    iter.next();
                 }
+                if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
+                    retain = false;
+                }
+            }
 
             idx += 1;
             retain

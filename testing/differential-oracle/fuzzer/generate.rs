@@ -380,10 +380,11 @@ impl SqlGenerator for PropTestBackend {
         // Recursive LIMIT/OFFSET and priority ordering remain fully generated
         // inside the CTE.
         if let sql_gen_prop::SqlStatement::Select(select) = &mut stmt
-            && select.has_recursive_cte() {
-                select.limit = None;
-                select.offset = None;
-            }
+            && select.has_recursive_cte()
+        {
+            select.limit = None;
+            select.offset = None;
+        }
         let sql = stmt.to_string();
         let stmt_kind = sql_gen_prop::StatementKind::from(&stmt);
         let is_ddl = stmt_kind.is_ddl();

@@ -449,9 +449,10 @@ impl Fuzzer {
         }
         if self.config.coverage
             && let Some(cov) = coverage
-                && let Err(e) = self.write_coverage_report(&cov) {
-                    tracing::warn!("Failed to write coverage report: {e}");
-                }
+            && let Err(e) = self.write_coverage_report(&cov)
+        {
+            tracing::warn!("Failed to write coverage report: {e}");
+        }
         stats.print_table(&self.config);
 
         result.map(|()| stats)
@@ -723,9 +724,10 @@ impl Fuzzer {
             match result {
                 QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
                     if let SqlValue::Text(ref text) = rows[0].0[0]
-                        && text == "ok" {
-                            return Ok(());
-                        }
+                        && text == "ok"
+                    {
+                        return Ok(());
+                    }
                     bail!("{db_name} integrity check failed: {:?}", rows);
                 }
                 QueryResult::Rows(rows) => {

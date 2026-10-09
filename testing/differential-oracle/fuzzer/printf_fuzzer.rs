@@ -114,12 +114,13 @@ fn fuzzy_text_eq(a: &str, b: &str) -> bool {
             let a_str: String = a[a_num_start..a_num_end].iter().collect();
             let b_str: String = b[b_num_start..b_num_end].iter().collect();
             if let (Ok(af), Ok(bf)) = (a_str.parse::<f64>(), b_str.parse::<f64>())
-                && floats_close(af, bf) {
-                    // Advance past the number, guaranteeing at least 1 step of progress
-                    ai = a_num_end.max(ai + 1);
-                    bi = b_num_end.max(bi + 1);
-                    continue;
-                }
+                && floats_close(af, bf)
+            {
+                // Advance past the number, guaranteeing at least 1 step of progress
+                ai = a_num_end.max(ai + 1);
+                bi = b_num_end.max(bi + 1);
+                continue;
+            }
         }
 
         return false;
@@ -244,9 +245,10 @@ fn fmt_result_diff(turso: &QueryResult, sqlite: &QueryResult) -> String {
             for (tr, sr) in t_rows.iter().zip(s_rows.iter()) {
                 for (tv, sv) in tr.0.iter().zip(sr.0.iter()) {
                     if let (SqlValue::Text(ta), SqlValue::Text(tb)) = (tv, sv)
-                        && ta != tb {
-                            return fmt_text_diff(ta, tb);
-                        }
+                        && ta != tb
+                    {
+                        return fmt_text_diff(ta, tb);
+                    }
                 }
             }
             // Fallback: length or non-text mismatch
