@@ -14,26 +14,20 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode        p1  p2  p3  p4      p5  comment
-   0  Init           0  18   0           0  Start at 18
+   0  Init           0  13   0           0  Start at 13
    1  OpenWrite      0   2   0           0  root=2; iDb=0
-   2  Rewind         0  17   0           0  Rewind table t
+   2  Rewind         0  12   0           0  Rewind table t
    3    Column       0   1   2           0  r[2]=t.b
-   4    Ne           2   3  16  Binary   0  if r[2]!=r[3] goto 16
+   4    Ne           2   3  11  Binary   0  if r[2]!=r[3] goto 11
    5    RowId        0   4   0           0  r[4]=t.rowid
-   6    IsNull       4  17   0           0  if (r[4]==NULL) goto 17
+   6    IsNull       4  12   0           0  if (r[4]==NULL) goto 12
    7    Column       0   1   6           0  r[6]=t.b
    8    Affinity     5   2   0           0  r[5..7] = D, D
-   9    Copy         5   9   0           0  r[9]=r[5]
-  10    Copy         6  10   0           0  r[10]=r[6]
-  11    Add          9  10   7           0  r[7]=r[9]+r[10]
-  12    Copy         7  11   0           0  r[11]=r[7]
-  13    Multiply    11  12   8           0  r[8]=r[11]*r[12]
-  14    MakeRecord   5   2  13           0  r[13]=mkrec(r[5..6])
-  15    Insert       0  13   4  t        8  intkey=r[4] data=r[13]
-  16  Next           0   3   0           1
-  17  Halt           0   0   0           0
-  18  Transaction    0   2   1           0  iDb=0 tx_mode=Write
-  19  Integer        3   3   0           0  r[3]=3
-  20  Integer        5   5   0           0  r[5]=5
-  21  Integer        2  12   0           0  r[12]=2
-  22  Goto           0   1   0           0
+   9    MakeRecord   5   2   9           0  r[9]=mkrec(r[5..6])
+  10    Insert       0   9   4  t        8  intkey=r[4] data=r[9]
+  11  Next           0   3   0           1
+  12  Halt           0   0   0           0
+  13  Transaction    0   2   1           0  iDb=0 tx_mode=Write
+  14  Integer        3   3   0           0  r[3]=3
+  15  Integer        5   5   0           0  r[5]=5
+  16  Goto           0   1   0           0
