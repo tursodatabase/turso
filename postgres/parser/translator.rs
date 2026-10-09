@@ -4652,6 +4652,17 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     })
 }
 
+pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt))
+            if stmt.kind == VariableSetKind::VarSetMulti as i32
+                && stmt.name.eq_ignore_ascii_case("transaction")
+    )
+}
+
 /// Try to extract a SHOW statement from a PG parse result.
 /// Returns None if the statement is not a SHOW.
 pub fn try_extract_show(parse_result: &ParseResult) -> Option<PgShowStmt> {
