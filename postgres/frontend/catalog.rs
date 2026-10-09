@@ -141,6 +141,15 @@ impl Dialect for PostgresDialect {
         Ok(encode_pg_schema_sql(input))
     }
 
+    fn format_rewritten_table_sql(&self, stmt: &ast::Stmt) -> Result<String> {
+        if !matches!(stmt, ast::Stmt::CreateTable { .. }) {
+            return Err(LimboError::InternalError(
+                "format_rewritten_table_sql requires CREATE TABLE".to_string(),
+            ));
+        }
+        Ok(stmt.to_string())
+    }
+
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
         turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
     }
@@ -1453,7 +1462,10 @@ impl SnapshotRows for PgConstraintTable {
             // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
             let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
             if !has_pk_in_unique_sets && btree.get_rowid_alias_column().is_some() {
-                let conname = format!("{table_name}_pkey");
+                let conname = btree
+                    .primary_key_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_pkey"));
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -1505,12 +1517,14 @@ impl SnapshotRows for PgConstraintTable {
             for us in &btree.unique_sets {
                 let contype = if us.is_primary_key { "p" } else { "u" };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let conname = if us.is_primary_key {
-                    format!("{table_name}_pkey")
-                } else {
-                    let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
-                };
+                let conname = us.name.clone().unwrap_or_else(|| {
+                    if us.is_primary_key {
+                        format!("{table_name}_pkey")
+                    } else {
+                        let cols_str = col_names.join("_");
+                        format!("{table_name}_{cols_str}_key")
+                    }
+                });
 
                 // Build conkey: space-separated 1-based attnums
                 let conkey: String = col_names
@@ -3861,7 +3875,10 @@ fn catalog_indexes(relations: &[CatalogRelation]) -> Vec<CatalogIndex> {
                 table_name: table_name.clone(),
                 namespace: relation.namespace.clone(),
                 namespace_oid: relation.namespace_oid,
-                name: format!("{table_name}_pkey"),
+                name: btree
+                    .primary_key_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_pkey")),
                 columns: vec![(
                     column.name.clone().expect("primary key columns have names"),
                     position,

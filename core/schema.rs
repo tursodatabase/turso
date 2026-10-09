@@ -1963,6 +1963,7 @@ impl Schema {
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
+                primary_key_name: None,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2629,6 +2630,7 @@ impl TryClone for UniqueSet {
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
+            name: self.name.clone(),
             columns: self.columns.try_clone()?,
             is_primary_key: self.is_primary_key,
             conflict_clause: self.conflict_clause,
@@ -2695,6 +2697,7 @@ impl TryClone for BTreeTable {
             root_page: self.root_page,
             name: self.name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
+            primary_key_name: self.primary_key_name.clone(),
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
@@ -3124,6 +3127,7 @@ impl PartialEq for Table {
 /// UniqueSet describes a column or set of columns for which rows are unique (PRIMARY KEY, UNIQUE)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
+    pub name: Option<String>,
     pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
@@ -3301,6 +3305,7 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
+    pub primary_key_name: Option<String>,
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -3367,6 +3372,10 @@ impl BTreeTable {
             root_page,
             name,
             primary_key_columns,
+            primary_key_name: unique_sets
+                .iter()
+                .find(|set| set.is_primary_key)
+                .and_then(|set| set.name.clone()),
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
@@ -3623,10 +3632,31 @@ impl BTreeTable {
             }
 
             if column.unique() {
+                if let Some(name) = self
+                    .unique_sets
+                    .iter()
+                    .find(|set| {
+                        !set.is_primary_key
+                            && set.columns.len() == 1
+                            && set.columns[0].name.eq_ignore_ascii_case(column_name)
+                    })
+                    .and_then(|set| set.name.as_ref())
+                {
+                    sql.push_str(&format!(
+                        " CONSTRAINT {}",
+                        Name::exact(name.clone()).as_ident()
+                    ));
+                }
                 sql.push_str(" UNIQUE");
                 push_on_conflict_clause(&mut sql, self.inline_unique_conflict_clause(column_name));
             }
             if needs_pk_inline && column.primary_key() {
+                if let Some(name) = &self.primary_key_name {
+                    sql.push_str(&format!(
+                        " CONSTRAINT {}",
+                        Name::exact(name.clone()).as_ident()
+                    ));
+                }
                 sql.push_str(" PRIMARY KEY");
                 if !column.is_rowid_alias() && self.primary_key_columns[0].1 == SortOrder::Desc {
                     sql.push_str(" DESC");
@@ -3684,7 +3714,14 @@ impl BTreeTable {
         let has_table_pk = !self.primary_key_columns.is_empty();
         // Add table-level PRIMARY KEY constraint if exists
         if !needs_pk_inline && has_table_pk {
-            sql.push_str(", PRIMARY KEY (");
+            sql.push_str(", ");
+            if let Some(name) = &self.primary_key_name {
+                sql.push_str(&format!(
+                    "CONSTRAINT {} ",
+                    Name::exact(name.clone()).as_ident()
+                ));
+            }
+            sql.push_str("PRIMARY KEY (");
             for (i, col) in self.primary_key_columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -3780,7 +3817,14 @@ impl BTreeTable {
                     }
                 }
             }
-            sql.push_str(", UNIQUE (");
+            sql.push_str(", ");
+            if let Some(name) = &unique_set.name {
+                sql.push_str(&format!(
+                    "CONSTRAINT {} ",
+                    Name::exact(name.clone()).as_ident()
+                ));
+            }
+            sql.push_str("UNIQUE (");
             for (i, unique_column) in unique_set.columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -4647,6 +4691,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         primary_key_columns.try_push((col_name, sort_order))?;
                     }
                     unique_sets_constraints.try_push(UniqueSet {
+                        name: c.name.as_ref().map(|name| name.as_str().to_string()),
                         columns: pk_unique_set_columns,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
@@ -4676,6 +4721,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         })?;
                     }
                     let unique_set = UniqueSet {
+                        name: c.name.as_ref().map(|name| name.as_str().to_string()),
                         columns: unique_columns,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
@@ -4859,6 +4905,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 order = *o;
                             }
                             unique_sets_columns.try_push(UniqueSet {
+                                name: c_def.name.as_ref().map(|name| name.as_str().to_string()),
                                 columns: try_vec![UniqueSetColumn {
                                     name: name.clone(),
                                     sort_order: order,
@@ -4887,6 +4934,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
                             unique_sets_columns.try_push(UniqueSet {
+                                name: c_def.name.as_ref().map(|name| name.as_str().to_string()),
                                 columns: try_vec![UniqueSetColumn {
                                     name: name.clone(),
                                     sort_order: order,
@@ -5092,6 +5140,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         .iter()
         .find(|us| us.is_primary_key)
         .and_then(|us| us.conflict_clause);
+    let primary_key_name = unique_sets
+        .iter()
+        .find(|set| set.is_primary_key)
+        .and_then(|set| set.name.clone());
     for col in cols.iter() {
         if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -5117,6 +5169,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         name: table_name,
         has_rowid,
         primary_key_columns,
+        primary_key_name,
         has_autoincrement,
         columns: cols,
         is_strict,
@@ -5838,6 +5891,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
+        primary_key_name: None,
         columns,
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
@@ -6970,6 +7024,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
+            primary_key_name: None,
             columns,
             unique_sets: vec![],
             foreign_keys: vec![],
