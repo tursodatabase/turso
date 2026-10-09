@@ -5904,6 +5904,21 @@ pub fn op_program(
     loop {
         match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
+                // A trigger does not fire again while its own body is still
+                // running, which is SQLite's behaviour without
+                // `PRAGMA recursive_triggers`.
+                if let Some(trigger) = &subprogram.trigger {
+                    if state
+                        .executing_triggers
+                        .iter()
+                        .any(|executing| Arc::ptr_eq(executing, trigger))
+                    {
+                        state.active_op_state.clear();
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                }
+
                 // Try to reuse a cached statement for this PC, otherwise create a new one.
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
                 // cached statements by storing them key'd by the state.pc if we are in a loop
@@ -5913,14 +5928,16 @@ pub fn op_program(
                         cached.reset_for_subprogram_reuse();
                         cached
                     } else {
-                        Box::new(Statement::new_with_origin(
+                        let mut statement = Box::new(Statement::new_with_origin(
                             Program::from_prepared(subprogram.clone(), program.connection.clone()),
                             pager.clone(),
                             QueryMode::Normal,
                             0,
                             crate::statement::StatementOrigin::Subprogram,
                             false,
-                        ))
+                        ));
+                        statement.set_executing_triggers(&state.executing_triggers);
+                        statement
                     };
 
                 // Check if this is a trigger subprogram - if so, track execution

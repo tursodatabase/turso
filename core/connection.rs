@@ -491,8 +491,6 @@ pub struct Connection {
     /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
     /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     pub(super) nestedness: AtomicI32,
-    /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
-    pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
@@ -914,29 +912,6 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
-    }
-
-    /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
-    pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
-        let compiling = self.compiling_triggers.read();
-        if let Some(trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
-            tracing::debug!("Trigger is already compiling: {}", trigger.name);
-            return true;
-        }
-        false
-    }
-
-    pub fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
-        tracing::debug!("Starting trigger compilation: {}", trigger.name);
-        self.compiling_triggers.write().push(trigger);
-    }
-
-    pub fn end_trigger_compilation(&self) {
-        tracing::debug!(
-            "Ending trigger compilation: {:?}",
-            self.compiling_triggers.read().last().map(|t| &t.name)
-        );
-        self.compiling_triggers.write().pop();
     }
 
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
