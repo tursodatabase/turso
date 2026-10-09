@@ -753,6 +753,31 @@ impl std::fmt::Display for AggFunc {
 }
 
 impl AggFunc {
+    pub fn reads_argument_subtypes(&self) -> bool {
+        self.is_json_group_function()
+    }
+
+    pub fn can_return_subtype(&self) -> bool {
+        self.is_json_group_function()
+    }
+
+    fn is_json_group_function(&self) -> bool {
+        #[cfg(feature = "json")]
+        {
+            matches!(
+                self,
+                Self::JsonGroupArray
+                    | Self::JsonbGroupArray
+                    | Self::JsonGroupObject
+                    | Self::JsonbGroupObject
+            )
+        }
+        #[cfg(not(feature = "json"))]
+        {
+            false
+        }
+    }
+
     pub fn num_args(&self) -> usize {
         match self {
             Self::Avg => 1,
@@ -1653,6 +1678,51 @@ impl Func {
     pub fn can_mask_nulls(&self) -> bool {
         match self {
             Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
+            _ => false,
+        }
+    }
+
+    pub fn reads_argument_subtypes(&self) -> bool {
+        match self {
+            Self::Scalar(ScalarFunc::Subtype) => true,
+            #[cfg(feature = "json")]
+            Self::Json(json_func) => matches!(
+                json_func,
+                JsonFunc::JsonArray
+                    | JsonFunc::JsonbArray
+                    | JsonFunc::JsonObject
+                    | JsonFunc::JsonbObject
+                    | JsonFunc::JsonInsert
+                    | JsonFunc::JsonbInsert
+                    | JsonFunc::JsonReplace
+                    | JsonFunc::JsonbReplace
+                    | JsonFunc::JsonSet
+                    | JsonFunc::JsonbSet
+                    | JsonFunc::JsonQuote
+            ),
+            Self::Agg(agg_func) => agg_func.reads_argument_subtypes(),
+            _ => false,
+        }
+    }
+
+    pub fn can_return_subtype(&self) -> bool {
+        match self {
+            #[cfg(feature = "json")]
+            Self::Json(json_func) => matches!(
+                json_func,
+                JsonFunc::Json
+                    | JsonFunc::JsonArray
+                    | JsonFunc::JsonExtract
+                    | JsonFunc::JsonArrowExtract
+                    | JsonFunc::JsonInsert
+                    | JsonFunc::JsonObject
+                    | JsonFunc::JsonPatch
+                    | JsonFunc::JsonQuote
+                    | JsonFunc::JsonRemove
+                    | JsonFunc::JsonReplace
+                    | JsonFunc::JsonSet
+            ),
+            Self::Agg(agg_func) => agg_func.can_return_subtype(),
             _ => false,
         }
     }

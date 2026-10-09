@@ -341,8 +341,17 @@ impl<'a> AggArgumentSource<'a> {
                 src_reg_start: start_reg,
                 ..
             } => Ok(*start_reg + arg_idx),
-            AggArgumentSource::Expression { args, .. } => {
-                resolve_expr(program, Some(referenced_tables), &args[arg_idx], resolver)
+            AggArgumentSource::Expression { func, args, .. } => {
+                let argument = &args[arg_idx];
+                let subtype_arguments: &[&ast::Expr] = if func.reads_argument_subtypes() {
+                    &[argument]
+                } else {
+                    &[]
+                };
+                let marked_before = program.mark_subtype_arguments(subtype_arguments);
+                let translated = resolve_expr(program, Some(referenced_tables), argument, resolver);
+                program.unmark_subtype_arguments(marked_before);
+                translated
             }
         }
     }

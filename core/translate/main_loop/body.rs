@@ -203,13 +203,22 @@ fn emit_loop_source<'a>(
                         for expr in agg.args.iter() {
                             let agg_reg = cur_reg;
                             cur_reg += 1;
-                            translate_expr(
+                            let subtype_arguments: &[&Expr] = if agg.func.reads_argument_subtypes()
+                            {
+                                &[expr]
+                            } else {
+                                &[]
+                            };
+                            let marked_before = program.mark_subtype_arguments(subtype_arguments);
+                            let translated = translate_expr(
                                 program,
                                 Some(&plan.table_references),
                                 expr,
                                 agg_reg,
                                 &t_ctx.resolver,
-                            )?;
+                            );
+                            program.unmark_subtype_arguments(marked_before);
+                            translated?;
                         }
                     }
                     group_by_agg_phase(program, t_ctx, plan)?;
