@@ -3064,9 +3064,20 @@ pub(super) fn query_output_columns(
                     infer_type_from_expr(&result_column.expr, Some(table_references))
                 });
             let column_type = affinity.to_type();
+            let declared_type = match &result_column.expr {
+                ast::Expr::Cast {
+                    type_name: Some(type_name),
+                    ..
+                } => Some(type_name.name.clone()),
+                ast::Expr::Column { table, column, .. } => table_references
+                    .find_table_by_internal_id(*table)
+                    .and_then(|(_, table)| table.get_column_at(*column))
+                    .map(|column| column.ty_str.clone()),
+                _ => None,
+            };
             let mut column = Column::new(
                 name,
-                column_type.to_string(),
+                declared_type.unwrap_or_else(|| column_type.to_string()),
                 None,
                 None,
                 column_type,

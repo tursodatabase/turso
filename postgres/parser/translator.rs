@@ -4219,6 +4219,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
+            | "pg_sequence"
             | "pg_sequences"
             | "pg_constraint"
             | "pg_index"
@@ -4573,13 +4574,13 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     let pg_type = parts.join(" ");
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "BIGINT" | "INT8" => "BIGINT",
+        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "BIGSERIAL"
+        | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        "BOOLEAN" | "BOOL" if !type_name.array_bounds.is_empty() => "BOOLEAN",
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        "BOOLEAN" | "BOOL" => "BOOLEAN",
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
         | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
         | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
