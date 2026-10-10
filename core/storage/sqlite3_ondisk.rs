@@ -2716,6 +2716,28 @@ mod tests {
             .unwrap_or(false)
     }
 
+    #[test]
+    fn read_varint_decodes_every_length_and_ignores_the_tail() {
+        for bits in 0..64 {
+            let low = 1u64 << bits;
+            for value in [low, low | (low >> 1), u64::MAX >> (63 - bits)] {
+                let mut buf = [0xffu8; 12];
+                let written = write_varint(&mut buf, value);
+                for tail in 0..=3 {
+                    assert_eq!(
+                        read_varint(&buf[..written + tail]).unwrap(),
+                        (value, written),
+                        "value {value:#x} with a {tail}-byte tail"
+                    );
+                }
+                assert!(
+                    read_varint(&buf[..written - 1]).is_err(),
+                    "value {value:#x} cut short"
+                );
+            }
+        }
+    }
+
     #[quickcheck_macros::quickcheck]
     fn split_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
         match (split_varint(&bytes), read_varint(&bytes)) {

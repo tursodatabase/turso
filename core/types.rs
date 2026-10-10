@@ -15,7 +15,8 @@ use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
-    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+    read_integer, read_value, read_value_serial_type, read_varint, split_varint, varint_len,
+    write_varint,
 };
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -2248,44 +2249,26 @@ impl<'a> Iterator for ValueIterator<'a> {
     #[inline(always)]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let mut header = self.header_section.get();
-        let mut data = self.data_section.get();
+        let data = self.data_section.get();
 
-        let mut data_sum = 0;
-        for _ in 0..n {
-            if unlikely(header.is_empty()) {
-                return None;
+        let data_sum = match skip_serial_types(&mut header, n) {
+            Ok(data_sum) => data_sum,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
             }
-
-            let (serial_type, bytes_read) = match read_varint(header) {
-                Ok(v) => v,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
-            header = &header[bytes_read..];
-
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
+        };
+        if unlikely(header.is_empty()) {
+            return None;
         }
-
         if unlikely(data_sum > data.len()) {
             return Some(Err(LimboError::Corrupt(
                 "Data section too small for indicated serial type size".into(),
             )));
         }
-        data = &data[data_sum..];
 
-        // Update iterator state
         self.header_section.set(header);
-        self.data_section.set(data);
-
-        // Return the nth value
+        self.data_section.set(&data[data_sum..]);
         self.next()
     }
 
@@ -3307,30 +3290,179 @@ impl SerialType {
     }
 }
 
+/// Moves `header` past its first `n` serial types and returns how many data
+/// bytes those columns take. Stops at the end of the header when it has
+/// fewer than `n` serial types.
+#[inline(always)]
+pub fn skip_serial_types(header: &mut &[u8], n: usize) -> Result<usize> {
+    let mut rest = *header;
+    let mut data_sum = 0usize;
+    let mut reserved_marker = 0u8;
+    let mut left = n;
+    #[cfg(target_arch = "x86_64")]
+    while left >= x86_64::SKIP_MIN_COLUMNS && rest.len() >= 8 {
+        // SAFETY: SSE2 is part of the x86_64 baseline instruction set.
+        let (columns, size) = unsafe { x86_64::sum_one_byte_serial_type_sizes(rest, left) };
+        data_sum += size;
+        rest = &rest[columns..];
+        left -= columns;
+        if left > 0 {
+            if !skip_one_serial_type(&mut rest, &mut data_sum, &mut reserved_marker)? {
+                break;
+            }
+            left -= 1;
+        }
+    }
+    while left > 0 && skip_one_serial_type(&mut rest, &mut data_sum, &mut reserved_marker)? {
+        left -= 1;
+    }
+    if unlikely(reserved_marker & RESERVED_SERIAL_TYPE_SIZE != 0) {
+        return Err(LimboError::Corrupt("Invalid serial type: 10 or 11".into()));
+    }
+    *header = rest;
+    Ok(data_sum)
+}
+
+/// Returns false at the end of the header. A reserved serial type sets the
+/// marker bit in `reserved_marker` instead of failing right away, so the
+/// hot loop has one branch less.
+#[inline(always)]
+fn skip_one_serial_type(
+    rest: &mut &[u8],
+    data_sum: &mut usize,
+    reserved_marker: &mut u8,
+) -> Result<bool> {
+    let Some((&first, tail)) = rest.split_first() else {
+        return Ok(false);
+    };
+    if first < 0x80 {
+        let size = ONE_BYTE_SERIAL_TYPE_SIZES[usize::from(first)];
+        *reserved_marker |= size;
+        *data_sum += usize::from(size);
+        *rest = tail;
+    } else {
+        let (serial_type, tail) = split_varint(rest)?;
+        *data_sum += get_serial_type_size(serial_type)?;
+        *rest = tail;
+    }
+    Ok(true)
+}
+
 #[inline(always)]
 pub fn get_serial_type_size(serial: u64) -> Result<usize> {
-    match serial {
-        0 | 8 | 9 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => Ok(4),
-        5 => Ok(6),
-        6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
-        _ => {
-            mark_unlikely();
-            Err(LimboError::Corrupt(format!(
+    if serial < ONE_BYTE_SERIAL_TYPE_SIZES.len() as u64 {
+        let size = ONE_BYTE_SERIAL_TYPE_SIZES[serial as usize];
+        if unlikely(size == RESERVED_SERIAL_TYPE_SIZE) {
+            return Err(LimboError::Corrupt(format!(
                 "Invalid serial type: {serial}"
-            )))
+            )));
         }
+        return Ok(usize::from(size));
+    }
+    Ok(((serial - 12) / 2) as usize)
+}
+
+const RESERVED_SERIAL_TYPE_SIZE: u8 = 0x80;
+
+static ONE_BYTE_SERIAL_TYPE_SIZES: [u8; 128] = one_byte_serial_type_sizes();
+
+const fn one_byte_serial_type_sizes() -> [u8; 128] {
+    let mut sizes = [0u8; 128];
+    sizes[1] = 1;
+    sizes[2] = 2;
+    sizes[3] = 3;
+    sizes[4] = 4;
+    sizes[5] = 6;
+    sizes[6] = 8;
+    sizes[7] = 8;
+    sizes[10] = RESERVED_SERIAL_TYPE_SIZE;
+    sizes[11] = RESERVED_SERIAL_TYPE_SIZE;
+    let mut serial = 12;
+    while serial < sizes.len() {
+        sizes[serial] = ((serial - 12) / 2) as u8;
+        serial += 1;
+    }
+    sizes
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_64 {
+    use std::arch::x86_64::*;
+
+    pub(super) const SKIP_MIN_COLUMNS: usize = 8;
+
+    /// Sums the sizes of the one-byte serial types at the front of `header`,
+    /// at most `want` of them, and stops before the first multi-byte or
+    /// reserved type. Returns how many serial types it summed and their
+    /// total size. `header` must be at least 8 bytes long.
+    ///
+    /// # Safety
+    /// The CPU must support SSE2. Every x86_64 CPU does.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn sum_one_byte_serial_type_sizes(
+        header: &[u8],
+        want: usize,
+    ) -> (usize, usize) {
+        let block = load_16_bytes_zero_padded(header);
+        let want = want.min(header.len()).min(16);
+        let multi_byte = _mm_movemask_epi8(block) as u32;
+        let reserved = _mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_and_si128(block, _mm_set1_epi8(!1)),
+            _mm_set1_epi8(10),
+        )) as u32;
+        let stop = (multi_byte | reserved) & ((1u32 << want) - 1);
+        let columns = if stop == 0 {
+            want
+        } else {
+            stop.trailing_zeros() as usize
+        };
+        let lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let summed = _mm_cmplt_epi8(lane, _mm_set1_epi8(columns as i8));
+        let sizes = _mm_and_si128(one_byte_serial_type_sizes(block), summed);
+        let sums = _mm_sad_epu8(sizes, _mm_setzero_si128());
+        let total = _mm_cvtsi128_si32(_mm_add_epi64(sums, _mm_srli_si128::<8>(sums)));
+        (columns, total as usize)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn load_16_bytes_zero_padded(bytes: &[u8]) -> __m128i {
+        if let Some(chunk) = bytes.first_chunk::<16>() {
+            // SAFETY: the chunk is 16 readable bytes and the load needs no alignment.
+            return unsafe { _mm_loadu_si128(chunk.as_ptr().cast()) };
+        }
+        let (Some(head), Some(tail)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) else {
+            unreachable!("the caller passes at least 8 bytes");
+        };
+        let low = u64::from_le_bytes(*head);
+        let high = u64::from_le_bytes(*tail);
+        let high = (high >> (8 * (15 - bytes.len()))) >> 8;
+        _mm_set_epi64x(high as i64, low as i64)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn one_byte_serial_type_sizes(serial_types: __m128i) -> __m128i {
+        let four = _mm_set1_epi8(4);
+        let two = _mm_set1_epi8(2);
+        let over_four = _mm_cmpgt_epi8(serial_types, four);
+        let over_five = _mm_cmpgt_epi8(serial_types, _mm_set1_epi8(5));
+        let under_eight = _mm_cmplt_epi8(serial_types, _mm_set1_epi8(8));
+        let fixed_width = _mm_add_epi8(
+            _mm_min_epu8(serial_types, four),
+            _mm_add_epi8(_mm_and_si128(over_four, two), _mm_and_si128(over_five, two)),
+        );
+        let fixed_width = _mm_and_si128(fixed_width, under_eight);
+        let text_or_blob = _mm_and_si128(
+            _mm_srli_epi16::<1>(_mm_subs_epu8(serial_types, _mm_set1_epi8(12))),
+            _mm_set1_epi8(0x7f),
+        );
+        let from_twelve = _mm_cmpgt_epi8(serial_types, _mm_set1_epi8(11));
+        _mm_or_si128(
+            _mm_and_si128(text_or_blob, from_twelve),
+            _mm_andnot_si128(from_twelve, fixed_width),
+        )
     }
 }
 
@@ -5235,6 +5367,77 @@ mod tests {
 
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
+        }
+    }
+
+    fn skip_serial_types_one_at_a_time(mut header: &[u8], n: usize) -> Result<(usize, &[u8])> {
+        let mut data_sum = 0;
+        for _ in 0..n {
+            if header.is_empty() {
+                break;
+            }
+            let (serial_type, len) = read_varint(header)?;
+            header = &header[len..];
+            data_sum += get_serial_type_size(serial_type)?;
+        }
+        Ok((data_sum, header))
+    }
+
+    fn assert_skip_matches_one_at_a_time(header: &[u8], n: usize) {
+        let mut rest = header;
+        let skipped = skip_serial_types(&mut rest, n).map(|data_sum| (data_sum, rest));
+        match (skipped, skip_serial_types_one_at_a_time(header, n)) {
+            (Ok(fast), Ok(slow)) => assert_eq!(fast, slow, "header {header:?}, n {n}"),
+            (Err(_), Err(_)) => {}
+            (fast, slow) => panic!("header {header:?}, n {n}: got {fast:?}, want {slow:?}"),
+        }
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn skip_serial_types_matches_one_at_a_time_on_any_bytes(header: Vec<u8>, n: u8) -> bool {
+        assert_skip_matches_one_at_a_time(&header, usize::from(n));
+        true
+    }
+
+    #[test]
+    fn skip_serial_types_matches_one_at_a_time_on_long_headers() {
+        let one_byte_types: Vec<u8> = (0..128).filter(|t| *t != 10 && *t != 11).collect();
+        for len in 1..=40 {
+            let header: Vec<u8> = (0..len)
+                .map(|i| one_byte_types[(i * 7) % one_byte_types.len()])
+                .collect();
+            for n in 0..=len + 1 {
+                assert_skip_matches_one_at_a_time(&header, n);
+            }
+            for position in 0..len {
+                let mut two_byte_type = header.clone();
+                two_byte_type.splice(position..position, [0x81, 0x02]);
+                let mut reserved_type = header.clone();
+                reserved_type[position] = 10;
+                for n in 0..=len + 2 {
+                    assert_skip_matches_one_at_a_time(&two_byte_type, n);
+                    assert_skip_matches_one_at_a_time(&reserved_type, n);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serial_type_sizes_follow_the_record_format() {
+        for serial in (0..100_000u64).chain([u32::MAX as u64, u64::MAX / 2, u64::MAX]) {
+            let expected = match serial {
+                0 | 8 | 9 => Ok(0),
+                1..=4 => Ok(serial as usize),
+                5 => Ok(6),
+                6 | 7 => Ok(8),
+                10 | 11 => Err(()),
+                _ => Ok(((serial - 12) / 2) as usize),
+            };
+            assert_eq!(
+                get_serial_type_size(serial).map_err(|_| ()),
+                expected,
+                "serial type {serial}"
+            );
         }
     }
 }

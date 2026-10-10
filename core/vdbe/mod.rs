@@ -3963,15 +3963,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 /// If the header is short, returns `Ok(())` with an empty `header`.
 #[inline(always)]
 fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<()> {
-    use crate::types::get_serial_type_size;
-    let mut data_sum = 0;
-    for _ in 0..n {
-        if header.is_empty() {
-            break;
-        }
-        let serial_type = read_serial_type(header)?;
-        data_sum += get_serial_type_size(serial_type)?;
-    }
+    let data_sum = crate::types::skip_serial_types(header, n)?;
     if data_sum > data.len() {
         return Err(LimboError::Corrupt(
             "Data section too small for indicated serial type size".into(),
