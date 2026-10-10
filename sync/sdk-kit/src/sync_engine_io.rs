@@ -208,7 +208,9 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoCompletion<TBytes> {
         completion.finished = true;
     }
 
-    fn inner(&self) -> turso_sync_engine::Result<MutexGuard<SyncEngineIoCompletionInner<TBytes>>> {
+    fn inner(
+        &self,
+    ) -> turso_sync_engine::Result<MutexGuard<'_, SyncEngineIoCompletionInner<TBytes>>> {
         let inner = self.inner.lock().unwrap();
         if let Some(err) = &inner.err {
             return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
