@@ -2003,10 +2003,8 @@ mod tests {
         let mut found_from = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(stmt) = generate_update(&generator, &mut ctx)
-                && let Sql::Update(update) = stmt
-            {
-                let sql = update.to_string();
+            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
+                let sql = stmt.to_string();
                 if sql.starts_with("UPDATE") && sql.contains(" FROM ") {
                     found_from = true;
                     break;
