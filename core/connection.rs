@@ -2036,7 +2036,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn has_no_open_transaction_state(&self) -> bool {
+    fn has_no_open_transaction_state(&self) -> bool {
         matches!(self.get_tx_state(), TransactionState::None)
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()

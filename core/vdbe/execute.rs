@@ -4664,14 +4664,6 @@ pub fn op_transaction_inner(
                     );
                     return Err(LimboError::SchemaUpdated.into());
                 }
-                if is_main_db
-                    && conn.has_no_open_transaction_state()
-                    && mv_store
-                        .as_ref()
-                        .is_some_and(|mv_store| mv_store.schema_change_commit_in_flight())
-                {
-                    return Ok(state.suspend_on_io(IOCompletions(Completion::new_yield())));
-                }
                 #[cfg(any(test, injected_yields))]
                 {
                     if let Some(IOResult::IO(io)) =
