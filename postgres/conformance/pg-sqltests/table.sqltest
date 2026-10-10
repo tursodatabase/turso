@@ -167,3 +167,12 @@ test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
 expect error {}
+
+test table-cast-timestamp-column-to-date-and-time {
+    CREATE TABLE events (ts timestamp);
+    INSERT INTO events VALUES ('2024-01-15 10:30:00');
+    SELECT ts::date, ts::time FROM events;
+}
+expect {
+    2024-01-15|10:30:00
+}
