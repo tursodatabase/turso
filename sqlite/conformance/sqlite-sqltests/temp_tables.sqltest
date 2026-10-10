@@ -68,6 +68,32 @@ expect {
     2
 }
 
+test unqualified-lookups-prefer-temp-main-then-attachment-order {
+    ATTACH ':memory:' AS z;
+    ATTACH ':memory:' AS a;
+    CREATE TABLE z.items(id INTEGER);
+    INSERT INTO z.items VALUES (17);
+    CREATE TABLE a.items(id INTEGER);
+    INSERT INTO a.items VALUES (29);
+    SELECT id FROM items;
+    UPDATE items SET id = id + 100;
+    SELECT id FROM z.items;
+    SELECT id FROM a.items;
+    CREATE TABLE main.items(id INTEGER);
+    INSERT INTO main.items VALUES (43);
+    SELECT id FROM items;
+    CREATE TEMP TABLE items(id INTEGER);
+    INSERT INTO temp.items VALUES (61);
+    SELECT id FROM items;
+}
+expect {
+    17
+    117
+    29
+    43
+    61
+}
+
 test temp-table-shadowing-applies-to-update-and-delete {
     CREATE TABLE t_shadow(x INTEGER);
     INSERT INTO main.t_shadow VALUES (1), (2);

@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -8,8 +9,8 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_core::{Database, Value};
+use turso_pg::{split_statements, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -28,7 +29,7 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<Database>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -36,13 +37,13 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<Database>,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
             interrupt_count,
         }
     }
@@ -53,6 +54,13 @@ impl TursoPgServer {
     }
 
     async fn run_async(&self) -> anyhow::Result<()> {
+        let schemas = {
+            let conn = PgConnection::new(self.db.connect()?);
+            auto_attach_pg_schemas(&conn, &self.db_file);
+            let paths = attached_schemas(&conn);
+            conn.close()?;
+            Arc::new(Mutex::new(SharedSchemas { version: 1, paths }))
+        };
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {})",
@@ -60,24 +68,37 @@ impl TursoPgServer {
             self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let db = self.db.clone();
+                            let db_file = self.db_file.clone();
+                            let schemas = schemas.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                let conn = match db.connect() {
+                                    Ok(conn) => PgConnection::new(conn),
+                                    Err(e) => {
+                                        error!("Error opening database connection for {}: {}", addr, e);
+                                        return;
+                                    }
+                                };
+                                let factory = Arc::new(TursoPgFactory {
+                                    handler: Arc::new(TursoPgHandler {
+                                        conn,
+                                        db_file,
+                                        schemas,
+                                        schemas_version: AtomicU64::new(0),
+                                        query_parser: Arc::new(NoopQueryParser::new()),
+                                    }),
+                                });
+                                if let Err(e) = process_socket(socket, None, factory.clone()).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = factory.handler.conn.close() {
+                                    error!("Error closing database connection for {}: {}", addr, e);
                                 }
                             });
                         }
@@ -102,56 +123,43 @@ impl TursoPgServer {
     }
 }
 
-struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
-    db_file: String,
-    query_parser: Arc<NoopQueryParser>,
-}
-
-impl TursoPgHandler {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
+pub fn auto_attach_pg_schemas(conn: &PgConnection, db_file: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    let dir = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix("turso-postgres-schema-")
+            .and_then(|s| s.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().to_string();
+        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        if let Err(e) = conn.inner().execute(&sql) {
+            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
         }
     }
+}
+
+struct TursoPgHandler {
+    conn: PgConnection,
+    db_file: String,
+    schemas: Arc<Mutex<SharedSchemas>>,
+    schemas_version: AtomicU64,
+    query_parser: Arc<NoopQueryParser>,
 }
 
 struct TursoPgFactory {
@@ -178,8 +186,6 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query)
@@ -187,11 +193,9 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
+            let mut stmt = self
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-            self.cleanup_dropped_schema_file(sql);
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
@@ -223,15 +227,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
+        let mut stmt = self
             .prepare(query)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
@@ -252,8 +252,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
+        let stmt = self
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
@@ -275,14 +274,112 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
+        let stmt = self
             .prepare(&portal.statement.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
     }
+}
+
+impl TursoPgHandler {
+    fn prepare(&self, sql: &str) -> turso_core::Result<turso_core::Statement> {
+        if self.conn.inner().get_auto_commit() {
+            self.attach_schemas_from_other_clients()?;
+        }
+        if !is_schema_change(sql) {
+            return self.conn.prepare(sql);
+        }
+        let before = attached_schemas(&self.conn);
+        let result = self.conn.prepare(sql);
+        let after = attached_schemas(&self.conn);
+        if before != after {
+            self.publish_schema_change(&before, &after);
+        }
+        result
+    }
+
+    fn attach_schemas_from_other_clients(&self) -> turso_core::Result<()> {
+        let shared = self.schemas.lock().unwrap();
+        if self.schemas_version.load(Ordering::Relaxed) == shared.version {
+            return Ok(());
+        }
+        for name in attached_schemas(&self.conn).keys() {
+            self.run_internal(format!("DETACH \"{}\"", name.replace('"', "\"\"")))?;
+        }
+        for (name, path) in &shared.paths {
+            self.run_internal(format!(
+                "ATTACH '{}' AS \"{}\"",
+                path.replace('\'', "''"),
+                name.replace('"', "\"\"")
+            ))?;
+        }
+        self.schemas_version
+            .store(shared.version, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn run_internal(&self, sql: String) -> turso_core::Result<()> {
+        self.conn.inner().prepare_internal(sql)?.run_ignore_rows()
+    }
+
+    fn publish_schema_change(
+        &self,
+        before: &BTreeMap<String, String>,
+        after: &BTreeMap<String, String>,
+    ) {
+        let mut shared = self.schemas.lock().unwrap();
+        let was_current = self.schemas_version.load(Ordering::Relaxed) == shared.version;
+        for name in before.keys().filter(|name| !after.contains_key(*name)) {
+            if let Some(path) = shared.paths.remove(name) {
+                self.delete_schema_file(&path);
+            }
+        }
+        for (name, path) in after.iter().filter(|(name, _)| !before.contains_key(*name)) {
+            shared.paths.insert(name.clone(), path.clone());
+        }
+        shared.version += 1;
+        if was_current {
+            self.schemas_version
+                .store(shared.version, Ordering::Relaxed);
+        }
+    }
+
+    fn delete_schema_file(&self, path: &str) {
+        if self.db_file == ":memory:" {
+            return;
+        }
+        let schema_file = std::path::Path::new(path);
+        if !schema_file.exists() {
+            return;
+        }
+        match std::fs::remove_file(schema_file) {
+            Ok(()) => tracing::info!("Deleted schema file {:?}", schema_file),
+            Err(e) => tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e),
+        }
+        let _ = std::fs::remove_file(schema_file.with_extension("db-wal"));
+        let _ = std::fs::remove_file(schema_file.with_extension("db-shm"));
+    }
+}
+
+fn is_schema_change(sql: &str) -> bool {
+    let upper = sql.trim().to_uppercase();
+    upper.starts_with("CREATE SCHEMA") || upper.starts_with("DROP SCHEMA")
+}
+
+fn attached_schemas(conn: &PgConnection) -> BTreeMap<String, String> {
+    conn.inner()
+        .list_all_databases()
+        .into_iter()
+        .filter(|(_, name, _)| name != "main" && name != "temp")
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+
+struct SharedSchemas {
+    version: u64,
+    paths: BTreeMap<String, String>,
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.

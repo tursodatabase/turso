@@ -709,11 +709,29 @@ impl<'a> Resolver<'a> {
             return Ok(crate::MAIN_DB_ID);
         }
 
-        for database_id in self.attached_database_ids_in_search_order()? {
-            if self.with_schema(database_id, |schema| {
-                schema_contains_object(schema, object_name)
-            }) {
-                return Ok(database_id);
+        if self.dialect.search_attached_databases_by_name() {
+            let mut databases: Vec<_> = self
+                .attached_databases
+                .read()
+                .name_to_index
+                .iter()
+                .map(|(name, &id)| (name.clone(), id))
+                .collect();
+            databases.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (_, database_id) in databases {
+                if self.with_schema(database_id, |schema| {
+                    schema_contains_object(schema, object_name)
+                }) {
+                    return Ok(database_id);
+                }
+            }
+        } else {
+            for database_id in self.attached_database_ids_in_search_order()? {
+                if self.with_schema(database_id, |schema| {
+                    schema_contains_object(schema, object_name)
+                }) {
+                    return Ok(database_id);
+                }
             }
         }
 
