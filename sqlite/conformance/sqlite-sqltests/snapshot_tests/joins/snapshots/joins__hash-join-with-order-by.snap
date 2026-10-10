@@ -23,7 +23,7 @@ QUERY PLAN
 BYTECODE
 addr  opcode              p1  p2  p3  p4                                        p5  comment
    0  Init                 0  50   0                                             0  Start at 50
-   1  SorterOpen           0   2   0  k(2,B,B)                                   0  cursor=0
+   1  SorterOpen           0   2   0  k(2,Binary,Binary)                         0  cursor=0
    2  OpenRead             1   2   0  k(3,B,B,B)                                 0  table=h_orders, root=2, iDb=0
    3  OpenRead             2   3   0  k(4,B,B,B,B)                               0  table=h_items, root=3, iDb=0
    4  Once                14   0   0                                             0  goto 14

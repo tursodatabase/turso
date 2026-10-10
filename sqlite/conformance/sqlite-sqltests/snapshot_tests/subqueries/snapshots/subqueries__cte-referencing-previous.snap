@@ -117,7 +117,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   64    Yield                    1   0   0                   0
   65  Goto                       0  58   0                   0
   66  EndCoroutine               1   0   0                   0
-  67  SorterOpen                 3   1   0  k(1,-B)          0  cursor=3
+  67  SorterOpen                 3   1   0  k(1,-Binary)     0  cursor=3
   68  OpenRead                   4   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
   69  InitCoroutine              1   0   2                   0
   70    Yield                    1  79   0                   0
