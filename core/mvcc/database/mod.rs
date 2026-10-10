@@ -3576,6 +3576,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .mark_durable(self.commit_coordinator.written_through());
                 }
                 let tx_header = *tx_unlocked.header.read();
+                // `MvStore::has_unpublished_schema_change` finds an unpublished schema change by
+                // looking for an exclusive transaction whose schema cookie differs from the
+                // global one.
+                if self.did_commit_schema_change {
+                    turso_assert!(
+                        mvcc_store.is_exclusive_tx(&self.tx_id),
+                        "a schema change must be committed by the exclusive transaction",
+                        { "tx_id": self.tx_id }
+                    );
+                    turso_assert!(
+                        self.header
+                            .read()
+                            .as_ref()
+                            .map(|header| header.schema_cookie.get())
+                            != Some(tx_header.schema_cookie.get()),
+                        "a schema change must change the schema cookie",
+                        { "tx_id": self.tx_id }
+                    );
+                }
                 let schema_did_change = self.did_commit_schema_change
                     || self
                         .header
@@ -6444,6 +6463,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
             let mut schema_stale = false;
+            let mut schema_change_unpublished = false;
             let begin_ts = self.clock.get_timestamp(|ts| {
                 let schema_generation = self.schema_generation();
                 if expected_schema_generation.is_some_and(|exp| exp != schema_generation) {
@@ -6454,6 +6474,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .global_header
                     .read()
                     .expect("global_header initialized above");
+                if self.has_unpublished_schema_change(&header) {
+                    schema_change_unpublished = true;
+                    return;
+                }
                 self.txs.insert(
                     tx_id,
                     Transaction::new(tx_id, ts, header, read_mark, schema_generation),
@@ -6462,6 +6486,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if schema_stale {
                 unlock_checkpoint_guard();
                 return Err(LimboError::SchemaUpdated);
+            }
+            if schema_change_unpublished {
+                unlock_checkpoint_guard();
+                return Err(LimboError::Busy);
             }
             if acquires_checkpoint_guard {
                 if let Some(entry) = self.txs.get(&tx_id) {
@@ -6668,6 +6696,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
+        let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
@@ -6684,16 +6713,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .global_header
                 .read()
                 .expect("global_header initialized above");
+            if self.has_unpublished_schema_change(&header) {
+                schema_change_unpublished = true;
+                return;
+            }
             self.txs.insert(
                 tx_id,
                 Transaction::new(tx_id, ts, header, read_mark, schema_generation),
             );
         });
-        if schema_stale {
+        if schema_stale || schema_change_unpublished {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
             }
-            return Err(LimboError::SchemaUpdated);
+            return Err(if schema_stale {
+                LimboError::SchemaUpdated
+            } else {
+                LimboError::Busy
+            });
         }
         if !passive {
             if let Some(entry) = self.txs.get(&tx_id) {
@@ -6706,6 +6743,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
 
         Ok(tx_id)
+    }
+
+    /// True when the exclusive transaction has taken its commit timestamp but has not yet
+    /// published its schema cookie to the global header. A transaction that begins now would
+    /// see that commit's rows but get the old header, and so run statements prepared against
+    /// the old schema.
+    fn has_unpublished_schema_change(&self, global_header: &DatabaseHeader) -> bool {
+        let exclusive_tx_id = self.exclusive_tx.load(Ordering::Acquire);
+        if exclusive_tx_id == NO_EXCLUSIVE_TX {
+            return false;
+        }
+        // The exclusive transaction publishes its header before it leaves `txs`, so a missing
+        // entry means it has already finished.
+        let Some(entry) = self.txs.get(&exclusive_tx_id) else {
+            return false;
+        };
+        let tx = entry.value();
+        matches!(
+            tx.state.load(),
+            TransactionState::Preparing(_) | TransactionState::Committed(_)
+        ) && tx.header.read().schema_cookie.get() != global_header.schema_cookie.get()
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
