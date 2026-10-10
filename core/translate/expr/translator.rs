@@ -1929,7 +1929,9 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq => translate_function(
+                | ScalarFunc::NumericEq
+                | ScalarFunc::DatePlus
+                | ScalarFunc::DateMinus => translate_function(
                     program,
                     args,
                     referenced_tables,

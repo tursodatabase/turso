@@ -307,7 +307,7 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -341,7 +341,7 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
