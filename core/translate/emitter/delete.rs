@@ -6,14 +6,15 @@ use crate::{
     translate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
+            emit_index_column_value_old_image, emit_partial_index_where_old_image,
+            emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
+            OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
+            ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -630,7 +631,7 @@ fn emit_delete_insns<'a>(
             cursor_id: main_table_cursor_id,
             dest: start_reg + num_regs - 1,
         });
-        Some((iteration_index_cursor, start_reg, num_regs, index))
+        Some((iteration_index_cursor, start_reg, num_regs))
     } else {
         None
     };
@@ -648,18 +649,17 @@ fn emit_delete_insns<'a>(
         main_table_cursor_id,
         iteration_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
-        resolver,
         returning_buffer,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
     // using the key values captured above.
-    if let Some((iteration_index_cursor, start_reg, num_regs, index)) = iteration_idx_delete_ctx {
+    if let Some((iteration_index_cursor, start_reg, num_regs)) = iteration_idx_delete_ctx {
         program.emit_insn(Insn::IdxDelete {
             start_reg,
             num_regs,
             cursor_id: iteration_index_cursor,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
     }
     Ok(())
@@ -686,7 +686,6 @@ fn emit_delete_row_common(
     main_table_cursor_id: usize,
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
     virtual_table_cursor_id: Option<usize>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
@@ -769,29 +768,23 @@ fn emit_delete_row_common(
             .collect::<Vec<_>>();
 
         for (index, index_cursor_id) in indexes_to_delete {
-            let skip_delete_label = if index.where_clause.is_some() {
-                let where_copy = index
-                    .bind_where_expr(Some(table_references), resolver)?
-                    .expect("index.where_clause was checked to be Some above");
+            let skip_delete_label = emit_partial_index_where_old_image(
+                program,
+                &t_ctx.resolver,
+                table_references,
+                main_table_cursor_id,
+                internal_id,
+                &index,
+            )?
+            .map(|where_reg| {
                 let skip_label = program.allocate_label();
-                let reg = program.alloc_register();
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    &where_copy,
-                    reg,
-                    &t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
                 program.emit_insn(Insn::IfNot {
-                    reg,
+                    reg: where_reg,
                     jump_if_null: true,
                     target_pc: skip_label,
                 });
-                Some(skip_label)
-            } else {
-                None
-            };
+                skip_label
+            });
             let num_regs = index.columns.len() + 1;
             let start_reg = program.alloc_registers(num_regs);
             for (reg_offset, column_index) in index.columns.iter().enumerate() {
@@ -813,7 +806,7 @@ fn emit_delete_row_common(
                 start_reg,
                 num_regs,
                 cursor_id: index_cursor_id,
-                raise_error_if_no_matching_entry: index.where_clause.is_none(),
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(label) = skip_delete_label {
                 program.preassign_label_to_next_insn(label);
@@ -1052,7 +1045,6 @@ fn emit_delete_insns_when_triggers_present(
         main_table_cursor_id,
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
-        resolver,
         returning_buffer,
     )?;
 
