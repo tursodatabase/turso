@@ -812,7 +812,7 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             assert!(!col2_ptr.is_null());
 
-            let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
+            let col2_slice = std::slice::from_raw_parts(col2_ptr.cast::<u8>(), col2_len as usize);
             let col2_str = std::str::from_utf8(col2_slice).unwrap().to_owned();
 
             assert_eq!(col2_str, "abc");
