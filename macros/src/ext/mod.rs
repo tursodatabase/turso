@@ -89,7 +89,20 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
     #[cfg(not(target_family = "wasm"))]
     #[cfg(not(feature = "static"))]
     #[global_allocator]
-    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    static GLOBAL: ::turso_ext::HostAllocator<::mimalloc::MiMalloc> =
+        ::turso_ext::HostAllocator(::mimalloc::MiMalloc);
+
+            /// The host that loads this extension calls this before `register_extension`.
+            #[cfg(not(target_family = "wasm"))]
+            #[cfg(not(feature = "static"))]
+            #[no_mangle]
+            pub unsafe extern "C" fn turso_set_allocator(
+                alloc: ::turso_ext::ExtAllocFn,
+                realloc: ::turso_ext::ExtReallocFn,
+                dealloc: ::turso_ext::ExtDeallocFn,
+            ) {
+                ::turso_ext::install_host_allocator(alloc, realloc, dealloc)
+            }
 
             #[cfg(feature = "static")]
             pub unsafe extern "C" fn register_extension_static(api: &mut ::turso_ext::ExtensionApi) -> ::turso_ext::ResultCode {

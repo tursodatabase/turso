@@ -11,7 +11,10 @@ use std::{
     ffi::{c_char, CString},
     sync::{Arc, Mutex, OnceLock},
 };
-use turso_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl};
+use turso_ext::{
+    ExtAllocFn, ExtDeallocFn, ExtReallocFn, ExtensionApi, ExtensionApiRef, ExtensionEntryPoint,
+    ResultCode, VfsImpl,
+};
 
 #[cfg(not(target_family = "wasm"))]
 type ExtensionStore = Vec<(Arc<Library>, ExtensionApiRef)>;
@@ -26,6 +29,31 @@ pub fn get_extension_libraries() -> Arc<Mutex<ExtensionStore>> {
 
 type Vfs = (String, Arc<VfsMod>);
 static VFS_MODULES: OnceLock<Mutex<Vec<Vfs>>> = OnceLock::new();
+
+type SetAllocatorFn = unsafe extern "C" fn(ExtAllocFn, ExtReallocFn, ExtDeallocFn);
+
+/// The extension was linked with its own copy of the allocator, which only accepts the
+/// pointers that copy handed out, so we hand the extension ours instead.
+unsafe extern "C" fn host_alloc(size: usize, align: usize) -> *mut u8 {
+    unsafe { std::alloc::alloc(alloc_layout(size, align)) }
+}
+
+unsafe extern "C" fn host_realloc(
+    ptr: *mut u8,
+    size: usize,
+    align: usize,
+    new_size: usize,
+) -> *mut u8 {
+    unsafe { std::alloc::realloc(ptr, alloc_layout(size, align), new_size) }
+}
+
+unsafe extern "C" fn host_dealloc(ptr: *mut u8, size: usize, align: usize) {
+    unsafe { std::alloc::dealloc(ptr, alloc_layout(size, align)) }
+}
+
+fn alloc_layout(size: usize, align: usize) -> std::alloc::Layout {
+    unsafe { std::alloc::Layout::from_size_align_unchecked(size, align) }
+}
 
 #[derive(Clone, Debug)]
 pub struct VfsMod {
@@ -47,6 +75,9 @@ impl Connection {
         let api = Box::new(unsafe { self._build_turso_ext() });
         let lib =
             unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };
+        if let Ok(set_allocator) = unsafe { lib.get::<SetAllocatorFn>(b"turso_set_allocator") } {
+            unsafe { set_allocator(host_alloc, host_realloc, host_dealloc) };
+        }
         let entry: Symbol<ExtensionEntryPoint> = unsafe {
             lib.get(b"register_extension")
                 .map_err(|e| LimboError::ExtensionError(e.to_string()))?

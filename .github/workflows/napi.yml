@@ -416,7 +416,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build toolchain
-        run: apt-get update && apt-get install -y --no-install-recommends build-essential
+        # libmimalloc-sys2 builds mimalloc with cmake, so cmake has to be here too.
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential cmake
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker

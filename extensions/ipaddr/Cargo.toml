@@ -18,4 +18,4 @@ turso_ext = { workspace = true, features = ["static"] }
 ipnetwork = "0.21.1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+mimalloc.workspace = true

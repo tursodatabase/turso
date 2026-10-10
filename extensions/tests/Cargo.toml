@@ -20,4 +20,4 @@ turso_ext = { workspace = true, features = ["static", "vfs"] }
 log = "0.4.26"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+mimalloc.workspace = true

@@ -1,8 +1,10 @@
+mod alloc;
 mod functions;
 mod types;
 #[cfg(feature = "vfs")]
 mod vfs_modules;
 mod vtabs;
+pub use alloc::{install_host_allocator, ExtAllocFn, ExtDeallocFn, ExtReallocFn, HostAllocator};
 pub use functions::{
     AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunc,
     ScalarFunction, StepFunction, ValueDestructor,

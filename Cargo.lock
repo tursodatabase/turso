@@ -3420,12 +3420,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8355be11b20d696c8f18f6cc018c4e372165b1fa8126cef092399c9951984ffa"
 
 [[package]]
-name = "libmimalloc-sys"
-version = "0.1.43"
+name = "libmimalloc-sys2"
+version = "0.1.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf88cd67e9de251c1781dbe2f641a1a3ad66eaae831b8a2c38fbdc5ddae16d4d"
+checksum = "2812ea58f6620a137d0e7c7b9ba63f515248c5575bd669f739a9ea4b56ba8259"
 dependencies = [
  "cc",
+ "cmake",
  "libc",
 ]
 
@@ -3455,7 +3456,7 @@ dependencies = [
 name = "limbo_completion"
 version = "0.8.0"
 dependencies = [
- "mimalloc",
+ "mimalloc-safe",
  "turso_ext",
 ]
 
@@ -3466,7 +3467,7 @@ dependencies = [
  "blake3",
  "data-encoding",
  "md5 0.7.0",
- "mimalloc",
+ "mimalloc-safe",
  "ring",
  "turso_ext",
  "urlencoding",
@@ -3477,7 +3478,7 @@ name = "limbo_csv"
 version = "0.8.0"
 dependencies = [
  "csv",
- "mimalloc",
+ "mimalloc-safe",
  "tempfile",
  "turso_ext",
 ]
@@ -3486,7 +3487,7 @@ dependencies = [
 name = "limbo_fuzzy"
 version = "0.8.0"
 dependencies = [
- "mimalloc",
+ "mimalloc-safe",
  "turso_ext",
 ]
 
@@ -3495,7 +3496,7 @@ name = "limbo_ipaddr"
 version = "0.8.0"
 dependencies = [
  "ipnetwork",
- "mimalloc",
+ "mimalloc-safe",
  "turso_ext",
 ]
 
@@ -3503,7 +3504,7 @@ dependencies = [
 name = "limbo_regexp"
 version = "0.8.0"
 dependencies = [
- "mimalloc",
+ "mimalloc-safe",
  "regex",
  "turso_ext",
 ]
@@ -3832,12 +3833,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimalloc"
-version = "0.1.47"
+name = "mimalloc-safe"
+version = "0.1.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
+checksum = "7f9fd5a18b7a9c72d89d0e906a9d5b93c330c159e9d5072c858e4631f0bd0ada"
 dependencies = [
- "libmimalloc-sys",
+ "libmimalloc-sys2",
 ]
 
 [[package]]
@@ -7017,7 +7018,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "mimalloc",
+ "mimalloc-safe",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "reqwest",
@@ -7093,7 +7094,7 @@ dependencies = [
  "libc",
  "limbo_completion",
  "miette",
- "mimalloc",
+ "mimalloc-safe",
  "nu-ansi-term",
  "prost 0.14.1",
  "rand 0.8.6",
@@ -7161,7 +7162,7 @@ dependencies = [
  "loom",
  "memory-stats",
  "miette",
- "mimalloc",
+ "mimalloc-safe",
  "num-bigint 0.4.6",
  "num-traits",
  "pack1",
@@ -7223,7 +7224,7 @@ dependencies = [
  "env_logger",
  "lazy_static",
  "log",
- "mimalloc",
+ "mimalloc-safe",
  "turso_ext",
 ]
 
@@ -7552,7 +7553,7 @@ dependencies = [
  "itertools 0.14.0",
  "libc",
  "limbo_completion",
- "mimalloc",
+ "mimalloc-safe",
  "nu-ansi-term",
  "rustyline",
  "schemars 0.8.22",

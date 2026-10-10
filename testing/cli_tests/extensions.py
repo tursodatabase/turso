@@ -943,6 +943,30 @@ def cleanup():
         os.remove("testing/system/vfs.db-wal")
 
 
+def test_extension_uses_the_host_allocator():
+    ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
+    console.info(f"Running test_extension_uses_the_host_allocator for {ext_path}")
+    script = "\n".join(
+        [
+            f".load {ext_path}",
+            "CREATE VIRTUAL TABLE t USING kv_store;",
+            "INSERT INTO t VALUES ('hello', 'world');",
+            "SELECT value FROM t WHERE key = 'hello';",
+        ]
+    )
+    exe = os.environ.get("SQLITE_EXEC", sqlite_exec)
+    result = subprocess.run(
+        [exe, ":memory:"], input=script, capture_output=True, text=True
+    )
+    assert result.returncode == 0, f"shell exited with {result.returncode}: {result.stderr}"
+    assert result.stdout.strip() == "world", f"unexpected output: {result.stdout!r}"
+    # The host and a dynamically loaded extension were linked separately, so each of
+    # them got its own copy of the allocator, and a copy only frees what it handed out
+    # itself. Loading the extension has to give it the host's allocator, otherwise
+    # mimalloc reports every pointer that crosses the boundary here.
+    assert "mimalloc" not in result.stderr, f"invalid free reported: {result.stderr}"
+
+
 def test_tablestats():
     ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
     turso = TestTursoShell(use_testing_db=True)
@@ -1060,6 +1084,7 @@ def main():
         test_vfs()
         test_sqlite_vfs_compat()
         test_kv()
+        test_extension_uses_the_host_allocator()
         test_csv()
         test_tablestats()
         test_fuzzy()
