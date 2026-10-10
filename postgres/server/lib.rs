@@ -557,6 +557,11 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
+        // float4 values are stored as doubles that were rounded to single
+        // precision; print them with single precision so 0.1 shows as 0.1.
+        Value::Numeric(turso_core::Numeric::Float(f)) if *pg_type == Type::FLOAT4 => encoder
+            .encode_field(&(f64::from(*f) as f32))
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
@@ -604,8 +609,10 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
@@ -864,6 +871,7 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
+        assert_eq!(sqlite_type_to_pg_type("float4"), Type::FLOAT4);
         assert_eq!(sqlite_type_to_pg_type("TEXT"), Type::TEXT);
         assert_eq!(sqlite_type_to_pg_type("BLOB"), Type::BYTEA);
         assert_eq!(sqlite_type_to_pg_type("BOOLEAN"), Type::BOOL);

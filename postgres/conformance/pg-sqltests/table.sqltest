@@ -167,3 +167,24 @@ test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
 expect error {}
+
+test table-real-column-rounds-to-single-precision {
+    CREATE TABLE t (a real, b float4, c double precision);
+    INSERT INTO t VALUES (1.0/3, 0.1, 1.0/3);
+    SELECT a, b, b::float8, c FROM t;
+}
+expect {
+    0.33333334|0.1|0.10000000149011612|0.3333333333333333
+}
+
+test table-real-cast-rounds-to-single-precision {
+    SELECT (1.0/3)::real, CAST(1.0/3 AS float4), 0.1::real::float8, float4(0.1)::float8;
+}
+expect {
+    0.33333334|0.33333334|0.10000000149011612|0.10000000149011612
+}
+
+test table-real-cast-out-of-range {
+    SELECT 1e300::real;
+}
+expect error {}

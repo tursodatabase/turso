@@ -11067,6 +11067,46 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::Float4Encode => {
+                check_arg_count!(arg_count, 1);
+                let double = match state.registers[*start_reg].get_value() {
+                    Value::Null => None,
+                    Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+                    Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+                    Value::Text(t) => Some(t.value.trim().parse::<f64>().map_err(|_| {
+                        LimboError::Constraint(format!(
+                            "invalid input syntax for type real: \"{}\"",
+                            t.value
+                        ))
+                    })?),
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input syntax for type real: \"{other}\""
+                        ))
+                        .into());
+                    }
+                };
+                let result = match double {
+                    None => Value::Null,
+                    Some(double) => {
+                        let single = double as f32;
+                        if single.is_infinite() && double.is_finite() {
+                            return Err(LimboError::Constraint(
+                                "value out of range: overflow".to_string(),
+                            )
+                            .into());
+                        }
+                        if single == 0.0 && double != 0.0 {
+                            return Err(LimboError::Constraint(
+                                "value out of range: underflow".to_string(),
+                            )
+                            .into());
+                        }
+                        Value::from_f64(f64::from(single))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::NumericEncode => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];

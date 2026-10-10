@@ -112,8 +112,8 @@ implemented.
 
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
-smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
-cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
+smallint, bigint, real/float4, uuid, date, time, timestamp[tz], bytea, json,
+jsonb, inet, cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
 numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.

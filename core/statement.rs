@@ -94,7 +94,9 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. A CAST to a
+/// non-parametric `CREATE TYPE` / `CREATE DOMAIN` is reported like a column of
+/// that type. When neither path
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`
@@ -1308,25 +1310,13 @@ impl Statement {
                 .resolve_type(&declared_name, table_ref.is_strict())
                 .ok()
                 .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
+            // A column whose declared name does not appear in the type
+            // registry is a Builtin.
             let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
+                Some(resolved) => (
+                    Some(resolved.primitive.to_uppercase()),
+                    custom_type_kind(&resolved),
+                ),
                 None => (None, ColumnTypeKind::Builtin),
             };
             drop(schema);
@@ -1336,6 +1326,29 @@ impl Statement {
                 base_type,
                 kind,
             }));
+        }
+        // A CAST to a custom type runs the type's ENCODE, so the result has
+        // that type. Parametric types cast without parameters (e.g.
+        // `CAST(x AS varchar)`) fall back to a plain CAST and are skipped.
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } = &column.expr
+        {
+            let schema = self.program.connection.schema.read();
+            if let Some(resolved) = schema
+                .resolve_type_unchecked(&type_name.name)
+                .ok()
+                .flatten()
+                .filter(|resolved| resolved.leaf().user_params().next().is_none())
+            {
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name: type_name.name.clone(),
+                    array_dimensions: type_name.array_dimensions,
+                    base_type: Some(resolved.primitive.to_uppercase()),
+                    kind: custom_type_kind(&resolved),
+                }));
+            }
         }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
@@ -1740,6 +1753,22 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+/// STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged separately
+/// on `TypeDef.is_domain`, and anything else registered through CREATE TYPE is
+/// a Custom.
+fn custom_type_kind(resolved: &crate::schema::ResolvedType) -> ColumnTypeKind {
+    let leaf = resolved.leaf();
+    if leaf.is_struct() {
+        ColumnTypeKind::Struct
+    } else if leaf.is_union() {
+        ColumnTypeKind::Union
+    } else if leaf.is_domain {
+        ColumnTypeKind::Domain
+    } else {
+        ColumnTypeKind::Custom
     }
 }
 

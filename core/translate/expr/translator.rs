@@ -1922,6 +1922,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::BooleanToInt
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
+                | ScalarFunc::Float4Encode
                 | ScalarFunc::NumericEncode
                 | ScalarFunc::NumericDecode
                 | ScalarFunc::NumericAdd

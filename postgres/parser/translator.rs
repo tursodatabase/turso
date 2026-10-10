@@ -3189,7 +3189,8 @@ impl PostgreSQLTranslator {
 
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
+            "FLOAT8" => Some("REAL"),
+            "FLOAT4" => Some("float4"),
             "INT4" | "INT2" | "INT8" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
@@ -4167,6 +4168,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "BOOLEAN" | "BOOL" => "boolean".into(),
         "SMALLINT" | "INT2" => "smallint".into(),
         "BIGINT" | "INT8" => "bigint".into(),
+        "REAL" | "FLOAT4" => "float4".into(),
         "UUID" => "uuid".into(),
         "DATE" => "date".into(),
         "TIME" | "TIMETZ" => "time".into(),
@@ -4195,7 +4197,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // Base types (no Turso custom type needed)
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -4321,7 +4323,8 @@ fn translate_create_enum(
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
+/// Maps PG types to their base SQLite storage types, or to a Turso custom type
+/// when the cast must change the value (e.g. `float4` rounds to single precision).
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
@@ -4341,9 +4344,8 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
         | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "REAL" | "FLOAT4" => "float4",
+        "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
@@ -5011,12 +5013,14 @@ mod tests {
         // Base types (no Turso custom type)
         assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
         assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type("DOUBLE PRECISION", no_params), Some(s("REAL")));
         assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
         assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
 
         // Turso custom type equivalents
         assert_eq!(map_pg_type("BOOLEAN", no_params), Some(s("boolean")));
+        assert_eq!(map_pg_type("REAL", no_params), Some(s("float4")));
+        assert_eq!(map_pg_type("FLOAT4", no_params), Some(s("float4")));
         assert_eq!(map_pg_type("SMALLINT", no_params), Some(s("smallint")));
         assert_eq!(map_pg_type("BIGINT", no_params), Some(s("bigint")));
         assert_eq!(map_pg_type("UUID", no_params), Some(s("uuid")));
