@@ -294,7 +294,7 @@ impl BackingStore {
                         .try_get_table_id_from_root_page_at(index.root_page, snapshot_ts)
                         .ok_or(LimboError::SchemaUpdated)?
                 } else {
-                    mv_store.get_table_id_from_root_page_at(index.root_page, snapshot_ts)
+                    mv_store.get_table_id_from_root_page_at(index.root_page, snapshot_ts)?
                 };
                 Some(BackingStoreMvccBinding {
                     mv_store,

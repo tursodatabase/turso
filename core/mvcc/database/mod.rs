@@ -4637,9 +4637,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.
-    /// Equivalent to `get_table_id_from_root_page_at(root_page, u64::MAX)`.
+    /// Panics if a positive root page has no live binding.
     pub fn get_table_id_from_root_page(&self, root_page: i64) -> MVTableId {
-        self.get_table_id_from_root_page_at(root_page, u64::MAX)
+        self.try_get_table_id_from_root_page_at(root_page, u64::MAX)
+            .unwrap_or_else(|| {
+                panic!("Positive root page is not mapped to a table id: {root_page}")
+            })
     }
 
     /// Get the table ID for `root_page` as seen by a transaction at `snapshot_ts`.
@@ -4657,10 +4660,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Whether the btree should actually be read at the snapshot is decided separately by
     /// `is_btree_allocated_at` / `resolve_root_page_at`, which do gate on
     /// `begin`. `u64::MAX` resolves the current live owner.
-    pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
+    pub fn get_table_id_from_root_page_at(
+        &self,
+        root_page: i64,
+        snapshot_ts: u64,
+    ) -> Result<MVTableId> {
         self.try_get_table_id_from_root_page_at(root_page, snapshot_ts)
-            .unwrap_or_else(|| {
-                panic!("Positive root page is not mapped to a table id: {root_page}")
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "Positive root page is not mapped to a table id: {root_page}"
+                ))
             })
     }
 

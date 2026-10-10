@@ -616,7 +616,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
                 .ok_or(LimboError::SchemaUpdated)?
         } else {
-            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
+            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)?
         };
         Ok(Self {
             db,
