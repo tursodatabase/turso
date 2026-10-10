@@ -2086,10 +2086,8 @@ mod tests {
         let mut found_alias = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(stmt) = generate_update(&generator, &mut ctx)
-                && let Sql::Update(update) = stmt
-            {
-                let sql = update.to_string();
+            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
+                let sql = stmt.to_string();
                 if sql.contains(" FROM ") && sql.contains(" AS t") {
                     found_alias = true;
                     break;
