@@ -25,14 +25,14 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
-    EXPR_INDEX_SENTINEL,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
+    Table, EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
-    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
     insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
@@ -2130,6 +2130,36 @@ pub(crate) fn emit_index_column_value_old_image(
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
     Ok(())
+}
+
+/// Emit code that evaluates a partial index's WHERE for the row under the table
+/// cursor, and return the register that holds the result. Return None for an
+/// index without a WHERE. The columns are read from the table cursor because it
+/// can be on a different row than a scan cursor, e.g. the row that REPLACE deletes.
+pub(crate) fn emit_partial_index_where_old_image(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    table_cursor_id: usize,
+    table_internal_id: TableInternalId,
+    index: &Index,
+) -> Result<Option<usize>> {
+    let Some(where_clause) = index.bind_where_expr(Some(table_references), resolver)? else {
+        return Ok(None);
+    };
+    let result_reg = program.alloc_register();
+    let table_cursor = [(CursorKey::table(table_internal_id), table_cursor_id)];
+    program.with_cursor_overrides(&table_cursor, |program| {
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &where_clause,
+            result_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )
+    })?;
+    Ok(Some(result_reg))
 }
 
 fn generated_column(

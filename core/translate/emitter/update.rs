@@ -19,8 +19,9 @@ use crate::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
-            OperationMode, Resolver, UpdateRowSource,
+            emit_index_column_value_old_image, emit_make_record,
+            emit_partial_index_where_old_image, emit_program_for_select, OperationMode, Resolver,
+            UpdateRowSource,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
@@ -454,7 +455,6 @@ pub fn emit_program_for_update(
         &all_index_cursors,
         target_table_cursor_id,
         target_table,
-        resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
     )?;
@@ -721,6 +721,23 @@ fn emit_replace_delete<'a>(
     };
 
     for (other_index, other_idx_cursor_id) in all_index_cursors {
+        let skip_delete_label = emit_partial_index_where_old_image(
+            program,
+            &t_ctx.resolver,
+            table_references,
+            target_table_cursor_id,
+            internal_id,
+            other_index,
+        )?
+        .map(|where_reg| {
+            let label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: where_reg,
+                target_pc: label,
+                jump_if_null: true,
+            });
+            label
+        });
         let other_num_regs = other_index.columns.len() + 1;
         let other_start_reg = program.alloc_registers(other_num_regs);
 
@@ -746,8 +763,11 @@ fn emit_replace_delete<'a>(
             start_reg: other_start_reg,
             num_regs: other_num_regs,
             cursor_id: *other_idx_cursor_id,
-            raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
+        if let Some(label) = skip_delete_label {
+            program.preassign_label_to_next_insn(label);
+        }
     }
 
     program.emit_insn(Insn::Delete {
@@ -1075,7 +1095,6 @@ fn emit_update_insns<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
@@ -1817,20 +1836,15 @@ fn emit_update_insns<'a>(
     let mut seen_replace = false;
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         let (old_satisfies_where, new_satisfies_where) = if index.where_clause.is_some() {
-            // This means that we need to bind the column references to a copy of the index Expr,
-            // so we can emit Insn::Column instructions and refer to the old values.
-            let where_clause = index
-                .bind_where_expr(Some(table_references), resolver)?
-                .expect("index.where_clause was checked to be Some above");
-            let old_satisfied_reg = program.alloc_register();
-            translate_expr_no_constant_opt(
+            let old_satisfied_reg = emit_partial_index_where_old_image(
                 program,
-                Some(table_references),
-                &where_clause,
-                old_satisfied_reg,
                 &t_ctx.resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+                table_references,
+                target_table_cursor_id,
+                internal_id,
+                index,
+            )?
+            .expect("index.where_clause was checked to be Some above");
 
             // Evaluate the partial index predicate against the NEW row image.
             // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
