@@ -1,0 +1,24 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/9069
+# The `before` record of an upsert (INSERT ... ON CONFLICT DO UPDATE) must hold
+# the row as it was before the update, not the new value.
+
+test cdc-upsert-before-record-holds-old-value {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, value ANY) STRICT;
+    PRAGMA capture_data_changes_conn('full');
+    INSERT INTO t VALUES (1, '000123');
+    UPDATE t SET value = '1.5' WHERE id = 1;
+    INSERT INTO t VALUES (1, '000456')
+    ON CONFLICT(id) DO UPDATE SET value = excluded.value;
+    SELECT change_type,
+           bin_record_json_object('["id","value"]', before),
+           bin_record_json_object('["id","value"]', after)
+    FROM turso_cdc
+    WHERE table_name = 't' AND change_type = 0
+    ORDER BY change_id;
+}
+expect {
+    0|{"id":1,"value":"000123"}|{"id":1,"value":"1.5"}
+    0|{"id":1,"value":"1.5"}|{"id":1,"value":"000456"}
+}
