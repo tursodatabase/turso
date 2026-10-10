@@ -108,7 +108,10 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
                 .strip_prefix("X'")
                 .or_else(|| token.strip_prefix("x'"))
             {
-                elements.push(Value::Blob(hex::decode(hex.strip_suffix('\'')?).ok()?));
+                let hex = hex.strip_suffix('\'')?;
+                let mut bytes = crate::alloc::vec![0; hex.len() / 2];
+                hex::decode_to_slice(hex, &mut bytes).ok()?;
+                elements.push(Value::Blob(bytes));
             } else if let Ok(i) = token.parse::<i64>() {
                 elements.push(Value::from_i64(i));
             } else if let Ok(f) = token.parse::<f64>() {
@@ -648,6 +651,7 @@ pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoIteratorExt;
 
     #[test]
     fn test_parse_text_array_multibyte_utf8() {
@@ -923,8 +927,12 @@ mod tests {
     #[test]
     fn test_array_blob_roundtrip() {
         assert_array_roundtrip(&[
-            Value::Blob(vec![]),
-            Value::Blob((0..=255).collect()),
+            Value::Blob(crate::alloc::vec![]),
+            Value::Blob(
+                (0..=255)
+                    .try_collect()
+                    .expect("blob allocation must succeed"),
+            ),
             values_to_record_blob(&[Value::build_text("001"), Value::Null])
                 .expect("nested array must encode"),
         ]);
@@ -970,8 +978,8 @@ mod tests {
         assert_eq!(
             parse_text_array(r#"{X'',x'00fF',"X'00FF'",NULL}"#),
             Some(vec![
-                Value::Blob(vec![]),
-                Value::Blob(vec![0, 255]),
+                Value::Blob(crate::alloc::vec![]),
+                Value::Blob(crate::alloc::vec![0, 255]),
                 Value::build_text("X'00FF'"),
                 Value::Null,
             ])
@@ -1002,7 +1010,12 @@ mod tests {
                             .map(|_| char::from_u32(rng.random_range(0..0x110000)).unwrap_or('\0'))
                             .collect::<String>(),
                     ),
-                    _ => Value::Blob((0..rng.random_range(0..32)).map(|_| rng.random()).collect()),
+                    _ => Value::Blob(
+                        (0..rng.random_range(0..32))
+                            .map(|_| rng.random())
+                            .try_collect()
+                            .expect("blob allocation must succeed"),
+                    ),
                 })
                 .collect();
             assert_array_roundtrip(&values);
