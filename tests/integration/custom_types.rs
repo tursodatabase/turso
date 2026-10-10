@@ -497,4 +497,96 @@ mod tests {
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
     }
+
+    /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
+    /// registered in the connection schema before the type SQL is parsed, and the rollback
+    /// restores that schema only when the schema cookie was set beforehand.
+    #[test]
+    fn test_failed_create_type_leaves_no_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            // 257 variants: the type SQL is persisted first and rejected only when the type
+            // itself is added to the schema
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                !tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE left the types table in the schema (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The connection must still be usable: a later CREATE TYPE has to succeed
+            conn.execute("CREATE TYPE t2 BASE text").unwrap();
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "CREATE TYPE did not register the types table (mvcc={mvcc}): {tables:?}"
+            );
+            conn.close().unwrap();
+        }
+    }
+
+    /// The other half of the same invariant: when the types table already exists, a failed
+    /// `CREATE TYPE` must leave it in place, and leave the connection usable.
+    #[test]
+    fn test_failed_create_type_keeps_an_existing_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            conn.execute("CREATE TYPE type_one BASE text").unwrap();
+
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE dropped the existing types table (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The failed type must not be persisted, and the connection must still be usable
+            conn.execute("CREATE TYPE type_two BASE text").unwrap();
+            let types: Vec<(String,)> =
+                conn.exec_rows("SELECT name FROM __turso_internal_types ORDER BY name");
+            assert_eq!(
+                types,
+                vec![("type_one".to_string(),), ("type_two".to_string(),)],
+                "mvcc={mvcc}"
+            );
+            conn.close().unwrap();
+        }
+    }
 }
