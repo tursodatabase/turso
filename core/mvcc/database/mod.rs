@@ -7054,22 +7054,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             tx.state.load(),
             TransactionState::Active | TransactionState::Preparing(_)
         ));
-        tx.state.store(TransactionState::Aborted);
-        tracing::trace!("abort(tx_id={})", tx_id);
-        self.unlock_commit_lock_if_held(tx);
-
         // Hekaton Section 3.3: "If it aborted, it forces the dependent transactions
         // to also abort by setting their AbortNow flags."
-        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        let mut dep_set = tx.commit_dep_set.lock();
+        let dependents = std::mem::take(&mut *dep_set);
         // a txn cannot depend on itself
         turso_assert!(
             !dependents.contains(&tx_id),
             "rollback_tx: transaction has itself in its own commit_dep_set"
         );
+        for dep_tx_id in &dependents {
+            if let Some(dep_tx_entry) = self.txs.get(dep_tx_id) {
+                let dep_tx = dep_tx_entry.value();
+                dep_tx.abort_now.store(true, Ordering::Release);
+            }
+        }
+        tx.state.store(TransactionState::Aborted);
+        drop(dep_set);
+        tracing::trace!("abort(tx_id={})", tx_id);
+        self.unlock_commit_lock_if_held(tx);
+
         for dep_tx_id in dependents {
             if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
                 let dep_tx = dep_tx_entry.value();
-                dep_tx.abort_now.store(true, Ordering::Release);
                 dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
             }
         }

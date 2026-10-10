@@ -972,3 +972,109 @@ impl Scheduler for RunUntilYieldScheduler {
         0
     }
 }
+
+#[test]
+fn shuttle_fts_aborted_writer_does_not_report_corruption() {
+    let scheduler = PctScheduler::new_from_seed(2735639250783491977, 3, 50);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(fts_aborted_writer_scenario()));
+}
+
+async fn fts_aborted_writer_scenario() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Builder::new_local(dir.path().join("fts.db").to_str().unwrap())
+        .with_io("memory_yield")
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let setup = db.connect().unwrap();
+    let mut rows = setup
+        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+    setup
+        .execute_batch(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);
+         CREATE INDEX idx ON docs USING fts(body);
+         CREATE TABLE padding(id INTEGER PRIMARY KEY);
+         INSERT INTO docs VALUES (1, 'alpha');
+         PRAGMA mvcc_checkpoint_threshold = -1;",
+        )
+        .await
+        .unwrap();
+
+    let ready = Arc::new(Barrier::new(2));
+    let start = Arc::new(Barrier::new(2));
+    let writer_handle = {
+        let ready = ready.clone();
+        let start = start.clone();
+        let db = db.clone();
+        turso_stress::future::spawn(async move {
+            let writer = db.connect().unwrap();
+            writer.execute("BEGIN CONCURRENT", ()).await.unwrap();
+            let docs = (2..=201)
+                .map(|id| format!("({id}, 'bravo')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer
+                .execute(&format!("INSERT INTO docs VALUES {docs}"), ())
+                .await
+                .unwrap();
+            let values = (1..=1025)
+                .map(|id| format!("({id})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer
+                .execute(&format!("INSERT INTO padding VALUES {values}"), ())
+                .await
+                .unwrap();
+            let mut statement = writer.prepare("COMMIT").await.unwrap();
+            let mut commit = Box::pin(statement.execute(()));
+            std::future::poll_fn(|cx| match commit.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("commit finished before the reader started: {result:?}")
+                }
+            })
+            .await;
+            ready.wait();
+            start.wait();
+            shuttle::thread::yield_now();
+            drop(commit);
+            drop(statement);
+        })
+    };
+
+    ready.wait();
+    let probe = db.connect().unwrap();
+    probe.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    assert_eq!(
+        query_i64(&probe, "SELECT count(*) FROM docs WHERE id = 2").await,
+        1
+    );
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    let mut optimize = reader.prepare("OPTIMIZE INDEX idx").await.unwrap();
+    start.wait();
+    let result = optimize.execute(()).await;
+    writer_handle.await.unwrap();
+    let mut rows = probe
+        .query("SELECT count(*) FROM docs WHERE id = 2", ())
+        .await
+        .unwrap();
+    let counted = rows.next().await;
+    assert!(
+        matches!(&counted, Err(turso::Error::BusySnapshot(message)) if message.starts_with("Commit dependency aborted")),
+        "a reader of the aborted writer returned {counted:?}"
+    );
+    assert!(
+        matches!(result, Ok(_) | Err(turso::Error::BusySnapshot(_))),
+        "FTS returned an unexpected error after a writer aborted: {result:?}"
+    );
+}
