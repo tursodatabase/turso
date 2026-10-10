@@ -1222,6 +1222,7 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // tests need them.
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
@@ -1477,7 +1478,7 @@ fn wire_cast_reports_target_type() {
         );
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
-            vec![OID_FLOAT8]
+            vec![OID_FLOAT4]
         );
     });
 }
@@ -1491,7 +1492,7 @@ fn wire_table_columns_report_declared_type() {
         c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
         assert_eq!(
             c.query_column_oids("SELECT id, label, score FROM t"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+            vec![OID_INT4, OID_TEXT, OID_FLOAT4]
         );
     });
 }
