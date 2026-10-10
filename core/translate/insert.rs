@@ -1760,7 +1760,12 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: table_name_reg,
+        extra_amount: 0,
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
@@ -3427,7 +3432,7 @@ fn ensure_sequence_initialized(
         rhs: name_col_reg,
         target_pc: entry_exists_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
     });
 
     program.emit_insn(Insn::Next {
