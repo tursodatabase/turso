@@ -1619,6 +1619,13 @@ expect {
     2.042747795102219097e+05
 }
 
+test quote-float-scientific-zero-exponent {
+    SELECT quote(pi()), quote(-10 / 3.0)
+}
+expect {
+    3.141592653589793116e+00|-3.333333333333333482e+00
+}
+
 # Regression: QUOTE() should return TEXT type for floats, not REAL
 test quote-float-typeof {
     SELECT typeof(quote(12.34))
