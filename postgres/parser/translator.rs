@@ -1826,6 +1826,17 @@ impl PostgreSQLTranslator {
         &self,
         range_func: &pg_query::protobuf::RangeFunction,
     ) -> Result<ast::SelectTable, ParseError> {
+        if range_func.ordinality {
+            return Err(ParseError::ParseError(
+                "WITH ORDINALITY is not supported".into(),
+            ));
+        }
+        if range_func.functions.len() > 1 {
+            return Err(ParseError::ParseError(
+                "ROWS FROM with more than one function is not supported".into(),
+            ));
+        }
+
         // RangeFunction.functions is a list of function-call items.
         // Each item is a List node whose first element is the FuncCall.
         let func_item = range_func
@@ -7525,5 +7536,39 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+    #[test]
+    fn test_function_in_from_rejects_options_that_change_the_result() {
+        let translator = PostgreSQLTranslator::new();
+        let cases = [
+            (
+                "SELECT * FROM generate_series(10, 12) WITH ORDINALITY AS g(v, n)",
+                "WITH ORDINALITY",
+            ),
+            (
+                "SELECT * FROM generate_series(10, 12) WITH ORDINALITY",
+                "WITH ORDINALITY",
+            ),
+            (
+                "SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(5, 7)) AS r(p, q)",
+                "ROWS FROM",
+            ),
+        ];
+        for (sql, expected) in cases {
+            let parse_result = crate::parse(sql).unwrap();
+            let err = translator.translate(&parse_result).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected} rejection for {sql}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rows_from_with_one_function_is_translated() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM ROWS FROM (generate_series(1, 3)) AS r(p)";
+        let parse_result = crate::parse(sql).unwrap();
+        translator.translate(&parse_result).unwrap();
     }
 }
