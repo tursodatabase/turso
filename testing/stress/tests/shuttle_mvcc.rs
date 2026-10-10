@@ -1058,13 +1058,21 @@ async fn fts_aborted_writer_scenario() {
         query_i64(&probe, "SELECT count(*) FROM docs WHERE id = 2").await,
         1
     );
-    drop(probe);
     let reader = db.connect().unwrap();
     reader.execute("BEGIN CONCURRENT", ()).await.unwrap();
     let mut optimize = reader.prepare("OPTIMIZE INDEX idx").await.unwrap();
     start.wait();
     let result = optimize.execute(()).await;
     writer_handle.await.unwrap();
+    let mut rows = probe
+        .query("SELECT count(*) FROM docs WHERE id = 2", ())
+        .await
+        .unwrap();
+    let counted = rows.next().await;
+    assert!(
+        matches!(&counted, Err(turso::Error::BusySnapshot(message)) if message.starts_with("Commit dependency aborted")),
+        "a reader of the aborted writer returned {counted:?}"
+    );
     assert!(
         matches!(result, Ok(_) | Err(turso::Error::BusySnapshot(_))),
         "FTS returned an unexpected error after a writer aborted: {result:?}"
