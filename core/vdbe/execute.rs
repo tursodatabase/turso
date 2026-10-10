@@ -14331,7 +14331,22 @@ pub fn op_drop_sequence(
 ) -> InsnResult {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
+        // In MVCC mode, track the backing table's root page so integrity_check knows about it.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs
+        // to include them to avoid "page never used" false positives.
+        if is_mvcc {
+            let backing_table_name =
+                crate::translate::sequence::sequence_backing_table_name(seq_name);
+            let root_page = schema
+                .get_btree_table(&backing_table_name)
+                .expect("DROP SEQUENCE: backing table must exist in schema")
+                .root_page;
+            if root_page > 0 {
+                schema.dropped_root_pages.insert(root_page);
+            }
+        }
         schema.remove_sequence(seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
