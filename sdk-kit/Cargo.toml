@@ -40,3 +40,4 @@ tempfile = { workspace = true }
 
 [build-dependencies]
 bindgen = "0.69.5"
+find-msvc-tools = "0.1.9"
