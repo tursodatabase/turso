@@ -73,6 +73,10 @@ impl FixedYieldInjector {
     fn remaining_len(&self) -> usize {
         self.remaining.lock().len()
     }
+
+    fn has_yielded_at(&self, point: YieldPoint) -> bool {
+        !self.remaining.lock().contains(&point)
+    }
 }
 
 impl YieldInjector for FixedYieldInjector {
@@ -1139,19 +1143,10 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
         },
     );
 
-    let mut reached_tail = false;
-    for _ in 0..50_000 {
-        match checkpoint_sm.state_for_test() {
-            CheckpointState::TruncateLogicalLog
-            | CheckpointState::FsyncLogicalLog
-            | CheckpointState::TruncateWal
-            | CheckpointState::GcTableRows { .. }
-            | CheckpointState::GcIndexRows { .. } => {
-                reached_tail = true;
-                break;
-            }
-            _ => {}
-        }
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforeTruncateLogicalLog.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    while !injector.is_empty() {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -1160,10 +1155,6 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
             }
         }
     }
-    assert!(
-        reached_tail,
-        "passive checkpoint must reach the post-backfill tail with frames to backfill"
-    );
 
     {
         let database = db.get_db();
@@ -2924,29 +2915,15 @@ fn test_checkpoint_truncates_wal_last() {
         },
     );
 
-    let mut saw_truncate_log_state_with_wal = false;
+    let before_truncate_log = CheckpointYieldPoint::BeforeTruncateLogicalLog.point();
+    let before_truncate_wal = CheckpointYieldPoint::BeforeTruncateWal.point();
+    let injector = FixedYieldInjector::new([before_truncate_log, before_truncate_wal]);
+    conn.set_yield_injector(Some(injector.clone()));
+
+    let mut saw_truncate_log_point_with_wal = false;
+    let mut saw_truncate_wal_point = false;
     let mut finished = false;
     for _ in 0..50_000 {
-        let state = checkpoint_sm.state_for_test();
-
-        if state == CheckpointState::TruncateLogicalLog {
-            let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
-            assert!(wal_len > 0, "WAL must still exist before log truncation");
-            saw_truncate_log_state_with_wal = true;
-        }
-
-        if state == CheckpointState::TruncateWal {
-            assert!(
-                saw_truncate_log_state_with_wal,
-                "must truncate logical log before truncating WAL"
-            );
-            assert_eq!(
-                mvcc_store.get_logical_log_file().size().unwrap(),
-                0,
-                "logical log should be truncated to 0"
-            );
-        }
-
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -2955,10 +2932,30 @@ fn test_checkpoint_truncates_wal_last() {
                 break;
             }
         }
+
+        if !saw_truncate_log_point_with_wal && injector.has_yielded_at(before_truncate_log) {
+            let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+            assert!(wal_len > 0, "WAL must still exist before log truncation");
+            saw_truncate_log_point_with_wal = true;
+        }
+
+        if !saw_truncate_wal_point && injector.has_yielded_at(before_truncate_wal) {
+            assert!(
+                saw_truncate_log_point_with_wal,
+                "must truncate logical log before truncating WAL"
+            );
+            assert_eq!(
+                mvcc_store.get_logical_log_file().size().unwrap(),
+                0,
+                "logical log should be truncated to 0"
+            );
+            saw_truncate_wal_point = true;
+        }
     }
 
     assert!(finished, "checkpoint state machine did not finish");
-    assert!(saw_truncate_log_state_with_wal);
+    assert!(saw_truncate_log_point_with_wal);
+    assert!(saw_truncate_wal_point);
 
     let final_wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
     assert_eq!(final_wal_len, 0);
@@ -2967,6 +2964,51 @@ fn test_checkpoint_truncates_wal_last() {
         0,
         "logical log should be truncated to 0 after checkpoint"
     );
+}
+
+/// What this test checks: a checkpoint of 10 rows and a checkpoint of 200 rows never return `Continue`.
+/// Why this matters: each `Continue` goes back to the caller, so a step per row or per phase slows down every checkpoint.
+#[test]
+fn test_checkpoint_never_returns_continue() {
+    fn checkpoint_continue_steps(row_count: usize) -> usize {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..row_count {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+
+        let pager = conn.pager.load().clone();
+        let mut checkpoint_sm = CheckpointStateMachine::new(
+            pager.clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        let mut continue_steps = 0;
+        loop {
+            match checkpoint_sm.step(&()).unwrap() {
+                TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+                TransitionResult::Continue => continue_steps += 1,
+                TransitionResult::Done(_) => return continue_steps,
+            }
+        }
+    }
+
+    assert_eq!(checkpoint_continue_steps(10), 0);
+    assert_eq!(checkpoint_continue_steps(200), 0);
 }
 
 /// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
@@ -3110,7 +3152,9 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         },
     );
 
-    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    while !injector.is_empty() {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -3964,10 +4008,10 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             },
         );
 
-        for _ in 0..50_000 {
-            if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
-                break;
-            }
+        let injector =
+            FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        while !injector.is_empty() {
             match checkpoint_sm.step(&()).unwrap() {
                 TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
                 TransitionResult::Continue => {}
@@ -4754,12 +4798,11 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
             upper_bound_inclusive: None,
         },
     );
-    let mut reached_truncate = false;
-    for _ in 0..50_000 {
-        if checkpoint_sm.state_for_test() == CheckpointState::TruncateLogicalLog {
-            reached_truncate = true;
-            break; // Simulate checkpoint aborting before log truncation
-        }
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforeTruncateLogicalLog.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    // Simulate checkpoint aborting before log truncation
+    while !injector.is_empty() {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -4768,10 +4811,6 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
             }
         }
     }
-    assert!(
-        reached_truncate,
-        "expected to reach TruncateLogicalLog state"
-    );
 
     // Pager commit already succeeded before log truncation.
     // Same-process retries must advance from this durable boundary.
@@ -4881,12 +4920,10 @@ fn test_checkpoint_resamples_boundary_before_starting() {
             upper_bound_inclusive: None,
         },
     );
-    let mut reached_wal_checkpoint = false;
-    for _ in 0..50_000 {
-        if interrupted_checkpoint.state_for_test() == CheckpointState::CheckpointWal {
-            reached_wal_checkpoint = true;
-            break;
-        }
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
+    interrupted_conn.set_yield_injector(Some(injector.clone()));
+    while !injector.is_empty() {
         match interrupted_checkpoint.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(interrupted_pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -4895,10 +4932,6 @@ fn test_checkpoint_resamples_boundary_before_starting() {
             }
         }
     }
-    assert!(
-        reached_wal_checkpoint,
-        "expected checkpoint to reach WAL checkpoint"
-    );
     assert_eq!(
         mvcc_store.durable_txid_max.load(Ordering::SeqCst),
         update_ts

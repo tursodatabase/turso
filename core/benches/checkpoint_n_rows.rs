@@ -1,6 +1,8 @@
 //! One `PRAGMA wal_checkpoint(PASSIVE)` after inserting N rows.
 //! Insert time is not measured. No helper racing writers.
 //!
+//! `mvcc-checkpoint` measures one MVCC checkpoint of N rows and their index entries.
+//!
 //! ```text
 //! cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
 //! CHECKPOINT_N_ROWS_OUT=/path.csv cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
@@ -8,10 +10,10 @@
 //! ```
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, BatchSize, Criterion};
 
 use std::hint::black_box;
 use std::io::Write;
@@ -102,6 +104,26 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_mvcc_checkpoint(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("mvcc-checkpoint");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+    for (mode, passive_checkpoint) in [("truncate", false), ("passive", true)] {
+        let checkpoint_sql = format!("PRAGMA wal_checkpoint({})", mode.to_uppercase());
+        for n in [100, 10_000] {
+            group.bench_function(format!("{mode}/{n}"), |b| {
+                b.iter_batched_ref(
+                    || load_rows(n, passive_checkpoint, true),
+                    |loaded| exec(&loaded.conn, &loaded.db, &checkpoint_sql),
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 fn row_counts() -> Vec<usize> {
     if cfg!(feature = "codspeed") {
         return vec![10_000];
@@ -139,6 +161,10 @@ fn one_checkpoint_ns(n: usize) -> u64 {
 }
 
 fn load_n_rows(n: usize) -> Loaded {
+    load_rows(n, true, false)
+}
+
+fn load_rows(n: usize, passive_checkpoint: bool, indexed: bool) -> Loaded {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("checkpoint_n_rows.db");
     #[allow(clippy::arc_with_non_send_sync)]
@@ -147,7 +173,7 @@ fn load_n_rows(n: usize) -> Loaded {
         io,
         db_path.to_str().unwrap(),
         OpenFlags::default(),
-        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive_checkpoint),
         None,
         Arc::new(SqliteDialect),
     )
@@ -165,6 +191,9 @@ fn load_n_rows(n: usize) -> Loaded {
         &db,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
     );
+    if indexed {
+        exec(&conn, &db, "CREATE INDEX t_v ON t (v)");
+    }
     exec(&conn, &db, "BEGIN CONCURRENT");
     let batch: usize = 1000;
     let mut i = 0usize;
@@ -176,7 +205,8 @@ fn load_n_rows(n: usize) -> Loaded {
             if j > i {
                 sql.push(',');
             }
-            sql.push_str(&format!("({j}, {j})"));
+            let v = if indexed { j * 7919 % 10_007 } else { j };
+            sql.push_str(&format!("({j}, {v})"));
         }
         exec(&conn, &db, &sql);
         i = end;
@@ -226,7 +256,7 @@ fn exec(conn: &Arc<Connection>, db: &Arc<Database>, sql: &str) {
 criterion_group! {
     name = checkpoint_n_rows_benches;
     config = Criterion::default();
-    targets = bench_checkpoint_passive_n_rows
+    targets = bench_checkpoint_passive_n_rows, bench_mvcc_checkpoint
 }
 
 criterion_main!(checkpoint_n_rows_benches);
