@@ -7992,10 +7992,14 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let mut scan = IndexShadowScan::default();
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
-    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(10)));
+    assert!(scan
+        .btree_row_is_valid(store, table_id, reader_id, &idx_key(10))
+        .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
-    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(30)));
+    assert!(scan
+        .btree_row_is_valid(store, table_id, reader_id, &idx_key(30))
+        .unwrap());
 
     let reader = store.txs.get(&reader_id).unwrap();
     assert_eq!(
@@ -11477,6 +11481,60 @@ fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
     }
 
     insert.reset().unwrap();
+}
+
+#[test]
+fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
+    for (begin, end_transaction) in [
+        (None, "INSERT OR ROLLBACK INTO other VALUES (6)"),
+        (Some("BEGIN"), "ROLLBACK"),
+    ] {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO other VALUES (6)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let mut read = conn.prepare("SELECT id FROM t").unwrap();
+        let mut ids = Vec::new();
+        assert!(matches!(read.step().unwrap(), StepResult::Row));
+        ids.push(read.row().unwrap().get::<i64>(0).unwrap());
+        let _ = conn.execute(end_transaction);
+
+        let err = loop {
+            match read.step() {
+                Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+                Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
+                Ok(other) => panic!("{end_transaction}: expected an error, got {other:?}"),
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            matches!(err, LimboError::NoSuchTransactionID(_)),
+            "{end_transaction}: expected NoSuchTransactionID, got {err:?}"
+        );
+        assert_eq!(ids, vec![1, 2], "{end_transaction}");
+        drop(read);
+
+        assert_eq!(
+            get_rows(conn, "SELECT id, v FROM t"),
+            vec![
+                vec![Value::from_i64(1), Value::from_text("a".to_string())],
+                vec![Value::from_i64(2), Value::from_text("b".to_string())],
+                vec![Value::from_i64(3), Value::from_text("z".to_string())],
+            ],
+            "{end_transaction}"
+        );
+    }
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.

@@ -6023,23 +6023,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         versions: &RwLock<RowVersionChain<A>>,
         tx_id: TxID,
-    ) -> bool {
+    ) -> Result<bool> {
         let tx = self
             .txs
             .get(&tx_id)
-            .expect("transaction should exist in txs map");
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         let versions = versions.read();
         if versions.is_empty() {
-            return false;
+            return Ok(false);
         }
         let table_id = versions[0].row.id.table_id;
         if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-            return false;
+            return Ok(false);
         }
-        versions.iter().rev().any(|version| {
+        Ok(versions.iter().rev().any(|version| {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        })
+        }))
     }
 
     /// Check if the B-tree version of a row should be shown to the given transaction.
@@ -6051,7 +6051,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         row_id: &RowKey,
         tx_id: TxID,
-    ) -> bool {
+    ) -> Result<bool> {
         match row_id {
             RowKey::Int(_) => {
                 let row_id_full = RowID {
@@ -6060,7 +6060,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 };
                 let Some(versions) = self.rows.get(&row_id_full) else {
                     // No MVCC version -> B-tree is valid
-                    return true;
+                    return Ok(true);
                 };
                 let versions = versions.value().read();
                 self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
@@ -6068,12 +6068,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             RowKey::Record(record) => {
                 // Dont allocate new SkipList here to avoid introducing concerns around error handling
                 let Some(index_rows) = self.index_rows.get(&table_id) else {
-                    return true;
+                    return Ok(true);
                 };
                 let index_rows = index_rows.value();
                 let Some(versions) = index_rows.get(record.as_ref()) else {
                     // No MVCC version -> B-tree is valid
-                    return true;
+                    return Ok(true);
                 };
                 let versions = versions.value().read();
                 self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
@@ -6086,14 +6086,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         table_id: MVTableId,
         versions: &[RowVersion],
-    ) -> bool {
+    ) -> Result<bool> {
         let tx = self
             .txs
             .get(&tx_id)
-            .expect("transaction should exist in txs map");
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
-            return true;
+            return Ok(true);
         }
 
         // Check if any version invalidates the B-tree row
@@ -6101,7 +6101,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
         });
 
-        !btree_is_invalid
+        Ok(!btree_is_invalid)
     }
 
     fn find_visible_version<'a>(
