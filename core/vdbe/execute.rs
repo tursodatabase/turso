@@ -5595,6 +5595,12 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
+            // A RELEASE that commits the transaction may suspend on I/O inside
+            // op_auto_commit after the savepoint was already removed. On
+            // re-entry, resume that commit instead of looking up the savepoint again.
+            if !matches!(state.commit_state, CommitState::Ready) {
+                return op_auto_commit(program, state, &release_commit_insn(), pager);
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
@@ -5622,11 +5628,7 @@ pub fn op_savepoint(
                         SavepointMirror::Release(name),
                     )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
-                    let auto_commit = Insn::AutoCommit {
-                        auto_commit: true,
-                        rollback: false,
-                    };
-                    return op_auto_commit(program, state, &auto_commit, pager);
+                    return op_auto_commit(program, state, &release_commit_insn(), pager);
                 }
             }
 
@@ -5698,6 +5700,13 @@ pub fn op_savepoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+    }
+}
+
+fn release_commit_insn() -> Insn {
+    Insn::AutoCommit {
+        auto_commit: true,
+        rollback: false,
     }
 }
 
