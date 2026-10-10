@@ -401,6 +401,9 @@ pub(crate) fn emit_user_facing_column_value(
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+        if resolved.chain.iter().all(|td| td.decode().is_none()) {
+            return Ok(());
+        }
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
             reg: dest_reg,
