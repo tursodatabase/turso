@@ -10377,6 +10377,22 @@ fn test_integrity_check_after_drop_index_before_checkpoint() {
 }
 
 #[test]
+fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(data) VALUES ('a')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("DROP TABLE t").unwrap();
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
 fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:interrupted-drop-table-schema-rollback";
