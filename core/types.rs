@@ -3077,29 +3077,10 @@ where
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint(left_packed)?;
+    let (header_size, header_pos) = read_varint(left_packed)?;
     let header_end = header_size as usize;
-    turso_debug_assert!(header_end <= left_packed.len());
-
-    let mut data_pos = header_size as usize;
-
-    // Skip over `skip` number of fields
-    for _ in 0..skip {
-        if header_pos >= header_end {
-            break;
-        }
-
-        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
-        header_pos += bytes_read;
-
-        let serial_type = SerialType::try_from(serial_type_raw)?;
-        if !matches!(
-            serial_type.kind(),
-            SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 | SerialTypeKind::Null
-        ) {
-            data_pos += serial_type.size();
-        }
-    }
+    let mut header = crate::slice_in_bounds_or_corrupt!(left_packed, header_pos..header_end);
+    let mut data_pos = header_end + skip_serial_types(&mut header, skip)?;
 
     let mut field_idx = skip;
     let field_limit = right_unpacked.len().min(index_info.key_info.len());
@@ -3107,24 +3088,16 @@ where
     // assumes that that the `unpacked' iterator was not skipped outside this function call`
     for rhs_value in right_unpacked.skip(skip) {
         let rhs_value = &rhs_value.as_value_ref();
-        if field_idx >= field_limit || header_pos >= header_end {
+        if field_idx >= field_limit || header.is_empty() {
             break;
         }
-        let (serial_type_raw, bytes_read) = read_varint(&left_packed[header_pos..])?;
-        header_pos += bytes_read;
+        let (serial_type_raw, rest) = split_varint(header)?;
+        header = rest;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
-
-        let lhs_value = match serial_type.kind() {
-            SerialTypeKind::ConstInt0 => ValueRef::Numeric(Numeric::Integer(0)),
-            SerialTypeKind::ConstInt1 => ValueRef::Numeric(Numeric::Integer(1)),
-            SerialTypeKind::Null => ValueRef::Null,
-            _ => {
-                let (value, field_size) = read_value(&left_packed[data_pos..], serial_type)?;
-                data_pos += field_size;
-                value
-            }
-        };
+        let data = crate::slice_in_bounds_or_corrupt!(left_packed, data_pos..);
+        let (lhs_value, field_size) = read_value(data, serial_type)?;
+        data_pos += field_size;
 
         let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
@@ -4441,6 +4414,31 @@ mod tests {
             gold_result, generic_result,
             "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}\n LHS: {serialized_values:?}\n RHS: {unpacked_values:?}"
         );
+    }
+
+    #[test]
+    fn compare_payload_generic_rejects_a_record_with_a_broken_header_size() {
+        let index_info = create_index_info(
+            2,
+            vec![SortOrder::Asc, SortOrder::Asc],
+            vec![CollationSeq::Binary, CollationSeq::Binary],
+        );
+        let unpacked = [ValueRef::Numeric(Numeric::Integer(1))];
+        let header_size_zero = [0x00];
+        let header_longer_than_payload = [0x05, 0x01];
+        for payload in [&header_size_zero[..], &header_longer_than_payload[..]] {
+            let result = compare_payload_generic(
+                payload,
+                unpacked.iter(),
+                &index_info,
+                0,
+                std::cmp::Ordering::Equal,
+            );
+            assert!(
+                matches!(result, Err(LimboError::Corrupt(_))),
+                "payload {payload:?}: {result:?}"
+            );
+        }
     }
 
     #[test]
