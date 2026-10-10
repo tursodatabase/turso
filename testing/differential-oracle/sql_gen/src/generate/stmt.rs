@@ -2003,8 +2003,10 @@ mod tests {
         let mut found_from = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
-                let sql = stmt.to_string();
+            if let Ok(stmt) = generate_update(&generator, &mut ctx)
+                && let Sql::Update(update) = stmt
+            {
+                let sql = update.to_string();
                 if sql.starts_with("UPDATE") && sql.contains(" FROM ") {
                     found_from = true;
                     break;
@@ -2037,15 +2039,15 @@ mod tests {
             let mut ctx = Context::new_with_seed(seed);
             let stmt = generate_update(&generator, &mut ctx)
                 .expect("single-table schemas should still generate UPDATE");
-            if let Stmt::Update(update) = stmt {
-                if update.from.is_some() {
-                    // Self-join: FROM same table with alias
-                    assert!(
-                        update.from.as_ref().unwrap().alias.is_some(),
-                        "Self-join FROM must have an alias"
-                    );
-                    found_self_join = true;
-                }
+            if let Stmt::Update(update) = stmt
+                && update.from.is_some()
+            {
+                // Self-join: FROM same table with alias
+                assert!(
+                    update.from.as_ref().unwrap().alias.is_some(),
+                    "Self-join FROM must have an alias"
+                );
+                found_self_join = true;
             }
         }
         assert!(
@@ -2086,8 +2088,10 @@ mod tests {
         let mut found_alias = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(stmt) = generate_update(&generator, &mut ctx) {
-                let sql = stmt.to_string();
+            if let Ok(stmt) = generate_update(&generator, &mut ctx)
+                && let Sql::Update(update) = stmt
+            {
+                let sql = update.to_string();
                 if sql.contains(" FROM ") && sql.contains(" AS t") {
                     found_alias = true;
                     break;
@@ -2128,16 +2132,15 @@ mod tests {
         let mut found_correlated_where = false;
         for seed in 0..50 {
             let mut ctx = Context::new_with_seed(seed);
-            if let Ok(Stmt::Update(update)) = generate_update(&generator, &mut ctx) {
-                if update.from.is_some()
-                    && update.where_clause.as_ref().is_some_and(|expr| {
-                        let rendered = expr.to_string();
-                        rendered.contains("users.") && rendered.contains("posts.")
-                    })
-                {
-                    found_correlated_where = true;
-                    break;
-                }
+            if let Ok(Stmt::Update(update)) = generate_update(&generator, &mut ctx)
+                && update.from.is_some()
+                && update.where_clause.as_ref().is_some_and(|expr| {
+                    let rendered = expr.to_string();
+                    rendered.contains("users.") && rendered.contains("posts.")
+                })
+            {
+                found_correlated_where = true;
+                break;
             }
         }
         assert!(
