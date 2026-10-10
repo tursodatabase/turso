@@ -82,19 +82,25 @@ fn translate_integrity_check_impl(
         Some(mv_store) => {
             // Integrity checks read the target's physical file. Its root pages match the
             // shared MVCC schema, not a connection's potentially older transaction snapshot.
-            let schema = connection.clone_shared_schema(database_id);
-            translate_integrity_check_for_schema(
-                &schema,
-                program,
-                resolver,
-                database_id,
-                max_errors,
-                quick,
-                Some(mv_store.as_ref()),
-            )
+            // Row checks read through the transaction, so they only cover the objects that
+            // this transaction can still see.
+            let file_schema = connection.clone_shared_schema(database_id);
+            resolver.with_schema(database_id, |connection_schema| {
+                translate_integrity_check_for_schema(
+                    &file_schema,
+                    connection_schema,
+                    program,
+                    resolver,
+                    database_id,
+                    max_errors,
+                    quick,
+                    Some(mv_store.as_ref()),
+                )
+            })
         }
         None => resolver.with_schema(database_id, |schema| {
             translate_integrity_check_for_schema(
+                schema,
                 schema,
                 program,
                 resolver,
@@ -169,8 +175,10 @@ fn bind_expr_for_table(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_integrity_check_for_schema(
     schema: &Schema,
+    connection_schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
@@ -181,37 +189,11 @@ fn translate_integrity_check_for_schema(
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
     // before any row-by-row semantic checks run.
-    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
-    let mut live_root_pages = HashSet::default();
-
-    // integrity_check verifies the physical file, so a placeholder (negative) root for an
-    // object a passive checkpoint has since materialized must be resolved to its real page.
-    let resolve_root = |root_page: i64| -> i64 {
-        match mv_store {
-            Some(mv) => mv.resolve_root_page(root_page),
-            None => root_page,
-        }
-    };
-
-    for table in schema.tables.values() {
-        if let Table::BTree(btree_table) = table.as_ref() {
-            let table_root = resolve_root(btree_table.root_page);
-            if table_root < 0 {
-                continue;
-            }
-            root_pages.push(table_root);
-            live_root_pages.insert(table_root);
-            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-                for index in indexes {
-                    let index_root = resolve_root(index.root_page);
-                    if index_root > 0 {
-                        root_pages.push(index_root);
-                        live_root_pages.insert(index_root);
-                    }
-                }
-            }
-        }
-    }
+    let mut root_pages = resolved_root_pages(schema, mv_store);
+    let live_root_pages: HashSet<i64> = root_pages.iter().copied().collect();
+    let connection_root_pages: HashSet<i64> = resolved_root_pages(connection_schema, mv_store)
+        .into_iter()
+        .collect();
 
     let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
@@ -269,7 +251,7 @@ fn translate_integrity_check_for_schema(
             continue;
         };
 
-        if btree_table.root_page <= 0 {
+        if btree_table.root_page <= 0 || !connection_root_pages.contains(&btree_table.root_page) {
             continue;
         }
 
@@ -308,7 +290,7 @@ fn translate_integrity_check_for_schema(
         let mut bound_indexes = Vec::new();
         if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
             for index in indexes {
-                if index.root_page <= 0 {
+                if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
                     continue;
                 }
 
@@ -679,6 +661,38 @@ fn translate_integrity_check_for_schema(
     program.add_pragma_result_column(column_name.into());
 
     Ok(())
+}
+
+fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Vec<i64> {
+    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+
+    // integrity_check verifies the physical file, so a placeholder (negative) root for an
+    // object a passive checkpoint has since materialized must be resolved to its real page.
+    let resolve_root = |root_page: i64| -> i64 {
+        match mv_store {
+            Some(mv) => mv.resolve_root_page(root_page),
+            None => root_page,
+        }
+    };
+
+    for table in schema.tables.values() {
+        if let Table::BTree(btree_table) = table.as_ref() {
+            let table_root = resolve_root(btree_table.root_page);
+            if table_root < 0 {
+                continue;
+            }
+            root_pages.push(table_root);
+            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+                for index in indexes {
+                    let index_root = resolve_root(index.root_page);
+                    if index_root > 0 {
+                        root_pages.push(index_root);
+                    }
+                }
+            }
+        }
+    }
+    root_pages
 }
 
 struct Registers {
