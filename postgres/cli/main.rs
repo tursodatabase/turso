@@ -35,10 +35,10 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -90,6 +90,14 @@ struct Opts {
         help = "Start PostgreSQL wire protocol server at given address (e.g. 0.0.0.0:5432)"
     )]
     server: Option<String>,
+
+    #[clap(
+        long,
+        value_name = "MILLIS",
+        default_value_t = 5000,
+        help = "How long a statement waits for the database write lock before failing (server mode)"
+    )]
+    busy_timeout: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +108,7 @@ fn open_database(
     db_path: &str,
     vfs: Option<&String>,
     readonly: bool,
-) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
+) -> anyhow::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
         .with_custom_types(true)
@@ -118,40 +126,7 @@ fn open_database(
 
     let (io, db) =
         turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect()?);
-    Ok((io, conn))
-}
-
-/// Discover and attach existing PG schema database files in the same directory.
-fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
-    if db_file == ":memory:" {
-        return;
-    }
-    let dir = Path::new(db_file)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(schema) = name
-            .strip_prefix("turso-postgres-schema-")
-            .and_then(|s| s.strip_suffix(".db"))
-        else {
-            continue;
-        };
-        let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
-        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
-            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
-        }
-    }
+    Ok((io, db))
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,7 +985,7 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
+    let (io, db) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));
     {
@@ -1021,12 +996,21 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
-    auto_attach_pg_schemas(&conn, &db_file);
-    // Server mode: start PG wire protocol server and exit
+    // Server mode: start PG wire protocol server and exit. The server opens
+    // per-client connections; none is needed here.
     if let Some(ref address) = opts.server {
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        let server = TursoPgServer::new(
+            address.clone(),
+            db_file,
+            db,
+            Duration::from_millis(opts.busy_timeout),
+            interrupt_count,
+        );
         return server.run();
     }
+
+    let conn = Connection::new(db.connect()?);
+    turso_pg_server::auto_attach_pg_schemas(&conn, &db_file);
 
     let table_config = TableConfig::adaptive_colors();
 
