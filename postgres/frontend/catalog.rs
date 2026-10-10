@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Table},
+    schema::{BTreeTable, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -187,6 +187,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_tables"
+            | "pg_indexes"
     )
 }
 
@@ -951,6 +952,43 @@ impl SnapshotRows for PgTablesTable {
                 Value::from_i64(0),                     // hastriggers
                 Value::from_i64(0),                     // rowsecurity
             ]);
+        }
+
+        rows
+    }
+}
+
+#[derive(Debug)]
+struct PgIndexesTable;
+
+impl SnapshotRows for PgIndexesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_indexes (
+            schemaname TEXT,
+            tablename TEXT,
+            indexname TEXT,
+            tablespace TEXT,
+            indexdef TEXT
+        )";
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let mut rows = Vec::new();
+
+        for (table_name, _) in user_tables_sorted(&schema) {
+            for idx in schema.get_indices(table_name) {
+                if idx.ephemeral {
+                    continue;
+                }
+                rows.push(vec![
+                    Value::Text("public".into()),
+                    Value::Text(table_name.clone().into()),
+                    Value::Text(idx.name.clone().into()),
+                    Value::Null,
+                    Value::build_text(index_definition(table_name, idx)),
+                ]);
+            }
         }
 
         rows
@@ -1902,6 +1940,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgTablesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_indexes",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgIndexesTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_get_tabledef",
         VTabKind::TableValuedFunction,
         CatalogModule {
@@ -2599,33 +2642,37 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
                 continue;
             }
             if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
+                return Some(index_definition(table_name, idx));
             }
             index_oid += 1;
         }
     }
 
     None
+}
+
+fn index_definition(table_name: &str, idx: &Index) -> String {
+    let unique = if idx.unique { "UNIQUE " } else { "" };
+    let cols: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|col| {
+            if let Some(expr) = &col.expr {
+                expr.to_string()
+            } else {
+                col.name.clone()
+            }
+        })
+        .collect();
+    let mut def = format!(
+        "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
+        idx.name,
+        cols.join(", ")
+    );
+    if let Some(where_clause) = &idx.where_clause {
+        def.push_str(&format!(" WHERE {where_clause}"));
+    }
+    def
 }
 
 // TODO: Fix tests to use correct API
@@ -2647,6 +2694,7 @@ mod tests {
             "pg_proc",
             "pg_database",
             "pg_tables",
+            "pg_indexes",
             "pg_get_tabledef",
             "pg_index",
             "pg_constraint",
