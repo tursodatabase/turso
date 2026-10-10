@@ -290,6 +290,12 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// `index_write_set` slots whose pager write or delete finished. Slots, not
     /// keys: `SortableIndexKey` is not `Hash`.
     written_index_slots: HashSet<usize>,
+    /// Table rows that need no pager write because the B-tree already matches them after
+    /// this checkpoint: rows of tables destroyed by it, and rows deleted before they were
+    /// ever written. GC stamps them like written rows, otherwise it never reclaims them.
+    unwritten_table_rows: Vec<RowID>,
+    /// Index rows that need no pager write, for the same reasons as `unwritten_table_rows`.
+    unwritten_index_rows: Vec<(MVTableId, Arc<SortableIndexKey>)>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -874,6 +880,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             freed_root_pages: HashSet::default(),
             written_table_rowids: HashSet::default(),
             written_index_slots: HashSet::default(),
+            unwritten_table_rows: crate::alloc::vec![],
+            unwritten_index_rows: crate::alloc::vec![],
         }
     }
 
@@ -963,26 +971,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // Resolve in-flight TxID begin/end markers to the owning tx's true state
             // (concurrent collection may not have rewritten the chain to a Timestamp yet).
             // Only a Committed tx contributes a timestamp; others resolve to None.
-            let begin_ts = match version.begin() {
-                Some(TxTimestampOrID::Timestamp(e)) => Some(e),
-                Some(TxTimestampOrID::TxID(t)) => {
-                    match lookup_tx_state(&self.mvstore.txs, &self.mvstore.finalized_tx_states, t) {
-                        Some(crate::mvcc::database::TransactionState::Committed(ts)) => Some(ts),
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-            let mut end_ts = match version.end() {
-                Some(TxTimestampOrID::Timestamp(e)) => Some(e),
-                Some(TxTimestampOrID::TxID(t)) => {
-                    match lookup_tx_state(&self.mvstore.txs, &self.mvstore.finalized_tx_states, t) {
-                        Some(crate::mvcc::database::TransactionState::Committed(ts)) => Some(ts),
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
+            let begin_ts = self.committed_ts(version.begin());
+            let mut end_ts = self.committed_ts(version.end());
             // Insert not visible at our snapshot (committed during the collection
             // phase): defer to the next pass and don't let it affect DB-file existence now.
             if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
@@ -1175,10 +1165,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
                     // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
                     tracing::trace!("skipping {key:?}");
+                    with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+                        self.unwritten_table_rows.try_push(key.clone())?;
+                    });
                     continue;
                 }
 
                 let row_versions = entry.value().read();
+                let write_set_len_before = self.write_set.len();
 
                 for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
                     let is_delete = version.end().is_some();
@@ -1324,6 +1318,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         });
                     }
                 }
+                if self.write_set.len() == write_set_len_before
+                    && self.deleted_since_last_checkpoint(&row_versions)
+                {
+                    with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+                        self.unwritten_table_rows.try_push(key.clone())?;
+                    });
+                }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
                     return Ok(Some(IOCompletions(Completion::new_yield())));
@@ -1385,13 +1386,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         while let Some(pinned) = outer_range.inner.next(&guard) {
             let outer = CollectEntry::new(pinned, &guard);
             let index_id = *outer.key();
-
-            // Skip destroyed indexes - we won't checkpoint rows for indexes that will be destroyed
-            if self.destroyed_indexes.contains(&index_id) {
-                self.collect_index_tableid_cursor = Some(index_id);
-                self.collect_index_key_cursor = None;
-                continue;
-            }
+            // We won't checkpoint rows for indexes that will be destroyed in this checkpoint.
+            let index_destroyed = self.destroyed_indexes.contains(&index_id);
 
             let index_rows_map = outer.value();
             let inner_bounds: (Bound<Arc<SortableIndexKey>>, Bound<Arc<SortableIndexKey>>) =
@@ -1406,17 +1402,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.collect_index_tableid_cursor = Some(index_id);
                 self.collect_index_key_cursor = Some(entry.key().clone());
 
-                for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
-                    let is_delete = version.end().is_some();
-                    if is_delete && !self.table_exists_for_snapshot(index_id) {
-                        continue;
-                    }
+                let index_write_set_len_before = self.index_write_set.len();
+                if !index_destroyed {
+                    for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
+                        let is_delete = version.end().is_some();
+                        if is_delete && !self.table_exists_for_snapshot(index_id) {
+                            continue;
+                        }
 
-                    // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
-                    // the database file.
+                        // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
+                        // the database file.
+                        with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
+                            self.index_write_set
+                                .try_push((index_id, version, is_delete))?;
+                        });
+                    }
+                }
+                if index_destroyed
+                    || (self.index_write_set.len() == index_write_set_len_before
+                        && self.deleted_since_last_checkpoint(&versions))
+                {
                     with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
-                        self.index_write_set
-                            .try_push((index_id, version, is_delete))?;
+                        self.unwritten_index_rows
+                            .try_push((index_id, entry.key().clone()))?;
                     });
                 }
                 processed += 1;
@@ -1428,6 +1436,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             self.collect_index_key_cursor = None;
         }
         Ok(None)
+    }
+
+    /// True when a version of the chain was deleted after the last checkpoint and at or
+    /// before this checkpoint's snapshot.
+    fn deleted_since_last_checkpoint(&self, versions: &[RowVersion]) -> bool {
+        versions.iter().any(|version| {
+            self.committed_ts(version.end()).is_some_and(|end_ts| {
+                end_ts <= self.snapshot_ts
+                    && self
+                        .durable_txid_max_old
+                        .is_none_or(|txid_max_old| end_ts > u64::from(txid_max_old))
+            })
+        })
+    }
+
+    /// The commit timestamp of a begin or end marker, or `None` if it has no committed transaction.
+    fn committed_ts(&self, ts_or_id: Option<TxTimestampOrID>) -> Option<u64> {
+        match ts_or_id {
+            Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+            Some(TxTimestampOrID::TxID(tx_id)) => {
+                match lookup_tx_state(&self.mvstore.txs, &self.mvstore.finalized_tx_states, tx_id) {
+                    Some(crate::mvcc::database::TransactionState::Committed(ts)) => Some(ts),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1861,25 +1896,36 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut index = next_index;
         let mut processed = 0;
         let drop_current_if_in_btree = true;
-        while index < self.write_set.len() {
+        let total = self.write_set.len() + self.unwritten_table_rows.len();
+        while index < total {
             let current = index;
             index += 1;
-            if current > 0
-                && self.write_set[current - 1].0.row.id == self.write_set[current].0.row.id
-            {
-                continue;
-            }
-            let row_id = &self.write_set[current].0.row.id;
+            let (row_id, stamp) = if current < self.write_set.len() {
+                if current > 0
+                    && self.write_set[current - 1].0.row.id == self.write_set[current].0.row.id
+                {
+                    continue;
+                }
+                let row_id = &self.write_set[current].0.row.id;
+                let written = match row_id.row_id {
+                    RowKey::Int(n) => self.written_table_rowids.contains(&(row_id.table_id, n)),
+                    RowKey::Record(_) => false,
+                };
+                (row_id, written)
+            } else {
+                (
+                    &self.unwritten_table_rows[current - self.write_set.len()],
+                    true,
+                )
+            };
             if let Some(entry) = self.mvstore.rows.get(row_id) {
                 let mut versions = entry.value().write();
-                if let RowKey::Int(n) = row_id.row_id {
-                    if self.written_table_rowids.contains(&(row_id.table_id, n)) {
-                        self.mvstore.stamp_chain_materialized(
-                            &mut versions,
-                            materialized_frame,
-                            snapshot_ts,
-                        );
-                    }
+                if stamp {
+                    self.mvstore.stamp_chain_materialized(
+                        &mut versions,
+                        materialized_frame,
+                        snapshot_ts,
+                    );
                 }
                 let dropped = self.mvstore.gc_chain_now(
                     &mut versions,
@@ -1904,7 +1950,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 break;
             }
         }
-        if index < self.write_set.len() {
+        if index < total {
             let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
                 unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
             };
@@ -1928,14 +1974,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut index = next_index;
         let mut processed = 0;
         let drop_current_if_in_btree = true;
-        while index < self.index_write_set.len() {
+        let total = self.index_write_set.len() + self.unwritten_index_rows.len();
+        while index < total {
             let current = index;
             index += 1;
             {
-                let (index_id, row_version, _is_delete) = &self.index_write_set[current];
-                let index_id = *index_id;
-                let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
-                    unreachable!("index row versions always have Record keys");
+                let (index_id, sortable_key, stamp) = if current < self.index_write_set.len() {
+                    let (index_id, row_version, _is_delete) = &self.index_write_set[current];
+                    let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                        unreachable!("index row versions always have Record keys");
+                    };
+                    (
+                        *index_id,
+                        sortable_key,
+                        self.written_index_slots.contains(&current),
+                    )
+                } else {
+                    let (index_id, sortable_key) =
+                        &self.unwritten_index_rows[current - self.index_write_set.len()];
+                    (*index_id, sortable_key, true)
                 };
                 let outer_entry = self
                     .mvstore
@@ -1947,7 +2004,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .get(sortable_key)
                     .expect("index row from write set must exist in inner map");
                 let mut versions = inner_entry.value().write();
-                if self.written_index_slots.contains(&current) {
+                if stamp {
                     self.mvstore.stamp_chain_materialized(
                         &mut versions,
                         materialized_frame,
@@ -1968,7 +2025,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 break;
             }
         }
-        if index < self.index_write_set.len() {
+        if index < total {
             let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
             };
