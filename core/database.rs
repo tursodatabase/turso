@@ -2653,6 +2653,7 @@ impl Database {
                 crate::connection::StatementActivity::default(),
             )),
             check_constraints_pragma: AtomicBool::new(false),
+            automatic_index_pragma: AtomicBool::new(true),
             vtab_txn_states: RwLock::new(HashSet::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),

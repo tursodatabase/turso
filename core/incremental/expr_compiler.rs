@@ -332,6 +332,7 @@ impl CompiledExpression {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            true,
             std::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,
         );

@@ -318,6 +318,15 @@ PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
 ```
 
+### automatic_index
+
+Turso can by default build a temporary index for tables to join faster.
+
+```sql
+PRAGMA automatic_index = 0;   -- off
+PRAGMA automatic_index = 1;   -- on (default)
+```
+
 ### data_sync_retry
 
 Controls whether Turso retries a disk sync (fsync) after a failure instead of treating it as fatal.

@@ -147,6 +147,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        AutomaticIndex => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["automatic_index"],
+        ),
         BusyTimeout => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["busy_timeout"],

@@ -540,6 +540,7 @@ pub struct Connection {
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    pub(super) automatic_index_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// One prepared cursor per index-method attachment touched by the active
@@ -1969,6 +1970,15 @@ impl Connection {
 
     pub fn check_constraints_ignored(&self) -> bool {
         self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
+    pub fn set_automatic_index(&self, enable: bool) {
+        self.automatic_index_pragma.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn automatic_index(&self) -> bool {
+        self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
@@ -5768,6 +5778,22 @@ mod tests {
             err.contains("no such table"),
             "expected no such table after temp reset, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE t1(a)").unwrap();
+        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
+
+        conn.execute("PRAGMA automatic_index = OFF").unwrap();
+        stmt.run_collect_rows().unwrap();
+
+        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
+        assert_eq!(reprepares, 1);
     }
 
     #[test]
