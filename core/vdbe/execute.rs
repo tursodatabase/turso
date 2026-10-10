@@ -7275,6 +7275,8 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0), Integer(0)]
 ///   // same but starts at 0.0
 /// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
+/// - Sum/Avg over a `numeric` column: same layout, but `op_agg_step` replaces
+///   payload[0] with the exact total stored as a numeric blob
 /// - Min/Max: [Null]
 /// - GroupConcat/StringAgg:
 ///   [Null|Text, Integer(count), Integer(first separator length),
@@ -7782,6 +7784,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             let count = payload[2].as_int().unwrap_or(0);
             if count == 0 || matches!(&payload[0], Value::Null) {
                 Value::Null
+            } else if let Value::Blob(total) = &payload[0] {
+                let total = crate::numeric::decimal::blob_to_bigdecimal(total)?;
+                let avg = crate::numeric::decimal::postgres_avg(&total, count);
+                Value::build_text(crate::numeric::decimal::format_numeric(&avg))
             } else {
                 let sum = payload[0].to_float_or_zero();
                 let r_err = payload[1].to_float_or_zero();
@@ -7818,6 +7824,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                     Value::from_f64(f64::from(*f) + r_err)
                 }
                 Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f)),
+                Value::Blob(total) => {
+                    let total = crate::numeric::decimal::blob_to_bigdecimal(total)?;
+                    Value::build_text(crate::numeric::decimal::format_numeric(&total))
+                }
                 _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
@@ -8702,6 +8712,10 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             *i -= 1;
         }
         AggFunc::Sum | AggFunc::Total => {
+            turso_assert!(
+                !matches!(payload[0], Value::Blob(_)),
+                "window frames never remove rows from an exact numeric total"
+            );
             let parsed = classify_numeric_arg(&arg);
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
@@ -8766,6 +8780,10 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             *ovrfl_val = Value::from_i64(sum_state.ovrfl as i64);
         }
         AggFunc::Avg => {
+            turso_assert!(
+                !matches!(payload[0], Value::Blob(_)),
+                "window frames never remove rows from an exact numeric total"
+            );
             let parsed = classify_numeric_arg(&arg);
             if matches!(parsed, NumericArg::Null) {
                 return Ok(());
@@ -9061,6 +9079,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         func,
         comparator,
         collation,
+        exact_numeric,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9106,6 +9125,11 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
             .pop()
             .unwrap_or_else(|| crate::alloc::vec![]);
         init_agg_payload(func, &mut payload)?;
+        if *exact_numeric {
+            payload[0] = Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(
+                &bigdecimal::BigDecimal::from(0),
+            ));
+        }
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
@@ -9161,19 +9185,53 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                current_collation,
-                comparator_factory,
-            )?;
+            if *exact_numeric {
+                update_exact_numeric_payload(func, arg, payload)?;
+            } else {
+                update_agg_payload(
+                    func,
+                    arg,
+                    maybe_arg2.as_ref(),
+                    payload,
+                    current_collation,
+                    comparator_factory,
+                )?;
+            }
         }
     };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Adds `arg` to the exact running total of SUM/AVG over a `numeric` column.
+/// `payload[0]` holds the total as a numeric blob instead of an integer or
+/// float, and the row count goes in the same slot the float path uses.
+fn update_exact_numeric_payload(func: &AggFunc, arg: &Value, payload: &mut [Value]) -> Result<()> {
+    let count_slot = match func {
+        AggFunc::Sum => 4,
+        AggFunc::Avg => 2,
+        _ => unreachable!("exact numeric accumulation is only emitted for sum and avg"),
+    };
+    if matches!(arg, Value::Null) {
+        return Ok(());
+    }
+    let Value::Blob(total) = &payload[0] else {
+        mark_unlikely();
+        return Err(LimboError::InternalError(format!(
+            "{func}: exact numeric total is not a blob"
+        )));
+    };
+    let total = crate::numeric::decimal::blob_to_bigdecimal(total)? + value_to_bigdecimal(arg)?;
+    payload[0] = Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&total));
+    let Value::Numeric(Numeric::Integer(count)) = &mut payload[count_slot] else {
+        mark_unlikely();
+        return Err(LimboError::InternalError(format!(
+            "{func}: payload[{count_slot}] is not an integer"
+        )));
+    };
+    *count = count.checked_add(1).or_overflow()?;
+    Ok(())
 }
 
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or

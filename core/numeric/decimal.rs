@@ -213,6 +213,67 @@ pub fn validate_precision_scale(
     Ok(rounded)
 }
 
+/// Divide `total` by `count` the way PostgreSQL computes `avg(numeric)`.
+/// PostgreSQL stores numerics as base-10000 digits and picks the result scale
+/// from the leading digit of each operand, so that the quotient keeps at least
+/// 16 significant digits and no fewer decimal places than either operand
+/// (`select_div_scale` in PostgreSQL's numeric.c). Ties round away from zero.
+pub fn postgres_avg(total: &BigDecimal, count: i64) -> BigDecimal {
+    const MIN_SIGNIFICANT_DIGITS: i64 = 16;
+    const MAX_DISPLAY_SCALE: i64 = 1000;
+
+    let (total_weight, total_first_digit) = leading_base_10000_digit(total);
+    let (count_weight, count_first_digit) = leading_base_10000_digit(&BigDecimal::from(count));
+    let mut quotient_weight = total_weight - count_weight;
+    if total_first_digit <= count_first_digit {
+        quotient_weight -= 1;
+    }
+    let scale = (MIN_SIGNIFICANT_DIGITS - quotient_weight * 4)
+        .max(total.fractional_digit_count())
+        .clamp(0, MAX_DISPLAY_SCALE);
+
+    // Compute one digit past `scale` with truncation, then round that digit.
+    let (total_digits, total_scale) = total.as_bigint_and_exponent();
+    let shift = scale + 1 - total_scale;
+    let (numerator, denominator) = if shift >= 0 {
+        (
+            total_digits * BigInt::from(10).pow(shift as u32),
+            BigInt::from(count),
+        )
+    } else {
+        (
+            total_digits,
+            BigInt::from(count) * BigInt::from(10).pow(shift.unsigned_abs() as u32),
+        )
+    };
+    BigDecimal::new(numerator / denominator, scale + 1)
+        .with_scale_round(scale, bigdecimal::RoundingMode::HalfUp)
+}
+
+/// Returns the weight (power of 10000) and value of the first non-zero
+/// base-10000 digit of `val`, or `(0, 0)` for zero.
+fn leading_base_10000_digit(val: &BigDecimal) -> (i64, u32) {
+    let (digits, scale) = val.as_bigint_and_exponent();
+    let magnitude = digits.magnitude();
+    if magnitude.bits() == 0 {
+        return (0, 0);
+    }
+    let decimal_exponent = magnitude.to_string().len() as i64 - 1 - scale;
+    let weight = decimal_exponent.div_euclid(4);
+    let shift = -scale - weight * 4;
+    let first_digit = if shift >= 0 {
+        magnitude * num_bigint::BigUint::from(10u32).pow(shift as u32)
+    } else {
+        magnitude / num_bigint::BigUint::from(10u32).pow(shift.unsigned_abs() as u32)
+    };
+    let first_digit = first_digit.to_u32_digits();
+    crate::turso_assert!(
+        first_digit.len() == 1 && first_digit[0] < 10000,
+        "leading base-10000 digit must be between 1 and 9999"
+    );
+    (weight, first_digit[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +312,22 @@ mod tests {
         let blob = bigdecimal_to_blob(&val);
         let decoded = blob_to_bigdecimal(&blob).unwrap();
         assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn test_postgres_avg_scale() {
+        for (total, count, expected) in [
+            ("4.00", 2, "2.0000000000000000"),
+            ("3.99", 3, "1.33000000000000000000"),
+            ("10000.5", 2, "5000.2500000000000000"),
+            ("2", 3, "0.66666666666666666667"),
+            ("-2", 3, "-0.66666666666666666667"),
+            ("0", 5, "0.00000000000000000000"),
+            ("-0.01", 1, "-0.01000000000000000000"),
+        ] {
+            let total = BigDecimal::from_str(total).unwrap();
+            assert_eq!(format_numeric(&postgres_avg(&total, count)), expected);
+        }
     }
 
     #[test]
