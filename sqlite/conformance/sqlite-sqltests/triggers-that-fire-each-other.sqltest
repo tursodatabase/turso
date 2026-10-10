@@ -1,0 +1,82 @@
+@database :memory:
+
+# Each trigger body used to be compiled again at every place the trigger
+# fires. When several triggers on one table change that table, each body
+# fires the others, and the compiled program grew factorially with the number
+# of triggers: twelve triggers took minutes to compile. SQLite compiles each
+# trigger once per statement, and so does Turso now.
+
+@cross-check-integrity
+test twelve-triggers-that-change-their-own-table-compile-quickly {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE log (name TEXT);
+    CREATE TRIGGER ins_1 AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ins_1'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER ins_2 AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ins_2'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER ins_3 AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ins_3'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER ins_4 AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ins_4'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER upd_1 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('upd_1'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER upd_2 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('upd_2'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER upd_3 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('upd_3'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER upd_4 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('upd_4'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER del_1 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('del_1'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER del_2 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('del_2'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER del_3 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('del_3'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    CREATE TRIGGER del_4 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('del_4'); UPDATE t SET b = 1 WHERE 0; DELETE FROM t WHERE 0; INSERT INTO t SELECT 1, 1 WHERE 0; END;
+    INSERT INTO t VALUES (1, 0);
+    UPDATE t SET b = 2;
+    DELETE FROM t;
+    SELECT name FROM log ORDER BY name;
+}
+expect {
+    del_1
+    del_2
+    del_3
+    del_4
+    ins_1
+    ins_2
+    ins_3
+    ins_4
+    upd_1
+    upd_2
+    upd_3
+    upd_4
+}
+
+# A trigger that is compiled once per statement is called from every place
+# it fires, including from inside a trigger body it fired itself. It must
+# still not run again while its own body is running, but it must run when
+# the same body is reached along a path where it is not already running.
+
+@cross-check-integrity
+test trigger-does-not-fire-again-while-its-own-body-runs {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER DEFAULT 0);
+    CREATE TABLE log (name TEXT, a INTEGER);
+    CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ai', NEW.a); UPDATE t SET b = 1 WHERE a = NEW.a; END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('au', NEW.a); INSERT INTO t VALUES (NEW.a + 10, 0); END;
+    INSERT INTO t VALUES (1, 0);
+    SELECT name, a FROM log ORDER BY rowid;
+}
+expect {
+    ai|1
+    au|1
+}
+
+@cross-check-integrity
+test trigger-fires-again-when-reached-outside-its-own-body {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER DEFAULT 0);
+    CREATE TABLE log (name TEXT, a INTEGER);
+    CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('ai', NEW.a); UPDATE t SET b = 1 WHERE a = NEW.a; END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('au', NEW.a); INSERT INTO t VALUES (NEW.a + 10, 0); END;
+    INSERT INTO t VALUES (1, 0);
+    DELETE FROM log;
+    UPDATE t SET b = 2 WHERE a = 11;
+    SELECT name, a FROM log ORDER BY rowid;
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    au|11
+    ai|21
+    1|1
+    11|2
+    21|1
+}

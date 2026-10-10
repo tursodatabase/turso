@@ -994,6 +994,11 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// The triggers whose bodies this statement runs inside, outermost first,
+    /// ending with this statement's own trigger when it is a trigger program.
+    /// A trigger already on this chain does not fire again, which is SQLite's
+    /// behaviour without `PRAGMA recursive_triggers`.
+    pub(crate) executing_triggers: Vec<Arc<Trigger>>,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     // Cache of unused allocated Vecs
@@ -1111,6 +1116,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            executing_triggers: Vec::new(),
             mv_store_cache: None,
         }
     }
