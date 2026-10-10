@@ -57,6 +57,38 @@ fn test_fail_drop_partial_index_column(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
+#[test]
+fn test_drop_sqlite_created_mixed_case_index() -> anyhow::Result<()> {
+    for drop_sql in [
+        "DROP INDEX Idx_A",
+        "DROP INDEX idx_a",
+        "DROP INDEX \"Idx_A\"",
+        "DROP INDEX IF EXISTS Idx_A",
+    ] {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let db_path = tmp_dir.path().join("test.db");
+        rusqlite::Connection::open(&db_path)?.execute_batch(
+            "CREATE TABLE t(a); CREATE INDEX Idx_A ON t(a); INSERT INTO t VALUES(7)",
+        )?;
+
+        let db = TempDatabase::new_with_existent(&db_path);
+        db.connect_limbo().execute(drop_sql)?;
+        drop(db);
+
+        let sqlite = rusqlite::Connection::open(&db_path)?;
+        let indexes: i64 = sqlite.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(indexes, 0, "{drop_sql}");
+        sqlite.execute_batch("CREATE TABLE t2(b); INSERT INTO t2 VALUES(9)")?;
+        drop(sqlite);
+        crate::common::rusqlite_integrity_check(&db_path)?;
+    }
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_alter_column_rewrites_indexed_affinity_change(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
