@@ -161,6 +161,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn requires_custom_types(&self) -> bool {
         false
     }
+
+    /// Whether `t.c` reads only the nearest query that has a table named `t`.
+    ///
+    /// SQLite keeps searching outer queries when that table has no column
+    /// `c`. PostgreSQL stops there and reports that the column does not
+    /// exist.
+    fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
