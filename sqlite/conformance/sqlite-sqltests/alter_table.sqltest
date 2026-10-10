@@ -2270,6 +2270,51 @@ expect {
     2
 }
 
+test alter-table-drop-column-trigger-uses-old-rowid {
+    CREATE TABLE drop_rowid_src (id INTEGER PRIMARY KEY, a INT, b TEXT);
+    CREATE TABLE drop_rowid_audit (rid INT);
+    CREATE TRIGGER trig_drop_rowid AFTER DELETE ON drop_rowid_src BEGIN
+        INSERT INTO drop_rowid_audit VALUES (OLD.rowid);
+    END;
+    ALTER TABLE drop_rowid_src DROP COLUMN b;
+    INSERT INTO drop_rowid_src VALUES (7, 1);
+    DELETE FROM drop_rowid_src;
+    SELECT * FROM drop_rowid_audit;
+}
+expect {
+    7
+}
+
+test alter-table-drop-column-trigger-uses-rowid-names-of-other-table {
+    CREATE TABLE drop_rowid_other (a, b);
+    INSERT INTO drop_rowid_other VALUES (1, 2);
+    CREATE TABLE drop_rowid_driver (x);
+    CREATE TABLE drop_rowid_log (v, w);
+    CREATE TRIGGER trig_drop_rowid_other AFTER INSERT ON drop_rowid_driver BEGIN
+        INSERT INTO drop_rowid_log SELECT drop_rowid_other._rowid_, oid FROM drop_rowid_other;
+        UPDATE drop_rowid_other SET b = NEW.x WHERE rowid = 1;
+    END;
+    ALTER TABLE drop_rowid_other DROP COLUMN a;
+    INSERT INTO drop_rowid_driver VALUES (5);
+    SELECT * FROM drop_rowid_log;
+    SELECT * FROM drop_rowid_other;
+}
+expect {
+    1|1
+    5
+}
+
+test fail-drop-column-without-rowid-trigger-uses-old-rowid {
+    CREATE TABLE drop_no_rowid (id INTEGER PRIMARY KEY, a INT, b TEXT) WITHOUT ROWID;
+    CREATE TABLE drop_no_rowid_audit (rid INT);
+    CREATE TRIGGER trig_drop_no_rowid AFTER DELETE ON drop_no_rowid BEGIN
+        INSERT INTO drop_no_rowid_audit VALUES (OLD.rowid);
+    END;
+    ALTER TABLE drop_no_rowid DROP COLUMN b;
+}
+expect error {
+}
+
 test alter-table-drop-column-temp-trigger-select-surviving-column {
     CREATE TEMP TABLE temp_src_drop_select (a, b);
     INSERT INTO temp.temp_src_drop_select VALUES (1, 2);

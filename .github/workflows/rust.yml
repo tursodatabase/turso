@@ -97,7 +97,12 @@ jobs:
       - name: Install LLVM (libclang for bindgen)
         if: runner.os == 'Windows'
         run: |
-          choco install llvm -y --no-progress
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -eq 0 -and (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) { break }
+            if ($attempt -eq 5) { throw "LLVM install failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6

@@ -1,0 +1,38 @@
+# PostgreSQL catalog views queried through the PostgreSQL frontend.
+
+@database :memory:
+
+setup indexed_tables {
+    CREATE TABLE items (id int, name text, price int);
+    CREATE INDEX items_name_idx ON items (name);
+    CREATE UNIQUE INDEX items_price_idx ON items (price);
+    CREATE TABLE orders (id int, item_id int);
+    CREATE INDEX orders_item_idx ON orders (item_id);
+}
+
+@setup indexed_tables
+test pg-indexes-lists-user-indexes {
+    SELECT schemaname, tablename, indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY indexname;
+}
+expect {
+    public|items|items_name_idx
+    public|items|items_price_idx
+    public|orders|orders_item_idx
+}
+
+@setup indexed_tables
+test pg-indexes-join-pg-namespace {
+    SELECT tablename, indexname
+    FROM pg_indexes
+    JOIN pg_namespace ON (schemaname = nspname)
+    WHERE schemaname = 'public'
+    ORDER BY pg_namespace.oid, indexname;
+}
+expect {
+    items|items_name_idx
+    items|items_price_idx
+    orders|orders_item_idx
+}

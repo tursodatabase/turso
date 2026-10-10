@@ -686,6 +686,8 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
+    #[cfg(test)]
+    frame_index_blocks_scanned: AtomicU64,
 }
 
 /// One lazily mapped frame-index block.
@@ -805,6 +807,8 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
+            #[cfg(test)]
+            frame_index_blocks_scanned: AtomicU64::new(0),
         }
     }
 
@@ -910,6 +914,11 @@ impl MappedSharedWalCoordination {
         self.header()
             .frame_index_overflowed
             .store(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
+        self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
 
     fn create_or_open_with_mode(
@@ -2440,9 +2449,12 @@ impl MappedSharedWalCoordination {
         if upper_frame < min_frame {
             return None;
         }
-        let range = frame_watermark
-            .map(|watermark| 0..=watermark)
-            .unwrap_or(min_frame..=max_frame);
+        let lower_frame = if frame_watermark.is_some() {
+            0
+        } else {
+            min_frame
+        };
+        let range = lower_frame..=upper_frame;
         let header = self.header();
         let len = header
             .frame_index_len
@@ -2455,14 +2467,19 @@ impl MappedSharedWalCoordination {
         self.ensure_mapped_frame_index_blocks(required_blocks)
             .expect("shared WAL frame index block missing");
         let mappings = self.frame_index_blocks.read();
-        let visible_slots = Self::visible_frame_index_slots(&mappings, len, upper_frame);
-        if visible_slots == 0 {
+        let slots = Self::frame_index_slot_range(&mappings, len, lower_frame, upper_frame);
+        if slots.is_empty() {
             return None;
         }
-        let last_block = (visible_slots - 1) / FRAME_INDEX_BLOCK_CAPACITY;
-        for block_index in (0..=last_block).rev() {
+        let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
+        let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
+        for block_index in (first_block..=last_block).rev() {
+            #[cfg(test)]
+            self.frame_index_blocks_scanned
+                .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
-            let visible_entries = visible_slots
+            let visible_entries = slots
+                .end
                 .saturating_sub(block_start_slot)
                 .min(FRAME_INDEX_BLOCK_CAPACITY);
             if let Some(local_entry) =
@@ -2497,16 +2514,21 @@ impl MappedSharedWalCoordination {
         self.ensure_mapped_frame_index_blocks(required_blocks)
             .expect("shared WAL frame index block missing");
         let mappings = self.frame_index_blocks.read();
-        let visible_slots = Self::visible_frame_index_slots(&mappings, len, max_frame);
-        if visible_slots == 0 {
+        let slots = Self::frame_index_slot_range(&mappings, len, min_frame, max_frame);
+        if slots.is_empty() {
             return Vec::new();
         }
         let mut seen_pages = std::collections::BTreeSet::new();
         let mut entries = Vec::new();
-        let last_block = (visible_slots - 1) / FRAME_INDEX_BLOCK_CAPACITY;
-        for block_index in (0..=last_block).rev() {
+        let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
+        let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
+        for block_index in (first_block..=last_block).rev() {
+            #[cfg(test)]
+            self.frame_index_blocks_scanned
+                .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
-            let visible_entries = visible_slots
+            let visible_entries = slots
+                .end
                 .saturating_sub(block_start_slot)
                 .min(FRAME_INDEX_BLOCK_CAPACITY);
             let latest_in_block =
@@ -2801,6 +2823,22 @@ impl MappedSharedWalCoordination {
                 .or_insert(local_index);
         }
         latest_entries
+    }
+
+    fn frame_index_slot_range(
+        mappings: &[FrameIndexBlockMapping],
+        len: u32,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> std::ops::Range<u32> {
+        let end = Self::visible_frame_index_slots(mappings, len, max_frame);
+        let start = match min_frame.checked_sub(1) {
+            Some(frame_before_min) => {
+                Self::visible_frame_index_slots(mappings, len, frame_before_min)
+            }
+            None => 0,
+        };
+        start.min(end)..end
     }
 
     /// Binary-search the frame index to find how many entries have
@@ -3997,6 +4035,130 @@ mod tests {
                 (13, boundary + 2),
             ]
         );
+    }
+
+    #[test]
+    fn frame_index_lookups_start_at_the_slot_of_min_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("slot-range.tshm"));
+        let capacity = FRAME_INDEX_BLOCK_CAPACITY;
+        let len = 3 * capacity + 10;
+        for slot in 0..len as u64 {
+            mapped.record_frame(slot % 97, 2 * slot + 1);
+        }
+        let last_frame = 2 * (len as u64 - 1) + 1;
+        let mappings = mapped.frame_index_blocks.read();
+        let slot_range = |min_frame, max_frame| {
+            MappedSharedWalCoordination::frame_index_slot_range(
+                &mappings, len, min_frame, max_frame,
+            )
+        };
+
+        assert_eq!(slot_range(0, last_frame), 0..len);
+        assert_eq!(slot_range(1, last_frame), 0..len);
+        assert_eq!(slot_range(2, last_frame), 1..len);
+        let frame_in_last_block = 2 * (3 * capacity as u64 + 4) + 1;
+        assert_eq!(
+            slot_range(frame_in_last_block, last_frame),
+            3 * capacity + 4..len
+        );
+        assert_eq!(
+            slot_range(frame_in_last_block + 1, last_frame),
+            3 * capacity + 5..len
+        );
+        assert_eq!(slot_range(5, 6), 2..3);
+        assert!(slot_range(last_frame + 1, last_frame).is_empty());
+        assert!(slot_range(last_frame, 1).is_empty());
+        assert!(slot_range(4, 4).is_empty());
+    }
+
+    #[test]
+    fn frame_index_lookups_scan_only_blocks_with_frames_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("blocks-scanned.tshm"));
+        let block = FRAME_INDEX_BLOCK_CAPACITY as u64;
+        let last_frame = 4 * block;
+        for frame_id in 1..=last_frame {
+            mapped.record_frame(frame_id % 97, frame_id);
+        }
+        let first_frame_of_last_block = 3 * block + 1;
+        let page_not_in_wal = 1000;
+        mapped.take_frame_index_blocks_scanned_for_tests();
+
+        mapped.iter_latest_frames(first_frame_of_last_block, last_frame);
+        assert_eq!(mapped.take_frame_index_blocks_scanned_for_tests(), 1);
+        mapped.find_frame(page_not_in_wal, first_frame_of_last_block, last_frame, None);
+        assert_eq!(mapped.take_frame_index_blocks_scanned_for_tests(), 1);
+        mapped.iter_latest_frames(last_frame + 1, last_frame);
+        assert_eq!(mapped.take_frame_index_blocks_scanned_for_tests(), 0);
+        mapped.iter_latest_frames(1, last_frame);
+        assert_eq!(mapped.take_frame_index_blocks_scanned_for_tests(), 4);
+        mapped.find_frame(page_not_in_wal, 1, last_frame, None);
+        assert_eq!(mapped.take_frame_index_blocks_scanned_for_tests(), 4);
+    }
+
+    #[test]
+    fn frame_index_lookups_with_min_frame_match_a_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mapped = create_mapping(&dir.path().join("full-scan.tshm"));
+        let frame_count = 3 * FRAME_INDEX_BLOCK_CAPACITY as u64 + 123;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut frames = Vec::new();
+        for frame_id in 1..=frame_count {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let page_id = if frame_id % 5 == 0 { 1 } else { seed % 600 };
+            mapped.record_frame(page_id, frame_id);
+            frames.push((page_id, frame_id));
+        }
+        let latest_frames = |min_frame: u64, max_frame: u64| {
+            let mut latest = std::collections::BTreeMap::new();
+            for &(page_id, frame_id) in &frames {
+                if frame_id <= max_frame {
+                    latest.insert(page_id, frame_id);
+                }
+            }
+            latest
+                .into_iter()
+                .filter(|&(_, frame_id)| frame_id >= min_frame)
+                .collect::<Vec<_>>()
+        };
+        let block = FRAME_INDEX_BLOCK_CAPACITY as u64;
+        let bounds = [
+            0,
+            1,
+            2,
+            block - 1,
+            block,
+            block + 1,
+            2 * block,
+            2 * block + 77,
+            3 * block,
+            frame_count - 1,
+            frame_count,
+        ];
+        for &min_frame in &bounds {
+            for &max_frame in &bounds {
+                let expected = latest_frames(min_frame, max_frame);
+                assert_eq!(
+                    mapped.iter_latest_frames(min_frame, max_frame),
+                    expected,
+                    "min_frame={min_frame} max_frame={max_frame}"
+                );
+                for page_id in [1, 2, 300, 599, 600] {
+                    let expected_frame = expected
+                        .iter()
+                        .find(|&&(page, _)| page == page_id)
+                        .map(|&(_, frame_id)| frame_id);
+                    assert_eq!(
+                        mapped.find_frame(page_id, min_frame, max_frame, None),
+                        expected_frame,
+                        "page_id={page_id} min_frame={min_frame} max_frame={max_frame}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

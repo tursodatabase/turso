@@ -11,6 +11,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
@@ -30,7 +31,7 @@ use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
-use crate::{Connection, MAIN_DB_ID};
+use crate::{Connection, Value, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
 use turso_parser::ast;
@@ -1692,14 +1693,14 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     } else {
         ""
     };
-    let ext_args = vtab
+    let module_args = vtab
         .args
         .iter()
-        .map(|a| turso_ext::Value::from_text(a.to_string()))
+        .map(|a| Value::from_text(a.to_string()))
         .collect::<Vec<_>>();
     let schema = module
         .implementation
-        .create_schema(ext_args)
+        .create_schema(module_args)
         .unwrap_or_default();
     let vtab_args = if let Some(first_paren) = schema.find('(') {
         let closing_paren = schema.rfind(')').unwrap_or_default();
@@ -1927,7 +1928,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2365,7 +2366,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(CollationSeq::NoCase),
         });
 
         program.emit_insn(Insn::Delete {

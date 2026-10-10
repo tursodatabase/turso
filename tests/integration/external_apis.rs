@@ -22,6 +22,81 @@ use turso_ext::{
 static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[turso_macros::test(mvcc)]
+fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let context = Arc::new(std::sync::Mutex::new(7i64));
+    let first = db.connect_with_context(context.clone())?;
+    let first_clone = first.clone();
+    let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
+    let shared = db.connect_with_context(context.clone())?;
+    let plain = db.connect()?;
+
+    assert!(std::ptr::eq(
+        context.as_ref(),
+        first.context::<std::sync::Mutex<i64>>().unwrap()
+    ));
+    assert!(first.context::<i64>().is_none());
+    assert!(first.context::<std::sync::Mutex<u64>>().is_none());
+    assert!(plain.context::<std::sync::Mutex<i64>>().is_none());
+
+    *context.lock().unwrap() = 13;
+    for (conn, expected) in [(&first_clone, 13), (&second, 19), (&shared, 13)] {
+        assert_eq!(
+            *conn
+                .context::<std::sync::Mutex<i64>>()
+                .unwrap()
+                .lock()
+                .unwrap(),
+            expected
+        );
+    }
+    *second
+        .context::<std::sync::Mutex<i64>>()
+        .unwrap()
+        .lock()
+        .unwrap() = 23;
+    assert_eq!(*context.lock().unwrap(), 13);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn connection_context_lives_until_the_last_connection_owner_drops(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let context = Arc::new(ConnectionContextDropCounter(drops.clone()));
+    let weak = Arc::downgrade(&context);
+    let conn = tmp_db
+        .limbo_database()
+        .connect_with_context(context.clone())?;
+    let cloned_conn = conn.clone();
+    let mut statement = conn.prepare("SELECT 7")?;
+
+    drop(context);
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 0);
+    drop(conn);
+    assert!(weak.upgrade().is_some());
+    drop(cloned_conn);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(
+        statement.run_collect_rows()?,
+        vec![vec![turso_core::Value::from_i64(7)]]
+    );
+    drop(statement);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    Ok(())
+}
+
+struct ConnectionContextDropCounter(Arc<AtomicUsize>);
+
+impl Drop for ConnectionContextDropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
 struct MultiplierState {
     multiplier: i64,
 }

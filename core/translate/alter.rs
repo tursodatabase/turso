@@ -8,6 +8,7 @@ use turso_parser::{
 
 use super::{
     index::emit_refill_index,
+    planner::ROWID_STRS,
     schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
@@ -991,13 +992,14 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
+                            join_info: None,
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],
                             cte_id: None,
                             cte_definition_only: false,
                             rowid_referenced: false,
+                            outer_join_may_null_extend: false,
                             scope_depth: 0,
                         }],
                     );
@@ -4257,23 +4259,11 @@ fn validate_trigger_columns_after_drop(
     let owning_table_columns: Option<Vec<String>> = if trigger_database_id == altered_database_id
         && trigger_table_norm == *altered_table_norm
     {
-        Some(
-            post_drop_table
-                .columns()
-                .iter()
-                .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                .collect(),
-        )
+        Some(referenceable_column_names(post_drop_table))
     } else {
         resolver.with_schema(trigger_database_id, |s| {
-            s.get_table(&trigger_table_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
-                })
-            })
+            s.get_table(&trigger_table_norm)
+                .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
     };
 
@@ -5978,25 +5968,31 @@ fn get_table_columns(
     };
 
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
-        Some(
-            post_drop_table
-                .columns()
-                .iter()
-                .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                .collect(),
-        )
+        Some(referenceable_column_names(post_drop_table))
     } else {
         resolver.with_schema(lookup_database_id, |s| {
-            s.get_table(table_name_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
-                })
-            })
+            s.get_table(table_name_norm)
+                .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
     }
+}
+
+/// Names that an expression can use to refer to a column of `table`, including
+/// the implicit rowid names when the table has a rowid.
+fn referenceable_column_names(table: &BTreeTable) -> Vec<String> {
+    let mut names: Vec<String> = table
+        .columns()
+        .iter()
+        .filter_map(|c| c.name.as_deref().map(normalize_ident))
+        .collect();
+    if table.has_rowid {
+        for rowid_name in ROWID_STRS {
+            if !names.iter().any(|name| name == rowid_name) {
+                names.push(rowid_name.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn resolve_trigger_command_table_for_alter(

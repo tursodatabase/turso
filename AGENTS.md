@@ -6,6 +6,7 @@ SQLite rewrite in Rust. 40+ crate workspace.
 
 ```bash
 cargo build                    # build. never build with --release
+cargo check                    # type check. prefer to `cargo build`
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
@@ -108,6 +109,8 @@ subject fully explains a trivial change. Conventional Commit prefixes such as
 `feat(scope):` are not required. See [CONTRIBUTING.md](CONTRIBUTING.md) for a
 complete example.
 
+Before opening a PR, read the "PR Workflow" document linked above.
+
 ## Benchmark Naming
 
 - Criterion benchmark functions must use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
@@ -117,11 +120,13 @@ complete example.
 
 1. **Correctness paramount.** Production DB, not a toy. Crash > corrupt
 2. **SQLite compatibility.** Compare bytecode with `EXPLAIN`
-3. **Every change needs a test.** Must fail without change, pass with it
+3. **MANDATORY: Every change MUST have a test. NO EXCEPTIONS.** Add or update a test that fails without the change and passes with it. You MUST run the test in both cases and make sure that it produces those results. Never skip this requirement or treat it as optional. Do not declare a change complete without evidence of both results. If you cannot run the test, report the blocker and leave the change incomplete.
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
-6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
-7. **Driver API parity.** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
+6. **Validate your hypotheses.** If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+7. **Fix root causes, not symptoms** When designing a fix, ask yourself: is this a symptom of a deeper root cause? would my fix hide a problem that's created upstream?
+7. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
+8. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
 
 ## Always use plain language instead of complex jargon
 
@@ -139,7 +144,7 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 
 No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is. Do
 not use metaphorical language, such as the following terms: load-bearing, pin, bite, sharp, arm, guard, bless, wedge,
-retire, retarget, answer, settle, carry, land, honor.
+retire, retarget, answer, settle, carry, land, honor, rebase, hold.
 Do not make up terms if they have equivalents that are commonly used in the domain.
 
 ## Code flows from top to bottom

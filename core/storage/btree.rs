@@ -1377,7 +1377,7 @@ impl BTreeCursor {
                 {
                     let (mem_page, c) = return_if_io!(self.pager.read_page(target));
                     self.iteration_pending_descent = None;
-                    self.descend_backwards(mem_page);
+                    self.descend_backwards(mem_page)?;
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -1410,7 +1410,7 @@ impl BTreeCursor {
                         // had moved us past it.
                         let (page, c) = return_if_io!(self.read_page(rightmost_pointer as i64));
                         self.stack.set_cell_index(past_rightmost_pointer);
-                        self.descend_backwards(page);
+                        self.descend_backwards(page)?;
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -1486,7 +1486,7 @@ impl BTreeCursor {
                 // of the loop replays only the read+descend on re-entry.
                 match self.pager.read_page(left_child_page as i64)? {
                     IOResult::Done((mem_page, c)) => {
-                        self.descend_backwards(mem_page);
+                        self.descend_backwards(mem_page)?;
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -1671,7 +1671,7 @@ impl BTreeCursor {
                 {
                     let (mem_page, c) = return_if_io!(self.pager.read_page(target));
                     self.iteration_pending_descent = None;
-                    self.descend(mem_page);
+                    self.descend(mem_page)?;
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -1731,7 +1731,7 @@ impl BTreeCursor {
                             // above skips the loop-top advances on re-entry.
                             match self.pager.read_page(right_most_pointer as i64)? {
                                 IOResult::Done((mem_page, c)) => {
-                                    self.descend(mem_page);
+                                    self.descend(mem_page)?;
                                     if let Some(c) = c {
                                         io_yield_one!(c);
                                     }
@@ -1782,7 +1782,7 @@ impl BTreeCursor {
                 // `iteration_pending_descent`.
                 match self.pager.read_page(left_child_page as i64)? {
                     IOResult::Done((mem_page, c)) => {
-                        self.descend(mem_page);
+                        self.descend(mem_page)?;
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -1831,16 +1831,16 @@ impl BTreeCursor {
 
     /// Descend into a child page during forward iteration.
     /// Clears the `going_upwards` flag — once we descend, we are no longer going upwards.
-    fn descend(&mut self, page: PageRef) {
+    fn descend(&mut self, page: PageRef) -> Result<()> {
         self.going_upwards = false;
-        self.stack.push(page);
+        self.stack.push(page)
     }
 
     /// Descend into a child page during backward iteration.
     /// Clears the `going_upwards` flag — once we descend, we are no longer going upwards.
-    fn descend_backwards(&mut self, page: PageRef) {
+    fn descend_backwards(&mut self, page: PageRef) -> Result<()> {
         self.going_upwards = false;
-        self.stack.push_backwards(page);
+        self.stack.push_backwards(page)
     }
 
     /// Move the cursor to the root page of the btree.
@@ -1878,7 +1878,7 @@ impl BTreeCursor {
         }
         let (mem_page, c) = return_if_io!(self.read_page(self.root_page));
         self.stack.clear();
-        self.stack.push(mem_page);
+        self.stack.push(mem_page)?;
         Ok(IOResult::Done(c))
     }
 
@@ -1931,7 +1931,7 @@ impl BTreeCursor {
                             let (mem_page, c) =
                                 return_if_io!(self.read_page(right_most_pointer as i64));
                             self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                            self.stack.push(mem_page);
+                            self.stack.push(mem_page)?;
                             if let Some(c) = c {
                                 io_yield_one!(c);
                             }
@@ -2077,7 +2077,7 @@ impl BTreeCursor {
             match self.read_page(left_child_page as i64)? {
                 IOResult::Done((mem_page, c)) => {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    self.stack.push(mem_page);
+                    self.stack.push(mem_page)?;
                     self.seek_state = CursorSeekState::MovingBetweenPages {
                         eq_seen: state.eq_seen,
                     };
@@ -2100,7 +2100,7 @@ impl BTreeCursor {
             Some(right_most_pointer) => match self.read_page(right_most_pointer as i64)? {
                 IOResult::Done((mem_page, c)) => {
                     self.stack.set_cell_index(cell_count as i32 + 1);
-                    self.stack.push(mem_page);
+                    self.stack.push(mem_page)?;
                     self.seek_state = CursorSeekState::MovingBetweenPages {
                         eq_seen: state.eq_seen,
                     };
@@ -2372,7 +2372,7 @@ impl BTreeCursor {
                     match self.read_page(right_most_pointer as i64)? {
                         IOResult::Done((mem_page, c)) => {
                             self.stack.set_cell_index(cell_count as i32 + 1);
-                            self.stack.push(mem_page);
+                            self.stack.push(mem_page)?;
                             self.seek_state = CursorSeekState::MovingBetweenPages {
                                 eq_seen: state.eq_seen,
                             };
@@ -2422,7 +2422,7 @@ impl BTreeCursor {
                 if iter_dir == IterationDirection::Backwards {
                     self.stack.retreat();
                 }
-                self.stack.push(mem_page);
+                self.stack.push(mem_page)?;
                 self.seek_state = CursorSeekState::MovingBetweenPages {
                     eq_seen: state.eq_seen,
                 };
@@ -5372,9 +5372,9 @@ impl BTreeCursor {
         root_contents.overflow_cells.clear();
         self.root_page = root.get().id() as i64;
         self.stack.clear();
-        self.stack.push(root);
+        self.stack.push(root)?;
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
-        self.stack.push(child);
+        self.stack.push(child)?;
         Ok(IOResult::Done(()))
     }
 
@@ -5558,7 +5558,7 @@ impl BTreeCursor {
                                     // there.
                                     match self.pager.read_page(rightmost as i64)? {
                                         IOResult::Done((rightmost_page, c)) => {
-                                            self.stack.push(rightmost_page);
+                                            self.stack.push(rightmost_page)?;
                                             let destroy_info =
                                                 self.state.mut_destroy_info().expect(
                                                     "unable to get a mut reference to destroy state in cursor",
@@ -5636,7 +5636,7 @@ impl BTreeCursor {
                                 // — see the rightmost branch comment above.
                                 match self.pager.read_page(child_page_id as i64)? {
                                     IOResult::Done((child_page, c)) => {
-                                        self.stack.push(child_page);
+                                        self.stack.push(child_page)?;
                                         let destroy_info =
                                             self.state.mut_destroy_info().expect(
                                                 "unable to get a mut reference to destroy state in cursor",
@@ -5676,7 +5676,7 @@ impl BTreeCursor {
                             let target = index_int_cell.left_child_page as i64;
                             match self.pager.read_page(target)? {
                                 IOResult::Done((child_page, c)) => {
-                                    self.stack.push(child_page);
+                                    self.stack.push(child_page)?;
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
                                     );
@@ -5707,7 +5707,7 @@ impl BTreeCursor {
                 }
                 DestroyState::PendingDescent { target } => {
                     let (child_page, c) = return_if_io!(self.pager.read_page(target));
-                    self.stack.push(child_page);
+                    self.stack.push(child_page)?;
                     let destroy_info = self
                         .state
                         .mut_destroy_info()
@@ -7476,7 +7476,7 @@ impl CursorTrait for BTreeCursor {
                         match self.pager.read_page(right_most_pointer as i64)? {
                             IOResult::Done((child, c)) => {
                                 self.stack.advance();
-                                self.stack.push(child);
+                                self.stack.push(child)?;
                                 if let Some(c) = c {
                                     io_yield_one!(c);
                                 }
@@ -7506,7 +7506,7 @@ impl CursorTrait for BTreeCursor {
                                 match self.pager.read_page(left_child_page as i64)? {
                                     IOResult::Done((child, c)) => {
                                         self.stack.advance();
-                                        self.stack.push(child);
+                                        self.stack.push(child)?;
                                         if let Some(c) = c {
                                             io_yield_one!(c);
                                         }
@@ -7529,7 +7529,7 @@ impl CursorTrait for BTreeCursor {
                     // this step; finish the descent and return to `Loop`.
                     let (child, c) = return_if_io!(self.pager.read_page(target));
                     self.stack.advance();
-                    self.stack.push(child);
+                    self.stack.push(child)?;
                     self.count_state = CountState::Loop;
                     if let Some(c) = c {
                         io_yield_one!(c);
@@ -7794,7 +7794,7 @@ impl CursorTrait for BTreeCursor {
                             let (child, c) =
                                 return_if_io!(self.read_page(right_most_pointer as i64));
                             self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                            self.stack.push(child);
+                            self.stack.push(child)?;
                             if let Some(c) = c {
                                 io_yield_one!(c);
                             }
@@ -8728,21 +8728,18 @@ impl PageStack {
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::push"))]
-    fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
+    fn _push(&mut self, page: PageRef, starting_cell_idx: i32) -> Result<()> {
         tracing::trace!(current = self.current_page, new_page_id = page.get().id(),);
-        'validate: {
-            let current = self.current_page;
-            if current == -1 {
-                break 'validate;
-            }
-            let current_top = self.stack[current as usize].as_ref();
-            if let Some(current_top) = current_top {
-                turso_assert!(
-                    current_top.get().id() != page.get().id(),
-                    "about to push page twice",
-                    { "page_id": page.get().id() }
-                );
-            }
+        // A child pointer that leads back to a page already on the path
+        // from the root makes the tree a loop. That only happens in a
+        // corrupt file, so report it instead of descending forever.
+        let page_id = page.get().id();
+        let on_path = self.stack[..(self.current_page + 1) as usize]
+            .iter()
+            .flatten()
+            .any(|ancestor| ancestor.get().id() == page_id);
+        if on_path {
+            crate::bail_corrupt_error!("page {page_id} is its own ancestor in the b-tree");
         }
         self.populate_parent_cell_count();
         self.current_page += 1;
@@ -8762,6 +8759,7 @@ impl PageStack {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
         };
+        Ok(())
     }
 
     /// Populate the parent page's cell count.
@@ -8792,12 +8790,12 @@ impl PageStack {
         self.node_states[current].cell_count = Some(cell_count);
     }
 
-    fn push(&mut self, page: PageRef) {
-        self._push(page, -1);
+    fn push(&mut self, page: PageRef) -> Result<()> {
+        self._push(page, -1)
     }
 
-    fn push_backwards(&mut self, page: PageRef) {
-        self._push(page, i32::MAX);
+    fn push_backwards(&mut self, page: PageRef) -> Result<()> {
+        self._push(page, i32::MAX)
     }
 
     /// Pop a page off the stack.

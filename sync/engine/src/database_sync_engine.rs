@@ -55,7 +55,7 @@ pub struct DatabaseSyncEngineOpts {
     /// Experimental [`turso_core::DatabaseOpts`] applied whenever the sync
     /// engine opens the local database itself (the main connection in
     /// [`DatabaseSyncEngine::create_db`] and the revert connection in
-    /// [`DatabaseSyncEngine::open_revert_db_conn`]). Bindings translate their
+    /// `DatabaseSyncEngine::open_revert_db_conn`). Bindings translate their
     /// user-facing experimental feature list into these options. Note that
     /// callers which open the main database on their own (e.g. the sdk-kit
     /// path) must still apply the same options there — this field only governs
@@ -64,7 +64,7 @@ pub struct DatabaseSyncEngineOpts {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<Secret>,
-    /// When set, [`push_changes_to_remote`] sends the local change set to the
+    /// When set, [`DatabaseSyncEngine::push_changes_to_remote`] sends the local change set to the
     /// remote in multiple HTTP batches, sealing the current batch as soon as it
     /// has accumulated >= `push_operations_threshold` operations *and* the
     /// next batch boundary lines up with a transaction boundary in the local

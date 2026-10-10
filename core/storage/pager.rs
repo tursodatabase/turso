@@ -137,7 +137,7 @@ mod page_inner {
         /// requests unpinning via [Page::unpin], the pin count will still be >0 if the outer
         /// code path has not yet requested to unpin the page as well.
         ///
-        /// Note that [PageCache::clear] evicts the pages even if pinned, so as long as
+        /// Note that `PageCache::clear` evicts the pages even if pinned, so as long as
         /// we clear the page cache on errors, pins will not 'leak'.
         pub pin_count: AtomicUsize,
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
@@ -162,7 +162,7 @@ mod page_inner {
 
     // Methods moved from PageContent - these provide btree page access
     impl PageInner {
-        /// Creates a new PageInner from an Arc<Buffer>.
+        /// Creates a new PageInner from an `Arc<Buffer>`.
         pub fn new(buffer: Arc<Buffer>) -> Self {
             let mut inner = Self::unloaded(0);
             inner.set_buffer(buffer);
@@ -1042,7 +1042,7 @@ impl Page {
     }
 
     #[inline]
-    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
+    /// caller must ensure that `Pager::dirty_pages` will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id());
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -2645,8 +2645,8 @@ impl Pager {
         PENDING_BYTE
     }
 
-    /// From SQLITE: https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608 \
-    /// The database page the [PENDING_BYTE] occupies. This page is never used.
+    /// From SQLITE: <https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608> \
+    /// The database page the `PENDING_BYTE` occupies. This page is never used.
     pub fn pending_byte_page_id(&self) -> Option<u32> {
         // PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
         let page_size = self.shared.page_size.load(Ordering::SeqCst);
@@ -3387,8 +3387,8 @@ impl Pager {
     }
 
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
-    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
-    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
+    /// if update_transaction_state set to false, then `Connection::transaction_state` left unchanged
+    /// if update_transaction_state set to true, then `Connection::transaction_state` reset to `TransactionState::None` in case when method completes without error
     /// `sync_mode` belongs to this pager's database because attached databases
     /// can use a different synchronous mode from the connection's main database.
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3445,6 +3445,7 @@ impl Pager {
                 _ => {
                     return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
+                        connection.get_wal_autocheckpoint(),
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
@@ -4488,6 +4489,7 @@ impl Pager {
     pub fn commit_wal(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4503,7 +4505,12 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(
+            allowed_auto_actions,
+            checkpoint_threshold,
+            sync_mode,
+            data_sync_retry,
+        );
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -4519,6 +4526,7 @@ impl Pager {
     fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4780,7 +4788,7 @@ impl Pager {
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
-                        && wal.should_checkpoint();
+                        && wal.should_checkpoint(checkpoint_threshold);
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -5457,7 +5465,7 @@ impl Pager {
     /// database handle, SQLite checks if if there are other connections to the
     /// same database, and if there are no other database connection (if the
     /// connection being closed is the last open connection to the database),
-    /// then SQLite performs a [checkpoint] before closing the connection and
+    /// then SQLite performs a checkpoint before closing the connection and
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
@@ -5869,6 +5877,12 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
+                        if next_leaf_page_id < 2 || next_leaf_page_id > header.database_size.get() {
+                            crate::bail_corrupt_error!(
+                                "freelist leaf page {next_leaf_page_id} is outside the database of {} pages",
+                                header.database_size.get()
+                            );
+                        }
                         // Pin + state-advance happen only on `Done` so a
                         // spill yield doesn't double-pin the leaf page.
                         let (leaf_page, c) =
@@ -5900,12 +5914,12 @@ impl Pager {
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist trunk page has overflow cells",
-                        { "page_id": trunk_page.get().id() }
-                    );
+                    if !trunk_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist trunk page {} is in use by a b-tree",
+                            trunk_page.get().id()
+                        );
+                    }
                     trunk_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id());
                     {
@@ -5934,12 +5948,12 @@ impl Pager {
                     );
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page has overflow cells",
-                        { "page_id": leaf_page.get().id() }
-                    );
+                    if !leaf_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist leaf page {} is in use by a b-tree",
+                            leaf_page.get().id()
+                        );
+                    }
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id());
                     {

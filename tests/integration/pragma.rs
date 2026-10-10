@@ -300,6 +300,50 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
         );
 }
 
+#[turso_macros::test]
+fn test_pragma_wal_autocheckpoint_zero_keeps_every_frame_in_the_wal(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+    conn.execute("CREATE TABLE t1(a)").unwrap();
+    conn.execute("INSERT INTO t1 SELECT randomblob(4000) FROM generate_series(1, 1500)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA wal_checkpoint"))
+        .single_element()
+        .satisfies_with_message(
+            "keep a frame for each of the 1500 rows in the WAL",
+            |row| matches!(row[..], [RValue::Integer(0), RValue::Integer(log), _] if log > 1500),
+        );
+}
+
+#[turso_macros::test]
+fn test_pragma_wal_autocheckpoint_small_threshold_checkpoints_after_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA wal_autocheckpoint = 10").unwrap();
+    conn.execute("CREATE TABLE t1(a)").unwrap();
+    conn.execute("INSERT INTO t1 SELECT randomblob(4000) FROM generate_series(1, 20)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA wal_checkpoint"))
+        .single_element()
+        .satisfies_with_message(
+            "restart the WAL after the 20 rows were checkpointed",
+            |row| matches!(row[..], [RValue::Integer(0), RValue::Integer(log), _] if log < 20),
+        );
+}
+
+#[turso_macros::test]
+fn test_pragma_wal_autocheckpoint_is_per_connection(db: TempDatabase) {
+    let conn1 = db.connect_limbo();
+    let conn2 = db.connect_limbo();
+    conn1.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+
+    assert_that!(limbo_exec_rows(&conn2, "PRAGMA wal_autocheckpoint"))
+        .is_equal_to(vec![row![1000]]);
+}
+
 // Regression tests for https://github.com/tursodatabase/turso/issues/7466:
 // querying a pragma virtual table (pragma_table_info, pragma_function_list, ...)
 // left the connection's implicit read transaction open, so every subsequent

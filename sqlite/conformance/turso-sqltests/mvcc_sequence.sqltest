@@ -164,6 +164,24 @@ expect {
     4
 }
 
+# An explicit rowid equal to a fresh sequence's first value (1, not yet
+# handed out) must still advance the sequence; otherwise the next
+# AUTOINCREMENT insert reuses 1 and replaces the row.
+test mvcc-autoinc-explicit-first-rowid-advances-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t7 VALUES (1, 'a');
+    SELECT name, seq FROM sqlite_sequence WHERE name = 't7';
+    INSERT INTO t7(v) VALUES ('b');
+    SELECT id, v FROM t7 ORDER BY id;
+}
+expect {
+    mvcc
+    t7|1
+    1|a
+    2|b
+}
+
 # MVCC -> WAL mode switch: autoincrement ids continue correctly
 test mvcc-to-wal-autoincrement-continues {
     PRAGMA journal_mode = 'mvcc';

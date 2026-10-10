@@ -287,7 +287,7 @@ avoid this window.
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
 | PRAGMA vdbe_trace                | ✅ Yes        |                                              |
-| PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
+| PRAGMA wal_autocheckpoint        | ✅ Yes        |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
 

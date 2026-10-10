@@ -141,6 +141,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["user_version"],
         ),
+        WalAutocheckpoint => Pragma::new(PragmaFlags::empty(), &["wal_autocheckpoint"]),
         WalCheckpoint => Pragma::new(PragmaFlags::NeedSchema, &["busy", "log", "checkpointed"]),
         AutoVacuum => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,

@@ -14,6 +14,7 @@ path = "lib.rs"
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"
+strum = { workspace = true }
 tempfile = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",
@@ -21,6 +22,9 @@ turso_core = { workspace = true, default-features = true, features = [
 turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_parser = { workspace = true }
+
+[dev-dependencies]
+turso_core = { workspace = true, features = ["io_memory_yield"] }
 
 [lints]
 workspace = true

@@ -88,7 +88,8 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
-            | "pg_tables" => table_name.to_string(),
+            | "pg_tables"
+            | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
@@ -1712,8 +1713,19 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
                     // A JoinExpr as a comma-separated item — flatten its joins
                     let nested = self.translate_join_expr(join_expr)?;
+                    if nested.joins.iter().any(join_keeps_unmatched_right_rows) {
+                        return Err(ParseError::ParseError(
+                            "RIGHT and FULL joins after a comma in FROM are not supported"
+                                .to_string(),
+                        ));
+                    }
+                    from_clause.joins.push(ast::JoinedSelectTable {
+                        operator: ast::JoinOperator::Comma,
+                        table: nested.select,
+                        constraint: None,
+                    });
                     from_clause.joins.extend(nested.joins);
-                    *nested.select
+                    continue;
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
@@ -3123,7 +3135,7 @@ impl PostgreSQLTranslator {
 
         // Translate OVER clause (window function)
         let over_clause = if let Some(ref window_def) = func_call.over {
-            Some(self.translate_window_def(window_def)?)
+            Some(Box::new(self.translate_window_def(window_def)?))
         } else {
             None
         };
@@ -3499,7 +3511,7 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let select = Box::new(self.translate_select(select_stmt)?);
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
@@ -4010,6 +4022,13 @@ impl PostgreSQLTranslator {
             constraints,
         })
     }
+}
+
+fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
+    matches!(
+        join.operator,
+        ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
+    )
 }
 
 /// PostgreSQL derives a name for result columns without an explicit alias
@@ -6147,6 +6166,43 @@ mod tests {
     }
 
     #[test]
+    fn test_join_after_a_comma_keeps_its_order() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM a, b JOIN c ON b.y < c.z",
+                "SELECT * FROM a, b INNER JOIN c ON b.y < c.z",
+            ),
+            (
+                "SELECT * FROM a, b CROSS JOIN c",
+                "SELECT * FROM a, b INNER JOIN c",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_right_or_full_join_after_a_comma_is_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT * FROM a, b RIGHT JOIN c ON true",
+            "SELECT * FROM a, b FULL JOIN c ON true",
+            "SELECT * FROM a, b JOIN c ON true RIGHT JOIN d ON true",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "RIGHT and FULL joins after a comma in FROM are not supported",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_join_subquery() {
         let translator = PostgreSQLTranslator::new();
         let sql = r#"SELECT c.name, sq.cnt FROM cities c LEFT JOIN (SELECT city_id, count(*) as cnt FROM users GROUP BY city_id) sq ON c.id = sq.city_id"#;
@@ -7166,7 +7222,7 @@ mod tests {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { filter_over, .. } = &**expr {
                         assert!(
-                            matches!(&filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"),
+                            matches!(filter_over.over_clause.as_deref(), Some(ast::Over::Name(n)) if n.as_str() == "w"),
                             "Expected Over::Name(\"w\"), got: {:?}",
                             filter_over.over_clause
                         );
@@ -7270,7 +7326,7 @@ mod tests {
         let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
             panic!("expected function call expression, got {expr:?}");
         };
-        let Some(ast::Over::Window(window)) = &filter_over.over_clause else {
+        let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
             panic!(
                 "expected inline OVER window, got {:?}",
                 filter_over.over_clause

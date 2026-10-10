@@ -347,6 +347,7 @@ pub(crate) fn emit_refill_index(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
             internal_id: table_ref,
@@ -1298,7 +1299,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // read type of table

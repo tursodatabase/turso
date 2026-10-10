@@ -220,7 +220,7 @@ set test_files {
   e_reindex            fail
   e_resolve            fail
   e_select             fail
-  e_select2            fail
+  e_select2            pass
   e_totalchanges       fail
   e_update             fail
   e_uri                fail
@@ -335,13 +335,13 @@ set test_files {
   join6                pass
   join7                fail
   join8                fail
-  join9                fail
-  joinA                fail
-  joinB                fail
-  joinC                fail
+  join9                pass
+  joinA                pass
+  joinB                pass
+  joinC                pass
   joinD                fail
   joinE                pass
-  joinF                fail
+  joinF                pass
   joinH                fail
   journal1             fail
   journal2             fail
@@ -601,7 +601,7 @@ set test_files {
   tkt-6bfb98dfc0       pass
   tkt-752e1646fc       pass
   tkt-78e04e52ea       fail
-  tkt-7a31705a7e6      fail
+  tkt-7a31705a7e6      pass
   tkt-7bbfb7d442       pass
   tkt-80ba201079       fail
   tkt-80e031a00f       fail
@@ -609,7 +609,7 @@ set test_files {
   tkt-868145d012       pass
   tkt-8c63ff0ec        pass
   tkt-91e2e8ba6f       pass
-  tkt-99378177930f87bd fail
+  tkt-99378177930f87bd pass
   tkt-9a8b09f8e6       pass
   tkt-9d68c883         fail
   tkt-9f2eb3abac       pass
@@ -628,7 +628,7 @@ set test_files {
   tkt-cbd054fa6b       fail
   tkt-d11f09d36e       pass
   tkt-d635236375       pass
-  tkt-d82e3f3721       fail
+  tkt-d82e3f3721       pass
   tkt-f3e5abed55       fail
   tkt-f67b41381a       fail
   tkt-f777251dc7a      fail
@@ -646,7 +646,7 @@ set test_files {
   tkt1512              fail
   tkt1514              fail
   tkt1536              pass
-  tkt1537              fail
+  tkt1537              pass
   tkt1567              fail
   tkt1644              fail
   tkt1667              pass
@@ -711,7 +711,7 @@ set test_files {
   tkt3841              pass
   tkt3871              fail
   tkt3879              pass
-  tkt3911              fail
+  tkt3911              pass
   tkt3918              fail
   tkt3922              pass
   tkt3929              pass
@@ -762,7 +762,7 @@ set test_files {
   upfrom1              fail
   upfrom2              fail
   upfrom3              fail
-  upfrom4              fail
+  upfrom4              pass
   upsert1              fail
   upsert2              fail
   upsert3              pass

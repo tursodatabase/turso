@@ -169,6 +169,8 @@ pub struct SnapshotCase {
     /// If true, only run EXPLAIN QUERY PLAN (no bytecode).
     /// Set by the `snapshot-eqp` directive.
     pub eqp_only: bool,
+    /// Include bundled SQLite's EXPLAIN output and an opcode diff.
+    pub sqlite_reference: bool,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
 }

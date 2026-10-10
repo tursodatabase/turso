@@ -162,6 +162,7 @@ mod cte_tests {
     pub fn cte_dml_scenario(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("cte_dml_scenario");
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         let iterations = helpers::fuzz_iterations(100);
         for i in 0..iterations {
@@ -169,7 +170,7 @@ mod cte_tests {
 
             // Create fresh databases for each iteration
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -579,13 +580,14 @@ mod cte_tests {
     pub fn cte_with_real_tables_scenario(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("cte_with_real_tables_scenario");
         let builder = helpers::builder_from_db(&db);
+        let sqlite_builder = helpers::sqlite_builder_from_db(&db);
 
         let iterations = helpers::fuzz_iterations(100);
         for i in 0..iterations {
             helpers::log_progress("cte_with_real_tables_scenario", i, iterations, 4);
 
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            let sqlite_db = sqlite_builder.clone().build();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 

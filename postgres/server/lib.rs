@@ -56,7 +56,8 @@ impl TursoPgServer {
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {})",
-            self.address, self.db_file
+            listener.local_addr()?,
+            self.db_file
         );
 
         let factory = Arc::new(TursoPgFactory {

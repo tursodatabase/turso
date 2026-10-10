@@ -375,6 +375,9 @@ fn emit_loop_source<'a>(
             // They are cached in expr_to_reg_cache so that when the full
             // expression is evaluated after AggFinal, translate_expr finds
             // the cached values instead of reading from the exhausted cursor.
+            // Columns of an outer query are not pre-read: the outer cursor does
+            // not move while this loop runs, and a value read here would be stale
+            // for an outer row where this loop finds no rows.
             for rc in plan
                 .result_columns
                 .iter()
@@ -382,6 +385,14 @@ fn emit_loop_source<'a>(
             {
                 walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
+                        Expr::Column { table, .. } | Expr::RowId { table, .. }
+                            if plan
+                                .table_references
+                                .find_joined_table_by_internal_id(*table)
+                                .is_none() =>
+                        {
+                            Ok(WalkControl::SkipChildren)
+                        }
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
                             translate_expr(
@@ -491,15 +502,30 @@ fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<
 /// by anything else are stale here: nothing refills them once the probe loop has
 /// exited. Skipping a condition whose columns are all readable silently drops it
 /// from the null-extended rows, letting through rows the query filtered out.
+///
+/// A correlated subquery result is readable only if every table the subquery
+/// reads is one of `allowed`. Otherwise the subquery runs inside the inner
+/// loop, and its result register still holds the value from an earlier row.
 fn condition_operands_are_available(
     expr: &Expr,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
     allowed: &TableMask,
     resolver: &Resolver,
     payload_regs: Range<usize>,
-) -> bool {
+) -> Result<bool> {
     let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { .. } = e {
+            if !allowed.contains_all_set_bits_of(&table_mask_from_expr(
+                e,
+                table_references,
+                subqueries,
+            )?) {
+                ok = false;
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = e else {
             return Ok(WalkControl::Continue);
         };
@@ -521,8 +547,8 @@ fn condition_operands_are_available(
         }
         // Outer query references are already in scope — allow them.
         Ok(WalkControl::Continue)
-    });
-    ok
+    })?;
+    Ok(ok)
 }
 
 /// Emit WHERE conditions and inner-loop entry for an unmatched hash build row.
@@ -587,7 +613,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .where_clause
         .iter()
         .enumerate()
-        .filter(|(_, condition)| !condition.consumed && condition.from_outer_join.is_none())
+        .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
     {
         if prefiltered_terms.contains(&condition_idx) {
             continue;
@@ -606,10 +632,11 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             && !condition_operands_are_available(
                 &condition.expr,
                 &plan.table_references,
+                &plan.non_from_clause_subqueries,
                 &allowed_tables,
                 &t_ctx.resolver,
                 payload_regs.clone(),
-            )
+            )?
         {
             continue;
         }

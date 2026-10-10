@@ -274,7 +274,7 @@ pub struct HashBuildData {
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
 ///
-/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// Build it from a `BitSet` via `From`; that keeps the invariant that the
 /// inner option is `None` exactly when the mask is empty.
 #[derive(Debug, Clone, Default)]
 pub struct NullMatchingMask(Option<Box<BitSet>>);
@@ -559,6 +559,13 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
+    /// If the cursor is on a null row, write NULL to `dest` and jump.
+    /// This instruction does nothing for an unopened cursor.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        dest: usize,
+    },
     /// Add two registers and store the result in a third register.
     Add {
         lhs: usize,
@@ -652,7 +659,7 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
-    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// Compute a hash on num_keys registers starting with `r[key_reg]`. Check to see if that hash
     /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
     /// then jump to target_pc. Otherwise fall through.
     /// False negatives are harmless. It is always safe to fall through, even if the value is
@@ -668,7 +675,7 @@ pub enum Insn {
         /// Number of key registers to hash together
         num_keys: usize,
     },
-    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
     FilterAdd {
         cursor_id: CursorID,
@@ -824,7 +831,7 @@ pub enum Insn {
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
-    /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
+    /// Input: reg = JSON text like `'[1,2,3]'`. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
         data: Box<ArrayEncodeData>,
@@ -902,8 +909,10 @@ pub enum Insn {
     },
 
     /// Copy a register value to a dynamically-computed destination.
+    /// ```text
     /// dest = registers[base + registers[offset_reg]]
     /// registers[base + registers[offset_reg]] = registers[src]
+    /// ```
     RegCopyOffset {
         src: usize,
         base: usize,
@@ -1023,7 +1032,7 @@ pub enum Insn {
 
     /// Invoke a trigger or foreign-key action subprogram.
     ///
-    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// According to SQLite documentation (<https://sqlite.org/opcode.html>):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
     /// allocates and initializes a fresh register set for each invocation of the
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
@@ -1101,6 +1110,11 @@ pub enum Insn {
     DeferredSeek {
         index_cursor_id: CursorID,
         table_cursor_id: CursorID,
+    },
+
+    /// Complete a pending DeferredSeek before a write that can use only index values.
+    FinishSeek {
+        cursor_id: CursorID,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -2162,6 +2176,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,
@@ -2243,6 +2258,7 @@ impl InsnVariants {
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
+            InsnVariants::FinishSeek => execute::op_finish_seek,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE

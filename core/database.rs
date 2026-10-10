@@ -39,8 +39,8 @@ use crate::{
     sync::{
         self,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize,
-            Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8,
+            AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
     },
@@ -55,6 +55,7 @@ use crate::{
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
 #[cfg(host_shared_wal)]
@@ -224,6 +225,7 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
+    pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
@@ -238,17 +240,19 @@ impl OpenOptions {
     /// The dialect has no default: it is fixed at open time and shared by
     /// every user of the instance, so the caller must choose it explicitly.
     pub fn new(dialect: Arc<dyn Dialect>) -> Self {
-        Self {
+        let options = Self {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
+            native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
-            dialect,
-        }
+            dialect: dialect.clone(),
+        };
+        dialect.register_native_extensions(options)
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
@@ -727,6 +731,7 @@ impl Database {
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -806,6 +811,7 @@ impl Database {
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
+        native_extensions.register(&db)?;
         Ok(db)
     }
 
@@ -1335,6 +1341,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         );
 
         match &result {
@@ -1412,6 +1419,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         )
     }
 
@@ -1432,6 +1440,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1453,6 +1462,7 @@ impl Database {
             page_codec,
             allocators,
             dialect,
+            native_extensions,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1474,6 +1484,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1502,6 +1513,7 @@ impl Database {
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1555,6 +1567,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
+                        None,
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1688,6 +1701,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
+                                None,
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -2352,7 +2366,7 @@ impl Database {
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
+                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2369,7 +2383,22 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None, StatsRefresh::Blocking)
+        self._connect(false, None, None, None, None, StatsRefresh::Blocking)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_context<C: Any + Send + Sync>(
+        self: &Arc<Database>,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            None,
+            None,
+            Some(context),
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Connect with an encryption key.
@@ -2379,7 +2408,14 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            encryption_key,
+            None,
+            None,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Connect with an external page codec.
@@ -2391,7 +2427,14 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
+        self._connect(
+            false,
+            None,
+            None,
+            Some(page_codec),
+            None,
+            StatsRefresh::Blocking,
+        )
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2433,8 +2476,14 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
-                let conn =
-                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
+                let conn = self._connect(
+                    false,
+                    None,
+                    encryption_key,
+                    None,
+                    None,
+                    StatsRefresh::Deferred,
+                )?;
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -2457,6 +2506,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
+        context: Option<Arc<dyn Any + Send + Sync>>,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2490,6 +2540,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            context,
         )?;
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
@@ -2512,6 +2563,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            None,
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2525,10 +2577,12 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        context: Option<Arc<dyn Any + Send + Sync>>,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
+            context,
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
@@ -2542,6 +2596,7 @@ impl Database {
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
+            wal_autocheckpoint: AtomicU32::new(1000),
             #[cfg(feature = "conn_raw_api")]
             portable_logical_changes_enabled: AtomicBool::new(false),
             #[cfg(feature = "conn_raw_api")]

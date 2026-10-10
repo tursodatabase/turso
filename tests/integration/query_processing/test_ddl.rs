@@ -1,4 +1,4 @@
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{rusqlite_integrity_check, ExecRows, TempDatabase};
 use asserting::prelude::*;
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
@@ -54,6 +54,38 @@ fn test_fail_drop_partial_index_column(tmp_db: TempDatabase) -> anyhow::Result<(
 
     conn.execute("CREATE INDEX i ON t (b) WHERE a > 0")?;
     assert_that!(conn.execute("ALTER TABLE t DROP COLUMN a")).is_err();
+    Ok(())
+}
+
+#[test]
+fn test_drop_sqlite_created_mixed_case_index() -> anyhow::Result<()> {
+    for drop_sql in [
+        "DROP INDEX Idx_A",
+        "DROP INDEX idx_a",
+        "DROP INDEX \"Idx_A\"",
+        "DROP INDEX IF EXISTS Idx_A",
+    ] {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let db_path = tmp_dir.path().join("test.db");
+        rusqlite::Connection::open(&db_path)?.execute_batch(
+            "CREATE TABLE t(a); CREATE INDEX Idx_A ON t(a); INSERT INTO t VALUES(7)",
+        )?;
+
+        let db = TempDatabase::new_with_existent(&db_path);
+        db.connect_limbo().execute(drop_sql)?;
+        drop(db);
+
+        let sqlite = rusqlite::Connection::open(&db_path)?;
+        let indexes: i64 = sqlite.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(indexes, 0, "{drop_sql}");
+        sqlite.execute_batch("CREATE TABLE t2(b); INSERT INTO t2 VALUES(9)")?;
+        drop(sqlite);
+        crate::common::rusqlite_integrity_check(&db_path)?;
+    }
     Ok(())
 }
 
@@ -288,4 +320,76 @@ fn test_drop_broken_legacy_view_row() -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT \"col one\" FROM v");
     assert_eq!(rows, vec![(42,)]);
     Ok(())
+}
+
+#[test]
+fn test_drop_sqlite_created_mixed_case_table() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "CREATE TABLE T1(a); INSERT INTO T1 VALUES(7)",
+            "DROP TABLE T1",
+        ),
+        ("CREATE TABLE T1(a)", "DROP TABLE t1"),
+        ("CREATE TABLE T1(a)", "DROP TABLE \"T1\""),
+        ("CREATE TABLE T1(a)", "DROP TABLE IF EXISTS T1"),
+        (
+            "CREATE TABLE T1(a); CREATE INDEX I1 ON T1(a); \
+             CREATE TRIGGER Tr1 AFTER INSERT ON T1 BEGIN SELECT 1; END; \
+             INSERT INTO T1 VALUES(7)",
+            "DROP TABLE T1",
+        ),
+    ];
+
+    for (setup, drop_sql) in cases {
+        let (_tmp_dir, db_path) = create_database_with_sqlite(setup)?;
+        let db = TempDatabase::builder().with_db_path(&db_path).build();
+        db.connect_limbo().execute(drop_sql)?;
+        drop(db);
+
+        let sqlite = rusqlite::Connection::open(&db_path)?;
+        let remaining: i64 =
+            sqlite.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+        assert_eq!(remaining, 0, "{drop_sql}");
+        sqlite.execute_batch("CREATE TABLE t2(b); INSERT INTO t2 VALUES(9)")?;
+        drop(sqlite);
+        rusqlite_integrity_check(&db_path)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_drop_sqlite_created_mixed_case_autoincrement_table() -> anyhow::Result<()> {
+    let (_tmp_dir, db_path) = create_database_with_sqlite(
+        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO T1(a, b) VALUES(99, 1)",
+    )?;
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO T1(b) VALUES(2)")?;
+    conn.execute("DROP TABLE T1")?;
+    drop(conn);
+    drop(db);
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let remaining: i64 =
+        sqlite.query_row("SELECT count(*) FROM sqlite_sequence", [], |row| row.get(0))?;
+    assert_eq!(remaining, 0);
+    drop(sqlite);
+
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b)")?;
+    conn.execute("INSERT INTO t1(b) VALUES(3)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t1");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+fn create_database_with_sqlite(
+    sql: &str,
+) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(sql)?;
+    Ok((tmp_dir, db_path))
 }

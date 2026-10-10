@@ -111,6 +111,9 @@ fn my_operation(&mut self) -> Result<IOResult<Output>> {
 }
 ```
 
+If a field is only used in one or two states, consider moving it into the relevant variant(s) of the state enum, to make
+the variable inaccessible from other states. It also makes it easier to follow the flow of the state machine.
+
 ## Re-Entrancy: The Critical Pitfall
 
 **State mutations before yield points cause bugs on re-entry.**

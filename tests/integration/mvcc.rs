@@ -761,6 +761,70 @@ fn test_stmt_rollback_on_attached_mvcc_db_with_index(tmp_db: TempDatabase) -> an
     Ok(())
 }
 
+/// A UNIQUE failure on a TEMP table inside an explicit MVCC transaction must
+/// undo that statement's TEMP writes. TEMP has no MvStore, so the pager
+/// savepoint opened for it has to be rolled back with the statement.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_rollback_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TEMP TABLE t(x UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1)")?;
+    conn.execute("BEGIN")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(2),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Same statement rollback when the UNIQUE failure is on a main table written
+/// by a TEMP trigger. Both the TEMP rows and the trigger's main writes from
+/// that statement must disappear.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_rollback_unique_via_trigger(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TABLE m(x UNIQUE)")?;
+    conn.execute("INSERT INTO m VALUES(1)")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO m VALUES(new.x); END",
+    )?;
+    conn.execute("BEGIN")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(2),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let temp_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    let main_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM m ORDER BY x");
+    assert_that!(temp_rows).is_empty();
+    assert_eq!(main_rows, vec![(1,)]);
+    Ok(())
+}
+
+/// A successful TEMP write in an explicit MVCC transaction must keep its row
+/// when a later statement rolls back. That is the statement savepoint release
+/// path: the first write is no longer undoable by the next statement abort.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_release_keeps_successful_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TEMP TABLE t(x UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1)")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES(2)")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(3),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
+    Ok(())
+}
+
 /// A deferred FK constraint violation detected at autocommit time must roll back
 /// changes on attached MVCC databases, not just the main DB.  The attached DB
 /// should be unchanged after the failed autocommit statement.

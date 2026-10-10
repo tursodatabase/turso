@@ -410,11 +410,15 @@ pub fn emit_disk_read_nextval(
     Ok(())
 }
 
-/// Emit bytecode that ensures the sequence's disk watermark is at least
-/// `value_reg`. If the current MAX is below the value, INSERTs a new
-/// watermark row at the value; otherwise no-op. Used for AUTOINCREMENT
-/// when the user supplies an explicit rowid that exceeds the running
-/// watermark — mirrors `Sequence::advance_past` but on disk.
+/// Emit bytecode that makes the sequence's next id come after `value_reg`.
+/// Used for AUTOINCREMENT when an INSERT supplies an explicit rowid, so that
+/// later generated ids never reuse it. Mirrors `Sequence::advance_past`, but
+/// on the backing table.
+///
+/// The backing table's last row is `(value, is_called)`. The next id is
+/// `value` when is_called is 0 (not handed out yet) and the id after `value`
+/// when is_called is 1. If the explicit rowid is the next id or later, this
+/// writes a row `(rowid, is_called = 1)`; otherwise it does nothing.
 pub fn emit_disk_advance_past(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -475,26 +479,57 @@ pub fn emit_disk_advance_past(
         });
     }
     program.emit_column_or_rowid(cursor_id, 0, col_value_reg);
+    let col_is_called_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 1, col_is_called_reg);
 
-    // For ascending sequences advance only if value > current; for
-    // descending advance only if value < current.
+    // Advance when the explicit rowid is the next id or later. For an
+    // ascending sequence:
+    //
+    //   rowid < value                    -> the rowid is behind; do nothing
+    //   rowid > value                    -> advance
+    //   rowid = value, is_called = 1     -> value is already used; do nothing
+    //   rowid = value, is_called = 0     -> value is the next id; advance
+    //
+    // The last case is a new table: its row is (1, is_called = 0). Without
+    // it, an explicit rowid 1 left the next id at 1, and the next generated
+    // id replaced that row. A descending sequence uses the same rule with
+    // the comparisons reversed.
     if seq.increment_by >= 0 {
-        program.emit_insn(Insn::Le {
+        program.emit_insn(Insn::Lt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
     } else {
-        program.emit_insn(Insn::Ge {
+        program.emit_insn(Insn::Gt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
+        program.emit_insn(Insn::Lt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
     }
+    program.emit_insn(Insn::If {
+        reg: col_is_called_reg,
+        target_pc: done_seek_label,
+        jump_if_null: false,
+    });
 
     program.preassign_label_to_next_insn(do_advance_label);
 
@@ -554,8 +589,8 @@ pub fn emit_disk_advance_past(
     }
 
     // Mirror the watermark into `sqlite_sequence` ONLY when the
-    // advance branch actually fired. If `value_reg` is at-or-below the
-    // current watermark we fall through to `done_seek_label` without
+    // advance branch actually fired. If `value_reg` does not advance the
+    // watermark we fall through to `done_seek_label` without
     // updating the backing table — emitting the sync after the label
     // would clobber `sqlite_sequence.seq` with a *lower* value than the
     // engine's actual watermark, regressing the SQLite-compatibility

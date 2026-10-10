@@ -5,7 +5,9 @@ use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+    },
     Arc, Mutex, RwLock,
 };
 use crate::types::IOResultOr;
@@ -34,6 +36,7 @@ use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
+use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::Display;
 use std::ops::Deref;
@@ -189,9 +192,6 @@ pub struct ReparseSchemaInner {
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
     fresh: Schema,
-    /// Built-in table-valued functions captured from the old schema; rehydrated
-    /// after the sqlite_schema scan since they don't survive re-parsing.
-    tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
@@ -384,6 +384,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
+    pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -410,6 +411,7 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    pub(super) wal_autocheckpoint: AtomicU32,
     /// Whether MVCC commits should include portable logical-change metadata in
     /// the logical log.
     ///
@@ -633,6 +635,10 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn context<C: Any>(&self) -> Option<&C> {
+        self.context.as_deref()?.downcast_ref()
+    }
+
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(
@@ -656,6 +662,7 @@ impl Connection {
         )
         .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
 
@@ -776,8 +783,13 @@ impl Connection {
         })
     }
 
+    /// Returns true once the per-connection temp database has been created.
+    pub(crate) fn has_temp_database(&self) -> bool {
+        self.temp.database.read().is_some()
+    }
+
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
-        if self.temp.database.read().is_some() {
+        if self.has_temp_database() {
             return Ok(());
         }
 
@@ -1452,23 +1464,7 @@ impl Connection {
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
-        // Capture built-in table-valued functions (e.g. generate_series, json_each)
-        // before dropping the old schema. These are registered programmatically and
-        // don't survive re-parsing from sqlite_schema alone.
-        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        fresh.copy_table_valued_functions(&self.schema.read());
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1491,7 +1487,6 @@ impl Connection {
         Ok(ReparseSchemaInner {
             _guard: guard,
             fresh,
-            tvfs,
             preserved_sequences,
             phase: ReparsePhase::ParseSchema {
                 parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
@@ -1527,14 +1522,6 @@ impl Connection {
                         &attached_resolver,
                         self.db.dialect().as_ref(),
                     ));
-
-                    // Rehydrate built-in table-valued functions captured at init.
-                    for vtab in &inner.tvfs {
-                        let normalized = crate::util::normalize_ident(&vtab.name);
-                        inner.fresh.tables.entry(normalized).or_insert_with(|| {
-                            Arc::new(crate::schema::Table::Virtual(vtab.clone()))
-                        });
-                    }
 
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::PopulateSequences {
@@ -2338,6 +2325,7 @@ impl Connection {
                     .block(|| {
                         return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
+                            self.get_wal_autocheckpoint(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -2507,6 +2495,15 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn get_wal_autocheckpoint(&self) -> u32 {
+        self.wal_autocheckpoint.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_wal_autocheckpoint(&self, frames: u32) {
+        self.wal_autocheckpoint.store(frames, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     /// Publish the connection's current schema snapshot to the shared database
@@ -4603,18 +4600,16 @@ impl Connection {
             .read()
             .functions
             .values()
-            .map(|f| {
+            .flat_map(|f| {
                 let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc,
-                    function::ExtFunc::Scalar { argc, .. } => *argc,
-                };
-                (
-                    f.name.clone(),
-                    is_agg,
-                    argc,
-                    function::Deterministic::is_deterministic(f.as_ref()),
-                )
+                f.func.arg_counts().into_iter().map(move |argc| {
+                    (
+                        f.name.clone(),
+                        is_agg,
+                        argc,
+                        function::Deterministic::is_deterministic(f.as_ref()),
+                    )
+                })
             })
             .collect()
     }
@@ -4930,6 +4925,24 @@ impl Connection {
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
+    }
+
+    /// Finish a commit of this connection's own MVCC transaction that was
+    /// abandoned before it completed. The dropped `CommitStateMachine` rolls
+    /// back the MVCC transaction itself; this releases the read lock and
+    /// transaction state the connection holds for it, which the state machine
+    /// does not own. Nested transactions, such as the one `nextval()` opens
+    /// inside a user transaction, must not call this.
+    pub(crate) fn end_abandoned_mvcc_commit(&self, db_id: usize) {
+        self.get_pager_from_database_index(&db_id)
+            .expect("the database of an abandoned MVCC commit must still have its pager")
+            .end_read_tx();
+        // `transaction_state` tracks only the main database. An attached database
+        // records its transaction in `attached_mv_txs` and in its pager locks, and
+        // the dropped state machine has already cleared that slot.
+        if db_id == MAIN_DB_ID {
+            self.set_tx_state(TransactionState::None);
+        }
     }
 
     /// Returns true if the connection is currently in a write transaction.

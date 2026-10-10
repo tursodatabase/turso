@@ -1,5 +1,5 @@
 //! VDBE bytecode generation for pragma statements.
-//! More info: https://www.sqlite.org/pragma.html.
+//! More info: <https://www.sqlite.org/pragma.html>.
 
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
@@ -239,12 +239,13 @@ pub fn translate_pragma(
         return Ok(());
     }
 
+    let database_id = resolver.resolve_database_id(name)?;
+
     let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
 
-    let database_id = resolver.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
     let query_only = connection.get_query_only();
 
@@ -441,6 +442,29 @@ fn update_pragma(
         }
         PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
             Ok(TransactionMode::None)
+        }
+        PragmaName::WalAutocheckpoint => {
+            let data = parse_signed_number(&value)?;
+            let frames = match data {
+                Value::Numeric(Numeric::Integer(i)) => i,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i64,
+                _ => bail_parse_error!("expected integer, got {:?}", data),
+            };
+            let frames = i32::try_from(frames)
+                .ok()
+                .and_then(|frames| u32::try_from(frames).ok())
+                .unwrap_or(0);
+            connection.set_wal_autocheckpoint(frames);
+            query_pragma(
+                PragmaName::WalAutocheckpoint,
+                resolver,
+                None,
+                pager,
+                connection,
+                database_id,
+                schema_was_explicit,
+                program,
+            )
         }
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
@@ -936,6 +960,12 @@ fn query_pragma(
         PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
             Ok(TransactionMode::None)
         }
+        PragmaName::WalAutocheckpoint => {
+            program.emit_int(i64::from(connection.get_wal_autocheckpoint()), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
@@ -1091,7 +1121,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
@@ -1153,7 +1183,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexList => {
             let table_name = match value {
@@ -1217,7 +1247,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
             let table_name = match value {
@@ -1282,7 +1312,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableList => {
             let name = match value {
@@ -1319,7 +1349,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableInfo => {
             let name = match value {
@@ -1380,7 +1410,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableXinfo => {
             let name = match value {
@@ -1449,7 +1479,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {
