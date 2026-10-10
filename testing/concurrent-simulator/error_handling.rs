@@ -51,10 +51,12 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         LimboError::SchemaUpdated
         | LimboError::SchemaConflict
         | LimboError::TableLocked
+        | LimboError::StatementsInProgress(..)
         | LimboError::Busy
         | LimboError::BusySnapshot
         | LimboError::WriteWriteConflict
         | LimboError::CommitDependencyAborted
+        | LimboError::TxTerminated
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
         | LimboError::TxError(..)
@@ -106,6 +108,25 @@ mod tests {
         );
         assert_eq!(
             classify_op_error(&LimboError::OutOfMemory, false),
+            ErrorAction::ClearTxn
+        );
+    }
+
+    #[test]
+    fn statements_in_progress_is_recoverable() {
+        let err = LimboError::StatementsInProgress("cannot checkpoint while a read is paused");
+        assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
+        assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
+    }
+
+    #[test]
+    fn terminated_read_is_recoverable() {
+        assert_eq!(
+            classify_op_error(&LimboError::TxTerminated, true),
+            ErrorAction::Rollback
+        );
+        assert_eq!(
+            classify_op_error(&LimboError::TxTerminated, false),
             ErrorAction::ClearTxn
         );
     }
