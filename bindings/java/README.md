@@ -8,6 +8,13 @@ The project is actively developed. Feel free to open issues and contribute.
 
 To view related works, visit this [issue](https://github.com/tursodatabase/turso/issues/615).
 
+## Kotlin Multiplatform
+
+If you are building a Kotlin Multiplatform (KMP) project, read
+[KOTLIN_MULTIPLATFORM.md](KOTLIN_MULTIPLATFORM.md) first. It documents which targets the
+driver supports today, why the dependency belongs in `jvm()` rather than `commonMain`, and
+how to consume it locally before it reaches Maven Central.
+
 ## How to use
 
 Currently, we have not published to the maven central. Instead, you can locally build the jar and deploy it to
