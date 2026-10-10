@@ -451,6 +451,167 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void OpenModeReadWriteRequiresExistingDatabase()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "missing.db");
+        using var connection = new SqliteConnection($"Data Source={path};Mode=ReadWrite");
+
+        var exception = Assert.Throws<SqliteException>(connection.Open);
+
+        exception.SqliteErrorCode.Should().Be(14);
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [Test]
+    public void OpenModeReadWriteOpensExistingDatabaseForWrites()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "existing.db");
+        using (var create = new SqliteConnection($"Data Source={path}"))
+        {
+            create.Open();
+            create.ExecuteNonQuery("CREATE TABLE Data(Value);");
+            create.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        File.Delete(path + "-wal");
+
+        using var connection = new SqliteConnection($"Data Source={path};Mode=ReadWrite");
+        connection.Open();
+        connection.ExecuteNonQuery("INSERT INTO Data VALUES (1);").Should().Be(1);
+    }
+
+    [Test]
+    public void OpenModeReadWriteUriRequiresExistingDatabase()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "missing-uri.db");
+        using var connection = new SqliteConnection($"Data Source=file:{path};Mode=ReadWrite");
+
+        var exception = Assert.Throws<SqliteException>(connection.Open);
+
+        exception.SqliteErrorCode.Should().Be(14);
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [TestCase(":memory:", SqliteOpenMode.ReadWrite)]
+    [TestCase(":memory:", SqliteOpenMode.ReadOnly)]
+    [TestCase("", SqliteOpenMode.ReadWrite)]
+    [TestCase("", SqliteOpenMode.ReadOnly)]
+    public void MemoryDataSourcesOpenWithExplicitFilesystemModes(string dataSource, SqliteOpenMode mode)
+    {
+        using var connection = new SqliteConnection($"Data Source={dataSource};Mode={mode}");
+
+        connection.Open();
+
+        connection.ExecuteScalar<long>("SELECT 1;").Should().Be(1);
+        if (mode == SqliteOpenMode.ReadOnly)
+        {
+            var exception = Assert.Throws<SqliteException>(
+                () => connection.ExecuteNonQuery("CREATE TABLE Data(Value);"));
+            exception.SqliteErrorCode.Should().Be(8);
+        }
+        else
+        {
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value);");
+        }
+    }
+
+    [TestCase("rw", false)]
+    [TestCase("ro", false)]
+    [TestCase("rw", true)]
+    [TestCase("ro", true)]
+    public void UriMustExistModesOverrideDefaultProviderMode(string uriMode, bool relative)
+    {
+        using var directory = new TemporaryDirectory();
+        var filename = Path.GetRandomFileName();
+        var path = relative ? Path.Combine(AppContext.BaseDirectory, filename) : Path.Combine(directory.Path, filename);
+        var uriPath = relative ? filename : path;
+        using var connection = new SqliteConnection($"Data Source=file:{uriPath}?mode={uriMode}");
+
+        try
+        {
+            var exception = Assert.Throws<SqliteException>(connection.Open);
+
+            exception.SqliteErrorCode.Should().Be(14);
+            File.Exists(path).Should().BeFalse();
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Test]
+    public void UriReadOnlyModeOverridesExplicitReadWriteCreateMode()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "uri-readonly.db");
+        using (var create = new SqliteConnection($"Data Source={path}"))
+        {
+            create.Open();
+            create.ExecuteNonQuery("CREATE TABLE Data(Value);");
+        }
+
+        using var connection = new SqliteConnection(
+            $"Data Source=file:{path}?mode=ro;Mode=ReadWriteCreate");
+        connection.Open();
+
+        var exception = Assert.Throws<SqliteException>(
+            () => connection.ExecuteNonQuery("INSERT INTO Data VALUES (1);"));
+        exception.SqliteErrorCode.Should().Be(8);
+    }
+
+    [Test]
+    public void UriReadWriteCreateModeOverridesExplicitReadOnlyMode()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "uri-create.db");
+        using var connection = new SqliteConnection(
+            $"Data Source=file:{path}?mode=rwc;Mode=ReadOnly");
+
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value);");
+
+        File.Exists(path).Should().BeTrue();
+    }
+
+    [Test]
+    public void UriReadWriteModeOverridesExplicitMemoryMode()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "uri-missing.db");
+        using var connection = new SqliteConnection(
+            $"Data Source=file:{path}?mode=rw;Mode=Memory");
+
+        var exception = Assert.Throws<SqliteException>(connection.Open);
+
+        exception.SqliteErrorCode.Should().Be(14);
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [Test]
+    public void UriReadWriteModeOverridesSharedMemoryCleanup()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "uri-existing.db");
+        using (var create = new SqliteConnection($"Data Source={path}"))
+        {
+            create.Open();
+            create.ExecuteNonQuery("CREATE TABLE Data(Value); INSERT INTO Data VALUES (42);");
+        }
+
+        using (var connection = new SqliteConnection(
+                   $"Data Source=file:{path}?mode=rw;Mode=Memory;Cache=Shared"))
+        {
+            connection.Open();
+            connection.ExecuteScalar<long>("SELECT Value FROM Data;").Should().Be(42);
+        }
+
+        File.Exists(path).Should().BeTrue();
+    }
+
+    [Test]
     public void SharedMemoryConnectionsUseSameBackingStore()
     {
         var connectionString = "Data Source=turso-shared-test;Mode=Memory;Cache=Shared";
