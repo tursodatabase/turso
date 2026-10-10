@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
+    dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
@@ -14,7 +15,6 @@ use turso_parser::ast::RefAct;
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
-const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -191,11 +191,11 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{STORED_PG_SCHEMA_PREFIX}{sql}")
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
-    sql.strip_prefix(STORED_PG_SCHEMA_PREFIX)
+    sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
 }
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
