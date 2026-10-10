@@ -933,6 +933,7 @@ pub enum ScalarFunc {
     BooleanToInt,
     IntToBoolean,
     ValidateIpAddr,
+    Float4Encode,
     // Numeric type functions
     NumericEncode,
     NumericDecode,
@@ -1063,6 +1064,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::Float4Encode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
@@ -1211,6 +1213,7 @@ impl Display for ScalarFunc {
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::Float4Encode => "float4_encode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
@@ -1360,6 +1363,7 @@ impl ScalarFunc {
             Self::BooleanToInt
             | Self::IntToBoolean
             | Self::ValidateIpAddr
+            | Self::Float4Encode
             | Self::NumericDecode => &[1],
             Self::NumericAdd
             | Self::NumericSub

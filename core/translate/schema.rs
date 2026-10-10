@@ -464,7 +464,9 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::StringReverse => Ok(CheckExprType::Text),
 
         // Functions that always return REAL
-        ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
+        ScalarFunc::Round | ScalarFunc::JulianDay | ScalarFunc::Float4Encode => {
+            Ok(CheckExprType::Real)
+        }
 
         // Functions that always return BLOB
         ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {

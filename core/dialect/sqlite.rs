@@ -535,6 +535,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "boolean_to_int" => Ok(Some(Func::Scalar(ScalarFunc::BooleanToInt))),
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
+        "float4_encode" => Ok(Some(Func::Scalar(ScalarFunc::Float4Encode))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
