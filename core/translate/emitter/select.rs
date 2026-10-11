@@ -235,6 +235,10 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
+        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+            let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+            program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+        }
         // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
         // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
         // Without resolving this label before the early return, bytecode assembly fails
