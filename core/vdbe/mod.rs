@@ -984,6 +984,9 @@ pub struct ProgramState {
     /// the promised outcome and drop staged work. The connection-level flag
     /// stays set and clears once no root statement is active.
     pub(crate) halt_in_progress: bool,
+    tx_terminated_read: bool,
+    pub(crate) is_root_statement: bool,
+    pub(crate) mvcc_read_tx_id: Option<crate::mvcc::database::TxID>,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -1109,6 +1112,9 @@ impl ProgramState {
             pending_fail_error: None,
             pending_fail_prepare_error: None,
             halt_in_progress: false,
+            tx_terminated_read: false,
+            is_root_statement: false,
+            mvcc_read_tx_id: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
             mv_store_cache: None,
@@ -1277,6 +1283,7 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
+        self.tx_terminated_read = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -1325,12 +1332,22 @@ impl ProgramState {
                 "active writer state without an active writer count"
             );
         }
-        if self.mv_store(connection).is_some() {
+        if let Some(mv_store) = self.mv_store(connection).cloned() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
+            let activity = connection.statement_activity.lock();
+            let expired_readers: i32 = activity
+                .mvcc_readers
+                .iter()
+                .filter(|(tx_id, _)| !mv_store.has_tx(**tx_id))
+                .map(|(_, count)| count)
+                .sum();
+            let active_roots =
+                connection.n_active_root_statements.load(Ordering::SeqCst) - expired_readers;
+            let self_expired = self.mvcc_read_tx_id.is_some_and(|id| !mv_store.has_tx(id));
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                && connection.n_active_root_statements.load(Ordering::SeqCst)
-                    == i32::from(self_counted)
+                && !self_expired
+                && active_roots == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
@@ -1368,6 +1385,20 @@ impl ProgramState {
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
             || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    pub(crate) fn release_mvcc_read(&mut self, connection: &Connection) {
+        if let Some(tx_id) = self.mvcc_read_tx_id.take() {
+            let mut activity = connection.statement_activity.lock();
+            let count = activity
+                .mvcc_readers
+                .get_mut(&tx_id)
+                .expect("MVCC read statement must be registered");
+            *count -= 1;
+            if *count == 0 {
+                activity.mvcc_readers.remove(&tx_id);
+            }
+        }
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -2285,6 +2316,9 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
+        if state.tx_terminated_read && state.execution_state == ProgramExecutionState::Failed {
+            return ProgramStep::Error(LimboError::TxTerminated.into());
+        }
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
@@ -2349,6 +2383,13 @@ impl Program {
                 }
                 if state.pending_fail_prepare_error.is_some() {
                     match program.prepare_pending_fail(state, pager, waker) {
+                        Some(result) => return result,
+                        None => continue 'io_check,
+                    }
+                }
+                if state.tx_terminated_read {
+                    let result = execute::halt(program, state, pager, 0, "", None);
+                    match dispatch_cold(program, state, pager, waker, result) {
                         Some(result) => return result,
                         None => continue 'io_check,
                     }
@@ -2445,7 +2486,11 @@ impl Program {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
-                        Some(ProgramStep::Done)
+                        Some(if state.tx_terminated_read {
+                            ProgramStep::Error(LimboError::TxTerminated.into())
+                        } else {
+                            ProgramStep::Done
+                        })
                     }
                     Ok(InsnFunctionStepResult::IO) => {
                         let io = state.take_suspended_io();
@@ -2687,6 +2732,10 @@ impl Program {
                 // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
                 // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
+            }
+            LimboError::TxTerminated if self.is_readonly() && !state.halt_in_progress => {
+                state.tx_terminated_read = true;
+                None
             }
             err if (matches!(err, LimboError::Constraint(_))
                 && self.resolve_type == ResolveType::Fail)

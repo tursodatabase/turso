@@ -7021,6 +7021,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
+    pub(crate) fn check_read_tx(&self, tx_id: TxID) -> Result<()> {
+        if self
+            .txs
+            .get(&tx_id)
+            .is_some_and(|tx| tx.value().state.load() == TransactionState::Active)
+        {
+            Ok(())
+        } else {
+            Err(LimboError::TxTerminated)
+        }
+    }
+
+    pub(crate) fn has_tx(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some()
+    }
+
     /// Rolls back a transaction with the specified ID.
     ///
     /// This function rolls back a transaction with the specified `tx_id` by

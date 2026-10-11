@@ -1334,6 +1334,201 @@ fn test_completed_writer_waits_for_sibling_mvcc_reader_to_commit() {
 }
 
 #[test]
+fn test_mvcc_expired_reader_does_not_defer_autocommit_update() {
+    use crate::mvcc::database::CommitYieldPoint;
+
+    for indexed in [false, true] {
+        for yield_commit in [false, true] {
+            let env = SameConnectionMvcc::new(&format!(
+                ":memory:expired-reader-update-{indexed}-{yield_commit}"
+            ));
+            env.setup_rows_table();
+            env.conn
+                .execute("INSERT INTO rows VALUES (10, 'first'), (20, 'second')")
+                .unwrap();
+            if indexed {
+                env.conn.execute("CREATE INDEX rows_v ON rows(v)").unwrap();
+            }
+            env.conn.execute("BEGIN CONCURRENT").unwrap();
+            let sql = if indexed {
+                "SELECT id FROM rows INDEXED BY rows_v ORDER BY v"
+            } else {
+                "SELECT id FROM rows ORDER BY id"
+            };
+            let mut reader = env.conn.prepare(sql).unwrap();
+            assert_eq!(step_returning_id(&mut reader), 10);
+            let mut second_reader = env
+                .conn
+                .prepare("SELECT id FROM rows ORDER BY id DESC")
+                .unwrap();
+            assert_eq!(step_returning_id(&mut second_reader), 20);
+            env.conn.execute("COMMIT").unwrap();
+            let mut update = env
+                .conn
+                .prepare("UPDATE rows SET v = 'third' WHERE id = 20")
+                .unwrap();
+            if yield_commit {
+                env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+                    CommitYieldPoint::LogRecordPrepared.point(),
+                ])));
+                expect_injected_yield(&mut update, "autocommit update");
+                env.conn.set_yield_injector(None);
+                assert!(env.conn.get_mv_tx().is_some());
+            }
+            finish_without_rows(&mut update);
+            assert_eq!(env.conn.get_mv_tx(), None);
+            assert_eq!(env.observer_value_for_id(20), "third");
+            expect_tx_terminated(&mut reader);
+            env.conn.execute("BEGIN CONCURRENT").unwrap();
+            env.conn
+                .execute("UPDATE rows SET v = 'fourth' WHERE id = 20")
+                .unwrap();
+            let tx = env.conn.get_mv_tx();
+            expect_tx_terminated(&mut reader);
+            expect_tx_terminated(&mut second_reader);
+            assert_eq!(env.conn.get_mv_tx(), tx);
+            reader.reset().unwrap();
+            drop(reader);
+            drop(second_reader);
+            assert_eq!(env.conn.get_mv_tx(), tx);
+            assert_eq!(env.observer_value_for_id(20), "third");
+            env.conn.execute("ROLLBACK").unwrap();
+            assert_eq!(env.observer_value_for_id(20), "third");
+            assert!(env.conn.statement_activity.lock().mvcc_readers.is_empty());
+        }
+    }
+}
+
+#[test]
+fn test_mvcc_expired_reader_does_not_end_later_transaction() {
+    for explicit in [false, true] {
+        let env = SameConnectionMvcc::new(&format!(":memory:expired-reader-later-{explicit}"));
+        env.setup_rows_table();
+        env.conn
+            .execute("INSERT INTO rows VALUES (10, 'first'), (20, 'second')")
+            .unwrap();
+        env.conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+        assert_eq!(step_returning_id(&mut reader), 10);
+        env.conn.execute("COMMIT").unwrap();
+        if explicit {
+            env.conn.execute("BEGIN CONCURRENT").unwrap();
+        }
+        let mut sibling = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+        assert_eq!(step_returning_id(&mut sibling), 10);
+        env.conn
+            .execute("UPDATE rows SET v = 'third' WHERE id = 20")
+            .unwrap();
+        let tx = env.conn.get_mv_tx();
+        expect_tx_terminated(&mut reader);
+        assert_eq!(env.conn.get_mv_tx(), tx);
+        assert_eq!(env.observer_value_for_id(20), "second");
+        sibling.run_ignore_rows().unwrap();
+        if explicit {
+            assert_eq!(env.conn.get_mv_tx(), tx);
+            env.conn.execute("ROLLBACK").unwrap();
+            assert_eq!(env.observer_value_for_id(20), "second");
+        } else {
+            assert_eq!(env.conn.get_mv_tx(), None);
+            assert_eq!(env.observer_value_for_id(20), "third");
+        }
+    }
+}
+
+fn expect_tx_terminated(stmt: &mut crate::Statement) {
+    loop {
+        match stmt.step() {
+            Err(LimboError::TxTerminated) => return,
+            Ok(crate::StepResult::IO | crate::StepResult::Yield) => {
+                stmt.get_pager().io.step().unwrap();
+            }
+            other => panic!("expected TxTerminated, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_mvcc_explicit_reader_keeps_explicit_write_uncommitted() {
+    let env = SameConnectionMvcc::new(":memory:explicit-reader-explicit-write");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    finish_without_rows(&mut reader);
+    assert_eq!(env.observer_ids(), vec![10]);
+    assert!(env.conn.get_mv_tx().is_some());
+    env.conn.execute("ROLLBACK").unwrap();
+    assert_eq!(env.observer_ids(), vec![10]);
+}
+
+#[test]
+fn test_mvcc_explicit_reader_drop_does_not_end_sibling_transaction() {
+    let env = SameConnectionMvcc::new(":memory:explicit-reader-drop-sibling");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+    env.conn.execute("COMMIT").unwrap();
+    let mut sibling = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut sibling), 10);
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    let tx = env.conn.get_mv_tx();
+    drop(reader);
+    assert_eq!(env.conn.get_mv_tx(), tx);
+    assert_eq!(env.observer_ids(), vec![10]);
+    finish_without_rows(&mut sibling);
+    assert_eq!(env.observer_ids(), vec![1, 10]);
+}
+
+#[test]
+fn test_mvcc_expired_autocommit_reader_teardown_does_not_end_later_transaction() {
+    for reset in [false, true] {
+        let env = SameConnectionMvcc::new(&format!(":memory:expired-reader-teardown-{reset}"));
+        env.setup_rows_table();
+        env.conn
+            .execute("INSERT INTO rows VALUES (10, 'ten')")
+            .unwrap();
+        env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+        assert_eq!(step_returning_id(&mut reader), 10);
+        env.conn.execute("BEGIN CONCURRENT").unwrap();
+        env.conn.execute("COMMIT").unwrap();
+        env.conn
+            .execute("INSERT INTO rows VALUES (1, 'one')")
+            .unwrap();
+        assert_eq!(env.conn.get_mv_tx(), None);
+        env.conn.execute("BEGIN CONCURRENT").unwrap();
+        env.conn
+            .execute("UPDATE rows SET v = 'pending' WHERE id = 1")
+            .unwrap();
+        let tx = env.conn.get_mv_tx();
+        assert!(tx.is_some());
+        if reset {
+            reader.reset().unwrap();
+        }
+        drop(reader);
+        assert_eq!(env.conn.get_mv_tx(), tx);
+        assert_eq!(env.observer_ids(), vec![1, 10]);
+        assert_eq!(env.observer_value_for_id(1), "one");
+        env.conn.execute("ROLLBACK").unwrap();
+        assert_eq!(env.observer_value_for_id(1), "one");
+    }
+}
+
+#[test]
 fn test_suspended_read_does_not_finish_sibling_read_transaction() {
     let env = SameConnectionMvcc::new(":memory:suspended-read-sibling-read");
     env.setup_rows_table();

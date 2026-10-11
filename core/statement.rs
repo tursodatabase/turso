@@ -390,7 +390,8 @@ impl Statement {
                 format: EqpFormat::Json,
             } => (EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(), 0),
         };
-        let state = vdbe::ProgramState::new(max_registers, cursor_count);
+        let mut state = vdbe::ProgramState::new(max_registers, cursor_count);
+        state.is_root_statement = origin == StatementOrigin::Root;
         Self {
             program,
             state,
@@ -537,6 +538,7 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            self.state.release_mvcc_read(&self.program.connection);
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -1709,6 +1711,7 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.cleanup_orphaned_seq_inner_tx();
+        self.state.release_mvcc_read(&self.program.connection);
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;
