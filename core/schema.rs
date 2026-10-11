@@ -6192,6 +6192,13 @@ impl Index {
                 return Ok(WalkControl::SkipChildren);
             }
             match e {
+                Expr::Literal(
+                    ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp,
+                ) => {
+                    ok = false;
+                }
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(n) => {

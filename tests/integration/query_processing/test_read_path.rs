@@ -6,6 +6,28 @@ use tempfile::TempDir;
 use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn current_time_literals_rejected_in_partial_index_predicates(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+    for literal in ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"] {
+        for predicate in [
+            format!("{literal} > ''"),
+            format!("coalesce({literal}, '') > ''"),
+        ] {
+            let sql = format!("CREATE INDEX i ON t(x) WHERE {predicate}");
+            assert!(
+                matches!(conn.prepare(&sql), Err(LimboError::ParseError(_))),
+                "accepted time-dependent partial index: {sql}"
+            );
+        }
+    }
+    conn.execute("CREATE INDEX stable ON t(x) WHERE lower('X') = 'x'")?;
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
 fn current_time_literals_refresh_on_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute(
