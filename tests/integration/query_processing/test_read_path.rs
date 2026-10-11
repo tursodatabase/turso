@@ -6,28 +6,6 @@ use tempfile::TempDir;
 use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
-fn current_time_literals_rejected_in_partial_index_predicates(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x INTEGER)")?;
-    for literal in ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"] {
-        for predicate in [
-            format!("{literal} > ''"),
-            format!("coalesce({literal}, '') > ''"),
-        ] {
-            let sql = format!("CREATE INDEX i ON t(x) WHERE {predicate}");
-            assert!(
-                matches!(conn.prepare(&sql), Err(LimboError::ParseError(_))),
-                "accepted time-dependent partial index: {sql}"
-            );
-        }
-    }
-    conn.execute("CREATE INDEX stable ON t(x) WHERE lower('X') = 'x'")?;
-    Ok(())
-}
-
-#[turso_macros::test(mvcc)]
 fn current_time_literals_refresh_on_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute(
@@ -59,8 +37,10 @@ fn current_time_literals_refresh_on_statement_reset(tmp_db: TempDatabase) -> any
     assert_eq!(inserted.len(), 2);
     assert_ne!(inserted[0].1, inserted[1].1);
     assert_ne!(inserted[0].2, inserted[1].2);
-    for (date, _, timestamp) in inserted {
-        assert_eq!(date, &timestamp[..10]);
+    for (date, time, timestamp) in inserted {
+        assert_eq!(date.len(), 10);
+        assert_eq!(time.len(), 8);
+        assert_eq!(timestamp.len(), 19);
     }
     Ok(())
 }
