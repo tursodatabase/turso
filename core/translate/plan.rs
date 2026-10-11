@@ -1797,6 +1797,10 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The index of the database this outer table belongs to ("main" is zero).
+    /// Needed so a database-qualified column reference (e.g. `aux.t1.id`) can
+    /// tell an outer `aux.t1` apart from an inner `main.t1` of the same name.
+    pub database_id: usize,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the
@@ -2178,15 +2182,17 @@ impl TableReferences {
         self.joined_tables
             .iter()
             .find(|t| {
-                t.identifier == identifier && database_id.map_or(true, |db| t.database_id == db)
+                t.identifier == identifier && database_id.is_none_or(|db| t.database_id == db)
             })
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
-                // Outer references carry no database information; they are
-                // matched on the reference identifier alone.
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .find(|t| {
+                        t.identifier == identifier
+                            && !t.cte_definition_only
+                            && database_id.is_none_or(|db| t.database_id == db)
+                    })
                     .map(|t| (t.internal_id, &t.table))
             })
     }
