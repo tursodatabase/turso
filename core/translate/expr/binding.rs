@@ -419,7 +419,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .find_table_and_internal_id_by_identifier(
+                                        &normalized_tbl_name,
+                                        Some(database_id),
+                                    );
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
@@ -446,7 +449,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         let normalized_col = normalize_ident(&tbl_name_str);
                         let field_name = normalize_ident(&col_name_str);
                         let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name, None);
                         if let Some((tbl_id, tbl)) = matching_tbl {
                             let col_idx = tbl.columns().iter().position(|c| {
                                 c.name
@@ -715,13 +718,8 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            if database_id == Some(joined_table.database_id)
-                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-            {
-                None
-            } else {
-                database_id
-            },
+            Some(joined_table.database_id),
+            database_id,
             table_name,
             column_name,
         )?;
@@ -766,6 +764,10 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
+            // Outer references carry no database information; match on the
+            // reference identifier alone so a database-qualified column can
+            // still bind to an outer-scope table.
+            None,
             database_id,
             table_name,
             column_name,
@@ -825,10 +827,17 @@ fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize)
 ///
 /// SQLite lets an outer query refer to tables inside a parenthesized join.
 /// If no inner column matches, the query can use the group's alias.
+///
+/// `table_database_id` is the database the candidate table lives in; `None`
+/// means the reference carries no database information (outer scopes), in
+/// which case no database filtering is applied. A database-qualified column
+/// reference (e.g. `aux.t1.id`) must only bind to a table in that database,
+/// otherwise `main.t1` would shadow an outer `aux.t1` of the same name.
 fn match_qualified_name_in_table(
     table: &Table,
     table_id: TableInternalId,
     table_reference_name: &str,
+    table_database_id: Option<usize>,
     database_id: Option<usize>,
     table_name: &str,
     column_name: &str,
@@ -856,7 +865,14 @@ fn match_qualified_name_in_table(
         }
     }
 
-    if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
+    if let Some(db) = database_id {
+        // Database-qualified reference: the candidate table must belong to
+        // that database. References without database information (outer
+        // scopes) are not filtered here.
+        if table_database_id.map_or(false, |tdb| tdb != db) {
+            return Ok(QualifiedTableMatch::NoTable);
+        }
+    } else if !table_reference_name.eq_ignore_ascii_case(table_name) {
         return Ok(QualifiedTableMatch::NoTable);
     }
     Ok(
