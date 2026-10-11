@@ -2166,15 +2166,24 @@ impl TableReferences {
     /// Returns `(internal_id, &Table)` for the table with the given identifier.
     /// Searches `joined_tables` first, then visible `outer_query_refs`
     /// (excluding CTE-definition-only entries).
+    ///
+    /// When `database_id` is `Some(id)`, joined tables are only matched if
+    /// they belong to that database, so `main.t1` cannot shadow an outer
+    /// `aux.t1` that shares the same reference name.
     pub fn find_table_and_internal_id_by_identifier(
         &self,
         identifier: &str,
+        database_id: Option<usize>,
     ) -> Option<(TableInternalId, &Table)> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| {
+                t.identifier == identifier && database_id.map_or(true, |db| t.database_id == db)
+            })
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
+                // Outer references carry no database information; they are
+                // matched on the reference identifier alone.
                 self.outer_query_refs
                     .iter()
                     .find(|t| t.identifier == identifier && !t.cte_definition_only)
