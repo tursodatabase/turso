@@ -3639,7 +3639,21 @@ impl BTreeTable {
 
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
+                let needs_parentheses = match default.as_ref() {
+                    Expr::Literal(_) | Expr::Parenthesized(_) => false,
+                    Expr::Unary(
+                        ast::UnaryOperator::Positive | ast::UnaryOperator::Negative,
+                        expr,
+                    ) => !matches!(expr.as_ref(), Expr::Literal(ast::Literal::Numeric(_))),
+                    _ => true,
+                };
+                if needs_parentheses {
+                    sql.push('(');
+                }
                 sql.push_str(&default.to_string());
+                if needs_parentheses {
+                    sql.push(')');
+                }
             }
 
             if let Some(collation) = column.collation_opt() {

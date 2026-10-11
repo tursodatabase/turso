@@ -11,6 +11,49 @@
 use crate::common::{ExecRows, TempDatabase};
 use tempfile::TempDir;
 
+#[test]
+fn alter_table_preserves_expression_defaults_after_reopen() -> anyhow::Result<()> {
+    for definition in [
+        "CREATE DOMAIN dm AS text DEFAULT lower('X')",
+        "CREATE TYPE dm BASE text ENCODE value DECODE value DEFAULT lower('X')",
+    ] {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("expression_default.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(definition)?;
+            conn.execute("CREATE TABLE t(a INTEGER, c INTEGER) STRICT")?;
+            conn.execute("ALTER TABLE t ADD COLUMN b dm")?;
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t(a, c) VALUES (1, 2)")?;
+            let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT a, c, b FROM t");
+            assert_eq!(rows, vec![(1, 2, "x".into())]);
+            conn.execute("ALTER TABLE t DROP COLUMN c")?;
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t(a) VALUES (3)")?;
+            let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+            assert_eq!(rows, vec![(1, "x".into()), (3, "x".into())]);
+            let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(integrity, vec![("ok".into(),)]);
+            conn.close()?;
+        }
+    }
+    Ok(())
+}
+
 /// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
 #[test]
