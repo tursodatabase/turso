@@ -764,10 +764,7 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            // Outer references carry no database information; match on the
-            // reference identifier alone so a database-qualified column can
-            // still bind to an outer-scope table.
-            None,
+            Some(outer_ref.database_id),
             database_id,
             table_name,
             column_name,
@@ -869,7 +866,7 @@ fn match_qualified_name_in_table(
         // Database-qualified reference: the candidate table must belong to
         // that database. References without database information (outer
         // scopes) are not filtered here.
-        if table_database_id.map_or(false, |tdb| tdb != db) {
+        if table_database_id.is_none_or(|tdb| tdb != db) {
             return Ok(QualifiedTableMatch::NoTable);
         }
     } else if !table_reference_name.eq_ignore_ascii_case(table_name) {
