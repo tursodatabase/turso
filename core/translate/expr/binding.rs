@@ -505,7 +505,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
-                    validate_function_filter(name.as_str(), 0, filter_over, resolver)?;
+                    validate_function_tail(name.as_str(), 0, filter_over, resolver)?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -582,7 +582,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     filter_over,
                     ..
                 } => {
-                    validate_function_filter(name.as_str(), args.len(), filter_over, resolver)?;
+                    validate_function_tail(name.as_str(), args.len(), filter_over, resolver)?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
                 _ => {}
@@ -593,13 +593,13 @@ pub fn bind_and_rewrite_expr<'a>(
     Ok(())
 }
 
-fn validate_function_filter(
+fn validate_function_tail(
     name: &str,
     arg_count: usize,
     filter_over: &ast::FunctionTail,
     resolver: &Resolver,
 ) -> Result<()> {
-    if filter_over.filter_clause.is_none() {
+    if filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
     match resolver.resolve_function(name, arg_count)? {
