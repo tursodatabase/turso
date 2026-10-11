@@ -1373,7 +1373,10 @@ pub fn constraints_from_where_clause(
             .filter(|term| {
                 let constraint = &cs.constraints[term.constraint_vec_pos];
                 let where_term = &where_clause[constraint.where_clause_pos.0];
-                !expr_uses_custom_collation(&where_term.expr)
+                let column_uses_custom_collation = constraint.table_col_pos.is_some_and(|pos| {
+                    table_reference.table.columns()[pos].collation().is_custom()
+                });
+                !column_uses_custom_collation && !expr_uses_custom_collation(&where_term.expr)
             })
             .collect();
         constraints.push(cs);
