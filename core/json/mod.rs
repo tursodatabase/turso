@@ -602,7 +602,11 @@ where
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
 
     let (json, element_type) = jsonb_extract_internal(jsonb, paths)?;
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
+    let output_variant = match element_type {
+        ElementType::ARRAY | ElementType::OBJECT => OutputVariant::Binary,
+        _ => OutputVariant::ElementType,
+    };
+    let result = json_string_to_db_type(json, element_type, output_variant)?;
 
     Ok(result)
 }
