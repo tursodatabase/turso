@@ -89,6 +89,49 @@ expect {
     value
 }
 
+test pragma-table-info-type-parameters {
+    CREATE TABLE t(
+        a VARCHAR(100),
+        b CHAR(50),
+        c DECIMAL(10,2),
+        d NUMERIC(5,3),
+        e FLOAT(24),
+        f NVARCHAR(200),
+        g TEXT,
+        h
+    );
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|VARCHAR(100)|0||0
+    1|b|CHAR(50)|0||0
+    2|c|DECIMAL(10,2)|0||0
+    3|d|NUMERIC(5,3)|0||0
+    4|e|FLOAT(24)|0||0
+    5|f|NVARCHAR(200)|0||0
+    6|g|TEXT|0||0
+    7|h||0||0
+}
+
+test pragma-table-xinfo-type-parameters {
+    CREATE TABLE t(a VARCHAR(100), b DECIMAL(10,2) AS (1.5));
+    PRAGMA table_xinfo(t);
+}
+expect {
+    0|a|VARCHAR(100)|0||0|0
+    1|b|DECIMAL(10,2)|0||0|2
+}
+
+test pragma-table-info-added-type-parameters {
+    CREATE TABLE t(a CHAR(50));
+    ALTER TABLE t ADD COLUMN b NUMERIC(5,3);
+    SELECT name, type FROM pragma_table_info('t') ORDER BY cid;
+}
+expect {
+    a|CHAR(50)
+    b|NUMERIC(5,3)
+}
+
 @skip-if mvcc "page_count not implemented for mvcc"
 @cross-check-integrity
 test pragma-page-count-table {
