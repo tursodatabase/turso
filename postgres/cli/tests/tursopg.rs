@@ -1,5 +1,5 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Output, Stdio};
 
 fn run_tursopg(input: &[u8]) -> Output {
@@ -945,45 +945,39 @@ fn copy_from_file_not_found_repl() {
 
 /// Start tursopg with --server on a kernel-assigned ephemeral port and wait
 /// for it to be ready. Returns the child and the port it is serving.
-///
-/// The port must not be derived from a fixed seed: each test runs in its own
-/// process, so two concurrently started tests can compute the same port, and
-/// the loser of the bind race silently connects to the winner's server — and
-/// then fails mid-test when the winner tears it down. Instead, ask the kernel
-/// for a free ephemeral port and verify our own child is the process that
-/// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
-    for _ in 0..10 {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
-            .arg("--server")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursopg server");
+    start_tursopg_server_with_db(":memory:", None)
+}
 
-        // Wait for the server to be ready by polling TCP connect, bailing out
-        // to a new port if the child exited (lost a bind race).
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+fn start_tursopg_server_with_db(
+    db_path: impl AsRef<std::ffi::OsStr>,
+    directory: Option<&std::path::Path>,
+) -> (Child, u16) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .current_dir(directory.unwrap_or_else(|| std::path::Path::new(".")))
+        .arg(db_path.as_ref())
+        .arg("--server")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start tursopg server");
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while stdout.read_line(&mut line).unwrap() > 0 {
+        if let Some(rest) = line.strip_prefix("PostgreSQL server listening on ") {
+            let address: std::net::SocketAddr =
+                rest.split_whitespace().next().unwrap().parse().unwrap();
+            child.stdout = Some(stdout.into_inner());
+            return (child, address.port());
         }
-        child.kill().ok();
-        child.wait().ok();
+        line.clear();
     }
-    panic!("tursopg server did not start");
+    let output = child.wait_with_output().unwrap();
+    panic!(
+        "tursopg server did not start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1093,6 +1087,29 @@ impl PgTestClient {
         self.send_query(sql);
         let response = self.read_until_ready();
         extract_first_data_row_text(&response).expect("query returned no rows")
+    }
+
+    fn extended_query_single_text(&mut self, sql: &str) -> String {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        for (tag, body) in [
+            (b'P', parse.as_slice()),
+            (b'D', b"S\0".as_slice()),
+            (b'B', [0; 8].as_slice()),
+            (b'D', b"P\0".as_slice()),
+            (b'E', [0; 5].as_slice()),
+            (b'S', [].as_slice()),
+        ] {
+            self.stream.write_all(&[tag]).unwrap();
+            self.stream
+                .write_all(&((4 + body.len()) as i32).to_be_bytes())
+                .unwrap();
+            self.stream.write_all(body).unwrap();
+        }
+        self.stream.flush().unwrap();
+        let response = self.read_until_ready();
+        extract_first_data_row_text(&response).expect("extended query returned no rows")
     }
 }
 
@@ -1302,16 +1319,379 @@ fn wire_comment_on_returns_comment_tag() {
     });
 }
 
+#[test]
+fn wire_clients_have_separate_transactions() {
+    with_pg_client(|first| {
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(
+            first.query_command_tags("CREATE TABLE items(id INT)"),
+            ["CREATE TABLE"]
+        );
+        assert_eq!(
+            first.query_command_tags("INSERT INTO items VALUES (7)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(first.query_command_tags("BEGIN"), ["BEGIN"]);
+        assert_eq!(
+            first.query_command_tags("INSERT INTO items VALUES (23)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(first.query_single_text("SELECT COUNT(*) FROM items"), "2");
+        assert_eq!(
+            second.query_single_text("SELECT COUNT(*) FROM items"),
+            "1",
+            "another client must not see an uncommitted insert"
+        );
+
+        assert_eq!(second.query_command_tags("BEGIN"), ["BEGIN"]);
+        assert_eq!(second.query_single_text("SELECT COUNT(*) FROM items"), "1");
+        assert_eq!(second.query_command_tags("ROLLBACK"), ["ROLLBACK"]);
+        assert_eq!(first.query_single_text("SELECT COUNT(*) FROM items"), "2");
+        assert_eq!(first.query_command_tags("COMMIT"), ["COMMIT"]);
+        assert_eq!(second.query_single_text("SELECT COUNT(*) FROM items"), "2");
+
+        assert_eq!(first.query_command_tags("BEGIN"), ["BEGIN"]);
+        assert_eq!(
+            first.query_command_tags("INSERT INTO items VALUES (47)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(first.query_command_tags("ROLLBACK"), ["ROLLBACK"]);
+        assert_eq!(second.query_single_text("SELECT COUNT(*) FROM items"), "2");
+    });
+}
+
+#[test]
+fn wire_clients_have_separate_search_paths() {
+    with_pg_client(|first| {
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(
+            first.query_command_tags("CREATE TABLE items(id INT)"),
+            ["CREATE TABLE"]
+        );
+        assert_eq!(
+            first.query_command_tags("INSERT INTO items VALUES (17)"),
+            ["INSERT 0 1"]
+        );
+        first.query_command_tags("SET search_path TO missing_schema");
+        assert!(first.query_command_tags("SELECT id FROM items").is_empty());
+        assert_eq!(
+            second.query_single_text("SELECT id FROM items"),
+            "17",
+            "another client's search_path must not change table resolution"
+        );
+        second.query_command_tags("SET search_path TO public");
+        assert!(first.query_command_tags("SELECT id FROM items").is_empty());
+        first.query_command_tags("SET search_path TO public");
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "17");
+    });
+}
+
+#[test]
+fn wire_clients_resolve_unqualified_tables_in_schema_name_order() {
+    with_pg_client(|first| {
+        let port = first.stream.peer_addr().unwrap().port();
+        let mut second = PgTestClient::connect(port);
+        for sql in [
+            "CREATE SCHEMA z",
+            "CREATE TABLE z.items(id INT)",
+            "INSERT INTO z.items VALUES (17)",
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (29)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        assert_eq!(
+            (
+                first.query_single_text("SELECT id FROM items"),
+                second.query_single_text("SELECT id FROM items"),
+            ),
+            ("29".to_string(), "29".to_string()),
+        );
+        assert_eq!(
+            first.query_command_tags("UPDATE items SET id = id + 100"),
+            ["UPDATE 1"]
+        );
+        assert_eq!(second.query_single_text("SELECT id FROM a.items"), "129");
+        assert_eq!(second.query_single_text("SELECT id FROM z.items"), "17");
+        let mut third = PgTestClient::connect(port);
+        assert_eq!(
+            third.extended_query_single_text("SELECT id FROM items"),
+            "129"
+        );
+
+        assert!(!first
+            .query_command_tags("CREATE TABLE items(id INT); INSERT INTO items VALUES (43)")
+            .is_empty());
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "43");
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "43");
+        first.query_command_tags("SET search_path TO z, a");
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(
+            second.extended_query_single_text("SELECT id FROM items"),
+            "43"
+        );
+    });
+}
+
+#[test]
+fn wire_clients_resolve_unqualified_tables_after_schema_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("main.db");
+    with_pg_client_with_db(&db_path, |first| {
+        let port = first.stream.peer_addr().unwrap().port();
+        for sql in [
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (17)",
+            "CREATE SCHEMA z",
+            "CREATE TABLE z.items(id INT)",
+            "INSERT INTO z.items VALUES (29)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        let mut second = PgTestClient::connect(port);
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA a CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "29");
+        for sql in [
+            "CREATE SCHEMA m",
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (43)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        let mut third = PgTestClient::connect(port);
+        assert_eq!(
+            (
+                first.query_single_text("SELECT id FROM items"),
+                second.extended_query_single_text("SELECT id FROM items"),
+                third.query_single_text("SELECT id FROM items"),
+            ),
+            ("43".to_string(), "43".to_string(), "43".to_string()),
+        );
+    });
+}
+
+#[test]
+fn wire_clients_have_separate_extended_queries() {
+    with_pg_client(|first| {
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        first.query_command_tags("CREATE TABLE items(id INT)");
+        first.query_command_tags("INSERT INTO items VALUES (7)");
+        first.query_command_tags("BEGIN");
+        first.query_command_tags("INSERT INTO items VALUES (23)");
+        assert_eq!(
+            first.extended_query_single_text("SELECT SUM(id) FROM items"),
+            "30"
+        );
+        assert_eq!(
+            second.extended_query_single_text("SELECT SUM(id) FROM items"),
+            "7",
+            "extended queries must use the client's own transaction"
+        );
+        assert_eq!(first.query_command_tags("COMMIT"), ["COMMIT"]);
+        assert_eq!(
+            second.extended_query_single_text("SELECT SUM(id) FROM items"),
+            "30"
+        );
+        first.query_command_tags("SET search_path TO missing_schema");
+        assert_eq!(
+            second.extended_query_single_text("SELECT SUM(id) FROM items"),
+            "30"
+        );
+    });
+}
+
+#[test]
+fn wire_client_disconnect_rolls_back_transaction() {
+    with_pg_client(|first| {
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        first.query_command_tags("CREATE TABLE items(id INT)");
+        first.query_command_tags("INSERT INTO items VALUES (7)");
+        second.query_command_tags("BEGIN");
+        second.query_command_tags("INSERT INTO items VALUES (23)");
+        assert_eq!(second.query_single_text("SELECT SUM(id) FROM items"), "30");
+        drop(second);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if first.query_command_tags("INSERT INTO items VALUES (47)") == ["INSERT 0 1"] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnected client kept the write lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            first.query_single_text("SELECT SUM(id) FROM items"),
+            "54",
+            "disconnect must discard the uncommitted row"
+        );
+        let mut third = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(third.query_single_text("SELECT SUM(id) FROM items"), "54");
+    });
+}
+
+#[test]
+fn wire_clients_share_schema_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("main.db");
+    let output = run_tursopg_with_db(
+        &db_path,
+        b"CREATE SCHEMA existing; CREATE TABLE existing.items(id INT); INSERT INTO existing.items VALUES (17);\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+
+    with_pg_client_with_db(&db_path, |first| {
+        let port = first.stream.peer_addr().unwrap().port();
+        let mut second = PgTestClient::connect(port);
+        assert_eq!(
+            first.query_single_text("SELECT id FROM existing.items"),
+            "17"
+        );
+        assert_eq!(
+            second.query_single_text("SELECT id FROM existing.items"),
+            "17"
+        );
+        assert_eq!(
+            first.query_command_tags("CREATE SCHEMA added"),
+            ["CREATE SCHEMA"]
+        );
+        assert_eq!(
+            first.query_command_tags("CREATE TABLE added.items(id INT)"),
+            ["CREATE TABLE"]
+        );
+        assert_eq!(
+            first.query_command_tags("INSERT INTO added.items VALUES (29)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(second.query_single_text("SELECT id FROM added.items"), "29");
+        let mut third = PgTestClient::connect(port);
+        assert_eq!(third.query_single_text("SELECT id FROM added.items"), "29");
+
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA added CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        assert!(third
+            .query_command_tags("SELECT id FROM added.items")
+            .is_empty());
+        assert_eq!(
+            first.query_command_tags("CREATE SCHEMA added"),
+            ["CREATE SCHEMA"]
+        );
+        assert_eq!(
+            first.query_command_tags("CREATE TABLE added.items(id INT)"),
+            ["CREATE TABLE"]
+        );
+        assert_eq!(
+            first.query_command_tags("INSERT INTO added.items VALUES (43)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(
+            second.extended_query_single_text("SELECT id FROM added.items"),
+            "43"
+        );
+        assert_eq!(third.query_single_text("SELECT id FROM added.items"), "43");
+    });
+}
+
+#[test]
+fn wire_clients_share_schemas_in_memory() {
+    with_pg_client(|first| {
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(
+            first.query_command_tags("CREATE SCHEMA shared"),
+            ["CREATE SCHEMA"]
+        );
+        assert_eq!(
+            first.query_command_tags("CREATE TABLE shared.items(id INT)"),
+            ["CREATE TABLE"]
+        );
+        assert_eq!(
+            first.query_command_tags("INSERT INTO shared.items VALUES (31)"),
+            ["INSERT 0 1"]
+        );
+        assert_eq!(
+            second.extended_query_single_text("SELECT id FROM shared.items"),
+            "31"
+        );
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA shared CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        assert!(second
+            .query_command_tags("SELECT id FROM shared.items")
+            .is_empty());
+    });
+}
+
+#[test]
+fn wire_client_in_transaction_sees_replaced_schema_after_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("main.db");
+    with_pg_client_with_db(&db_path, |first| {
+        first.query_command_tags("CREATE SCHEMA changed");
+        first.query_command_tags("CREATE TABLE changed.items(id INT)");
+        first.query_command_tags("INSERT INTO changed.items VALUES (17)");
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(second.query_command_tags("BEGIN"), ["BEGIN"]);
+        assert_eq!(
+            second.query_single_text("SELECT id FROM changed.items"),
+            "17"
+        );
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA changed CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        first.query_command_tags("CREATE SCHEMA changed");
+        first.query_command_tags("CREATE TABLE changed.items(id INT)");
+        first.query_command_tags("INSERT INTO changed.items VALUES (29)");
+        assert_eq!(second.query_command_tags("COMMIT"), ["COMMIT"]);
+        assert_eq!(
+            second.query_single_text("SELECT id FROM changed.items"),
+            "29",
+            "a client must catch up with replaced schemas once its transaction ends"
+        );
+    });
+}
+
 /// Wire-protocol fixture: spin up tursopg, hand the caller a connected
 /// client, run their assertions, then shut the server down. Each test
 /// gets its own kernel-assigned port so they can run in parallel without
 /// TCP collisions.
 fn with_pg_client<F: FnOnce(&mut PgTestClient)>(f: F) {
-    let (mut server, port) = start_tursopg_server();
-    let mut client = PgTestClient::connect(port);
-    f(&mut client);
+    with_pg_client_with_db(":memory:", f);
+}
+
+fn with_pg_client_with_db(db_path: impl AsRef<std::ffi::OsStr>, f: impl FnOnce(&mut PgTestClient)) {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut server, port) = start_tursopg_server_with_db(db_path, Some(directory.path()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut client = PgTestClient::connect(port);
+        f(&mut client);
+    }));
     server.kill().ok();
     server.wait().ok();
+    if let Err(error) = result {
+        let mut stderr = String::new();
+        server
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        eprintln!("tursopg server stderr: {stderr}");
+        std::panic::resume_unwind(error);
+    }
 }
 
 /// `SELECT 42` MUST report INT4 over the wire. PostgreSQL itself does, and

@@ -124,6 +124,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn search_attached_databases_by_name(&self) -> bool {
+        false
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
