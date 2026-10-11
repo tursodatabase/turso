@@ -5,15 +5,15 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
+            emit_cdc_full_record, emit_cdc_insns, emit_index_column_value_old_image,
+            emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
+            OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
-            emit_returning_results, emit_returning_scan_back, emit_table_column,
-            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
+            emit_returning_results, emit_table_column, restore_returning_row_image_in_cache,
+            seed_returning_row_image_in_cache, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -277,18 +277,12 @@ fn emit_row_loop_delete(
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
-    }
-    // Emit scan-back loop for buffered RETURNING results.
-    // All DML is complete at this point; now yield the buffered rows to the caller.
-    // FkCheck must come before the scan-back so that FK violations prevent
-    // RETURNING rows from being emitted (matching SQLite behavior).
-    if let Some(ref buf) = returning_buffer {
-        program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(program, buf);
-    }
-    Ok(())
+    program.emit_dml_statement_end(resolver, t_ctx.cdc_cursor_id, returning_buffer.as_ref())?;
+    program.keep_writable_cte_part_returning(
+        returning_buffer,
+        &plan.result_columns,
+        &plan.table_references,
+    )
 }
 
 fn emit_clear_btree_delete(
@@ -318,6 +312,10 @@ fn emit_clear_btree_delete(
     let Some(table) = table_ref.btree() else {
         return Ok(false);
     };
+    // Rows that an earlier part of the statement wrote must stay.
+    if program.tracks_rows_changed_by_statement(table_ref.database_id, table.root_page) {
+        return Ok(false);
+    }
     if connection.mv_store_for_db(table_ref.database_id).is_some() {
         return Ok(false);
     }
@@ -368,9 +366,6 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
-        if !fk_ref.fk.deferred {
-            continue;
-        }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
@@ -441,7 +436,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -488,7 +483,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, fk_ref.fk.deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -548,19 +543,20 @@ fn emit_delete_insns<'a>(
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let iteration_index = unsafe { &*table_reference }.op.index();
     let has_returning = !result_columns.is_empty();
-    let has_delete_triggers = if let Some(btree_table) = btree_table {
+    let has_delete_triggers = if let Some(btree_table) = &btree_table {
         has_triggers_including_temp(
             &t_ctx.resolver,
             database_id,
             TriggerEvent::Delete,
             None,
-            &btree_table,
+            btree_table,
         )
     } else {
         false
     };
 
     let cols_len = unsafe { &*table_reference }.columns().len();
+    let skip_label;
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
         // An index can supply all values without moving the table cursor.
         // SQLite finishes the deferred move before it reads the row for deletion.
@@ -575,6 +571,18 @@ fn emit_delete_insns<'a>(
             cursor_id: main_table_cursor_id,
             dest: rowid_reg,
         });
+        let row_done = program.allocate_label();
+        skip_label = btree_table
+            .as_deref()
+            .is_some_and(|table| {
+                program.emit_skip_of_row_changed_by_statement(
+                    database_id,
+                    table.root_page,
+                    rowid_reg,
+                    row_done,
+                )
+            })
+            .then_some(row_done);
         if unsafe { &*table_reference }.virtual_table().is_some() {
             // VUpdate requires a NULL second argument ("new rowid") for deletion
             let new_rowid_reg = program.alloc_register();
@@ -661,6 +669,9 @@ fn emit_delete_insns<'a>(
             cursor_id: iteration_index_cursor,
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
+    }
+    if let Some(skip_label) = skip_label {
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
@@ -953,6 +964,14 @@ fn emit_delete_insns_when_triggers_present(
     }
     let btree_table = unsafe { &*table_reference }.btree();
     let database_id = unsafe { (*table_reference).database_id };
+    if let Some(table) = btree_table.as_deref() {
+        program.emit_skip_of_row_changed_by_statement(
+            database_id,
+            table.root_page,
+            rowid_reg,
+            skip_not_found_label,
+        );
+    }
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         has_triggers_including_temp(

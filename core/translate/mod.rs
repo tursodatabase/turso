@@ -48,6 +48,7 @@ pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
 mod window;
+pub(crate) mod writable_cte;
 
 use crate::connection::PrepareOptions;
 use crate::schema::Schema;
@@ -196,6 +197,18 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
+    let has_writable_cte = writable_cte::has_writable_cte(&stmt);
+    if has_writable_cte {
+        if !connection.writable_ctes_enabled() {
+            bail_parse_error!(
+                "INSERT, UPDATE and DELETE inside WITH are not supported (enable them with --experimental-writable-ctes)"
+            );
+        }
+        if connection.get_query_only() {
+            bail_parse_error!("Cannot execute write statement in query_only mode")
+        }
+    }
+
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
@@ -220,6 +233,9 @@ pub fn translate_inner(
     };
 
     match stmt {
+        stmt if has_writable_cte => {
+            writable_cte::translate_writable_cte_statement(stmt, resolver, program, connection)?;
+        }
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }

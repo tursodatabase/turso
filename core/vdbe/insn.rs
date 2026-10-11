@@ -1060,6 +1060,23 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Set the number of rows the current statement has changed to the integer in a register.
+    /// A statement with INSERT, UPDATE or DELETE inside WITH saves the count with ChangeCount
+    /// before a WITH part and restores it after, so only the main statement's rows count.
+    SetChangeCount {
+        src: usize,
+    },
+
+    /// Jump to target_pc if this statement already wrote the row with the rowid in rowid_reg
+    /// into the tracked table. The program's tracked tables come from
+    /// [crate::translate::writable_cte]: when several parts of one statement change the same
+    /// table, a row that one part changed must not be changed again by another part.
+    IfRowChangedByStatement {
+        tracked_table: usize,
+        rowid_reg: usize,
+        target_pc: BranchOffset,
+    },
+
     /// Write a float value into a register
     Real {
         value: f64,
@@ -2249,6 +2266,8 @@ impl InsnVariants {
             InsnVariants::Program => execute::op_program,
             InsnVariants::ResetCount => execute::op_reset_count,
             InsnVariants::ChangeCount => execute::op_change_count,
+            InsnVariants::SetChangeCount => execute::op_set_change_count,
+            InsnVariants::IfRowChangedByStatement => execute::op_if_row_changed_by_statement,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,

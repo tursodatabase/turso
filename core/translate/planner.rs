@@ -80,16 +80,23 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
 
+        // The writable CTE translator removes INSERT, UPDATE and DELETE from the
+        // statement's own WITH before planning, so one found here is nested.
+        let ast::CteBody::Select(select) = cte.body else {
+            crate::bail_parse_error!(
+                "WITH clause containing a data-modifying statement must be at the top level"
+            );
+        };
         let mut referenced_table_names = Vec::new();
-        collect_from_clause_table_refs(&cte.select, &mut referenced_table_names);
+        collect_from_clause_table_refs(&select, &mut referenced_table_names);
         let references_itself = RecursiveRefCounter { cte_name: &name }
-            .count_select(&cte.select, &mut RecursiveRefScope::new())
+            .count_select(&select, &mut RecursiveRefScope::new())
             > 0;
         referenced_table_names_by_cte.push(referenced_table_names);
         definitions.push(CteDefinition {
             cte_id: program.alloc_cte_id(),
             name,
-            select: cte.select,
+            select,
             explicit_columns: cte
                 .columns
                 .iter()
@@ -181,7 +188,12 @@ impl RecursiveRefCounter<'_> {
             // The CTE's own name is visible inside its body, where it refers
             // to the nested CTE itself rather than the recursive table.
             scope.push((name, 0));
-            let weight = self.count_select(&cte.select, scope);
+            // An INSERT, UPDATE or DELETE here is nested, and planning this
+            // WITH clause fails with an error, so its references do not matter.
+            let weight = cte
+                .body
+                .as_select()
+                .map_or(0, |select| self.count_select(select, scope));
             scope.last_mut().expect("scope entry pushed above").1 = weight;
         }
     }
@@ -2073,6 +2085,23 @@ fn parse_table(
             }
             return Ok(());
         }
+
+        // A CTE of a statement with INSERT, UPDATE or DELETE inside WITH. Its
+        // rows were stored by an earlier part of the statement.
+        if program.writable_cte.is_some() {
+            let identifier = maybe_alias
+                .map(|a| normalize_ident(a.name().as_str()))
+                .unwrap_or_else(|| normalized_qualified_name.clone());
+            if let Some(stored_cte) =
+                program.statement_cte_reference(&normalized_qualified_name, identifier)?
+            {
+                if !args.is_empty() {
+                    crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
+                }
+                table_references.add_joined_table(stored_cte);
+                return Ok(());
+            }
+        }
     }
 
     // Resolve table using connection's with_schema method
@@ -2088,7 +2117,9 @@ fn parse_table(
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
-            Table::BTree(table.clone())
+            // In a statement with INSERT, UPDATE or DELETE inside WITH, a read
+            // of a table that an earlier part wrote uses a copy of the table.
+            Table::BTree(program.table_for_read(database_id, table)?)
         } else {
             return Err(crate::LimboError::InvalidArgument(
                 "Table type not supported".to_string(),

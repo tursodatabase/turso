@@ -23,6 +23,25 @@ Some Turso features are still experimental and must be explicitly enabled before
 | Without Rowid | `without_rowid` | `WITHOUT ROWID` tables |
 | Multi-Process WAL | `multiprocess_wal` | [Multi-Process Access](/docs/sql-reference/multiprocess-access) — share a database file between OS processes via a shared WAL coordinator |
 | MVCC Passive Checkpoint | `mvcc_passive_checkpoint` | Passive checkpointing under MVCC (`journal_mode=mvcc`) |
+| Writable CTEs | `writable_ctes` | INSERT, UPDATE, DELETE inside WITH. PostgreSQL semantics. See [Writable CTEs](#writable-ctes) |
+
+## Writable CTEs
+
+INSERT, UPDATE and DELETE inside WITH. Not SQLite syntax; works like PostgreSQL.
+
+```sql
+WITH moved AS (DELETE FROM queue WHERE done RETURNING *)
+INSERT INTO archive SELECT * FROM moved;
+```
+
+- All parts see the database as of statement start.
+- Parts share rows only through RETURNING.
+- A row is changed at most once per statement.
+- Every part runs to the end, even if nothing reads it.
+- Rejected: tables with triggers, WITHOUT ROWID tables, REPLACE on a table another part writes.
+- `changes()`: main statement only. `total_changes()`: all parts.
+
+Differences from PostgreSQL: [postgres/COMPAT.md](https://github.com/tursodatabase/turso/blob/main/postgres/COMPAT.md#writable-ctes).
 
 <Info>
 Triggers are no longer experimental as of Turso 0.7 — [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) and [DROP TRIGGER](/docs/sql-reference/statements/drop-trigger) work without any flag.
@@ -63,6 +82,7 @@ let db = Builder::new_local("database.db")
     .experimental_vacuum(true)
     .experimental_attach(true)
     .experimental_multiprocess_wal(true)
+    .experimental_writable_ctes(true)
     .build()?;
 ```
 

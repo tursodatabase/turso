@@ -1,0 +1,671 @@
+# INSERT, UPDATE and DELETE inside WITH ("writable CTEs").
+#
+# Every expectation here is what PostgreSQL itself returns; check with
+#   sqltest run pg-sqltests --backend pg --postgres-dsn postgres://...
+# PostgreSQL documents the order in which the parts of such a statement run
+# as unpredictable. These tests only use orders that real PostgreSQL produces
+# deterministically and that the engine reproduces: CTEs that the main
+# statement reads run before it, CTEs that nothing reads run after it in
+# reverse order of declaration.
+
+@database :memory:
+
+setup items {
+    CREATE TABLE items (id int PRIMARY KEY, v int, tag text);
+    INSERT INTO items VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd');
+    CREATE TABLE archive (id int PRIMARY KEY, v int, tag text);
+}
+
+setup log {
+    CREATE TABLE log (id serial PRIMARY KEY, msg text);
+}
+
+setup indexed {
+    CREATE TABLE ix (id int PRIMARY KEY, v int, tag text UNIQUE);
+    CREATE INDEX ix_v ON ix (v);
+    CREATE INDEX ix_v_partial ON ix (v) WHERE v > 15;
+    CREATE INDEX ix_v_double ON ix ((v * 2));
+    INSERT INTO ix VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd');
+}
+
+# --- Rows move between parts only through RETURNING ---
+
+@setup items
+test move-rows-with-delete-returning {
+    WITH moved AS (DELETE FROM items WHERE v >= 30 RETURNING *)
+    INSERT INTO archive SELECT * FROM moved;
+    SELECT 'items', id, v, tag FROM items ORDER BY id;
+    SELECT 'archive', id, v, tag FROM archive ORDER BY id;
+}
+expect {
+    items|1|10|a
+    items|2|20|b
+    archive|3|30|c
+    archive|4|40|d
+}
+
+@setup items
+test main-select-joins-two-dml-ctes {
+    WITH d AS (DELETE FROM items WHERE id = 1 RETURNING id, v),
+         i AS (INSERT INTO archive VALUES (9, 90, 'z') RETURNING id, v)
+    SELECT d.id, d.v, i.id, i.v FROM d, i;
+    SELECT count(*) FROM items;
+    SELECT id FROM archive;
+}
+expect {
+    1|10|9|90
+    3
+    9
+}
+
+@setup items
+test dml-cte-feeds-another-dml-cte {
+    WITH d AS (DELETE FROM items WHERE id <= 2 RETURNING *),
+         i AS (INSERT INTO archive SELECT id, v * 100, tag FROM d RETURNING id, v)
+    SELECT id, v FROM i ORDER BY id;
+    SELECT id FROM items ORDER BY id;
+}
+expect {
+    1|1000
+    2|2000
+    3
+    4
+}
+
+@setup items
+test cte-column-names {
+    WITH changed(key, new_value) AS (UPDATE items SET v = v + 1 WHERE id = 2 RETURNING id, v)
+    SELECT key, new_value FROM changed;
+    SELECT 'items', id, v FROM items ORDER BY id;
+}
+expect {
+    2|21
+    items|1|10
+    items|2|21
+    items|3|30
+    items|4|40
+}
+
+@setup items
+test select-cte-reads-dml-cte {
+    WITH d AS (DELETE FROM items WHERE id IN (1, 3) RETURNING id, v),
+         doubled AS (SELECT id, v * 2 AS v2 FROM d)
+    SELECT id, v2 FROM doubled ORDER BY id;
+    SELECT 'items', id, v FROM items ORDER BY id;
+}
+expect {
+    1|20
+    3|60
+    items|2|20
+    items|4|40
+}
+
+@setup items
+test update-from-dml-cte {
+    WITH staged AS (INSERT INTO archive VALUES (4, 40, 'd') RETURNING id, v)
+    UPDATE items SET v = items.v + staged.v FROM staged WHERE items.id = 1
+    RETURNING items.id, items.v;
+    SELECT id, v FROM items ORDER BY id;
+    SELECT 'archive', id, v, tag FROM archive ORDER BY id;
+}
+expect {
+    1|50
+    1|50
+    2|20
+    3|30
+    4|40
+    archive|4|40|d
+}
+
+@setup items
+test dml-cte-column-list-renames-leading-columns {
+    WITH c(key) AS (UPDATE items SET v = v + 1 WHERE id = 2 RETURNING id, v, tag)
+    SELECT key, v, tag FROM c;
+    SELECT 'items', id, v FROM items ORDER BY id;
+}
+expect {
+    2|21|b
+    items|1|10
+    items|2|21
+    items|3|30
+    items|4|40
+}
+
+@setup items
+test dml-cte-column-list-longer-than-returning-is-rejected {
+    WITH c(a, b, d, e) AS (UPDATE items SET v = v + 1 WHERE id = 2 RETURNING id, v, tag)
+    SELECT * FROM c;
+}
+expect error {}
+
+@setup items
+test delete-where-in-dml-cte {
+    WITH gone AS (DELETE FROM items WHERE v > 25 RETURNING tag)
+    DELETE FROM archive WHERE tag IN (SELECT tag FROM gone);
+    SELECT id FROM items ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup items
+test nested-select-with-inside-dml-cte {
+    WITH d AS (
+        WITH small AS (SELECT id FROM items WHERE v < 25)
+        DELETE FROM items WHERE id IN (SELECT id FROM small) RETURNING id
+    )
+    SELECT id FROM d ORDER BY id;
+    SELECT id FROM items ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup items
+test empty-dml-cte-returns-no-rows {
+    WITH d AS (DELETE FROM items WHERE id = 99 RETURNING id)
+    SELECT count(*) FROM d;
+    SELECT count(*) FROM items;
+}
+expect {
+    0
+    4
+}
+
+@setup items
+test insert-returning-expressions {
+    WITH i AS (INSERT INTO items VALUES (5, 50, 'e'), (6, 60, 'f') RETURNING id * 10, tag || '!')
+    SELECT * FROM i ORDER BY 1;
+    SELECT 'items', id, v, tag FROM items WHERE id > 4 ORDER BY id;
+}
+expect {
+    50|e!
+    60|f!
+    items|5|50|e
+    items|6|60|f
+}
+
+# --- Every part reads the database as it was when the statement started ---
+
+@setup items
+test main-select-reads-table-as-of-statement-start {
+    WITH upd AS (UPDATE items SET v = v + 1 RETURNING id, v)
+    SELECT items.id, items.v, upd.v FROM items JOIN upd ON items.id = upd.id ORDER BY items.id;
+    SELECT id, v FROM items ORDER BY id;
+}
+expect {
+    1|10|11
+    2|20|21
+    3|30|31
+    4|40|41
+    1|11
+    2|21
+    3|31
+    4|41
+}
+
+@setup items
+test unreferenced-update-runs-after-main-select {
+    WITH upd AS (UPDATE items SET v = 0)
+    SELECT id, v FROM items ORDER BY id;
+    SELECT sum(v) FROM items;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+    0
+}
+
+@setup items
+test select-cte-and-subqueries-read-statement-start {
+    WITH snap AS (SELECT * FROM items),
+         up AS (UPDATE items SET v = v * 10 RETURNING *)
+    SELECT (SELECT sum(v) FROM snap), (SELECT sum(v) FROM up), (SELECT sum(v) FROM items);
+    SELECT 'items', id, v FROM items ORDER BY id;
+}
+expect {
+    100|1000|100
+    items|1|100
+    items|2|200
+    items|3|300
+    items|4|400
+}
+
+@setup items
+test dml-cte-reads-table-written-by-earlier-cte {
+    WITH d AS (DELETE FROM items WHERE id = 1 RETURNING id),
+         copy AS (INSERT INTO archive SELECT * FROM items RETURNING id)
+    SELECT (SELECT count(*) FROM d), (SELECT count(*) FROM copy);
+    SELECT id FROM archive ORDER BY id;
+}
+expect {
+    1|4
+    1
+    2
+    3
+    4
+}
+
+@setup items
+test update-reads-its-own-table-as-of-statement-start {
+    WITH o AS (INSERT INTO archive VALUES (1, 1, 'x')),
+         u AS (UPDATE items SET v = (SELECT coalesce(sum(i2.v), 0) FROM items i2 WHERE i2.id < items.id) + 100
+               RETURNING id, v)
+    SELECT id, v FROM u ORDER BY id;
+    SELECT 'items', id, v FROM items ORDER BY id;
+    SELECT 'archive', id, v, tag FROM archive ORDER BY id;
+}
+expect {
+    1|100
+    2|110
+    3|130
+    4|160
+    items|1|100
+    items|2|110
+    items|3|130
+    items|4|160
+    archive|1|1|x
+}
+
+@setup items
+test returning-subquery-reads-its-own-table-as-of-statement-start {
+    WITH o AS (INSERT INTO archive VALUES (1, 1, 'x'))
+    UPDATE items SET v = 7 RETURNING (SELECT sum(v) FROM items);
+    SELECT 'items', sum(v) FROM items;
+    SELECT 'archive', count(*) FROM archive;
+}
+expect {
+    100
+    100
+    100
+    100
+    items|28
+    archive|1
+}
+
+@setup items
+test delete-reads-its-own-table-as-of-statement-start {
+    WITH o AS (INSERT INTO archive VALUES (1, 1, 'x'))
+    DELETE FROM items WHERE v > (SELECT avg(v) FROM items) RETURNING (SELECT count(*) FROM items);
+    SELECT 'items', id FROM items ORDER BY id;
+    SELECT 'archive', count(*) FROM archive;
+}
+expect {
+    4
+    4
+    items|1
+    items|2
+    archive|1
+}
+
+@setup indexed
+test reads-of-an-indexed-table-as-of-statement-start {
+    WITH up AS (UPDATE ix SET v = v + 100, tag = tag || '!' RETURNING id)
+    SELECT (SELECT count(*) FROM up),
+           (SELECT id FROM ix WHERE v = 20),
+           (SELECT count(*) FROM ix WHERE v > 15),
+           (SELECT min(v) FROM ix),
+           (SELECT max(v) FROM ix),
+           (SELECT id FROM ix WHERE v * 2 = 60),
+           (SELECT id FROM ix ORDER BY v DESC LIMIT 1),
+           (SELECT id FROM ix WHERE tag = 'c');
+    SELECT id, v, tag FROM ix ORDER BY id;
+}
+expect {
+    4|2|3|10|40|3|4|3
+    1|110|a!
+    2|120|b!
+    3|130|c!
+    4|140|d!
+}
+
+@setup indexed
+test update-skips-rows-moved-to-new-keys-by-main {
+    WITH a AS (UPDATE ix SET v = 0 WHERE v >= 30)
+    UPDATE ix SET id = id + 100 WHERE v >= 20 RETURNING id;
+    SELECT id, v FROM ix ORDER BY id;
+}
+expect unordered {
+    102
+    103
+    104
+    1|10
+    102|20
+    103|30
+    104|40
+}
+
+@setup indexed
+test delete-through-index-skips-row-changed-by-main {
+    WITH d AS (DELETE FROM ix WHERE v = 20 RETURNING id)
+    UPDATE ix SET tag = 'zz' WHERE id = 2;
+    SELECT id, v, tag FROM ix ORDER BY id;
+}
+expect {
+    1|10|a
+    2|20|zz
+    3|30|c
+    4|40|d
+}
+
+@setup indexed
+test unique-conflict-between-parts-fails {
+    WITH a AS (UPDATE ix SET tag = 'x' WHERE id = 1)
+    INSERT INTO ix VALUES (5, 50, 'x');
+}
+expect error {}
+
+@setup items
+test inserted-rows-are-invisible-to-other-parts {
+    WITH ins AS (INSERT INTO items VALUES (100, 1, 'new') RETURNING id)
+    UPDATE items SET v = -1 WHERE id IN (SELECT id FROM ins) RETURNING id;
+    SELECT id, v FROM items WHERE id = 100;
+}
+expect {
+    100|1
+}
+
+@setup items
+test dml-cte-referenced-twice-runs-once {
+    WITH i AS (INSERT INTO archive VALUES (7, 70, 'g') RETURNING id)
+    SELECT (SELECT count(*) FROM i), (SELECT count(*) FROM i), (SELECT count(*) FROM archive);
+    SELECT count(*) FROM archive;
+}
+expect {
+    1|1|0
+    1
+}
+
+@setup items
+test main-limit-does-not-stop-dml {
+    WITH i AS (INSERT INTO archive VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z') RETURNING id)
+    SELECT id FROM i ORDER BY id LIMIT 1;
+    SELECT count(*) FROM archive;
+}
+expect {
+    1
+    3
+}
+
+@setup items
+test values-main-statement-runs-dml-cte {
+    WITH i AS (INSERT INTO archive VALUES (8, 80, 'h') RETURNING id)
+    VALUES (1);
+    SELECT id FROM archive;
+}
+expect {
+    1
+    8
+}
+
+@setup items
+test union-main-statement-reads-dml-ctes {
+    WITH a AS (UPDATE items SET v = 100 WHERE id <= 2 RETURNING id, v),
+         b AS (UPDATE items SET v = 200 WHERE id >= 3 RETURNING id, v)
+    SELECT 'a', id, v FROM a UNION ALL SELECT 'b', id, v FROM b ORDER BY 1, 2;
+    SELECT 'items', id, v FROM items ORDER BY id;
+}
+expect {
+    a|1|100
+    a|2|100
+    b|3|200
+    b|4|200
+    items|1|100
+    items|2|100
+    items|3|200
+    items|4|200
+}
+
+# --- A row is changed at most once per statement ---
+
+@setup items
+test two-unreferenced-updates-of-one-row {
+    WITH a AS (UPDATE items SET v = 1 WHERE id = 3),
+         b AS (UPDATE items SET v = 2 WHERE id = 3)
+    SELECT 1;
+    SELECT v FROM items WHERE id = 3;
+}
+expect {
+    1
+    2
+}
+
+@setup items
+test main-update-wins-over-unreferenced-update {
+    WITH a AS (UPDATE items SET v = 300 WHERE id = 3 RETURNING *)
+    UPDATE items SET v = 400 WHERE id = 3 RETURNING id, v;
+    SELECT v FROM items WHERE id = 3;
+}
+expect {
+    3|400
+    400
+}
+
+@setup items
+test main-update-skips-row-changed-by-referenced-cte {
+    WITH up AS (UPDATE items SET v = 555 WHERE id = 1 RETURNING *)
+    UPDATE items SET v = 666 FROM up WHERE items.id = up.id RETURNING items.id;
+    SELECT v FROM items WHERE id = 1;
+}
+expect {
+    555
+}
+
+@setup items
+test main-delete-skips-row-updated-by-referenced-cte {
+    WITH up AS (UPDATE items SET v = 1 WHERE id <= 2 RETURNING id)
+    DELETE FROM items WHERE id IN (SELECT id FROM up) OR id = 3 RETURNING id;
+    SELECT id, v FROM items ORDER BY id;
+}
+expect {
+    3
+    1|1
+    2|1
+    4|40
+}
+
+@setup items
+test update-from-delete-cte-of-same-table {
+    WITH staged AS (DELETE FROM items WHERE id = 4 RETURNING id, v)
+    UPDATE items SET v = items.v + staged.v FROM staged WHERE items.id = 1
+    RETURNING items.id, items.v;
+    SELECT id, v FROM items ORDER BY id;
+}
+expect {
+    1|50
+    1|50
+    2|20
+    3|30
+}
+
+@setup items
+test unreferenced-delete-skips-row-updated-by-main {
+    WITH d AS (DELETE FROM items WHERE id <= 2)
+    UPDATE items SET v = -v WHERE id >= 2;
+    SELECT id, v FROM items ORDER BY id;
+}
+expect {
+    2|-20
+    3|-30
+    4|-40
+}
+
+@setup items
+test upsert-in-main-wins-over-unreferenced-update {
+    WITH a AS (UPDATE items SET v = 7 WHERE id = 2 RETURNING *)
+    INSERT INTO items VALUES (2, 8, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING id, v;
+    SELECT v FROM items WHERE id = 2;
+}
+expect {
+    2|8
+    8
+}
+
+@setup items
+test upsert-do-update-on-row-inserted-by-referenced-cte {
+    WITH a AS (INSERT INTO items VALUES (51, 1, 'x') RETURNING *)
+    INSERT INTO items SELECT 51, 2, 'y' FROM a ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+}
+expect error {}
+
+@setup items
+test upsert-of-row-inserted-by-same-cte-fails {
+    WITH x AS (INSERT INTO items VALUES (7, 1, 'x'), (7, 2, 'y') ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING id)
+    SELECT * FROM x;
+}
+expect error {}
+
+@setup items
+test update-else-insert {
+    WITH up AS (UPDATE items SET v = 90 WHERE id = 9 RETURNING id)
+    INSERT INTO items SELECT 9, 91, 'new' WHERE NOT EXISTS (SELECT 1 FROM up);
+    WITH up AS (UPDATE items SET v = 92 WHERE id = 9 RETURNING id)
+    INSERT INTO items SELECT 9, 93, 'new' WHERE NOT EXISTS (SELECT 1 FROM up);
+    SELECT id, v FROM items WHERE id = 9;
+}
+expect {
+    9|92
+}
+
+@setup items
+test upsert-do-nothing-on-row-inserted-by-referenced-cte {
+    WITH a AS (INSERT INTO items VALUES (52, 1, 'x') RETURNING *)
+    INSERT INTO items SELECT 52, 2, 'y' FROM a ON CONFLICT (id) DO NOTHING RETURNING id;
+    SELECT id, v FROM items WHERE id = 52;
+}
+expect {
+    52|1
+}
+
+# --- Constraints see the rows other parts wrote ---
+
+@setup items
+test unreferenced-delete-runs-after-insert-of-same-key {
+    WITH d AS (DELETE FROM items WHERE id = 1 RETURNING *)
+    INSERT INTO items VALUES (1, 999, 'z');
+}
+expect error {}
+
+@setup items
+test referenced-delete-runs-before-insert-of-same-key {
+    WITH d AS (DELETE FROM items WHERE id = 1 RETURNING *)
+    INSERT INTO items SELECT id, 555, tag FROM d;
+    SELECT id, v FROM items ORDER BY id;
+}
+expect {
+    1|555
+    2|20
+    3|30
+    4|40
+}
+
+@setup items
+test two-inserts-of-same-key-fail {
+    WITH a AS (INSERT INTO archive VALUES (1, 1, 'x'))
+    INSERT INTO archive VALUES (1, 2, 'y');
+}
+expect error {}
+
+# --- Order in which the parts run ---
+
+@setup log
+test unreferenced-ctes-run-after-main-in-reverse-order {
+    WITH a AS (INSERT INTO log (msg) VALUES ('a')),
+         b AS (INSERT INTO log (msg) VALUES ('b')),
+         c AS (INSERT INTO log (msg) VALUES ('c'))
+    INSERT INTO log (msg) VALUES ('main');
+    SELECT id, msg FROM log ORDER BY id;
+}
+expect {
+    1|main
+    2|c
+    3|b
+    4|a
+}
+
+@setup log
+test referenced-ctes-run-before-main {
+    WITH a AS (INSERT INTO log (msg) VALUES ('a') RETURNING msg),
+         b AS (INSERT INTO log (msg) SELECT msg || 'b' FROM a RETURNING msg),
+         c AS (INSERT INTO log (msg) VALUES ('c'))
+    INSERT INTO log (msg) SELECT msg || 'm' FROM b;
+    SELECT id, msg FROM log ORDER BY id;
+}
+expect {
+    1|a
+    2|ab
+    3|abm
+    4|c
+}
+
+# The PostgreSQL frontend does not enforce foreign keys, so foreign keys
+# between parts are tested in tests/integration/writable_cte.rs.
+
+# --- Statements that PostgreSQL rejects ---
+
+@setup items
+test dml-cte-without-returning-cannot-be-read {
+    WITH d AS (DELETE FROM items WHERE id = 1)
+    SELECT * FROM d;
+}
+expect error {}
+
+@setup items
+test dml-cte-in-subquery-is-rejected {
+    SELECT * FROM (WITH x AS (DELETE FROM items WHERE id = 4 RETURNING *) SELECT * FROM x) s;
+}
+expect error {}
+
+@setup items
+test dml-cte-in-nested-with-is-rejected {
+    WITH y AS (WITH x AS (DELETE FROM items WHERE id = 4 RETURNING *) SELECT * FROM x)
+    SELECT * FROM y;
+}
+expect error {}
+
+@setup items
+test dml-cte-in-insert-select-is-rejected {
+    INSERT INTO archive WITH x AS (DELETE FROM items WHERE id = 4 RETURNING *) SELECT * FROM x;
+}
+expect error {}
+
+@setup items
+test dml-cte-in-scalar-subquery-is-rejected {
+    SELECT (WITH x AS (DELETE FROM items WHERE id = 2 RETURNING v) SELECT v FROM x);
+}
+expect error {}
+
+@setup items
+test recursive-dml-cte-is-rejected {
+    WITH RECURSIVE x AS (DELETE FROM items WHERE id IN (SELECT id FROM x) RETURNING *)
+    SELECT * FROM x;
+}
+expect error {}
+
+@setup items
+test dml-cte-in-view-is-rejected {
+    CREATE VIEW v AS WITH x AS (DELETE FROM items WHERE id = 4 RETURNING *) SELECT * FROM x;
+}
+expect error {}
+
+@setup items
+test recursive-select-cte-feeds-insert {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3),
+         i AS (INSERT INTO archive SELECT n, n * 10, 'r' FROM r RETURNING id)
+    SELECT id FROM i ORDER BY id;
+    SELECT 'archive', id, v, tag FROM archive ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    archive|1|10|r
+    archive|2|20|r
+    archive|3|30|r
+}

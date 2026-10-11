@@ -541,7 +541,11 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
         Stmt::Update(update) => {
             if let Some(with) = &mut update.with {
                 for cte in &mut with.ctes {
-                    if walk_select(&mut cte.select, f) {
+                    if cte
+                        .body
+                        .as_select_mut()
+                        .is_some_and(|select| walk_select(select, f))
+                    {
                         return true;
                     }
                 }
@@ -571,7 +575,11 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
         } => {
             if let Some(with) = with {
                 for cte in &mut with.ctes {
-                    if walk_select(&mut cte.select, f) {
+                    if cte
+                        .body
+                        .as_select_mut()
+                        .is_some_and(|select| walk_select(select, f))
+                    {
                         return true;
                     }
                 }
@@ -618,7 +626,11 @@ fn walk_result_columns(columns: &mut [ResultColumn], f: &mut dyn FnMut(&mut Expr
 fn walk_select(select: &mut Select, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            if walk_select(&mut cte.select, f) {
+            if cte
+                .body
+                .as_select_mut()
+                .is_some_and(|select| walk_select(select, f))
+            {
                 return true;
             }
         }
@@ -765,7 +777,11 @@ fn walk_sites(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool
         Stmt::Update(update) => {
             if let Some(with) = &mut update.with {
                 for cte in &mut with.ctes {
-                    if walk_select_sites(&mut cte.select, f) {
+                    if cte
+                        .body
+                        .as_select_mut()
+                        .is_some_and(|select| walk_select_sites(select, f))
+                    {
                         return true;
                     }
                 }
@@ -785,7 +801,11 @@ fn walk_sites(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool
         } => {
             if let Some(with) = with {
                 for cte in &mut with.ctes {
-                    if walk_select_sites(&mut cte.select, f) {
+                    if cte
+                        .body
+                        .as_select_mut()
+                        .is_some_and(|select| walk_select_sites(select, f))
+                    {
                         return true;
                     }
                 }
@@ -802,7 +822,11 @@ fn walk_sites(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool
 fn walk_select_sites(select: &mut Select, f: &mut dyn FnMut(&mut Site<'_>) -> bool) -> bool {
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            if walk_select_sites(&mut cte.select, f) {
+            if cte
+                .body
+                .as_select_mut()
+                .is_some_and(|select| walk_select_sites(select, f))
+            {
                 return true;
             }
         }

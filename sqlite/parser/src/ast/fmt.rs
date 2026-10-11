@@ -2446,7 +2446,10 @@ impl ToTokens for CommonTableExpr {
             }
         };
         s.append(TK_LP, None)?;
-        self.select.to_tokens(s, context)?;
+        match &self.body {
+            CteBody::Select(select) => select.to_tokens(s, context)?,
+            CteBody::DataModifying(stmt) => stmt.to_tokens(s, context)?,
+        }
         s.append(TK_RP, None)
     }
 }

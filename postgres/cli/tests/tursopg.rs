@@ -1302,6 +1302,117 @@ fn wire_comment_on_returns_comment_tag() {
     });
 }
 
+/// The tag names the main statement and counts only its rows, as in
+/// PostgreSQL, also when the statement starts with WITH or returns rows.
+#[test]
+fn wire_dml_tags_count_the_main_statement() {
+    with_pg_client(|client| {
+        client.query_command_tags("CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        client.query_command_tags("CREATE TABLE log(id INT PRIMARY KEY)");
+        let cases = [
+            ("INSERT INTO t VALUES (1, 1), (2, 2) RETURNING id", "INSERT 0 2"),
+            ("UPDATE t SET v = 0 WHERE id = 1 RETURNING id", "UPDATE 1"),
+            (
+                "WITH l AS (INSERT INTO log VALUES (1), (2), (3)) INSERT INTO t VALUES (3, 3)",
+                "INSERT 0 1",
+            ),
+            (
+                "WITH l AS (DELETE FROM log WHERE id <= 2 RETURNING id) UPDATE t SET v = 9 WHERE id IN (SELECT id FROM l) RETURNING id",
+                "UPDATE 2",
+            ),
+            (
+                "WITH l AS (DELETE FROM log) DELETE FROM t WHERE id = 3",
+                "DELETE 1",
+            ),
+            (
+                "WITH l AS (INSERT INTO log VALUES (10) RETURNING id) SELECT id FROM l",
+                "SELECT 1",
+            ),
+            (
+                "/* tag */ DELETE FROM log WHERE id = 10 RETURNING id",
+                "DELETE 1",
+            ),
+            ("insert into log values (20)", "INSERT 0 1"),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(client.query_command_tags(sql), [expected], "{sql}");
+        }
+    });
+}
+
+/// Bound parameters reach the right parts of a statement with INSERT, UPDATE
+/// or DELETE inside WITH, whose parts run in a different order than they are
+/// written, and a prepared statement runs again with new parameters.
+#[test]
+fn wire_writable_cte_with_bound_parameters() {
+    use turso_pg_client::{BackendEvent, ConnParams, PgConn};
+    let (mut server, port) = start_tursopg_server();
+    let params =
+        ConnParams::parse(&format!("postgres://postgres@127.0.0.1:{port}/postgres")).unwrap();
+    let mut conn = PgConn::connect(&params, &[]).unwrap();
+    let rows = |events: Vec<BackendEvent>| -> Vec<String> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                BackendEvent::DataRow(row) => Some(
+                    row.into_iter()
+                        .map(|value| value.unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ),
+                BackendEvent::ErrorResponse(fields) => {
+                    panic!("{}", turso_pg_client::error_message(&fields))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    conn.simple_query("CREATE TABLE t (id int PRIMARY KEY, v int)")
+        .unwrap();
+    conn.simple_query("CREATE TABLE archive (id int PRIMARY KEY, v int)")
+        .unwrap();
+    conn.simple_query("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    // `a` runs after the main statement, which reads `d`, which runs first.
+    conn.prepare_statement(
+        "move",
+        "WITH a AS (UPDATE t SET v = v + $3 WHERE id = $2),
+              d AS (DELETE FROM t WHERE id = $1 RETURNING id, v)
+         INSERT INTO archive SELECT id, v FROM d RETURNING id, v",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            conn.execute_prepared("move", &[Some("1"), Some("2"), Some("5")])
+                .unwrap()
+        ),
+        ["1|10"]
+    );
+    assert_eq!(
+        rows(
+            conn.execute_prepared("move", &[Some("3"), Some("2"), Some("100")])
+                .unwrap()
+        ),
+        ["3|30"]
+    );
+    assert_eq!(
+        rows(
+            conn.simple_query("SELECT id, v FROM t ORDER BY id")
+                .unwrap()
+        ),
+        ["2|125"]
+    );
+    assert_eq!(
+        rows(
+            conn.simple_query("SELECT id, v FROM archive ORDER BY id")
+                .unwrap()
+        ),
+        ["1|10", "3|30"]
+    );
+    server.kill().ok();
+    server.wait().ok();
+}
+
 /// Wire-protocol fixture: spin up tursopg, hand the caller a connected
 /// client, run their assertions, then shut the server down. Each test
 /// gets its own kernel-assigned port so they can run in parallel without

@@ -487,6 +487,13 @@ pub fn emit_upsert(
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
 ) -> crate::Result<()> {
+    // In a statement with INSERT, UPDATE or DELETE inside WITH, a row that the
+    // statement already wrote cannot be updated again (PostgreSQL semantics).
+    program.emit_upsert_error_if_row_changed_by_statement(
+        ctx.database_id,
+        ctx.table.root_page,
+        ctx.conflict_rowid_reg,
+    );
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,

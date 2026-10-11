@@ -1141,6 +1141,31 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]=changes"),
             ),
+            Insn::SetChangeCount { src } => (
+                "SetChangeCount",
+                *src as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("changes=r[{src}]"),
+            ),
+            Insn::IfRowChangedByStatement {
+                tracked_table,
+                rowid_reg,
+                target_pc,
+            } => (
+                "IfRowChangedByStatement",
+                *tracked_table as i64,
+                target_pc.as_debug_int() as i64,
+                *rowid_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if r[{rowid_reg}] in rows changed in tracked table {tracked_table} goto {}",
+                    target_pc.as_debug_int()
+                ),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,

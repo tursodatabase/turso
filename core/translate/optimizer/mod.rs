@@ -104,6 +104,13 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
+            // A copy of a table that a statement part reads has no indexes.
+            .filter(|jt| {
+                jt.btree().is_none_or(|btree| {
+                    btree.root_page
+                        != crate::translate::writable_cte::STATEMENT_START_COPY_ROOT_PAGE
+                })
+            })
             .filter_map(|jt| {
                 let indexes = resolver.with_schema(jt.database_id, |schema| {
                     schema.indexes.get(jt.table.get_name()).cloned()
@@ -2351,6 +2358,16 @@ fn enforce_indexed_by_hints(
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
                 let Some(forced_index) = forced_index else {
+                    if table_ref.btree().is_some_and(|table| {
+                        table.root_page
+                            == crate::translate::writable_cte::STATEMENT_START_COPY_ROOT_PAGE
+                    }) {
+                        crate::bail_parse_error!(
+                            "INDEXED BY {} cannot be used here: this part reads table {} as it was when the statement started, which has no indexes",
+                            idx_name,
+                            table_ref.table.get_name()
+                        );
+                    }
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.

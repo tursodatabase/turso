@@ -996,6 +996,10 @@ pub struct ProgramState {
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+    /// Rowids this statement wrote into each tracked table, indexed like
+    /// [PreparedProgram::tracked_table_cursors]. Empty unless the statement has
+    /// INSERT, UPDATE or DELETE inside WITH that change the same table.
+    pub(crate) rows_changed_by_statement: Vec<crate::HashSet<i64>>,
     // Cache of unused allocated Vecs
     pub(crate) spare_agg_payloads: Vec<crate::alloc::Vec<Value>>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
@@ -1095,6 +1099,7 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
+            rows_changed_by_statement: Vec::new(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
@@ -1255,6 +1260,9 @@ impl ProgramState {
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
+        }
+        if !self.rows_changed_by_statement.is_empty() {
+            self.rows_changed_by_statement.clear();
         }
         if !self.bloom_filters.is_empty() {
             self.bloom_filters.clear();
@@ -1884,6 +1892,15 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// For each table whose changed rows this statement tracks, the cursors that
+    /// write into it. `Insert` through one of these cursors records the rowid in
+    /// [ProgramState::rows_changed_by_statement].
+    pub tracked_table_cursors: Vec<Vec<CursorID>>,
+    /// The statement has INSERT, UPDATE or DELETE inside WITH. All its writes
+    /// finish before it returns its first row, so a reset after the first row
+    /// commits instead of rolling back, and its writes count in
+    /// total_changes() even when the main statement is a SELECT.
+    pub is_writable_cte_statement: bool,
 }
 
 #[derive(Clone)]
@@ -1936,6 +1953,11 @@ impl PreparedProgram {
             prepared: self,
             connection,
         }
+    }
+
+    /// Whether the rows this statement changes count in total_changes().
+    pub(crate) fn counts_total_changes(&self) -> bool {
+        self.change_cnt_on || self.is_writable_cte_statement
     }
 
     pub fn is_compatible_with(&self, connection: &Connection) -> bool {
@@ -2869,6 +2891,8 @@ impl Program {
             if self.change_cnt_on {
                 self.connection
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
+            }
+            if self.counts_total_changes() {
                 self.connection
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }

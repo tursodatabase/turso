@@ -14,7 +14,9 @@
 //! `(tag, body)` frames for callers that need full control over rendering
 //! (the regression runner reproduces psql transcripts byte-for-byte), and
 //! [`PgConn::read_event`] / [`PgConn::simple_query`] decode the frames for
-//! callers that just want rows and errors.
+//! callers that just want rows and errors. [`PgConn::prepare_statement`] and
+//! [`PgConn::execute_prepared`] use the extended query protocol, for tests
+//! of bound parameters.
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -270,6 +272,64 @@ impl PgConn {
         }
     }
 
+    /// Prepares `sql` as the named statement `name` with the extended query
+    /// protocol (Parse, Sync) and collects every event up to and including
+    /// `ReadyForQuery`.
+    pub fn prepare_statement(&mut self, name: &str, sql: &str) -> Result<Vec<BackendEvent>> {
+        let mut parse = Vec::new();
+        push_cstring(&mut parse, name);
+        push_cstring(&mut parse, sql);
+        parse.extend_from_slice(&0u16.to_be_bytes()); // let the server infer parameter types
+        self.write_message(b'P', &parse)?;
+        self.sync()
+    }
+
+    /// Runs the named statement `name` with the extended query protocol
+    /// (Bind, Describe, Execute, Sync). Parameters are sent in text format;
+    /// `None` is NULL.
+    pub fn execute_prepared(
+        &mut self,
+        name: &str,
+        params: &[Option<&str>],
+    ) -> Result<Vec<BackendEvent>> {
+        let mut bind = Vec::new();
+        push_cstring(&mut bind, ""); // unnamed portal
+        push_cstring(&mut bind, name);
+        bind.extend_from_slice(&0u16.to_be_bytes()); // all parameters in text format
+        bind.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        for param in params {
+            match param {
+                Some(value) => {
+                    bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(value.as_bytes());
+                }
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        bind.extend_from_slice(&0u16.to_be_bytes()); // all results in text format
+        self.write_message(b'B', &bind)?;
+        self.write_message(b'D', b"P\0")?;
+        let mut execute = Vec::new();
+        push_cstring(&mut execute, "");
+        execute.extend_from_slice(&0u32.to_be_bytes()); // no row limit
+        self.write_message(b'E', &execute)?;
+        self.sync()
+    }
+
+    /// Sends Sync and collects every event up to and including `ReadyForQuery`.
+    fn sync(&mut self) -> Result<Vec<BackendEvent>> {
+        self.write_message(b'S', &[])?;
+        let mut events = Vec::new();
+        loop {
+            let event = self.read_event()?;
+            let done = matches!(event, BackendEvent::ReadyForQuery(_));
+            events.push(event);
+            if done {
+                return Ok(events);
+            }
+        }
+    }
+
     fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer
@@ -278,6 +338,11 @@ impl PgConn {
         self.writer.flush()?;
         Ok(())
     }
+}
+
+fn push_cstring(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
 }
 
 /// Parses a `RowDescription` message body.

@@ -115,6 +115,11 @@ pub struct Opts {
     pub experimental_without_rowid: bool,
     #[clap(
         long,
+        help = "Enable experimental INSERT, UPDATE and DELETE inside WITH (PostgreSQL semantics)"
+    )]
+    pub experimental_writable_ctes: bool,
+    #[clap(
+        long,
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
     )]
     pub experimental_multiprocess_wal: bool,
@@ -265,6 +270,7 @@ impl Limbo {
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
             .with_without_rowid(opts.experimental_without_rowid)
+            .with_writable_ctes(opts.experimental_writable_ctes)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);

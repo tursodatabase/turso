@@ -1586,10 +1586,11 @@ impl Statement {
 
         if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
-                && self.program.change_cnt_on
+                && (self.program.change_cnt_on || self.program.is_writable_cte_statement)
                 && self.has_returned_row
             {
-                // Write statement with RETURNING, user got at least one Row.
+                // Write statement with RETURNING (or with INSERT, UPDATE or DELETE
+                // inside WITH), user got at least one Row.
                 // With ephemeral-buffered RETURNING, ALL DML completed before any
                 // rows were yielded. The remaining work is just the scan-back
                 // (in-memory) + Halt. Commit the transaction via halt().

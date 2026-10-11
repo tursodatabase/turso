@@ -11,6 +11,7 @@ pub use session::{
 pub use turso_core::{
     Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, Result, StepResult,
 };
+pub use turso_pg_parser::{dml_command, DmlCommand};
 
 pub mod vtab {
     pub use turso_core::VirtualTable;

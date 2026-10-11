@@ -41,6 +41,8 @@ pub struct RunOptions {
     pub backend_type: Backend,
     /// Whether this is the sqlite CLI backend
     pub backend_is_sqlite: bool,
+    /// Whether this runs against a real PostgreSQL server
+    pub backend_is_postgres: bool,
     /// Snapshot update mode (used by snapshots)
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Path to binary used for cross-checking integrity (None = disabled)
@@ -470,6 +472,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 None => true, // Unconditional skip
                 Some(SkipCondition::Mvcc) => options.mvcc,
                 Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
+                Some(SkipCondition::Postgres) => options.backend_is_postgres,
             };
             if should_skip {
                 return TestResult {
@@ -1012,6 +1015,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
                     backend_is_sqlite: self.backend.is_sqlite(),
+                    backend_is_postgres: self.backend.is_postgres(),
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                     cross_check_binary: self.config.cross_check_binary.clone(),
@@ -1083,6 +1087,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
                     backend_is_sqlite: self.backend.is_sqlite(),
+                    backend_is_postgres: self.backend.is_postgres(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                     cross_check_binary: self.config.cross_check_binary.clone(),
                 };
@@ -1140,6 +1145,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         backend_capabilities: backend_capabilities.clone(),
                         backend_type,
                         backend_is_sqlite: self.backend.is_sqlite(),
+                        backend_is_postgres: self.backend.is_postgres(),
                         snapshot_update_mode: self.config.snapshot_update_mode,
                         cross_check_binary: self.config.cross_check_binary.clone(),
                     };

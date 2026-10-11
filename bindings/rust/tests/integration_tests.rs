@@ -226,6 +226,33 @@ async fn test_builder_read_only_opens_os_read_only_database() {
 }
 
 #[tokio::test]
+async fn test_builder_experimental_writable_ctes() {
+    let statement =
+        "WITH d AS (DELETE FROM t WHERE x = 1 RETURNING x) INSERT INTO u SELECT x FROM d";
+    for enabled in [false, true] {
+        let db = Builder::new_local(":memory:")
+            .experimental_writable_ctes(enabled)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)", ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE u (x INTEGER)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)", ())
+            .await
+            .unwrap();
+        assert_eq!(conn.execute(statement, ()).await.is_ok(), enabled);
+        let mut rows = conn.query("SELECT count(*) FROM u", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), i64::from(enabled));
+    }
+}
+
+#[tokio::test]
 async fn test_rows_next() {
     let builder = Builder::new_local(":memory:");
     let db = builder.build().await.unwrap();

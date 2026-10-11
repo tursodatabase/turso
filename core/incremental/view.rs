@@ -635,7 +635,7 @@ impl IncrementalView {
             for cte in &with.ctes {
                 // Recursively extract tables from each CTE's SELECT statement
                 Self::extract_all_tables_inner(
-                    &cte.select,
+                    crate::util::stored_cte_select(cte)?,
                     schema,
                     table_map,
                     aliases,

@@ -38,6 +38,7 @@ struct Args {
     mvcc: Option<SpannedType<()>>,
     views: Option<SpannedType<()>>,
     encryption: Option<SpannedType<()>>,
+    writable_ctes: Option<SpannedType<()>>,
     init_sql: Option<Expr>,
 }
 
@@ -58,12 +59,14 @@ impl Args {
             |path| path.to_token_stream(),
         );
 
+        let writable_ctes = self.writable_ctes.is_some();
         let db_opts = quote! {
             turso_core::DatabaseOpts::new()
                 .with_index_method(true)
                 .with_encryption(true)
                 .with_attach(true)
                 .with_generated_columns(true)
+                .with_writable_ctes(#writable_ctes)
         };
 
         builder = quote! {
@@ -111,6 +114,7 @@ impl Parse for Args {
         let mut mvcc = None;
         let mut views = None;
         let mut encryption = None;
+        let mut writable_ctes = None;
         let mut init_sql = None;
 
         let errors = args
@@ -162,6 +166,9 @@ impl Parse for Args {
                         } else if p.is_ident("encryption") {
                             encryption = Some(SpannedType((), p.span()));
                             seen_args.insert(ident.unwrap().clone());
+                        } else if p.is_ident("writable_ctes") {
+                            writable_ctes = Some(SpannedType((), p.span()));
+                            seen_args.insert(ident.unwrap().clone());
                         } else {
                             return Some(syn::Error::new_spanned(p, "unexpected flag"));
                         }
@@ -186,6 +193,7 @@ impl Parse for Args {
             mvcc,
             views,
             encryption,
+            writable_ctes,
             init_sql,
         })
     }

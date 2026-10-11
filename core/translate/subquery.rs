@@ -1314,6 +1314,12 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                 if program.get_materialized_cte(cte_id).is_some() {
                     continue;
                 }
+                if from_clause_subquery.stored_by_earlier_part() {
+                    return Err(crate::LimboError::InternalError(format!(
+                        "rows of CTE {} were not stored before this part of the statement",
+                        from_clause_subquery.name
+                    )));
+                }
                 let reads_a_row_of_an_outer_query = query_level == QueryLevel::Nested
                     && plan_has_outer_scope_dependency(&from_clause_subquery.plan);
                 if from_clause_subquery.requires_table_materialization()
@@ -1603,6 +1609,12 @@ pub fn emit_from_clause_subqueries(
                     program.pop_current_parent_explain();
                     continue; // Skip normal emission
                 }
+            }
+            if from_clause_subquery.stored_by_earlier_part() {
+                return Err(crate::LimboError::InternalError(format!(
+                    "rows of CTE {} were not stored before this part of the statement",
+                    from_clause_subquery.name
+                )));
             }
 
             let result_columns_start = match execution_mode {

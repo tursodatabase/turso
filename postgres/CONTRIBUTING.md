@@ -28,6 +28,27 @@ If Turso intentionally diverges from PostgreSQL, document that in
 are silently ignored: the parser accepts the full PostgreSQL grammar, so a
 feature the translator drops produces wrong results, not an error.
 
+## Checking against a real PostgreSQL server
+
+Two make targets run the same SQL on a real PostgreSQL 17 server. They use
+the server at `PG_DSN` if it is set (its user must be able to create and drop
+databases); otherwise they start a throwaway `postgres:17` container with
+Docker and remove it afterwards (see
+[`conformance/with-postgres.sh`](conformance/with-postgres.sh)). CI runs both
+against a `postgres:17` service container.
+
+- `make -C postgres/conformance run-postgres` runs the `.sqltest` corpus in
+  [`conformance/pg-sqltests/`](conformance/pg-sqltests/) against PostgreSQL,
+  to check that it expects only what PostgreSQL does. Tests of Turso-specific
+  output are marked `@skip-if postgres "reason"`.
+- `make -C postgres/conformance differential` runs
+  [`differential/`](differential/main.rs): random statements with INSERT,
+  UPDATE and DELETE inside WITH, on tursopg and on PostgreSQL, comparing rows,
+  errors, command tags and table contents after every statement, in plain,
+  transaction, MVCC and foreign key modes. On a difference it writes the SQL
+  of the case to `postgres/conformance/pg-differential-failure.sql`; the
+  printed seed replays the run with `target/debug/pg-differential --seed N`.
+
 ## Running the upstream regression suite
 
 The upstream regression suite is the day-to-day test loop. Run it with:

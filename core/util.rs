@@ -1599,6 +1599,28 @@ impl ViewColumnSchema {
     }
 }
 
+/// The SELECT of a CTE stored in a view or trigger definition. CREATE VIEW and
+/// CREATE TRIGGER reject an INSERT, UPDATE or DELETE inside WITH, so stored SQL
+/// that has one is invalid.
+pub(crate) fn stored_cte_select(cte: &ast::CommonTableExpr) -> Result<&ast::Select> {
+    cte.body.as_select().ok_or_else(|| {
+        LimboError::ParseError(format!(
+            "WITH query \"{}\" is an INSERT, UPDATE or DELETE, which is not allowed in a view or trigger",
+            cte.tbl_name.as_str()
+        ))
+    })
+}
+
+/// Mutable form of [stored_cte_select].
+pub(crate) fn stored_cte_select_mut(cte: &mut ast::CommonTableExpr) -> Result<&mut ast::Select> {
+    let name = cte.tbl_name.as_str().to_string();
+    cte.body.as_select_mut().ok_or_else(|| {
+        LimboError::ParseError(format!(
+            "WITH query \"{name}\" is an INSERT, UPDATE or DELETE, which is not allowed in a view or trigger"
+        ))
+    })
+}
+
 /// Walk all expressions in a SELECT statement, including subqueries.
 pub fn walk_select_expressions<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
@@ -1613,7 +1635,7 @@ where
 {
     if let Some(with_clause) = &select.with {
         for cte in &with_clause.ctes {
-            walk_select_expressions_inner(&cte.select, func)?;
+            walk_select_expressions_inner(stored_cte_select(cte)?, func)?;
         }
     }
 
@@ -1786,7 +1808,7 @@ fn validate_no_cross_db_references(
 ) -> Result<()> {
     if let Some(with_clause) = &select_stmt.with {
         for cte in &with_clause.ctes {
-            validate_no_cross_db_references(&cte.select, view_db_name)?;
+            validate_no_cross_db_references(stored_cte_select(cte)?, view_db_name)?;
         }
     }
 
@@ -2286,7 +2308,7 @@ fn extract_view_columns_inner(
     let mut ctes = outer_ctes.clone();
     if let Some(with) = &select_stmt.with {
         for cte in &with.ctes {
-            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+            let mut derived = extract_view_columns_inner(stored_cte_select(cte)?, schema, &ctes)?;
             for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
                 column.column.name = Some(explicit_name.col_name.as_str().to_string());
             }
@@ -2804,16 +2826,16 @@ mod rename_column_view {
         let mut ctes: HashMap<String, CteInfo> = HashMap::default();
         if let Some(ref mut with_clause) = select.with {
             for cte in &mut with_clause.ctes {
-                let mut before_cols = select_output_columns(&cte.select, ctx, false)?;
+                let mut before_cols = select_output_columns(stored_cte_select(cte)?, ctx, false)?;
                 apply_explicit_column_names(&mut before_cols, &cte.columns);
                 let cte_changed = rewrite_view_select_for_column_rename(
-                    &mut cte.select,
+                    stored_cte_select_mut(cte)?,
                     ctx,
                     &[],
                     visiting_views,
                 )?;
                 changed |= cte_changed;
-                let mut after_cols = select_output_columns(&cte.select, ctx, true)?;
+                let mut after_cols = select_output_columns(stored_cte_select(cte)?, ctx, true)?;
                 apply_explicit_column_names(&mut after_cols, &cte.columns);
                 let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
                 ctes.insert(
@@ -3861,8 +3883,12 @@ fn rewrite_select_column_refs_scoped(
 ) {
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
+            // See rewrite_select_table_refs.
+            let Some(cte_select) = cte.body.as_select_mut() else {
+                continue;
+            };
             rewrite_select_column_refs_scoped(
-                &mut cte.select,
+                cte_select,
                 target_table,
                 trigger_table,
                 old_col,
@@ -4499,8 +4525,12 @@ fn select_still_references_renamed_column(
 ) -> bool {
     if let Some(with_clause) = &select.with {
         for cte in &with_clause.ctes {
+            // See rewrite_select_table_refs.
+            let Some(cte_select) = cte.body.as_select() else {
+                continue;
+            };
             if select_still_references_renamed_column(
-                &cte.select,
+                cte_select,
                 target_table,
                 trigger_table,
                 old_col,
@@ -5073,7 +5103,12 @@ pub fn rewrite_trigger_cmd_column_refs(
 fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
-            rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl);
+            // Only a hand-edited schema stores INSERT, UPDATE or DELETE inside
+            // WITH. Such SQL fails when it is used, so a rename leaves it as it is.
+            let Some(cte_select) = cte.body.as_select_mut() else {
+                continue;
+            };
+            rewrite_select_table_refs(cte_select, old_tbl, new_tbl);
         }
     }
     rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl);
@@ -5365,7 +5400,12 @@ pub mod tests {
         };
         let ast::OneSelect::Select {
             from: Some(from), ..
-        } = &with_clause.ctes[0].select.body.select
+        } = &with_clause.ctes[0]
+            .body
+            .as_select()
+            .expect("expected CTE SELECT")
+            .body
+            .select
         else {
             panic!("expected CTE SELECT core");
         };

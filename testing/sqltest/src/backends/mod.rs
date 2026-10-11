@@ -119,6 +119,11 @@ pub trait SqlBackend: Send + Sync {
         false
     }
 
+    /// Whether this backend runs tests against a real PostgreSQL server
+    fn is_postgres(&self) -> bool {
+        false
+    }
+
     /// Whether this backend supports snapshot tests (EXPLAIN output comparison).
     /// Returns false by default; only the Rust backend enables this.
     fn supports_snapshots(&self) -> bool {

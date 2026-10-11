@@ -1,7 +1,7 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
+    CreateVirtualTable, CteBody, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
     ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
     GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
@@ -2627,13 +2627,22 @@ impl<'a> Parser<'a> {
             _ => Materialized::Any,
         };
         eat_expect!(self, TK_LP);
-        let select = self.parse_select()?;
+        let body = match self.peek_no_eof()?.token_type {
+            TK_INSERT | TK_REPLACE => CteBody::DataModifying(Box::new(self.parse_insert()?)),
+            TK_UPDATE => CteBody::DataModifying(Box::new(self.parse_update()?)),
+            TK_DELETE => CteBody::DataModifying(Box::new(self.parse_delete()?)),
+            TK_WITH => match self.parse_with_stmt()? {
+                Stmt::Select(select) => CteBody::Select(select),
+                stmt => CteBody::DataModifying(Box::new(stmt)),
+            },
+            _ => CteBody::Select(self.parse_select()?),
+        };
         eat_expect!(self, TK_RP);
         Ok(CommonTableExpr {
             tbl_name: nm,
             columns: eid_list,
             materialized: wqas,
-            select,
+            body,
         })
     }
 
@@ -8891,7 +8900,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -8909,7 +8918,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                }
+                                })
                             },
                         ]
                     }),
@@ -8947,7 +8956,7 @@ mod tests {
                                     },
                                 ],
                                 materialized: Materialized::Yes,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -8965,7 +8974,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                }
+                                })
                             },
                         ]
                     }),
@@ -9003,7 +9012,7 @@ mod tests {
                                     },
                                 ],
                                 materialized: Materialized::No,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -9021,7 +9030,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                }
+                                })
                             },
                         ]
                     }),
@@ -9053,7 +9062,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -9071,13 +9080,13 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                }
+                                })
                             },
                             CommonTableExpr {
                                 tbl_name: Name::exact("test_2".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -9095,7 +9104,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                }
+                                })
                             },
                         ]
                     }),
@@ -12663,7 +12672,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -12681,7 +12690,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                },
+                                }),
                             }
                         ],
                     }),
@@ -12859,7 +12868,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -12877,7 +12886,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                },
+                                }),
                             }
                         ],
                     }),
@@ -12907,7 +12916,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -12925,7 +12934,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                },
+                                }),
                             }
                         ],
                     }),
@@ -12981,7 +12990,7 @@ mod tests {
                                 tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
-                                select: Select {
+                                body: CteBody::Select(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -12999,7 +13008,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                },
+                                }),
                             }
                         ],
                     }),

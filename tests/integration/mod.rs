@@ -33,6 +33,7 @@ mod trigger;
 mod unreliable_io;
 mod views;
 mod wal;
+mod writable_cte;
 
 #[cfg(test)]
 mod tests {

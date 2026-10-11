@@ -115,6 +115,34 @@ jobs:
       - name: Run tests
         run: make -C postgres/conformance run
 
+  sqltest-pg-against-postgres:
+    name: Check PostgreSQL frontend against PostgreSQL
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PG_DSN: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Check that the pg-sqltests corpus expects what PostgreSQL does
+        run: make -C postgres/conformance run-postgres
+      - name: Compare writable CTEs on tursopg and PostgreSQL
+        run: make -C postgres/conformance differential DIFFERENTIAL_CASES=500
+
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
     runs-on: blacksmith-4vcpu-ubuntu-2404

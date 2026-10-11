@@ -332,6 +332,8 @@ pub struct ProgramBuilder {
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
+    /// Set while translating a statement with INSERT, UPDATE or DELETE inside WITH.
+    pub(crate) writable_cte: Option<Box<crate::translate::writable_cte::WritableCteState>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -746,6 +748,7 @@ impl ProgramBuilder {
             views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
+            writable_cte: None,
         }
     }
 
@@ -826,6 +829,17 @@ impl ProgramBuilder {
 
     /// Expand a view with circular-reference tracking and without the caller's
     /// CTE context. Restore both stacks even when expansion returns an error.
+    /// True while the body of a view is planned.
+    pub(crate) fn is_expanding_view(&self) -> bool {
+        !self.views_being_expanded.is_empty()
+    }
+
+    /// Replaces the type of an allocated cursor. Used when the rows a cursor
+    /// holds turn out to have a different layout than the one it was opened for.
+    pub(crate) fn set_cursor_type(&mut self, cursor_id: CursorID, cursor_type: CursorType) {
+        self.cursor_ref[cursor_id].1 = cursor_type;
+    }
+
     pub fn with_view_expansion<T>(
         &mut self,
         database_id: usize,
@@ -1766,6 +1780,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotExists")?;
                 }
+                Insn::IfRowChangedByStatement { target_pc, .. } => {
+                    resolve(target_pc, "IfRowChangedByStatement")?;
+                }
                 Insn::MustBeInt {
                     target_pc: Some(target_pc),
                     ..
@@ -2366,6 +2383,15 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
+        let (tracked_table_cursors, is_writable_cte_statement) = match self.writable_cte.take() {
+            Some(writable_cte) => {
+                writable_cte
+                    .open_table_copies_instead_of_tables(&mut self.insns, &self.cursor_ref)?;
+                (writable_cte.tracked_table_cursors(&self.insns), true)
+            }
+            None => (Vec::new(), false),
+        };
+
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
@@ -2400,6 +2426,8 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            tracked_table_cursors,
+            is_writable_cte_statement,
         };
         Ok(prepared)
     }

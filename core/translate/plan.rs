@@ -3050,6 +3050,34 @@ pub(super) fn query_output_columns(
         _ => None,
     };
 
+    result_set_output_columns(
+        result_columns,
+        table_references,
+        compound_arms.as_deref(),
+        explicit_columns,
+    )
+}
+
+/// Columns of the rows that an INSERT, UPDATE or DELETE inside WITH returns.
+/// They are derived from the RETURNING list the same way a subquery's columns
+/// are derived from its result columns.
+pub(super) fn returning_output_columns(
+    result_columns: &[ResultSetColumn],
+    table_references: &TableReferences,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
+    let mut columns =
+        result_set_output_columns(result_columns, table_references, None, explicit_columns)?;
+    make_column_names_unique(&mut columns);
+    Ok(columns)
+}
+
+fn result_set_output_columns(
+    result_columns: &[ResultSetColumn],
+    table_references: &TableReferences,
+    compound_arms: Option<&[&SelectPlan]>,
+    explicit_columns: Option<&[String]>,
+) -> Result<alloc::Vec<Column>> {
     let mut columns = result_columns
         .iter()
         .enumerate()
@@ -3058,7 +3086,6 @@ pub(super) fn query_output_columns(
                 .and_then(|names| names.get(column_index).cloned())
                 .or_else(|| result_column.name(table_references).map(String::from));
             let affinity = compound_arms
-                .as_ref()
                 .map(|arms| compound_column_affinity(arms, column_index))
                 .unwrap_or_else(|| {
                     infer_type_from_expr(&result_column.expr, Some(table_references))
@@ -3088,7 +3115,7 @@ pub(super) fn query_output_columns(
     Ok(columns)
 }
 
-fn subquery_output_columns(
+pub(super) fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
@@ -3201,6 +3228,7 @@ impl JoinedTable {
             id,
             shared_materialization: false,
             materialize_hint,
+            stored_by_earlier_part: false,
         });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
@@ -3225,6 +3253,77 @@ impl JoinedTable {
             indexed: None,
             plan_estimate: None,
         })
+    }
+
+    /// Creates a reference to rows that an earlier part of a statement with
+    /// INSERT, UPDATE or DELETE inside WITH stored in an ephemeral table. The
+    /// reference reads them through the materialized CTE registered under
+    /// `cte_id`; its plan only lists the columns and is never emitted.
+    pub(crate) fn new_stored_cte_reference(
+        identifier: String,
+        columns: alloc::Vec<Column>,
+        cte_id: usize,
+        internal_id: TableInternalId,
+    ) -> Self {
+        let result_columns = columns
+            .iter()
+            .map(|column| ResultSetColumn {
+                expr: ast::Expr::Literal(ast::Literal::Null),
+                alias: column.name.clone(),
+                implicit_column_name: None,
+                contains_aggregates: false,
+            })
+            .collect();
+        let plan = Plan::Select(Box::new(SelectPlan {
+            table_references: TableReferences::new(vec![], vec![]),
+            join_order: vec![],
+            result_columns,
+            where_clause: vec![],
+            group_by: None,
+            order_by: vec![],
+            aggregates: vec![],
+            limit: None,
+            offset: None,
+            contains_constant_false_condition: false,
+            query_destination: QueryDestination::placeholder_for_subquery(),
+            distinctness: Distinctness::NonDistinct,
+            values: vec![],
+            window: None,
+            non_from_clause_subqueries: vec![],
+            input_cardinality_hint: None,
+            estimated_output_rows: None,
+            estimated_cost: None,
+            simple_aggregate: None,
+            phantom_params: vec![],
+        }));
+        let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
+            name: identifier.clone(),
+            plan: Box::new(plan),
+            columns,
+            parenthesized_join_columns: None,
+            result_columns_start_reg: None,
+            materialized_cursor_id: None,
+            cte: Some(crate::schema::FromClauseSubqueryCteMetadata {
+                id: cte_id,
+                shared_materialization: false,
+                materialize_hint: true,
+                stored_by_earlier_part: true,
+            }),
+        }));
+        Self {
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            table,
+            identifier,
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+            plan_estimate: None,
+        }
     }
 
     pub fn new_recursive_cte_input(

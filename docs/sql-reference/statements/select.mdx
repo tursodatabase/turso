@@ -433,7 +433,8 @@ GROUP BY ac.name;
 ```
 
 <Info>
-CTEs in Turso are SELECT-only. RECURSIVE CTEs and the MATERIALIZED/NOT MATERIALIZED hints are not supported.
+WITH RECURSIVE and the MATERIALIZED / NOT MATERIALIZED hints are supported.
+INSERT, UPDATE and DELETE inside WITH: experimental, PostgreSQL semantics. See [Writable CTEs](/docs/sql-reference/experimental-features#writable-ctes).
 </Info>
 
 ## Window Functions

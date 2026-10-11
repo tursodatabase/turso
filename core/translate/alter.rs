@@ -3493,7 +3493,7 @@ fn apply_select_for_column_rename(
         for cte in &mut with_clause.ctes {
             apply_select_for_column_rename(
                 mode,
-                &mut cte.select,
+                crate::util::stored_cte_select_mut(cte)?,
                 trigger_table,
                 trigger_table_name,
                 target_table_name,
@@ -4727,7 +4727,7 @@ fn validate_select_table_refs_after_rename(
     if let Some(with_clause) = &select.with {
         for cte in &with_clause.ctes {
             if let Some(missing_table) = validate_select_table_refs_after_rename(
-                &cte.select,
+                crate::util::stored_cte_select(cte)?,
                 altered_table_norm,
                 resolver,
                 trigger_database_id,
@@ -5289,7 +5289,7 @@ fn validate_select_column_refs_after_drop(
     if let Some(with_clause) = &select.with {
         for cte in &with_clause.ctes {
             if let Some(bad) = validate_select_column_refs_after_drop(
-                &cte.select,
+                crate::util::stored_cte_select(cte)?,
                 &[],
                 owning_table_columns,
                 allow_bare_owning_columns,

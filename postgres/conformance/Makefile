@@ -25,7 +25,10 @@ SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CA
 # Test corpora (relative to this directory)
 PG_TESTS := pg-sqltests
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-upstream clean
+PG_DIFFERENTIAL := $(TARGET_ROOT)/$(TARGET_DIR)/pg-differential
+DIFFERENTIAL_CASES ?= 300
+
+.PHONY: all build build-tursopg build-runner check run test run-one run-upstream run-postgres differential clean
 
 # Build everything
 all: build
@@ -55,6 +58,21 @@ test: run
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
 	$(SQLTEST) run $(FILE) --backend pg --binary $(TURSOPG)
+
+# Run the corpus against real PostgreSQL to check that it expects what
+# PostgreSQL does. Uses the server at PG_DSN, or a throwaway Docker container.
+run-postgres: build-runner
+	./with-postgres.sh sh -c '$(SQLTEST) run $(PG_TESTS) --backend pg --postgres-dsn "$$PG_DSN"'
+
+# Run random statements with INSERT, UPDATE and DELETE inside WITH on tursopg
+# and on real PostgreSQL, in every mode, and fail on the first difference.
+# Uses the server at PG_DSN, or a throwaway Docker container.
+differential: build-tursopg
+	cd $(ROOT_DIR) && cargo build $(CARGO_PROFILE) --package turso_pg_differential
+	./with-postgres.sh sh -c 'for mode in "" "--transaction" "--mvcc --transaction" "--foreign-keys"; do \
+		$(PG_DIFFERENTIAL) --postgres-dsn "$$PG_DSN" --tursopg $(TURSOPG) \
+			--cases $(DIFFERENTIAL_CASES) --failure-file pg-differential-failure.sql $$mode || exit 1; \
+	done'
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

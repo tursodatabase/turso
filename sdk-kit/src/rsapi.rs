@@ -401,6 +401,7 @@ impl TursoDatabaseConfig {
                 "generated_columns" => opts.with_generated_columns(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
+                "writable_ctes" => opts.with_writable_ctes(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
@@ -2052,7 +2053,7 @@ mod tests {
 
         // Each token toggles its corresponding flag.
         let opts = config_with_features(Some(
-            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid,writable_ctes",
         ))
         .database_opts();
         assert!(opts.enable_views);
@@ -2065,6 +2066,7 @@ mod tests {
         assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
+        assert!(opts.enable_writable_ctes);
 
         // Whitespace is trimmed; `strict` and unknown names are ignored.
         let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();

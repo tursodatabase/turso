@@ -26,6 +26,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run tests
     Run {
@@ -88,6 +89,14 @@ enum Commands {
         /// :memory: databases are automatically upgraded to temp files for annotated tests.
         #[arg(long)]
         cross_check_binary: Option<PathBuf>,
+
+        /// Run the pg backend against this PostgreSQL server instead of
+        /// tursopg, e.g. postgres://postgres@127.0.0.1:5432/postgres. Each
+        /// test database is a fresh database on the server, so the DSN's user
+        /// must be allowed to create and drop databases. Use it to check that
+        /// the PostgreSQL corpus expects what PostgreSQL itself does.
+        #[arg(long)]
+        postgres_dsn: Option<String>,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -157,6 +166,7 @@ async fn main() -> ExitCode {
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
+            postgres_dsn,
         } => {
             run_tests(
                 paths,
@@ -172,6 +182,7 @@ async fn main() -> ExitCode {
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
+                postgres_dsn,
             )
             .await
         }
@@ -228,7 +239,12 @@ async fn run_tests(
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
+    postgres_dsn: Option<String>,
 ) -> ExitCode {
+    if postgres_dsn.is_some() && backend_type != "pg" {
+        eprintln!("Error: --postgres-dsn only works with --backend pg");
+        return ExitCode::from(2);
+    }
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
     let mut missing = Vec::new();
@@ -431,7 +447,17 @@ async fn run_tests(
             } else {
                 binary
             };
-            let mut backend = PgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+            let backend = match &postgres_dsn {
+                Some(dsn) => match PgBackend::postgres(dsn) {
+                    Ok(backend) => backend,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => PgBackend::new(&binary),
+            };
+            let mut backend = backend.with_timeout(Duration::from_secs(timeout));
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }

@@ -1491,7 +1491,7 @@ impl PostgreSQLTranslator {
             let order_by = self.translate_order_by(&select.sort_clause)?;
             let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
             return Ok(ast::Select {
-                with: None,
+                with: self.translate_with_clause(&select.with_clause)?,
                 body,
                 order_by,
                 limit,
@@ -1594,7 +1594,7 @@ impl PostgreSQLTranslator {
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
 
         Ok(ast::Select {
-            with: None,
+            with: self.translate_with_clause(&select.with_clause)?,
             body: ast::SelectBody {
                 select: first_select,
                 compounds,
@@ -1652,6 +1652,14 @@ impl PostgreSQLTranslator {
         if select.into_clause.is_some() {
             return Err(ParseError::ParseError(
                 "SELECT ... INTO is not allowed here".into(),
+            ));
+        }
+        // A parenthesized arm can carry its own WITH clause, which a compound
+        // SELECT arm has no place for. Dropping it would drop an INSERT, UPDATE
+        // or DELETE inside it without running it.
+        if select.with_clause.is_some() {
+            return Err(ParseError::ParseError(
+                "WITH inside an arm of UNION, INTERSECT or EXCEPT is not supported".into(),
             ));
         }
 
@@ -2106,9 +2114,14 @@ impl PostgreSQLTranslator {
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
+                            // PostgreSQL names a column it cannot derive a name
+                            // for "?column?". A column without a name would be
+                            // left out of `SELECT *` over a subquery or CTE.
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                derived_column_name(val)
-                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
+                                Some(ast::As::Elided(ast::Name::from_string(
+                                    derived_column_name(val)
+                                        .unwrap_or_else(|| "?column?".to_string()),
+                                )))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -3590,11 +3603,22 @@ impl PostgreSQLTranslator {
                 .ctequery
                 .as_ref()
                 .ok_or_else(|| ParseError::ParseError("CTE missing query body".into()))?;
-            let select = match &cte_query.node {
-                Some(Node::SelectStmt(select_stmt)) => self.translate_select(select_stmt)?,
+            let body = match &cte_query.node {
+                Some(Node::SelectStmt(select_stmt)) => {
+                    ast::CteBody::Select(self.translate_select(select_stmt)?)
+                }
+                Some(Node::InsertStmt(insert)) => {
+                    ast::CteBody::DataModifying(Box::new(self.translate_insert(insert)?))
+                }
+                Some(Node::UpdateStmt(update)) => {
+                    ast::CteBody::DataModifying(Box::new(self.translate_update(update)?))
+                }
+                Some(Node::DeleteStmt(delete)) => {
+                    ast::CteBody::DataModifying(Box::new(self.translate_delete(delete)?))
+                }
                 _ => {
                     return Err(ParseError::ParseError(
-                        "CTE query is not a SELECT statement".into(),
+                        "CTE query is not a SELECT, INSERT, UPDATE or DELETE statement".into(),
                     ));
                 }
             };
@@ -3612,7 +3636,7 @@ impl PostgreSQLTranslator {
                 tbl_name,
                 columns,
                 materialized,
-                select,
+                body,
             });
         }
 
@@ -5937,6 +5961,129 @@ mod tests {
         } else {
             panic!("Expected Delete");
         }
+    }
+
+    fn translate_sql(sql: &str) -> Result<ast::Stmt, ParseError> {
+        PostgreSQLTranslator::new().translate(&crate::parse(sql).unwrap())
+    }
+
+    fn select_with(stmt: &ast::Stmt) -> &ast::With {
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected a SELECT, got {stmt:?}");
+        };
+        select
+            .with
+            .as_ref()
+            .expect("the SELECT keeps its WITH clause")
+    }
+
+    #[test]
+    fn test_writable_cte_bodies() {
+        let stmt = translate_sql(
+            "WITH i AS (INSERT INTO t VALUES (1) RETURNING *),
+                  u AS (UPDATE t SET a = 2 RETURNING a),
+                  d AS (DELETE FROM t WHERE a = 3 RETURNING *),
+                  s AS (SELECT 1)
+             SELECT * FROM i",
+        )
+        .unwrap();
+        let kinds: Vec<&str> = select_with(&stmt)
+            .ctes
+            .iter()
+            .map(|cte| match &cte.body {
+                ast::CteBody::Select(_) => "select",
+                ast::CteBody::DataModifying(stmt) => match stmt.as_ref() {
+                    ast::Stmt::Insert { .. } => "insert",
+                    ast::Stmt::Update(_) => "update",
+                    ast::Stmt::Delete { .. } => "delete",
+                    other => panic!("unexpected CTE body {other:?}"),
+                },
+            })
+            .collect();
+        assert_eq!(kinds, vec!["insert", "update", "delete", "select"]);
+
+        let stmt =
+            translate_sql("WITH d AS (DELETE FROM t RETURNING *) INSERT INTO u SELECT * FROM d")
+                .unwrap();
+        let ast::Stmt::Insert {
+            with: Some(with), ..
+        } = stmt
+        else {
+            panic!("expected an INSERT with a WITH clause, got {stmt:?}");
+        };
+        assert!(matches!(with.ctes[0].body, ast::CteBody::DataModifying(_)));
+    }
+
+    #[test]
+    fn test_with_clause_of_values_and_set_operations_is_kept() {
+        for sql in [
+            "WITH x AS (SELECT 1) VALUES (1)",
+            "WITH x AS (SELECT 1) SELECT * FROM x UNION ALL SELECT 2",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d UNION SELECT 1",
+        ] {
+            let stmt = translate_sql(sql).unwrap();
+            assert_eq!(select_with(&stmt).ctes.len(), 1, "WITH dropped from: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_with_inside_set_operation_arm_is_rejected() {
+        let error = translate_sql(
+            "SELECT 1 UNION ALL (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("WITH inside an arm"));
+    }
+
+    #[test]
+    fn test_unnamed_expression_column_is_named_like_postgresql() {
+        let stmt = translate_sql("SELECT a + 1, upper(b), c FROM t").unwrap();
+        let ast::Stmt::Select(select) = stmt else {
+            panic!("expected a SELECT");
+        };
+        let ast::OneSelect::Select { columns, .. } = select.body.select else {
+            panic!("expected a SELECT core");
+        };
+        let names: Vec<Option<String>> = columns
+            .iter()
+            .map(|column| match column {
+                ast::ResultColumn::Expr(_, alias) => alias.as_ref().map(|alias| match alias {
+                    ast::As::As(name)
+                    | ast::As::Elided(name)
+                    | ast::As::ImplicitColumnName(name) => name.as_str().to_string(),
+                }),
+                other => panic!("unexpected result column {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("?column?".to_string()),
+                Some("upper".to_string()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dml_command_of_statements() {
+        use crate::{dml_command, DmlCommand};
+        assert_eq!(
+            dml_command("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"),
+            Some(DmlCommand::Insert)
+        );
+        assert_eq!(
+            dml_command("WITH d AS (DELETE FROM t RETURNING *) UPDATE u SET a = 1"),
+            Some(DmlCommand::Update)
+        );
+        assert_eq!(
+            dml_command("DELETE FROM t RETURNING *"),
+            Some(DmlCommand::Delete)
+        );
+        assert_eq!(
+            dml_command("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"),
+            None
+        );
     }
 
     #[test]

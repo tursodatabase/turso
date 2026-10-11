@@ -14,6 +14,29 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
+/// The main command of a statement that changes rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmlCommand {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// The INSERT, UPDATE or DELETE that the first statement of `sql` runs as its
+/// main statement. A statement such as `WITH x AS (...) INSERT ...` starts
+/// with WITH, so its text does not show the command.
+pub fn dml_command(sql: &str) -> Option<DmlCommand> {
+    use pg_query::protobuf::node::Node;
+    let parse_result = pg_query::parse(sql).ok()?;
+    let stmt = parse_result.protobuf.stmts.first()?.stmt.as_ref()?;
+    match stmt.node.as_ref()? {
+        Node::InsertStmt(_) => Some(DmlCommand::Insert),
+        Node::UpdateStmt(_) => Some(DmlCommand::Update),
+        Node::DeleteStmt(_) => Some(DmlCommand::Delete),
+        _ => None,
+    }
+}
+
 /// Split a multi-statement SQL string into individual statements.
 /// Uses pg_query's scanner which correctly handles semicolons inside
 /// string literals, comments, and dollar-quoted strings.

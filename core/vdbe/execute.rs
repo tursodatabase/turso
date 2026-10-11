@@ -3957,6 +3957,8 @@ pub fn halt(
                 program
                     .connection
                     .set_changes(state.n_change.load(Ordering::SeqCst));
+            }
+            if program.counts_total_changes() {
                 program
                     .connection
                     .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
@@ -3982,6 +3984,8 @@ pub fn halt(
             program
                 .connection
                 .set_changes(state.n_change.load(Ordering::SeqCst));
+        }
+        if program.counts_total_changes() {
             program
                 .connection
                 .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
@@ -12541,6 +12545,11 @@ pub fn op_insert(
                     }
                     state.record_rows_written(1);
                 }
+                // An UPDATE that writes identical values skips the btree write, but
+                // the row still counts as changed by this statement.
+                if !program.tracked_table_cursors.is_empty() {
+                    record_row_changed_by_statement(program, state, *cursor_id, *key_reg)?;
+                }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
                     let cursor = state.get_cursor(*cursor_id);
@@ -12666,6 +12675,93 @@ pub fn op_insert(
     }
 
     state.active_op_state.clear();
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Remember that this statement wrote the row with the rowid in `key_reg`, if
+/// `cursor_id` writes into a tracked table.
+fn record_row_changed_by_statement(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+    key_reg: usize,
+) -> Result<()> {
+    let Some(tracked_table) = program
+        .tracked_table_cursors
+        .iter()
+        .position(|cursors| cursors.contains(&cursor_id))
+    else {
+        return Ok(());
+    };
+    let rowid = match state.registers[key_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "Insert into a tracked table: key register holds {other:?}"
+            )))
+        }
+    };
+    if state.rows_changed_by_statement.len() < program.tracked_table_cursors.len() {
+        state
+            .rows_changed_by_statement
+            .resize_with(program.tracked_table_cursors.len(), Default::default);
+    }
+    state.rows_changed_by_statement[tracked_table].insert(rowid);
+    Ok(())
+}
+
+pub fn op_if_row_changed_by_statement(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IfRowChangedByStatement {
+            tracked_table,
+            rowid_reg,
+            target_pc,
+        },
+        insn
+    );
+    let changed = match state.registers[*rowid_reg].get_value() {
+        Value::Numeric(Numeric::Integer(rowid)) => state
+            .rows_changed_by_statement
+            .get(*tracked_table)
+            .is_some_and(|rows| rows.contains(rowid)),
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "IfRowChangedByStatement: rowid register holds {other:?}"
+            ))
+            .into())
+        }
+    };
+    if changed {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_set_change_count(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SetChangeCount { src }, insn);
+    let count = match state.registers[*src].get_value() {
+        Value::Numeric(Numeric::Integer(count)) => *count,
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "SetChangeCount: register holds {other:?}"
+            ))
+            .into())
+        }
+    };
+    state.n_change.store(count, Ordering::SeqCst);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

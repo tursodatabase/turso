@@ -17,17 +17,16 @@ use crate::{
     translate::{
         emitter::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
-            emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record, emit_program_for_select,
-            OperationMode, Resolver, UpdateRowSource,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            emit_index_column_value_new_image, emit_index_column_value_old_image, emit_make_record,
+            emit_program_for_select, OperationMode, Resolver, UpdateRowSource,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
-            emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_dml_expr_index_value, emit_returning_results, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -470,17 +469,12 @@ pub fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
-    }
-    // Emit scan-back loop for buffered RETURNING results.
-    // All DML is complete at this point; now yield the buffered rows to the caller.
-    // FkCheck must come before the scan-back so that FK violations prevent
-    // RETURNING rows from being emitted (matching SQLite behavior).
-    if let Some(ref buf) = returning_buffer {
-        program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(program, buf);
-    }
+    program.emit_dml_statement_end(resolver, t_ctx.cdc_cursor_id, returning_buffer.as_ref())?;
+    program.keep_writable_cte_part_returning(
+        returning_buffer,
+        plan.returning.as_deref().unwrap_or_default(),
+        &write_phase_tables,
+    )?;
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
@@ -1219,6 +1213,17 @@ fn emit_update_insns<'a>(
             reg: beg,
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         });
+    }
+
+    // In a statement with INSERT, UPDATE or DELETE inside WITH, PostgreSQL
+    // changes each row at most once: skip a row that the statement already wrote.
+    if let Some(table) = target_table.table.btree() {
+        program.emit_skip_of_row_changed_by_statement(
+            update_database_id,
+            table.root_page,
+            beg,
+            skip_row_label,
+        );
     }
 
     // Emit any remaining SET-clause subqueries inside the loop, after the write cursor

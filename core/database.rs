@@ -79,6 +79,7 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
+    pub enable_writable_ctes: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
@@ -147,6 +148,12 @@ impl DatabaseOpts {
 
     pub fn with_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    /// Allow INSERT, UPDATE and DELETE inside WITH, with PostgreSQL semantics.
+    pub fn with_writable_ctes(mut self, enable: bool) -> Self {
+        self.enable_writable_ctes = enable;
         self
     }
 
@@ -3438,6 +3445,10 @@ impl Database {
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {
         self.opts.enable_without_rowid
+    }
+
+    pub fn writable_ctes_enabled(&self) -> bool {
+        self.opts.enable_writable_ctes || self.dialect.supports_writable_ctes()
     }
 
     /// check if database is currently in MVCC mode

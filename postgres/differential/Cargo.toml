@@ -1,0 +1,23 @@
+[package]
+name = "turso_pg_differential"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Differential fuzzer that runs the same SQL on tursopg and a real PostgreSQL server"
+publish = false
+
+[[bin]]
+name = "pg-differential"
+path = "main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+turso_pg_client = { workspace = true }
+
+[lints]
+workspace = true

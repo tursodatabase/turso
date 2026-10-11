@@ -457,7 +457,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         // Build each CTE
         for cte in &with.ctes {
-            let cte_plan = self.build_select(&cte.select)?;
+            let cte_plan = self.build_select(crate::util::stored_cte_select(cte)?)?;
             let cte_name = Self::name_to_string(&cte.tbl_name);
             cte_plans.insert(cte_name.clone(), Arc::new(cte_plan));
             self.ctes

@@ -159,6 +159,10 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
+
+    fn supports_writable_ctes(&self) -> bool {
+        true
+    }
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {

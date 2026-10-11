@@ -3040,6 +3040,11 @@ impl Connection {
         self.db.experimental_without_rowid_enabled()
     }
 
+    /// Whether INSERT, UPDATE and DELETE may appear inside WITH.
+    pub fn writable_ctes_enabled(&self) -> bool {
+        self.db.writable_ctes_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }

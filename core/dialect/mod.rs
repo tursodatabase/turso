@@ -161,6 +161,12 @@ pub trait Dialect: Send + Sync + 'static {
     fn requires_custom_types(&self) -> bool {
         false
     }
+
+    /// Whether INSERT, UPDATE and DELETE may appear inside WITH regardless of
+    /// the database flag. PostgreSQL has them; SQLite does not.
+    fn supports_writable_ctes(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

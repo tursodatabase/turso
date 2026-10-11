@@ -201,7 +201,65 @@ INTEGER. Unknown type names pass through as custom types.
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC and explicit NULLS ordering are not supported |
 | WITH ORDINALITY clause | ❌ Not supported | |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
-| Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
+| Writable WITH queries (Common Table Expressions) | 🟡 Partial | INSERT, UPDATE, DELETE inside WITH. Differences: see [Writable CTEs](#writable-ctes) |
+
+### Writable CTEs
+
+INSERT, UPDATE and DELETE inside WITH. Always on in the PostgreSQL frontend.
+
+```sql
+WITH moved AS (DELETE FROM queue WHERE done RETURNING *)
+INSERT INTO archive SELECT * FROM moved;
+```
+
+Same as PostgreSQL:
+
+- All parts see the database as of statement start. Each CTE and the main
+  statement. Also subqueries that read the table the part changes.
+- Parts share rows only through RETURNING.
+- A row is changed at most once. A second UPDATE or DELETE skips it. A second
+  ON CONFLICT DO UPDATE fails.
+- Every INSERT, UPDATE and DELETE runs to the end. Even if nothing reads it,
+  or the query has a LIMIT.
+- Unique constraints see rows other parts wrote.
+- Foreign keys are checked after all parts. RESTRICT is checked at once.
+- `WITH c(a, b) AS (...)`: names rename the first columns. More names than
+  columns: error.
+- Command tag counts the main statement only.
+- DML inside WITH only at the top level. Not in subqueries, nested WITH or
+  views.
+
+Different from PostgreSQL:
+
+- **Order of the parts.** Turso runs each part to the end before the next:
+  CTEs the main statement reads, then the main statement, then the other
+  CTEs, last one first. PostgreSQL runs a CTE that another part reads row by
+  row, alongside its reader. Matters only when that CTE and another part write
+  the same table. Example:
+  `WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) UPDATE t SET v = 0 WHERE id = 1 OR id IN (SELECT id FROM d)`.
+  PostgreSQL 17: row 1 updated, DELETE skips it. Turso: row 1 deleted, UPDATE
+  finds nothing. Serial values can also come out in a different order.
+- **Foreign key actions.** CASCADE, SET NULL, SET DEFAULT run inside the part,
+  not at the end. Rejected if the action could change a table another part
+  writes.
+- **Rejected targets.** Tables with triggers. Tables with materialized views.
+  WITHOUT ROWID tables.
+- **CREATE TABLE AS / SELECT INTO** with DML inside WITH: rejected.
+- **Cost.** A part that reads a table written in the same statement reads a
+  copy. The copy is made at statement start. Time and memory grow with the
+  table.
+- **Types.** CTE columns lose PostgreSQL types, like every CTE in the
+  frontend. Booleans read back as 1/0. `date_col + 1` is a number.
+
+Tests:
+
+- `conformance/pg-sqltests/writable_cte.sqltest`. Checked against PostgreSQL 17
+  with `make -C postgres/conformance run-postgres`.
+- `tests/integration/writable_cte.rs` (repository root).
+- Fuzzer in [`differential/`](differential/main.rs):
+  `make -C postgres/conformance differential`. Random statements on tursopg
+  and PostgreSQL; compares rows and every table.
+- CI runs the corpus and the fuzzer against PostgreSQL 17.
 
 ## Data Definition Language (DDL)
 

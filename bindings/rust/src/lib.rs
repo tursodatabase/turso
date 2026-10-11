@@ -176,6 +176,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_writable_ctes: bool,
     enable_mvcc_passive_checkpoint: bool,
     vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
@@ -197,6 +198,7 @@ impl Builder {
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_writable_ctes: false,
             enable_mvcc_passive_checkpoint: false,
             vfs: IoBackend::Default,
             encryption_opts: None,
@@ -264,6 +266,12 @@ impl Builder {
         self
     }
 
+    /// INSERT, UPDATE and DELETE inside WITH, with PostgreSQL semantics.
+    pub fn experimental_writable_ctes(mut self, enabled: bool) -> Self {
+        self.enable_writable_ctes = enabled;
+        self
+    }
+
     pub fn experimental_mvcc_passive_checkpoint(mut self, enabled: bool) -> Self {
         self.enable_mvcc_passive_checkpoint = enabled;
         self
@@ -314,6 +322,9 @@ impl Builder {
         }
         if self.enable_without_rowid {
             features.push("without_rowid");
+        }
+        if self.enable_writable_ctes {
+            features.push("writable_ctes");
         }
         if self.enable_mvcc_passive_checkpoint {
             features.push("mvcc_passive_checkpoint");

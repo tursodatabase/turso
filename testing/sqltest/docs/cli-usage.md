@@ -35,6 +35,7 @@ sqltest run <PATHS>... [OPTIONS]
 | `--jobs <N>` | `-j` | CPU count | Maximum concurrent test jobs |
 | `--output <FORMAT>` | `-o` | `pretty` | Output format: `pretty` or `json` |
 | `--timeout <SECS>` | | `30` | Timeout per query in seconds |
+| `--postgres-dsn <DSN>` | | | With `--backend pg`: run against this PostgreSQL server instead of tursopg, in a fresh database per test database. Checks that the PostgreSQL corpus expects what PostgreSQL itself does. |
 
 #### Examples
 

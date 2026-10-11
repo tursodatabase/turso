@@ -4335,6 +4335,88 @@ test fk-deferred-null-parent-key-does-not-repay {
 expect error {
 }
 
+# Immediate foreign keys are checked when the statement ends, like SQLite.
+# A later row of the same statement can fix a violation of an earlier row.
+
+# Deletes the parent row 1 first, then its child row 2.
+@cross-check-integrity
+test fk-immediate-delete-parent-then-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# Inserts the child row 2 first, then its parent row 1.
+@cross-check-integrity
+test fk-immediate-insert-child-then-parent-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, p INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES (2, 1), (1, NULL);
+    SELECT id, p FROM s ORDER BY id;
+}
+expect {
+    1|
+    2|1
+}
+
+# Moving the parent key orphans row 2 until row 2 moves too.
+@cross-check-integrity
+test fk-immediate-update-moves-parent-and-child-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, p = p + 10;
+    SELECT id, p FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+@cross-check-integrity
+test fk-immediate-orphan-in-multi-row-insert-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE par(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES par(id));
+    INSERT INTO ch VALUES (5, 9), (6, NULL);
+}
+expect error {
+}
+
+# Deleting a parent counts one violation per child row, also when the child
+# column has an index. Deleting one of two children repays only one.
+@cross-check-integrity
+test fk-deferred-indexed-child-counts-each-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_a ON c(a);
+    INSERT INTO p VALUES (40);
+    INSERT INTO c VALUES (9, 40), (13, 40);
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c WHERE id = 13;
+    COMMIT;
+}
+expect error {
+}
+
+# RESTRICT fails at once, even if a later row would fix it.
+@cross-check-integrity
+test fk-restrict-fails-before-the-statement-ends {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE r(id INTEGER PRIMARY KEY, p INTEGER REFERENCES r(id) ON DELETE RESTRICT);
+    INSERT INTO r VALUES (1, NULL), (2, 1);
+    DELETE FROM r;
+}
+expect error {
+}
+
 # UPDATE and UPSERT only emit parent-side foreign-key bytecode when the
 # statement can change the key that the children point at. These snapshots record
 # which statements get the OLD/NEW key probes and which get the CASCADE,

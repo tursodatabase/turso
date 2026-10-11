@@ -1126,7 +1126,7 @@ where
     // Rewrite WITH clause (CTEs)
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
-            rewrite_select_expressions(&mut cte.select, rewrite_expr)?;
+            rewrite_select_expressions(crate::util::stored_cte_select_mut(cte)?, rewrite_expr)?;
         }
     }
 

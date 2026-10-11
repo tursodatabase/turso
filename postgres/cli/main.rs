@@ -742,7 +742,6 @@ fn print_result_set(
 
     stmt.run_with_row_callback(|row| {
         let mut table_row = Row::new();
-        table_row.max_height(1);
         for (idx, value) in row.get_values().enumerate() {
             let (content, alignment) = match value {
                 Value::Null => ("NULL".to_string(), CellAlignment::Left),

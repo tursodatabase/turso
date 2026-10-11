@@ -7289,6 +7289,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_differential"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "turso_pg_client",
+]
+
+[[package]]
 name = "turso_pg_parser"
 version = "0.8.0"
 dependencies = [
@@ -7565,6 +7576,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_pg",
+ "turso_pg_client",
  "turso_pg_server",
  "validator",
  "windows-sys 0.61.2",

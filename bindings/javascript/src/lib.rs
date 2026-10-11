@@ -280,6 +280,7 @@ pub fn apply_experimental_features(
             "generated_columns" => opts.with_generated_columns(true),
             "multiprocess_wal" => opts.with_multiprocess_wal(true),
             "without_rowid" => opts.with_without_rowid(true),
+            "writable_ctes" => opts.with_writable_ctes(true),
             _ => opts,
         };
     }
@@ -1052,6 +1053,7 @@ mod tests {
             "generated_columns",
             "multiprocess_wal",
             "without_rowid",
+            "writable_ctes",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1067,6 +1069,7 @@ mod tests {
         assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
+        assert!(opts.enable_writable_ctes);
 
         // `strict` and unknown names are no-ops.
         assert_eq!(

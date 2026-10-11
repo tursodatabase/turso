@@ -2153,7 +2153,37 @@ pub struct CommonTableExpr {
     /// `MATERIALIZED`
     pub materialized: Materialized,
     /// query
-    pub select: Select,
+    pub body: CteBody,
+}
+
+/// The statement inside `name AS (...)` of a common table expression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(clippy::large_enum_variant)]
+pub enum CteBody {
+    /// `SELECT` or `VALUES`
+    Select(Select),
+    /// `INSERT`, `UPDATE` or `DELETE`. SQLite does not accept these here; the
+    /// engine runs them only when writable CTEs are enabled.
+    DataModifying(Box<Stmt>),
+}
+
+impl CteBody {
+    /// The SELECT, or `None` for an INSERT, UPDATE or DELETE.
+    pub fn as_select(&self) -> Option<&Select> {
+        match self {
+            CteBody::Select(select) => Some(select),
+            CteBody::DataModifying(_) => None,
+        }
+    }
+
+    /// The SELECT, or `None` for an INSERT, UPDATE or DELETE.
+    pub fn as_select_mut(&mut self) -> Option<&mut Select> {
+        match self {
+            CteBody::Select(select) => Some(select),
+            CteBody::DataModifying(_) => None,
+        }
+    }
 }
 
 /// A field in a STRUCT or UNION type declaration, e.g. `x INT` in `STRUCT(x INT, y TEXT)`.

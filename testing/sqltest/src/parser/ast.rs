@@ -312,6 +312,8 @@ pub enum SkipCondition {
     Mvcc,
     /// Skip when running against the sqlite CLI backend
     Sqlite,
+    /// Skip when running against a real PostgreSQL server (`--postgres-dsn`)
+    Postgres,
 }
 
 /// What we expect from executing the SQL

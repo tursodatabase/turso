@@ -4182,11 +4182,19 @@ pub struct FromClauseSubqueryCteMetadata {
     pub shared_materialization: bool,
     /// True for explicit WITH ... AS MATERIALIZED.
     pub materialize_hint: bool,
+    /// True when an earlier part of a statement with INSERT, UPDATE or DELETE
+    /// inside WITH already stored the rows. The subquery's plan then only
+    /// describes the columns and must never be emitted.
+    pub stored_by_earlier_part: bool,
 }
 
 impl FromClauseSubquery {
     pub fn cte_id(&self) -> Option<usize> {
         self.cte.map(|cte| cte.id)
+    }
+
+    pub fn stored_by_earlier_part(&self) -> bool {
+        self.cte.is_some_and(|cte| cte.stored_by_earlier_part)
     }
 
     pub fn materialize_hint(&self) -> bool {

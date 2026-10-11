@@ -385,7 +385,11 @@ fn check_select_table_refs(
     // Check CTEs
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            check_select_table_refs(&cte.select, check_qname, check_expr)?;
+            check_select_table_refs(
+                crate::util::stored_cte_select(cte)?,
+                check_qname,
+                check_expr,
+            )?;
         }
     }
 

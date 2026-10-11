@@ -9,7 +9,7 @@ use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg::{dml_command, split_statements, Connection, DmlCommand, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -197,7 +197,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+                responses.push(execute_query(&mut stmt, header, sql)?);
             }
         }
 
@@ -241,7 +241,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        execute_query(&mut stmt, header, query)
     }
 
     async fn do_describe_statement<C>(
@@ -386,6 +386,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 fn execute_query(
     stmt: &mut turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
+    query: &str,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
@@ -405,7 +406,17 @@ fn execute_query(
     .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
     let data_stream = stream::iter(rows);
-    Ok(Response::Query(QueryResponse::new(header, data_stream)))
+    let mut response = QueryResponse::new(header, data_stream);
+    // INSERT, UPDATE and DELETE with RETURNING return rows but keep their own
+    // tag. pgwire appends the number of rows, which RETURNING makes equal to
+    // the number of changed rows.
+    match main_dml_command(query) {
+        Some(DmlCommand::Insert) => response.set_command_tag("INSERT 0"),
+        Some(DmlCommand::Update) => response.set_command_tag("UPDATE"),
+        Some(DmlCommand::Delete) => response.set_command_tag("DELETE"),
+        None => {}
+    }
+    Ok(Response::Query(response))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
@@ -413,9 +424,40 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
     stmt.run_ignore_rows()
         .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-    let affected = stmt.n_change();
-    let tag = command_tag(query, affected as usize);
+    let affected = stmt.n_change() as usize;
+    let tag = match main_dml_command(query) {
+        Some(DmlCommand::Insert) => Tag::new("INSERT").with_oid(0).with_rows(affected),
+        Some(DmlCommand::Update) => Tag::new("UPDATE").with_rows(affected),
+        Some(DmlCommand::Delete) => Tag::new("DELETE").with_rows(affected),
+        None => command_tag(query, affected),
+    };
     Ok(Response::Execution(tag))
+}
+
+/// Whether the main statement of `query` is an INSERT, UPDATE or DELETE. The
+/// first word decides it unless the statement starts with WITH (where the
+/// main statement follows the CTEs), a comment or a parenthesis; only then is
+/// the text parsed.
+fn main_dml_command(query: &str) -> Option<DmlCommand> {
+    let trimmed = query.trim_start();
+    let first_word: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match first_word.as_str() {
+        "INSERT" => Some(DmlCommand::Insert),
+        "UPDATE" => Some(DmlCommand::Update),
+        "DELETE" => Some(DmlCommand::Delete),
+        "WITH" => dml_command(query),
+        "" if trimmed.starts_with("--")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('(') =>
+        {
+            dml_command(query)
+        }
+        _ => None,
+    }
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -697,9 +739,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("COMMENT")
     } else if upper.starts_with("SELECT") || upper.starts_with("WITH") {
         // Row-returning SELECTs never reach command_tag (they take the
-        // query-response path), so a zero-column SELECT- or WITH-prefixed
-        // statement is SELECT ... INTO (writable CTEs are unsupported),
-        // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
+        // query-response path), and execute_non_query handles a WITH-prefixed
+        // INSERT, UPDATE or DELETE before calling it. So a zero-column SELECT-
+        // or WITH-prefixed statement is SELECT ... INTO, which PostgreSQL
+        // reports as `SELECT n` like CREATE TABLE AS.
         Tag::new("SELECT").with_rows(affected_rows)
     } else {
         Tag::new("OK")
