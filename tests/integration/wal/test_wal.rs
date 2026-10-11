@@ -1,8 +1,11 @@
 use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
+use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::{
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, SqliteDialect,
+};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -59,6 +62,44 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
     // A truncate checkpoint must not come back busy after a rollback.
     assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
+    Ok(())
+}
+
+/// A TRUNCATE checkpoint reads the database header after it copies the WAL
+/// frames. When that read fails, the next statement on the same connection
+/// must read the header again instead of failing with the old read error.
+#[test]
+fn test_failed_truncate_checkpoint_header_read_does_not_fail_next_statement() -> Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "failed-truncate-checkpoint-header-read.db";
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    io.fault_after(path, QueuedIoOpKind::Pread, 0);
+    let checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    io.clear_fault();
+    assert!(
+        matches!(checkpoint, Err(LimboError::CheckpointFailed(_))),
+        "the checkpoint must fail on the database header read, got {checkpoint:?}"
+    );
+
+    assert_eq!(
+        execute_and_get_strings(&conn, "PRAGMA integrity_check")?,
+        vec!["ok"]
+    );
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+        vec![3]
+    );
     Ok(())
 }
 
