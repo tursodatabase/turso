@@ -564,6 +564,9 @@ fn test_registered_collation_in_schema_is_used_only_outside_indexes() -> anyhow:
 
     let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM t1 ORDER BY a");
     assert_eq!(rows, vec![("b".to_string(),), ("a".to_string(),)]);
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT x.a FROM t2 x JOIN t1 y ON y.a = x.a ORDER BY x.a");
+    assert_eq!(rows, vec![("a".to_string(),), ("b".to_string(),)]);
     for sql in [
         "INSERT INTO t1 VALUES ('c', 3)",
         "SELECT a FROM t1 UNION SELECT a FROM t1",

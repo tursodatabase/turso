@@ -9,6 +9,7 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
+use crate::translate::collate::resolve_comparison_collseq;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
@@ -1354,6 +1355,7 @@ pub fn try_hash_join_access_method(
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
+    table_references: &TableReferences,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1391,11 +1393,15 @@ pub fn try_hash_join_access_method(
     }
     // Custom-collated equality depends on a connection-owned callback, so the
     // hash join planner cannot derive a stable hash/equality pair here.
-    if join_keys.iter().any(|join_key| {
-        expr_uses_custom_collation(join_key.get_build_expr(where_clause))
-            || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
-    }) {
-        return Ok(None);
+    for join_key in &join_keys {
+        let (lhs, _, rhs) = as_binary_components(&where_clause[join_key.where_clause_idx].expr)?
+            .expect("a hash join key is a binary comparison");
+        if expr_uses_custom_collation(lhs)
+            || expr_uses_custom_collation(rhs)
+            || resolve_comparison_collseq(lhs, rhs, table_references)?.is_custom()
+        {
+            return Ok(None);
+        }
     }
 
     // Prefer nested loops when an index can read the join columns.

@@ -870,6 +870,7 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     params,
+                    table_references,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -4537,6 +4538,7 @@ mod tests {
             true,
             &[],
             &DEFAULT_PARAMS,
+            &table_references,
         )
         .unwrap()
         .unwrap();
