@@ -1,0 +1,88 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/9429
+#
+# Column names are case-insensitive, so the duplicate-name check for
+# ALTER TABLE ... RENAME COLUMN used to find the column being renamed itself
+# and reject a case-only rename (`a` -> `A`) with "duplicate column name".
+# SQLite accepts it and rewrites the schema with the new spelling.
+
+@cross-check-integrity
+test rename-column-case-only {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    CREATE INDEX i ON t (a);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    ALTER TABLE t RENAME COLUMN a TO A;
+    SELECT sql FROM sqlite_schema ORDER BY name;
+    SELECT name FROM pragma_table_info('t') ORDER BY cid;
+    SELECT A, b FROM t ORDER BY A;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE INDEX i ON t (A)
+    CREATE TABLE t (A INTEGER, b TEXT)
+    A
+    b
+    1|x
+    2|y
+    ok
+}
+
+@cross-check-integrity
+test rename-column-case-only-without-column-keyword {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (7);
+    ALTER TABLE t RENAME a TO A;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT A FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (A)
+    7
+    ok
+}
+
+# Triggers that use the column must keep working: the rename used to be
+# rejected because the rewritten trigger still "referenced" the old name.
+@cross-check-integrity
+test rename-column-case-only-with-trigger {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    CREATE TABLE log (v);
+    CREATE TRIGGER tr AFTER UPDATE OF a ON t WHEN new.a > 0 BEGIN
+        INSERT INTO log VALUES (new.a);
+        UPDATE t SET b = a WHERE rowid = new.rowid;
+    END;
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t RENAME COLUMN a TO A;
+    UPDATE t SET A = 5;
+    SELECT A, b FROM t;
+    SELECT v FROM log;
+    PRAGMA integrity_check;
+}
+expect {
+    5|5
+    5
+    ok
+}
+
+@cross-check-integrity
+test rename-column-to-same-name {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN a TO a;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a, b FROM t;
+}
+expect {
+    CREATE TABLE t (a, b)
+    1|2
+}
+
+test rename-column-onto-other-column-with-different-case-fails {
+    CREATE TABLE t (a, b);
+    ALTER TABLE t RENAME COLUMN b TO A;
+}
+expect error {
+    duplicate column name
+}
