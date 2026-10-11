@@ -12,7 +12,7 @@ use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
 use crate::{
-    busy::BusyHandlerState,
+    busy::{BusyHandler, BusyHandlerState},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -354,6 +354,8 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    conflict_retry_state: Option<BusyHandlerState>,
+    started_in_autocommit: bool,
     /// Per-execution timeout override for this statement.
     /// - `None`: use connection default
     /// - `Some(Some(duration))`: override with a query-specific timeout
@@ -452,6 +454,8 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            conflict_retry_state: None,
+            started_in_autocommit: false,
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
@@ -706,6 +710,7 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
+            self.started_in_autocommit = self.program.connection.get_auto_commit();
             if self.state.db_mv_store(&self.program.connection).is_some() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
@@ -724,6 +729,18 @@ impl Statement {
         }
 
         self.arm_query_timeout_if_needed();
+
+        if let Some(retry_state) = self.conflict_retry_state.as_ref() {
+            let now = self.pager.io.current_time_monotonic();
+            if now < retry_state.timeout() {
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
+                return Ok(Some(StepResult::Sleep {
+                    duration: retry_state.get_delay(now),
+                }));
+            }
+        }
 
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
@@ -789,6 +806,7 @@ impl Statement {
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.conflict_retry_state = None;
             self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -807,6 +825,10 @@ impl Statement {
             }
         } else {
             self.busy = true;
+        }
+
+        if let Some(sleep) = self.restart_after_write_conflict(&res, waker)? {
+            return Ok(sleep);
         }
 
         // Handle busy result by invoking the busy handler
@@ -895,6 +917,48 @@ impl Statement {
         // The interpreter chain carries a boxed error to keep per-row returns
         // register-sized; unbox once at the public boundary.
         res.map_err(|err| (*err).into_structured_constraint())
+    }
+
+    fn restart_after_write_conflict(
+        &mut self,
+        res: &std::result::Result<StepResult, Box<LimboError>>,
+        waker: Option<&Waker>,
+    ) -> Result<Option<StepResult>> {
+        let Err(err) = res else {
+            return Ok(None);
+        };
+        if !matches!(**err, LimboError::WriteWriteConflict)
+            || !self.started_in_autocommit
+            || self.has_returned_row
+            || self.query_mode != QueryMode::Normal
+        {
+            return Ok(None);
+        }
+
+        let handler = self.program.connection.conflict_retry_busy_handler();
+        if matches!(handler, BusyHandler::None) {
+            return Ok(None);
+        }
+
+        let now = self.pager.io.current_time_monotonic();
+        let mut retry_state = self
+            .conflict_retry_state
+            .take()
+            .unwrap_or_else(|| BusyHandlerState::new(now));
+        if !retry_state.invoke(&handler, now) {
+            return Ok(None);
+        }
+
+        let parameters = std::mem::take(&mut self.state.parameters);
+        self.reset_internal(None, None, self.counted_as_active_root)?;
+        self.state.parameters = parameters;
+
+        let delay = retry_state.get_delay(now);
+        self.conflict_retry_state = Some(retry_state);
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
+        }
+        Ok(Some(StepResult::Sleep { duration: delay }))
     }
 
     #[inline]
@@ -1851,6 +1915,7 @@ impl Statement {
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;
+        self.conflict_retry_state = None;
         self.query_timeout_override = None;
         self.has_returned_row = false;
 

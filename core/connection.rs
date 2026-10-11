@@ -4415,6 +4415,13 @@ impl Connection {
         self.busy_handler.read()
     }
 
+    pub(crate) fn conflict_retry_busy_handler(&self) -> BusyHandler {
+        match &*self.busy_handler.read() {
+            BusyHandler::Timeout(d) => BusyHandler::Timeout(*d),
+            BusyHandler::None | BusyHandler::Custom { .. } => BusyHandler::None,
+        }
+    }
+
     /// Sets a progress handler invoked approximately every `ops` VM steps.
     /// Passing `ops == 0` or `None` disables the progress handler.
     pub fn set_progress_handler(&self, ops: u64, handler: Option<ProgressHandlerCallback>) {
