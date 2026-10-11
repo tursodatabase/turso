@@ -9,9 +9,10 @@ use aegis::aegis256::Aegis256;
 use aegis::aegis256x2::Aegis256X2;
 use aegis::aegis256x4::Aegis256X4;
 use aes_gcm::{
-    aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
+    aead::{Aead, AeadInOut, Generate, KeyInit},
     Aes128Gcm, Aes256Gcm, Key, Nonce,
 };
+use rand::RngExt;
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 
 /// Encryption Scheme
@@ -299,7 +300,7 @@ macro_rules! define_aes_gcm_cipher {
             }
 
             fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
-                let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
+                let nonce = Nonce::generate();
                 let ciphertext = self.cipher.encrypt(&nonce, aes_gcm::aead::Payload {
                     msg: plaintext,
                     aad: ad,
@@ -311,35 +312,35 @@ macro_rules! define_aes_gcm_cipher {
                 Ok((ciphertext, nonce_array))
             }
 
-            fn encrypt_in_place(
-                &self,
-                plaintext_ciphertext: &mut [u8],
-                ad: &[u8],
-                tag_out: &mut [u8],
-                nonce_out: &mut [u8],
-            ) -> Result<()> {
-                if tag_out.len() != Self::TAG_SIZE {
-                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
-                }
-                if nonce_out.len() != Self::NONCE_SIZE {
-                    return Err(LimboError::InternalError(format!(
-                        "Invalid nonce size for {}: expected {}, got {}",
-                        $name,
-                        Self::NONCE_SIZE,
-                        nonce_out.len()
-                    )));
-                }
-                let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
-                let tag = self
-                    .cipher
-                    .encrypt_in_place_detached(&nonce, ad, plaintext_ciphertext)
-                    .map_err(|e| {
-                        LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
-                    })?;
-                tag_out.copy_from_slice(&tag);
-                nonce_out.copy_from_slice(&nonce);
-                Ok(())
-            }
+    fn encrypt_in_place(
+        &self,
+        plaintext_ciphertext: &mut [u8],
+        ad: &[u8],
+        tag_out: &mut [u8],
+        nonce_out: &mut [u8],
+    ) -> Result<()> {
+        if tag_out.len() != Self::TAG_SIZE {
+          return Err(CipherError::InvalidTagSize { cipher: $name }.into());
+        }
+        if nonce_out.len() != Self::NONCE_SIZE {
+          return Err(LimboError::InternalError(format!(
+            "Invalid nonce size for {}: expected {}, got {}",
+            $name,
+            Self::NONCE_SIZE,
+            nonce_out.len()
+        )));
+      }
+      let nonce = Nonce::generate();
+      let tag = self
+        .cipher
+        .encrypt_inout_detached(&nonce, ad, plaintext_ciphertext.into())
+        .map_err(|e| {
+            LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
+        })?;
+      tag_out.copy_from_slice(&tag);
+      nonce_out.copy_from_slice(&nonce);
+      Ok(())
+    }
 
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
                 let mut out = Vec::with_capacity(ciphertext.len().saturating_sub(Self::TAG_SIZE));
@@ -1048,10 +1049,9 @@ impl EncryptionContext {
 }
 
 fn generate_secure_nonce<const N: usize>() -> [u8; N] {
-    // use OsRng directly to fill bytes, generic over nonce size
-    use aes_gcm::aead::rand_core::RngCore;
     let mut nonce = [0u8; N];
-    OsRng.fill_bytes(&mut nonce);
+    let mut rng = rand::rng();
+    rng.fill(&mut nonce);
     nonce
 }
 
