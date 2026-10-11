@@ -8,9 +8,6 @@ with the same name, the inner (joined) table must not shadow the outer one,
 and outer-scope tables must remain reachable through their qualified name.
 """
 
-import os
-
-from cli_tests.console import log_info
 from cli_tests.test_turso_cli import TestTursoShell
 
 
