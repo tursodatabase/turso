@@ -2184,6 +2184,8 @@ pub(crate) fn summarize_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
@@ -2191,12 +2193,14 @@ pub(crate) fn summarize_binary_term_for_index(
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
+    let affinity = term_comparison_affinity(lhs, rhs, operator, table_col_pos, table_references);
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
         indexes,
         rowid_alias_column,
         is_rowid,
+        affinity,
         table_reference,
         query_where_clause,
     );
@@ -2252,6 +2256,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
+    let affinity = term_comparison_affinity(lhs, rhs, operator, table_col_pos, table_references);
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2259,6 +2264,7 @@ pub(crate) fn analyze_binary_term_for_index(
         indexes,
         rowid_alias_column,
         is_rowid,
+        affinity,
         table_reference,
         query_where_clause,
     );
@@ -2300,17 +2306,6 @@ pub(crate) fn analyze_binary_term_for_index(
         }
     }
 
-    // Compute the affinity for the constraining expression
-    let affinity = if let Some(ast_op) = operator.as_ast_operator() {
-        if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
-        } else {
-            Affinity::Blob
-        }
-    } else {
-        Affinity::Blob
-    };
-
     // Store the pre-computed constraining expression for multi-index branches
     let stored_constraining_expr = operator
         .as_ast_operator()
@@ -2338,13 +2333,30 @@ pub(crate) fn analyze_binary_term_for_index(
     })
 }
 
+fn term_comparison_affinity(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    operator: ConstraintOperator,
+    table_col_pos: Option<usize>,
+    table_references: &TableReferences,
+) -> Affinity {
+    match operator.as_ast_operator() {
+        Some(op) if op.is_comparison() && table_col_pos.is_some() => {
+            comparison_affinity(lhs, rhs, Some(table_references), None)
+        }
+        _ => Affinity::Blob,
+    }
+}
+
 /// Find the best index for a single constraint.
+#[allow(clippy::too_many_arguments)]
 fn find_best_index_for_constraint(
     table_col_pos: Option<usize>,
     operator: ConstraintOperator,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
+    affinity: Affinity,
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
 ) -> (Option<Arc<Index>>, Vec<RangeConstraintRef>) {
@@ -2406,6 +2418,15 @@ fn find_best_index_for_constraint(
             },
         };
         return (None, vec![constraint_ref]);
+    }
+
+    if !table_reference
+        .table
+        .columns()
+        .get(col_pos)
+        .is_some_and(|column| column.affinity().index_affinity_ok(affinity))
+    {
+        return (None, vec![]);
     }
 
     // Find the best index that has this column as its first column
