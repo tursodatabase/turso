@@ -3547,8 +3547,12 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            let local_state = self.connection_state();
+            let shared_ignoring_backfill = WalSnapshot {
+                nbackfills: local_state.snapshot.nbackfills,
+                ..self.load_coordination_snapshot()
+            };
+            let db_changed = self.db_changed_against(shared_ignoring_backfill, local_state);
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
