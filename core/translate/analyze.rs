@@ -104,6 +104,7 @@ fn resolve_targets_in_db(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<Vec<AnalyzeTarget>> {
+    resolver.with_schema(database_id, |s| s.check_broken_table(name))?;
     // Try as a table first
     let table_opt: Option<Arc<BTreeTable>> =
         resolver.with_schema(database_id, |s| s.get_btree_table(name));

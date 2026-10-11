@@ -51,6 +51,9 @@ fn validate_materialized(
             "View {normalized_view_name} already exists"
         )));
     }
+    resolver.with_schema(database_id, |s| {
+        s.check_object_name_conflict(normalized_view_name, SchemaObjectType::View)
+    })?;
     Ok(())
 }
 
@@ -69,8 +72,10 @@ pub fn translate_create_materialized_view(
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
-            s.get_view(&normalized_view_name).is_some()
-                || s.is_materialized_view(&normalized_view_name)
+            matches!(
+                s.get_object_type(&normalized_view_name),
+                Some(SchemaObjectType::Table | SchemaObjectType::View)
+            ) || s.is_materialized_view(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
         })
     {
