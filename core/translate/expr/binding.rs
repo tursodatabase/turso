@@ -866,9 +866,8 @@ fn match_qualified_name_in_table(
     // database the candidate table belongs to (so `aux.t1.id` binds to an
     // outer `aux.t1` but never to an inner `main.t1` of the same name).
     let name_matches = table_reference_name.eq_ignore_ascii_case(table_name);
-    let db_matches = database_id.map_or(true, |db| {
-        table_database_id.map_or(false, |tdb| tdb == db)
-    });
+    let db_matches =
+        database_id.is_none_or(|db| table_database_id.is_some_and(|tdb| tdb == db));
     if !name_matches || !db_matches {
         return Ok(QualifiedTableMatch::NoTable);
     }
