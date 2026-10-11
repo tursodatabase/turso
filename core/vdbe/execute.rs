@@ -3566,15 +3566,12 @@ pub fn op_blob_write(
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_result_row(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ResultRow { start_reg, count }, insn);
-    if program.connection.mvcc_tx_should_abort() {
-        return Err(LimboError::CommitDependencyAborted.into());
-    }
     let row = Row {
         values: &state.registers[*start_reg] as *const Register,
         count: *count,
