@@ -862,14 +862,14 @@ fn match_qualified_name_in_table(
         }
     }
 
-    if let Some(db) = database_id {
-        // Database-qualified reference: the candidate table must belong to
-        // that database. References without database information (outer
-        // scopes) are not filtered here.
-        if table_database_id.is_none_or(|tdb| tdb != db) {
-            return Ok(QualifiedTableMatch::NoTable);
-        }
-    } else if !table_reference_name.eq_ignore_ascii_case(table_name) {
+    // The reference name must match, and a database qualifier must name the
+    // database the candidate table belongs to (so `aux.t1.id` binds to an
+    // outer `aux.t1` but never to an inner `main.t1` of the same name).
+    let name_matches = table_reference_name.eq_ignore_ascii_case(table_name);
+    let db_matches = database_id.map_or(true, |db| {
+        table_database_id.map_or(false, |tdb| tdb == db)
+    });
+    if !name_matches || !db_matches {
         return Ok(QualifiedTableMatch::NoTable);
     }
     Ok(
