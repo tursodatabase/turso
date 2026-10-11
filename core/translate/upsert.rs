@@ -14,7 +14,7 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::insert::{format_unique_violation_desc, IndexCursor, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
@@ -1097,7 +1097,12 @@ pub fn emit_upsert(
 
         // Pass 1: compute the NEW key for every affected index and probe the
         // unique ones for conflicts, without modifying any index yet.
-        for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
+        for IndexCursor {
+            name: idx_name,
+            cursor_id: idx_cid,
+            ..
+        } in &ctx.idx_cursors
+        {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
                     s.get_index(table.get_name(), idx_name).cloned()
