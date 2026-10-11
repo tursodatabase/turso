@@ -1,6 +1,7 @@
 use crate::common::{
     do_flush, run_query, run_query_on_row, ExecRows, TempDatabase, TempDatabaseBuilder,
 };
+use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::SqliteDialect;
@@ -147,10 +148,9 @@ fn run_corruption_associated_data_bytes_test(
 
         let result = run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
-        assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
-        );
+        assert_that!(result)
+            .described_as(format!("accessing an encrypted database with corrupted associated data at position {corrupt_pos}"))
+            .is_err();
     }
 
     Ok(())
@@ -250,18 +250,18 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with wrong key"
-        );
+        assert_that!(result)
+            .described_as("accessing an encrypted database with the wrong key")
+            .is_err();
     }
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
-        let result = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect));
+        // `from_uri` returns a connection handle that is not Debug, so the
+        // result cannot go through `assert_that!`.
         assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB without passing hexkey in URI"
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)).is_err(),
+            "opening an encrypted database without a hexkey in the URI must fail"
         );
     }
     {
@@ -269,20 +269,18 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let result = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect));
         assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB without passing cipher in URI"
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)).is_err(),
+            "opening an encrypted database without a cipher in the URI must fail"
         );
     }
     {
         // test connecting to encrypted db without using URI.
         let conn = tmp_db.connect_limbo();
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB without using URI"
-        );
+        assert_that!(result)
+            .described_as("accessing an encrypted database without using the URI")
+            .is_err();
     }
 
     Ok(())
@@ -315,26 +313,19 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
         "INSERT INTO pre (v) VALUES ('before_late_pragma')",
     )?;
 
-    let key_err = run_query(
+    assert_that!(run_query(
         &tmp_db,
         &conn,
         "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-    )
-    .unwrap_err();
-    assert!(
-        key_err
-            .to_string()
-            .contains("configure encryption before PRAGMA journal_mode='mvcc'"),
-        "unexpected error: {key_err:?}"
-    );
+    ))
+    .err()
+    .display_string()
+    .contains("configure encryption before PRAGMA journal_mode='mvcc'");
 
-    let cipher_err = run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';").unwrap_err();
-    assert!(
-        cipher_err
-            .to_string()
-            .contains("configure encryption before PRAGMA journal_mode='mvcc'"),
-        "unexpected error: {cipher_err:?}"
-    );
+    assert_that!(run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';"))
+        .err()
+        .display_string()
+        .contains("configure encryption before PRAGMA journal_mode='mvcc'");
 
     // Data inserted before the rejected pragmas must still be readable.
     let mut pre_count = 0;
@@ -418,15 +409,11 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
         let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
         let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
-        assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with corrupted Turso magic bytes"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Decryption failed"),
-            "error should indicate decryption failure, got: {err_msg}"
-        );
+        assert_that!(result)
+            .described_as("accessing an encrypted database with corrupted Turso magic bytes")
+            .err()
+            .display_string()
+            .contains("Decryption failed");
     }
 
     Ok(())
@@ -704,16 +691,11 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         );
 
-        assert!(
-            result.is_err(),
-            "Opening encrypted database without encryption options should fail"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Database is encrypted but no encryption options provided"),
-            "Error message should indicate missing encryption options"
-        );
+        assert_that!(result)
+            .described_as("opening an encrypted database with no encryption options")
+            .err()
+            .display_string()
+            .contains("Database is encrypted but no encryption options provided");
     }
 
     // Step 5: verify correct key still works after wrong key attempt
@@ -897,10 +879,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
                 "SELECT value FROM aux_a.secret_a",
                 |_: &Row| {},
             );
-            assert!(
-                read_result.is_err(),
-                "Reading with wrong key should fail with decryption error"
-            );
+            assert_that!(read_result)
+                .described_as("reading an attached database with the wrong key")
+                .is_err();
         }
         // If attach itself failed, that's also acceptable
     }
@@ -952,10 +933,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A
         );
         let result = run_query(&main_db, &conn, &attach_no_hexkey);
-        assert!(
-            result.is_err(),
-            "ATTACH with cipher but no hexkey should fail"
-        );
+        assert_that!(result)
+            .described_as("ATTACH with a cipher but no hexkey")
+            .is_err();
     }
 
     // --- Test 5: Missing cipher in URI ---
@@ -967,10 +947,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             KEY_A
         );
         let result = run_query(&main_db, &conn, &attach_no_cipher);
-        assert!(
-            result.is_err(),
-            "ATTACH with hexkey but no cipher should fail"
-        );
+        assert_that!(result)
+            .described_as("ATTACH with a hexkey but no cipher")
+            .is_err();
     }
 
     // --- Test 6: No encryption params at all ---
@@ -979,10 +958,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
         let attach_no_enc = format!("ATTACH '{}' AS aux_a", path_a.to_str().unwrap());
         let result = run_query(&main_db, &conn, &attach_no_enc);
         // Opening an encrypted DB without key should fail
-        assert!(
-            result.is_err(),
-            "ATTACH encrypted DB without key should fail"
-        );
+        assert_that!(result)
+            .described_as("ATTACH of an encrypted database with no key at all")
+            .is_err();
     }
 
     // --- Test 7: Correct key after wrong key attempt ---
@@ -1133,29 +1111,21 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
         // Reading should fail
         let result = unauthorized_conn.execute("SELECT * FROM secret_data");
-        assert!(
-            result.is_err(),
-            "Encrypted source should not be readable as plaintext"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        assert_that!(result)
+            .described_as("reading an encrypted database as plaintext")
+            .err()
+            .display_string()
+            .contains("Corrupt database");
 
         // VACUUM INTO should also fail because it cannot read the source schema/data
         let fail_path = dest_dir.path().join("should_fail.db");
         let fail_path_str = fail_path.to_str().unwrap();
         let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
-        assert!(
-            result.is_err(),
-            "VACUUM INTO should fail on encrypted database when no keys are provided"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        assert_that!(result)
+            .described_as("VACUUM INTO from an encrypted database with no keys")
+            .err()
+            .display_string()
+            .contains("Corrupt database");
     }
 
     // 3. Execute VACUUM INTO using an authorized connection

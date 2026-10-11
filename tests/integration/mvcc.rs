@@ -1,4 +1,5 @@
 use crate::common::{ExecRows, TempDatabase};
+use asserting::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 use turso_core::{
@@ -165,8 +166,9 @@ fn test_mvcc_create_table_on_attached_db(tmp_db: TempDatabase) -> anyhow::Result
     // Verify the table works
     conn.execute("INSERT INTO aux.test_table VALUES (1, 'hello')")?;
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, name FROM aux.test_table");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0], (1, "hello".to_string()));
+    assert_that!(rows)
+        .single_element()
+        .is_equal_to((1, "hello".to_string()));
 
     Ok(())
 }
@@ -211,10 +213,8 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
     assert_eq!(rows, vec![(1,)]);
 
     // Assert the injected storage was actually used.
-    assert!(
-        recording.saw_log_tx(),
-        "expected MVCC commit to call injected DurableStorage::log_tx()"
-    );
+    // The MVCC commit must call the injected DurableStorage::log_tx().
+    assert_that!(recording.saw_log_tx()).is_true();
 
     conn.close()?;
     Ok(())
@@ -345,7 +345,7 @@ fn test_stmt_rollback_cleans_write_set(tmp_db: TempDatabase) -> anyhow::Result<(
     // DELETE from parent fails due to FK constraint, triggering
     // statement-level rollback of the MVCC version changes.
     let result = conn2.execute("DELETE FROM parent WHERE id = 1");
-    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+    assert_that!(result).is_err();
 
     // COMMIT must succeed — the write_set should be clean after the
     // statement rollback.
@@ -379,7 +379,7 @@ fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyho
     // DELETE from parent fails due to FK constraint. With an index on
     // child(parent_id), the rollback must also undo index version changes.
     let result = conn2.execute("DELETE FROM parent WHERE id = 1");
-    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+    assert_that!(result).is_err();
 
     conn2.execute("COMMIT")?;
     Ok(())
@@ -468,16 +468,10 @@ fn test_attach_rejects_incompatible_journal_mode(tmp_db: TempDatabase) -> anyhow
     aux_conn.close()?;
 
     // ATTACH should fail because main=MVCC but attached=WAL
-    let result = conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()));
-    assert!(
-        result.is_err(),
-        "ATTACH should fail with incompatible journal modes"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("journal mode"),
-        "Error should mention journal mode incompatibility, got: {err}"
-    );
+    assert_that!(conn.execute(format!("ATTACH '{}' AS aux", aux_path.display())))
+        .err()
+        .display_string()
+        .contains("journal mode");
 
     Ok(())
 }
@@ -494,16 +488,10 @@ fn test_attach_rejects_mvcc_attached_on_wal_main(tmp_db: TempDatabase) -> anyhow
     create_mvcc_db(&tmp_db.io, &aux_path)?;
 
     // ATTACH should fail because main=WAL but attached=MVCC
-    let result = conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()));
-    assert!(
-        result.is_err(),
-        "ATTACH should fail with incompatible journal modes"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("journal mode"),
-        "Error should mention journal mode incompatibility, got: {err}"
-    );
+    assert_that!(conn.execute(format!("ATTACH '{}' AS aux", aux_path.display())))
+        .err()
+        .display_string()
+        .contains("journal mode");
 
     Ok(())
 }
@@ -526,11 +514,9 @@ fn test_mvcc_rollback_reverts_attached_db(tmp_db: TempDatabase) -> anyhow::Resul
     conn.execute("ROLLBACK")?;
 
     // The insert should have been rolled back — table should be empty
+    // ROLLBACK reverts the INSERT on the attached database.
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM aux.t");
-    assert!(
-        rows.is_empty(),
-        "ROLLBACK should have reverted the INSERT on the attached DB, but found {rows:?}"
-    );
+    assert_that!(rows).is_empty();
 
     Ok(())
 }
@@ -720,7 +706,7 @@ fn test_stmt_rollback_on_attached_mvcc_db(tmp_db: TempDatabase) -> anyhow::Resul
     // DELETE from parent fails due to FK constraint — triggers statement-level
     // rollback of the MVCC version changes on the attached DB's MvStore.
     let result = conn2.execute("DELETE FROM aux.parent WHERE id = 1");
-    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+    assert_that!(result).is_err();
 
     // COMMIT must succeed — the write_set should be clean after the
     // statement savepoint rollback on the attached MvStore.
@@ -765,13 +751,77 @@ fn test_stmt_rollback_on_attached_mvcc_db_with_index(tmp_db: TempDatabase) -> an
     // child(parent_id), the rollback must also undo index version changes
     // on the attached MvStore.
     let result = conn2.execute("DELETE FROM aux.parent WHERE id = 1");
-    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+    assert_that!(result).is_err();
 
     conn2.execute("COMMIT")?;
 
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM aux.parent");
     assert_eq!(rows, vec![(1,)]);
 
+    Ok(())
+}
+
+/// A UNIQUE failure on a TEMP table inside an explicit MVCC transaction must
+/// undo that statement's TEMP writes. TEMP has no MvStore, so the pager
+/// savepoint opened for it has to be rolled back with the statement.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_rollback_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TEMP TABLE t(x UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1)")?;
+    conn.execute("BEGIN")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(2),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Same statement rollback when the UNIQUE failure is on a main table written
+/// by a TEMP trigger. Both the TEMP rows and the trigger's main writes from
+/// that statement must disappear.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_rollback_unique_via_trigger(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TABLE m(x UNIQUE)")?;
+    conn.execute("INSERT INTO m VALUES(1)")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO m VALUES(new.x); END",
+    )?;
+    conn.execute("BEGIN")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(2),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let temp_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    let main_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM m ORDER BY x");
+    assert_that!(temp_rows).is_empty();
+    assert_eq!(main_rows, vec![(1,)]);
+    Ok(())
+}
+
+/// A successful TEMP write in an explicit MVCC transaction must keep its row
+/// when a later statement rolls back. That is the statement savepoint release
+/// path: the first write is no longer undoable by the next statement abort.
+#[turso_macros::test]
+fn test_mvcc_temp_stmt_release_keeps_successful_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TEMP TABLE t(x UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES(1)")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES(2)")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES(3),(1)")).is_err();
+    conn.execute("COMMIT")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
     Ok(())
 }
 
@@ -802,18 +852,12 @@ fn test_deferred_fk_violation_rolls_back_attached_mvcc(tmp_db: TempDatabase) -> 
     // The deferred FK check fires at commit (halt) and must roll back the
     // insert on the attached DB.
     let result = conn.execute("INSERT INTO aux.child VALUES (1, 999)");
-    assert!(
-        result.is_err(),
-        "INSERT with invalid deferred FK should fail at autocommit"
-    );
+    assert_that!(result).is_err();
 
     // The attached DB must be empty — the deferred FK rollback should have
     // reverted the insert.
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM aux.child");
-    assert!(
-        rows.is_empty(),
-        "Deferred FK rollback should have reverted the INSERT on the attached DB, but found {rows:?}"
-    );
+    assert_that!(rows).is_empty();
 
     // The connection should still be usable for subsequent operations.
     conn.execute("INSERT INTO aux.child VALUES (1, 1)")?;
@@ -1440,7 +1484,7 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 ///
 /// An active MVCC index scan must not return a row deleted after the scan
 /// cursor was opened. Pre-fix, the scan panicked with
-/// `index finger diverged from query_btree_version_is_valid` in
+/// `index shadow scan diverged from query_btree_version_is_valid` in
 /// core/mvcc/cursor.rs (or, without the assertion, returned the deleted row).
 #[turso_macros::test]
 fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(

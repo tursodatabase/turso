@@ -88,7 +88,7 @@ pub fn translate_create_materialized_view(
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
-    let view_columns = view_column_schema.flat_columns();
+    let view_columns = view_column_schema.flat_columns()?;
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);

@@ -12,6 +12,9 @@ pub enum TursoError {
     #[error("Invalid connection pointer")]
     InvalidConnectionPointer,
 
+    #[error("Invalid statement pointer")]
+    InvalidStatementPointer,
+
     #[error("JNI Errors: `{0}`")]
     JNIErrors(Error),
 }
@@ -28,6 +31,7 @@ impl From<TursoError> for JniError {
             TursoError::CustomError(_)
             | TursoError::InvalidDatabasePointer
             | TursoError::InvalidConnectionPointer
+            | TursoError::InvalidStatementPointer
             | TursoError::JNIErrors(_) => {
                 eprintln!("Error occurred: {value:?}");
                 JniError::Other(-1)

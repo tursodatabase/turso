@@ -10,7 +10,7 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, IterationDirection, JoinedTable, Operation, Plan, Scan,
+            GroupBy, IterationDirection, JoinInfo, JoinedTable, Operation, Plan, Scan,
             SimpleAggregate, TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
@@ -19,11 +19,7 @@ use crate::{
 };
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::{
-    access_method::AccessMethod,
-    cost::{is_unique_point_lookup, IndexInfo},
-    join::JoinN,
-};
+use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
@@ -246,11 +242,40 @@ pub fn plan_satisfies_order_target(
     order_target: &OrderTarget,
     schema: &Schema,
 ) -> bool {
-    // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
+    // SQLite always sorts after a RIGHT JOIN or FULL JOIN. The unmatched
+    // right rows run after the normal loops, so no scan order is sufficient.
+    if joined_tables.iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
+    }) {
+        return false;
+    }
+    let mut hash_join_build_tables = TableMask::default();
     for (_, access_method_index) in plan.data.iter() {
         let access_method = &access_methods_arena[*access_method_index];
-        if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
-            if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
+        if let AccessMethodParams::HashJoin {
+            build_table_idx,
+            join_type,
+            materialize_build_input,
+            ..
+        } = &access_method.params
+        {
+            hash_join_build_tables
+                .set(*build_table_idx)
+                .expect("a plan cannot contain more than the table limit");
+            // We bail out early because as soon as there's a hash join that materializes its
+            // build side, we can't rely on any of the relations to the left of its probe table
+            // in the join order. This is because translation retransforms the join order later on
+            // (see `prune_join_order_for_materialized_inputs`)
+            // Eventually, we could narrow down this check to consider the ordering of the relations
+            // at, or to the right of, the rightmost probe table, but for now this'll do.
+            if *materialize_build_input {
+                return false;
+            }
+            // Outer hash joins emit unmatched rows in hash-bucket order, not scan order.
+            if join_type.keeps_unmatched_build_rows() {
                 return false;
             }
         }
@@ -262,6 +287,12 @@ pub fn plan_satisfies_order_target(
     for (loop_pos, (table_index, access_method_index)) in plan.data.iter().enumerate() {
         let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
+
+        // A hash build is consumed into an unordered hash table and omitted
+        // from the execution loop order. Its scan order cannot order output.
+        if hash_join_build_tables.get(*table_index) {
+            return false;
+        }
 
         // Outer joins can emit an extra row with NULLs on the right-hand side
         // when no match is found. Because that row is produced after the scan or
@@ -392,12 +423,8 @@ fn access_method_emits_unique_order_prefix(
     if order_consumption.includes_rowid {
         return true;
     }
-    // Otherwise the only safe claim is a point lookup: a UNIQUE index with
-    // every column pinned by plain `=` returns at most one row. Anything
-    // weaker can emit duplicate prefixes: an `IS` equality matches NULL keys
-    // (a UNIQUE index stores any number of NULL keys), and counting
-    // equality-pinned columns together with consumed ORDER BY terms counts
-    // the same column twice when the ORDER BY mentions the equality column.
+    // A complete lookup on a UNIQUE index also returns at most one row.
+    // Each key column must use `=`. `IS` can match many NULL entries.
     match &access_method.params {
         AccessMethodParams::BTreeTable {
             index,
@@ -405,14 +432,13 @@ fn access_method_emits_unique_order_prefix(
             constraint_refs,
             ..
         } => {
-            !*build_index
-                && is_unique_point_lookup(index_info_for_access(index.as_deref()), constraint_refs)
+            !*build_index && index_access_is_unique_point_lookup(index.as_deref(), constraint_refs)
         }
         AccessMethodParams::MaterializedSubquery {
             index,
             constraint_refs,
             ..
-        } => is_unique_point_lookup(index_info_for_access(Some(index.as_ref())), constraint_refs),
+        } => index_access_is_unique_point_lookup(Some(index.as_ref()), constraint_refs),
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
@@ -420,23 +446,6 @@ fn access_method_emits_unique_order_prefix(
         | AccessMethodParams::IndexMethod { .. }
         | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,
-    }
-}
-
-fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
-    match index {
-        Some(index) => IndexInfo {
-            unique: index.unique,
-            column_count: index.columns.len(),
-            covering: false,
-            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
-        },
-        None => IndexInfo {
-            unique: true,
-            column_count: 1,
-            covering: false,
-            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
-        },
     }
 }
 

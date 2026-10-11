@@ -149,7 +149,7 @@ enum InsertState {
 #[derive(Debug, Clone, Copy)]
 enum InitChunkHeapState {
     Start,
-    PushChunk,
+    PushChunk { chunk_idx: usize },
 }
 
 pub struct Sorter {
@@ -421,6 +421,14 @@ impl Sorter {
     fn init_chunk_heap(&mut self) -> IOResultOr<()> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
+                turso_assert!(self.records.is_empty());
+                self.records = vec![];
+                self.arena = Bump::new();
+                let read_buffer_size = self.max_buffer_size / self.chunks.len();
+                self.chunk_heap.try_reserve(self.chunks.len())?;
+                for chunk in self.chunks.iter_mut() {
+                    chunk.grow_buffer(read_buffer_size)?;
+                }
                 let mut group = CompletionGroup::new(|_| {});
                 for chunk in self.chunks.iter_mut() {
                     if let Err(e) = chunk.read(Some(&mut group)) {
@@ -430,11 +438,11 @@ impl Sorter {
                         return Err(e.into());
                     }
                 }
-                self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
+                self.init_chunk_heap_state = InitChunkHeapState::PushChunk { chunk_idx: 0 };
                 let completion = group.build();
                 io_yield_one!(completion);
             }
-            InitChunkHeapState::PushChunk => {
+            InitChunkHeapState::PushChunk { mut chunk_idx } => {
                 // Make sure all chunks read at least one record into their buffer.
                 turso_assert!(
                     !self.chunks.iter().any(|chunk| matches!(
@@ -443,19 +451,15 @@ impl Sorter {
                     )),
                     "chunks should have been read"
                 );
-                self.chunk_heap.try_reserve(self.chunks.len())?;
-                // TODO: blocking will be unnecessary here with IO completions
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk_idx in 0..self.chunks.len() {
-                    self.push_to_chunk_heap(chunk_idx, Some(&mut group))?;
+                while chunk_idx < self.chunks.len() {
+                    if let Some(completion) = self.push_to_chunk_heap(chunk_idx)? {
+                        io_yield_one!(completion);
+                    }
+                    chunk_idx += 1;
+                    self.init_chunk_heap_state = InitChunkHeapState::PushChunk { chunk_idx };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
-                let completion = group.build();
-                if completion.finished() {
-                    Ok(IOResult::Done(()))
-                } else {
-                    io_yield_one!(completion);
-                }
+                Ok(IOResult::Done(()))
             }
         }
     }
@@ -476,14 +480,14 @@ impl Sorter {
                 return Ok(IOResult::IO(IOCompletions(completion)));
             }
             // IO completed - push result to heap and retry
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
         }
 
         // No pending IO - safe to pop from heap
         if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
-            if let Some(c) = self.push_to_chunk_heap(chunk_idx, None)? {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
             return Ok(IOResult::Done(Some(next_record.0)));
@@ -494,16 +498,11 @@ impl Sorter {
     }
 
     /// Pushes the next record of chunk `chunk_idx` onto the heap. If the
-    /// chunk needs a read first, the read is added to `group` when given,
-    /// and its completion is returned.
-    fn push_to_chunk_heap(
-        &mut self,
-        chunk_idx: usize,
-        group: Option<&mut CompletionGroup>,
-    ) -> Result<Option<Completion>> {
+    /// chunk needs a read first, the read's completion is returned.
+    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
         let chunk = &mut self.chunks[chunk_idx];
 
-        match chunk.next(group)? {
+        match chunk.next()? {
             ChunkNextResult::Done(Some(record)) => {
                 self.chunk_heap.try_push((
                     Reverse(Box::new(BoxedSortableRecord::new(
@@ -588,9 +587,10 @@ enum NextState {
 ///
 /// # Buffer management
 ///
-/// The chunk uses a fixed-size read buffer (`buffer`) to read data from disk. The buffer
+/// The chunk uses a read buffer (`buffer`) to read data from disk. The buffer
 /// has two relevant sizes:
-/// - `buffer.len()` (capacity): The total allocated size of the buffer (fixed at creation)
+/// - `buffer.len()` (capacity): The total allocated size of the buffer. It is set at
+///   creation and can only grow with [SortedChunk::grow_buffer] before the first read.
 /// - `buffer_len`: The amount of valid data currently in the buffer (0 to capacity)
 ///
 /// The difference `buffer.len() - buffer_len` is the free space available for reading
@@ -621,8 +621,8 @@ struct SortedChunk {
     start_offset: u64,
     /// Total size of this chunk in bytes (set during write, used to detect EOF during read).
     chunk_size: usize,
-    /// Fixed-size buffer for reading data from disk. The capacity (`buffer.len()`) is
-    /// constant; use `buffer_len` for the amount of valid data.
+    /// Buffer for reading data from disk. The capacity (`buffer.len()`) does not change
+    /// once reading starts; use `buffer_len` for the amount of valid data.
     buffer: Arc<RwLock<Vec<u8>>>,
     /// Amount of valid (unparsed) data in `buffer`, from index 0 to buffer_len.
     /// This is separate from buffer.len() because we reuse the same allocation.
@@ -662,6 +662,20 @@ impl SortedChunk {
         self.buffer_len.load(atomic::Ordering::SeqCst)
     }
 
+    /// Grows the read buffer to `size` bytes, but never past the size of the
+    /// chunk. Must be called before the first read.
+    fn grow_buffer(&mut self, size: usize) -> Result<()> {
+        turso_assert_eq!(self.total_bytes_read.load(atomic::Ordering::SeqCst), 0);
+        let size = size.min(self.chunk_size);
+        let mut buffer = self.buffer.write();
+        if size > buffer.len() {
+            let additional = size - buffer.len();
+            buffer.try_reserve_exact(additional)?;
+            buffer.resize(size, 0);
+        }
+        Ok(())
+    }
+
     fn set_buffer_len(&self, len: usize) {
         self.buffer_len.store(len, atomic::Ordering::SeqCst);
     }
@@ -674,7 +688,7 @@ impl SortedChunk {
     /// Internally manages a two-phase state machine:
     /// - `Start`: Parse records from buffer, issue prefetch read if needed
     /// - `Finish`: Return the next parsed record
-    fn next(&mut self, mut group: Option<&mut CompletionGroup>) -> Result<ChunkNextResult> {
+    fn next(&mut self) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
                 NextState::Start => {
@@ -736,7 +750,7 @@ impl SortedChunk {
                     if self.records.len() == 1
                         && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
-                        if let Some(c) = self.read(group.as_deref_mut())? {
+                        if let Some(c) = self.read(None)? {
                             if !c.succeeded() {
                                 return Ok(ChunkNextResult::IO(c));
                             }
@@ -1325,6 +1339,172 @@ mod tests {
                     .expect("Failed to get the next record");
             }
             assert!(!sorter.has_more());
+        }
+    }
+
+    #[test]
+    fn spilled_sort_splits_memory_budget_between_chunk_read_buffers() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let max_buffer_size = 2000 * 1024;
+        let min_read_buffer_size = 4096;
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            try_vec![CollationSeq::Binary].unwrap(),
+            try_vec![None].unwrap(),
+            try_vec![None].unwrap(),
+            max_buffer_size,
+            min_read_buffer_size,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 4000;
+        for i in (0..n).rev() {
+            let values =
+                try_vec![Value::from_i64(i), Value::Blob(try_vec![0; 1000].unwrap())].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        assert!(sorter.arena.allocated_bytes() > 0);
+        assert!(sorter.records.capacity() > 0);
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert_eq!(
+            sorter.arena.allocated_bytes(),
+            0,
+            "input arena must be released before merging"
+        );
+        assert_eq!(
+            sorter.records.capacity(),
+            0,
+            "input record capacity must be released before merging"
+        );
+        assert!(sorter.chunks.len() > 1);
+        let read_buffer_size = max_buffer_size / sorter.chunks.len();
+        assert!(read_buffer_size > min_read_buffer_size);
+        for chunk in sorter.chunks.iter() {
+            assert!(chunk.buffer.read().len() >= read_buffer_size.min(chunk.chunk_size));
+        }
+
+        for i in 0..n {
+            assert!(sorter.has_more());
+            let record = sorter.record().unwrap();
+            assert_eq!(record.get_values().unwrap()[0], ValueRef::from_i64(i));
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert!(!sorter.has_more());
+    }
+
+    #[cfg(all(
+        feature = "io_memory_yield",
+        feature = "fs",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn spilled_sort_resumes_heap_initialization_after_prefetch() {
+        for num_records in [3, 6, 7] {
+            let io = Arc::new(crate::io::MemoryYieldIO::new());
+            let mut sorter = Sorter::new(
+                &[SortOrder::Asc],
+                try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![None].unwrap(),
+                try_vec![None].unwrap(),
+                2000 * 1024,
+                4096,
+                io.clone(),
+                crate::TempStore::File,
+            )
+            .unwrap();
+            let payload = try_vec![0; 800_000].unwrap();
+            let mut initial_records = Vec::new();
+            for i in (0..num_records).rev() {
+                let values =
+                    try_vec![Value::from_i64(i), Value::from_slice(&payload).unwrap()].unwrap();
+                let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+                io.block(|| sorter.insert(&record)).unwrap();
+                initial_records.push(record);
+            }
+
+            let mut prefetch_yields = 0;
+            loop {
+                match sorter.sort().unwrap() {
+                    IOResult::Done(()) => break,
+                    IOResult::IO(completion) => {
+                        if sorter.chunks.iter().any(|chunk| {
+                            matches!(chunk.next_state, NextState::Finish)
+                                && *chunk.io_state.read() == SortedChunkIOState::WaitingForRead
+                        }) {
+                            prefetch_yields += 1;
+                        }
+                        completion.wait(io.as_ref()).unwrap();
+                    }
+                }
+            }
+            assert!(prefetch_yields > 0);
+            assert!(sorter.chunks.len() > 1);
+
+            for expected in initial_records.iter().rev() {
+                assert_eq!(sorter.record(), Some(expected));
+                io.block(|| sorter.next()).unwrap();
+            }
+            assert!(!sorter.has_more());
+        }
+    }
+
+    #[cfg(all(
+        feature = "io_memory_yield",
+        feature = "fs",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn spilled_sort_buffer_growth_failure_does_not_leave_pending_reads() {
+        let io = Arc::new(crate::io::MemoryYieldIO::new());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            try_vec![CollationSeq::Binary].unwrap(),
+            try_vec![None].unwrap(),
+            try_vec![None].unwrap(),
+            2048,
+            64,
+            io.clone(),
+            crate::TempStore::File,
+        )
+        .unwrap();
+        let values = try_vec![Value::Blob(try_vec![0; 1000].unwrap())].unwrap();
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        for _ in 0..3 {
+            io.block(|| sorter.insert(&record)).unwrap();
+        }
+        let completion = sorter.flush().unwrap().unwrap();
+        io.drain_completions(&[completion]).unwrap();
+        assert_eq!(sorter.chunks.len(), 2);
+        assert!(sorter.chunks[0].buffer.read().len() < sorter.chunks[0].chunk_size);
+
+        sorter.max_buffer_size = usize::MAX;
+        sorter.chunks[1].chunk_size = usize::MAX;
+        let buffers: Vec<_> = sorter
+            .chunks
+            .iter()
+            .map(|chunk| Arc::downgrade(&chunk.buffer))
+            .try_collect()
+            .unwrap();
+        let error = sorter.init_chunk_heap().unwrap_err();
+        assert!(matches!(*error, LimboError::OutOfMemory));
+        assert_eq!(
+            sorter.chunks[0].buffer.read().len(),
+            sorter.chunks[0].chunk_size
+        );
+        drop(sorter);
+        for buffer in buffers {
+            assert!(
+                buffer.upgrade().is_none(),
+                "pending read retained its buffer"
+            );
         }
     }
 

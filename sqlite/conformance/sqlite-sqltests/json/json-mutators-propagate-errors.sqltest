@@ -1,0 +1,119 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/9502
+# json_remove(), json_insert(), json_replace() and the jsonb_* variants must
+# return an error for a bad path or malformed JSON, matching SQLite.
+
+@database :memory:
+
+test json-remove-bad-path-errors {
+    SELECT json_remove('{"a":1}', 'a');
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test jsonb-remove-bad-path-errors {
+    SELECT jsonb_remove('{"a":1}', 'a');
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test json-insert-bad-path-errors {
+    SELECT json_insert('{"a":1}', 'a', 2);
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test jsonb-insert-bad-path-errors {
+    SELECT jsonb_insert('{"a":1}', 'a', 2);
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test json-replace-bad-path-errors {
+    SELECT json_replace('{"a":1}', 'a', 2);
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test jsonb-replace-bad-path-errors {
+    SELECT jsonb_replace('{"a":1}', 'a', 2);
+}
+expect error {
+    bad JSON path: 'a'
+}
+
+test json-remove-malformed-json-errors {
+    SELECT json_remove('not json', '$.x');
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb-remove-malformed-json-errors {
+    SELECT jsonb_remove('not json', '$.x');
+}
+expect error {
+    malformed JSON
+}
+
+test json-insert-malformed-json-errors {
+    SELECT json_insert('not json', '$.x', 1);
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb-insert-malformed-json-errors {
+    SELECT jsonb_insert('not json', '$.x', 1);
+}
+expect error {
+    malformed JSON
+}
+
+test json-replace-malformed-json-errors {
+    SELECT json_replace('not json', '$.x', 1);
+}
+expect error {
+    malformed JSON
+}
+
+test jsonb-replace-malformed-json-errors {
+    SELECT jsonb_replace('not json', '$.x', 1);
+}
+expect error {
+    malformed JSON
+}
+
+test update-with-bad-path-keeps-original-data {
+    CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO docs VALUES (1, '{"tmp":1,"keep":2}');
+    UPDATE docs SET body = json_remove(body, 'tmp');
+}
+expect error {
+    bad JSON path: 'tmp'
+}
+
+test json-remove-valid-path-still-works {
+    SELECT json_remove('{"a":1,"b":2}', '$.a');
+}
+expect {
+    {"b":2}
+}
+
+test json-insert-valid-path-still-works {
+    SELECT json_insert('{"a":1}', '$.b', 2);
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json-replace-valid-path-still-works {
+    SELECT json_replace('{"a":1}', '$.a', 2);
+}
+expect {
+    {"a":2}
+}

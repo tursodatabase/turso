@@ -2,7 +2,6 @@ use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
 
-use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
@@ -74,7 +73,6 @@ pub fn open_database_with_io(
 
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
-        aliases::install(&conn);
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,

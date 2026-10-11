@@ -8,6 +8,7 @@ use turso_parser::{
 
 use super::{
     index::emit_refill_index,
+    planner::ROWID_STRS,
     schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
@@ -16,7 +17,8 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, Index, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -418,16 +420,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
-        ast::Literal::Blob(s) => Ok(Value::Blob(
-            ast::blob_literal_hex(s)
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
-                    u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
-                })
-                .try_collect()?,
-        )),
+        ast::Literal::Blob(s) => Ok(Value::Blob(ast::blob_literal_bytes(s).try_collect()?)),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
         ast::Literal::False => Ok(Value::from_i64(0)),
@@ -999,13 +992,14 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
+                            join_info: None,
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],
                             cte_id: None,
                             cte_definition_only: false,
                             rowid_referenced: false,
+                            outer_join_may_null_extend: false,
                             scope_depth: 0,
                         }],
                     );
@@ -1267,7 +1261,11 @@ pub fn translate_alter_table(
                 }
             }
             let constraints = col_def.constraints.clone();
-            let mut column = Column::try_from(&col_def)?;
+            let mut column = Column::from_definition(
+                &col_def,
+                FromDefinitionFlags::empty()
+                    .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+            )?;
 
             if btree.columns().len() >= crate::types::MAX_COLUMN {
                 return Err(LimboError::ParseError(format!(
@@ -1328,7 +1326,7 @@ pub fn translate_alter_table(
                     }
                 }
 
-                default_type_mismatch = strict_default_type_mismatch(&column)?;
+                default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1873,7 +1871,11 @@ pub fn translate_alter_table(
                 match rename {
                     true => (false, false, None),
                     false => {
-                        let replacement_column = Column::try_from(&definition)?;
+                        let replacement_column = Column::from_definition(
+                            &definition,
+                            FromDefinitionFlags::empty()
+                                .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+                        )?;
                         let old_column = &btree.columns()[column_index];
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
@@ -1891,8 +1893,8 @@ pub fn translate_alter_table(
                         // serial type and SQLite's `PRAGMA integrity_check` reports the
                         // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
                         // changing NUMERIC -> TEXT). See issue #3706.
-                        let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                            != replacement_column.affinity_with_strict(btree.is_strict);
+                        let affinity_changed =
+                            old_column.affinity() != replacement_column.affinity();
                         let rewrites_physical_layout =
                             becomes_generated || virtuality_changed || affinity_changed;
                         (
@@ -2628,7 +2630,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect()
 }
 
@@ -4257,23 +4259,11 @@ fn validate_trigger_columns_after_drop(
     let owning_table_columns: Option<Vec<String>> = if trigger_database_id == altered_database_id
         && trigger_table_norm == *altered_table_norm
     {
-        Some(
-            post_drop_table
-                .columns()
-                .iter()
-                .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                .collect(),
-        )
+        Some(referenceable_column_names(post_drop_table))
     } else {
         resolver.with_schema(trigger_database_id, |s| {
-            s.get_table(&trigger_table_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
-                })
-            })
+            s.get_table(&trigger_table_norm)
+                .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
     };
 
@@ -5978,25 +5968,31 @@ fn get_table_columns(
     };
 
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
-        Some(
-            post_drop_table
-                .columns()
-                .iter()
-                .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                .collect(),
-        )
+        Some(referenceable_column_names(post_drop_table))
     } else {
         resolver.with_schema(lookup_database_id, |s| {
-            s.get_table(table_name_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
-                })
-            })
+            s.get_table(table_name_norm)
+                .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
     }
+}
+
+/// Names that an expression can use to refer to a column of `table`, including
+/// the implicit rowid names when the table has a rowid.
+fn referenceable_column_names(table: &BTreeTable) -> Vec<String> {
+    let mut names: Vec<String> = table
+        .columns()
+        .iter()
+        .filter_map(|c| c.name.as_deref().map(normalize_ident))
+        .collect();
+    if table.has_rowid {
+        for rowid_name in ROWID_STRS {
+            if !names.iter().any(|name| name == rowid_name) {
+                names.push(rowid_name.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn resolve_trigger_command_table_for_alter(

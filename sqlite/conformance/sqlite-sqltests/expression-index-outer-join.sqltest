@@ -1,0 +1,158 @@
+@database :memory:
+
+# An expression index stores the value for a real row. When an outer join gives
+# the indexed table a NULL row, the expression is computed from NULL columns
+# instead, and some expressions (coalesce, IS NULL, CASE) are not NULL there.
+# Every matrix case is compared against SQLite.
+
+setup ei {
+    CREATE TABLE l(x INT, k INT);
+    CREATE TABLE r(a INT, b INT, c TEXT);
+    CREATE TABLE s(a INT, d INT);
+    CREATE INDEX r_all ON r(a, coalesce(b,7), b IS NULL, ifnull(c,'none'),
+        CASE WHEN b IS NULL THEN 'nb' ELSE 'b' END, b + 1, length(c));
+    CREATE INDEX r_expr_first ON r(coalesce(b,7), a);
+    CREATE INDEX s_expr ON s(a, coalesce(d,-1));
+    INSERT INTO l VALUES (1, 1), (2, 1), (3, 2), (4, 2), (NULL, 3);
+    INSERT INTO r VALUES (1, 10, 'x'), (1, NULL, NULL), (2, NULL, 'yy'), (5, 50, 'z'), (NULL, 7, 'n');
+    INSERT INTO s VALUES (1, NULL), (2, 20), (4, NULL);
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r NOT INDEXED ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x AND r.b > 5 |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_expr_first ON coalesce(r.b,7) = l.x + 6 |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x LEFT JOIN s ON s.a = l.k
+}
+@var e { coalesce(r.b,7) | r.b IS NULL | ifnull(r.c,'none') | CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END | r.b + 1 | length(r.c) }
+matrix null-row-expression-in-result {
+    SELECT l.rowid, r.rowid, $e FROM $from ORDER BY 1, 2, 3;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
+}
+@var pred {
+    coalesce(r.b,7) = 7 | coalesce(r.b,7) > 7 | r.b IS NULL | NOT (r.b IS NULL) |
+    ifnull(r.c,'none') = 'none' | CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END = 'nb' |
+    r.b + 1 IS NULL | length(r.c) IS NULL | coalesce(r.b,7) IN (7, 11) |
+    coalesce(r.b,7) = 7 OR l.x = 4
+}
+matrix null-row-expression-in-where {
+    SELECT l.rowid, r.rowid FROM $from WHERE $pred ORDER BY 1, 2;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
+}
+@var e { coalesce(r.b,7) | r.b IS NULL | ifnull(r.c,'none') | CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END | r.b + 1 | length(r.c) }
+matrix null-row-expression-as-group-key {
+    SELECT $e, count(*), sum(l.x) FROM $from GROUP BY $e ORDER BY 1;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r NOT INDEXED ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.k |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_expr_first ON coalesce(r.b,7) = l.x + 6 |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x |
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x LEFT JOIN s ON s.a = l.k
+}
+@var agg {
+    sum(coalesce(r.b,7)) | count(CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END) |
+    max(ifnull(r.c,'none')) | total(r.b + 1) | sum(r.b IS NULL) |
+    sum(CASE WHEN coalesce(r.b,7) = 7 THEN 1 END) |
+    min(coalesce(r.b,7)) FILTER (WHERE r.b IS NULL) |
+    count(DISTINCT coalesce(r.b,7)) | avg(length(r.c)) |
+    sum(coalesce(r.b,7)) + max(r.b IS NULL)
+}
+matrix null-row-expression-in-grouped-aggregate {
+    SELECT l.k, $agg FROM $from GROUP BY l.k ORDER BY 1;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
+}
+@var agg {
+    sum(coalesce(r.b,7)) | sum(r.b IS NULL) | max(ifnull(r.c,'none')) |
+    count(DISTINCT CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END) |
+    total(r.b + 1) FILTER (WHERE coalesce(r.b,7) = 7)
+}
+@var having { 1 | sum(coalesce(r.b,7)) > 7 | max(r.b IS NULL) = 1 }
+matrix null-row-expression-in-aggregate-with-having {
+    SELECT $agg FROM $from HAVING $having;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x |
+    l LEFT JOIN (r JOIN s USING(a)) ON r.a = l.x
+}
+@var shape {
+    SELECT DISTINCT coalesce(r.b,7) FROM |
+    SELECT DISTINCT r.b IS NULL, ifnull(r.c,'none') FROM |
+    SELECT l.rowid, r.rowid, sum(coalesce(r.b,7)) OVER (ORDER BY l.rowid, r.rowid) FROM |
+    SELECT l.rowid, r.rowid, count(*) OVER (PARTITION BY r.b IS NULL ORDER BY l.rowid, r.rowid) FROM |
+    SELECT l.rowid, r.rowid, ifnull(r.c,'none') FROM
+}
+matrix null-row-expression-in-distinct-and-window {
+    $shape $from ORDER BY 1, 2;
+}
+
+@setup ei
+@var from {
+    l LEFT JOIN r INDEXED BY r_all ON r.a = l.x |
+    l LEFT JOIN r ON r.a = l.x |
+    r INDEXED BY r_all RIGHT JOIN l ON r.a = l.x
+}
+@var order {
+    coalesce(r.b,7), l.rowid, r.rowid |
+    r.b IS NULL DESC, l.rowid, r.rowid |
+    ifnull(r.c,'none'), l.rowid, r.rowid |
+    CASE WHEN r.b IS NULL THEN 'nb' ELSE 'b' END, l.rowid, r.rowid |
+    coalesce(r.b,7) DESC, length(r.c), l.rowid, r.rowid
+}
+matrix null-row-expression-in-order-by {
+    SELECT l.rowid, r.rowid FROM $from ORDER BY $order;
+}
+
+@setup ei
+@var query {
+    SELECT l.x, (SELECT sum(coalesce(r.b,7)) FROM s LEFT JOIN r INDEXED BY r_all ON r.a = s.d WHERE s.a = l.x) FROM l |
+    SELECT l.x, (SELECT max(r.b IS NULL) FROM s LEFT JOIN r ON r.a = s.a WHERE s.a <= l.x) FROM l |
+    SELECT l.x FROM l WHERE EXISTS (SELECT 1 FROM s LEFT JOIN r INDEXED BY r_all ON r.a = s.d WHERE s.a = l.x AND coalesce(r.b,7) = 7) |
+    SELECT l.x FROM l WHERE l.k IN (SELECT r.b IS NULL FROM s LEFT JOIN r ON r.a = s.a) |
+    SELECT q.v, count(*) FROM (SELECT coalesce(r.b,7) AS v FROM l LEFT JOIN r INDEXED BY r_all ON r.a = l.x) AS q GROUP BY q.v |
+    WITH q AS (SELECT l.k, ifnull(r.c,'none') AS v FROM l LEFT JOIN r ON r.a = l.x) SELECT k, max(v) FROM q GROUP BY k |
+    WITH q AS MATERIALIZED (SELECT l.rowid AS lr, r.b IS NULL AS v FROM l LEFT JOIN r INDEXED BY r_all ON r.a = l.x) SELECT v, count(*) FROM q GROUP BY v |
+    SELECT l.x, coalesce(r.b,7) FROM l LEFT JOIN r INDEXED BY r_all ON r.a = l.x UNION SELECT s.a, coalesce(s.d,-1) FROM s |
+    SELECT l.x, coalesce(s.d,-1), coalesce(r.b,7) FROM l LEFT JOIN s ON s.a = l.x LEFT JOIN r INDEXED BY r_all ON r.a = s.a
+}
+matrix null-row-expression-in-subqueries {
+    $query ORDER BY 1, 2;
+}

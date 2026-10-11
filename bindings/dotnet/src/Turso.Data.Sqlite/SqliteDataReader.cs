@@ -31,6 +31,11 @@ public class SqliteDataReader : DbDataReader
     private int _managedResultIndex;
     private int _managedRowIndex = -1;
 
+    // Declared types resolved for the current result set, so GetValue does not cross into
+    // native code for them on every cell.
+    private TursoStatementHandle? _declaredTypeStatement;
+    private string?[] _declaredTypeNames = [];
+
     internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
         _command = command;
@@ -1090,35 +1095,28 @@ public class SqliteDataReader : DbDataReader
             return CurrentManagedResult.Columns[ordinal].DataTypeName;
         }
 
-        if (TryGetSelectSource(out var tableName, out var selections))
-        {
-            var tableColumns = GetTableColumns(tableName);
-            var columnName = GetName(ordinal);
-            var selection = ordinal < selections.Count ? selections[ordinal] : columnName;
-            var baseColumnName = ResolveBaseColumnName(selection, columnName, tableColumns);
-            if (baseColumnName is not null && tableColumns.TryGetValue(baseColumnName, out var columnInfo))
-                return StripTypeLength(columnInfo.TypeName);
-        }
+        EnsureDeclaredTypeCache();
+        if ((uint)ordinal >= (uint)_declaredTypeNames.Length)
+            throw new ArgumentOutOfRangeException(nameof(ordinal), ordinal, null);
 
-        var match = Regex.Match(_command.CommandText, @"^\s*SELECT\s+(?<column>[\w\[\]""`]+)\s+FROM\s+(?<table>[\w\[\]""`]+)", RegexOptions.IgnoreCase);
-        if (!match.Success || _command.Connection is null)
-            return string.Empty;
+        return _declaredTypeNames[ordinal] ??= ResolveDeclaredTypeName(ordinal);
+    }
 
-        var column = UnquoteIdentifier(match.Groups["column"].Value);
-        if (!string.Equals(column, GetName(ordinal), StringComparison.OrdinalIgnoreCase))
-            return string.Empty;
+    private void EnsureDeclaredTypeCache()
+    {
+        if (_declaredTypeStatement is not null && ReferenceEquals(_declaredTypeStatement, _statement))
+            return;
 
-        var table = UnquoteIdentifier(match.Groups["table"].Value);
-        using var command = _command.Connection.CreateCommand();
-        command.CommandText = $"PRAGMA table_info({QuoteIdentifier(table)});";
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
-                return StripTypeLength(reader.GetString(2));
-        }
+        _declaredTypeStatement = _statement;
+        _declaredTypeNames = _statement is null ? [] : new string?[TursoBindings.GetFieldCount(_statement)];
+    }
 
-        return string.Empty;
+    private string ResolveDeclaredTypeName(int ordinal)
+    {
+        // Like sqlite3_column_decltype: the declared type of a direct table-column reference,
+        // nothing for an expression.
+        var declaredType = TursoBindings.GetDeclaredTypeName(GetStatement(), ordinal);
+        return string.IsNullOrEmpty(declaredType) ? string.Empty : StripTypeLength(declaredType);
     }
 
     private static string InferDataTypeName(string expression)

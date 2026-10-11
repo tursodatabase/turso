@@ -1,0 +1,52 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8862
+# PRAGMA query_only=1 must refuse every statement that writes to the
+# database, including schema cookie updates and DROP TRIGGER.
+
+setup table_with_trigger {
+    CREATE TABLE items(id INTEGER PRIMARY KEY);
+    CREATE TABLE audit(id INTEGER);
+    CREATE TRIGGER changed AFTER INSERT ON items BEGIN INSERT INTO audit VALUES (new.id); END;
+}
+
+@setup table_with_trigger
+test query-only-rejects-insert {
+    PRAGMA query_only = 1;
+    INSERT INTO items VALUES (1);
+}
+expect error {
+}
+
+@setup table_with_trigger
+test query-only-rejects-user-version-write {
+    PRAGMA query_only = 1;
+    PRAGMA user_version = 123;
+}
+expect error {
+}
+
+@setup table_with_trigger
+test query-only-rejects-application-id-write {
+    PRAGMA query_only = 1;
+    PRAGMA application_id = 123;
+}
+expect error {
+}
+
+@setup table_with_trigger
+test query-only-rejects-drop-trigger {
+    PRAGMA query_only = 1;
+    DROP TRIGGER changed;
+}
+expect error {
+}
+
+@setup table_with_trigger
+test query-only-still-allows-reading-user-version {
+    PRAGMA query_only = 1;
+    PRAGMA user_version;
+}
+expect {
+    0
+}

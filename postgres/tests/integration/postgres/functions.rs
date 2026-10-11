@@ -139,6 +139,136 @@ fn test_pg_backend_pid_is_positive_integer(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for (sql, expected) in [
+        ("SELECT quote_ident('Foo')", Value::build_text("\"Foo\"")),
+        ("SELECT booleq(1, 0)", Value::from_i64(0)),
+        ("SELECT boolne(1, 0)", Value::from_i64(1)),
+        (
+            "SELECT format_type(1043)",
+            Value::build_text("character varying"),
+        ),
+        (
+            "SELECT format_type(1043, 17)",
+            Value::build_text("character varying(13)"),
+        ),
+        ("SELECT pg_get_expr('x + 7', 1)", Value::build_text("x + 7")),
+        (
+            "SELECT pg_get_expr('x + 7', 1, 1)",
+            Value::build_text("x + 7"),
+        ),
+        ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
+        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT version(1)",
+        "SELECT quote_ident()",
+        "SELECT format_type()",
+        "SELECT format_type(23, -1, 0)",
+        "SELECT pg_get_expr('x')",
+        "SELECT pg_get_expr('x', 1, 1, 1)",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    let rows = conn
+        .prepare_internal(
+            "SELECT name, narg, flags FROM pragma_function_list WHERE name IN \
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY name, narg",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("format_type", 1, 2048),
+            ("format_type", 2, 2048),
+            ("now", -1, 0),
+            ("pg_get_constraintdef", 1, 0),
+            ("pg_get_constraintdef", 2, 0),
+            ("quote_ident", 1, 2048),
+        ]
+        .into_iter()
+        .map(|(name, count, flags)| vec![
+            Value::build_text(name),
+            Value::from_i64(count),
+            Value::from_i64(flags)
+        ])
+        .collect::<Vec<_>>()
+    );
+    let rows = conn
+        .prepare(
+            "SELECT proname, pronargs, provolatile FROM pg_proc WHERE proname IN \
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY proname, pronargs",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("format_type", 1, "i"),
+            ("format_type", 2, "i"),
+            ("now", -1, "v"),
+            ("pg_get_constraintdef", 1, "v"),
+            ("pg_get_constraintdef", 2, "v"),
+            ("quote_ident", 1, "i"),
+        ]
+        .into_iter()
+        .map(|(name, count, volatility)| vec![
+            Value::build_text(name),
+            Value::from_i64(count),
+            Value::build_text(volatility)
+        ])
+        .collect::<Vec<_>>()
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for name in [
+        "now",
+        "clock_timestamp",
+        "transaction_timestamp",
+        "statement_timestamp",
+    ] {
+        assert!(conn.get_syms_functions().iter().any(
+            |(registered, is_agg, argc, deterministic)| registered == name
+                && !is_agg
+                && *argc == -1
+                && !deterministic
+        ));
+        let rows = conn
+            .prepare(format!("SELECT {name}()"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let Value::Text(timestamp) = &rows[0][0] else {
+            panic!("expected timestamp text for {name}")
+        };
+        assert_eq!(timestamp.as_str().len(), 23);
+        for (index, separator) in [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b' '),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+        ] {
+            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
+        }
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_quote_functions(db: TempDatabase) {
     let conn = db.connect_postgres();
 

@@ -1026,6 +1026,7 @@ mod tests {
                     constraints: vec![
                         ColumnConstraint::Unique(None),
                         ColumnConstraint::Generated {
+                            generated_always: false,
                             expr: Box::new(generated_expr),
                             typ: Some(ast::GeneratedColumnType::Virtual),
                         },
@@ -1368,6 +1369,12 @@ impl SimulatorEnv {
 
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
+    }
+
+    pub(crate) fn can_simulate_power_loss(&self) -> bool {
+        !self.profile.mvcc
+            && self.io_backend == IoBackend::Memory
+            && matches!(self.type_, SimulationType::Default)
     }
 
     /// Rng only used for generating interactions. By having a separate Rng we can guarantee that a particular seed

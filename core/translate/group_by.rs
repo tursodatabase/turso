@@ -10,6 +10,7 @@ use super::{
 use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
+    expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -357,9 +358,18 @@ pub fn compute_group_by_sort_order(
 /// scan loop, stored in the sorter, and read back during the sorter loop so that
 /// each sorted row sees the correct subquery result instead of a stale register
 /// value left over from the last scanned row.
+///
+/// An expression that the selected index stores is saved whole, as in SQLite,
+/// so the sorter row keeps the index value instead of recomputing it.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
     let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        if selected_expression_index(expr, &plan.table_references).is_some() {
+            if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                leaf_columns.push(expr.clone());
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
                 if plan
@@ -507,14 +517,16 @@ fn collect_result_columns<'a>(
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
                     return Ok(WalkControl::SkipChildren);
                 }
-                // Skip children of GROUP BY expressions — their leaf columns
-                // are already covered by the GROUP BY key and don't need
-                // separate materialization in the sorter.
+                // GROUP BY uses this expression to form groups, but ORDER BY or HAVING
+                // may need its value afterward. We add it to result_columns so that
+                // value is read back even when the expression isn't selected, and skip
+                // its children because we reuse the expression's computed value.
                 if plan
                     .group_by
                     .as_ref()
                     .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
                 {
+                    result_columns.push(expr);
                     return Ok(WalkControl::SkipChildren);
                 }
             }

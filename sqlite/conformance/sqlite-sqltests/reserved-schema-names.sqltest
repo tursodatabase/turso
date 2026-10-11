@@ -1,0 +1,56 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a);
+}
+
+@setup schema
+test reserved-trigger-name {
+    CREATE TRIGGER sqlite_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: sqlite_trg
+}
+
+@setup schema
+test reserved-trigger-name-quoted-case-insensitive {
+    CREATE TEMP TRIGGER "SQLITE_TRG" AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: SQLITE_TRG
+}
+
+@setup schema
+test reserved-trigger-name-if-not-exists {
+    CREATE TRIGGER IF NOT EXISTS sqlite_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: sqlite_trg
+}
+
+@setup schema
+@skip-if sqlite "__turso_internal_ is a Turso-specific reserved prefix"
+test reserved-trigger-name-turso-internal {
+    CREATE TRIGGER __turso_internal_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: __turso_internal_trg
+}
+
+@setup schema
+@skip-if sqlite "__turso_internal_ is a Turso-specific reserved prefix"
+test reserved-trigger-name-turso-internal-quoted-case-insensitive {
+    CREATE TEMP TRIGGER "__TURSO_INTERNAL_TRG" AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: __TURSO_INTERNAL_TRG
+}
+
+@setup schema
+@skip-if sqlite "__turso_internal_ is a Turso-specific reserved prefix"
+test reserved-trigger-name-turso-internal-if-not-exists {
+    CREATE TRIGGER IF NOT EXISTS __turso_internal_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: __turso_internal_trg
+}

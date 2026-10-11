@@ -1,7 +1,9 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, Numeric, StepResult, Value};
+use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -75,10 +77,9 @@ fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        plan.contains("SETUP") && plan.contains("RECURSIVE STEP"),
-        "expected recursive CTE structure in query plan, got:\n{plan}"
-    );
+    assert_that!(plan)
+        .contains("SETUP")
+        .contains("RECURSIVE STEP");
     Ok(())
 }
 
@@ -100,25 +101,13 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(stmt.parameters().count(), 4);
 
     stmt.run_with_row_callback(|row| {
-        if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {
-            assert_eq!(*i, 42)
-        }
-
-        if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-            assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Float(f)) = row.get::<&Value>(4).unwrap() {
-            assert_eq!(f64::from(*f), 0.5)
-        }
+        assert_that!(row.get_values().cloned().collect::<Vec<_>>()).is_equal_to(row![
+            "hello",
+            "hello",
+            42,
+            vec![0x1_u8, 0x2, 0x3],
+            0.5
+        ]);
         Ok(())
     })
     .unwrap();
@@ -158,11 +147,10 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
     assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
     assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
 
-    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
-    assert!(
-        err.to_string().contains("no such column: rowid"),
-        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
-    );
+    assert_that!(conn.prepare("SELECT rowid FROM config"))
+        .err()
+        .display_string()
+        .contains("no such column: rowid");
 
     Ok(())
 }
@@ -640,9 +628,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(99));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(99)]);
 
     // Test 2: CTE with UNION (not UNION ALL)
     let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
@@ -665,9 +653,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(2));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(2)]);
 
     Ok(())
 }
@@ -843,18 +831,10 @@ fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
     ];
 
     for sql in empty_inputs {
-        let Err(err) = conn.prepare(sql) else {
-            panic!("Expected invalid argument error for input: {sql}");
+        let Err(LimboError::InvalidArgument(msg)) = conn.prepare(sql) else {
+            panic!("Expected an invalid argument error for input: {sql}");
         };
-        match err {
-            LimboError::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("contains no statements"),
-                    "Unexpected error message for input {sql}: {msg}"
-                );
-            }
-            other => panic!("Unexpected error for input {sql}: {other}"),
-        }
+        assert_that!(msg).contains("contains no statements");
     }
 
     let invalid_syntax_inputs = ["/* outer /* inner */ still outer */"];
@@ -889,7 +869,7 @@ fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
         panic!("Expected an error but got no error");
     };
-    assert!(result.contains("Only up to 63 tables can be joined"));
+    assert_that!(result).contains("Only up to 63 tables can be joined");
 }
 
 #[turso_macros::test]
@@ -1042,8 +1022,9 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
         turso_rows.push(row.get::<&Value>(2).unwrap().clone());
         Ok(())
     })?;
-    assert_eq!(turso_rows.len(), 1);
-    assert_eq!(turso_rows[0], Value::from_i64(42));
+    assert_that!(turso_rows)
+        .single_element()
+        .is_equal_to(Cell::from(42));
     Ok(())
 }
 

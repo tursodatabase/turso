@@ -1,0 +1,62 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/8700
+#
+# ALTER TABLE ... RENAME TO "1a" must keep the quotes around the new name when
+# it rewrites the stored CREATE TABLE and CREATE INDEX text. A bare `1a` is not
+# a valid identifier, so writing it unquoted leaves schema rows that no longer
+# parse: the next ALTER in the same session fails with `bad number '1'`, and
+# the database file can no longer be opened by Turso or SQLite.
+
+setup renamed-to-digit-leading-name {
+    CREATE TABLE t(a);
+    CREATE TABLE u(a);
+    CREATE INDEX i ON t(a);
+    INSERT INTO t VALUES (7);
+    ALTER TABLE t RENAME TO "1a";
+}
+
+@setup renamed-to-digit-leading-name
+test rename-to-digit-leading-name-keeps-quotes-in-table-sql {
+    SELECT sql LIKE '%"1a"%' FROM sqlite_schema WHERE name = '1a';
+}
+expect {
+    1
+}
+
+@setup renamed-to-digit-leading-name
+test rename-to-digit-leading-name-keeps-quotes-in-index-sql {
+    SELECT sql LIKE '%"1a"%' FROM sqlite_schema WHERE name = 'i';
+}
+expect {
+    1
+}
+
+@setup renamed-to-digit-leading-name
+test next-alter-after-rename-to-digit-leading-name-still-works {
+    ALTER TABLE u RENAME TO "b c";
+    SELECT count(*) FROM sqlite_schema WHERE name = 'b c';
+}
+expect {
+    1
+}
+
+@setup renamed-to-digit-leading-name
+test renamed-digit-leading-table-can-be-renamed-again {
+    ALTER TABLE "1a" RENAME TO "select";
+    SELECT sql LIKE '%"select"%' FROM sqlite_schema WHERE name = 'select';
+    SELECT a FROM "select";
+}
+expect {
+    1
+    7
+}
+
+test rename-to-name-with-space-keeps-quotes {
+    CREATE TABLE w(a);
+    ALTER TABLE w RENAME TO "b c";
+    SELECT sql LIKE '%"b c"%' FROM sqlite_schema WHERE name = 'b c';
+}
+expect {
+    1
+}

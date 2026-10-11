@@ -18,6 +18,7 @@ pub struct DatabaseReplayGenerator {
     pub opts: DatabaseReplaySessionOpts,
 }
 
+/// SQL and ancillary info required to replay a change type (insert, update, delete) on a given table.
 #[derive(Debug)]
 pub struct ReplayInfo {
     pub change_type: DatabaseChangeType,
@@ -374,7 +375,7 @@ impl DatabaseReplayGenerator {
                     Ok(delete)
                 }
                 DatabaseTapeRowChangeType::Insert { after } => {
-                    assert!(after.len() == 5);
+                    assert_eq!(after.len(), 5);
                     let Some(turso_core::Value::Text(sql)) = after.last() else {
                         return Err(Error::DatabaseTapeError(format!(
                             "unexpected 'sql' column of sqlite_schema table: {:?}",
@@ -397,8 +398,7 @@ impl DatabaseReplayGenerator {
                             "'updates' column of CDC table must be populated".to_string(),
                         ));
                     };
-                    assert!(updates.len() % 2 == 0);
-                    assert!(updates.len() / 2 == 5);
+                    assert_eq!(updates.len(), 10);
                     let turso_core::Value::Text(ddl_stmt) = updates.last().unwrap() else {
                         panic!(
                             "unexpected 'sql' column of sqlite_schema table update record: {:?}",
@@ -455,7 +455,7 @@ impl DatabaseReplayGenerator {
         columns: &[bool],
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
-            self.table_columns_info(coro, table_name).await?;
+            self.writable_columns(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
@@ -518,7 +518,7 @@ impl DatabaseReplayGenerator {
         columns: usize,
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
-            self.table_columns_info(coro, table_name).await?;
+            self.writable_columns(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
@@ -609,7 +609,7 @@ impl DatabaseReplayGenerator {
         use_rowid: bool,
     ) -> Result<ReplayInfo> {
         let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
-            self.table_columns_info(coro, table_name).await?;
+            self.writable_columns(coro, table_name).await?;
         let mut pk_predicates = Vec::with_capacity(1);
         for &idx in &pk_column_indices {
             pk_predicates.push(identity_predicate(&column_names[idx]));
@@ -659,10 +659,80 @@ impl DatabaseReplayGenerator {
         })
     }
 
-    /// Execute a DDL statement idempotently: CREATE TABLE is replayed with
-    /// `IF NOT EXISTS`, named schema objects are skipped when already present,
-    /// and `ALTER TABLE ADD COLUMN` only adds missing columns. Falls back to
-    /// direct execution for other DDL.
+    pub async fn rename_and_drop_local_columns_to_match_remote<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        create_table: &str,
+    ) -> Result<()> {
+        let mut parser = Parser::new(create_table.as_bytes());
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
+            tbl_name,
+            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }))) = parser.next()
+        else {
+            return Ok(());
+        };
+        let Some(local_columns) = self
+            .local_column_definitions(coro, tbl_name.name.as_str())
+            .await?
+        else {
+            return Ok(());
+        };
+        let (renamed_columns, dropped_columns) =
+            renamed_and_dropped_columns(&local_columns, &columns);
+        for (old_name, new_name) in renamed_columns {
+            let rename_column =
+                format!("ALTER TABLE {tbl_name} RENAME COLUMN {old_name} TO {new_name}");
+            self.execute_ddl(&rename_column)?;
+        }
+        for name in dropped_columns.into_iter().rev() {
+            let drop_column = format!("ALTER TABLE {tbl_name} DROP COLUMN {name}");
+            self.execute_ddl(&drop_column)?;
+        }
+        return Ok(());
+
+        fn renamed_and_dropped_columns<'a>(
+            local_columns: &'a [turso_parser::ast::ColumnDefinition],
+            remote_columns: &'a [turso_parser::ast::ColumnDefinition],
+        ) -> (
+            Vec<(&'a turso_parser::ast::Name, &'a turso_parser::ast::Name)>,
+            Vec<&'a turso_parser::ast::Name>,
+        ) {
+            let mut renamed = Vec::new();
+            let mut dropped = Vec::new();
+            let mut remote_columns = remote_columns.iter().peekable();
+            for (index, local_column) in local_columns.iter().enumerate() {
+                let local_name = &local_column.col_name;
+                let Some(remote_column) = remote_columns.peek() else {
+                    dropped.push(local_name);
+                    continue;
+                };
+                let remote_name = &remote_column.col_name;
+                if local_name
+                    .as_str()
+                    .eq_ignore_ascii_case(remote_name.as_str())
+                {
+                    remote_columns.next();
+                } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
+                    // This doesn't correctly handle a remote transaction that swaps two columns,
+                    // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
+                    // best we can do. Note that this change didn't introduce the bug.
+                    dropped.push(local_name);
+                } else {
+                    renamed.push((local_name, remote_name));
+                    remote_columns.next();
+                }
+            }
+            (renamed, dropped)
+        }
+    }
+
+    /// Execute a DDL statement idempotently: CREATE TABLE for an existing table
+    /// drops the generated columns that it removes or changes and adds the
+    /// columns that are missing, named schema objects are skipped when already
+    /// present, and `ALTER TABLE ADD COLUMN` only adds missing columns. Falls
+    /// back to direct execution for other DDL.
     pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
         let mut parser = Parser::new(ddl.as_bytes());
         let Some(Ok(turso_parser::ast::Cmd::Stmt(mut stmt))) = parser.next() else {
@@ -678,25 +748,41 @@ impl DatabaseReplayGenerator {
             } => {
                 *if_not_exists = true;
                 let table_name = tbl_name.name.as_str();
-                let (current_columns, _, _) = self.table_columns_info(coro, table_name).await?;
-                if current_columns.is_empty() {
+                let Some(mut local_columns) =
+                    self.local_column_definitions(coro, table_name).await?
+                else {
+                    // the local table didn't exist
                     self.execute_ddl(ddl)?;
                     return Ok(());
-                }
+                };
                 if let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
-                    columns, ..
+                    columns: remote_columns,
+                    ..
                 } = body
                 {
-                    for column in columns {
-                        let col_name = column.col_name.as_str();
-                        if current_columns.iter().any(|c| c == col_name) {
+                    // drop the generated columns that were changed
+                    for index in (0..local_columns.len()).rev() {
+                        if !generated_column_changed_between_local_and_remote(
+                            &local_columns[index],
+                            remote_columns,
+                        ) {
+                            continue;
+                        }
+                        let dropped = local_columns.remove(index);
+                        let drop_column =
+                            format!("ALTER TABLE {tbl_name} DROP COLUMN {}", dropped.col_name);
+                        self.execute_ddl(&drop_column)?;
+                    }
+                    // add the missing remote columns
+                    for column in remote_columns {
+                        if has_column(&local_columns, column.col_name.as_str()) {
                             continue;
                         }
                         let add_column = format!("ALTER TABLE {tbl_name} ADD COLUMN {column}");
                         self.execute_ddl(&add_column)?;
                     }
                 }
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateIndex { idx_name, .. } => {
                 if self
@@ -706,7 +792,7 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateTrigger { trigger_name, .. } => {
                 if self
@@ -716,7 +802,7 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateMaterializedView { view_name, .. }
             | turso_parser::ast::Stmt::CreateView { view_name, .. } => {
@@ -727,29 +813,65 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
-            _ => {}
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+            }) => {
+                let table_name = tbl_name.name.as_str();
+                let local_columns = self
+                    .local_column_definitions(coro, table_name)
+                    .await?
+                    .unwrap_or_default();
+                let col_name = col_def.col_name.as_str();
+
+                if has_column(&local_columns, col_name) {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
+                    );
+                } else {
+                    self.execute_ddl(ddl)?;
+                }
+                Ok(())
+            }
+            _ => {
+                self.conn.execute(ddl)?;
+                Ok(())
+            }
         }
-        let turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
-            name: tbl_name,
-            body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
-        }) = stmt
-        else {
-            self.conn.execute(ddl)?;
-            return Ok(());
+    }
+
+    /// Returns `None` if there is no matching local table
+    async fn local_column_definitions<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        table_name: &str,
+    ) -> Result<Option<Vec<turso_parser::ast::ColumnDefinition>>> {
+        let table_name_literal = sql_string_literal(table_name);
+        let mut stmt = self.conn.prepare(format!(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = {table_name_literal} COLLATE NOCASE"
+        ))?;
+        let Some(row) = run_stmt_once(coro, &mut stmt).await? else {
+            return Ok(None);
         };
-        let table_name = tbl_name.name.as_str();
-        let (current_columns, _, _) = self.table_columns_info(coro, table_name).await?;
-        let col_name = col_def.col_name.as_str();
-        if current_columns.iter().any(|c| c == col_name) {
-            tracing::debug!(
-                "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
-            );
-            return Ok(());
-        }
-        self.execute_ddl(ddl)?;
-        Ok(())
+        let turso_core::Value::Text(sql) = row.get_value(0) else {
+            return Err(Error::DatabaseTapeError(format!(
+                "unexpected sql column type for table '{table_name}' in sqlite_schema"
+            )));
+        };
+        let sql = sql.as_str().to_string();
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
+            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }))) = parser.next()
+        else {
+            return Err(Error::DatabaseTapeError(format!(
+                "unexpected definition of table '{table_name}' in sqlite_schema: {sql}"
+            )));
+        };
+        Ok(Some(columns))
     }
 
     fn execute_ddl(&self, ddl: &str) -> Result<()> {
@@ -772,7 +894,9 @@ impl DatabaseReplayGenerator {
         Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
     }
 
-    async fn table_columns_info<Ctx>(
+    /// Returns which columns can be INSERTed or UPDATEd, skipping generated columns.
+    /// Returns `(Vec<col_name>, Vec<pk_column_indices>, Option<rowid_alias_pk_column_index>)`
+    async fn writable_columns<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
@@ -845,6 +969,42 @@ impl DatabaseReplayGenerator {
         };
         Ok((column_names, pk_column_indices, rowid_alias_pk_column_index))
     }
+}
+
+/// returns true if a local column is generated and the remote either removed it or modified it
+fn generated_column_changed_between_local_and_remote(
+    local_column: &turso_parser::ast::ColumnDefinition,
+    remote_columns: &[turso_parser::ast::ColumnDefinition],
+) -> bool {
+    if !is_generated(local_column) {
+        return false;
+    }
+    let local_name = local_column.col_name.as_str();
+    let Some(remote_column) = remote_columns.iter().find(|remote_column| {
+        remote_column
+            .col_name
+            .as_str()
+            .eq_ignore_ascii_case(local_name)
+    }) else {
+        // remote has removed the gencol
+        return true;
+    };
+    return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
+
+    fn is_generated(column: &turso_parser::ast::ColumnDefinition) -> bool {
+        column.constraints.iter().any(|constraint| {
+            matches!(
+                constraint.constraint,
+                turso_parser::ast::ColumnConstraint::Generated { .. }
+            )
+        })
+    }
+}
+
+fn has_column(columns: &[turso_parser::ast::ColumnDefinition], name: &str) -> bool {
+    columns
+        .iter()
+        .any(|column| column.col_name.as_str().eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]

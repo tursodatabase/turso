@@ -77,6 +77,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: "./.github/shared/setup-mold"
@@ -87,14 +90,19 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
       # pg_query, whose bindgen needs libclang.dll.
       - name: Install LLVM (libclang for bindgen)
         if: runner.os == 'Windows'
         run: |
-          choco install llvm -y --no-progress
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -eq 0 -and (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) { break }
+            if ($attempt -eq 5) { throw "LLVM install failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
@@ -102,13 +110,14 @@ jobs:
           python-version: "3.10"
       - name: Install SQLite (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          vcpkg install sqlite3:x64-windows-static-md
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -120,18 +129,30 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || github.event_name == 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' --failure-output=final
         timeout-minutes: 30
+      # Same suite against a --sync-dir server, so directory mode's per-database
+      # routing gets the coverage the single-database run above provides.
+      - name: Test sync suite against --sync-dir
+        if: runner.os == 'Linux'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          LOCAL_SYNC_SERVER_DIR: "1"
+        run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
+        timeout-minutes: 20
+      - name: Memory leak check (repeated database open/workload/drop)
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+        timeout-minutes: 10
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -313,13 +334,25 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
-      # run 10 iterations of the same seed to get to the failure
+      - name: Build simulator
+        run: cargo build -p limbo_sim --bin limbo_sim --locked
       - name: Simulator ${{ matrix.profile.name }}
+        env:
+          SIM_ARGS: ${{ matrix.profile.args }}
         run: |
-          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
-            ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
-          done
+          set -euo pipefail
+          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
+            i="$1"
+            log="sim-run-$i.log"
+            read -r -a args <<< "$SIM_ARGS"
+            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
+              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            else
+              echo "iteration $i FAILED:"
+              cat "$log"
+              exit 255
+            fi
+          ' _
 
         # TODO: find out why this blows the stack so quickly every time..
         # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
@@ -382,7 +415,7 @@ jobs:
       matrix:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -426,7 +459,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -484,7 +517,7 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
-        run: make test
+        run: make test-without-sqltest
 
   concurrent-simulator:
     name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
@@ -513,6 +546,24 @@ jobs:
           - name: btree-rebalance
             iterations: 5
             args: "--mode btree-rebalance --allocation-fault-probability 0"
+          - name: fts-merge-wal
+            iterations: 10
+            args: "--mode fts-merge --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-merge-mvcc
+            iterations: 10
+            args: "--mode fts-merge --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-wal
+            iterations: 10
+            args: "--mode fts-snapshots --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-mvcc
+            iterations: 10
+            args: "--mode fts-snapshots --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-wal
+            iterations: 10
+            args: "--mode fts-recovery --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-mvcc
+            iterations: 10
+            args: "--mode fts-recovery --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
           - name: multiprocess
             iterations: 10
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
@@ -565,6 +616,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSVC
+        uses: "./.github/shared/setup-msvc"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"

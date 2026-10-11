@@ -2,17 +2,22 @@
 # /// script
 # dependencies = ["matplotlib", "numpy", "scienceplots"]
 # ///
-"""Draw the runtime of every TPC-H query as grouped bars from a results CSV.
+"""Draw the runtime of every TPC-H query as grouped bars from results CSVs.
 
-Usage: ./results2csv.sh ../results_<timestamp>.txt > results.csv
-       uv run plot-tpch.py results.csv
+Usage: ./results2csv.sh ../results_<timestamp>-r1.txt > results-r1.csv
+       ...
+       uv run plot-tpch.py results-r1.csv results-r2.csv ...
 
-The CSV has one row per query and one column per engine, as
-`results2csv.sh` writes it: `Query,Limbo,SQLite`. Every query gets a
-group of bars, one per engine, with runtime in seconds up a log axis so
-a query that takes a fifth of a second and one that takes a minute both
-read. Under the bars sits a table with the exact runtime of every bar,
-one row per engine and one column per query, lined up with the bars.
+Every CSV is one run over all the queries, with one row per query and one
+column per engine, as `results2csv.sh` writes it: `Query,Limbo,SQLite`.
+Every query gets a group of bars, one per engine, with runtime in seconds
+up a linear axis that starts at zero. A bar is the median over the runs, and its
+whiskers reach the fastest and the slowest run; with a single CSV there
+are no whiskers. Under the bars sits a table with the median of every
+bar, one row per engine and one column per query, lined up with the bars.
+In every column the fastest median is in bold, as TPC-H result tables
+usually mark the winner; when the fastest medians round to the same
+number no cell is bold.
 A query an engine did not run (`NA` in the CSV) has no bar and `n/a` in
 its cell, so a gap is never mistaken for a fast run.
 
@@ -49,7 +54,7 @@ TABLE_LABEL_WIDTH = 0.95
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("csv_file", type=Path)
+    parser.add_argument("csv_files", type=Path, nargs="+")
     parser.add_argument("--out", type=Path, default=Path("tpch"), metavar="PREFIX",
                         help="write PREFIX.png, PREFIX.pdf and PREFIX.tikz (default tpch)")
     parser.add_argument("--name", action="append", default=[], metavar="ENGINE=NAME",
@@ -57,14 +62,15 @@ def main():
     args = parser.parse_args()
     names = dict(name.split("=", 1) for name in args.name)
 
-    with open(args.csv_file, newline="") as f:
-        reader = csv.DictReader(f)
-        columns = [c for c in reader.fieldnames if c != "Query"]
-        rows = list(reader)
-    if not rows or not columns:
+    runs = [read_run(path) for path in args.csv_files]
+    columns = runs[0].columns
+    if not runs[0].rows or not columns:
         raise SystemExit("no results found")
+    for run in runs[1:]:
+        if run.columns != columns:
+            raise SystemExit(f"{run.path} has columns {run.columns}, {runs[0].path} has {columns}")
 
-    figure = Figure(rows, columns, names)
+    figure = Figure(runs, columns, names)
     for suffix in (".png", ".pdf"):
         output = args.out.with_suffix(suffix)
         figure.matplotlib(output)
@@ -74,16 +80,50 @@ def main():
     print(f"wrote {output}")
 
 
-class Series:
-    """One engine: its runtime for every query, `None` where it did not run."""
+class Run:
+    """One CSV: the queries in file order and every engine's time for each."""
 
-    def __init__(self, column, index, rows, name=None):
+    def __init__(self, path, columns, rows):
+        self.path = path
+        self.columns = columns
+        self.rows = rows
+        self.times = {row["Query"]: row for row in rows}
+
+
+def read_run(path):
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        columns = [c for c in reader.fieldnames if c != "Query"]
+        rows = list(reader)
+    return Run(path, columns, rows)
+
+
+class Series:
+    """One engine: for every query, the median runtime over the runs that
+    have one, with the fastest and slowest of them for the whiskers, or
+    `None` where the engine did not run the query."""
+
+    def __init__(self, column, index, queries, runs, name=None):
         engine = column.lower()
         look = ENGINES.get(engine)
         self.label = name or (look["name"] if look else column)
         self.color = look["color"] if look else FALLBACK_COLORS[index % len(FALLBACK_COLORS)]
         self.tikz_color = "".join(ch for ch in engine if ch.isalpha())
-        self.times = [parse_time(row[column]) for row in rows]
+        self.times = []
+        self.lows = []
+        self.highs = []
+        for query in queries:
+            samples = [t for t in (parse_time(run.times[query][column]) for run in runs if query in run.times)
+                       if t is not None]
+            self.times.append(float(np.median(samples)) if samples else None)
+            self.lows.append(min(samples) if samples else None)
+            self.highs.append(max(samples) if samples else None)
+
+    def bars(self):
+        """(query index, median, distance down to the fastest run, distance up to
+        the slowest) for every query the engine ran."""
+        return [(x, t, t - lo, hi - t)
+                for x, (t, lo, hi) in enumerate(zip(self.times, self.lows, self.highs)) if t is not None]
 
 
 def parse_time(text):
@@ -94,17 +134,17 @@ def parse_time(text):
 
 
 class Figure:
-    def __init__(self, rows, columns, names):
-        self.queries = [row["Query"] for row in rows]
-        self.series = [Series(c, i, rows, names.get(c.lower())) for i, c in enumerate(columns)]
-        times = [t for s in self.series for t in s.times if t is not None]
-        if not times:
+    def __init__(self, runs, columns, names):
+        self.queries = [row["Query"] for row in runs[0].rows]
+        self.series = [Series(c, i, self.queries, runs, names.get(c.lower())) for i, c in enumerate(columns)]
+        self.whiskers = len(runs) > 1
+        highs = [t for s in self.series for t in s.highs if t is not None]
+        if not highs:
             raise SystemExit("no query finished on any engine")
-        # A decade of headroom under the fastest query and over the slowest,
-        # so the shortest bar still has height and the legend fits over the tallest.
-        self.ymin = 10 ** np.floor(np.log10(min(times)))
-        self.ymax = 10 ** (np.ceil(np.log10(max(times))) + 0.5)
+        # Headroom over the slowest run so the legend fits over the tallest bar.
+        self.ymax = max(highs) * 1.15
         self.bar_width = GROUP_WIDTH / len(self.series)
+        self.fastest = fastest_cells(self.series, len(self.queries))
 
     def offset(self, index):
         """How far the bars of the engine at `index` sit from the query's centre."""
@@ -116,28 +156,27 @@ class Figure:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import scienceplots  # noqa: F401  (registers the styles)
-        from matplotlib.ticker import FuncFormatter, NullLocator
+        from matplotlib.ticker import NullLocator
 
         plt.style.use(["science", "no-latex"])
 
         fig, ax = plt.subplots(figsize=(7.2, 2.8), dpi=300)
-        ax.set_yscale("log")
         ax.grid(True, axis="y", which="major", linewidth=0.5, linestyle=(0, (2, 2)), color="0.7")
         ax.set_axisbelow(True)
         x = np.arange(len(self.queries))
         for i, s in enumerate(self.series):
-            xs = x + self.offset(i)
-            ax.bar([xi for xi, t in zip(xs, s.times) if t is not None],
-                   [t for t in s.times if t is not None],
-                   self.bar_width, color=s.color, linewidth=0, label=s.label, zorder=3)
+            bars = s.bars()
+            yerr = [[down for _, _, down, _ in bars], [up for _, _, _, up in bars]] if self.whiskers else None
+            ax.bar([x[xi] + self.offset(i) for xi, _, _, _ in bars], [t for _, t, _, _ in bars],
+                   self.bar_width, color=s.color, linewidth=0, label=s.label, zorder=3,
+                   yerr=yerr, capsize=1.2, error_kw={"linewidth": 0.5, "capthick": 0.5, "zorder": 4})
         # The table replaces the x tick labels: its header row names the
         # queries, and each column is as wide as one query's group of bars,
         # so the axis must span exactly the queries with no padding.
         ax.set_xticks([])
         ax.xaxis.set_minor_locator(NullLocator())
         ax.set_xlim(-0.5, len(self.queries) - 0.5)
-        ax.set_ylim(self.ymin, self.ymax)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.set_ylim(0, self.ymax)
         ax.yaxis.set_minor_locator(NullLocator())
         ax.set_ylabel("Runtime (s)")
         table = ax.table(cellText=[[cell_text(t) for t in s.times] for s in self.series],
@@ -150,6 +189,10 @@ class Figure:
         for cell in table.get_celld().values():
             cell.set_linewidth(0.4)
             cell.set_edgecolor("black")
+        for row, s in enumerate(self.series, start=1):
+            for column, fastest in enumerate(self.fastest[row - 1]):
+                if fastest:
+                    table[row, column].get_text().set_fontweight("bold")
         ax.legend(loc="upper left", ncol=len(self.series), frameon=False,
                   handlelength=1.0, handletextpad=0.4, columnspacing=1.8)
         fig.savefig(output, bbox_inches="tight")
@@ -168,8 +211,7 @@ class Figure:
         out.append(rf"""\begin{{axis}}[
   scale only axis, width=0.92\linewidth, height=0.36\linewidth, clip=false,
   ybar, bar width={self.bar_width:.4g}, bar shift=0pt,
-  ymode=log, log origin=infty, ymin={self.ymin:g}, ymax={self.ymax:.4g},
-  log ticks with fixed point, yminorticks=false,
+  ymin=0, ymax={self.ymax:.4g}, yminorticks=false,
   xmin=-0.5, xmax={n - 0.5:g}, xtick=\empty, xminorticks=false,
   ylabel={{Runtime (s)}},
   ymajorgrids, grid style={{line width=0.3pt, dashed, draw=black!30}},
@@ -180,10 +222,17 @@ class Figure:
   legend style={{draw=none, font=\scriptsize, /tikz/every even column/.append style={{column sep=0.5cm}}}},
   legend image code/.code={{\fill[#1] (0cm,-0.1cm) rectangle (0.3cm,0.1cm);}},
 ]""")
+        # The whiskers are pgfplots error bars with the distance from the
+        # median down to the fastest run and up to the slowest given outright,
+        # the same numbers matplotlib gets.
+        whiskers = (", error bars/.cd, y dir=both, y explicit, error bar style={line width=0.4pt, black},"
+                    " error mark options={rotate=90, mark size=1pt, line width=0.4pt, black}"
+                    if self.whiskers else "")
         for i, s in enumerate(self.series):
             coords = " ".join(f"({x + self.offset(i):.4g},{t:.4g})"
-                              for x, t in enumerate(s.times) if t is not None)
-            out.append(rf"\addplot[fill={s.tikz_color}, draw=none] coordinates {{{coords}}};")
+                              + (f" += (0,{up:.4g}) -= (0,{down:.4g})" if self.whiskers else "")
+                              for x, t, down, up in s.bars())
+            out.append(rf"\addplot[fill={s.tikz_color}, draw=none{whiskers}] coordinates {{{coords}}};")
             out.append(rf"\addlegendentry{{{s.label}}}")
         out.extend(self.tikz_table())
         out.append(r"\end{axis}")
@@ -196,7 +245,9 @@ class Figure:
         `axis description cs`, whose x runs 0 to 1 across the axis, shifted
         down from the axis bottom by whole rows of `TABLE_ROW_HEIGHT`."""
         n = len(self.queries)
-        rows = [self.queries] + [[cell_text(t) for t in s.times] for s in self.series]
+        rows = [self.queries] + [[rf"\textbf{{{cell_text(t)}}}" if fastest else cell_text(t)
+                                  for t, fastest in zip(s.times, self.fastest[i])]
+                                 for i, s in enumerate(self.series)]
         labels = [""] + [s.label for s in self.series]
         out = [
             r"\begin{scope}[every node/.style={font=\tiny, scale=0.85, transform shape, inner sep=0pt},"
@@ -218,6 +269,22 @@ class Figure:
                            rf"axis description cs:0,0) {{{label}}};")
         out.append(r"\end{scope}")
         return out
+
+
+def fastest_cells(series, query_count):
+    """For every engine and query, whether the engine's median is the one
+    fastest median for the query as the table prints it. Comparing the
+    printed numbers means two medians that show up the same are a tie."""
+    fastest = [[False] * query_count for _ in series]
+    for q in range(query_count):
+        shown = [(float(cell_text(s.times[q])), i) for i, s in enumerate(series) if s.times[q] is not None]
+        if len(shown) < 2:
+            continue
+        best = min(t for t, _ in shown)
+        winners = [i for t, i in shown if t == best]
+        if len(winners) == 1:
+            fastest[winners[0]][q] = True
+    return fastest
 
 
 def cell_text(time):

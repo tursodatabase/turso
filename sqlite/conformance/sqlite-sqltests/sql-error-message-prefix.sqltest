@@ -13,3 +13,18 @@ test sql-error-has-no-internal-error-prefix {
 expect error {
     ^second argument to nth_value must be a positive integer$
 }
+
+# SQLITE_FULL is reported bare too. Turso used to stamp a "Database is
+# full: " prefix on it, so PRAGMA max_page_count overflow read
+# "Database is full: database or disk is full".
+
+@skip-if mvcc "MVCC keeps new rows in memory until checkpoint, so the page limit is not hit at INSERT time"
+test database-full-error-has-no-prefix {
+    PRAGMA page_size = 1024;
+    PRAGMA max_page_count = 2;
+    CREATE TABLE f (x);
+    INSERT INTO f VALUES (zeroblob(4000));
+}
+expect error {
+    ^database or disk is full$
+}

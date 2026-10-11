@@ -3466,7 +3466,8 @@ expect error {
 test jsonb-oversized-child-remove {
     SELECT json_remove(x'8BC7C8000000000000', '$[0]');
 }
-expect {
+expect error {
+    malformed JSON
 }
 
 test json_each_over_null_column {

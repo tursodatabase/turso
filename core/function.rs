@@ -68,7 +68,9 @@ impl Debug for ExternalCollation {
 impl Deterministic for ExternalFunc {
     fn is_deterministic(&self) -> bool {
         match self.func {
-            ExtFunc::Scalar { deterministic, .. } => deterministic,
+            ExtFunc::Scalar { deterministic, .. } | ExtFunc::NativeScalar { deterministic, .. } => {
+                deterministic
+            }
             _ => false,
         }
     }
@@ -83,6 +85,7 @@ pub enum ExtFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        context_owner: Arc<ExternalContext>,
     },
     Aggregate {
         context: usize,
@@ -93,12 +96,45 @@ pub enum ExtFunc {
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        context_owner: Arc<ExternalContext>,
     },
+    NativeScalar {
+        arity: crate::native_ext::FunctionArity,
+        deterministic: bool,
+        function: Arc<dyn crate::native_ext::ScalarFactory>,
+    },
+    NativeAggregate {
+        argc: i32,
+        function: Arc<dyn crate::native_ext::AggregateFactory>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ExternalContext {
+    context: usize,
+    destructor: Option<ContextDestructor>,
+}
+
+impl ExternalContext {
+    fn new(context: usize, destructor: Option<ContextDestructor>) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            destructor,
+        })
+    }
+}
+
+impl Drop for ExternalContext {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.destructor {
+            unsafe { destructor(self.context) };
+        }
+    }
 }
 
 impl ExtFunc {
     pub fn agg_args(&self) -> Result<i32, ()> {
-        if let ExtFunc::Aggregate { argc, .. } = self {
+        if let ExtFunc::Aggregate { argc, .. } | ExtFunc::NativeAggregate { argc, .. } = self {
             return Ok(*argc);
         }
         Err(())
@@ -106,13 +142,24 @@ impl ExtFunc {
 
     pub fn matches_arg_count(&self, arg_count: usize) -> bool {
         match self {
-            Self::Scalar { argc, .. } => *argc < 0 || *argc as usize == arg_count,
-            Self::Aggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+            Self::NativeScalar { arity, .. } => arity.accepts(arg_count),
+            Self::Scalar { argc, .. }
+            | Self::Aggregate { argc, .. }
+            | Self::NativeAggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+        }
+    }
+
+    pub fn arg_counts(&self) -> Vec<i32> {
+        match self {
+            Self::NativeScalar { arity, .. } => arity.arg_counts(),
+            Self::Scalar { argc, .. }
+            | Self::Aggregate { argc, .. }
+            | Self::NativeAggregate { argc, .. } => vec![*argc],
         }
     }
 
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Self::Aggregate { .. })
+        matches!(self, Self::Aggregate { .. } | Self::NativeAggregate { .. })
     }
 
     pub fn with_aggregate_arg_count(&self, arg_count: usize) -> Self {
@@ -122,8 +169,10 @@ impl ExtFunc {
                 init,
                 step,
                 finalize,
+                context_destructor,
                 aggregate_destructor,
                 value_destructor,
+                context_owner,
                 ..
             } => Self::Aggregate {
                 context: *context,
@@ -131,9 +180,14 @@ impl ExtFunc {
                 init: *init,
                 step: *step,
                 finalize: *finalize,
-                context_destructor: None,
+                context_destructor: *context_destructor,
                 aggregate_destructor: *aggregate_destructor,
                 value_destructor: *value_destructor,
+                context_owner: context_owner.clone(),
+            },
+            Self::NativeAggregate { function, .. } => Self::NativeAggregate {
+                argc: arg_count as i32,
+                function: function.clone(),
             },
             _ => self.clone(),
         }
@@ -149,8 +203,9 @@ impl ExternalFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::Scalar {
                 context,
@@ -159,8 +214,9 @@ impl ExternalFunc {
                 callback,
                 context_destructor,
                 value_destructor,
+                context_owner: ExternalContext::new(context, context_destructor),
             },
-        }
+        })
     }
 
     pub fn new_aggregate(
@@ -171,8 +227,9 @@ impl ExternalFunc {
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::Aggregate {
                 context,
@@ -183,26 +240,18 @@ impl ExternalFunc {
                 context_destructor,
                 aggregate_destructor,
                 value_destructor,
+                context_owner: ExternalContext::new(context, context_destructor),
             },
-        }
+        })
     }
-}
 
-impl Drop for ExternalFunc {
-    fn drop(&mut self) {
-        match self.func {
-            ExtFunc::Scalar {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            }
-            | ExtFunc::Aggregate {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            } => unsafe { context_destructor(context) },
-            _ => {}
+    pub(crate) fn validate_arg_count(argc: i32) -> crate::Result<()> {
+        if argc < -1 {
+            return Err(LimboError::InvalidArgument(
+                "function argument count must be at least -1".into(),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -423,7 +472,9 @@ impl Display for FtsFunc {
 #[derive(Debug, Clone, strum::EnumIter)]
 pub enum AggFunc {
     Avg,
+    /// COUNT(expr)
     Count,
+    /// COUNT(*) or COUNT()
     Count0,
     GroupConcat,
     Max,

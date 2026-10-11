@@ -15,7 +15,7 @@ use tracing::debug;
 /// *every* `pread` / `pwrite` / `pwritev` / `sync` / `truncate`.
 ///
 /// This backend performs the identical byte-level data movement as
-/// `MemoryIO` (it shares [`MemStore`]) but enqueues the completion instead of
+/// `MemoryIO` (it shares `MemStore`) but enqueues the completion instead of
 /// signalling it. The completion only becomes `finished()` when `step()` runs,
 /// so the engine must return `StepResult::IO`, yield, and re-enter — exercising
 /// the resume path behind each yield point.

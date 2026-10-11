@@ -2668,6 +2668,11 @@ impl Jsonb {
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
+        // With nested array locators ($[0][2]) the element of the outer
+        // entry is the container of the inner entry, whose header the
+        // previous round already resized; resizing it again would count
+        // the change twice.
+        let mut last_container: Option<usize> = None;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
@@ -2676,17 +2681,19 @@ impl Jsonb {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
-                let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
-                    self.read_header(arr_element_idx)?;
+                if last_container != Some(arr_element_idx) {
+                    let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
+                        self.read_header(arr_element_idx)?;
 
-                let new_arr_el_header_len = self.write_element_header(
-                    arr_element_idx,
-                    arr_el_type,
-                    (arr_el_size as isize + delta) as usize,
-                    true,
-                )?;
+                    let new_arr_el_header_len = self.write_element_header(
+                        arr_element_idx,
+                        arr_el_type,
+                        (arr_el_size as isize + delta) as usize,
+                        true,
+                    )?;
 
-                delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                    delta += new_arr_el_header_len as isize - arr_el_header_len as isize;
+                }
             }
             let new_size = el_size as isize + delta;
             let new_header_size = self.write_element_header(
@@ -2700,6 +2707,7 @@ impl Jsonb {
 
             delta += parent.delta;
             delta += header_diff;
+            last_container = Some(parent.field_value_index);
         }
 
         Ok(())

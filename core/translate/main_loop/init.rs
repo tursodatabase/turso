@@ -51,6 +51,11 @@ impl InitLoop {
             tables.joined_tables().len(),
             "meta_left_joins length must match tables length"
         );
+        turso_assert_eq!(
+            t_ctx.meta_right_joins.len(),
+            tables.joined_tables().len(),
+            "meta_right_joins length must match tables length"
+        );
 
         if matches!(
             &mode,
@@ -112,15 +117,22 @@ impl InitLoop {
                 }
             );
         }
-        // Include hash-join build tables so their cursors are opened for hash build.
         let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
             .try_collect()?;
         for table in tables.joined_tables().iter() {
-            if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.set(hash_join_op.build_table_idx)?;
+            let Operation::HashJoin(hash_join_op) = &table.op else {
+                continue;
+            };
+            if t_ctx
+                .materialized_build_inputs
+                .get(&hash_join_op.build_table_idx)
+                .is_some_and(|input| !input.requires_build_table())
+            {
+                continue;
             }
+            required_tables.set(hash_join_op.build_table_idx)?;
         }
 
         for (table_index, table) in tables.joined_tables().iter().enumerate() {
@@ -134,7 +146,7 @@ impl InitLoop {
             program.begin_read_on_database(table.database_id, schema_cookie)?;
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() {
+                if join_info.keeps_left_rows() {
                     let lj_metadata = LeftJoinMetadata {
                         reg_match_flag: program.alloc_register(),
                         label_match_flag_set_true: program.allocate_label(),
@@ -142,7 +154,13 @@ impl InitLoop {
                     };
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
                 }
-                if join_info.is_semi_or_anti() {
+                if join_info.keeps_right_rows() {
+                    t_ctx.meta_right_joins[table_index] =
+                        Some(right_join_metadata(program, table)?);
+                }
+                let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                    hj.join_type == HashJoinType::LeftAnti);
+                if join_info.is_semi_or_anti() && !is_hash_anti {
                     let join_idx = join_order
                         .iter()
                         .position(|m| m.original_idx == table_index)
@@ -511,6 +529,19 @@ impl InitLoop {
             }
         }
 
+        for right_join in t_ctx.meta_right_joins.iter().flatten() {
+            // A correlated subquery can run this loop more than once. Clear the
+            // old return address before the first path reaches Return.
+            program.emit_insn(Insn::Null {
+                dest: right_join.return_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: right_join.matched_rows_cursor_id,
+                is_table: false,
+            });
+        }
+
         for cond in where_clause
             .iter()
             .filter(|c| c.should_eval_before_loop(join_order, subqueries, Some(tables)))
@@ -532,6 +563,67 @@ impl InitLoop {
 
         Ok(())
     }
+}
+
+/// Allocate the match set and subroutine state for one RIGHT or FULL JOIN.
+///
+/// SQLite records matched right rowids during the main loop. It scans the same
+/// source later and calls the shared result body for each missing rowid.
+/// A WITHOUT ROWID table has no rowid, so SQLite records its primary key instead.
+fn right_join_metadata(
+    program: &mut ProgramBuilder,
+    table: &JoinedTable,
+) -> Result<RightJoinMetadata> {
+    let primary_key_columns = match &table.table {
+        Table::BTree(btree) if !btree.has_rowid => Some(
+            btree
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| {
+                    btree
+                        .get_column(name)
+                        .map(|(position, _)| position)
+                        .expect("a primary key column must exist in its table")
+                })
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    let key_columns = match &primary_key_columns {
+        Some(positions) => positions
+            .iter()
+            .enumerate()
+            .map(|(key_position, &column_position)| {
+                let name = table.table.columns()[column_position]
+                    .name
+                    .clone()
+                    .unwrap_or_default();
+                IndexColumn::new(&name, key_position)
+            })
+            .try_collect::<crate::alloc::Vec<_>>()?,
+        None => crate::alloc::vec![IndexColumn::new("rowid", 0)],
+    };
+    let key_len = key_columns.len();
+    let matched_rows_index = Arc::new(Index {
+        name: format!("right_join_matches_{}", usize::from(table.internal_id)),
+        table_name: table.table.get_name().to_string(),
+        root_page: 0,
+        columns: key_columns,
+        unique: true,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    Ok(RightJoinMetadata {
+        matched_rows_cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(matched_rows_index)),
+        key_start_reg: program.alloc_registers(key_len),
+        primary_key_columns,
+        return_reg: program.alloc_register(),
+        body_label: program.allocate_label(),
+        return_label: program.allocate_label(),
+    })
 }
 
 /// Evaluates and range-checks a percentile aggregate's fraction direct

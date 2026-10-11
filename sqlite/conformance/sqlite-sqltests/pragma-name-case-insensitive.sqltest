@@ -1,0 +1,56 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8736
+# SQLite matches PRAGMA names without regard to case, so PRAGMA FOREIGN_KEYS
+# and PRAGMA foreign_keys name the same pragma.
+
+test pragma-uppercase-setter-is-applied {
+    PRAGMA USER_VERSION = 9;
+    PRAGMA user_version;
+}
+expect {
+    9
+}
+
+test pragma-mixed-case-reader-sees-value {
+    PRAGMA user_version = 9;
+    PRAGMA User_Version;
+}
+expect {
+    9
+}
+
+test pragma-lowercase-still-works {
+    PRAGMA user_version = 7;
+    PRAGMA USER_VERSION;
+}
+expect {
+    7
+}
+
+test pragma-uppercase-table-info-returns-columns {
+    CREATE TABLE t1(a);
+    PRAGMA TABLE_INFO(t1);
+}
+expect {
+    0|a||0||0
+}
+
+test pragma-uppercase-foreign-keys-enforces {
+    PRAGMA FOREIGN_KEYS = ON;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY);
+    CREATE TABLE t2(b INTEGER REFERENCES t1(a));
+    INSERT INTO t2 VALUES(999);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test unknown-pragma-in-any-case-is-ignored {
+    PRAGMA NOT_A_REAL_PRAGMA = 1;
+    PRAGMA Not_A_Real_Pragma;
+    SELECT 1;
+}
+expect {
+    1
+}

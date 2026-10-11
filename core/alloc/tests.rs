@@ -1,4 +1,5 @@
 use super::*;
+use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
     sync::{
@@ -51,6 +52,7 @@ impl Iterator for UnderreportedLowerBound {
     }
 }
 
+#[derive(Clone)]
 struct CountingAlloc {
     allocations: StdArc<AtomicUsize>,
     deallocations: StdArc<AtomicUsize>,
@@ -68,6 +70,30 @@ unsafe impl ApiAllocator for CountingAlloc {
             <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
         }
     }
+}
+
+#[test]
+fn database_allocators_preserve_distinct_concrete_types() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let allocators: DatabaseAllocators<Global, CountingAlloc> = DatabaseAllocators {
+        mv_store: Global,
+        fts: CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    };
+    let cloned = allocators.clone();
+    let layout = Layout::new::<u64>();
+    let mv_block = cloned.mv_store.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 0);
+    let fts_block = cloned.fts.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    unsafe {
+        allocators.mv_store.deallocate(mv_block.cast(), layout);
+        allocators.fts.deallocate(fts_block.cast(), layout);
+    }
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -90,6 +116,7 @@ fn dyn_allocator_delegates_skiplist_allocations() {
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
+    let fts_allocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
         deallocations,
@@ -108,7 +135,13 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
         "open-with-allocator.db",
         crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
             .storage(db_file)
-            .allocator(alloc),
+            .allocators(DatabaseAllocators {
+                mv_store: alloc,
+                fts: DynAllocator::new(CountingAlloc {
+                    allocations: fts_allocations.clone(),
+                    deallocations: StdArc::new(AtomicUsize::new(0)),
+                }),
+            }),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -118,6 +151,65 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+    assert_eq!(fts_allocations.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(all(nightly, feature = "fts"))]
+#[test]
+fn database_fts_build_and_merge_use_only_the_fts_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let mv_allocations = StdArc::new(AtomicUsize::new(0));
+    let db = crate::Database::open(
+        StdArc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true))
+            .allocators(DatabaseAllocators {
+                mv_store: DynAllocator::new(CountingAlloc {
+                    allocations: mv_allocations.clone(),
+                    deallocations: StdArc::new(AtomicUsize::new(0)),
+                }),
+                fts: DynAllocator::new(CountingAlloc {
+                    allocations: allocations.clone(),
+                    deallocations: deallocations.clone(),
+                }),
+            }),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO docs VALUES (7, 'hello turso')",
+        "INSERT INTO docs VALUES (19, 'hello world')",
+        "OPTIMIZE INDEX docs_fts",
+    ] {
+        allocations.store(0, Ordering::Relaxed);
+        deallocations.store(0, Ordering::Relaxed);
+        conn.execute(sql).unwrap();
+        assert!(allocations.load(Ordering::Relaxed) > 0, "{sql}");
+        assert_eq!(
+            allocations.load(Ordering::Relaxed),
+            deallocations.load(Ordering::Relaxed),
+            "{sql}"
+        );
+        assert_eq!(mv_allocations.load(Ordering::Relaxed), 0, "{sql}");
+    }
+    let rows = conn
+        .prepare("SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        std::vec![
+            std::vec![crate::Value::from_i64(7)],
+            std::vec![crate::Value::from_i64(19)]
+        ]
+    );
 }
 
 #[cfg(nightly)]

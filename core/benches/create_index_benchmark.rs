@@ -31,8 +31,6 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -423,8 +421,7 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = create_index_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default();
     targets = bench_create_index
 }
 

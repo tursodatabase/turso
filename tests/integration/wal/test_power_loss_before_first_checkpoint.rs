@@ -20,6 +20,7 @@
 //! and the database is reopened with the regular platform IO. All committed
 //! rows must be recovered.
 
+use asserting::prelude::*;
 use std::sync::Arc;
 
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
@@ -59,11 +60,9 @@ fn test_committed_wal_survives_power_loss_before_first_checkpoint() {
     // exactly what a power loss would leave on disk.
     let durable = io.durable_files();
     let wal_path = format!("{db_path_str}-wal");
+    // synchronous=FULL commits must have fsync'd frames into the -wal.
     let durable_wal = durable.get(&wal_path).map(|bytes| bytes.len()).unwrap_or(0);
-    assert!(
-        durable_wal > 0,
-        "synchronous=FULL commits must have fsync'd frames into the -wal"
-    );
+    assert_that!(durable_wal).is_greater_than(0);
     for (path, bytes) in &durable {
         std::fs::write(path, bytes).unwrap();
     }
@@ -73,13 +72,9 @@ fn test_committed_wal_survives_power_loss_before_first_checkpoint() {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
-    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM t");
-    assert_eq!(
-        rows,
-        vec![vec![rusqlite::types::Value::Integer(10)]],
-        "all 10 committed (fsync-acknowledged) transactions must be recovered \
-         from the WAL after a crash before the first checkpoint"
-    );
+    // All 10 committed, fsync-acknowledged transactions must come back from
+    // the WAL after a crash before the first checkpoint.
+    assert_that!(limbo_exec_rows(&conn, "SELECT count(*) FROM t")).is_equal_to(vec![row![10]]);
 }
 
 /// SQLite guarantees that a WAL never exists next to an empty main database
@@ -119,12 +114,10 @@ fn test_page1_is_durable_in_main_file_before_first_wal_commit() {
         .get(&db_path_str)
         .map(|bytes| bytes.len())
         .unwrap_or(0);
-    assert!(
-        durable_db >= 4096,
-        "page 1 must be durable in the main database file before the first \
-         WAL commit (got {durable_db} durable bytes); a WAL next to a 0-byte \
-         database file is a state SQLite deletes the WAL for"
-    );
+    // Page 1 must be durable in the main database file before the first WAL
+    // commit. A WAL next to a 0-byte database file is a state SQLite deletes
+    // the WAL for.
+    assert_that!(durable_db).is_at_least(4096);
     for (path, bytes) in &durable {
         std::fs::write(path, bytes).unwrap();
     }
@@ -135,10 +128,8 @@ fn test_page1_is_durable_in_main_file_before_first_wal_commit() {
     let count: i64 = sqlite
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(
-        count, 10,
-        "SQLite must recover all committed transactions from the crash image"
-    );
+    // SQLite must recover every committed transaction from the crash image.
+    assert_that!(count).is_equal_to(10);
 }
 
 /// A WAL that holds frames next to a database file with zero pages does not
@@ -171,11 +162,9 @@ fn test_orphan_wal_of_an_empty_database_is_discarded_like_sqlite() {
     for (path, bytes) in &io.durable_files() {
         std::fs::write(path, bytes).unwrap();
     }
+    // The committed data must sit in the -wal.
     let source_wal = std::fs::read(format!("{source_path_str}-wal")).unwrap();
-    assert!(
-        !source_wal.is_empty(),
-        "the committed data must sit in the -wal"
-    );
+    assert_that!(&source_wal).is_not_empty();
 
     // Copy the WAL next to a database file that does not exist, which is what
     // a user leaves behind by deleting the `.db` to reset the database and
@@ -240,9 +229,7 @@ fn test_orphan_wal_of_an_empty_database_is_discarded_like_sqlite() {
     let count: i64 = sqlite
         .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count, 0, "SQLite also opens the database empty");
-    assert!(
-        !sqlite_wal_path.exists(),
-        "SQLite also deletes the orphan WAL"
-    );
+    // SQLite also opens the database empty and deletes the orphan WAL.
+    assert_that!(count).is_zero();
+    assert_that!(sqlite_wal_path.exists()).is_false();
 }

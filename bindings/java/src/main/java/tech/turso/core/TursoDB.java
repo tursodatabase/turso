@@ -21,7 +21,6 @@ public final class TursoDB implements AutoCloseable {
   private static final Logger logger = LoggerFactory.getLogger(TursoDB.class);
   // Pointer to database instance
   private long dbPointer;
-  private boolean isOpen;
 
   private final String url;
   private final String filePath;
@@ -212,12 +211,12 @@ public final class TursoDB implements AutoCloseable {
   // TODO: add support for JNI
   public native void interrupt();
 
-  public boolean isClosed() {
-    return !this.isOpen;
+  public synchronized boolean isClosed() {
+    return !isOpen();
   }
 
-  public boolean isOpen() {
-    return this.isOpen;
+  public synchronized boolean isOpen() {
+    return dbPointer != 0;
   }
 
   private void open(int openFlags, @Nullable String cipher, @Nullable String hexkey)
@@ -240,7 +239,6 @@ public final class TursoDB implements AutoCloseable {
     } else {
       dbPointer = openUtf8(filePathBytes, openFlags);
     }
-    isOpen = true;
   }
 
   private native long openUtf8(byte[] file, int openFlags) throws SQLException;
@@ -248,18 +246,22 @@ public final class TursoDB implements AutoCloseable {
   private native long openWithEncryptionUtf8(
       byte[] file, int openFlags, String cipher, String hexkey) throws SQLException;
 
-  public long connect() throws SQLException {
+  public synchronized long connect() throws SQLException {
+    if (!isOpen()) {
+      throw TursoExceptionUtils.buildTursoException(
+          TursoErrorCode.TURSO_ETC.code, "database is closed");
+    }
     return connect0(dbPointer);
   }
 
   private native long connect0(long databasePtr) throws SQLException;
 
   @Override
-  public void close() throws Exception {
-    if (!isOpen) return;
+  public synchronized void close() throws Exception {
+    if (!isOpen()) return;
 
     close0(dbPointer);
-    isOpen = false;
+    dbPointer = 0;
   }
 
   private native void close0(long databasePtr) throws SQLException;

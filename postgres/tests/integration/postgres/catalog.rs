@@ -241,6 +241,48 @@ fn test_pg_type_array_types(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_pg_indexes_lists_index_definitions(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE items (id INT, name TEXT, price INT)")
+        .unwrap();
+    conn.execute("CREATE INDEX items_name_idx ON items (name)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX items_price_idx ON items (price) WHERE price > 0")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT schemaname, tablename, indexname, tablespace, indexdef
+             FROM pg_catalog.pg_indexes
+             ORDER BY indexname",
+        )
+        .unwrap();
+
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![
+            vec![
+                Value::build_text("public"),
+                Value::build_text("items"),
+                Value::build_text("items_name_idx"),
+                Value::Null,
+                Value::build_text("CREATE INDEX items_name_idx ON items USING btree (name)"),
+            ],
+            vec![
+                Value::build_text("public"),
+                Value::build_text("items"),
+                Value::build_text("items_price_idx"),
+                Value::Null,
+                Value::build_text(
+                    "CREATE UNIQUE INDEX items_price_idx ON items USING btree (price) WHERE price > 0"
+                ),
+            ],
+        ]
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // pg_index tests
 // ──────────────────────────────────────────────────────────────────────

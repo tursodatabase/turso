@@ -10,6 +10,8 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("{0}")]
+    IoBackendUnavailable(String),
     /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
     /// e.g. ALTER TABLE validation or window-function argument checks.
     /// Displayed bare, like sqlite3_errmsg. Kept distinct from `Constraint`
@@ -18,8 +20,10 @@ pub enum LimboError {
     SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
-    #[error("Database is full: {0}")]
-    DatabaseFull(String),
+    #[error("database or disk is full")]
+    DatabaseFull,
+    #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
+    SequenceExhausted { name: String, ascending: bool },
     #[error("Parse error: {0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
@@ -69,7 +73,7 @@ pub enum LimboError {
     TooBig,
     #[error("database table is locked")]
     TableLocked,
-    #[error("Error: Resource is read-only")]
+    #[error("attempt to write a readonly database")]
     ReadOnly,
     #[error("Database is busy")]
     Busy,
@@ -171,13 +175,21 @@ impl LimboError {
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
-            Self::DatabaseFull(_) => 13,
+            Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
+    }
+}
+
+fn sequence_bound(ascending: &bool) -> &'static str {
+    if *ascending {
+        "maximum"
+    } else {
+        "minimum"
     }
 }
 
@@ -290,10 +302,22 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
     v
 }
 
+/// Builds the error for [bail_parse_error!]. The message is formatted here, out
+/// of line, so that the many functions that can fail with a parse error do not
+/// each hold the formatting temporaries in their stack frames. This matters
+/// for the functions that translate expressions, which recurse once per level
+/// of an expression.
+#[doc(hidden)]
+#[cold]
+#[inline(never)]
+pub fn parse_error(message: std::fmt::Arguments<'_>) -> LimboError {
+    LimboError::ParseError(std::fmt::format(message))
+}
+
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*)).into()))
+        return $crate::error::cold_return(Err($crate::error::parse_error(format_args!($($arg)*)).into()))
     };
 }
 

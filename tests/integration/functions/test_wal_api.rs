@@ -64,6 +64,41 @@ fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
     assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
 }
 
+#[test]
+fn test_wal_frame_transfer_reserved_bytes() {
+    let source = TempDatabase::new_empty();
+    let writer = source.connect_limbo();
+    writer.set_reserved_bytes(8).unwrap();
+    writer.execute("CREATE TABLE t(y BLOB)").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (zeroblob(4050)), (zeroblob(4056))")
+        .unwrap();
+    let expected = vec![(4050,), (4056,)];
+    let rows: Vec<(i64,)> = writer.exec_rows("SELECT length(y) FROM t");
+    assert_eq!(rows, expected);
+
+    let target = TempDatabase::new_empty();
+    let importer = target.connect_limbo();
+    importer.get_pager().reset_checksum_context();
+    importer.set_reserved_bytes(0).unwrap();
+    importer.execute("BEGIN IMMEDIATE").unwrap();
+    importer.execute("COMMIT").unwrap();
+    let reader = target.connect_limbo();
+    let mut frame = [0; 24 + 4096];
+    importer.wal_insert_begin().unwrap();
+    for frame_id in 1..=writer.wal_state().unwrap().max_frame {
+        writer.wal_get_frame(frame_id, &mut frame).unwrap();
+        importer.wal_insert_frame(frame_id, &frame).unwrap();
+    }
+    assert_eq!(importer.get_reserved_bytes(), Some(8));
+    importer.wal_insert_end(false).unwrap();
+
+    for conn in [reader, importer, target.connect_limbo()] {
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT length(y) FROM t");
+        assert_eq!(rows, expected);
+    }
+}
+
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
@@ -974,4 +1009,29 @@ fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
             ))
             .unwrap();
     }
+}
+
+#[turso_macros::test()]
+fn test_wal_watermark_read_page_out_of_range_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    let max_frame = conn.wal_state().unwrap().max_frame;
+    assert!(max_frame > 1);
+    let mut page = vec![0u8; 4096];
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame + 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+
+    conn.checkpoint(CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame - 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
 }

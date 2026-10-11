@@ -15,7 +15,7 @@
 //!
 //! You can find a full list of SQLite opcodes at:
 //!
-//! https://www.sqlite.org/opcode.html
+//! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
@@ -34,6 +34,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+#[cfg(test)]
+mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -58,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -90,7 +92,7 @@ use execute::{
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
-use crate::storage::sqlite3_ondisk::read_varint;
+use crate::storage::sqlite3_ondisk::split_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{
@@ -271,7 +273,7 @@ impl CommitState {
     }
 
     fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
-        match self {
+        let db_id = match self {
             CommitState::CommittingAttachedMvcc {
                 state_machine,
                 db_id: attached_db_id,
@@ -285,8 +287,11 @@ impl CommitState {
                 {
                     connection.bump_prepare_context_generation();
                 }
+                *attached_db_id
             }
-            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {
+                crate::MAIN_DB_ID
+            }
             _ => return, // no-op for already-finalized state machines and non-MVCC commit states
         };
 
@@ -299,6 +304,7 @@ impl CommitState {
         // The locks/exclusive slot the SM acquired are released by the same
         // cleanup path on drop.
         *self = CommitState::Ready;
+        connection.end_abandoned_mvcc_commit(db_id);
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
@@ -307,7 +313,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -320,7 +326,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
-            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
                 RecordBuf::alloc(),
@@ -351,7 +357,7 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+            (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
     }
@@ -455,6 +461,14 @@ impl Register {
             _ => {
                 *self = Register::Value(Value::Numeric(Numeric::Float(val)));
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_numeric(&mut self, val: Numeric) {
+        match val {
+            Numeric::Integer(i) => self.set_int(i),
+            Numeric::Float(f) => self.set_float(f),
         }
     }
 
@@ -601,7 +615,7 @@ pub struct OpHashProbeState {
 }
 
 // repr(u8): with the tag in its own byte, the idle test that every Column
-// and RowId runs is one byte compare instead of a niche computation on a
+// runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
 enum ActiveOpState {
@@ -618,7 +632,6 @@ enum ActiveOpState {
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -644,7 +657,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -776,7 +788,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState::Start
     );
     active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -832,6 +843,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {
@@ -870,6 +883,7 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -892,7 +906,7 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
-    pre_op_registers: Option<Box<[Register]>>,
+    pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -974,7 +988,7 @@ pub struct ProgramState {
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
     ///
-    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// capture_data_changes has type `Option<CaptureDataChangesInfo>` (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
@@ -1036,11 +1050,15 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
+        let registers = (0..max_registers)
+            .map(|_| Register::Value(Value::Null))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
@@ -1153,6 +1171,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -1181,14 +1200,19 @@ impl ProgramState {
                 cursor.close(context);
             }
             match cursor.take() {
-                Some(Cursor::BTree(cursor)) => crate::storage::btree::CursorTrait::recycle(cursor),
-                Some(Cursor::Dyn(cursor)) => cursor.recycle(),
+                Some(Cursor::BTree(cursor, ..)) => {
+                    crate::storage::btree::CursorTrait::recycle(cursor)
+                }
+                Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
                 _ => {}
             }
             *context = None;
         }
-        for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
-            cursor.close(&context);
+        if !self.closed_index_method_cursors.is_empty() {
+            // for performance reasons
+            for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
+                cursor.close(&context);
+            }
         }
         self.index_method_finalize_cursor = 0;
         self.index_method_finalize_subprogram_keys = None;
@@ -1249,7 +1273,7 @@ impl ProgramState {
         *self.n_change.get_mut() = 0;
         *self.n_total_change.get_mut() = 0;
         // reset has exclusive access, so no lock or atomic store is needed.
-        *self.explain_state.get_mut() = ExplainState::default();
+        self.explain_state.get_mut().clear();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
@@ -1258,17 +1282,22 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_change);
+        bump_change_count(&self.n_total_change);
+    }
+
+    pub(crate) fn record_statement_changes(&self, count: i64) {
+        add_to_change_count(&self.n_change, count);
+        add_to_change_count(&self.n_total_change, count);
     }
 
     pub(crate) fn record_total_change(&self) {
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_total_change);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
     /// now, including re-entry while its commit is in progress.
-    #[inline]
+    #[inline(always)]
     /// `self_counted` is true while this statement is still included in
     /// `Connection::n_active_root_statements`. It is false when a statement
     /// that already finished (released on Done or on its step error) is being
@@ -1581,6 +1610,9 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
                     Ok(())
                 } else if self.uses_subjournal || !attached_pagers.is_empty() {
                     if self.uses_subjournal {
@@ -1612,6 +1644,13 @@ impl ProgramState {
                             }
                         }
                     });
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                        }
+                    }
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
@@ -1801,6 +1840,14 @@ impl ExplainState {
             self.pending.push_back(subprogram);
         }
     }
+
+    fn clear(&mut self) {
+        // optimization to skip the drop glue
+        if self.pending.is_empty() && self.queued_subprograms.is_empty() && self.current.is_none() {
+            return;
+        }
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1814,7 +1861,7 @@ pub struct PreparedProgram {
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
-    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -1825,7 +1872,7 @@ pub struct PreparedProgram {
     pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -2192,20 +2239,24 @@ impl Program {
         if !vdbe_trace {
             return;
         }
+        let snapshots: Box<[_]> = state
+            .registers
+            .iter()
+            .map(|register| format!("{register:?}"))
+            .collect();
         // Diff registers from PREVIOUS opcode
         // The last opcode (Halt) won't have its diff printed, but Halt
         // doesn't write to any registers
-        if let Some(ref old) = state.pre_op_registers {
-            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+        if let Some(old) = state.pre_op_registers.take() {
+            for (i, (old_reg, new_reg)) in old.iter().zip(snapshots.iter()).enumerate() {
                 if old_reg != new_reg {
-                    match new_reg {
+                    match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
                 }
             }
-            state.pre_op_registers = None;
         }
 
         // Print CURRENT opcode
@@ -2223,7 +2274,7 @@ impl Program {
             )
         );
         // Snapshot for next iteration
-        state.pre_op_registers = Some(state.registers.clone());
+        state.pre_op_registers = Some(snapshots);
     }
 
     /// Step in [QueryMode::Normal]
@@ -2245,6 +2296,7 @@ impl Program {
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
+                crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
             }
             ProgramStep::Interrupt => {
@@ -3160,6 +3212,7 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
+                        connection.get_wal_autocheckpoint(),
                         connection.get_sync_mode_for_database(db_id)?,
                         connection.get_data_sync_retry(),
                     ) {
@@ -3224,7 +3277,7 @@ impl Program {
     /// Statement teardown passes its actual counted state: a statement that
     /// already finished was released on Done or on its step error, so the
     /// counted statements are all siblings (see
-    /// [`ProgramState::can_autocommit_now`]).
+    /// `ProgramState::can_autocommit_now`).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,
@@ -3244,6 +3297,11 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        if let Err(err) = execute::abort_active_subprogram(self, state, err) {
+            capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
+        }
+        state.extension_state = crate::native_ext::ExtensionState::None;
+        crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -3612,6 +3670,18 @@ impl Program {
                     }
                 },
             }
+            if (must_rollback_tx_if_needed || inside_explicit_transaction)
+                && !keeps_prior_changes
+                && self.connection.get_auto_commit()
+            {
+                if let Err(err) = execute::vtab_rollback_all(&self.connection) {
+                    capture_abort_error(
+                        &mut abort_error,
+                        err,
+                        "Failed to rollback virtual tables during abort",
+                    );
+                }
+            }
         }
         if state.uses_subjournal {
             pager.stop_use_subjournal();
@@ -3680,6 +3750,19 @@ impl Deref for Program {
     }
 }
 
+#[inline(always)]
+fn bump_change_count(count: &AtomicI64) {
+    add_to_change_count(count, 1);
+}
+
+#[inline(always)]
+fn add_to_change_count(count: &AtomicI64, amount: i64) {
+    count.store(
+        count.load(Ordering::Relaxed).wrapping_add(amount),
+        Ordering::Relaxed,
+    );
+}
+
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
 pub(crate) fn split_registers(
     registers: &mut [Register],
@@ -3698,7 +3781,7 @@ pub(crate) fn split_registers(
 
 pub fn registers_to_ref_values<'a>(
     registers: &'a [Register],
-) -> impl ExactSizeIterator<Item = ValueRef<'a>> {
+) -> impl ExactSizeIterator<Item = ValueRef<'a>> + Clone {
     registers.iter().map(|reg| reg.get_value().as_ref())
 }
 
@@ -3901,9 +3984,35 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
+    let bytes = *header;
+    if let Some((first, rest)) = bytes.split_first() {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(u64::from(*first));
+        }
+    }
+    let (serial_type, rest) = split_varint(bytes)?;
+    *header = rest;
     Ok(serial_type)
+}
+
+/// Puts a TEXT value in a register that does not hold text yet.
+#[cold]
+#[inline(never)]
+fn start_text_register(dest: &mut Register, text_data: &[u8]) -> Result<()> {
+    use crate::types::Text;
+    let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
+    dest.set_text(Text::new(text_str.to_string()))
+}
+
+/// Puts a BLOB value in a register that does not hold a blob yet.
+#[cold]
+#[inline(never)]
+fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
+    crate::with_value_blob_allocation_site!(RecordDecode, {
+        let blob = crate::types::value_blob_from_slice(blob_data)?;
+        dest.set_blob(blob)
+    })
 }
 
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
@@ -3914,7 +4023,7 @@ fn decode_serial_type_into_register(
     data: &mut &[u8],
     dest: &mut Register,
 ) -> Result<()> {
-    use crate::types::{Extendable, Text};
+    use crate::types::Extendable;
     match serial_type {
         // NULL
         0 => {
@@ -4022,10 +4131,7 @@ fn decode_serial_type_into_register(
                 Register::Value(Value::Blob(existing_blob)) => {
                     existing_blob.do_extend(&blob_data)?;
                 }
-                _ => {
-                    let blob = crate::types::value_blob_from_slice(blob_data)?;
-                    dest.set_blob(blob)?;
-                }
+                _ => start_blob_register(dest, blob_data)?,
             }
             *data = &data[content_size..];
         }),
@@ -4036,19 +4142,11 @@ fn decode_serial_type_into_register(
                 return Err(LimboError::Corrupt("Invalid Text value".into()));
             }
             let text_data = &data[..content_size];
-            let Some(text_str) = crate::types::validate_utf8(text_data) else {
-                mark_unlikely();
-                return Err(LimboError::Corrupt(
-                    "TEXT value contains invalid UTF-8".into(),
-                ));
-            };
             match dest {
                 Register::Value(Value::Text(existing_text)) => {
-                    existing_text.do_extend(&text_str)?;
+                    existing_text.replace_with_bytes(text_data)?;
                 }
-                _ => {
-                    dest.set_text(Text::new(text_str.to_string()))?;
-                }
+                _ => start_text_register(dest, text_data)?,
             }
             *data = &data[content_size..];
         }
@@ -4066,6 +4164,18 @@ fn decode_serial_type_into_register(
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn change_count_increment_matches_atomic_wraparound() {
+        let expected = AtomicI64::new(i64::MAX);
+        expected.fetch_add(1, Ordering::Relaxed);
+        let expected = expected.load(Ordering::Relaxed);
+
+        let actual = AtomicI64::new(i64::MAX);
+        bump_change_count(&actual);
+
+        assert_eq!(actual.load(Ordering::Relaxed), expected);
+    }
 
     #[test]
     fn program_step_conversion_preserves_error_allocation() {
@@ -4115,6 +4225,106 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    /// Builds a record payload holding one TEXT value of `value`.
+    fn one_text_record(value: &[u8]) -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(13 + 2 * value.len() as u64, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    fn decode_one_text(payload: &[u8], destination: &mut Register) -> Result<()> {
+        let mut iterator = crate::types::ValueIterator::new(payload)?;
+        iterator
+            .nth_into_register(0, destination)
+            .expect("record contains one value")
+    }
+
+    fn register_text(destination: &Register) -> &str {
+        match destination {
+            Register::Value(Value::Text(text)) => text.as_str(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_every_length() {
+        let mut destination = Register::Value(Value::Null);
+        // Grow the buffer first so later values take the reuse path.
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).len(), 80);
+
+        for len in 0..=80usize {
+            let value: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
+            decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+            assert_eq!(
+                register_text(&destination).as_bytes(),
+                value.as_slice(),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_multibyte_utf8() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+
+        for value in [
+            "é",
+            "héllo",
+            "日本語",
+            "\u{1F600}",
+            "aé",
+            "ααααααααα",
+            "ααααααααααααααααααααααααααααααααααα",
+        ] {
+            decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
+            assert_eq!(register_text(&destination), value);
+        }
+    }
+
+    #[test]
+    fn text_decode_reads_a_serial_type_that_needs_two_varint_bytes() {
+        let mut destination = Register::Value(Value::Null);
+        let value: Vec<u8> = (0..200usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).as_bytes(), value.as_slice());
+
+        decode_one_text(&one_text_record(b"short"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "short");
+    }
+
+    #[test]
+    fn text_decode_rejects_invalid_utf8_and_leaves_the_register_usable() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+
+        let short_invalid = [0xff, 0xfe];
+        let long_invalid = [0xff; 20];
+        for invalid in [&short_invalid[..], &long_invalid[..]] {
+            let result = decode_one_text(&one_text_record(invalid), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == "TEXT value contains invalid UTF-8"
+                ),
+                "unexpected result: {result:?}"
+            );
+            let _ = register_text(&destination);
+        }
+        decode_one_text(&one_text_record(b"ok"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "ok");
     }
 
     #[test]
@@ -4168,12 +4378,10 @@ mod tests {
     }
 
     #[test]
-    fn register_try_clone_copies_each_variant() {
+    fn register_try_clone_copies_values_and_records() {
         let record_values = [Value::from_i64(1), Value::build_text("record payload")];
-        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
         let registers = [
             Register::Value(Value::build_text("value")),
-            Register::Aggregate(AggContext::Builtin(aggregate_values)),
             Register::Record(
                 ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
             ),
@@ -4222,14 +4430,6 @@ mod tests {
             Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
             _ => unreachable!(),
         }
-
-        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
-            Value::build_text("agg state"),
-            Value::from_i64(2),
-        ]));
-        let mut dst = Register::Value(Value::Null);
-        dst.try_clone_from(&src).unwrap();
-        assert_eq!(dst, src);
     }
 
     #[test]

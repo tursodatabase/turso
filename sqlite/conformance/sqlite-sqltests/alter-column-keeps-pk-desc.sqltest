@@ -1,0 +1,34 @@
+@database :memory:
+
+setup desc-pk-tables {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC, q TEXT);
+    CREATE TABLE v(a TEXT PRIMARY KEY DESC, q TEXT);
+    CREATE TABLE w(a INTEGER PRIMARY KEY DESC, q TEXT, r TEXT);
+}
+
+@setup desc-pk-tables
+test add-column-keeps-desc-on-integer-primary-key {
+    ALTER TABLE t ADD COLUMN z TEXT;
+    SELECT instr(sql, 'PRIMARY KEY DESC') > 0 FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    1
+}
+
+@setup desc-pk-tables
+test add-column-keeps-desc-on-text-primary-key {
+    ALTER TABLE v ADD COLUMN z TEXT;
+    SELECT instr(sql, 'PRIMARY KEY DESC') > 0 FROM sqlite_schema WHERE name = 'v';
+}
+expect {
+    1
+}
+
+@setup desc-pk-tables
+test drop-column-keeps-desc-on-integer-primary-key {
+    ALTER TABLE w DROP COLUMN r;
+    SELECT instr(sql, 'PRIMARY KEY DESC') > 0 FROM sqlite_schema WHERE name = 'w';
+}
+expect {
+    1
+}

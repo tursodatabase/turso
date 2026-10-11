@@ -30,9 +30,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            emit_fk_child_update_counters, emit_fk_parent_deferred_new_key_probes,
-            emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
-            ForeignKeyActions, ParentKeyNewProbeMode,
+            affected_parent_fks_for_update, emit_fk_child_update_counters,
+            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
+            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
+            ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -59,7 +60,7 @@ use crate::{
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
-use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::ast::{RefAct, ResolveType, TriggerEvent, TriggerTime};
 
 /// Info about position of rowid alias in the table if present + whether the current UPDATE statement will update the rowid.
 struct RowidUpdateInfo {
@@ -172,6 +173,7 @@ pub fn emit_program_for_update(
                     iter_dir: IterationDirection::Forwards,
                     index: None,
                 }),
+                unmatched_right_rows_plan: None,
                 join_info: None,
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
@@ -186,13 +188,14 @@ pub fn emit_program_for_update(
             identifier: target_table.identifier.clone(),
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
-            using_dedup_hidden_cols: ColumnMask::default(),
+            join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
             cte_explicit_columns: vec![],
             cte_id: None,
             cte_definition_only: false,
             rowid_referenced: false,
+            outer_join_may_null_extend: false,
             scope_depth: 0,
         });
         // CTEs are also visible during the write phase, so add them here.
@@ -510,13 +513,30 @@ struct UpdateColumnCtx<'a> {
 }
 
 impl UpdateColumnCtx<'_> {
-    fn col_len(&self) -> usize {
-        self.target_table.table.columns().len()
+    /// Returns `None` when CDC does not record updates, or when the column is virtual
+    /// and so has no entry in the `updates` record.
+    fn cdc_update_registers(&self, idx: usize, column: &Column) -> Option<CdcUpdateRegisters> {
+        if column.is_virtual_generated() {
+            return None;
+        }
+        let start = self.cdc_updates_register?;
+        let stored_col_count = self.layout.num_non_virtual_cols();
+        let offset = self.layout.to_reg_offset(idx);
+        Some(CdcUpdateRegisters {
+            change_flag: start + offset,
+            new_value: start + stored_col_count + offset,
+        })
     }
 
     fn table_name(&self) -> &str {
         self.target_table.table.get_name()
     }
+}
+
+/// Registers of one column's entries in the CDC `updates` record.
+struct CdcUpdateRegisters {
+    change_flag: usize,
+    new_value: usize,
 }
 
 /// Emit the VDBE instructions that enforce a `NOT NULL` constraint on the
@@ -913,22 +933,24 @@ fn emit_update_column_values<'a>(
                     )?;
                 }
 
-                if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
-                    let change_reg = cdc_updates_register + idx;
-                    let value_reg = cdc_updates_register + column_ctx.col_len() + idx;
-                    program.emit_bool(true, change_reg);
+                if let Some(CdcUpdateRegisters {
+                    change_flag,
+                    new_value,
+                }) = column_ctx.cdc_update_registers(idx, table_column)
+                {
+                    program.emit_bool(true, change_flag);
                     program.mark_last_insn_constant();
                     let mut updated = false;
                     if let Some(ddl_query_for_cdc_update) = column_ctx.cdc_update_alter_statement {
                         if table_column.name.as_deref() == Some("sql") {
-                            program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
+                            program.emit_string8(ddl_query_for_cdc_update.to_string(), new_value);
                             updated = true;
                         }
                     }
                     if !updated {
                         program.emit_insn(Insn::Copy {
                             src_reg: target_reg,
-                            dst_reg: value_reg,
+                            dst_reg: new_value,
                             extra_amount: 0,
                         });
                     }
@@ -976,12 +998,14 @@ fn emit_update_column_values<'a>(
                 }
             }
 
-            if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
-                let change_bit_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + column_ctx.col_len() + idx;
-                program.emit_bool(false, change_bit_reg);
+            if let Some(CdcUpdateRegisters {
+                change_flag,
+                new_value,
+            }) = column_ctx.cdc_update_registers(idx, table_column)
+            {
+                program.emit_bool(false, change_flag);
                 program.mark_last_insn_constant();
-                program.emit_null(value_reg, None);
+                program.emit_null(new_value, None);
                 program.mark_last_insn_constant();
             }
         }
@@ -1055,6 +1079,7 @@ fn emit_update_insns<'a>(
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
+    let update_body_start = program.insns.len();
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
     let or_conflict = program.resolve_type;
@@ -1231,20 +1256,39 @@ fn emit_update_insns<'a>(
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
 
+    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
     let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
-        Some(program.alloc_registers(2 * col_len))
+        Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
     } else {
         None
     };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
-    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
-    let affected_columns = match target_table.table.btree() {
-        Some(btree) => btree.columns_affected_by_update(&updated_column_indices)?,
+    let target_btree = target_table.table.btree();
+    let affected_columns = match target_btree.as_deref() {
+        Some(table) => table.columns_affected_by_update(&updated_column_indices)?,
         None => updated_column_indices.clone(),
     };
+    let affected_parent_fks = match (connection.foreign_keys_enabled(), target_btree.as_deref()) {
+        (true, Some(table)) => affected_parent_fks_for_update(
+            &t_ctx.resolver,
+            table,
+            &updated_column_indices,
+            update_database_id,
+        )?,
+        _ => crate::alloc::vec![],
+    };
+    let has_parent_fk_checks = affected_parent_fks
+        .iter()
+        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
+    let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
+        matches!(
+            fk.fk.on_update,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        )
+    });
     let column_ctx = UpdateColumnCtx {
         cdc_update_alter_statement,
         target_table: &target_table,
@@ -1328,12 +1372,8 @@ fn emit_update_insns<'a>(
                 &btree_table,
             );
 
-            let has_fk_cascade = connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                });
-
-            let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
+            let needs_old_registers =
+                has_before_triggers || has_after_triggers || has_parent_fk_actions;
 
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
@@ -1527,6 +1567,19 @@ fn emit_update_insns<'a>(
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
+        if btree.is_strict {
+            // pre-encode typecheck for updated columns
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: layout.num_non_virtual_cols(),
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    btree,
+                    t_ctx.resolver.schema(),
+                    Some(&updated_column_indices),
+                )?,
+            });
+        }
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
         let virtual_col_names: HashSet<String> = cols
@@ -1551,18 +1604,17 @@ fn emit_update_insns<'a>(
                 .is_some_and(expr_references_virtual)
         });
 
-        if update_affects_virtual_columns
+        // compute virtual columns pre-encoding, so that we can type-check them later
+        if btree.is_strict
+            || update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
             || has_returning
             || has_check_constraints
             || index_references_virtual_column
         {
-            let columns = target_table.table.columns();
-
-            //TODO don't emit all virtual columns
             let dml_ctx =
-                DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
+                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone());
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
@@ -1572,11 +1624,6 @@ fn emit_update_insns<'a>(
             )?;
         }
     }
-
-    let target_is_strict = target_table
-        .table
-        .btree()
-        .is_some_and(|btree| btree.is_strict);
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
@@ -1662,32 +1709,13 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            let set_col_indices: ColumnMask = set_clauses
-                .iter()
-                .map(|set_clause| set_clause.column_index)
-                .try_collect()?;
-
-            // Pre-encode TypeCheck: validate SET column input types.
-            // Non-SET columns hold encoded values from disk, so skip them (ANY).
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: true,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &btree_table,
-                    t_ctx.resolver.schema(),
-                    Some(&set_col_indices),
-                )?,
-            });
-
-            // Encode only SET clause columns. Non-SET columns were read from disk
-            // and are already encoded; re-encoding them would corrupt data.
+            // Encode updated columns (the others are already encoded)
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 &t_ctx.resolver,
                 btree_table.columns(),
                 start,
-                Some(&set_col_indices),
+                Some(&updated_column_indices),
                 table_name,
                 &layout,
             )?;
@@ -1695,7 +1723,8 @@ fn emit_update_insns<'a>(
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
-                count: layout.num_non_virtual_cols(),
+                count: btree_table.columns().len(),
+                //TODO we should only type-check the generated columns whose dependencies were updated.
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,
@@ -1884,7 +1913,7 @@ fn emit_update_insns<'a>(
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]
-                        .affinity_with_strict(target_is_strict)
+                        .affinity()
                         .aff_mask()
                 }
             })
@@ -2124,9 +2153,7 @@ fn emit_update_insns<'a>(
             // RESTRICT halts immediately, while NO ACTION increments the FK
             // counter so the statement/transaction can fail later if nothing
             // fixes it.
-            if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            }) {
+            if has_parent_fk_checks {
                 let new_key_probe_mode = if any_effective_replace(
                     program.flags.has_statement_conflict(),
                     or_conflict,
@@ -2140,6 +2167,7 @@ fn emit_update_insns<'a>(
                 deferred_new_key_plans = emit_fk_update_parent_actions(
                     program,
                     &table_btree,
+                    &affected_parent_fks,
                     indexes_to_update.iter(),
                     target_table_cursor_id,
                     beg,
@@ -2255,7 +2283,6 @@ fn emit_update_insns<'a>(
                 target_table.table.columns().iter(),
                 start,
                 record_reg,
-                table.is_strict,
             );
 
             if not_exists_check_required {
@@ -2292,7 +2319,6 @@ fn emit_update_insns<'a>(
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                    table.is_strict,
                 ))
             } else {
                 None
@@ -2304,6 +2330,21 @@ fn emit_update_insns<'a>(
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
             let needs_delete = not_exists_check_required
                 || connection.mv_store_for_db(update_database_id).is_some();
+            // A table-column read finishes DeferredSeek. SQLite emits FinishSeek
+            // only when no such read appears before the table write.
+            let table_column_was_read =
+                program.insns[update_body_start..].iter().any(|(insn, _)| {
+                    matches!(
+                        insn,
+                        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. }
+                            if *cursor_id == target_table_cursor_id
+                    )
+                });
+            if target_table.op.index().is_some() && !table_column_was_read {
+                program.emit_insn(Insn::FinishSeek {
+                    cursor_id: target_table_cursor_id,
+                });
+            }
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,
@@ -2383,11 +2424,7 @@ fn emit_update_insns<'a>(
 
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
             // This ensures the new parent key exists when cascade actions update child rows
-            if connection.foreign_keys_enabled()
-                && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
-                })
-            {
+            if has_parent_fk_actions {
                 // OLD column values are stored in preserved_old_registers (contiguous registers)
                 let old_values_start = preserved_old_registers
                     .as_ref()
@@ -2402,6 +2439,7 @@ fn emit_update_insns<'a>(
                     effective_rowid_reg,
                     connection,
                     update_database_id,
+                    &affected_parent_fks,
                 )?;
             }
 
@@ -2481,7 +2519,7 @@ fn emit_update_insns<'a>(
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(cdc_updates_register),
-                    count: to_u32(2 * col_len),
+                    count: to_u32(2 * layout.num_non_virtual_cols()),
                     dest_reg: to_u32(record_reg),
                     index_name: None,
                     affinity_str: None,

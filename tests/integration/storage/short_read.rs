@@ -1,4 +1,5 @@
 use crate::common::{do_flush, limbo_exec_rows_fallible, run_query, TempDatabase};
+use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::fs::OpenOptions;
 
@@ -33,11 +34,8 @@ fn test_truncated_database_returns_short_read_error() {
         run_query(&tmp_db, &conn, "PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    let original_size = std::fs::metadata(&db_path).unwrap().len();
-    assert!(
-        original_size > 4096,
-        "Database should be larger than one page, got {original_size} bytes",
-    );
+    // The database must be larger than one page.
+    assert_that!(std::fs::metadata(&db_path).unwrap().len()).is_greater_than(4096);
 
     // Truncate to 1.5 pages - reading page 2 will get 2048 bytes instead of 4096
     let truncated_size = 4096 + 2048;
@@ -56,12 +54,10 @@ fn test_truncated_database_returns_short_read_error() {
 
         let result = limbo_exec_rows_fallible(&existing_db, &conn, "SELECT * FROM test");
 
-        let err = result.expect_err("Query on truncated database must return an error");
-        let err_string = err.to_string();
-        assert!(
-            err_string.contains("short read"),
-            "Expected 'short read' error, got: {err_string}",
-        );
+        assert_that!(result)
+            .err()
+            .display_string()
+            .contains("short read");
     }
 }
 
@@ -99,13 +95,11 @@ fn test_truncated_wal_returns_short_read_error() {
         do_flush(&conn, &tmp_db).unwrap();
     }
 
-    let wal_size = std::fs::metadata(&wal_path)
+    // The WAL must contain data.
+    assert_that!(std::fs::metadata(&wal_path)
         .expect("WAL file should exist")
-        .len();
-    assert!(
-        wal_size > 4096,
-        "WAL should contain data, got {wal_size} bytes"
-    );
+        .len())
+    .is_greater_than(4096);
 
     // Truncate WAL mid-frame: header (32) + 1 full frame (24+4096) + partial frame
     let truncated_wal_size = 32 + (24 + 4096) + 2048;
@@ -214,10 +208,8 @@ fn test_zeroed_page_returns_corrupt_error() {
     // Zero out page 2 (bytes 4096-8191)
     {
         let mut file_contents = std::fs::read(&db_path).unwrap();
-        assert!(
-            file_contents.len() >= 8192,
-            "Database should have at least 2 pages"
-        );
+        // The database must have at least two pages.
+        assert_that!(&file_contents).has_at_least_length(8192);
         file_contents[4096..8192].fill(0);
         std::fs::write(&db_path, file_contents).unwrap();
     }
@@ -228,11 +220,10 @@ fn test_zeroed_page_returns_corrupt_error() {
 
         let result = limbo_exec_rows_fallible(&existing_db, &conn, "SELECT * FROM test");
 
-        let err = result.expect_err("Query on database with zeroed page must return an error");
-        let err_string = err.to_string();
-        assert!(
-            err_string.contains("Corrupt") && err_string.contains("Invalid page type: 0"),
-            "Expected 'Corrupt database: Invalid page type: 0' error, got: {err_string}",
-        );
+        assert_that!(result)
+            .err()
+            .display_string()
+            .contains("Corrupt")
+            .contains("Invalid page type: 0");
     }
 }

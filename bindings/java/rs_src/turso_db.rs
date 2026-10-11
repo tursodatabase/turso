@@ -222,10 +222,15 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoDB_close0<'local>(
-    _env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
     db_pointer: jlong,
 ) {
+    if db_pointer == 0 {
+        let e = TursoError::InvalidDatabasePointer;
+        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+        return;
+    }
     TursoDB::drop(db_pointer);
 }
 

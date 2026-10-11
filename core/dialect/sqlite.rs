@@ -138,7 +138,7 @@ pub fn table_sql_for_replay(sql: &str) -> crate::Result<String> {
 
 /// Insert the standard SQLite-style catalog tables into `schema`.
 ///
-/// `pragma_*` virtual tables use the dedicated [`VirtualTableType::Pragma`]
+/// `pragma_*` virtual tables use the dedicated `VirtualTableType::Pragma`
 /// variant (they aren't `InternalVirtualTable`), so they are inserted
 /// directly. The rest go through [`Schema::register_internal_vtab`] — the
 /// same path external callers use via [`crate::Database::register_internal_vtab`].

@@ -1506,3 +1506,15 @@ test table-referenced-with-call-arguments-rejected {
 expect error {
     'not_a_function' is not a function
 }
+
+test materialized-cte-in-a-nested-subquery-reads-the-outer-row {
+    CREATE TABLE mc(id INTEGER PRIMARY KEY, x INT);
+    INSERT INTO mc VALUES (1, 10), (2, 20);
+    SELECT *
+    FROM (SELECT mc.id, (WITH c AS MATERIALIZED (SELECT mc.x AS v) SELECT v FROM c) AS w FROM mc) AS q
+    ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+}
