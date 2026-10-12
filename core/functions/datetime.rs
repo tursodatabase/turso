@@ -1,3 +1,4 @@
+use crate::io::clock::Clock;
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
@@ -195,20 +196,17 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
     Some((val, &z[digits..]))
 }
 
-fn set_to_current(p: &mut DateTime) {
-    let now = std::time::SystemTime::now();
-    let duration = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+fn set_to_current(p: &mut DateTime, clock: &dyn Clock) {
+    let now = clock.current_time_wall_clock();
     const UNIX_EPOCH_IJD: i64 = 210866760000000;
-    p.i_jd = UNIX_EPOCH_IJD + duration.as_millis() as i64;
+    p.i_jd = UNIX_EPOCH_IJD + now.secs * 1000 + i64::from(now.micros / 1000);
     p.valid_jd = true;
     p.is_utc = true;
     p.is_local = false;
     p.clear_ymd_hms_tz();
 }
 
-fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
+fn parse_date_or_time(value: &str, p: &mut DateTime, clock: &dyn Clock) -> Result<()> {
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
     }
@@ -216,7 +214,7 @@ fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
         return Ok(());
     }
     if value.eq_ignore_ascii_case("now") {
-        set_to_current(p);
+        set_to_current(p, clock);
         return Ok(());
     }
     let numeric_value = value.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -231,7 +229,7 @@ fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
     }
     if value.eq_ignore_ascii_case("subsec") || value.eq_ignore_ascii_case("subsecond") {
         p.use_subsec = true;
-        set_to_current(p);
+        set_to_current(p, clock);
         return Ok(());
     }
     Err(crate::LimboError::InvalidModifier("Parse Failed".into()))
@@ -865,7 +863,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
 }
 
-pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
+pub fn exec_datetime_general<I, E, V>(clock: &dyn Clock, values: I, func_type: &str) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -876,12 +874,12 @@ where
     let mut has_modifier = false;
 
     if values.len() == 0 {
-        set_to_current(&mut p);
+        set_to_current(&mut p, clock);
     } else {
         let first = values.next().unwrap();
         match blob_as_text(first.as_value_ref()) {
             ValueRef::Text(s) => {
-                if parse_date_or_time(s.as_str(), &mut p).is_err() {
+                if parse_date_or_time(s.as_str(), &mut p, clock).is_err() {
                     return Value::Null;
                 }
             }
@@ -987,70 +985,72 @@ where
     }
 }
 
-pub fn exec_date<I, E, V>(values: I) -> Value
+pub fn exec_date<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "date")
+    exec_datetime_general(clock, values, "date")
 }
 
-pub fn exec_time<I, E, V>(values: I) -> Value
+pub fn exec_time<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "time")
+    exec_datetime_general(clock, values, "time")
 }
 
-pub fn exec_datetime_full<I, E, V>(values: I) -> Value
+pub fn exec_datetime_full<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "datetime")
+    exec_datetime_general(clock, values, "datetime")
 }
 
-pub fn exec_julianday<I, E, V>(values: I) -> Value
+pub fn exec_julianday<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "julianday")
+    exec_datetime_general(clock, values, "julianday")
 }
 
-pub fn exec_unixepoch<I, E, V>(values: I) -> Value
+pub fn exec_unixepoch<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime_general(values, "unixepoch")
+    exec_datetime_general(clock, values, "unixepoch")
 }
 
-pub fn exec_date_plus(lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (date @ Value::Text(_), Value::Numeric(Numeric::Integer(days)))
-        | (Value::Numeric(Numeric::Integer(days)), date @ Value::Text(_)) => add_days(date, *days),
+        | (Value::Numeric(Numeric::Integer(days)), date @ Value::Text(_)) => {
+            add_days(clock, date, *days)
+        }
         _ => Err(crate::LimboError::Constraint(
             "a date can only be added to an integer number of days".to_string(),
         )),
     }
 }
 
-pub fn exec_date_minus(lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
-            add_days(lhs, days.saturating_neg())
+            add_days(clock, lhs, days.saturating_neg())
         }
         (Value::Text(_), Value::Text(_)) => {
-            let days = julian_day(lhs)? - julian_day(rhs)?;
+            let days = julian_day(clock, lhs)? - julian_day(clock, rhs)?;
             Ok(Value::from_i64(days.round() as i64))
         }
         _ => Err(crate::LimboError::Constraint(
@@ -1059,8 +1059,11 @@ pub fn exec_date_minus(lhs: &Value, rhs: &Value) -> Result<Value> {
     }
 }
 
-fn add_days(date: &Value, days: i64) -> Result<Value> {
-    match exec_date([Value::from_f64(julian_day(date)? + days as f64)]) {
+fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
+    match exec_date(
+        clock,
+        [Value::from_f64(julian_day(clock, date)? + days as f64)],
+    ) {
         Value::Null => Err(crate::LimboError::Constraint(
             "date out of range".to_string(),
         )),
@@ -1068,8 +1071,8 @@ fn add_days(date: &Value, days: i64) -> Result<Value> {
     }
 }
 
-fn julian_day(date: &Value) -> Result<f64> {
-    match exec_julianday([date]) {
+fn julian_day(clock: &dyn Clock, date: &Value) -> Result<f64> {
+    match exec_julianday(clock, [date]) {
         Value::Numeric(Numeric::Float(jd)) => Ok(f64::from(jd)),
         _ => Err(crate::LimboError::Constraint(format!(
             "invalid date value: {date}"
@@ -1077,7 +1080,7 @@ fn julian_day(date: &Value) -> Result<f64> {
     }
 }
 
-pub fn exec_timediff<I, E, V>(values: I) -> Value
+pub fn exec_timediff<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1095,7 +1098,7 @@ where
     let val1 = values.next().unwrap();
     match blob_as_text(val1.as_value_ref()) {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d1).is_err() {
+            if parse_date_or_time(s.as_str(), &mut d1, clock).is_err() {
                 return Value::Null;
             }
         }
@@ -1122,7 +1125,7 @@ where
     let val2 = values.next().unwrap();
     match blob_as_text(val2.as_value_ref()) {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d2).is_err() {
+            if parse_date_or_time(s.as_str(), &mut d2, clock).is_err() {
                 return Value::Null;
             }
         }
@@ -1254,7 +1257,7 @@ where
     Value::from_text(res)
 }
 
-pub fn exec_strftime<I, E, V>(values: I) -> Value
+pub fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1274,14 +1277,14 @@ where
 
     let mut p = DateTime::default();
     if values.len() == 0 {
-        set_to_current(&mut p);
+        set_to_current(&mut p, clock);
     } else {
         let init_val = values.next().unwrap();
         match blob_as_text(init_val.as_value_ref()) {
             ValueRef::Text(s) => {
                 let s_str = s.as_str();
                 if s_str.eq_ignore_ascii_case("now") {
-                    set_to_current(&mut p);
+                    set_to_current(&mut p, clock);
                 } else if let Ok(val) = s_str.parse::<f64>() {
                     p.s = val;
                     p.raw_s = true;
@@ -1291,7 +1294,7 @@ where
                     }
                 } else {
                     let mut temp_p = DateTime::default();
-                    if parse_date_or_time(s_str, &mut temp_p).is_ok() {
+                    if parse_date_or_time(s_str, &mut temp_p, clock).is_ok() {
                         p = temp_p;
                     } else {
                         return Value::Null;
@@ -1483,6 +1486,7 @@ fn blob_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::clock::DefaultClock;
 
     #[test]
     fn test_valid_get_date_from_time_value() {
@@ -1593,7 +1597,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_date(&[input.clone()]);
+            let result = exec_date(&DefaultClock, &[input.clone()]);
             assert_eq!(
                 result,
                 Value::build_text(expected.to_string()),
@@ -1633,7 +1637,7 @@ mod tests {
         ];
 
         for case in invalid_cases.iter() {
-            let result = exec_date([case]);
+            let result = exec_date(&DefaultClock, [case]);
             assert_eq!(result, Value::Null);
         }
     }
@@ -1722,7 +1726,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_time(&[input]);
+            let result = exec_time(&DefaultClock, &[input]);
             if let Value::Text(result_str) = result {
                 assert_eq!(result_str.as_str(), expected);
             } else {
@@ -1767,7 +1771,7 @@ mod tests {
         ];
 
         for case in invalid_cases {
-            let result = exec_time(&[case.clone()]);
+            let result = exec_time(&DefaultClock, &[case.clone()]);
             assert_eq!(result, Value::Null);
         }
     }
@@ -1797,7 +1801,10 @@ mod tests {
 
         for modifier in modifiers {
             assert_eq!(
-                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                exec_datetime_full(
+                    &DefaultClock,
+                    &[Value::build_text("now"), Value::build_text(modifier),]
+                ),
                 Value::Null,
                 "modifier: {modifier}"
             );
@@ -1927,7 +1934,7 @@ mod tests {
                 Value::build_text("2000-01-01 00:00:00".to_string()),
                 Value::build_text(modifier.to_string()),
             ];
-            let val = exec_datetime_full(args);
+            let val = exec_datetime_full(&DefaultClock, args);
             val.to_text().unwrap().to_string()
         };
 
@@ -1942,7 +1949,7 @@ mod tests {
                 Value::build_text("2000-01-01 00:00:00".to_string()),
                 Value::build_text(modifier.to_string()),
             ];
-            let val = exec_datetime_full(args);
+            let val = exec_datetime_full(&DefaultClock, args);
             val.to_text().unwrap().to_string()
         };
 
@@ -1955,7 +1962,10 @@ mod tests {
 
         for modifier in valid {
             assert_ne!(
-                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                exec_datetime_full(
+                    &DefaultClock,
+                    &[Value::build_text("now"), Value::build_text(modifier),]
+                ),
                 Value::Null,
                 "modifier: {modifier}"
             );
@@ -1965,7 +1975,10 @@ mod tests {
 
         for modifier in invalid {
             assert_eq!(
-                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                exec_datetime_full(
+                    &DefaultClock,
+                    &[Value::build_text("now"), Value::build_text(modifier),]
+                ),
                 Value::Null,
                 "modifier: {modifier}"
             );
@@ -1979,7 +1992,7 @@ mod tests {
                 Value::build_text(start.to_string()),
                 Value::build_text(modifier.to_string()),
             ];
-            let val = exec_datetime_full(args);
+            let val = exec_datetime_full(&DefaultClock, args);
             val.to_text().unwrap().to_string()
         };
 
@@ -2004,8 +2017,10 @@ mod tests {
         ];
 
         for modifier in modifiers {
-            let result =
-                exec_datetime_full(&[Value::build_text("2023-06-15"), Value::build_text(modifier)]);
+            let result = exec_datetime_full(
+                &DefaultClock,
+                &[Value::build_text("2023-06-15"), Value::build_text(modifier)],
+            );
 
             assert_eq!(result, Value::Null, "modifier: {modifier}");
         }
@@ -2018,7 +2033,7 @@ mod tests {
                 Value::build_text(start.to_string()),
                 Value::build_text(modifier.to_string()),
             ];
-            let val = exec_date(args);
+            let val = exec_date(&DefaultClock, args);
             val.to_text().unwrap().to_string()
         };
 
@@ -2085,7 +2100,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("5 days"), "2023-06-20 12:30:45");
@@ -2099,7 +2117,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("6 hours"), "2023-06-15 18:30:45");
@@ -2113,7 +2134,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("45 minutes"), "2023-06-15 13:15:45");
@@ -2127,7 +2151,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("30 seconds"), "2023-06-15 12:31:15");
@@ -2136,66 +2163,90 @@ mod tests {
     #[test]
     fn test_datetime_boundary_arithmetic() {
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("9999-12-31 23:59:59"),
-                Value::build_text("+1 second"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("9999-12-31 23:59:59"),
+                    Value::build_text("+1 second"),
+                ]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("9999-12-31 23:59:59"),
-                Value::build_text("+1 day"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("9999-12-31 23:59:59"),
+                    Value::build_text("+1 day"),
+                ]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("9999-12-31 23:59:59"),
-                Value::build_text("+1 month"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("9999-12-31 23:59:59"),
+                    Value::build_text("+1 month"),
+                ]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("9999-12-31 23:59:59"),
-                Value::build_text("+1 year"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("9999-12-31 23:59:59"),
+                    Value::build_text("+1 year"),
+                ]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("0000-01-01 00:00:00"),
-                Value::build_text("-1 second"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("0000-01-01 00:00:00"),
+                    Value::build_text("-1 second"),
+                ]
+            ),
             Value::build_text("-0001-12-31 23:59:59")
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("0000-01-01 00:00:00"),
-                Value::build_text("-1 day"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("0000-01-01 00:00:00"),
+                    Value::build_text("-1 day"),
+                ]
+            ),
             Value::build_text("-0001-12-31 00:00:00")
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("0000-01-01 00:00:00"),
-                Value::build_text("-1 month"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("0000-01-01 00:00:00"),
+                    Value::build_text("-1 month"),
+                ]
+            ),
             Value::build_text("-0001-12-01 00:00:00")
         );
 
         assert_eq!(
-            exec_datetime_full(&[
-                Value::build_text("0000-01-01 00:00:00"),
-                Value::build_text("-1 year"),
-            ]),
+            exec_datetime_full(
+                &DefaultClock,
+                &[
+                    Value::build_text("0000-01-01 00:00:00"),
+                    Value::build_text("-1 year"),
+                ]
+            ),
             Value::build_text("-0001-01-01 00:00:00")
         );
     }
@@ -2207,7 +2258,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("+01:30"), "2023-06-15 14:00:45");
@@ -2221,7 +2275,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("+0001-01-01 01:01"), "2024-07-16 13:31:45");
@@ -2232,44 +2289,57 @@ mod tests {
 
     #[test]
     fn test_apply_modifier_start_of_year() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("start of year"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("start of year"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-01-01 00:00:00");
     }
 
     #[test]
     fn test_apply_modifier_start_of_day() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("start of day"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("start of day"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-06-15 00:00:00");
     }
 
     #[test]
     fn test_single_modifier() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("-1 day"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("-1 day"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-06-14 12:30:45");
     }
 
     #[test]
     fn test_multiple_modifiers() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("-1 day"),
-            Value::build_text("+3 hours"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("-1 day"),
+                Value::build_text("+3 hours"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-06-14 15:30:45");
     }
 
     #[test]
     fn test_subsec_modifier() {
         let res = exec_datetime_general(
+            &DefaultClock,
             &[
                 Value::build_text("2023-06-15 12:30:45"),
                 Value::build_text("subsec"),
@@ -2281,32 +2351,41 @@ mod tests {
 
     #[test]
     fn test_start_of_day_modifier() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("start of day"),
-            Value::build_text("-1 day"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("start of day"),
+                Value::build_text("-1 day"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-06-14 00:00:00");
     }
 
     #[test]
     fn test_start_of_month_modifier() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("start of month"),
-            Value::build_text("+1 day"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("start of month"),
+                Value::build_text("+1 day"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-06-02 00:00:00");
     }
 
     #[test]
     fn test_start_of_year_modifier() {
-        let res = exec_datetime_full(&[
-            Value::build_text("2023-06-15 12:30:45"),
-            Value::build_text("start of year"),
-            Value::build_text("+30 days"),
-            Value::build_text("+5 hours"),
-        ]);
+        let res = exec_datetime_full(
+            &DefaultClock,
+            &[
+                Value::build_text("2023-06-15 12:30:45"),
+                Value::build_text("start of year"),
+                Value::build_text("+30 days"),
+                Value::build_text("+5 hours"),
+            ],
+        );
         assert_eq!(res.to_text().unwrap(), "2023-01-31 05:00:00");
     }
 
@@ -2323,7 +2402,7 @@ mod tests {
             Value::build_text(base_str.to_string()),
             Value::build_text("localtime".to_string()),
         ];
-        let res_local = exec_datetime_full(args_local);
+        let res_local = exec_datetime_full(&DefaultClock, args_local);
 
         // Expected calculation: Treat naive as UTC, convert to Local
         let utc_dt = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
@@ -2343,7 +2422,7 @@ mod tests {
             Value::build_text(base_str.to_string()),
             Value::build_text("utc".to_string()),
         ];
-        let res_utc = exec_datetime_full(args_utc);
+        let res_utc = exec_datetime_full(&DefaultClock, args_utc);
 
         // Expected calculation: Treat naive as Local, convert to UTC
         // We handle potential Local ambiguities (though 2023-06-15 is typically safe)
@@ -2378,21 +2457,21 @@ mod tests {
             Value::build_text("+15 seconds".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "1999-12-31 05:30:15.000");
     }
 
     #[test]
     fn test_max_datetime_limit() {
         let args = vec![Value::build_text("9999-12-31 23:59:59".to_string())];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "9999-12-31 23:59:59");
     }
 
     #[test]
     fn test_leap_second_ignored() {
         let args = vec![Value::build_text("2024-06-30 23:59:60".to_string())];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result, Value::Null);
     }
 
@@ -2402,7 +2481,7 @@ mod tests {
             Value::build_text("2023-01-01 12:00:00".to_string()),
             Value::build_text("weekday 0".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2023-01-01 12:00:00");
     }
 
@@ -2412,14 +2491,14 @@ mod tests {
             Value::build_text("2023-01-01 12:00:00".to_string()),
             Value::build_text("weekday 1".to_string()),
         ];
-        let res1 = exec_datetime_full(args1);
+        let res1 = exec_datetime_full(&DefaultClock, args1);
         assert_eq!(res1.to_text().unwrap(), "2023-01-02 12:00:00");
 
         let args2 = vec![
             Value::build_text("2023-01-03 12:00:00".to_string()),
             Value::build_text("weekday 5".to_string()),
         ];
-        let res2 = exec_datetime_full(args2);
+        let res2 = exec_datetime_full(&DefaultClock, args2);
         assert_eq!(res2.to_text().unwrap(), "2023-01-06 12:00:00");
     }
 
@@ -2429,14 +2508,14 @@ mod tests {
             Value::build_text("2023-01-06 12:00:00".to_string()),
             Value::build_text("weekday 0".to_string()),
         ];
-        let res1 = exec_datetime_full(args1);
+        let res1 = exec_datetime_full(&DefaultClock, args1);
         assert_eq!(res1.to_text().unwrap(), "2023-01-08 12:00:00");
 
         let args2 = vec![
             Value::build_text("2023-01-08 12:00:00".to_string()),
             Value::build_text("weekday 0".to_string()),
         ];
-        let res2 = exec_datetime_full(args2);
+        let res2 = exec_datetime_full(&DefaultClock, args2);
         assert_eq!(res2.to_text().unwrap(), "2023-01-08 12:00:00");
     }
 
@@ -2446,7 +2525,7 @@ mod tests {
             Value::build_text("2023-01-05 12:00:00".to_string()),
             Value::build_text("weekday 4".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-01-05 12:00:00");
     }
 
@@ -2456,17 +2535,17 @@ mod tests {
             Value::build_text("2023-01-06 12:00:00".to_string()),
             Value::build_text("weekday 5".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-01-06 12:00:00");
     }
 
     #[test]
     fn test_apply_modifier_julianday() {
         let jd_args = vec![Value::build_text("2000-01-01 12:00:00".to_string())];
-        let jd_val = exec_julianday(jd_args);
+        let jd_val = exec_julianday(&DefaultClock, jd_args);
 
         let dt_args = vec![jd_val, Value::build_text("auto".to_string())];
-        let dt_res = exec_datetime_full(dt_args);
+        let dt_res = exec_datetime_full(&DefaultClock, dt_args);
         assert_eq!(dt_res.to_text().unwrap(), "2000-01-01 12:00:00");
     }
 
@@ -2476,7 +2555,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45".to_string()),
             Value::build_text("start of month".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
     }
 
@@ -2486,7 +2565,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_general(args, "datetime");
+        let res = exec_datetime_general(&DefaultClock, args, "datetime");
         assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.000");
     }
 
@@ -2497,7 +2576,7 @@ mod tests {
             Value::build_text("+1 month".to_string()),
             Value::build_text("floor".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-02-28 00:00:00");
     }
 
@@ -2508,7 +2587,7 @@ mod tests {
             Value::build_text("+1 month".to_string()),
             Value::build_text("floor".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-02-15 00:00:00");
     }
 
@@ -2519,7 +2598,7 @@ mod tests {
             Value::build_text("ceiling".to_string()),
             Value::build_text("+1 month".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-03-03 00:00:00");
     }
 
@@ -2529,7 +2608,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45".to_string()),
             Value::build_text("start of month".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
     }
 
@@ -2539,7 +2618,7 @@ mod tests {
             Value::build_text("2023-06-01 00:00:00".to_string()),
             Value::build_text("start of month".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
     }
 
@@ -2549,7 +2628,7 @@ mod tests {
             Value::build_text("2023-07-31 23:59:59".to_string()),
             Value::build_text("start of month".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-07-01 00:00:00");
     }
 
@@ -2559,7 +2638,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45.123".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.123");
     }
 
@@ -2569,7 +2648,7 @@ mod tests {
             Value::build_text("2025-01-02 04:12:21.891".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.891");
     }
 
@@ -2579,7 +2658,7 @@ mod tests {
             Value::build_text("2025-01-02 04:12:21".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.000");
     }
 
@@ -2589,7 +2668,7 @@ mod tests {
             Value::build_text("2025-01-02 04:12:21.891123456".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_full(args);
+        let res = exec_datetime_full(&DefaultClock, args);
         assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.891");
     }
 
@@ -2598,72 +2677,72 @@ mod tests {
         let fmt = Value::build_text("%Y-%m-%d".to_string());
         let date = Value::build_text("2023-10-25 14:30:00".to_string());
         let expected = Value::build_text("2023-10-25".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%H:%M:%S".to_string());
         let date = Value::build_text("2023-10-25 14:30:45".to_string());
         let expected = Value::build_text("14:30:45".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("Date: %Y-%m-%d, Time: %H:%M".to_string());
         let date = Value::build_text("2023-10-25 14:30:45".to_string());
         let expected = Value::build_text("Date: 2023-10-25, Time: 14:30".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%Y-%m-%d".to_string());
         let date = Value::build_text("2023-10-25".to_string());
         let mod1 = Value::build_text("start of month".to_string());
         let expected = Value::build_text("2023-10-01".to_string());
-        assert_eq!(exec_strftime(&[fmt, date, mod1]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date, mod1]), expected);
 
         let fmt = Value::build_text("%Y-%m-%d".to_string());
         let date = Value::build_text("2023-10-25".to_string());
         let mod1 = Value::build_text("+5 days".to_string());
         let expected = Value::build_text("2023-10-30".to_string());
-        assert_eq!(exec_strftime(&[fmt, date, mod1]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date, mod1]), expected);
 
         let fmt = Value::build_text("%J".to_string());
         let date = Value::build_text("2023-01-01 12:00:00".to_string());
         let expected = Value::build_text("2459946".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%s".to_string());
         let date = Value::build_text("2023-01-01 00:00:00".to_string());
         let expected = Value::build_text("1672531200".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%S.%f".to_string());
         let date = Value::build_text("2023-01-01 12:00:05.123".to_string());
         let expected = Value::build_text("05.05.123".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%w".to_string());
         let date = Value::build_text("2023-01-01".to_string());
         let expected = Value::build_text("0".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%j".to_string());
         let date = Value::build_text("2023-02-01".to_string());
         let expected = Value::build_text("032".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::Null;
         let date = Value::build_text("now".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), Value::Null);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), Value::Null);
 
         let fmt = Value::build_text("%Y".to_string());
         let date = Value::Null;
         let expected = Value::Null;
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
 
         let fmt = Value::build_text("%Y".to_string());
         let date = Value::build_text("invalid-date".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), Value::Null);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), Value::Null);
 
         let fmt = Value::build_text("100%%".to_string());
         let date = Value::build_text("2023-01-01".to_string());
         let expected = Value::build_text("100%".to_string());
-        assert_eq!(exec_strftime(&[fmt, date]), expected);
+        assert_eq!(exec_strftime(&DefaultClock, &[fmt, date]), expected);
     }
 
     #[test]
@@ -2671,43 +2750,43 @@ mod tests {
         let start = Value::build_text("12:00:00");
         let end = Value::build_text("14:30:45");
         let expected = Value::build_text("-0000-00-00 02:30:45.000");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::build_text("14:30:45");
         let end = Value::build_text("12:00:00");
         let expected = Value::build_text("+0000-00-00 02:30:45.000");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::build_text("12:00:01.300");
         let end = Value::build_text("12:00:00.500");
         let expected = Value::build_text("+0000-00-00 00:00:00.800");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::build_text("13:30:00");
         let end = Value::build_text("16:45:30");
         let expected = Value::build_text("-0000-00-00 03:15:30.000");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::build_text("2023-05-10 23:30:00");
         let end = Value::build_text("2023-05-11 01:15:00");
         let expected = Value::build_text("-0000-00-00 01:45:00.000");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::Null;
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         let start = Value::build_text("not a time");
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
 
         // Test identical times - should return zero duration, not Null
         let start = Value::build_text("12:00:00");
         let end = Value::build_text("12:00:00");
         let expected = Value::build_text("+0000-00-00 00:00:00.000");
-        assert_eq!(exec_timediff(&[start, end]), expected);
+        assert_eq!(exec_timediff(&DefaultClock, &[start, end]), expected);
     }
 
     #[test]
@@ -2716,7 +2795,7 @@ mod tests {
             Value::build_text("2024-01-01 12:00:00".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:00.000");
     }
 
@@ -2726,7 +2805,7 @@ mod tests {
             Value::build_text("2024-01-01".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 00:00:00.000");
     }
 
@@ -2736,7 +2815,7 @@ mod tests {
             Value::build_text("2024-01-01T15:30:00".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 15:30:00.000");
     }
 
@@ -2747,7 +2826,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
             Value::build_text("+1 hour".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 13:00:00.000");
     }
 
@@ -2758,7 +2837,7 @@ mod tests {
             Value::build_text("+1 hour".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 13:00:00.000");
     }
 
@@ -2769,7 +2848,7 @@ mod tests {
             Value::build_text("+1 second".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:01.999");
     }
 
@@ -2779,7 +2858,7 @@ mod tests {
             Value::build_text("2024-01-01 12:00:00".to_string()),
             Value::build_text("SuBsEc".to_string()),
         ];
-        let result = exec_datetime_full(args);
+        let result = exec_datetime_full(&DefaultClock, args);
         assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:00.000");
     }
 
@@ -2792,7 +2871,7 @@ mod tests {
                 Value::build_text("now".to_string()),
                 Value::build_text(input.to_string()),
             ];
-            let result = exec_datetime_full(args);
+            let result = exec_datetime_full(&DefaultClock, args);
             // Expect Null for invalid modifiers, but no panic
             assert_eq!(result, Value::Null);
         }
@@ -2800,16 +2879,25 @@ mod tests {
 
     #[test]
     fn test_unixepoch_basic_usage() {
-        let result = exec_unixepoch(vec![Value::build_text("1970-01-01 00:00:00".to_string())]);
+        let result = exec_unixepoch(
+            &DefaultClock,
+            vec![Value::build_text("1970-01-01 00:00:00".to_string())],
+        );
         assert_eq!(result, Value::from_i64(0));
 
-        let result = exec_unixepoch(vec![Value::build_text("2023-01-01 00:00:00".to_string())]);
+        let result = exec_unixepoch(
+            &DefaultClock,
+            vec![Value::build_text("2023-01-01 00:00:00".to_string())],
+        );
         assert_eq!(result, Value::from_i64(1672531200));
 
-        let result = exec_unixepoch(vec![Value::build_text("1969-12-31 23:59:59".to_string())]);
+        let result = exec_unixepoch(
+            &DefaultClock,
+            vec![Value::build_text("1969-12-31 23:59:59".to_string())],
+        );
         assert_eq!(result, Value::from_i64(-1));
 
-        let result = exec_unixepoch(vec![Value::from_f64(2440587.5)]);
+        let result = exec_unixepoch(&DefaultClock, vec![Value::from_f64(2440587.5)]);
         assert_eq!(result, Value::from_i64(0));
     }
 
@@ -2817,57 +2905,78 @@ mod tests {
     fn test_numeric_datetime_accepts_ascii_whitespace() {
         let expected = Value::from_i64(-210866328000);
         for input in ["5 ", " 5", " 5 ", "\t5\n"] {
-            let result = exec_unixepoch(vec![Value::build_text(input.to_string())]);
+            let result = exec_unixepoch(&DefaultClock, vec![Value::build_text(input.to_string())]);
             assert_eq!(result, expected, "input {input:?}");
         }
 
-        let result = exec_julianday(vec![Value::build_text("5 ".to_string())]);
+        let result = exec_julianday(&DefaultClock, vec![Value::build_text("5 ".to_string())]);
         assert_eq!(result, Value::from_f64(5.0));
 
-        let result = exec_unixepoch(vec![Value::build_text("5 trailing".to_string())]);
+        let result = exec_unixepoch(
+            &DefaultClock,
+            vec![Value::build_text("5 trailing".to_string())],
+        );
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn test_unixepoch_numeric_modifiers_unixepoch() {
-        let res1 = exec_unixepoch(vec![
-            Value::from_i64(1672531200),
-            Value::build_text("unixepoch".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(1672531200),
+                Value::build_text("unixepoch".to_string()),
+            ],
+        );
         assert_eq!(res1, Value::from_i64(1672531200));
 
-        let res2 = exec_unixepoch(vec![
-            Value::from_i64(0),
-            Value::build_text("unixepoch".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(0),
+                Value::build_text("unixepoch".to_string()),
+            ],
+        );
         assert_eq!(res2, Value::from_i64(0));
 
-        let res3 = exec_unixepoch(vec![
-            Value::from_i64(1672531200),
-            Value::build_text("unixepoch".to_string()),
-            Value::build_text("start of year".to_string()),
-        ]);
+        let res3 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(1672531200),
+                Value::build_text("unixepoch".to_string()),
+                Value::build_text("start of year".to_string()),
+            ],
+        );
         assert_eq!(res3, Value::from_i64(1672531200));
     }
 
     #[test]
     fn test_unixepoch_numeric_modifiers_julianday() {
-        let res1 = exec_unixepoch(vec![
-            Value::from_f64(2440587.5),
-            Value::build_text("julianday".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(2440587.5),
+                Value::build_text("julianday".to_string()),
+            ],
+        );
         assert_eq!(res1, Value::from_i64(0));
 
-        let res2 = exec_unixepoch(vec![
-            Value::from_f64(2460311.5),
-            Value::build_text("julianday".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(2460311.5),
+                Value::build_text("julianday".to_string()),
+            ],
+        );
         assert_eq!(res2, Value::from_i64(1704153600));
 
-        let res3 = exec_unixepoch(vec![
-            Value::from_f64(0.0),
-            Value::build_text("julianday".to_string()),
-        ]);
+        let res3 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(0.0),
+                Value::build_text("julianday".to_string()),
+            ],
+        );
         match res3 {
             Value::Numeric(Numeric::Integer(i)) => assert_eq!(i, -210866760000),
             _ => panic!("Expected Integer result for JD 0"),
@@ -2876,22 +2985,28 @@ mod tests {
 
     #[test]
     fn test_unixepoch_numeric_modifiers_auto() {
-        let res1 = exec_unixepoch(vec![
-            Value::from_f64(2440587.5),
-            Value::build_text("auto".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(2440587.5),
+                Value::build_text("auto".to_string()),
+            ],
+        );
         assert_eq!(res1, Value::from_i64(0));
 
-        let res2 = exec_unixepoch(vec![
-            Value::from_i64(1672531200),
-            Value::build_text("auto".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(1672531200),
+                Value::build_text("auto".to_string()),
+            ],
+        );
         assert_eq!(res2, Value::from_i64(1672531200));
 
-        let res3 = exec_unixepoch(vec![
-            Value::from_f64(0.0),
-            Value::build_text("auto".to_string()),
-        ]);
+        let res3 = exec_unixepoch(
+            &DefaultClock,
+            vec![Value::from_f64(0.0), Value::build_text("auto".to_string())],
+        );
         match res3 {
             Value::Numeric(Numeric::Integer(i)) => assert!(i < 0),
             _ => panic!("Expected Integer result"),
@@ -2900,51 +3015,69 @@ mod tests {
 
     #[test]
     fn test_unixepoch_invalid_usage() {
-        let res1 = exec_unixepoch(vec![
-            Value::from_i64(0),
-            Value::build_text("start of year".to_string()),
-            Value::build_text("unixepoch".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(0),
+                Value::build_text("start of year".to_string()),
+                Value::build_text("unixepoch".to_string()),
+            ],
+        );
         assert_eq!(res1, Value::Null);
 
-        let res2 = exec_unixepoch(vec![
-            Value::build_text("2023-01-01".to_string()),
-            Value::build_text("unixepoch".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::build_text("2023-01-01".to_string()),
+                Value::build_text("unixepoch".to_string()),
+            ],
+        );
         assert_eq!(res2, Value::Null);
 
-        let res3 = exec_unixepoch(vec![
-            Value::from_i64(0),
-            Value::build_text("unixepoch".to_string()),
-            Value::build_text("julianday".to_string()),
-        ]);
+        let res3 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_i64(0),
+                Value::build_text("unixepoch".to_string()),
+                Value::build_text("julianday".to_string()),
+            ],
+        );
         assert_eq!(res3, Value::Null);
     }
 
     #[test]
     fn test_unixepoch_complex_calculations() {
-        let res1 = exec_unixepoch(vec![
-            Value::from_f64(2440587.5),
-            Value::build_text("julianday".to_string()),
-            Value::build_text("+1 day".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(2440587.5),
+                Value::build_text("julianday".to_string()),
+                Value::build_text("+1 day".to_string()),
+            ],
+        );
         assert_eq!(res1, Value::from_i64(86400));
 
-        let res2 = exec_unixepoch(vec![
-            Value::from_f64(2460311.5),
-            Value::build_text("auto".to_string()),
-            Value::build_text("start of month".to_string()),
-            Value::build_text("+1 month".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::from_f64(2460311.5),
+                Value::build_text("auto".to_string()),
+                Value::build_text("start of month".to_string()),
+                Value::build_text("+1 month".to_string()),
+            ],
+        );
         assert_eq!(res2, Value::from_i64(1706745600));
     }
 
     #[test]
     fn test_unixepoch_subsecond_precision() {
-        let res1 = exec_unixepoch(vec![
-            Value::build_text("1970-01-01 00:00:00.0006".to_string()),
-            Value::build_text("subsec".to_string()),
-        ]);
+        let res1 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::build_text("1970-01-01 00:00:00.0006".to_string()),
+                Value::build_text("subsec".to_string()),
+            ],
+        );
         match res1 {
             Value::Numeric(Numeric::Float(f)) => {
                 assert!((f64::from(f) - 0.001).abs() < f64::EPSILON)
@@ -2952,10 +3085,13 @@ mod tests {
             _ => panic!("Expected Float result"),
         }
 
-        let res2 = exec_unixepoch(vec![
-            Value::build_text("1970-01-01 00:00:00.9996".to_string()),
-            Value::build_text("subsec".to_string()),
-        ]);
+        let res2 = exec_unixepoch(
+            &DefaultClock,
+            vec![
+                Value::build_text("1970-01-01 00:00:00.9996".to_string()),
+                Value::build_text("subsec".to_string()),
+            ],
+        );
         match res2 {
             Value::Numeric(Numeric::Float(f)) => {
                 assert!((f64::from(f) - 0.999).abs() < f64::EPSILON)
@@ -2967,68 +3103,107 @@ mod tests {
     #[test]
     fn test_fast_path_date_only() {
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-01-01".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-01".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-01"
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("0001-01-01".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("0001-01-01".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "0001-01-01"
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("9999-12-31".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("9999-12-31".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "9999-12-31"
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-02-29".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-02-29".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-02-29"
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2023-02-29".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2023-02-29".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2023-03-01"
         );
 
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-00-01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-00-01".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-13-01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-13-01".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-01-00".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-00".to_string())]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-01-32".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-32".to_string())]
+            ),
             Value::Null
         );
 
         assert_eq!(
-            exec_date(vec![Value::build_text("2024/01/01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024/01/01".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2024.01.01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024.01.01".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("202X-01-01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("202X-01-01".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_date(vec![Value::build_text("2024-0a-01".to_string())]),
+            exec_date(
+                &DefaultClock,
+                vec![Value::build_text("2024-0a-01".to_string())]
+            ),
             Value::Null
         );
     }
@@ -3036,44 +3211,68 @@ mod tests {
     #[test]
     fn test_fast_path_datetime_formats() {
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 10:30".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-15 10:30:00"
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15T10:30".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15T10:30".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-15 10:30:00"
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15X10:30".to_string())]),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15X10:30".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 10:30:45".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30:45".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-15 10:30:45"
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15T10:30:45".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15T10:30:45".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-15 10:30:45"
         );
 
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 25:30:45".to_string())]),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 25:30:45".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 10:60:45".to_string())]),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:60:45".to_string())]
+            ),
             Value::Null
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 10:30:60".to_string())]),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30:60".to_string())]
+            ),
             Value::Null
         );
     }
@@ -3081,54 +3280,64 @@ mod tests {
     #[test]
     fn test_fast_path_time_only() {
         assert_eq!(
-            exec_time(vec![Value::build_text("10:30".to_string())])
+            exec_time(&DefaultClock, vec![Value::build_text("10:30".to_string())])
                 .to_text()
                 .unwrap(),
             "10:30:00"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("00:00".to_string())])
+            exec_time(&DefaultClock, vec![Value::build_text("00:00".to_string())])
                 .to_text()
                 .unwrap(),
             "00:00:00"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("23:59".to_string())])
+            exec_time(&DefaultClock, vec![Value::build_text("23:59".to_string())])
                 .to_text()
                 .unwrap(),
             "23:59:00"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("24:00".to_string())])
+            exec_time(&DefaultClock, vec![Value::build_text("24:00".to_string())])
                 .to_text()
                 .unwrap(),
             "24:00:00"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("10:60".to_string())]),
+            exec_time(&DefaultClock, vec![Value::build_text("10:60".to_string())]),
             Value::Null
         );
 
         assert_eq!(
-            exec_time(vec![Value::build_text("10:30:45".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_time(
+                &DefaultClock,
+                vec![Value::build_text("10:30:45".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "10:30:45"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("00:00:00".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_time(
+                &DefaultClock,
+                vec![Value::build_text("00:00:00".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "00:00:00"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("23:59:59".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_time(
+                &DefaultClock,
+                vec![Value::build_text("23:59:59".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "23:59:59"
         );
 
         let res1 = exec_datetime_general(
+            &DefaultClock,
             vec![
                 Value::build_text("10:30:45.123".to_string()),
                 Value::build_text("subsec".to_string()),
@@ -3138,6 +3347,7 @@ mod tests {
         assert_eq!(res1.to_text().unwrap(), "10:30:45.123");
 
         let res2 = exec_datetime_general(
+            &DefaultClock,
             vec![
                 Value::build_text("10:30:45.1".to_string()),
                 Value::build_text("subsec".to_string()),
@@ -3150,31 +3360,39 @@ mod tests {
     #[test]
     fn test_fast_path_skips_timezone_strings() {
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text("2024-01-15 10:30:45Z".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30:45Z".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "2024-01-15 10:30:45"
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text(
-                "2024-01-15 10:30:45+02:00".to_string()
-            )])
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30:45+02:00".to_string())]
+            )
             .to_text()
             .unwrap(),
             "2024-01-15 08:30:45"
         );
         assert_eq!(
-            exec_datetime_full(vec![Value::build_text(
-                "2024-01-15 10:30:45-05:00".to_string()
-            )])
+            exec_datetime_full(
+                &DefaultClock,
+                vec![Value::build_text("2024-01-15 10:30:45-05:00".to_string())]
+            )
             .to_text()
             .unwrap(),
             "2024-01-15 15:30:45"
         );
         assert_eq!(
-            exec_time(vec![Value::build_text("10:30:45+02:00".to_string())])
-                .to_text()
-                .unwrap(),
+            exec_time(
+                &DefaultClock,
+                vec![Value::build_text("10:30:45+02:00".to_string())]
+            )
+            .to_text()
+            .unwrap(),
             "08:30:45"
         );
     }
@@ -3186,7 +3404,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args1).to_text().unwrap(),
+            exec_datetime_full(&DefaultClock, args1).to_text().unwrap(),
             "2024-01-15 10:30:45.123"
         );
 
@@ -3195,7 +3413,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args2).to_text().unwrap(),
+            exec_datetime_full(&DefaultClock, args2).to_text().unwrap(),
             "2024-01-15 10:30:45.100"
         );
 
@@ -3204,7 +3422,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args3).to_text().unwrap(),
+            exec_datetime_full(&DefaultClock, args3).to_text().unwrap(),
             "2024-01-15 10:30:45.100"
         );
 
@@ -3213,7 +3431,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args4).to_text().unwrap(),
+            exec_datetime_full(&DefaultClock, args4).to_text().unwrap(),
             "2024-01-15 10:30:45.000"
         );
     }
@@ -3221,7 +3439,7 @@ mod tests {
     #[test]
     fn test_fast_path_month_day_boundaries() {
         let run = |s: &str| -> String {
-            exec_datetime_full(&[Value::build_text(s.to_string())])
+            exec_datetime_full(&DefaultClock, &[Value::build_text(s.to_string())])
                 .to_text()
                 .unwrap()
                 .to_string()
@@ -3239,7 +3457,9 @@ mod tests {
     #[test]
     fn test_fast_path_edge_cases() {
         // Helper for cases expected to fail (return Null)
-        let run = |s: &str| -> Value { exec_datetime_full(&[Value::build_text(s.to_string())]) };
+        let run = |s: &str| -> Value {
+            exec_datetime_full(&DefaultClock, &[Value::build_text(s.to_string())])
+        };
 
         // Helper for cases expected to succeed (return String)
         let run_str = |s: &str| -> String { run(s).to_text().unwrap().to_string() };
@@ -3267,7 +3487,9 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_general(dt_args, "time").to_text().unwrap(),
+            exec_datetime_general(&DefaultClock, dt_args, "time")
+                .to_text()
+                .unwrap(),
             "10:30:45.120"
         );
     }
@@ -3286,7 +3508,7 @@ mod tests {
             Value::build_text(modifier_with_multibyte.to_string()),
         ];
         // Should not panic, just return an error or null
-        let _ = exec_strftime(args.iter());
+        let _ = exec_strftime(&DefaultClock, args.iter());
 
         // Also test the 'w' => weekday branch with similar input
         let weekday_modifier = "weekda\u{fffd}\u{fffd}";
@@ -3295,6 +3517,6 @@ mod tests {
             Value::from_f64(0.0),
             Value::build_text(weekday_modifier.to_string()),
         ];
-        let _ = exec_strftime(args2.iter());
+        let _ = exec_strftime(&DefaultClock, args2.iter());
     }
 }

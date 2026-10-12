@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0-pre.7"
+version = "0.8.0"
 dependencies = [
  "aegis",
  "aes",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0-pre.7"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0-pre.7"
+version = "0.8.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0-pre.7"
+version = "0.8.0"
 dependencies = [
  "bitflags",
  "memchr",

@@ -13,7 +13,6 @@ use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::functions::datetime;
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
