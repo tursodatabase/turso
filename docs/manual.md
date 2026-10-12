@@ -883,39 +883,30 @@ Turso provides full-text search (FTS) capabilities powered by the [Tantivy](http
 
 ### Where FTS is available
 
-FTS is gated two ways at once, and both have to pass:
+FTS requires the `fts` Cargo feature on `turso_core` and a non-WebAssembly target.
+It is not part of `turso_core`'s default features. The module in
+`core/index_method/mod.rs` is guarded by
+`#[cfg(all(feature = "fts", not(target_family = "wasm")))]`, so enabling the feature
+does not make FTS available on WebAssembly.
 
-* the `fts` cargo feature must be enabled. It is **not** part of `turso_core`'s default
-  feature set.
-* the build target must not be WebAssembly. The index method is compiled out of
-  `wasm32` targets, so no cargo flag can turn it on there.
+At this repository revision, the source build configuration is:
 
-That makes the availability picture concrete:
-
-| Build | FTS |
+| Build | FTS configuration |
 | --- | --- |
-| `tursodb` CLI | Yes - the CLI enables `fts` by default |
-| Native Rust crate built from source | Yes - add `--features fts` |
-| `@tursodatabase/database` (npm, native addon) | Yes - the JS bindings enable `fts` |
-| `@tursodatabase/database-wasm` (npm, WASM) | No - excluded on `wasm32`, see below |
+| `tursodb` CLI | Enables `turso_core/fts` |
+| `turso_core` on a native target | Enable it in the dependency's `features = ["fts"]` |
+| `turso` Rust binding on a native target | Includes `fts` in its default features |
+| `@tursodatabase/database` native addon built from this source | Enables `turso_core/fts` |
+| `@tursodatabase/database-wasm` | Excluded on WebAssembly |
 
-The one case that needs a caveat is the native JS addon: `bindings/javascript` does enable
-the `fts` feature, so FTS is compiled in and the `CREATE INDEX ... USING fts` syntax works.
-The caveat is that the index is built on **Tantivy**, which needs native file access. On a
-`wasm32` build the `fts` module is not compiled at all - that is a `#[cfg]` in
-`core/index_method/mod.rs`, not a cargo flag - so the same package reports
-`Parse error: unknown module name: 'fts'` when built for WASM.
+The native addon's build script in `bindings/javascript/packages/native/package.json`
+uses `bindings/javascript/Cargo.toml`, which enables `turso_core/fts`. This describes
+the repository's build configuration; it does not establish whether a particular published npm version
+contains FTS. Check the release version you use.
 
-When the feature is missing, `CREATE INDEX ... USING fts` does not fail at index-creation
-time; you get an error from the module lookup:
-
-```console
-Parse error: unknown module name: 'fts'
-```
-
-Because the WASM build is excluded rather than feature-gated, that error is also what a
-`wasm32` build reports if you compile the feature in yourself - it is not a signal that the
-feature flag was mis-set.
+When the module is absent, preparing `CREATE INDEX ... USING fts` fails at module lookup
+with an unknown-module-name error. A WebAssembly build has the same limitation even
+when the `fts` Cargo feature is requested.
 
 ### Creating an FTS Index
 
