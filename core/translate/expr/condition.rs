@@ -277,6 +277,18 @@ pub fn translate_condition_expr(
         emit_cond_jump(program, condition_metadata, reg);
         return Ok(());
     }
+    let index_value_reg = program.alloc_register();
+    if try_emit_expression_index_value_if_any(
+        program,
+        Some(referenced_tables),
+        expr,
+        index_value_reg,
+        resolver,
+    )? {
+        emit_cond_jump(program, condition_metadata, index_value_reg);
+        return Ok(());
+    }
+    program.release_registers(index_value_reg, 1);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because

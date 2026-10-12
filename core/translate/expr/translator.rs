@@ -304,7 +304,7 @@ fn copy_cached_expr_reg(
 /// Try to read the value of the expression from an expression index.
 /// Returns false when no expression index has it.
 #[inline(never)]
-fn try_emit_expression_index_value_if_any(
+pub(super) fn try_emit_expression_index_value_if_any(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
