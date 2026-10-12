@@ -167,3 +167,12 @@ test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
 expect error {}
+
+test table-date-arithmetic {
+    CREATE TABLE dates (a date, b date);
+    INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
+    SELECT a + 1, a - 1, a - b FROM dates;
+}
+expect {
+    2025-01-06|2025-01-04|4
+}

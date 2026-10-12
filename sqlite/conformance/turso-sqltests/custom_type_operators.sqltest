@@ -472,6 +472,32 @@ expect {
 
 
 @requires strict "uses STRICT tables"
+test op-decoding-type-plus-non-literal-no-override {
+    -- DECODE changes the stored value, so an operand that is not a literal
+    -- cannot be passed to the operator next to it: standard + is used.
+    CREATE TYPE cents(value integer) BASE integer
+        ENCODE value * 100
+        DECODE value / 100
+        OPERATOR '+' max;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, c cents, i INTEGER) STRICT;
+    INSERT INTO t1 VALUES (1, 5, 7);
+    SELECT c + i, i + c, c + (7) FROM t1;
+}
+expect {
+    12|12|12
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-integer-column-no-override {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), i INTEGER) STRICT;
+    INSERT INTO t1 VALUES (1, 1.5, 7);
+    SELECT n + i, i + n FROM t1;
+}
+expect {
+    8.5|8.5
+}
+
+@requires strict "uses STRICT tables"
 test op-order-by-custom-lt {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)

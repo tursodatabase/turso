@@ -942,6 +942,9 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    // Date type functions
+    DatePlus,
+    DateMinus,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1070,7 +1073,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::DatePlus
+            | ScalarFunc::DateMinus => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1219,6 +1224,8 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::DatePlus => "date_plus",
+            Self::DateMinus => "date_minus",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1366,7 +1373,9 @@ impl ScalarFunc {
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericLt
-            | Self::NumericEq => &[2],
+            | Self::NumericEq
+            | Self::DatePlus
+            | Self::DateMinus => &[2],
             Self::NumericEncode => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
