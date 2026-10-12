@@ -145,6 +145,15 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
                     col.col_name.as_str()
                 );
             }
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
+            {
+                bail_parse_error!(
+                    "default value of column [{}] is not constant",
+                    col.col_name.as_str()
+                );
+            }
             _ => Ok(WalkControl::Continue),
         }
     })?;

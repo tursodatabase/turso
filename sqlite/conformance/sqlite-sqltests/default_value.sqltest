@@ -96,3 +96,40 @@ test default-value-column-name {
 expect error {
     default value of column \[y\] is not constant
 }
+
+test scalar-function-filter-in-default-rejected {
+    CREATE TABLE t1(a DEFAULT (abs(-1) FILTER (WHERE 1)));
+}
+expect error {
+    default value of column.*is not constant
+}
+
+test scalar-function-filter-in-default-case-rejected {
+    CREATE TABLE t1(a DEFAULT (CASE WHEN 0 THEN abs(-1) FILTER (WHERE 1) ELSE 2 END));
+}
+expect error {
+    default value of column.*is not constant
+}
+
+test scalar-function-over-in-default-rejected {
+    CREATE TABLE t1(a DEFAULT (abs(-1) OVER ()));
+}
+expect error {
+    default value of column.*is not constant
+}
+
+test scalar-function-over-star-in-default-rejected {
+    CREATE TABLE t1(a DEFAULT (random(*) OVER ()));
+}
+expect error {
+    default value of column.*is not constant
+}
+
+test scalar-function-in-default-control {
+    CREATE TABLE t1(a DEFAULT (abs(-1)));
+    INSERT INTO t1 DEFAULT VALUES;
+    SELECT a FROM t1;
+}
+expect {
+    1
+}
