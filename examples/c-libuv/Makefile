@@ -32,11 +32,17 @@ TURSO_INCLUDE := $(TURSO_ROOT)/sdk-kit
 CFLAGS ?= -O2 -g -Wall -Wextra -std=c11
 LDFLAGS := -L$(TURSO_LIB_DIR) -lturso_sdk_kit $(UV_LDFLAGS)
 INCLUDES := -I$(TURSO_INCLUDE) $(UV_CFLAGS)
+RUN_ENV = DYLD_LIBRARY_PATH=$(TURSO_LIB_DIR)
+
+ifeq ($(UNAME),Linux)
+CPPFLAGS += -D_POSIX_C_SOURCE=200809L
+RUN_ENV = LD_LIBRARY_PATH=$(TURSO_LIB_DIR):$(LD_LIBRARY_PATH)
+endif
 
 all: $(BUILD_DIR)/libuv-example
 
 $(BUILD_DIR)/libuv-example: main.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ main.c $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -o $@ main.c $(LDFLAGS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -47,7 +53,7 @@ $(BUILD_DIR):
 # abort with the diagnostic the example prints.
 DB ?= $(shell mktemp -u /tmp/libuv-example-XXXXXX.db)
 run: all
-	DYLD_LIBRARY_PATH=$(TURSO_LIB_DIR) $(BUILD_DIR)/libuv-example $(DB)
+	$(RUN_ENV) $(BUILD_DIR)/libuv-example $(DB)
 
 clean:
 	rm -rf $(BUILD_DIR) libuv-example.db
