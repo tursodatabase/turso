@@ -396,6 +396,8 @@ fn translate_subquery_result_expr(
                     lhs_column_regs_start + i,
                     resolver,
                 )?;
+            }
+            for i in 0..lhs_column_count {
                 // If LHS is NULL, we need to check if ephemeral is empty first.
                 // - If empty: IN returns FALSE, NOT IN returns TRUE
                 // - If not empty: result is NULL (unknown)
