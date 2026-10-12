@@ -6,7 +6,7 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
+    schema::{BTreeTable, Index, Schema, Table, TURSO_INTERNAL_PREFIX},
     security::roles::{BuiltinRoleNames, Role, RoleId},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
@@ -196,6 +196,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
         .filter(|(name, table)| {
             // Skip system tables
             if name.starts_with("sqlite_")
+                || name.starts_with(TURSO_INTERNAL_PREFIX)
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
