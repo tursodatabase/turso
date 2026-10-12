@@ -158,20 +158,18 @@ mod tests {
             conn.execute("CREATE TABLE t(a cents, b zz) STRICT")
                 .unwrap();
             conn.execute("INSERT INTO t VALUES (5, 'Hi')").unwrap();
+
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+                 WHERE name = 'cents'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.close().unwrap();
         }
-
-        let bytes = std::fs::read(&path).unwrap();
-        let good = b"CREATE TYPE cents BASE";
-        let bad = b"CREATE TYPE cents BAZE";
-        let pos = bytes
-            .windows(good.len())
-            .position(|w| w == good)
-            .expect("stored type sql must be in the database file");
-        let mut corrupted = bytes.clone();
-        corrupted[pos..pos + bad.len()].copy_from_slice(bad);
-        std::fs::write(&path, corrupted).unwrap();
 
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
         let result = turso_core::Database::open_file_with_flags(
