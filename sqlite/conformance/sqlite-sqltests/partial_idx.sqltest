@@ -1756,3 +1756,37 @@ expect {
     one
     two
 }
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is not in the
+# partial index p, so there is no p entry to delete.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-not-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 9);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|9
+    ok
+}
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is in the partial
+# index p and the updated row 2 is not, so the p entry of row 1 must go.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 9), (2, 'b', 1);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    SELECT count(*) FROM t WHERE c0 > 5;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|1
+    0
+    ok
+}
