@@ -533,6 +533,51 @@ fn test_postgres_alter_table_rename_column(db: TempDatabase) {
     assert_eq!(val.value, "hello");
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_view_with_table_alias(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    conn.execute("CREATE VIEW v AS SELECT q.x FROM t AS q")
+        .unwrap();
+    conn.execute("CREATE VIEW w AS SELECT q.y FROM t q")
+        .unwrap();
+
+    let mut rows = conn.query("SELECT * FROM v").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+    drop(rows);
+
+    let mut rows = conn.query("SELECT * FROM w").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "2");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_rename_column_with_aliased_view(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    conn.execute("CREATE VIEW v AS SELECT q.x FROM t AS q")
+        .unwrap();
+
+    conn.execute("ALTER TABLE t RENAME COLUMN x TO z").unwrap();
+
+    let mut rows = conn.query("SELECT * FROM v").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "1");
+}
+
 // ==================== CREATE INDEX / DROP INDEX ====================
 
 #[turso_macros::test(mvcc)]
