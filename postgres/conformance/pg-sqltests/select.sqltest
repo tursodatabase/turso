@@ -67,6 +67,36 @@ expect {
     1!
 }
 
+test select-cast-to-enum {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'happy'::mood, CAST('sad' AS mood);
+}
+expect {
+    happy|sad
+}
+
+test select-cast-to-enum-rejects-unknown-label {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    SELECT 'xyz'::mood;
+}
+expect error {
+    invalid input value for enum mood
+}
+
+test select-cast-to-domain {
+    CREATE DOMAIN dd AS date;
+    SELECT '2024-01-01'::dd;
+}
+expect {
+    2024-01-01
+}
+
+test select-cast-to-domain-checks-constraint {
+    CREATE DOMAIN short_text AS text CHECK (length(VALUE) < 3);
+    SELECT 'abcd'::short_text;
+}
+expect error {}
+
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
 }
