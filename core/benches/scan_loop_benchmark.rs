@@ -15,7 +15,9 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Statement, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, PlatformIO, SqliteDialect, Statement, StepResult, Value,
+};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -35,7 +37,7 @@ fn seed_db() -> Fixture {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("PRAGMA cache_size=-65536").unwrap(); //negative means kibibytes (https://sqlite.org/pragma.html#pragma_cache_size)
     conn.execute(

@@ -8,7 +8,9 @@ use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
+use turso_core::{
+    CheckpointMode, ConnectOpts, Connection, LimboError, Numeric, Row, Statement, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -865,7 +867,7 @@ fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
 #[turso_macros::test()]
 pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -880,7 +882,7 @@ pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn delete_eq_correct(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -896,7 +898,7 @@ pub fn delete_eq_correct(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn upsert_conflict(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
         "INSERT INTO t VALUES (1, 2, 100);",
@@ -945,7 +947,7 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // quoted identifiers, because INSERT stored the joined-table identifier
     // via `Name::to_string` (which preserves quotes) instead of normalizing
     // it like DELETE/UPDATE do.
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
         .unwrap();
     assert_that!(limbo_exec_rows(
@@ -958,7 +960,7 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for _ in 0..COUNT {
@@ -1008,7 +1010,7 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for i in 0..COUNT {
@@ -1049,7 +1051,7 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
     conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
@@ -1079,7 +1081,7 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1121,7 +1123,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
 #[turso_macros::test]
 pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1205,8 +1207,8 @@ fn test_unique_complex_key() {
 #[turso_macros::test]
 pub fn test_conflict_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1225,8 +1227,8 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1247,8 +1249,8 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1281,8 +1283,8 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
     limbo: TempDatabase,
 ) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect()?;
-    let conn2 = limbo.db.connect()?;
+    let conn1 = limbo.db.connect(ConnectOpts::new())?;
+    let conn2 = limbo.db.connect(ConnectOpts::new())?;
 
     conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
     for i in 1..=8 {

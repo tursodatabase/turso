@@ -7128,6 +7128,7 @@ mod checkpoint_phase_tests {
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
+    use crate::ConnectOpts;
     use crate::Database;
     use crate::SqliteDialect;
 
@@ -7182,7 +7183,7 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

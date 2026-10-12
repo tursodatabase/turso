@@ -485,6 +485,43 @@ enum StatsRefresh {
     Deferred,
 }
 
+/// Settings for a single connection, passed to [`Database::connect`] and
+/// [`Database::connect_async`].
+pub struct ConnectOpts {
+    encryption_key: Option<EncryptionKey>,
+    page_codec: Option<Arc<dyn PageCodec>>,
+}
+
+#[expect(
+    clippy::new_without_default,
+    reason = "callers must construct the settings with new() so that new required settings reach every caller"
+)]
+impl ConnectOpts {
+    /// Creates settings for a connection without encryption and without an
+    /// external page codec.
+    pub fn new() -> Self {
+        Self {
+            encryption_key: None,
+            page_codec: None,
+        }
+    }
+
+    /// Sets the key used to open an encrypted database. Use this when the key
+    /// is known at connect time.
+    pub fn with_encryption_key(mut self, encryption_key: Option<EncryptionKey>) -> Self {
+        self.encryption_key = encryption_key;
+        self
+    }
+
+    /// Sets the external page codec for this connection. The codec may
+    /// contain sensitive key material, so it is installed only on the pager
+    /// for this connection and is not cached on the shared `Database`.
+    pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
+        self.page_codec = Some(page_codec);
+        self
+    }
+}
+
 /// Resumable state for [`Database::connect_async`]. Create one per
 /// connect and pass it to every call until `IOResult::Done`.
 #[derive(Default)]
@@ -2382,8 +2419,15 @@ impl Database {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None, None, StatsRefresh::Blocking)
+    pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            opts.encryption_key,
+            opts.page_codec,
+            None,
+            StatsRefresh::Blocking,
+        )
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2397,42 +2441,6 @@ impl Database {
             None,
             None,
             Some(context),
-            StatsRefresh::Blocking,
-        )
-    }
-
-    /// Connect with an encryption key.
-    /// Use this when opening an encrypted database where the key is known at connect time.
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect_with_encryption(
-        self: &Arc<Database>,
-        encryption_key: Option<EncryptionKey>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            encryption_key,
-            None,
-            None,
-            StatsRefresh::Blocking,
-        )
-    }
-
-    /// Connect with an external page codec.
-    ///
-    /// The codec may contain sensitive key material, so it is installed only on
-    /// the pager for this connection and is not cached on the shared `Database`.
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect_with_page_codec(
-        self: &Arc<Database>,
-        page_codec: Arc<dyn PageCodec>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            Some(page_codec),
-            None,
             StatsRefresh::Blocking,
         )
     }
@@ -2456,21 +2464,12 @@ impl Database {
     /// completion, then call again with the same `state`. The stats refresh
     /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
     /// logged and the connection is returned without stats.
+    ///
+    /// Only the first call, which creates the connection, uses `opts`; later
+    /// calls with the same `state` only resume the stats refresh.
     pub fn connect_async(
         self: &Arc<Database>,
-        state: &mut ConnectAsyncState,
-    ) -> IOResultOr<Arc<Connection>> {
-        self.connect_with_encryption_async(None, state)
-    }
-
-    /// Non-blocking [`Self::connect_with_encryption`]; see [`Self::connect_async`].
-    ///
-    /// `encryption_key` is consumed by the first call, which creates the
-    /// connection; later calls with the same `state` only resume the stats
-    /// refresh.
-    pub fn connect_with_encryption_async(
-        self: &Arc<Database>,
-        encryption_key: Option<EncryptionKey>,
+        opts: ConnectOpts,
         state: &mut ConnectAsyncState,
     ) -> IOResultOr<Arc<Connection>> {
         let conn = match &state.conn {
@@ -2479,8 +2478,8 @@ impl Database {
                 let conn = self._connect(
                     false,
                     None,
-                    encryption_key,
-                    None,
+                    opts.encryption_key,
+                    opts.page_codec,
                     None,
                     StatsRefresh::Deferred,
                 )?;
@@ -3638,7 +3637,7 @@ mod database_tests {
     };
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
-        storage::database::DatabaseFile, CompletionError, Connection, DatabaseOpts,
+        storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
         DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
         OpenOptions, PlatformIO, SqliteDialect, IO,
     };
@@ -4356,7 +4355,7 @@ mod database_tests {
 
         let db = open_with_page_codec(io.clone(), path, first_codec);
 
-        let err = match db.connect_with_page_codec(different_codec.clone()) {
+        let err = match db.connect(ConnectOpts::new().with_page_codec(different_codec.clone())) {
             Ok(_) => panic!("a cached codec-backed database must reject a different codec"),
             Err(err) => err,
         };
@@ -4466,7 +4465,9 @@ mod database_tests {
         });
         let _db = open_with_page_codec(io.clone(), path, codec.clone());
         let db = open_with_page_codec(io.clone(), path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         conn.execute("create table test(id integer primary key)")
             .unwrap();
         drop(conn);
@@ -4501,7 +4502,9 @@ mod database_tests {
             database_page1_decodes: database_page1_decodes.clone(),
         });
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
@@ -4545,7 +4548,9 @@ mod database_tests {
             ),
         });
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
@@ -4591,7 +4596,9 @@ mod database_tests {
             fail_context: PageCodecContext::new(2, PageLocation::Wal),
         });
         let db = open_with_page_codec(io, path, codec.clone());
-        let writer = db.connect_with_page_codec(codec.clone()).unwrap();
+        let writer = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         writer.wal_auto_actions_disable();
         writer.execute("PRAGMA journal_mode = 'wal'").unwrap();
         writer
@@ -4616,14 +4623,18 @@ mod database_tests {
             "test setup must leave page 2 in the WAL"
         );
 
-        let first = db.connect_with_page_codec(codec.clone()).unwrap();
+        let first = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         assert!(first.get_pager().has_wal());
         fail_wal_page2_decode.store(true, Ordering::Relaxed);
         let first_error = passive_checkpoint_busy(&first).unwrap_err();
         assert!(matches!(first_error, LimboError::CheckpointFailed(_)));
         assert!(!fail_wal_page2_decode.load(Ordering::Relaxed));
 
-        let second = db.connect_with_page_codec(codec).unwrap();
+        let second = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert!(second.get_pager().has_wal());
         let other_connection_retry = passive_checkpoint_busy(&second);
         let same_connection_retry = passive_checkpoint_busy(&first);
@@ -4650,7 +4661,9 @@ mod database_tests {
             failures: failures.clone(),
         });
         let db = open_with_page_codec(io.clone(), path, codec.clone());
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
 
@@ -4669,7 +4682,9 @@ mod database_tests {
         drop(db);
 
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
     }
 
@@ -4691,7 +4706,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute(
                 "create table test(id integer primary key, value text);
                  insert into test(value) values ('persisted');",
@@ -4701,7 +4718,9 @@ mod database_tests {
         }
 
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         failures.database_decode_page.store(2, Ordering::Relaxed);
         let err = try_count_test_rows(&conn).unwrap_err();
         assert!(matches!(
@@ -4710,7 +4729,9 @@ mod database_tests {
         ));
 
         assert_eq!(try_count_test_rows(&conn).unwrap(), 1);
-        let second = db.connect_with_page_codec(codec).unwrap();
+        let second = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(try_count_test_rows(&second).unwrap(), 1);
     }
 
@@ -4730,7 +4751,9 @@ mod database_tests {
             failures: failures.clone(),
         });
         let db = open_with_page_codec(io.clone(), path, codec.clone());
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
              insert into test(value) values ('first');",
@@ -4758,7 +4781,9 @@ mod database_tests {
         drop(db);
 
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 2);
     }
 
@@ -4776,7 +4801,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
             conn.execute(
                 "create table test(id integer primary key, value text);
@@ -4810,7 +4837,9 @@ mod database_tests {
         assert_ne!(&raw_database[..16], b"SQLite format 3\0");
 
         let reopened = open_with_page_codec(io, path, codec.clone());
-        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        let conn = reopened
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 3);
     }
 
@@ -4825,7 +4854,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
             conn.execute(
                 "create table test(id integer primary key, value text);
@@ -4842,7 +4873,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             assert_eq!(count_test_rows(&conn), 3);
             let checkpoint = conn
                 .checkpoint(crate::storage::wal::CheckpointMode::Full)
@@ -4853,7 +4886,9 @@ mod database_tests {
             );
         }
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 3);
     }
 
@@ -4871,7 +4906,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute(
                 "create table test(id integer primary key, value text);
                  insert into test(value) values ('alpha'), ('bravo');",
@@ -4895,7 +4932,9 @@ mod database_tests {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
 
         let err = conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap_err();
         assert!(err
@@ -4920,7 +4959,8 @@ mod database_tests {
         )
         .unwrap();
 
-        let err = match db.connect_with_page_codec(Arc::new(IdentityPageCodec)) {
+        let err = match db.connect(ConnectOpts::new().with_page_codec(Arc::new(IdentityPageCodec)))
+        {
             Ok(_) => panic!("plaintext databases must reject external page codecs"),
             Err(err) => err,
         };
@@ -4938,7 +4978,7 @@ mod database_tests {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let db = open_with_page_codec(io, path, Arc::new(IdentityPageCodec));
 
-        let err = match db.connect() {
+        let err = match db.connect(ConnectOpts::new()) {
             Ok(_) => panic!("codec-backed databases must reject codec-less connections"),
             Err(err) => err,
         };
@@ -4961,7 +5001,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, initial_codec.clone());
-            let conn = db.connect_with_page_codec(initial_codec).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(initial_codec))
+                .unwrap();
             conn.execute("create table test(id integer primary key)")
                 .unwrap();
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -4990,7 +5032,7 @@ mod database_tests {
         {
             let db = open_with_page_codec(io.clone(), path, Arc::new(IdentityPageCodec));
             let conn = db
-                .connect_with_page_codec(Arc::new(IdentityPageCodec))
+                .connect(ConnectOpts::new().with_page_codec(Arc::new(IdentityPageCodec)))
                 .unwrap();
             conn.execute("create table test(id integer primary key)")
                 .unwrap();
@@ -5068,7 +5110,9 @@ mod database_tests {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
         let codec: Arc<dyn PageCodec> = Arc::new(IdentityPageCodec);
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
 
         let err = conn
             .set_encryption_key(EncryptionKey::from_hex_string(&"00".repeat(32)).unwrap())
@@ -5099,7 +5143,9 @@ mod database_tests {
             DatabaseOpts::new().with_vacuum(true),
         )
         .unwrap();
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
              insert into test(value) values ('alpha'), ('bravo');",
@@ -5112,7 +5158,9 @@ mod database_tests {
 
         assert_ne!(&std::fs::read(path).unwrap()[..16], b"SQLite format 3\0");
         let reopened = open_with_page_codec(io, path, codec.clone());
-        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        let conn = reopened
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 2);
     }
 
@@ -5135,7 +5183,9 @@ mod database_tests {
             DatabaseOpts::new().with_vacuum(true),
         )
         .unwrap();
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
              insert into test(value) values ('secret-value');",
@@ -5147,7 +5197,9 @@ mod database_tests {
         let raw_output = std::fs::read(&output_path).unwrap();
         assert_ne!(&raw_output[..16], b"SQLite format 3\0");
         let output = open_with_page_codec(io, output_path.to_str().unwrap(), codec.clone());
-        let output_conn = output.connect_with_page_codec(codec).unwrap();
+        let output_conn = output
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&output_conn), 1);
     }
 
@@ -5163,7 +5215,9 @@ mod database_tests {
             reserved_bytes: 1,
         });
         let db = open_with_page_codec(io.clone(), path, codec.clone());
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         conn.execute(
             "create table test(id integer primary key, value text);
              insert into test(value) values ('main');
@@ -5186,7 +5240,9 @@ mod database_tests {
         drop(db);
 
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
     }
 
@@ -5204,8 +5260,12 @@ mod database_tests {
             })
         };
         let db = open_with_page_codec(io.clone(), path, codec());
-        let writer = db.connect_with_page_codec(codec()).unwrap();
-        let old_reader = db.connect_with_page_codec(codec()).unwrap();
+        let writer = db
+            .connect(ConnectOpts::new().with_page_codec(codec()))
+            .unwrap();
+        let old_reader = db
+            .connect(ConnectOpts::new().with_page_codec(codec()))
+            .unwrap();
         writer
             .execute(
                 "create table test(id integer primary key, value text);
@@ -5220,7 +5280,9 @@ mod database_tests {
             .unwrap();
         assert_eq!(count_test_rows(&old_reader), 1);
 
-        let new_reader = db.connect_with_page_codec(codec()).unwrap();
+        let new_reader = db
+            .connect(ConnectOpts::new().with_page_codec(codec()))
+            .unwrap();
         assert_eq!(count_test_rows(&new_reader), 2);
         let passive = writer
             .checkpoint(crate::CheckpointMode::Passive {
@@ -5239,7 +5301,9 @@ mod database_tests {
         drop(db);
 
         let db = open_with_page_codec(io, path, codec());
-        let conn = db.connect_with_page_codec(codec()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec()))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 2);
     }
 
@@ -5257,7 +5321,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute("PRAGMA page_size = 512").unwrap();
             assert_eq!(conn.get_page_size().get(), 512);
             conn.execute(
@@ -5269,7 +5335,9 @@ mod database_tests {
         }
 
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(conn.get_page_size().get(), 512);
         assert_eq!(count_test_rows(&conn), 1);
     }
@@ -5288,7 +5356,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path_str, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute("PRAGMA page_size = 512").unwrap();
             conn.execute(
                 "create table test(id integer primary key, value blob);
@@ -5315,7 +5385,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path_str, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             let err = try_count_test_rows(&conn).unwrap_err();
             assert!(matches!(
                 err,
@@ -5330,7 +5402,9 @@ mod database_tests {
         drop(file);
 
         let db = open_with_page_codec(io, path_str, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
     }
 
@@ -5348,7 +5422,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path_str, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute(
                 "create table test(id integer primary key, value text);
                  insert into test(value) values ('read-only');",
@@ -5366,7 +5442,9 @@ mod database_tests {
                 .page_codec(codec.clone()),
         )
         .unwrap();
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
         drop(conn);
         drop(db);
@@ -5391,7 +5469,7 @@ mod database_tests {
                 Arc::new(SqliteDialect),
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
 
@@ -5419,7 +5497,7 @@ mod database_tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        db.connect().unwrap();
+        db.connect(ConnectOpts::new()).unwrap();
     }
 
     #[cfg(feature = "fs")]
@@ -5433,7 +5511,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             conn.execute(
                 "create table test(id integer primary key, value blob);
                  insert into test(value) values (zeroblob(12000));
@@ -5451,7 +5531,9 @@ mod database_tests {
         let raw_database = std::fs::read(path).unwrap();
         assert_ne!(&raw_database[..16], b"SQLite format 3\0");
         let reopened = open_with_page_codec(io, path, codec.clone());
-        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        let conn = reopened
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         let mut values: Vec<(i64, String)> = Vec::new();
         conn.prepare("select length(value), hex(substr(value, 1, 8)) from test order by id")
             .unwrap()
@@ -5483,7 +5565,9 @@ mod database_tests {
             DatabaseOpts::new().with_attach(true),
         )
         .unwrap();
-        let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+            .unwrap();
         let err = conn
             .execute(format!("ATTACH '{aux_path}' AS aux"))
             .unwrap_err();
@@ -5505,7 +5589,9 @@ mod database_tests {
             reserved_bytes: 1,
         });
         let db = open_with_page_codec(io, path, codec.clone());
-        let conn = db.connect_with_page_codec(codec).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
 
         let err = conn.set_reserved_bytes(0).unwrap_err();
         assert!(err
@@ -5528,7 +5614,9 @@ mod database_tests {
 
         {
             let db = open_with_page_codec(io.clone(), path, codec.clone());
-            let conn = db.connect_with_page_codec(codec.clone()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_page_codec(codec.clone()))
+                .unwrap();
             // 512 - 33 = 479 usable bytes < 480: must be rejected up front,
             // otherwise the engine creates a database it refuses to reopen.
             let err = conn.execute("PRAGMA page_size = 512").unwrap_err();
@@ -5543,7 +5631,9 @@ mod database_tests {
         }
 
         let reopened = open_with_page_codec(io, path, codec.clone());
-        let conn = reopened.connect_with_page_codec(codec).unwrap();
+        let conn = reopened
+            .connect(ConnectOpts::new().with_page_codec(codec))
+            .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
     }
 }

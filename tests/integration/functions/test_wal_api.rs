@@ -6,7 +6,7 @@ use rand_chacha::ChaCha8Rng;
 use tempfile::TempDir;
 use turso_core::{
     types::{WalFrameInfo, WalState},
-    CheckpointMode, LimboError, StepResult,
+    CheckpointMode, ConnectOpts, LimboError, StepResult,
 };
 
 use crate::common::{rng_from_time, ExecRows, TempDatabase};
@@ -908,7 +908,7 @@ fn test_db_share_same_file() {
             .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
-    let conn1 = db1.connect().unwrap();
+    let conn1 = db1.connect(ConnectOpts::new()).unwrap();
     conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
@@ -933,7 +933,7 @@ fn test_db_share_same_file() {
             .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
-    let conn2 = db2.connect().unwrap();
+    let conn2 = db2.connect(ConnectOpts::new()).unwrap();
     conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
