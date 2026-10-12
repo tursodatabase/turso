@@ -27,3 +27,4 @@ napi-build = "2.3.1"
 
 [features]
 browser = ["turso_node/browser"]
+leak-check = []

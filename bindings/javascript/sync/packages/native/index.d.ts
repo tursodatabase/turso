@@ -298,6 +298,8 @@ export type JsProtocolRequest =
   | { type: 'FullWrite', path: string, content: Uint8Array }
   | { type: 'Transform', mutations: Array<DatabaseRowMutationJs> }
 
+export declare function nativeAllocatedBytes(): number | null
+
 export interface SyncEngineOpts {
   path: string
   remoteUrl?: string

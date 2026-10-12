@@ -343,6 +343,38 @@ jobs:
         env:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync test
+  test-sync-memory-leaks:
+    name: Test sync bindings for memory leaks on Linux-x64-gnu
+    timeout-minutes: 30
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Build tursodb
+        working-directory: .
+        run: cargo build --bin tursodb --locked
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build sync common
+        run: yarn workspace @tursodatabase/sync-common build
+      - name: Build sync bindings with allocation counting
+        run: yarn workspace @tursodatabase/sync napi-build:leak-check
+      - name: Test for memory leaks
+        run: yarn workspace @tursodatabase/sync test:memory-leak
   test-sync-windows-x64-msvc-binding:
     name: Test sync bindings on Windows-x64-msvc - node@${{ matrix.node }}
     timeout-minutes: 45

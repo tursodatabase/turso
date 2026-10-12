@@ -27,12 +27,14 @@
   },
   "scripts": {
     "napi-build": "napi build --platform --profile release-official --esm --manifest-path ../../Cargo.toml --output-dir .",
+    "napi-build:leak-check": "napi build --platform --esm --features leak-check --manifest-path ../../Cargo.toml --output-dir .",
     "napi-dirs": "napi create-npm-dirs",
     "napi-artifacts": "napi artifacts --output-dir .",
     "tsc-build": "npm exec tsc",
     "build": "npm run napi-build && npm run tsc-build",
     "test": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb vitest --run --exclude remote-write.test.ts",
     "test:remote-write": "vitest --run remote-write.test.ts",
+    "test:memory-leak": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb vitest --run memory-leak.test.ts",
     "prepublishOnly": "npm run napi-dirs && npm run napi-artifacts && napi prepublish -t npm"
   },
   "napi": {
