@@ -325,6 +325,7 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    reads_engine_metadata: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -406,7 +407,13 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            reads_engine_metadata: false,
         }
+    }
+
+    pub(crate) fn with_reads_engine_metadata(mut self, reads_engine_metadata: bool) -> Self {
+        self.reads_engine_metadata = reads_engine_metadata;
+        self
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -1044,7 +1051,10 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
+            let prepare_options = PrepareOptions {
+                reads_engine_metadata: self.reads_engine_metadata,
+                ..PrepareOptions::default()
+            };
             translate::translate(
                 &schema,
                 stmt,

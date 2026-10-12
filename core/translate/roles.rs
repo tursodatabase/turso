@@ -8,13 +8,21 @@
 //!
 //! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
 //! has no privileges on any database object. It may still run statements that
-//! touch no database object, such as `SELECT 1`, and switch roles.
+//! touch no database object, such as `SELECT 1`, switch roles, and read the
+//! catalog: the schema table, the types table and the role table.
+//!
+//! Statements that the engine prepares for itself are checked the same way,
+//! against the current role. The exception is a statement that reads the
+//! engine's own metadata, such as sequence state or table statistics, to load
+//! the schema. It is prepared with `PrepareOptions::engine_metadata_read()`,
+//! keeps that setting when it is prepared again, and its rows never reach the
+//! client.
 
 use std::sync::Arc;
 
 use turso_parser::ast;
 
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, Schema, SEQ_BACKING_TABLE_PREFIX};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
@@ -26,7 +34,8 @@ use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
-/// Fails if the current role may not run `stmt` at all.
+/// Fails if the current role may not run `stmt` at all. Statements that pass
+/// are checked again by [`check_storage_access`] once they are compiled.
 pub fn check_statement_privileges(
     stmt: &ast::Stmt,
     resolver: &Resolver,
@@ -146,8 +155,96 @@ fn database_denial(action: Action) -> PermissionDenied {
     PermissionDenied::privilege(action, Object::Database(MAIN_SCHEMA_NAME.to_string()))
 }
 
+/// Fails if the compiled program reads or writes a database object that the
+/// current role has no privileges on. Every access to stored data goes
+/// through one of the instructions checked here, so a statement cannot reach
+/// an object without being checked.
+pub fn check_storage_access(
+    program: &ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Connection,
+) -> Result<()> {
+    if resolver
+        .schema()
+        .roles
+        .is_superuser(connection.current_role())
+    {
+        return Ok(());
+    }
+    for (insn, index) in &program.insns {
+        if program.change_capture_writes.contains(index) {
+            continue;
+        }
+        let (action, db, root_page) = match insn {
+            Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, Some(*root_page)),
+            Insn::OpenWrite {
+                db,
+                root_page: RegisterOrLiteral::Literal(root_page),
+                ..
+            } => (Action::Write, *db, Some(*root_page)),
+            Insn::OpenWrite { db, .. } => (Action::Write, *db, None),
+            Insn::ClearBtree { db, root, .. } | Insn::Destroy { db, root, .. } => {
+                (Action::Write, *db, Some(*root))
+            }
+            Insn::CreateBtree { db, .. } => (Action::Write, *db, None),
+            _ => continue,
+        };
+        let object = root_page
+            .and_then(|root_page| {
+                resolver.with_schema(db, |schema| object_with_root_page(schema, root_page))
+            })
+            .unwrap_or(Object::Storage);
+        if action == Action::Read && is_catalog_table(&object) {
+            continue;
+        }
+        return Err(permission_denied(PermissionDenied::privilege(
+            action, object,
+        )));
+    }
+    Ok(())
+}
+
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
+}
+
+/// Returns the object stored at `root_page`. An index is reported as the
+/// table it belongs to.
+fn object_with_root_page(schema: &Schema, root_page: i64) -> Option<Object> {
+    let table_name = schema
+        .tables
+        .values()
+        .filter_map(|table| table.btree())
+        .find(|table| table.root_page == root_page)
+        .map(|table| table.name.clone())
+        .or_else(|| {
+            schema
+                .indexes
+                .values()
+                .flatten()
+                .find(|index| index.root_page == root_page)
+                .map(|index| index.table_name.clone())
+        })?;
+    if let Some(sequence_name) = table_name.strip_prefix(SEQ_BACKING_TABLE_PREFIX) {
+        return Some(Object::Sequence(sequence_name.to_string()));
+    }
+    if schema.materialized_view_names.contains(&table_name) {
+        return Some(Object::MaterializedView(table_name));
+    }
+    Some(Object::Table(table_name))
+}
+
+fn is_catalog_table(object: &Object) -> bool {
+    matches!(
+        object,
+        Object::Table(name)
+            if [
+                crate::schema::SCHEMA_TABLE_NAME,
+                crate::schema::TURSO_TYPES_TABLE_NAME,
+                ROLES_TABLE_NAME,
+            ]
+            .contains(&name.as_str())
+    )
 }
 
 /// Switches the connection to `role_name`, or back to the session role when
@@ -295,10 +392,13 @@ mod tests {
 
     use turso_parser::ast;
 
+    use crate::connection::PrepareOptions;
     use crate::security::permission::{Action, Object, PermissionDenied};
     use crate::security::roles::RoleId;
+    use crate::statement::StatementOrigin;
     use crate::{
-        Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect, IO,
+        Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect,
+        StepResult, Value, IO,
     };
 
     #[test]
@@ -424,6 +524,216 @@ mod tests {
         conn.execute("SELECT 1").unwrap();
         reset_role(&conn).unwrap();
         conn.execute("CREATE TABLE t (x)").unwrap();
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_or_change_tables() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for (sql, action) in [
+            ("SELECT * FROM t", Action::Read),
+            ("INSERT INTO t VALUES (1)", Action::Write),
+            ("UPDATE t SET x = 2", Action::Write),
+            ("DELETE FROM t", Action::Write),
+        ] {
+            let error = conn.execute(sql).unwrap_err();
+            assert_eq!(
+                denial(error),
+                PermissionDenied::privilege(action, Object::Table("t".to_string())),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_use_sequences() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.execute("SELECT nextval('s')").unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Write, Object::Sequence("s".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_can_commit_a_read_only_transaction_with_change_capture() {
+        let conn = open_connection();
+        conn.execute("PRAGMA capture_data_changes_conn('full')")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT 1").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        assert!(conn.get_auto_commit());
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_write_the_change_capture_table() {
+        let conn = open_connection();
+        conn.execute("PRAGMA capture_data_changes_conn('full')")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.execute("DELETE FROM turso_cdc").unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Write, Object::Table("turso_cdc".to_string()))
+        );
+    }
+
+    #[test]
+    fn open_pragma_cursor_does_not_skip_privilege_checks() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        let mut pragma = conn
+            .prepare("SELECT * FROM pragma_table_info('t')")
+            .unwrap();
+        assert!(matches!(pragma.step().unwrap(), StepResult::Row));
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.prepare("SELECT * FROM t").err().unwrap();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_can_read_the_schema_again() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.reparse_schema().unwrap();
+
+        assert!(conn.role_catalog().get_by_name("alice").is_some());
+    }
+
+    #[test]
+    fn role_without_privileges_can_read_a_schema_with_sequences_again() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.reparse_schema().unwrap();
+
+        assert!(conn.schema.read().sequences.contains_key("s"));
+    }
+
+    #[test]
+    fn role_without_privileges_can_read_a_schema_with_statistics_again() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("CREATE INDEX t_x ON t (x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        conn.execute("ANALYZE").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.reparse_schema().unwrap();
+    }
+
+    #[test]
+    fn engine_metadata_read_is_not_checked_when_prepared_again() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+        let mut stmt = conn
+            .prepare_with_origin_and_options(
+                "SELECT x FROM t",
+                StatementOrigin::Root,
+                &PrepareOptions::engine_metadata_read(),
+            )
+            .unwrap();
+
+        conn.bump_prepare_context_generation();
+
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_can_read_the_catalog() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 't'")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![crate::Value::build_text("t")]]);
+    }
+
+    #[test]
+    fn statement_prepared_by_the_engine_is_checked() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.prepare_internal("SELECT * FROM t").err().unwrap();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn statement_prepared_while_the_schema_is_read_again_is_checked() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let results_in_handler = results.clone();
+        let conn_in_handler = Arc::downgrade(&conn);
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                let conn = conn_in_handler.upgrade().unwrap();
+                if conn.schema_reparse_in_progress() {
+                    let result = conn.prepare("CREATE TABLE t (x)").map(drop);
+                    results_in_handler.lock().unwrap().push(result);
+                }
+                false
+            })),
+        );
+
+        conn.reparse_schema().unwrap();
+        conn.set_progress_handler(0, None);
+
+        let results = std::mem::take(&mut *results.lock().unwrap());
+        assert!(!results.is_empty(), "no statement was prepared");
+        for result in results {
+            assert_eq!(
+                denial(result.unwrap_err()),
+                PermissionDenied::privilege(Action::Create, Object::Schema("main".to_string()))
+            );
+        }
     }
 
     #[test]

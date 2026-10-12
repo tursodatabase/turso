@@ -193,9 +193,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
             .expect("PostgreSQL connections have session state")
             .lock()
             .unwrap();
-        PrepareOptions {
-            unqualified_database_search_path: state.search_path.clone(),
-        }
+        let mut options = PrepareOptions::default();
+        options
+            .unqualified_database_search_path
+            .clone_from(&state.search_path);
+        options
     };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
