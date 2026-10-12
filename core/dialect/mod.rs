@@ -14,6 +14,10 @@ pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
 
+/// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
+/// stores in `sqlite_schema`.
+pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by

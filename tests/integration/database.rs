@@ -171,6 +171,34 @@ fn test_open_refuses_file_with_unknown_virtual_table_module() {
     }
 }
 
+/// The SQLite dialect must refuse a table written by the PostgreSQL frontend,
+/// as sqlite3 does. Reading it as a plain SQLite table drops the PostgreSQL
+/// column types and rowid alias, so writes store values tursopg cannot read.
+#[test]
+fn test_open_refuses_file_with_postgres_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("postgres.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(id serial PRIMARY KEY, n numeric(10,2));
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = '/* turso_frontend:postgres */ ' || sql
+              WHERE name = 't';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let err = match open_plain_file(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("expected malformed schema error, got a successful open"),
+    };
+    let turso_core::LimboError::Corrupt(msg) = err else {
+        panic!("expected malformed schema error, got {err:?}");
+    };
+    assert_that!(msg).contains("malformed database schema");
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
