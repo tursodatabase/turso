@@ -956,6 +956,27 @@ fn test_named_savepoint_release_commits_attached_mvcc(tmp_db: TempDatabase) -> a
     Ok(())
 }
 
+/// RELEASE that commits the transaction must not fail when the commit runs an
+/// automatic checkpoint that waits on I/O.
+#[turso_macros::test]
+fn test_named_savepoint_release_with_checkpoint_on_commit(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+
+    conn.execute("SAVEPOINT sp1")?;
+    conn.execute("INSERT INTO t(v) VALUES ('x')")?;
+    conn.execute("RELEASE sp1")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+
+    Ok(())
+}
+
 /// Attaching a :memory: database must succeed even when the main DB uses MVCC,
 /// since in-memory databases do not have a journal mode to conflict with.
 #[turso_macros::test(mvcc)]
