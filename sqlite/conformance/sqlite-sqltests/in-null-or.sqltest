@@ -201,3 +201,46 @@ test left-join-is-not-predicate-keeps-unmatched-rows {
 expect {
     2
 }
+
+# IN and NOT IN over a subquery, evaluated once per row, for a value that is
+# found, a value that is missing, and a NULL value, against an empty list, a
+# list without NULL, a list with a NULL, and a list of only NULL.
+test in-subquery-null-semantics {
+    CREATE TABLE l(x);
+    INSERT INTO l VALUES (1), (5), (NULL);
+    CREATE TABLE r_empty(v);
+    CREATE TABLE r_values(v);
+    INSERT INTO r_values VALUES (1), (2);
+    CREATE TABLE r_with_null(v);
+    INSERT INTO r_with_null VALUES (3), (1), ('zz'), (NULL);
+    CREATE TABLE r_only_null(v);
+    INSERT INTO r_only_null VALUES (NULL);
+    SELECT quote(x),
+           quote(x IN (SELECT v FROM r_empty)), quote(x NOT IN (SELECT v FROM r_empty)),
+           quote(x IN (SELECT v FROM r_values)), quote(x NOT IN (SELECT v FROM r_values)),
+           quote(x IN (SELECT v FROM r_with_null)), quote(x NOT IN (SELECT v FROM r_with_null)),
+           quote(x IN (SELECT v FROM r_only_null)), quote(x NOT IN (SELECT v FROM r_only_null))
+      FROM l ORDER BY rowid;
+}
+expect {
+    1|0|1|1|0|1|0|NULL|NULL
+    5|0|1|0|1|NULL|NULL|NULL|NULL
+    NULL|0|1|NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test in-subquery-null-depends-on-outer-row {
+    CREATE TABLE l(x);
+    INSERT INTO l VALUES (1), (2), (5), (6), (9);
+    CREATE TABLE r(v);
+    INSERT INTO r VALUES (2), (6), (NULL);
+    SELECT x, quote(x IN (SELECT v FROM r WHERE v >= l.x OR (v IS NULL AND l.x > 4))),
+           quote(x NOT IN (SELECT v FROM r WHERE v >= l.x OR (v IS NULL AND l.x > 4)))
+      FROM l ORDER BY x;
+}
+expect {
+    1|0|1
+    2|1|0
+    5|NULL|NULL
+    6|1|0
+    9|NULL|NULL
+}
