@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.2 -- 2026-10-12
+
+### Fixed
+
+* core/mvcc: publish upgraded logical-log header only after its write succeeds (roboturso)
+* core/mvcc: keep finalized state of transactions still in txs during GC (Pekka Enberg)
+* core/mvcc: keep late commits in the logical log on passive-flag TRUNCATE (roboturso)
+* core/mvcc: make B-tree deletion and conflict checking atomic (Pedro Muniz)
+* core/mvcc: stop AUTOINCREMENT from overwriting a row inserted with explicit id 1 (Jussi Saurio)
+* core/mvcc: skip a redundant index seek only for a key that matches one row (Jussi Saurio)
+* core/vdbe: refuse to switch to or from MVCC inside a transaction (Jussi Saurio)
+* sync: order replayed schema operations per-transaction (Mikaël Francoeur)
+
 ## 0.8.2 -- 2026-10-06
 
 ### Updated
