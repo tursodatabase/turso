@@ -519,6 +519,10 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// Bumped when the main MVCC transaction ends under running statements;
+    /// their cursors then move to the successor transaction
+    /// (`MvccLazyCursor::follow_connection_tx`).
+    pub(crate) mv_tx_successor_generation: Arc<AtomicU64>,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection

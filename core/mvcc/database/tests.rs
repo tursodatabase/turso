@@ -7326,6 +7326,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -7686,6 +7687,7 @@ fn test_lazy_scan_cursor_basic() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -7739,6 +7741,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -7799,6 +7802,7 @@ fn test_cursor_basic() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,
@@ -7863,6 +7867,7 @@ fn test_cursor_with_empty_table() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         table_id,
         MvccCursorType::Table,
@@ -7884,6 +7889,7 @@ fn test_cursor_modification_during_scan() {
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         &db.conn,
+        crate::MAIN_DB_ID,
         tx_id,
         i64::from(table_id),
         MvccCursorType::Table,

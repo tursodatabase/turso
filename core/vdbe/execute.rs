@@ -1439,6 +1439,7 @@ pub fn op_open_read(
                 Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store.clone(),
                     &program.connection,
+                    *db,
                     tx_id,
                     *root_page,
                     mv_cursor_type,
@@ -14459,6 +14460,7 @@ pub fn op_open_write(
                 Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store,
                     &program.connection,
+                    *db,
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -17054,6 +17056,7 @@ pub fn op_open_dup(
                     OpenedBTree::Mvcc(Box::new(MvCursor::new(
                         mv_store,
                         &program.connection,
+                        MAIN_DB_ID,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
