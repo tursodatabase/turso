@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::mvcc::database::SuccessorTx;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -1565,9 +1566,16 @@ impl ProgramState {
             );
         }
         if self.mv_store(connection).is_some() {
+            let writer_commits_at_its_own_halt =
+                self.is_active_write && connection.main_mv_tx_is_closed_by_last_statement();
+            if writer_commits_at_its_own_halt {
+                return true;
+            }
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
-            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            let closes_shared_tx = self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                || connection.main_mv_tx_is_closed_by_last_statement();
+            return closes_shared_tx
                 && connection.n_active_root_statements.load(Ordering::SeqCst)
                     == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
@@ -3106,7 +3114,8 @@ impl Program {
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
-                && self.connection.get_tx_state() == TransactionState::None;
+                && (self.connection.get_tx_state() == TransactionState::None
+                    || self.connection.main_mv_tx_is_closed_by_last_statement());
             if transaction_finished {
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
@@ -3233,10 +3242,18 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
 
-        // Phase 1: Commit main DB MVCC transaction
-        if matches!(program_state.commit_state, CommitState::Ready) {
+        // Phase 1: Commit main DB MVCC transaction. ROLLBACK already ended it
+        // and may have left a successor for running statements in its place.
+        if matches!(program_state.commit_state, CommitState::Ready) && !rollback {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
+                let state_machine = mv_store.commit_tx(
+                    tx_id,
+                    &conn,
+                    crate::MAIN_DB_ID,
+                    SuccessorTx::ForOtherStatements {
+                        caller_counted: true,
+                    },
+                )?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             } else {
                 conn.set_tx_state(TransactionState::None);
@@ -3254,7 +3271,7 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.end_committed_main_mvcc_tx(&pager);
+                    conn.finish_main_mvcc_tx(&pager);
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -3302,7 +3319,8 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+            let commit = attached_mv_store.commit_tx(tx_id, &conn, db_id, SuccessorTx::NotNeeded);
+            let mut state_machine = match commit {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -3781,7 +3799,7 @@ impl Program {
                             "Failed to rollback saved outer transaction after sequence conflict",
                         );
                     }
-                    self.rollback_current_txn(pager);
+                    self.rollback_current_txn(pager, self_counted);
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
@@ -3789,7 +3807,7 @@ impl Program {
                 // rollback transaction in autocommit mode.
                 Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
-                        self.rollback_current_txn(pager);
+                        self.rollback_current_txn(pager, self_counted);
                     }
                     self.connection.set_changes(0);
                 }
@@ -3808,7 +3826,7 @@ impl Program {
                     };
                     match effective_resolve {
                         ResolveType::Rollback => {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                             // All deferred FK violations are undone by the full rollback.
                             self.connection.clear_deferred_foreign_key_violations();
                         }
@@ -3899,7 +3917,7 @@ impl Program {
                         }
                         _ => {
                             if must_rollback_tx_if_needed {
-                                self.rollback_current_txn(pager);
+                                self.rollback_current_txn(pager, self_counted);
                             }
                         }
                     }
@@ -3921,7 +3939,7 @@ impl Program {
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
@@ -3932,7 +3950,7 @@ impl Program {
                         // SQLite on SQLITE_IOERR.
                         let io_error = matches!(err, Some(LimboError::CompletionError(_)));
                         if can_autocommit_now || io_error {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
                                 &self.connection,
@@ -3992,7 +4010,7 @@ impl Program {
                             );
                         }
                         if can_autocommit_now || forces_rollback || wrote_without_savepoint {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         }
                     }
                 },
@@ -4021,8 +4039,14 @@ impl Program {
         Ok(())
     }
 
-    fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        self.connection.rollback_current_txn_state(pager, true);
+    fn rollback_current_txn(&self, pager: &Arc<Pager>, self_counted: bool) {
+        self.connection.rollback_current_txn_state(
+            pager,
+            true,
+            SuccessorTx::ForOtherStatements {
+                caller_counted: self_counted,
+            },
+        );
         self.connection.set_cdc_transaction_id(-1);
     }
 
@@ -4056,11 +4080,17 @@ impl Program {
                  conflict rollback"
             )));
         }
-        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
-        // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
-        // generic rollback then has no current tx to inspect, so it will not flip
-        // autocommit for us.
-        self.connection.auto_commit.store(true, Ordering::SeqCst);
+        mv_store.rollback_tx(
+            outer_tx_id,
+            pager,
+            &self.connection,
+            db,
+            SuccessorTx::NotNeeded,
+        );
+        // The inner tx is in the connection's MVCC tx slot, so rolling back
+        // the outer tx leaves the slot alone. The caller's generic rollback
+        // ends the inner tx, flips autocommit, and starts a successor for the
+        // other statements still running.
         Ok(())
     }
 

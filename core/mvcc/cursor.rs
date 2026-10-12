@@ -1240,10 +1240,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             )
         })?;
         let Some(tx_id) = connection.get_mv_tx_id_for_db(self.db_index) else {
-            return Err(LimboError::TxError(
-                "cannot continue the statement: the transaction it was running in has ended"
-                    .to_string(),
-            ));
+            return Err(self.transaction_ended_error(&connection));
         };
         if tx_id == self.tx_id {
             return Ok(());
@@ -1254,11 +1251,36 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.skip_queued_row_if_invisible()
     }
 
+    #[cfg(test)]
+    pub(crate) fn tx_id(&self) -> u64 {
+        self.tx_id
+    }
+
+    fn transaction_ended_error(&self, connection: &Connection) -> LimboError {
+        let successor_failure = if self.db_index == crate::MAIN_DB_ID {
+            connection.mv_tx_successor_failure.lock().clone()
+        } else {
+            None
+        };
+        match successor_failure {
+            Some(failure) => LimboError::TxError(format!(
+                "cannot continue the statement: its transaction ended and no transaction could replace it: {failure}"
+            )),
+            None => LimboError::TxError(
+                "cannot continue the statement: the transaction it was running in has ended"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Drop a version-store row queued under the old snapshot if the new one
     /// no longer shows it, unless the cursor is positioned on that row, which
     /// `next` and `prev` move past on their own.
     fn skip_queued_row_if_invisible(&mut self) -> Result<()> {
         let Some(versions) = self.dual_peek.mvcc_peek.get_versions() else {
+            return Ok(());
+        };
+        let Some(queued_key) = self.dual_peek.mvcc_peek.get_row_key() else {
             return Ok(());
         };
         let positioned_on_queued_row = matches!(
@@ -1267,14 +1289,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 row_id,
                 in_btree: false,
                 ..
-            } if Some(&row_id.row_id) == self.dual_peek.mvcc_peek.get_row_key()
+            } if &row_id.row_id == queued_key
         );
         if positioned_on_queued_row {
             return Ok(());
         }
+        let queued_row_id = RowID {
+            table_id: self.table_id,
+            row_id: queued_key.clone(),
+        };
         if self
             .db
-            .read_visible_from_versions(self.snapshot, &versions)?
+            .read_visible_from_versions(self.snapshot, &queued_row_id, &versions)?
             .is_none()
         {
             self.advance_mvcc_iterator();

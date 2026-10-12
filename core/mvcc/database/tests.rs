@@ -594,8 +594,13 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store
-        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(
+        tx_id,
+        pager,
+        &db.conn,
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -6870,6 +6875,7 @@ fn test_rollback() {
         db.conn.pager.load().clone(),
         &db.conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
     let tx2 = db
         .mvcc_store
@@ -7123,8 +7129,13 @@ fn test_lost_update() {
         Err(LimboError::WriteWriteConflict)
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
-    db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(
+        tx3,
+        conn3.pager.load().clone(),
+        &conn3,
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -7333,6 +7344,134 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 }
 
 #[test]
+fn every_cursor_operation_moves_to_the_successor_transaction() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE successor_ops(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO successor_ops VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'successor_ops'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let pager = db.conn.pager.load().clone();
+    let new_row = ImmutableRecord::from_values(&[Value::Text(Text::new("d"))], 1).unwrap();
+
+    type Operation = Box<dyn Fn(&mut crate::MvCursor) -> IOResultOr<()>>;
+    fn finished<T>(result: IOResultOr<T>) -> IOResultOr<()> {
+        result.map(|io| match io {
+            IOResult::Done(_) => IOResult::Done(()),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+    let operations: Vec<(&str, Operation)> = vec![
+        ("next", Box::new(|cursor| cursor.next())),
+        ("prev", Box::new(|cursor| cursor.prev())),
+        ("rewind", Box::new(|cursor| cursor.rewind())),
+        ("last", Box::new(|cursor| cursor.last())),
+        ("seek_end", Box::new(|cursor| cursor.seek_end())),
+        ("rowid", Box::new(|cursor| finished(cursor.rowid()))),
+        (
+            "current_row",
+            Box::new(|cursor| finished(cursor.current_row())),
+        ),
+        (
+            "seek",
+            Box::new(|cursor| {
+                finished(cursor.seek(
+                    crate::types::SeekKey::TableRowId(2),
+                    crate::types::SeekOp::GE { eq_only: false },
+                ))
+            }),
+        ),
+        (
+            "exists",
+            Box::new(|cursor| finished(cursor.exists(&Value::from_i64(2)))),
+        ),
+        ("count", Box::new(|cursor| finished(cursor.count()))),
+        ("delete", Box::new(|cursor| cursor.delete())),
+        (
+            "insert",
+            Box::new(move |cursor| {
+                cursor.insert(&crate::storage::btree::BTreeKey::new_table_rowid(
+                    9,
+                    Some(&new_row),
+                ))
+            }),
+        ),
+    ];
+
+    fn run(db: &MvccTestDb, cursor: &mut crate::MvCursor, operation: &Operation) -> Result<()> {
+        loop {
+            match operation(cursor)? {
+                IOResult::IO(io) => io.wait(db.conn.db.io.as_ref())?,
+                IOResult::Done(()) => return Ok(()),
+            }
+        }
+    }
+
+    for (name, operation) in &operations {
+        let tx_id = db.mvcc_store.begin_tx(pager.clone()).unwrap();
+        db.conn.set_mv_tx(Some((tx_id, TransactionMode::Write)));
+        let mut cursor = MvccLazyCursor::new(
+            db.mvcc_store.clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+            tx_id,
+            i64::from(table_id),
+            MvccCursorType::Table,
+            Box::new(BTreeCursor::new(pager.clone(), root_page.abs(), 2)),
+        )
+        .unwrap();
+        let position_on_first_row: Operation = Box::new(|cursor| cursor.next());
+        run(&db, &mut cursor, &position_on_first_row).unwrap();
+        assert_eq!(cursor.tx_id(), tx_id);
+
+        db.conn
+            .n_active_root_statements
+            .fetch_add(1, Ordering::SeqCst);
+        commit_tx_with_successor(
+            db.mvcc_store.clone(),
+            &db.conn,
+            tx_id,
+            SuccessorTx::ForOtherStatements {
+                caller_counted: false,
+            },
+        )
+        .unwrap();
+        db.conn
+            .n_active_root_statements
+            .fetch_sub(1, Ordering::SeqCst);
+        let successor = db
+            .conn
+            .get_mv_tx_id()
+            .expect("the running cursor should have been given a successor transaction");
+        assert_ne!(successor, tx_id);
+
+        run(&db, &mut cursor, operation).unwrap_or_else(|err| panic!("{name} failed: {err}"));
+        assert_eq!(
+            cursor.tx_id(),
+            successor,
+            "{name} did not move the cursor to the successor transaction"
+        );
+
+        drop(cursor);
+        db.mvcc_store.rollback_tx(
+            successor,
+            pager.clone(),
+            db.conn.as_ref(),
+            crate::MAIN_DB_ID,
+            SuccessorTx::NotNeeded,
+        );
+    }
+}
+
+#[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
     db.conn
@@ -7372,8 +7511,13 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         cursor.next().unwrap(),
         IOResult::IO(io) if io.is_explicit_yield()
     );
-    db.mvcc_store
-        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+    db.mvcc_store.rollback_tx(
+        tx_id,
+        db.conn.pager.load().clone(),
+        db.conn.as_ref(),
+        0,
+        SuccessorTx::NotNeeded,
+    );
 
     assert!(
         saw_yield,
@@ -7386,7 +7530,18 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
+    commit_tx_with_successor(mv_store, conn, tx_id, SuccessorTx::NotNeeded)
+}
+
+pub(crate) fn commit_tx_with_successor(
+    mv_store: Arc<crate::MvStore>,
+    conn: &Arc<Connection>,
+    tx_id: u64,
+    successor: SuccessorTx,
+) -> Result<()> {
+    let mut sm = mv_store
+        .commit_tx(tx_id, conn, crate::MAIN_DB_ID, successor)
+        .unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7407,7 +7562,9 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
+    let mut sm = mv_store
+        .commit_tx(tx_id, conn, crate::MAIN_DB_ID, SuccessorTx::NotNeeded)
+        .unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7453,7 +7610,13 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
         Some(12)
     );
 
-    mv_store.rollback_tx(tx2, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(
+        tx2,
+        pager,
+        conn.as_ref(),
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
     assert_eq!(
         mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
         Some(13)
@@ -7482,7 +7645,13 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 
     assert_eq!(rows[0][0].as_int().unwrap(), 10);
 
-    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(
+        tx_id,
+        pager,
+        conn.as_ref(),
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
     let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
 
     assert_eq!(rows[0][0].as_int().unwrap(), 42);
@@ -8044,6 +8213,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
+        closed_by_last_statement: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
@@ -8644,6 +8814,7 @@ fn test_commit_dep_threaded_abort_cascades() {
         writer_conn.pager.load().clone(),
         &writer_conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
@@ -8753,6 +8924,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         writer_conn.pager.load().clone(),
         &writer_conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
 
     for handle in handles {
@@ -8954,6 +9126,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         writer_conn.pager.load().clone(),
         &writer_conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
@@ -9835,6 +10008,7 @@ fn transaction_display() {
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
+        closed_by_last_statement: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
@@ -9936,6 +10110,7 @@ fn test_auto_checkpoint_busy_is_ignored() {
         db.conn.pager.load().clone(),
         &db.conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
 }
 
@@ -11998,6 +12173,7 @@ fn transaction_rollback_removes_created_versions_immediately() {
             db.conn.pager.load().clone(),
             &db.conn,
             crate::MAIN_DB_ID,
+            SuccessorTx::NotNeeded,
         );
     }
 
@@ -12135,7 +12311,7 @@ fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
 }
 
 #[test]
-fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
+fn reader_continues_after_its_transaction_is_rolled_back() {
     for (begin, end_transaction) in [
         (None, "INSERT OR ROLLBACK INTO other VALUES (6)"),
         (Some("BEGIN"), "ROLLBACK"),
@@ -12161,19 +12337,15 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
         ids.push(read.row().unwrap().get::<i64>(0).unwrap());
         let _ = conn.execute(end_transaction);
 
-        let err = loop {
-            match read.step() {
-                Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
-                Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
-                Ok(other) => panic!("{end_transaction}: expected an error, got {other:?}"),
-                Err(err) => break err,
+        loop {
+            match read.step().unwrap() {
+                StepResult::Row => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO => read.get_pager().io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("{end_transaction}: unexpected step result {other:?}"),
             }
-        };
-        assert!(
-            matches!(err, LimboError::NoSuchTransactionID(_)),
-            "{end_transaction}: expected NoSuchTransactionID, got {err:?}"
-        );
-        assert_eq!(ids, vec![1, 2], "{end_transaction}");
+        }
+        assert_eq!(ids, vec![1, 2, 3], "{end_transaction}");
         drop(read);
 
         assert_eq!(
@@ -12536,6 +12708,7 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         db.conn.pager.load().clone(),
         &db.conn,
         crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
     );
 
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
@@ -13109,7 +13282,13 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
         .unwrap();
-    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
+    mvcc_store.rollback_tx(
+        tx,
+        conn.pager.load().clone(),
+        &conn,
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
     let entry = mvcc_store.rows.get(&row_id).unwrap();
@@ -20312,8 +20491,13 @@ fn test_begin_tx_schema_generation_gate() {
         .mvcc_store
         .begin_tx_with_schema_generation(pager.clone(), Some(generation))
         .unwrap();
-    db.mvcc_store
-        .rollback_tx(tx, pager.clone(), &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(
+        tx,
+        pager.clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
 
     // Stale (mismatched) generation: forced reprepare.
     let err = db
@@ -20330,8 +20514,13 @@ fn test_begin_tx_schema_generation_gate() {
         .mvcc_store
         .begin_tx_with_schema_generation(pager.clone(), None)
         .unwrap();
-    db.mvcc_store
-        .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(
+        tx,
+        pager,
+        &db.conn,
+        crate::MAIN_DB_ID,
+        SuccessorTx::NotNeeded,
+    );
 }
 
 /// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
@@ -22968,6 +23157,59 @@ fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
         1,
         "the DELETE from the rolled-back transaction must not persist"
     );
+}
+
+#[test]
+fn sequence_conflict_with_a_running_read_leaves_no_transaction_behind() {
+    let db = MvccTestDbNoConn::new();
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    setup
+        .execute("CREATE TABLE rows(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO rows VALUES (1), (2), (3)")
+        .unwrap();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let nextval_conn = db.connect();
+    let setval_conn = db.connect();
+    nextval_conn.execute("BEGIN CONCURRENT").unwrap();
+    setval_conn.execute("BEGIN CONCURRENT").unwrap();
+    nextval_conn.execute("DELETE FROM t WHERE TRUE").unwrap();
+
+    let mut reader = nextval_conn.prepare("SELECT id FROM rows").unwrap();
+    assert!(matches!(reader.step().unwrap(), StepResult::Row));
+
+    get_rows(&setval_conn, "SELECT setval('s', 100, true)");
+    let nextval = nextval_conn.execute("SELECT nextval('s')");
+    assert!(
+        matches!(nextval, Err(LimboError::WriteWriteConflict)),
+        "conflicting nextval must abort with WriteWriteConflict, got {nextval:?}"
+    );
+    setval_conn.execute("COMMIT").unwrap();
+
+    let mut ids = Vec::new();
+    loop {
+        match reader.step().unwrap() {
+            StepResult::Row => ids.push(reader.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::Done => break,
+            StepResult::IO => reader.get_pager().io.step().unwrap(),
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    drop(reader);
+    assert_eq!(ids, vec![2, 3], "the read must finish after the conflict");
+
+    let mv_store = nextval_conn.mv_store().clone().unwrap();
+    assert_eq!(nextval_conn.get_mv_tx_id(), None);
+    assert_eq!(
+        mv_store.debug_gc_snapshot().active_txs,
+        0,
+        "no transaction may stay behind after the read finishes"
+    );
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
 
 /// Regression: a multi-row `INSERT INTO autoinc_table VALUES (...), (...)`

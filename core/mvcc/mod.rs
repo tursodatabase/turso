@@ -48,7 +48,7 @@ mod tests {
     use crate::mvcc::database::tests::{
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
     };
-    use crate::mvcc::database::{RowID, RowKey};
+    use crate::mvcc::database::{RowID, RowKey, SuccessorTx};
     use crate::sync::atomic::AtomicI64;
     use crate::sync::atomic::Ordering;
     use crate::sync::Arc;
@@ -104,6 +104,7 @@ mod tests {
                                     conn.pager.load().clone(),
                                     &conn,
                                     crate::MAIN_DB_ID,
+                                    SuccessorTx::NotNeeded,
                                 );
                                 std::thread::yield_now();
                                 continue;
@@ -130,6 +131,7 @@ mod tests {
                                     conn.pager.load().clone(),
                                     &conn,
                                     crate::MAIN_DB_ID,
+                                    SuccessorTx::NotNeeded,
                                 );
                                 std::thread::yield_now();
                                 continue;
@@ -175,6 +177,7 @@ mod tests {
                                     conn.pager.load().clone(),
                                     &conn,
                                     crate::MAIN_DB_ID,
+                                    SuccessorTx::NotNeeded,
                                 );
                                 std::thread::yield_now();
                                 continue;
@@ -201,6 +204,7 @@ mod tests {
                                     conn.pager.load().clone(),
                                     &conn,
                                     crate::MAIN_DB_ID,
+                                    SuccessorTx::NotNeeded,
                                 );
                                 std::thread::yield_now();
                                 continue;
@@ -271,6 +275,7 @@ mod tests {
                             conn.pager.load().clone(),
                             &conn,
                             crate::MAIN_DB_ID,
+                            SuccessorTx::NotNeeded,
                         );
                         continue;
                     }
@@ -284,6 +289,7 @@ mod tests {
                                 conn.pager.load().clone(),
                                 &conn,
                                 crate::MAIN_DB_ID,
+                                SuccessorTx::NotNeeded,
                             );
                             continue;
                         }

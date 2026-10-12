@@ -8,7 +8,7 @@ use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
-    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
+    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, SuccessorTx, TxID,
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
@@ -3867,13 +3867,21 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            &program.connection,
+                            MAIN_DB_ID,
+                            SuccessorTx::ForOtherStatements {
+                                caller_counted: true,
+                            },
+                        );
                     }
-                    pager.end_read_tx();
+                    program.connection.finish_main_mvcc_tx(pager);
                 } else {
                     pager.rollback_tx(&program.connection);
+                    program.connection.set_tx_state(TransactionState::None);
                 }
-                program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "FOREIGN KEY constraint failed".to_string(),
                 )
@@ -3916,8 +3924,9 @@ pub fn halt(
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             index_method_register_transaction_all(state, &program.connection)?;
             //
-            // FIXME: when this statement is a writer in MVCC mode, deferring
-            // its commit to the last sibling statement means the writer's
+            // FIXME: when this statement is a writer in an MVCC autocommit
+            // transaction that a sibling statement started, deferring its
+            // commit to the last sibling statement means the writer's
             // caller observes success before the changes are durable. If the
             // shared transaction then ends in a rollback — the last sibling
             // reader is reset or dropped mid-scan, or a later joining writer
@@ -3933,7 +3942,11 @@ pub fn halt(
             // timestamp, swapping `mv_tx` to that successor so remaining
             // readers keep an identical snapshot. That also attributes commit
             // errors (e.g. WriteWriteConflict) to the writer's own step
-            // instead of whichever sibling happens to finish last.
+            // instead of whichever sibling happens to finish last. A writer
+            // in a successor transaction, one that COMMIT or ROLLBACK started
+            // for the statements still running, already commits at its own
+            // halt (`can_autocommit_now`) and the commit starts the next
+            // successor for the readers.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
@@ -5386,9 +5399,16 @@ pub fn op_auto_commit(
             TxOp::Rollback => {
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = conn.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            &conn,
+                            MAIN_DB_ID,
+                            SuccessorTx::ForOtherStatements {
+                                caller_counted: true,
+                            },
+                        );
                     }
-                    pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
                 } else {
                     pager.rollback_tx(&conn);
@@ -5400,7 +5420,11 @@ pub fn op_auto_commit(
                 if let Some(hooks) = conn.hooks() {
                     hooks.transaction_rolled_back(&conn);
                 }
-                conn.set_tx_state(TransactionState::None);
+                if mv_store.is_some() {
+                    conn.finish_main_mvcc_tx(pager);
+                } else {
+                    conn.set_tx_state(TransactionState::None);
+                }
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
@@ -5456,7 +5480,7 @@ pub fn op_auto_commit(
                 // Write: set by Transaction opcode for BEGIN IMMEDIATE/EXCLUSIVE; leave as-is.
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
-                conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.leave_autocommit_mode();
                 conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -5684,7 +5708,7 @@ pub fn op_savepoint(
                             !conn.tx_is_poisoned(),
                             "rollback-only marker leaked outside an explicit transaction"
                         );
-                        conn.auto_commit.store(false, Ordering::SeqCst);
+                        conn.leave_autocommit_mode();
                     }
 
                     state.pc += 1;
@@ -15754,7 +15778,8 @@ pub fn op_sequence_commit_inner_tx(
                 .into());
             }
         };
-        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+        state.sequence_inner_commit =
+            Some(mv_store.commit_tx(inner_tx_id, &conn, *db, SuccessorTx::NotNeeded)?);
     }
 
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
@@ -15781,7 +15806,13 @@ pub fn op_sequence_commit_inner_tx(
             // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(
+                        inner_tx_id,
+                        pager.clone(),
+                        &conn,
+                        *db,
+                        SuccessorTx::NotNeeded,
+                    );
                 }
             }
             state.sequence_inner_tx_pending = None;
@@ -15820,7 +15851,13 @@ pub fn op_sequence_commit_inner_tx(
             state.sequence_inner_commit = None;
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(
+                        inner_tx_id,
+                        pager.clone(),
+                        &conn,
+                        *db,
+                        SuccessorTx::NotNeeded,
+                    );
                 }
             }
             state.sequence_inner_tx_pending = None;
