@@ -2169,7 +2169,11 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
+    pub fn cursor_loop<R>(
+        &mut self,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut ProgramBuilder, usize) -> R,
+    ) -> R {
         let loop_start = self.allocate_label();
         let loop_end = self.allocate_label();
 
@@ -2191,7 +2195,7 @@ impl ProgramBuilder {
             target_pc: loop_end,
         });
 
-        f(self, rowid);
+        let result = f(self, rowid);
 
         self.emit_insn(Insn::Next {
             cursor_id,
@@ -2200,6 +2204,7 @@ impl ProgramBuilder {
             is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
+        result
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
