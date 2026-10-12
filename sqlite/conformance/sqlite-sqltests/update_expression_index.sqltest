@@ -371,6 +371,43 @@ expect {
     ok
 }
 
+# The UPDATE can scan the partial index i1 because its WHERE matches the
+# statement's WHERE. Changing c0 removes rows from i1, so the UPDATE must
+# collect the rowids first. Deleting from i1 while scanning it moves the
+# scan cursor, and the old key of i0 would then read k from the next row.
+@cross-check-integrity
+test update-expression-index-while-scanning-partial-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, c0 INT);
+    CREATE UNIQUE INDEX i0 ON t(length(k)) WHERE c0 >= -1;
+    CREATE UNIQUE INDEX i1 ON t(k) WHERE c0 > -2;
+    INSERT INTO t VALUES(1, 'fizz', 2), (2, 'bb', 7);
+    UPDATE t SET c0 = -4 WHERE c0 > -2;
+    SELECT id, k, c0 FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|fizz|-4
+    2|bb|-4
+    ok
+}
+
+# Same as above with a single row: deleting the only i1 entry leaves the
+# i1 cursor on no row at all.
+@cross-check-integrity
+test update-expression-index-while-scanning-partial-index-single-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, c0 INT);
+    CREATE UNIQUE INDEX i0 ON t(length(k)) WHERE c0 >= -1;
+    CREATE UNIQUE INDEX i1 ON t(k) WHERE c0 > -2;
+    INSERT INTO t VALUES(1, 'ww', 9);
+    UPDATE t SET c0 = -4 WHERE c0 > -2;
+    SELECT id, k, c0 FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|ww|-4
+    ok
+}
+
 # Expression index with modulo operator.
 @cross-check-integrity
 test modulo-expression-index {
