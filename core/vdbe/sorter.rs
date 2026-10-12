@@ -16,7 +16,7 @@ use crate::io::TempFile;
 use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, CompletionGroup, File, IO},
+    io::{start_in_group, Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
@@ -824,13 +824,9 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pread(
-            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
-            c,
-        )?;
+        let offset =
+            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64;
+        let c = start_in_group(group, c, |c| self.file.pread(offset, c))?;
         Ok(Some(c))
     }
 

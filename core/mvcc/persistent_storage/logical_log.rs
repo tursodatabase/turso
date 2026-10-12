@@ -238,7 +238,7 @@ use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
     alloc::{ConcurrentAllocator, TursoAllocator},
-    io::{CompletionGroup, ReadComplete},
+    io::{start_in_group, CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     return_if_io,
@@ -1030,10 +1030,7 @@ impl LogicalLog {
                 );
             }
         });
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pwrite(0, buffer, c)?;
+        let c = start_in_group(group, c, |c| self.file.pwrite(0, buffer, c))?;
         Ok((header, c))
     }
 
@@ -1109,8 +1106,9 @@ impl LogicalLog {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        group.add(&c);
-        let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        let _truncate_c = start_in_group(Some(&mut group), c, |c| {
+            self.file.truncate(LOG_HDR_SIZE as u64, c)
+        })?;
         self.offset = 0;
         Ok(group.build())
     }
