@@ -216,13 +216,17 @@ int main(int argc, char **argv)
     }
 
     /* Open and connect once, outside the loop. Note if they ask for IO. */
-    if (turso_database_open(db, &err) == TURSO_IO) {
+    turso_status_code_t open_status = turso_database_open(db, &err);
+    if (open_status == TURSO_IO) {
         fprintf(stderr,
                 "turso_database_open requested IO, but the C ABI exposes no "
                 "database-level pump (only turso_statement_run_io). Open the "
                 "database before starting the event loop with a synchronous "
                 "driver, or drive the open through the Rust bindings.\n");
         return 1;
+    }
+    if (open_status != TURSO_OK) {
+        die("turso_database_open", err);
     }
     if (turso_database_connect(db, &conn, &err) != TURSO_OK) {
         die("turso_database_connect", err);

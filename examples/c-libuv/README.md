@@ -1,15 +1,15 @@
 # Turso + libuv
 
-An example of using Turso's [C ABI](../../../sdk-kit/turso.h) from a **non-Rust**
-external I/O loop. The database is driven entirely from libuv callbacks, so libuv
-decides how many statements run and when.
+An example of using Turso's [C ABI](../../sdk-kit/turso.h) from a **non-Rust**
+event loop. After database setup, libuv timer callbacks run small statements to
+completion.
 
 ## Why this shape
 
-Turso's C ABI has an `async_io` mode where an operation that would normally block
-returns `TURSO_IO` instead. It is then the caller's job to decide when to make
-progress, by calling `turso_statement_run_io()` and retrying. That is the hook an
-external event loop needs.
+Turso's C ABI has an `async_io` mode that returns `TURSO_IO` when a statement needs
+the caller to drive I/O. The caller then calls `turso_statement_run_io()` and
+retries. This controls who drives I/O; it does not make a synchronous backend
+non-blocking.
 
 Worth being precise about what is and is not integrated here:
 
@@ -18,11 +18,10 @@ Worth being precise about what is and is not integrated here:
 - `turso_statement_run_io()` is the only way to pump the I/O backend, and it takes
   a *statement*. There is no database- or connection-level equivalent.
 
-So with `async_io` the file I/O still happens inside Turso; what libuv takes over is
-**scheduling**. The loop decides which callback runs when, how many statements are
-in flight, and how database work is interleaved with the rest of the loop. Turso
-knows nothing about libuv - the integration point is a single polling loop over
-`TURSO_IO`.
+File I/O still happens inside Turso. This example selects `vfs = "syscall"`, whose
+Unix implementation uses synchronous file operations. Each timer callback runs
+its statements to completion and does not yield back to libuv between retries.
+Long queries or slow file operations can therefore delay other callbacks.
 
 If you want libuv's *own* file I/O to be what backs the database, that needs a VFS
 inside Turso, which this example does not attempt.
@@ -72,16 +71,17 @@ Two pieces:
        if (turso_statement_run_io(stmt, &err) != TURSO_OK) return TURSO_IOERR;
    }
    ```
-   This matches the pattern in `sdk-kit/src/capi.rs`, which is the same loop.
-2. Every libuv callback that touches the database goes through that pump, so the
-   loop never blocks inside Turso and Turso never makes progress on its own.
+2. The callback returns to libuv only after the insert and query finish. A
+   responsive application needs a different execution strategy, such as running
+   database work on a worker thread, rather than copying this callback unchanged.
 
 ## Known limitation (please read)
 
-**Opening an already-populated database with `async_io = 1` is not possible from
-C.** `turso_database_open()` can return `TURSO_IO` - as reading the schema of an
-existing file requires I/O - and the only pump the C ABI exposes is
-`turso_statement_run_io()`, which needs a statement that does not exist yet.
+If `turso_database_open()` returns `TURSO_IO`, this example cannot complete the
+open: the C ABI exposes only `turso_statement_run_io()`, which needs a statement
+that does not exist yet. Whether opening a particular file returns `TURSO_IO`
+depends on the operation and backend; this is not a claim that every existing
+database fails to open.
 
 The example checks for this and prints a diagnostic instead of hanging:
 
@@ -91,15 +91,13 @@ turso_database_open requested IO, but the C ABI exposes no database-level pump
 with a synchronous driver, or drive the open through the Rust bindings.
 ```
 
-`make run` therefore passes a fresh path each time. Workarounds while that gap is
-open:
+Other open errors are reported immediately, without attempting to connect.
+`make run` uses a fresh database path. Alternatives when opening returns
+`TURSO_IO` include:
 
-- open the database with `async_io = 0` before the loop starts, then switch to the
-  polling pattern for statements (the I/O still happens inside Turso; you lose the
-  caller-driven pacing for the open only);
+- create the database with `async_io = 0`, so Turso drives I/O for both opening and
+  subsequent statements; the C API has no setter to switch that database to
+  caller-driven I/O after opening;
 - drive the open through the Rust bindings (`sdk-kit/src/rsapi.rs`), whose
   `TursoDatabase::open()` returns an `IOResult` you can pump yourself;
-- or wait for a database-level `turso_database_run_io`.
-
-This is the one rough edge found while writing this example; it is a limitation of
-the C ABI rather than of the libuv integration pattern itself.
+- or add a database-level I/O pump to the C API.
