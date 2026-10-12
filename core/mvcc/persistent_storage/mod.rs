@@ -99,6 +99,15 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
+    /// Forget the record written by the last `log_tx`, whose commit was
+    /// abandoned.
+    ///
+    /// The record may still become durable: its write can already have
+    /// reached storage. The offset was not advanced, so the next `log_tx`
+    /// starts at the discarded record's offset. Recovery must then use that
+    /// later record and ignore the discarded one. If nothing later is written
+    /// at that offset, recovery may replay the discarded record: the outcome
+    /// of the abandoned commit is unknown.
     #[aristo::intent(
         "the pending running-CRC slot is cleared by the storage abort path after an abandoned deferred-offset write",
         id = "logical_log_pending_crc_cleared_on_abort",
