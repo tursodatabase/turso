@@ -7183,7 +7183,9 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

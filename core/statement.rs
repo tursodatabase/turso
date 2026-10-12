@@ -1815,7 +1815,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        db.connect(ConnectOpts::new())
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
     }
 
     #[test]

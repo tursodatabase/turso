@@ -283,7 +283,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
             (io, conn)
         };
         unsafe {
@@ -503,7 +503,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect(ConnectOpts::new())?;
+        self.conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -2071,7 +2071,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new())?;
+        let target = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;

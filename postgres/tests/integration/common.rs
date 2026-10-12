@@ -193,7 +193,9 @@ impl TempDatabaseBuilder {
         .unwrap();
 
         if self.enable_mvcc {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -213,7 +215,9 @@ impl TempDatabase {
     }
 
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
-        self.db.connect(ConnectOpts::new()).unwrap()
+        self.db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap()
     }
 
     pub fn connect_postgres(&self) -> Connection {

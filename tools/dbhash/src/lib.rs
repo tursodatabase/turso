@@ -69,7 +69,7 @@ pub fn hash_database_with_database_opts(
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

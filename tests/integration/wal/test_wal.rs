@@ -194,7 +194,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     let db = tmp_db.lock().unwrap().limbo_database();
 
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         match conn.query("CREATE TABLE t (id)")? {
             Some(ref mut rows) => {
                 rows.run_with_row_callback(|_| Ok(())).unwrap();
@@ -208,7 +210,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     const ROWS_WRITE: usize = 1000;
     let tmp_db_w = db.clone();
     let writer_thread = std::thread::spawn(move || {
-        let conn = tmp_db_w.connect(ConnectOpts::new()).unwrap();
+        let conn = tmp_db_w
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         for i in 0..ROWS_WRITE {
             conn.execute(format!("INSERT INTO t values({i})").as_str())
                 .unwrap();
@@ -218,7 +222,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     });
     let rows_ = rows.clone();
     let reader_thread = std::thread::spawn(move || {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         loop {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
@@ -292,14 +298,20 @@ fn test_wal_read_lock_released_on_conn_drop() {
     let db = tmp_db.limbo_database();
 
     // Setup: create table and insert data so WAL has content
-    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
+    let setup_conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     setup_conn
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
     setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let conn1 = db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     // conn1 starts a read transaction and panics while holding the read lock
     let join_result = std::thread::spawn(move || {
@@ -330,8 +342,12 @@ fn test_wal_write_lock_released_on_conn_drop() {
     let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
     let db = tmp_db.limbo_database();
 
-    let conn1 = db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let join_result = std::thread::spawn(move || {
         conn1.execute("BEGIN IMMEDIATE").unwrap();

@@ -61,7 +61,9 @@ fn current_time_comes_from_the_io_clock() {
         unix_secs: AtomicI64::new(1_000_000_000),
     });
     let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let rows: Vec<(String, String, String, String, f64, String)> = conn.exec_rows(
         "SELECT date('now'), time(), datetime('now'), strftime('%s', 'now'), \

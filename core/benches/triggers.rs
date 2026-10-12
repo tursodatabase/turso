@@ -56,7 +56,9 @@ fn setup_limbo(temp_dir: &TempDir, stmts: &[&str]) -> Arc<Database> {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let mut stmt = conn.query("PRAGMA synchronous = OFF").unwrap().unwrap();
     run_to_completion(&mut stmt, &db).unwrap();
@@ -113,7 +115,9 @@ fn bench_multirow_insert_with_trigger(criterion: &mut Criterion) {
         // Limbo
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, stmts);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         group.bench_function(
             BenchmarkId::new("limbo", format!("{row_count}_rows")),
@@ -213,7 +217,9 @@ fn bench_wide_table_sparse_trigger(criterion: &mut Criterion) {
         // Limbo
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, &stmts);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         group.bench_function(
             BenchmarkId::new("limbo", format!("{col_count}_cols")),
@@ -341,7 +347,9 @@ fn bench_multiple_triggers(criterion: &mut Criterion) {
         // Limbo
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, &stmts);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         group.bench_function(
             BenchmarkId::new("limbo", format!("{trigger_count}_triggers")),
@@ -433,7 +441,9 @@ fn bench_trigger_overhead(criterion: &mut Criterion) {
         // Limbo
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, stmts);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         group.bench_function(BenchmarkId::new("limbo", label), |b| {
             let mut insert_stmt = conn.prepare(&values).unwrap();
@@ -521,7 +531,9 @@ fn bench_before_trigger(criterion: &mut Criterion) {
         // Limbo
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, stmts);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         group.bench_function(
             BenchmarkId::new("limbo", format!("{row_count}_rows")),

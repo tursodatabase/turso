@@ -247,7 +247,9 @@ mod tests {
     fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let pager = conn.pager.load().clone();
 

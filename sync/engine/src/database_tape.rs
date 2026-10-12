@@ -163,14 +163,18 @@ impl DatabaseTape {
         }
     }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self
+            .inner
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
-        let connection = self.inner.connect(ConnectOpts::new())?;
+        let connection = self
+            .inner
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         if self.disable_auto_checkpoint {
             connection.wal_auto_actions_disable();
         }
@@ -226,7 +230,9 @@ impl DatabaseTape {
         opts: DatabaseChangesIteratorOpts,
     ) -> Result<DatabaseChangesIterator> {
         tracing::debug!("opening changes iterator with options {:?}", opts);
-        let conn = self.inner.connect(ConnectOpts::new())?;
+        let conn = self
+            .inner
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         if self.disable_auto_checkpoint {
             conn.wal_auto_actions_disable();
         }
@@ -1534,7 +1540,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();
@@ -1622,7 +1628,7 @@ mod tests {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db1 =
             turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
-        db1.connect(ConnectOpts::new())
+        db1.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
             .unwrap()
             .execute("PRAGMA journal_mode = 'mvcc'")
             .unwrap();

@@ -245,7 +245,9 @@ impl TempDatabaseBuilder {
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -310,7 +312,10 @@ impl TempDatabase {
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
         log::debug!("conneting to limbo");
 
-        let conn = self.db.connect(ConnectOpts::new()).unwrap();
+        let conn = self
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         log::debug!("connected to limbo");
         conn
     }
@@ -979,11 +984,11 @@ mod tests {
         let mut connections = Vec::new();
 
         // Create a new connection to verify persistence
-        let verification_conn = db.connect(ConnectOpts::new())?;
+        let verification_conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         // Create multiple connections and create a table from each
 
         for i in 0..NUM_CONNECTIONS {
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
             connections.push(conn);
 
             // Create a unique table name for this connection

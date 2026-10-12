@@ -107,7 +107,9 @@ fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Pat
     )
     .unwrap();
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     if mvcc {
         conn.pragma_update("journal_mode", "'mvcc'").unwrap();
     }

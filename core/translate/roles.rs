@@ -285,7 +285,10 @@ mod tests {
     #[test]
     fn role_catalog_includes_roles_committed_by_another_connection() {
         let conn1 = open_connection();
-        let conn2 = conn1.db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn2 = conn1
+            .db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert!(conn1.role_catalog().get_by_name("alice").is_none());
 
         create_role(&conn2, "alice").unwrap();
@@ -331,7 +334,8 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        db.connect(crate::ConnectOpts::new()).unwrap()
+        db.connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap()
     }
 
     fn set_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {

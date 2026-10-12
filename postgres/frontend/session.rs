@@ -72,7 +72,10 @@ pub fn open_database_with_io(
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
-        let conn = db.connect_with_context(context)?;
+        let conn = db.connect_with_context(
+            turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+            context,
+        )?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
