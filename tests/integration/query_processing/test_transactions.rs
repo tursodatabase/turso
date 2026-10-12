@@ -2362,6 +2362,47 @@ fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
     );
 }
 
+/// An uncommitted edit of one table's sqlite_sequence row must not conflict
+/// with AUTOINCREMENT inserts into, or sqlite_sequence edits of, other tables.
+#[turso_macros::test(mvcc)]
+fn test_sqlite_sequence_edit_does_not_conflict_with_other_tables(tmp_db: TempDatabase) {
+    if !tmp_db.enable_mvcc {
+        return;
+    }
+    let conn1 = tmp_db.connect_limbo();
+    for table in ["p", "q", "r"] {
+        conn1
+            .execute(format!(
+                "CREATE TABLE {table}(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
+            ))
+            .unwrap();
+        conn1
+            .execute(format!("INSERT INTO {table}(v) VALUES ('a')"))
+            .unwrap();
+    }
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE sqlite_sequence SET seq = 10 WHERE name = 'q'")
+        .unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE sqlite_sequence SET seq = 20 WHERE name = 'r'")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn2.execute("INSERT INTO p(v) VALUES ('b')").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    for (table, next_id) in [("p", 3), ("q", 11), ("r", 21)] {
+        conn1
+            .execute(format!("INSERT INTO {table}(v) VALUES ('c')"))
+            .unwrap();
+        let ids: Vec<(i64,)> = conn1.exec_rows(&format!("SELECT max(id) FROM {table}"));
+        assert_eq!(ids, vec![(next_id,)], "table {table}");
+    }
+}
+
 /// BEGIN IMMEDIATE emits a write Transaction for temp, but must not create the
 /// per-connection temp database just to lock it (SQLite treats it as a no-op
 /// while temp is not open). Creating it costs a temp file and an fsync on
