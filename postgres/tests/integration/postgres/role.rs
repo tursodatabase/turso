@@ -1,4 +1,5 @@
 use crate::common::TempDatabase;
+use turso_core::StepResult;
 use turso_pg::{error_message, PgConnection};
 
 #[test]
@@ -120,6 +121,27 @@ fn statement_prepared_before_set_role_is_checked_against_the_new_role() {
 
     conn.execute("SET ROLE alice").unwrap();
 
+    let error = select.run_collect_rows().unwrap_err();
+    assert_eq!(error_message(&error), "permission denied for table t");
+}
+
+#[test]
+fn query_started_before_set_role_returns_its_remaining_rows_but_fails_when_run_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut select = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+    assert!(matches!(select.step().unwrap(), StepResult::Row));
+    assert_eq!(select.row().unwrap().get_value(0).to_string(), "1");
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert!(matches!(select.step().unwrap(), StepResult::Row));
+    assert_eq!(select.row().unwrap().get_value(0).to_string(), "2");
+    assert!(matches!(select.step().unwrap(), StepResult::Done));
+    select.reset().unwrap();
     let error = select.run_collect_rows().unwrap_err();
     assert_eq!(error_message(&error), "permission denied for table t");
 }
