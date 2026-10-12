@@ -3,9 +3,9 @@
 This page describes what the Turso Java bindings actually support today, so that you can
 decide whether they fit a Kotlin Multiplatform (KMP) project before you start.
 
-**Short version:** `tech.turso:turso` is a plain **JVM** library. It works wherever a JVM
-runs, including the `jvm()` target of a KMP project and Android application modules. It
-cannot be used from `commonMain`, and there is no Kotlin/Native, JS or Wasm target for it.
+**Short version:** `tech.turso:turso` is a plain **JVM** library for the supported desktop platforms
+listed below. A KMP project can use it from its `jvm()` target. Android is not supported.
+It cannot be used from `commonMain`, and there is no Kotlin/Native, JS or Wasm target for it.
 
 ## What the artifact is
 
@@ -17,7 +17,7 @@ driver that wraps the Turso Rust core through JNI:
   (plus the `java.sql` / JDBC 4 types under `tech.turso.jdbc4`).
 - Native code: `bindings/java/rs_src` — Rust, compiled to a shared library that is loaded
   at runtime.
-- Published as a **single JVM jar** containing the desktop native libraries. There is no
+- Built as a **single JVM jar** containing the desktop native libraries you build. There is no
   Kotlin Multiplatform Gradle plugin, no `commonMain`, and no `expect`/`actual` sources.
 
 Because the Gradle module is a plain `java-library` (`bindings/java/build.gradle.kts`) with
@@ -42,8 +42,10 @@ architecture onto one of the native libraries packaged in the jar.
 | Desktop via Kotlin/Native (Compose Desktop native) | **Not supported** | No Kotlin/Native binding exists |
 | JS / Wasm | **Not supported** | No JS or Wasm target exists |
 
-Any OS/architecture combination that is not in the table above resolves to
-`Architecture.UNSUPPORTED`, whose library path is empty, and the driver throws
+The table describes the desktop targets configured in `bindings/java/Makefile`.
+The loader first tries `System.loadLibrary("_turso_java")`, then a bundled library.
+If `Architecture.detect()` returns `UNSUPPORTED`, no bundled library is selected;
+if neither loading method succeeds, the driver throws
 `InternalError: Unable to load necessary native library`.
 
 ### Android
@@ -55,16 +57,16 @@ desktop code path. The jar's native libraries are desktop artifacts
 (`arm64-v8a`, `armeabi-v7a`, `x86_64`). The Makefile in `bindings/java` builds only
 `macos_x86`, `macos_arm64`, `windows` and `linux_x86`.
 
-So while the driver compiles against Android's classpath, it will not load on a device. Do
-not plan on Android as a supported target until native libraries for Android ABIs are
-published.
+The bundled desktop libraries do not provide Android support. Adding the dependency to
+an Android module does not supply a compatible JNI library. Use a binding with Android
+support for that target.
 
 ## Using it from a KMP project
 
-A KMP project can depend on the driver from its **`jvm()` target** (and from an Android
-application module, which also produces a JVM classpath), but **not from `commonMain`** —
-`commonMain` has no access to `java.sql` or to JNI, and the artifact has no `commonMain`
-metadata.
+A KMP project can depend on the driver from its **`jvm()` target** on the
+supported desktop platforms, but **not from `commonMain`**. The common source set has
+no access to `java.sql` or JNI, and the artifact has no KMP common metadata.
+Android requires a separate supported binding; this JDBC driver does not supply one.
 
 ### Keep the database interface in `commonMain`
 
@@ -173,7 +175,7 @@ compilation will break.
 
 Because the interface lives in `commonMain`, any KMP-compatible DI approach works — a simple
 `commonMain` module object, or constructor injection wired up in each target's entry point
-(`Activity` on Android, `main()` on desktop). The only target-specific part is *which
+(for example, `main()` on desktop). The only target-specific part is *which
 implementation* you pass in; that decision belongs next to the target's entry point, not in
 `commonMain`.
 
