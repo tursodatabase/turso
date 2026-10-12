@@ -2190,6 +2190,275 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
     );
 }
 
+// Statements that are still running when their connection ends the MVCC
+// transaction with COMMIT or ROLLBACK (issue #9619). SQLite keeps a read
+// transaction open for them (btreeEndTransaction); here they move to a
+// successor read transaction that the last running statement closes.
+
+fn insert_three_rows(env: &SameConnectionMvcc) {
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+}
+
+fn observer_inserts_row_four_without_committing(env: &SameConnectionMvcc) {
+    env.observer.execute("BEGIN CONCURRENT").unwrap();
+    env.observer
+        .execute("INSERT INTO rows VALUES (4, 'd')")
+        .unwrap();
+}
+
+fn prepare_read_positioned_on_first_row(env: &SameConnectionMvcc, sql: &str) -> crate::Statement {
+    let mut reader = env.conn.prepare(sql).unwrap();
+    assert_eq!(step_returning_id(&mut reader), 1);
+    reader
+}
+
+#[test]
+fn test_mvcc_read_continues_after_commit_past_an_uncommitted_row_of_another_connection() {
+    let env = SameConnectionMvcc::new(":memory:read-continues-after-commit");
+    insert_three_rows(&env);
+    observer_inserts_row_four_without_committing(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3]);
+    env.observer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_mvcc_index_read_continues_after_commit_past_an_uncommitted_row_of_another_connection() {
+    let env = SameConnectionMvcc::new(":memory:index-read-continues-after-commit");
+    insert_three_rows(&env);
+    env.conn.execute("CREATE INDEX idx_v ON rows(v)").unwrap();
+    observer_inserts_row_four_without_committing(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(
+        &env,
+        "SELECT id FROM rows INDEXED BY idx_v WHERE v > ''",
+    );
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3]);
+    env.observer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_mvcc_read_continues_after_rollback_past_an_uncommitted_row_of_another_connection() {
+    let env = SameConnectionMvcc::new(":memory:read-continues-after-rollback");
+    insert_three_rows(&env);
+    observer_inserts_row_four_without_committing(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("ROLLBACK").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3]);
+    env.observer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_mvcc_read_keeps_seeing_its_transactions_insert_after_commit() {
+    let env = SameConnectionMvcc::new(":memory:read-sees-own-insert-after-commit");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (4, 'd')")
+        .unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3, 4]);
+}
+
+#[test]
+fn test_mvcc_read_stops_seeing_the_row_its_transaction_deleted_after_commit() {
+    let env = SameConnectionMvcc::new(":memory:read-skips-own-delete-after-commit");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    env.conn.execute("DELETE FROM rows WHERE id = 3").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2]);
+}
+
+#[test]
+fn test_mvcc_read_stops_seeing_its_transactions_insert_after_rollback() {
+    let env = SameConnectionMvcc::new(":memory:read-skips-own-insert-after-rollback");
+    insert_three_rows(&env);
+    observer_inserts_row_four_without_committing(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (5, 'e')")
+        .unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("ROLLBACK").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3]);
+    env.observer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_mvcc_read_does_not_return_a_queued_row_its_transaction_rolled_back() {
+    let env = SameConnectionMvcc::new(":memory:read-skips-queued-rolled-back-row");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'a'), (3, 'c')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Row 1 is served from the B-tree, so the version-store side of the
+    // cursor has already queued the uncommitted row 2 when ROLLBACK removes it.
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (2, 'b')")
+        .unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("ROLLBACK").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![3]);
+}
+
+#[test]
+fn test_mvcc_read_does_not_return_a_queued_row_another_connection_deleted_before_commit() {
+    let env = SameConnectionMvcc::new(":memory:read-skips-queued-row-deleted-elsewhere");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'a'), (3, 'c')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (2, 'b')")
+        .unwrap();
+
+    // Row 1 is served from the B-tree, so the version-store side of the
+    // cursor has already queued row 2 when the observer deletes it.
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.observer
+        .execute("DELETE FROM rows WHERE id = 2")
+        .unwrap();
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![3]);
+}
+
+#[test]
+fn test_mvcc_read_sees_rows_committed_by_others_once_its_transaction_ends() {
+    let env = SameConnectionMvcc::new(":memory:read-sees-foreign-commit-after-commit");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.observer
+        .execute("INSERT INTO rows VALUES (4, 'd')")
+        .unwrap();
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3, 4]);
+}
+
+#[test]
+fn test_mvcc_last_running_read_closes_the_successor_transaction() {
+    let env = SameConnectionMvcc::new(":memory:last-read-closes-successor");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+    assert!(
+        env.conn.get_mv_tx().is_some(),
+        "the running read should have been moved to a successor transaction"
+    );
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::Read
+    );
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3]);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::None
+    );
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (5, 'e')")
+        .unwrap();
+    assert_eq!(env.observer_ids(), vec![1, 2, 3, 5]);
+}
+
+#[test]
+fn test_mvcc_dropping_a_read_after_commit_closes_the_successor_transaction() {
+    let env = SameConnectionMvcc::new(":memory:dropped-read-closes-successor");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+    drop(reader);
+
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::None
+    );
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (5, 'e')")
+        .unwrap();
+    env.conn.execute("COMMIT").unwrap();
+    assert_eq!(env.observer_ids(), vec![1, 2, 3, 5]);
+}
+
+#[test]
+fn test_mvcc_write_started_while_a_read_outlives_commit_commits_when_the_read_finishes() {
+    let env = SameConnectionMvcc::new(":memory:write-joins-successor");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+
+    // The write shares the successor transaction with the running read, like
+    // an autocommit writer shares a sibling reader's implicit transaction.
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten')")
+        .unwrap();
+    assert_eq!(env.observer_ids(), vec![1, 2, 3]);
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3, 10]);
+    assert_eq!(env.observer_ids(), vec![1, 2, 3, 10]);
+    assert_eq!(env.conn.get_mv_tx(), None);
+}
+
+#[test]
+fn test_mvcc_read_follows_successive_commits() {
+    let env = SameConnectionMvcc::new(":memory:read-follows-successive-commits");
+    insert_three_rows(&env);
+
+    env.conn.execute("BEGIN").unwrap();
+    let mut reader = prepare_read_positioned_on_first_row(&env, "SELECT id FROM rows");
+    env.conn.execute("COMMIT").unwrap();
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (4, 'd')")
+        .unwrap();
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(drain_returning_ids(&mut reader), vec![2, 3, 4]);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(env.observer_ids(), vec![1, 2, 3, 4]);
+}
+
 #[cfg(feature = "fts")]
 fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
     let io = Arc::new(MemoryIO::new());

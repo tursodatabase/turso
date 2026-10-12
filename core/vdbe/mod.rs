@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::mvcc::database::SuccessorTx;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -1328,7 +1329,9 @@ impl ProgramState {
         if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
-            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            let closes_shared_tx = self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                || connection.main_mv_tx_is_closed_by_last_statement();
+            return closes_shared_tx
                 && connection.n_active_root_statements.load(Ordering::SeqCst)
                     == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
@@ -2873,7 +2876,8 @@ impl Program {
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
-                && self.connection.get_tx_state() == TransactionState::None;
+                && (self.connection.get_tx_state() == TransactionState::None
+                    || self.connection.main_mv_tx_is_closed_by_last_statement());
             if transaction_finished {
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
@@ -2999,10 +3003,18 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
 
-        // Phase 1: Commit main DB MVCC transaction
-        if matches!(program_state.commit_state, CommitState::Ready) {
+        // Phase 1: Commit main DB MVCC transaction. ROLLBACK already ended it
+        // and may have left a successor for running statements in its place.
+        if matches!(program_state.commit_state, CommitState::Ready) && !rollback {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
+                let state_machine = mv_store.commit_tx(
+                    tx_id,
+                    &conn,
+                    crate::MAIN_DB_ID,
+                    SuccessorTx::ForOtherStatements {
+                        caller_counted: true,
+                    },
+                )?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -3021,7 +3033,7 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.end_committed_main_mvcc_tx(&pager);
+                    conn.finish_main_mvcc_tx(&pager);
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -3069,7 +3081,8 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+            let commit = attached_mv_store.commit_tx(tx_id, &conn, db_id, SuccessorTx::NotNeeded);
+            let mut state_machine = match commit {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -3502,14 +3515,14 @@ impl Program {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.
-                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                    if let Err(err) = self.rollback_pending_sequence_outer_tx(state, self_counted) {
                         capture_abort_error(
                             &mut abort_error,
                             err,
                             "Failed to rollback saved outer transaction after sequence conflict",
                         );
                     }
-                    self.rollback_current_txn(pager);
+                    self.rollback_current_txn(pager, self_counted);
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
@@ -3517,7 +3530,7 @@ impl Program {
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
                     if must_rollback_tx_if_needed {
-                        self.rollback_current_txn(pager);
+                        self.rollback_current_txn(pager, self_counted);
                     }
                     self.connection.set_changes(0);
                 }
@@ -3534,7 +3547,7 @@ impl Program {
                     };
                     match effective_resolve {
                         ResolveType::Rollback => {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                             // All deferred FK violations are undone by the full rollback.
                             self.connection.clear_deferred_foreign_key_violations();
                         }
@@ -3617,7 +3630,7 @@ impl Program {
                         }
                         _ => {
                             if must_rollback_tx_if_needed {
-                                self.rollback_current_txn(pager);
+                                self.rollback_current_txn(pager, self_counted);
                             }
                         }
                     }
@@ -3639,12 +3652,12 @@ impl Program {
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
                         if can_autocommit_now {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
                                 &self.connection,
@@ -3663,7 +3676,7 @@ impl Program {
                         if can_autocommit_now
                             || (!self.connection.get_auto_commit() && err.is_some())
                         {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn(pager, self_counted);
                         }
                     }
                 },
@@ -3692,8 +3705,14 @@ impl Program {
         Ok(())
     }
 
-    fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        self.connection.rollback_current_txn_state(pager, true);
+    fn rollback_current_txn(&self, pager: &Arc<Pager>, self_counted: bool) {
+        self.connection.rollback_current_txn_state(
+            pager,
+            true,
+            SuccessorTx::ForOtherStatements {
+                caller_counted: self_counted,
+            },
+        );
         self.connection.set_cdc_transaction_id(-1);
     }
 
@@ -3703,7 +3722,11 @@ impl Program {
     /// `saved_outer`, not in `connection.mv_tx`. Roll it back here and clear
     /// `saved_outer` so later statement cleanup cannot restore a transaction
     /// that has already been aborted.
-    fn rollback_pending_sequence_outer_tx(&self, state: &mut ProgramState) -> Result<()> {
+    fn rollback_pending_sequence_outer_tx(
+        &self,
+        state: &mut ProgramState,
+        self_counted: bool,
+    ) -> Result<()> {
         let Some(pending) = state.sequence_inner_tx_pending.as_mut() else {
             return Ok(());
         };
@@ -3727,7 +3750,15 @@ impl Program {
                  conflict rollback"
             )));
         }
-        mv_store.rollback_tx(outer_tx_id, pager, &self.connection, db);
+        mv_store.rollback_tx(
+            outer_tx_id,
+            pager,
+            &self.connection,
+            db,
+            SuccessorTx::ForOtherStatements {
+                caller_counted: self_counted,
+            },
+        );
         // `rollback_tx` clears the connection's MVCC tx slot for this db. The caller's
         // generic rollback then has no current tx to inspect, so it will not flip
         // autocommit for us.
