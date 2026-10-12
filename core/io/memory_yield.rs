@@ -260,6 +260,10 @@ mod tests {
             self.inner.supports_shared_wal_coordination()
         }
 
+        fn uses_host_file_system(&self) -> bool {
+            self.inner.uses_host_file_system()
+        }
+
         fn step(&self) -> Result<()> {
             assert!(
                 self.step_allowed.load(Ordering::SeqCst),

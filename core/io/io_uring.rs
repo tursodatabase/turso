@@ -453,6 +453,10 @@ impl RingState {
 }
 
 impl IO for UringIO {
+    fn uses_host_file_system(&self) -> bool {
+        true
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }

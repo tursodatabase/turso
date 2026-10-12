@@ -128,6 +128,10 @@ impl WindowsIO {
 }
 
 impl IO for WindowsIO {
+    fn uses_host_file_system(&self) -> bool {
+        true
+    }
+
     #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);

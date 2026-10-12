@@ -43,6 +43,10 @@ impl Clock for UnixIO {
 }
 
 impl IO for UnixIO {
+    fn uses_host_file_system(&self) -> bool {
+        true
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }

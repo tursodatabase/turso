@@ -288,6 +288,10 @@ unsafe impl Sync for WindowsIOCP {}
 crate::assert::assert_send_sync!(WindowsIOCP);
 
 impl IO for WindowsIOCP {
+    fn uses_host_file_system(&self) -> bool {
+        true
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }

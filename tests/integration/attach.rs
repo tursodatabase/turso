@@ -927,3 +927,31 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn attached_write_check_runs_for_writes_to_attached_databases_only() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attached_write_check.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t (x)")?;
+    conn.execute("CREATE TABLE t (x)")?;
+    let checked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let checked_by_hook = checked.clone();
+    conn.set_attached_write_check(Arc::new(move |name| {
+        checked_by_hook.lock().unwrap().push(name.to_string());
+        Err(turso_core::LimboError::TxError(format!(
+            "{name} is read-only"
+        )))
+    }));
+
+    let error = conn.execute("INSERT INTO aux.t VALUES (1)").unwrap_err();
+    conn.execute("SELECT * FROM aux.t")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    assert_eq!(error.to_string(), "Transaction error: aux is read-only");
+    assert_eq!(*checked.lock().unwrap(), vec!["aux".to_string()]);
+    conn.set_attached_write_check(Arc::new(|_| Ok(())));
+    conn.execute("INSERT INTO aux.t VALUES (2)")?;
+    Ok(())
+}

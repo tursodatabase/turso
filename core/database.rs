@@ -487,9 +487,11 @@ enum StatsRefresh {
 
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
+#[derive(Clone)]
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    context: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 #[expect(
@@ -503,6 +505,7 @@ impl ConnectOpts {
         Self {
             encryption_key: None,
             page_codec: None,
+            context: None,
         }
     }
 
@@ -518,6 +521,13 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Sets the value that [`Connection::context`] returns for this
+    /// connection.
+    pub fn with_context<C: Any + Send + Sync>(mut self, context: Arc<C>) -> Self {
+        self.context = Some(context);
         self
     }
 }
@@ -2417,7 +2427,7 @@ impl Database {
             None,
             opts.encryption_key,
             opts.page_codec,
-            None,
+            opts.context,
             StatsRefresh::Blocking,
         )
     }
@@ -2427,14 +2437,7 @@ impl Database {
         self: &Arc<Database>,
         context: Arc<C>,
     ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            Some(context),
-            StatsRefresh::Blocking,
-        )
+        self.connect(ConnectOpts::new().with_context(context))
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2472,7 +2475,7 @@ impl Database {
                     None,
                     opts.encryption_key,
                     opts.page_codec,
-                    None,
+                    opts.context,
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2574,6 +2577,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             context,
+            attached_write_check: RwLock::new(None),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),

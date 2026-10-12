@@ -436,6 +436,13 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Whether the paths that this IO backend opens are files on the host
+    /// file system, so that a caller can rename or delete them with
+    /// `std::fs`.
+    fn uses_host_file_system(&self) -> bool {
+        false
+    }
+
     fn step(&self) -> Result<()> {
         Ok(())
     }

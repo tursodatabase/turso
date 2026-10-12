@@ -81,6 +81,10 @@ impl IO for TestIo {
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         self.io.remove_file(path)
     }
+
+    fn uses_host_file_system(&self) -> bool {
+        self.io.uses_host_file_system()
+    }
     fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
         self.io.file_id(path)
     }

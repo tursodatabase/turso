@@ -61,6 +61,36 @@ fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Res
 }
 
 #[turso_macros::test(mvcc)]
+fn connection_context_set_in_connect_opts_reaches_every_connection_made_with_them(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let context = Arc::new(std::sync::Mutex::new(7i64));
+    let opts = ConnectOpts::new().with_context(context.clone());
+
+    let conn = db.connect(opts.clone())?;
+    let mut state = turso_core::ConnectAsyncState::new();
+    let async_conn = loop {
+        match db.connect_async(opts.clone(), &mut state)? {
+            turso_core::IOResult::Done(conn) => break conn,
+            turso_core::IOResult::IO(io) => io.wait(tmp_db.io.as_ref())?,
+        }
+    };
+
+    for conn in [&conn, &async_conn] {
+        assert!(std::ptr::eq(
+            context.as_ref(),
+            conn.context::<std::sync::Mutex<i64>>().unwrap()
+        ));
+    }
+    assert!(db
+        .connect(ConnectOpts::new())?
+        .context::<std::sync::Mutex<i64>>()
+        .is_none());
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
 fn connection_context_lives_until_the_last_connection_owner_drops(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
