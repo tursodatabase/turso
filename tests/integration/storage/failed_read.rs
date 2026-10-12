@@ -1,24 +1,70 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
 };
 
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, ConnectOpts, Database, File, LimboError, MemoryIO, MonotonicInstant,
-    OpenFlags, SqliteDialect, WallClockInstant, IO,
+    Buffer, Clock, Completion, ConnectOpts, Connection, Database, File, LimboError, MemoryIO,
+    MonotonicInstant, OpenFlags, SqliteDialect, WallClockInstant, IO,
 };
 
-/// IO whose database file reads return an error without finishing the
-/// completion they were given, once `fail_reads` is set.
-struct FailingReadIo {
+/// What the next database file read does.
+#[derive(Clone, Copy)]
+enum ReadAction {
+    /// Return an error without finishing the completion.
+    Fail,
+    /// Start the read but finish it only when the test calls
+    /// `finish_held_reads`, never from `step()`. Like IO that is finished
+    /// outside the connection's IO loop.
+    Hold,
+}
+
+#[derive(Default)]
+struct ReadScript {
+    next_actions: VecDeque<ReadAction>,
+    held: Vec<(Arc<dyn File>, u64, Completion)>,
+}
+
+/// IO whose database file reads follow a script. Reads not in the script
+/// go straight to memory.
+struct ScriptedReadIo {
     inner: Arc<dyn IO>,
-    fail_reads: Arc<AtomicBool>,
+    script: Arc<Mutex<ReadScript>>,
 }
 
 const MAX_DRAIN_STEPS: usize = 10_000;
 
-impl Clock for FailingReadIo {
+impl ScriptedReadIo {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(MemoryIO::new()),
+            script: Arc::new(Mutex::new(ReadScript::default())),
+        })
+    }
+
+    fn script_next_reads(&self, actions: &[ReadAction]) {
+        self.script
+            .lock()
+            .unwrap()
+            .next_actions
+            .extend(actions.iter().copied());
+    }
+
+    fn held_read_count(&self) -> usize {
+        self.script.lock().unwrap().held.len()
+    }
+
+    fn finish_held_reads(&self) -> turso_core::Result<()> {
+        let held = std::mem::take(&mut self.script.lock().unwrap().held);
+        for (file, pos, c) in held {
+            drop(file.pread(pos, c)?);
+        }
+        Ok(())
+    }
+}
+
+impl Clock for ScriptedReadIo {
     fn current_time_monotonic(&self) -> MonotonicInstant {
         self.inner.current_time_monotonic()
     }
@@ -28,7 +74,7 @@ impl Clock for FailingReadIo {
     }
 }
 
-impl IO for FailingReadIo {
+impl IO for ScriptedReadIo {
     fn open_file(
         &self,
         path: &str,
@@ -39,9 +85,9 @@ impl IO for FailingReadIo {
         if !path.ends_with(".db") {
             return Ok(inner);
         }
-        Ok(Arc::new(FailingReadFile {
+        Ok(Arc::new(ScriptedReadFile {
             inner,
-            fail_reads: self.fail_reads.clone(),
+            script: self.script.clone(),
         }))
     }
 
@@ -54,7 +100,8 @@ impl IO for FailingReadIo {
     }
 
     // The default loops until every completion finishes. A completion that
-    // nobody finishes would make the test hang, so give up after a bound.
+    // `step()` never finishes would make the test hang, so give up after a
+    // bound.
     fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
         for _ in 0..MAX_DRAIN_STEPS {
             if completions.iter().all(|c| c.finished()) {
@@ -62,7 +109,7 @@ impl IO for FailingReadIo {
             }
             self.step()?;
         }
-        panic!("drain_completions waited for a completion that never finishes");
+        panic!("drain_completions waited for a completion that step() never finishes");
     }
 
     fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
@@ -78,12 +125,12 @@ impl IO for FailingReadIo {
     }
 }
 
-struct FailingReadFile {
+struct ScriptedReadFile {
     inner: Arc<dyn File>,
-    fail_reads: Arc<AtomicBool>,
+    script: Arc<Mutex<ReadScript>>,
 }
 
-impl File for FailingReadFile {
+impl File for ScriptedReadFile {
     fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
         self.inner.lock_file(exclusive)
     }
@@ -93,10 +140,20 @@ impl File for FailingReadFile {
     }
 
     fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
-        if self.fail_reads.load(Ordering::Acquire) {
-            return Err(LimboError::InternalError("injected read error".to_string()));
+        let mut script = self.script.lock().unwrap();
+        match script.next_actions.pop_front() {
+            Some(ReadAction::Fail) => {
+                Err(LimboError::InternalError("injected read error".to_string()))
+            }
+            Some(ReadAction::Hold) => {
+                script.held.push((self.inner.clone(), pos, c.clone()));
+                Ok(c)
+            }
+            None => {
+                drop(script);
+                self.inner.pread(pos, c)
+            }
         }
-        self.inner.pread(pos, c)
     }
 
     fn pwrite(
@@ -130,40 +187,76 @@ impl File for FailingReadFile {
     }
 }
 
+/// Opens a database with 200 rows of 1000 bytes, ids 10, 20, ..., 2000,
+/// written to the database file, and returns a new connection whose page
+/// cache is empty.
+fn open_filled_database(io: Arc<ScriptedReadIo>, name: &str) -> anyhow::Result<Arc<Connection>> {
+    let db = Database::open_file(io, name, Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+    conn.execute("INSERT INTO t SELECT value * 10, zeroblob(1000) FROM generate_series(1, 200)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.close()?;
+    Ok(db.connect(ConnectOpts::new())?)
+}
+
 /// A page split reads the sibling pages of the full page. If one of those
 /// reads fails before it starts, the split must return the error instead of
 /// waiting for the read's completion, which nothing will ever finish.
 #[test]
 fn failed_sibling_read_during_page_split_returns_error() -> anyhow::Result<()> {
-    let fail_reads = Arc::new(AtomicBool::new(false));
-    let io: Arc<dyn IO> = Arc::new(FailingReadIo {
-        inner: Arc::new(MemoryIO::new()),
-        fail_reads: fail_reads.clone(),
-    });
-    let db = Database::open_file(io, "failed-sibling-read.db", Arc::new(SqliteDialect))?;
-
-    {
-        let conn = db.connect(ConnectOpts::new())?;
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
-        conn.execute(
-            "INSERT INTO t SELECT value * 10, zeroblob(1000) FROM generate_series(1, 200)",
-        )?;
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        conn.close()?;
-    }
-
-    let conn = db.connect(ConnectOpts::new())?;
+    let io = ScriptedReadIo::new();
+    let conn = open_filled_database(io.clone(), "failed-sibling-read.db")?;
     // Load the leaves around id 1005, so that only the split's sibling reads
     // go to the file.
     conn.execute("SELECT v FROM t WHERE id IN (1000, 1010)")?;
-    fail_reads.store(true, Ordering::Release);
-    let result = conn.execute("INSERT INTO t VALUES (1005, zeroblob(1000))");
-    fail_reads.store(false, Ordering::Release);
+    io.script_next_reads(&[ReadAction::Fail]);
 
-    let err = result.expect_err("the INSERT must fail with the read error");
+    let err = conn
+        .execute("INSERT INTO t VALUES (1005, zeroblob(1000))")
+        .expect_err("the INSERT must fail with the read error");
     assert!(
         err.to_string().contains("injected read error"),
         "unexpected error: {err}"
     );
+    Ok(())
+}
+
+/// When one sibling read fails while another is still in flight, the split
+/// must return the error without waiting for the in-flight read. That read
+/// may be finished by code that cannot run while the split waits, so
+/// waiting could never end.
+#[test]
+fn failed_sibling_read_does_not_wait_for_other_sibling_reads() -> anyhow::Result<()> {
+    let io = ScriptedReadIo::new();
+    let conn = open_filled_database(io.clone(), "failed-sibling-read-in-flight.db")?;
+    // Load only the leaf that the INSERT of id 1005 lands on, so that the
+    // split reads two siblings from the file: the right one first, then the
+    // left one.
+    conn.execute("SELECT v FROM t WHERE id = 1010")?;
+    io.script_next_reads(&[ReadAction::Hold, ReadAction::Fail]);
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (1005, zeroblob(1000))")
+        .expect_err("the INSERT must fail with the read error");
+    assert!(
+        err.to_string().contains("injected read error"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        io.held_read_count(),
+        1,
+        "the right sibling read must be in flight"
+    );
+
+    io.finish_held_reads()?;
+    conn.execute("INSERT INTO t VALUES (1005, zeroblob(1000))")?;
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let mut result = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        result.push(row.get::<String>(0)?);
+        Ok(())
+    })?;
+    assert_eq!(result, vec!["ok".to_string()]);
     Ok(())
 }
