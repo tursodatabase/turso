@@ -2640,6 +2640,7 @@ impl Database {
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
+            mv_tx_successor_generation: Arc::new(AtomicU64::new(0)),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),
             )),

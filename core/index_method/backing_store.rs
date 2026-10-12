@@ -330,6 +330,7 @@ impl BackingStore {
         Ok(Box::new(MvCursor::new(
             Arc::clone(&binding.mv_store),
             &connection,
+            self.database_id,
             binding.tx_id,
             self.root_page,
             MvccCursorType::Index(Arc::clone(&self.index_info)),
