@@ -109,7 +109,7 @@ regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",
 ] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
-rand = { workspace = true }
+rand = "0.10"
 libm = "0.2"
 turso_macros = { workspace = true }
 miette = { workspace = true }
@@ -129,7 +129,7 @@ uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
-aes-gcm = { version = "0.10.3" }
+aes-gcm = { version = "0.11.1", features = ["getrandom"] }
 aes = { version = "0.8.4" }
 turso_parser = { workspace = true }
 twox-hash = "2.1.1"
@@ -141,10 +141,10 @@ either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
 simdutf8 = "0.1.5"
-branches = { version = "0.4.3", default-features = false }
+branches = { version = "0.5.1", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
-fastbloom = { version = "0.14.1", default-features = false }
+fastbloom = { git = "https://github.com/matheus23/fastbloom", branch = "matheus23/rand-0.10" }
 crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
@@ -155,10 +155,7 @@ stacker = { version = "0.1", optional = true }
 simsimd = { version = "6.5.3", optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-# From fastbloom/rand
-getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
-# From  aes-gcm
-getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom = "0.4"
 uuid = { version = "1.11.0", features = ["js"], optional = true }
 
 [target.'cfg(antithesis)'.dependencies]
