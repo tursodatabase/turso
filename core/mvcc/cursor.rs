@@ -12,6 +12,7 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
@@ -542,8 +543,11 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     pub db: Arc<MvStore<Clock, A>>,
     /// Weak so a cursor retained past its statement (an index-method cursor
     /// parked on its connection) cannot keep the connection alive.
-    #[cfg(any(test, injected_yields))]
     connection: crate::sync::Weak<Connection>,
+    db_index: usize,
+    /// Clone of `Connection::mv_tx_successor_generation`.
+    mv_tx_successor_generation: Arc<AtomicU64>,
+    seen_mv_tx_successor_generation: u64,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     current_pos: CursorPosition<A>,
@@ -596,6 +600,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     pub fn new(
         db: Arc<MvStore<Clock, A>>,
         connection: &Arc<Connection>,
+        db_index: usize,
         tx_id: u64,
         root_page_or_table_id: i64,
         mv_cursor_type: MvccCursorType,
@@ -626,8 +631,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             db,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            #[cfg(any(test, injected_yields))]
             connection: Arc::downgrade(connection),
+            db_index,
+            mv_tx_successor_generation: connection.mv_tx_successor_generation.clone(),
+            seen_mv_tx_successor_generation: connection
+                .mv_tx_successor_generation
+                .load(Ordering::Acquire),
             tx_id,
             snapshot,
             table_iterator: None,
@@ -676,6 +685,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        self.follow_connection_tx()?;
         if self.db.tx_should_abort(self.tx_id) {
             return Err(LimboError::CommitDependencyAborted.into());
         }
@@ -1216,6 +1226,62 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    /// COMMIT and ROLLBACK leave running statements on a successor read
+    /// transaction (`MvStore::finish_committed_tx`); move there on first use.
+    fn follow_connection_tx(&mut self) -> Result<()> {
+        let generation = self.mv_tx_successor_generation.load(Ordering::Acquire);
+        if generation == self.seen_mv_tx_successor_generation {
+            return Ok(());
+        }
+        self.seen_mv_tx_successor_generation = generation;
+        let connection = self.connection.upgrade().ok_or_else(|| {
+            LimboError::InternalError(
+                "MVCC cursor used after its connection was dropped".to_string(),
+            )
+        })?;
+        let Some(tx_id) = connection.get_mv_tx_id_for_db(self.db_index) else {
+            return Err(LimboError::TxError(
+                "cannot continue the statement: the transaction it was running in has ended"
+                    .to_string(),
+            ));
+        };
+        if tx_id == self.tx_id {
+            return Ok(());
+        }
+        self.tx_id = tx_id;
+        self.snapshot = self.db.read_snapshot(tx_id)?;
+        self.eq_seek_row = None;
+        self.skip_queued_row_if_invisible()
+    }
+
+    /// Drop a version-store row queued under the old snapshot if the new one
+    /// no longer shows it, unless the cursor is positioned on that row, which
+    /// `next` and `prev` move past on their own.
+    fn skip_queued_row_if_invisible(&mut self) -> Result<()> {
+        let Some(versions) = self.dual_peek.mvcc_peek.get_versions() else {
+            return Ok(());
+        };
+        let positioned_on_queued_row = matches!(
+            &self.current_pos,
+            CursorPosition::Loaded {
+                row_id,
+                in_btree: false,
+                ..
+            } if Some(&row_id.row_id) == self.dual_peek.mvcc_peek.get_row_key()
+        );
+        if positioned_on_queued_row {
+            return Ok(());
+        }
+        if self
+            .db
+            .read_visible_from_versions(self.snapshot, &versions)?
+            .is_none()
+        {
+            self.advance_mvcc_iterator();
+        }
+        Ok(())
+    }
+
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
@@ -1367,6 +1433,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
     fn last(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -1442,6 +1509,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1539,6 +1607,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1626,6 +1695,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        self.follow_connection_tx()?;
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -1671,6 +1741,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.follow_connection_tx()?;
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1918,6 +1989,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
             BTreeKey::IndexKey(record) => {
@@ -2016,6 +2088,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn delete(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         let (rowid, in_btree) = match self.get_current_pos() {
             CursorPosition::Loaded {
                 row_id, in_btree, ..
@@ -2067,6 +2140,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        self.follow_connection_tx()?;
         if self.state.is_none() {
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
@@ -2212,6 +2286,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
+        self.follow_connection_tx()?;
         loop {
             let state = self.count_state;
             match state {
@@ -2267,6 +2342,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -2351,6 +2427,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        self.follow_connection_tx()?;
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()

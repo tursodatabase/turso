@@ -725,6 +725,7 @@ fn promote_to_mvcc_cursor(
     Ok(Box::new(MvCursor::new(
         mv_store,
         connection,
+        database_id,
         tx_id,
         root_page,
         cursor_type,
