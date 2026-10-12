@@ -36,8 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
-    SqliteDialect, Statement, Value,
+    io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
+    QueryMode, SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -283,7 +283,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
             (io, conn)
         };
         unsafe {
@@ -503,7 +503,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect()?;
+        self.conn = db.connect(ConnectOpts::new())?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -2071,7 +2071,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect()?;
+        let target = db.connect(ConnectOpts::new())?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;

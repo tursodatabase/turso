@@ -11,7 +11,7 @@ use crate::sync::{atomic::Ordering, Arc};
 use crate::types::IOResult;
 use crate::types::IOResultOr;
 use crate::SqliteDialect;
-use crate::{Connection, Database, Value};
+use crate::{ConnectOpts, Connection, Database, Value};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {
@@ -60,7 +60,7 @@ impl ProjectOperator {
         // Set up internal connection for expression evaluation
         let io = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let internal_conn = db.connect()?;
+        let internal_conn = db.connect(ConnectOpts::new())?;
         // Set to read-only mode and disable auto-commit since we're only evaluating expressions
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);

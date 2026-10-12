@@ -6,8 +6,8 @@ use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::SqliteDialect;
 use turso_core::{
-    CipherMode, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, PlatformIO, Row,
-    IO,
+    CipherMode, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
+    PlatformIO, Row, IO,
 };
 
 const ENABLE_ENCRYPTION: bool = true;
@@ -584,7 +584,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         let correct_encryption_key =
             turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
 
-        let conn = main_db.connect()?;
+        let conn = main_db.connect(ConnectOpts::new())?;
         conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
         conn.set_encryption_key(correct_encryption_key)?;
 
@@ -610,7 +610,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
         conn.set_encryption_key(correct_encryption_key)?;
 
@@ -653,7 +653,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         )?;
 
         // opening succeeds - the key is not validated at open time
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
         conn.set_encryption_key(wrong_encryption_key)?;
 
@@ -712,7 +712,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
         conn.set_encryption_key(correct_encryption_key)?;
 
@@ -781,7 +781,7 @@ fn create_encrypted_db(
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let cipher_mode = CipherMode::try_from(cipher)?;
     let key = EncryptionKey::from_hex_string(hexkey)?;
     conn.set_encryption_cipher(cipher_mode)?;
@@ -1176,7 +1176,7 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
             Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
-        let conn = db.connect_with_encryption(Some(key))?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute(format!("INSERT INTO test (value) VALUES ('{large_value}')"))?;
@@ -1202,7 +1202,7 @@ fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<
             Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
-        let conn = db.connect_with_encryption(Some(key))?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
 
         let rows: Vec<(i64, i64, String, String)> = conn.exec_rows(
             "SELECT id, length(value), substr(value, 1, 16), substr(value, length(value) - 15, 16) FROM test",
@@ -1251,7 +1251,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
-        let conn = db.connect_with_encryption(Some(key))?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO test (value) VALUES ('before mvcc')")?;
         for c in conn.cacheflush()? {
@@ -1270,7 +1270,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
-        let conn = db.connect_with_encryption(Some(key))?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
 
         // Pre-existing row should be readable
         let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test");
@@ -1313,7 +1313,7 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             Arc::new(SqliteDialect),
         )?;
         let key = EncryptionKey::from_hex_string(hex_key)?;
-        let conn = db.connect_with_encryption(Some(key))?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
 
         let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test ORDER BY id");
         assert_eq!(

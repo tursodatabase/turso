@@ -14,12 +14,14 @@
 
 use std::sync::Arc;
 
-use turso_core::{Connection, Database, LimboError, MemoryYieldIO, SqliteDialect, StepResult, IO};
+use turso_core::{
+    ConnectOpts, Connection, Database, LimboError, MemoryYieldIO, SqliteDialect, StepResult, IO,
+};
 
 fn open_conn(io: Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
     Database::open_file(io, path, Arc::new(SqliteDialect))
         .unwrap()
-        .connect()
+        .connect(ConnectOpts::new())
         .unwrap()
 }
 

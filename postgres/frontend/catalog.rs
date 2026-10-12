@@ -2682,6 +2682,7 @@ mod tests {
     use super::*;
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
+    use turso_core::ConnectOpts;
 
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
@@ -2723,7 +2724,7 @@ mod tests {
                 crate::DatabaseOpts::new(),
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.pragma_update("journal_mode", "'mvcc'").unwrap();
             }
@@ -2751,7 +2752,7 @@ mod tests {
                 .prepare("SELECT relname FROM pg_class WHERE relname = 'second_connection'")
                 .unwrap();
             assert!(tables.run_collect_rows().unwrap().is_empty());
-            let other = db.connect().unwrap();
+            let other = db.connect(ConnectOpts::new()).unwrap();
             other
                 .execute("CREATE TABLE second_connection (v INT)")
                 .unwrap();
@@ -2802,7 +2803,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut expected = Vec::new();
         for i in 0..12 {
             let name = format!("catalog_{i:02}");
@@ -2909,7 +2910,7 @@ mod tests {
                     opts,
                 )
                 .unwrap();
-                let conn = db.connect().unwrap();
+                let conn = db.connect(ConnectOpts::new()).unwrap();
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
@@ -2927,7 +2928,7 @@ mod tests {
                 opts,
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             assert_eq!(columns(&conn), expected);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
@@ -2963,7 +2964,7 @@ mod tests {
             opts,
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
             .unwrap();
         conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
@@ -2993,7 +2994,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             attached
-                .connect()
+                .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
                 .unwrap()
@@ -3002,7 +3003,7 @@ mod tests {
             vec![vec![Value::from_i64(3)]]
         );
         for temp_store in ["MEMORY", "FILE"] {
-            let temp_conn = db.connect().unwrap();
+            let temp_conn = db.connect(ConnectOpts::new()).unwrap();
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
@@ -3033,7 +3034,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output
-                .connect()
+                .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM catalog_names")
                 .unwrap()
@@ -3056,7 +3057,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = crate::Connection::new(db.connect().unwrap());
+        let conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
@@ -3104,7 +3105,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create test tables in SQLite mode (default)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3164,7 +3165,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create a test table with known columns
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
@@ -3229,7 +3230,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER)")
@@ -3268,7 +3269,7 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");
@@ -3311,7 +3312,7 @@ mod tests {
         .unwrap();
 
         // SQLite-mode connection: sqlite_master sees the user table.
-        let sqlite_conn = db.connect().unwrap();
+        let sqlite_conn = db.connect(ConnectOpts::new()).unwrap();
         sqlite_conn
             .execute("CREATE TABLE users (id INTEGER, name TEXT)")
             .unwrap();
@@ -3335,7 +3336,7 @@ mod tests {
         assert!(found, "users table not found in sqlite_master");
 
         // PostgreSQL-mode connection: pg_class sees the user table.
-        let pg_conn = crate::Connection::new(db.connect().unwrap());
+        let pg_conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
         let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
@@ -3369,7 +3370,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create multiple tables
         conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
@@ -3440,7 +3441,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create test tables
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3488,7 +3489,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();

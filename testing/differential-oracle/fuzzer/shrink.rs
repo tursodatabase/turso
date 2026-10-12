@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use turso_core::{Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database, SqliteDialect};
 use turso_parser::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
@@ -78,7 +78,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect()?;
+        let turso = turso_db.connect(ConnectOpts::new())?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();

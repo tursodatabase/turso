@@ -637,7 +637,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 mod tests {
     use super::*;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
     /// to verify that callers can register an arbitrary catalog table at
@@ -738,7 +738,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -782,7 +782,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);
