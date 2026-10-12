@@ -393,6 +393,8 @@ impl Builder {
             push_operations_threshold: None,
             pull_bytes_threshold: None,
             logical_mvcc_pull: self.logical_mvcc_pull,
+            // the tape stays on: this binding pushes through the engine
+            cdc_mode: None,
         };
 
         // Create sync wrapper.

@@ -374,6 +374,7 @@ impl SyncEngine {
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
+            cdc_mode: None,
             remote_encryption_key: self
                 .opts
                 .remote_encryption_key

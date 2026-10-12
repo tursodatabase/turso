@@ -59,6 +59,7 @@ fn replica_opts() -> DatabaseSyncEngineOpts {
         reserved_bytes: 0,
         db_opts: database_opts(),
         partial_sync_opts: None,
+        cdc_mode: None,
         remote_encryption_key: None,
         push_operations_threshold: None,
         pull_bytes_threshold: None,
