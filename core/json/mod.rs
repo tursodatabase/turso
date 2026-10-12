@@ -672,7 +672,7 @@ where
 /// - `element_type` – the element type of the jsonb
 /// - `flag` – how the result should be formatted (null values will stay null).
 ///   - If the flag is `OutputVariant::Binary`, the result is a `Value::Blob`.
-///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TestSubtype::Text`, with the outer quotes removed.
+///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`, with the outer quotes removed.
 ///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
 ///   - If the `element_type` is not text, the flag is ignored.
 pub fn json_string_to_db_type(
