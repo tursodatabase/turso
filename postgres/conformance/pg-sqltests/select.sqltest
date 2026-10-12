@@ -47,6 +47,20 @@ expect {
     1|two|3.5
 }
 
+test select-star-from-subquery-with-unnamed-columns {
+    SELECT * FROM (SELECT 1, 'two', 1 + 2) AS s;
+}
+expect {
+    1|two|3
+}
+
+test select-star-from-subquery-with-column-alias-list {
+    SELECT * FROM (SELECT 1, 2) AS s(p, q);
+}
+expect {
+    1|2
+}
+
 test select-null-renders-empty {
     SELECT NULL;
 }
