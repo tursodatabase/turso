@@ -1064,7 +1064,9 @@ impl Schema {
     /// used by both initial database open and schema reparse.
     pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql)?;
+            self.add_type_from_sql(sql).map_err(|e| {
+                crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
+            })?;
         }
         self.resolve_all_custom_type_affinities()?;
         Ok(())
