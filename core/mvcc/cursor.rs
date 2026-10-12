@@ -1164,10 +1164,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             )
         })?;
         let Some(tx_id) = connection.get_mv_tx_id_for_db(self.db_index) else {
-            return Err(LimboError::TxError(
-                "cannot continue the statement: the transaction it was running in has ended"
-                    .to_string(),
-            ));
+            return Err(self.transaction_ended_error(&connection));
         };
         if tx_id == self.tx_id {
             return Ok(());
@@ -1176,6 +1173,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.snapshot = self.db.read_snapshot(tx_id)?;
         self.eq_seek_row = None;
         self.skip_queued_row_if_invisible()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tx_id(&self) -> u64 {
+        self.tx_id
+    }
+
+    fn transaction_ended_error(&self, connection: &Connection) -> LimboError {
+        let successor_failure = if self.db_index == crate::MAIN_DB_ID {
+            connection.mv_tx_successor_failure.lock().clone()
+        } else {
+            None
+        };
+        match successor_failure {
+            Some(failure) => LimboError::TxError(format!(
+                "cannot continue the statement: its transaction ended and no transaction could replace it: {failure}"
+            )),
+            None => LimboError::TxError(
+                "cannot continue the statement: the transaction it was running in has ended"
+                    .to_string(),
+            ),
+        }
     }
 
     /// Drop a version-store row queued under the old snapshot if the new one

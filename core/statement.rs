@@ -11,6 +11,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
+use crate::mvcc::database::SuccessorTx;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -1082,7 +1083,13 @@ impl Statement {
             || attached_leaked
             || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
         if conn.get_auto_commit() && has_implicit_txn_state {
-            conn.rollback_current_txn_state(&main_pager, true);
+            conn.rollback_current_txn_state(
+                &main_pager,
+                true,
+                SuccessorTx::ForOtherStatements {
+                    caller_counted: true,
+                },
+            );
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
 
@@ -1610,7 +1617,7 @@ impl Statement {
         let conn = self.program.connection.clone();
         if let Some(mv_store) = conn.mv_store_for_db(db) {
             if let Some((tx_id, _)) = conn.get_mv_tx_for_db(db) {
-                mv_store.rollback_tx(tx_id, self.pager.clone(), &conn, db);
+                mv_store.rollback_tx(tx_id, self.pager.clone(), &conn, db, SuccessorTx::NotNeeded);
                 self.pager.end_read_tx();
             }
         }
@@ -1626,7 +1633,13 @@ impl Statement {
             return;
         };
         if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
-            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+            mv_store.rollback_tx(
+                pending.inner_tx_id,
+                self.pager.clone(),
+                &conn,
+                pending.db,
+                SuccessorTx::NotNeeded,
+            );
         }
         conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
         // When the inner tx aborted via the vdbe's catch-all error path
