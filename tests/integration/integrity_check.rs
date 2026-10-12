@@ -132,6 +132,45 @@ fn test_integrity_check_strict_custom_type_arrays() {
     assert_eq!(run_quick_check(&conn), "ok");
 }
 
+#[test]
+fn test_delete_reports_missing_partial_index_entry() {
+    // SQLite builds p without row 1 (c0 = 1). Changing p's WHERE afterwards
+    // means row 1 should be in p but is not, like a corrupt index. DELETE must
+    // report that, as SQLite does, instead of skipping the missing entry.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("missing_partial_index_entry.db");
+    let sqlite_conn = rusqlite::Connection::open(&path).unwrap();
+    sqlite_conn
+        .execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, c0 INT);
+             CREATE INDEX p ON t(c0) WHERE c0 > 5;
+             INSERT INTO t VALUES (1, 1);
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = 'CREATE INDEX p ON t(c0) WHERE c0 > 0' WHERE name = 'p';",
+        )
+        .unwrap();
+    sqlite_conn.close().unwrap();
+
+    let sqlite_conn = rusqlite::Connection::open(&path).unwrap();
+    let sqlite_result = sqlite_conn.execute("DELETE FROM t WHERE id = 1", []);
+    assert!(
+        matches!(
+            sqlite_result,
+            Err(rusqlite::Error::SqliteFailure(ref e, _)) if e.code == rusqlite::ErrorCode::DatabaseCorrupt
+        ),
+        "{sqlite_result:?}"
+    );
+    drop(sqlite_conn);
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let result = conn.execute("DELETE FROM t WHERE id = 1");
+    assert!(
+        matches!(result, Err(turso_core::LimboError::Corrupt(_))),
+        "{result:?}"
+    );
+}
+
 fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, expected: &str) {
     let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
     let db = TempDatabase::builder().with_opts(opts).build();

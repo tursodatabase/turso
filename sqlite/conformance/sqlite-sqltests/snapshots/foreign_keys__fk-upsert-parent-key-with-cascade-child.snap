@@ -60,7 +60,7 @@ addr  opcode           p1  p2  p3  p4                 p5  comment
   42    Halt         1555   0   0  parent.k            0
   43    Copy           16  25   0                      0  r[25]=r[16]
   44    Copy            1  26   0                      0  r[26]=r[1]
-  45    IdxDelete       0  25   2                      0
+  45    IdxDelete       0  25   2                      1
   46    IdxInsert       0  23  21                      2  key=r[23]
   47    MakeRecord     18   3  27                      0  r[27]=mkrec(r[18..20])
   48    Insert          1  27   1  parent              8  intkey=r[1] data=r[27]
