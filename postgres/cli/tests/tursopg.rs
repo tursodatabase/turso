@@ -951,8 +951,12 @@ fn copy_from_file_not_found_repl() {
 /// talks to that process. So the server binds port 0 and the test reads the
 /// address that the server prints once it is listening.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_with_db(":memory:")
+}
+
+fn start_tursopg_server_with_db(db_path: impl AsRef<std::ffi::OsStr>) -> (Child, u16) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(":memory:")
+        .arg(db_path)
         .arg("--server")
         .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
@@ -1571,4 +1575,46 @@ fn schema_sidecar_reattaches_on_reopen() {
         out.contains("persisted"),
         "expected 'persisted' in output, got: {out}"
     );
+}
+
+/// A schema that the server attached at startup and a client dropped has its
+/// file deleted once no client has it attached.
+#[test]
+fn server_deletes_file_of_schema_attached_at_startup_when_a_client_drops_it() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("tursopg_server_drop_schema_{timestamp}"));
+    std::fs::create_dir(&test_dir).unwrap();
+    let db_path = test_dir.join("main.db");
+    let out = run_tursopg_with_db(&db_path, b"CREATE SCHEMA s;\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let schema_files = || -> Vec<String> {
+        std::fs::read_dir(&test_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("turso-postgres-schema-s.db"))
+            .collect()
+    };
+    assert!(!schema_files().is_empty());
+
+    let (mut server, port) = start_tursopg_server_with_db(&db_path);
+    let mut client = PgTestClient::connect(port);
+    client.send_query("DROP SCHEMA s");
+    client.read_until_ready();
+    drop(client);
+
+    let mut remaining = schema_files();
+    for _ in 0..50 {
+        if remaining.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        remaining = schema_files();
+    }
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&test_dir).ok();
+    assert_eq!(remaining, Vec::<String>::new());
 }
