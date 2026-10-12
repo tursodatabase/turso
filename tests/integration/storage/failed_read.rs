@@ -18,16 +18,22 @@ enum ReadAction {
     /// `finish_held_reads`, never from `step()`. Like IO that is finished
     /// outside the connection's IO loop.
     Hold,
+    /// Start the read on the inner IO, which finishes it as usual.
+    #[cfg_attr(not(all(target_os = "linux", feature = "io_uring")), allow(dead_code))]
+    Pass,
 }
 
 #[derive(Default)]
 struct ReadScript {
     next_actions: VecDeque<ReadAction>,
     held: Vec<(Arc<dyn File>, u64, Completion)>,
+    passed: Vec<Completion>,
+    /// For each `Fail`, how many `Pass` reads were still unfinished.
+    passed_in_flight_at_failure: Vec<usize>,
 }
 
 /// IO whose database file reads follow a script. Reads not in the script
-/// go straight to memory.
+/// go straight to the inner IO.
 struct ScriptedReadIo {
     inner: Arc<dyn IO>,
     script: Arc<Mutex<ReadScript>>,
@@ -36,11 +42,20 @@ struct ScriptedReadIo {
 const MAX_DRAIN_STEPS: usize = 10_000;
 
 impl ScriptedReadIo {
-    fn new() -> Arc<Self> {
+    fn new(inner: Arc<dyn IO>) -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(MemoryIO::new()),
+            inner,
             script: Arc::new(Mutex::new(ReadScript::default())),
         })
+    }
+
+    #[cfg_attr(not(all(target_os = "linux", feature = "io_uring")), allow(dead_code))]
+    fn passed_in_flight_at_failure(&self) -> Vec<usize> {
+        self.script
+            .lock()
+            .unwrap()
+            .passed_in_flight_at_failure
+            .clone()
     }
 
     fn script_next_reads(&self, actions: &[ReadAction]) {
@@ -143,11 +158,18 @@ impl File for ScriptedReadFile {
         let mut script = self.script.lock().unwrap();
         match script.next_actions.pop_front() {
             Some(ReadAction::Fail) => {
+                let in_flight = script.passed.iter().filter(|c| !c.finished()).count();
+                script.passed_in_flight_at_failure.push(in_flight);
                 Err(LimboError::InternalError("injected read error".to_string()))
             }
             Some(ReadAction::Hold) => {
                 script.held.push((self.inner.clone(), pos, c.clone()));
                 Ok(c)
+            }
+            Some(ReadAction::Pass) => {
+                script.passed.push(c.clone());
+                drop(script);
+                self.inner.pread(pos, c)
             }
             None => {
                 drop(script);
@@ -205,7 +227,7 @@ fn open_filled_database(io: Arc<ScriptedReadIo>, name: &str) -> anyhow::Result<A
 /// waiting for the read's completion, which nothing will ever finish.
 #[test]
 fn failed_sibling_read_during_page_split_returns_error() -> anyhow::Result<()> {
-    let io = ScriptedReadIo::new();
+    let io = ScriptedReadIo::new(Arc::new(MemoryIO::new()));
     let conn = open_filled_database(io.clone(), "failed-sibling-read.db")?;
     // Load the leaves around id 1005, so that only the split's sibling reads
     // go to the file.
@@ -228,7 +250,7 @@ fn failed_sibling_read_during_page_split_returns_error() -> anyhow::Result<()> {
 /// waiting could never end.
 #[test]
 fn failed_sibling_read_does_not_wait_for_other_sibling_reads() -> anyhow::Result<()> {
-    let io = ScriptedReadIo::new();
+    let io = ScriptedReadIo::new(Arc::new(MemoryIO::new()));
     let conn = open_filled_database(io.clone(), "failed-sibling-read-in-flight.db")?;
     // Load only the leaf that the INSERT of id 1005 lands on, so that the
     // split reads two siblings from the file: the right one first, then the
@@ -250,6 +272,44 @@ fn failed_sibling_read_does_not_wait_for_other_sibling_reads() -> anyhow::Result
     );
 
     io.finish_held_reads()?;
+    conn.execute("INSERT INTO t VALUES (1005, zeroblob(1000))")?;
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    let mut result = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        result.push(row.get::<String>(0)?);
+        Ok(())
+    })?;
+    assert_eq!(result, vec!["ok".to_string()]);
+    Ok(())
+}
+
+/// The same split with io_uring: the right sibling's read is really in
+/// flight in the kernel when the left sibling's read fails. The split must
+/// return the error without waiting, and the late read must not break the
+/// database.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[test]
+fn failed_sibling_read_with_io_uring_read_in_flight() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("failed-sibling-read-io-uring.db");
+    let io = ScriptedReadIo::new(Arc::new(turso_core::UringIO::new()?));
+    let conn = open_filled_database(io.clone(), path.to_str().unwrap())?;
+    conn.execute("SELECT v FROM t WHERE id = 1010")?;
+    io.script_next_reads(&[ReadAction::Pass, ReadAction::Fail]);
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (1005, zeroblob(1000))")
+        .expect_err("the INSERT must fail with the read error");
+    assert!(
+        err.to_string().contains("injected read error"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        io.passed_in_flight_at_failure(),
+        vec![1],
+        "the right sibling read must be in flight when the left one fails"
+    );
+
     conn.execute("INSERT INTO t VALUES (1005, zeroblob(1000))")?;
     let mut stmt = conn.prepare("PRAGMA integrity_check")?;
     let mut result = Vec::new();
