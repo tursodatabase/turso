@@ -1727,7 +1727,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 continue;
             };
             if latest != *stamp && mvstore.mark_checkpoint_dirty_key(key, latest).is_err() {
-                mvstore.require_checkpoint_full_scan();
+                mvstore.require_checkpoint_full_scan(latest);
             }
         }
         self.prune_cursor = end;
@@ -3462,7 +3462,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(TransitionResult::Io(io));
                 }
                 if let Some(generation) = self.full_scan_generation {
-                    self.mvstore.clear_checkpoint_full_scan(generation);
+                    self.mvstore
+                        .clear_checkpoint_full_scan(generation, self.snapshot_ts);
                 }
                 self.state = CheckpointState::Finalize;
                 Ok(TransitionResult::Continue)

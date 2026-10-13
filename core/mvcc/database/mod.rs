@@ -4468,6 +4468,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     pub checkpoint_dirty_table_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
     pub checkpoint_dirty_index_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
     checkpoint_full_scan_generation: AtomicU64,
+    /// Highest stamp that a failed `mark_checkpoint_dirty_key` left out of the dirty maps.
+    /// A full scan only clears the request once its snapshot reaches this stamp, because a
+    /// lower snapshot does not collect the version that carries it.
+    checkpoint_full_scan_min_snapshot_ts: AtomicU64,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -4666,6 +4670,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
             checkpoint_full_scan_generation: AtomicU64::new(1),
+            checkpoint_full_scan_min_snapshot_ts: AtomicU64::new(0),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -7801,7 +7806,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return;
         }
         if self.mark_checkpoint_dirty_key(key, actual).is_err() {
-            self.require_checkpoint_full_scan();
+            self.require_checkpoint_full_scan(actual);
         }
     }
 
@@ -7835,12 +7840,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         std::num::NonZeroU64::new(self.checkpoint_full_scan_generation.load(Ordering::Acquire))
     }
 
-    pub(crate) fn require_checkpoint_full_scan(&self) {
+    pub(crate) fn require_checkpoint_full_scan(&self, lost_stamp: u64) {
+        self.checkpoint_full_scan_min_snapshot_ts
+            .fetch_max(lost_stamp, Ordering::AcqRel);
         self.checkpoint_full_scan_generation
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn clear_checkpoint_full_scan(&self, generation: std::num::NonZeroU64) {
+    pub(crate) fn clear_checkpoint_full_scan(
+        &self,
+        generation: std::num::NonZeroU64,
+        snapshot_ts: u64,
+    ) {
+        if snapshot_ts
+            < self
+                .checkpoint_full_scan_min_snapshot_ts
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
         let _ = self.checkpoint_full_scan_generation.compare_exchange(
             generation.get(),
             0,
@@ -8870,7 +8888,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             return;
         }
         if self.mark_checkpoint_dirty_key(&rowid, end_ts).is_err() {
-            self.require_checkpoint_full_scan();
+            self.require_checkpoint_full_scan(end_ts);
         }
     }
 
