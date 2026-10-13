@@ -287,22 +287,88 @@ export class Session {
     let sawProbe = false;
     let unreliable = false;
     let completed = false;
+    let currentStep: number | undefined;
+    let lastStep = -1;
+    let columnCount = 0;
+    let queryCompleted = false;
+    let terminated = false;
+    let fatal = false;
     try {
       for await (const entry of entries) {
-        if (entry.type === 'step_begin' && entry.step === probeIdx) {
-          sawProbe = true;
-          continue;
+        if ((entry.type === 'error' || entry.type === 'step_error')
+          && (!entry.error || typeof entry.error.message !== 'string' || typeof entry.error.code !== 'string')) {
+          throw new DatabaseError('Invalid cursor error', 'PROTOCOL_ERROR');
         }
-        if (sawProbe && (entry.type === 'row' || entry.type === 'step_end')) {
-          continue;
+        const structural = entry.type === 'step_begin' || entry.type === 'row'
+          || entry.type === 'step_end' || entry.type === 'step_error'
+          || entry.type === 'error' || entry.type === 'replication_index';
+        if ((terminated || fatal) && structural) {
+          throw new DatabaseError('Cursor entries after completion', 'PROTOCOL_ERROR');
         }
-        if (entry.type === 'error' || (entry.type === 'step_error' && entry.step === probeIdx)) {
-          unreliable = true;
-          if (entry.type === 'step_error') {
-            continue;
+        switch (entry.type) {
+          case 'step_begin': {
+            const step = entry.step;
+            if (!Number.isInteger(step) || step === undefined || step < 0 || step > probeIdx
+              || step <= lastStep || currentStep !== undefined
+              || (step === probeIdx && !queryCompleted) || !Array.isArray(entry.cols)) {
+              throw new DatabaseError('Invalid cursor step_begin', 'PROTOCOL_ERROR');
+            }
+            currentStep = step;
+            lastStep = step;
+            columnCount = entry.cols.length;
+            if (step === probeIdx) {
+              sawProbe = true;
+              continue;
+            }
+            break;
           }
+          case 'row':
+            if (currentStep === undefined || !Array.isArray(entry.row) || entry.row.length !== columnCount) {
+              throw new DatabaseError('Invalid cursor row', 'PROTOCOL_ERROR');
+            }
+            if (currentStep === probeIdx) continue;
+            break;
+          case 'step_end': {
+            if (currentStep === undefined) {
+              throw new DatabaseError('Invalid cursor step_end', 'PROTOCOL_ERROR');
+            }
+            const step = currentStep;
+            currentStep = undefined;
+            if (step === probeIdx) continue;
+            queryCompleted = true;
+            break;
+          }
+          case 'step_error': {
+            const step = entry.step;
+            if (!Number.isInteger(step) || step === undefined || step < 0 || step > probeIdx
+              || (currentStep !== undefined ? step !== currentStep : step <= lastStep)
+              || (step === probeIdx && !queryCompleted)) {
+              throw new DatabaseError('Invalid cursor step_error', 'PROTOCOL_ERROR');
+            }
+            currentStep = undefined;
+            lastStep = step;
+            if (step === probeIdx) {
+              unreliable = true;
+              continue;
+            }
+            queryCompleted = true;
+            break;
+          }
+          case 'error':
+            fatal = true;
+            unreliable = true;
+            break;
+          case 'replication_index':
+            if (!queryCompleted || currentStep !== undefined) {
+              throw new DatabaseError('Incomplete cursor statement', 'PROTOCOL_ERROR');
+            }
+            terminated = true;
+            break;
         }
         yield entry;
+      }
+      if (!terminated && !fatal) {
+        throw new DatabaseError('Missing cursor terminator', 'PROTOCOL_ERROR');
       }
       completed = true;
     } finally {
@@ -371,17 +437,16 @@ export class Session {
     let response;
     try {
       response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      this.baton = response.baton;
+      if (response.base_url) {
+        this.baseUrl = normalizeUrl(response.base_url);
+      }
+      this.updateAutocommit(response);
     } catch {
       this.baton = null;
       this.autocommit = true;
       return;
     }
-
-    this.baton = response.baton;
-    if (response.base_url) {
-      this.baseUrl = normalizeUrl(response.base_url);
-    }
-    this.updateAutocommit(response);
   }
 
   /**

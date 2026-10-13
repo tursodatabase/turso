@@ -365,7 +365,7 @@ test.serial('Session attaches requestHeaders and lets them override Authorizatio
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n${JSON.stringify({ type: 'replication_index', replication_index: null })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
@@ -426,7 +426,7 @@ test.serial('per-query requestHeaders are attached and override session-level he
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n${JSON.stringify({ type: 'replication_index', replication_index: null })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
@@ -533,7 +533,7 @@ test.serial('run() treats a trailing requestHeaders-only object as query options
     capturedHeaders.push(opts.headers);
     capturedArgs.push(JSON.parse(opts.body).batch.steps[0].stmt.args);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n${JSON.stringify({ type: 'replication_index', replication_index: null })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
