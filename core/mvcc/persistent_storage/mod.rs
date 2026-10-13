@@ -1,10 +1,8 @@
 use crate::io::FileSyncType;
 use crate::storage::encryption::EncryptionContext;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::turso_assert;
 use std::fmt::Debug;
 
 #[cfg(test)]
@@ -30,13 +28,6 @@ pub trait DurableStorage: Send + Sync + Debug {
         log_record: &mut LogRecord,
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
-    ) -> Result<()>;
-
-    /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
-    fn serialize_database_header(
-        &self,
-        log_record: &mut LogRecord,
-        header: &DatabaseHeader,
     ) -> Result<()>;
 
     /// Write a transaction to the logical log without advancing the writer offset.
@@ -172,23 +163,6 @@ impl DurableStorage for Storage {
     ) -> Result<()> {
         LogSerializer::new(&mut log_record.buf)
             .serialize_op_entry(row_version, portable_extension)?;
-        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
-            LimboError::InternalError("logical log op_count exceeds u32".to_string())
-        })?;
-        Ok(())
-    }
-
-    fn serialize_database_header(
-        &self,
-        log_record: &mut LogRecord,
-        header: &DatabaseHeader,
-    ) -> Result<()> {
-        turso_assert!(
-            !log_record.has_header,
-            "DatabaseHeader op appended more than once to a single LogRecord"
-        );
-        LogSerializer::new(&mut log_record.buf).serialize_header_entry(header)?;
-        log_record.has_header = true;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;

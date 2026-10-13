@@ -1,25 +1,34 @@
 @database :memory:
 
-# DDL statements inside BEGIN CONCURRENT should produce a clear error message
-# instead of the confusing "database table is locked".
+# DDL inside BEGIN CONCURRENT runs under per-object DDL locks: same-object
+# contention and writes to a DDL-locked table fail with "table is locked"
+# and the transaction stays open; unrelated transactions are unaffected.
 
 test mvcc-create-table-in-begin-concurrent {
     PRAGMA journal_mode = 'mvcc';
     BEGIN CONCURRENT;
     CREATE TABLE t5(x);
+    INSERT INTO t5 VALUES (5);
+    COMMIT;
+    SELECT * FROM t5;
 }
-expect error {
-    DDL statements require an exclusive transaction
+expect {
+    mvcc
+    5
 }
 
 test mvcc-create-index-in-begin-concurrent {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t6(x INTEGER);
+    INSERT INTO t6 VALUES (6);
     BEGIN CONCURRENT;
     CREATE INDEX idx6 ON t6(x);
+    COMMIT;
+    SELECT x FROM t6 WHERE x = 6;
 }
-expect error {
-    DDL statements require an exclusive transaction
+expect {
+    mvcc
+    6
 }
 
 test mvcc-drop-table-in-begin-concurrent {
@@ -27,9 +36,12 @@ test mvcc-drop-table-in-begin-concurrent {
     CREATE TABLE t7(x);
     BEGIN CONCURRENT;
     DROP TABLE t7;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema WHERE name = 't7';
 }
-expect error {
-    DDL statements require an exclusive transaction
+expect {
+    mvcc
+    0
 }
 
 test mvcc-alter-table-in-begin-concurrent {
@@ -37,9 +49,25 @@ test mvcc-alter-table-in-begin-concurrent {
     CREATE TABLE t9(x);
     BEGIN CONCURRENT;
     ALTER TABLE t9 ADD COLUMN y;
+    INSERT INTO t9 VALUES (1, 2);
+    COMMIT;
+    SELECT x, y FROM t9;
 }
-expect error {
-    DDL statements require an exclusive transaction
+expect {
+    mvcc
+    1|2
+}
+
+test mvcc-ddl-in-begin-concurrent-rolls-back {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN CONCURRENT;
+    CREATE TABLE t10(x);
+    ROLLBACK;
+    SELECT count(*) FROM sqlite_schema WHERE name = 't10';
+}
+expect {
+    mvcc
+    0
 }
 
 test mvcc-ddl-works-in-exclusive-transaction {

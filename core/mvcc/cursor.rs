@@ -618,6 +618,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        // Scoped commit-time schema validation: remember which tables this
+        // transaction touched so a committed DDL only aborts its users.
+        db.record_table_use(tx_id, table_id)?;
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
