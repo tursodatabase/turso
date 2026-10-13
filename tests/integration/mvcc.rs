@@ -1416,6 +1416,166 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     Ok(())
 }
 
+/// Reopens the database at `path` in MVCC mode. Goes through [TempDatabase] rather
+/// than `Database::connect` so the tests do not depend on the connect signature.
+fn reopen_mvcc_db(
+    path: &Path,
+    opts: turso_core::DatabaseOpts,
+) -> (TempDatabase, Arc<turso_core::Connection>) {
+    let db = TempDatabase::builder()
+        .with_db_path(path)
+        .with_opts(opts)
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    (db, conn)
+}
+
+fn sqlite_schema_rowid(conn: &Arc<turso_core::Connection>, name: &str) -> i64 {
+    let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+        "SELECT rowid FROM sqlite_schema WHERE name = '{name}'"
+    ));
+    assert_eq!(rows.len(), 1, "expected one sqlite_schema row for {name}");
+    rows[0].0
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284
+///
+/// A trigger dropped after a checkpoint, followed by a restart and a new trigger
+/// that reuses its sqlite_schema rowid and is dropped too, must stay dropped after
+/// the next checkpoint. Pre-fix the delete of the on-disk row was skipped because
+/// the newest version began after the last checkpoint.
+#[turso_macros::test]
+fn test_mvcc_dropped_schema_object_after_checkpoint_trigger_reuses_trigger_rowid(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let opts = db.db_opts;
+    let tr1_rowid = {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE t(x)")?;
+        conn.execute("CREATE TRIGGER tr1 AFTER INSERT ON t BEGIN SELECT 1; END")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let rowid = sqlite_schema_rowid(&conn, "tr1");
+        conn.execute("DROP TRIGGER tr1")?;
+        rowid
+    };
+    drop(db);
+
+    let (_db, conn) = reopen_mvcc_db(&path, opts);
+    conn.execute("CREATE TRIGGER tr2 AFTER INSERT ON t BEGIN SELECT 2; END")?;
+    assert_eq!(
+        sqlite_schema_rowid(&conn, "tr2"),
+        tr1_rowid,
+        "test relies on tr2 reusing tr1's sqlite_schema rowid"
+    );
+    conn.execute("DROP TRIGGER tr2")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'trigger'");
+    assert_eq!(rows, Vec::<(String,)>::new());
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284
+///
+/// A trigger that reuses the sqlite_schema rowid of a dropped, checkpointed table
+/// and is then dropped must not make the checkpoint delete the rowid twice. Pre-fix
+/// the checkpoint failed with `MVCC delete: rowid N not found`.
+#[turso_macros::test]
+fn test_mvcc_dropped_schema_object_after_checkpoint_trigger_reuses_table_rowid(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let opts = db.db_opts;
+    let t_rowid = {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE base(a)")?;
+        conn.execute("CREATE TABLE t(x)")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let rowid = sqlite_schema_rowid(&conn, "t");
+        conn.execute("DROP TABLE t")?;
+        rowid
+    };
+    drop(db);
+
+    let (_db, conn) = reopen_mvcc_db(&path, opts);
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON base BEGIN SELECT 1; END")?;
+    assert_eq!(
+        sqlite_schema_rowid(&conn, "tr"),
+        t_rowid,
+        "test relies on tr reusing t's sqlite_schema rowid"
+    );
+    conn.execute("DROP TRIGGER tr")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso_internal_%' ORDER BY name",
+    );
+    assert_eq!(rows, vec![("base".to_string(),)]);
+    drop(conn);
+    drop(_db);
+
+    let (_db, conn) = reopen_mvcc_db(&path, opts);
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso_internal_%' ORDER BY name",
+    );
+    assert_eq!(rows, vec![("base".to_string(),)]);
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9284
+///
+/// A never-checkpointed table that reuses the sqlite_schema rowid of a dropped,
+/// checkpointed trigger and is then dropped must not leave the trigger's row on
+/// disk. Pre-fix the trigger delete was replaced by the table delete, which was
+/// then skipped because the table had no B-tree, so the trigger fired again after
+/// a restart.
+#[turso_macros::test]
+fn test_mvcc_dropped_schema_object_after_checkpoint_table_reuses_trigger_rowid(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let opts = db.db_opts;
+    let tr_rowid = {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE base(a)")?;
+        conn.execute("CREATE TABLE log(x)")?;
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON base BEGIN INSERT INTO log VALUES(1); END",
+        )?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let rowid = sqlite_schema_rowid(&conn, "tr");
+        conn.execute("DROP TRIGGER tr")?;
+        rowid
+    };
+    drop(db);
+
+    {
+        let (_db, conn) = reopen_mvcc_db(&path, opts);
+        conn.execute("CREATE TABLE x(y)")?;
+        assert_eq!(
+            sqlite_schema_rowid(&conn, "x"),
+            tr_rowid,
+            "test relies on x reusing tr's sqlite_schema rowid"
+        );
+        conn.execute("DROP TABLE x")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+
+    let (_db, conn) = reopen_mvcc_db(&path, opts);
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso_internal_%' ORDER BY name",
+    );
+    assert_eq!(rows, vec![("base".to_string(),), ("log".to_string(),)]);
+    conn.execute("INSERT INTO base VALUES (1)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM log");
+    assert_eq!(rows, vec![(0,)]);
+    Ok(())
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7578
 ///
 /// An active MVCC index scan must not return a row deleted after the scan
