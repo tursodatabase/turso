@@ -2963,16 +2963,31 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
-    // Check if any table uses this type
-    for (_, table) in resolver.schema().tables.iter() {
-        for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
-                bail_parse_error!(
-                    "cannot drop type {normalized_name}: used by column {} in table {}",
-                    col.name.as_deref().unwrap_or("?"),
-                    table.get_name()
-                );
-            }
+    // Check if any table in any database uses this type
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    database_ids.set(MAIN_DB_ID)?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
+        let column_using_type = resolver.with_schema(database_id, |schema| {
+            schema.tables.values().find_map(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .find(|col| normalize_ident(&col.ty_str) == normalized_name)
+                    .map(|col| {
+                        (
+                            col.name.as_deref().unwrap_or("?").to_string(),
+                            table.get_name().to_string(),
+                        )
+                    })
+            })
+        });
+        if let Some((column_name, table_name)) = column_using_type {
+            bail_parse_error!(
+                "cannot drop type {normalized_name}: used by column {column_name} in table {table_name}"
+            );
         }
     }
 
