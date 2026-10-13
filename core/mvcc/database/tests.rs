@@ -23248,3 +23248,114 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let conn = db.connect();
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
 }
+
+/// A sync-style reader that trusts `sequence_watermark_experimental()` must
+/// never skip a committed row. After a plain `BEGIN ... nextval ... ROLLBACK`
+/// the in-memory watermark keeps the rolled-back advance, but the disk value
+/// goes back, so the same id is reissued *below* the watermark the reader
+/// already passed.
+#[test]
+fn test_sequence_watermark_reader_does_not_skip_row_reissued_after_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'rolled back')")
+        .unwrap();
+    writer.execute("ROLLBACK").unwrap();
+
+    let (mut seen, last) = read_ids_below_sequence_watermark(&reader, 0);
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'committed')")
+        .unwrap();
+    seen.extend(read_ids_below_sequence_watermark(&reader, last).0);
+
+    let committed: Vec<i64> = get_rows(&reader, "SELECT id FROM t ORDER BY id")
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    assert_eq!(
+        seen, committed,
+        "reader advanced past the watermark and skipped a committed row"
+    );
+}
+
+#[test]
+fn test_nextval_after_begin_concurrent_rollback_keeps_gap() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    writer.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_reader_does_not_skip_row_reissued_after_rollback_to_savepoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'kept')")
+        .unwrap();
+    writer.execute("SAVEPOINT sp").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'rolled back')")
+        .unwrap();
+    writer.execute("ROLLBACK TO sp").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let (mut seen, last) = read_ids_below_sequence_watermark(&reader, 0);
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'committed')")
+        .unwrap();
+    seen.extend(read_ids_below_sequence_watermark(&reader, last).0);
+
+    let committed: Vec<i64> = get_rows(&reader, "SELECT id FROM t ORDER BY id")
+        .iter()
+        .map(|r| r[0].as_int().unwrap())
+        .collect();
+    assert_eq!(
+        seen, committed,
+        "reader advanced past the watermark and skipped a committed row"
+    );
+}
+
+fn read_ids_below_sequence_watermark(reader: &Arc<Connection>, last: i64) -> (Vec<i64>, i64) {
+    let watermark = get_rows(reader, "SELECT sequence_watermark_experimental('s')")[0][0].as_int();
+    let upper_bound = watermark.unwrap_or(i64::MAX);
+    let ids: Vec<i64> = get_rows(
+        reader,
+        &format!("SELECT id FROM t WHERE id > {last} AND id < {upper_bound} ORDER BY id"),
+    )
+    .iter()
+    .map(|r| r[0].as_int().unwrap())
+    .collect();
+    let new_last = match watermark {
+        Some(watermark) => watermark - 1,
+        None => ids.last().copied().unwrap_or(last),
+    };
+    (ids, new_last)
+}
