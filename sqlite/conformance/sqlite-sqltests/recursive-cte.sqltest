@@ -439,6 +439,36 @@ expect {
     1|15
 }
 
+# GROUP BY is rejected in the recursive term; in the query consuming the CTE it is ordinary.
+test recursive-cte-outer-group-by {
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 5
+    )
+    SELECT x % 2 AS parity, count(*) FROM c GROUP BY parity ORDER BY parity;
+}
+expect {
+    0|2
+    1|3
+}
+
+test recursive-cte-outer-group-by-having {
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 5
+    )
+    SELECT x % 2 AS parity, count(*) AS n
+    FROM c
+    GROUP BY parity
+    HAVING n > 2
+    ORDER BY parity;
+}
+expect {
+    1|3
+}
+
 test recursive-cte-outer-distinct-collapses-union-all {
     WITH RECURSIVE c(x, depth) AS (
         VALUES(1, 0)
