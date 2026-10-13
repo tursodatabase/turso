@@ -17,7 +17,7 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
@@ -1903,12 +1903,11 @@ pub fn translate_alter_table(
                         // of the new type and go through its ENCODE, even when the
                         // affinity stays the same (e.g. TEXT -> varchar(3)).
                         let strict_type_changed = btree.is_strict
-                            && (!old_column
-                                .ty_str
-                                .eq_ignore_ascii_case(&replacement_column.ty_str)
-                                || old_column.ty_params != replacement_column.ty_params
-                                || old_column.array_dimensions()
-                                    != replacement_column.array_dimensions());
+                            && strict_column_type_changed(
+                                old_column,
+                                &replacement_column,
+                                resolver.schema(),
+                            );
                         let rewrites_physical_layout = becomes_generated
                             || virtuality_changed
                             || affinity_changed
@@ -2546,6 +2545,22 @@ fn validate_indexes_can_be_rewritten(
         }
     }
     Ok(())
+}
+
+fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bool {
+    if old.array_dimensions() != new.array_dimensions() {
+        return true;
+    }
+    match (
+        schema.get_type_def(&old.ty_str, true),
+        schema.get_type_def(&new.ty_str, true),
+    ) {
+        (None, None) => old.strict_value_type() != new.strict_value_type(),
+        (Some(_), Some(_)) => {
+            !old.ty_str.eq_ignore_ascii_case(&new.ty_str) || old.ty_params != new.ty_params
+        }
+        _ => true,
+    }
 }
 
 fn emit_rewrite_table_indexes(

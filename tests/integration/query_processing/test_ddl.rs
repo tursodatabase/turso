@@ -147,6 +147,27 @@ fn test_alter_column_strict_type_mismatch_keeps_table(tmp_db: TempDatabase) -> a
     Ok(())
 }
 
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, v INT) STRICT;"
+)]
+fn test_alter_column_strict_int_to_integer_keeps_rows_and_index(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE INDEX t_v ON t(v)")?;
+    conn.execute("INSERT INTO t VALUES (1, 5)")?;
+
+    conn.execute("ALTER TABLE t ALTER COLUMN v TO v2 INTEGER")?;
+
+    let rows: Vec<(i64, i64, String)> =
+        conn.exec_rows("SELECT id, v2, typeof(v2) FROM t WHERE v2 = 5");
+    assert_eq!(rows, vec![(1, 5, "integer".to_string())]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
