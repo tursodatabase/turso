@@ -117,6 +117,7 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        connection.automatic_index(),
         // Engine-generated helper statements are always SQLite text and
         // must resolve functions with SQLite semantics regardless of the
         // database's dialect — the same invariant as unmarked schema rows.

@@ -219,7 +219,7 @@ avoid this window.
 | PRAGMA analysis_limit            | ❌ No         |                                              |
 | PRAGMA application_id            | ✅ Yes        |                                              |
 | PRAGMA auto_vacuum               | 🚧 Partial    | Read works; write requires `--experimental-autovacuum` |
-| PRAGMA automatic_index           | ❌ No         |                                              |
+| PRAGMA automatic_index           | 🚧 Partial    | Applies to tables only, not subqueries or views |
 | PRAGMA busy_timeout              | ✅ Yes         |                                              |
 | PRAGMA cache_size                | ✅ Yes        |                                              |
 | PRAGMA cache_spill               | 🚧 Partial    | Enabled/Disabled only                        |
