@@ -19449,8 +19449,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // Pin source metadata before building the output database. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
+                // Spelled BEGIN DEFERRED so a non-SQLite dialect (postgres maps
+                // plain BEGIN to BEGIN CONCURRENT) cannot reinterpret it.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute("BEGIN")?;
+                program.connection.execute("BEGIN DEFERRED")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
                     &program
