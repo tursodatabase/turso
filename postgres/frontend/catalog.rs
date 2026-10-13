@@ -2194,6 +2194,16 @@ impl SnapshotRows for PgSettingsTable {
     }
 }
 
+#[derive(strum::IntoStaticStr)]
+enum DependencyKind {
+    #[strum(serialize = "n")]
+    Normal,
+    #[strum(serialize = "a")]
+    Auto,
+    #[strum(serialize = "i")]
+    Internal,
+}
+
 #[derive(Debug)]
 struct PgDependTable;
 
@@ -2219,13 +2229,17 @@ impl SnapshotRows for PgDependTable {
             }
             let oid = relation[0].as_int().expect("catalog OIDs are integers");
             let namespace = relation[2].as_int().expect("catalog OIDs are integers");
-            rows.push(dependency_row([1259, oid, 0], [2615, namespace, 0], "n"));
+            rows.push(dependency_row(
+                [1259, oid, 0],
+                [2615, namespace, 0],
+                DependencyKind::Normal,
+            ));
             let access_method = relation[6].as_int().expect("catalog OIDs are integers");
             if access_method != 0 {
                 rows.push(dependency_row(
                     [1259, oid, 0],
                     [2601, access_method, 0],
-                    "n",
+                    DependencyKind::Normal,
                 ));
             }
         }
@@ -2252,11 +2266,15 @@ impl SnapshotRows for PgDependTable {
                 rows.push(dependency_row(
                     [1259, oid, 0],
                     [2606, constraint_oid, 0],
-                    "i",
+                    DependencyKind::Internal,
                 ));
             } else {
                 for column in columns {
-                    rows.push(dependency_row([1259, oid, 0], [1259, table, column], "a"));
+                    rows.push(dependency_row(
+                        [1259, oid, 0],
+                        [1259, table, column],
+                        DependencyKind::Auto,
+                    ));
                 }
             }
         }
@@ -2265,7 +2283,11 @@ impl SnapshotRows for PgDependTable {
             let oid = constraint[0].as_int().expect("catalog OIDs are integers");
             let table = constraint[7].as_int().expect("catalog OIDs are integers");
             for column in catalog_column_numbers(&constraint[18]) {
-                rows.push(dependency_row([2606, oid, 0], [1259, table, column], "a"));
+                rows.push(dependency_row(
+                    [2606, oid, 0],
+                    [1259, table, column],
+                    DependencyKind::Auto,
+                ));
             }
             let referenced_table = constraint[11].as_int().expect("catalog OIDs are integers");
             if referenced_table != 0 {
@@ -2274,7 +2296,7 @@ impl SnapshotRows for PgDependTable {
                     rows.push(dependency_row(
                         [2606, oid, 0],
                         [1259, referenced_table, column],
-                        "n",
+                        DependencyKind::Normal,
                     ));
                 }
                 if let Some(index) = indexes.iter().find(|index| {
@@ -2283,7 +2305,11 @@ impl SnapshotRows for PgDependTable {
                         && catalog_column_numbers(&index[14]) == referenced_columns
                 }) {
                     let index_oid = index[0].as_int().expect("catalog OIDs are integers");
-                    rows.push(dependency_row([2606, oid, 0], [1259, index_oid, 0], "n"));
+                    rows.push(dependency_row(
+                        [2606, oid, 0],
+                        [1259, index_oid, 0],
+                        DependencyKind::Normal,
+                    ));
                 }
             }
         }
@@ -2294,7 +2320,11 @@ impl SnapshotRows for PgDependTable {
             let column = default[2]
                 .as_int()
                 .expect("catalog column numbers are integers");
-            rows.push(dependency_row([2604, oid, 0], [1259, table, column], "a"));
+            rows.push(dependency_row(
+                [2604, oid, 0],
+                [1259, table, column],
+                DependencyKind::Auto,
+            ));
         }
         rows
     }
@@ -2320,7 +2350,8 @@ fn catalog_column_numbers(value: &Value) -> Vec<i64> {
     }
 }
 
-fn dependency_row(dependent: [i64; 3], referenced: [i64; 3], kind: &'static str) -> Vec<Value> {
+fn dependency_row(dependent: [i64; 3], referenced: [i64; 3], kind: DependencyKind) -> Vec<Value> {
+    let kind: &'static str = kind.into();
     dependent
         .into_iter()
         .chain(referenced)
