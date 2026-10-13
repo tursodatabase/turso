@@ -88,6 +88,8 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
+            | "pg_settings"
+            | "pg_extension"
             | "pg_tables"
             | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
@@ -4063,6 +4065,8 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_policy"
             | "pg_input_error_info"
             | "pg_get_tabledef"
+            | "pg_settings"
+            | "pg_extension"
             | "pg_tables"
             | "pg_indexes"
     )
@@ -4672,6 +4676,17 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         values,
         is_local: set_stmt.is_local,
     })
+}
+
+pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt))
+            if stmt.kind == VariableSetKind::VarSetMulti as i32
+                && stmt.name.eq_ignore_ascii_case("transaction")
+    )
 }
 
 /// Try to extract a SHOW statement from a PG parse result.

@@ -7,9 +7,9 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -26,9 +26,12 @@ struct PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path: Option<Vec<String>>,
+    search_path_setting: Option<String>,
 }
 
 type PgSessionState = Mutex<SessionState>;
+
+pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -254,6 +257,10 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
+    if is_set_transaction(&parse_result) {
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
     if let Some(show_stmt) = try_extract_show(&parse_result) {
         let pragma_sql = format!("PRAGMA {}", show_stmt.name);
         return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
@@ -329,10 +336,17 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
     let state = conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
-    state.lock().unwrap().search_path = path;
+    let mut state = state.lock().unwrap();
+    state.search_path = path;
+    state.search_path_setting = value.map(str::to_owned);
     Ok(Value::build_text(
-        value.unwrap_or("\"$user\", public").to_owned(),
+        value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
+    conn.context::<PgSessionState>()
+        .and_then(|state| state.lock().unwrap().search_path_setting.clone())
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {

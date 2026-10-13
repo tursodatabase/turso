@@ -1993,6 +1993,23 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgSequencesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_settings",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSettingsTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_extension",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_extension (
+                oid INTEGER, extname TEXT, extowner INTEGER, extnamespace INTEGER,
+                extrelocatable BOOLEAN, extversion TEXT, extconfig INTEGER[], extcondition TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)".to_string() },
@@ -2057,6 +2074,66 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
     );
     options
+}
+
+#[derive(Debug)]
+struct PgSettingsTable;
+
+impl SnapshotRows for PgSettingsTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_settings (
+        name TEXT,
+        setting TEXT,
+        unit TEXT,
+        category TEXT,
+        short_desc TEXT,
+        extra_desc TEXT,
+        context TEXT,
+        vartype TEXT,
+        source TEXT,
+        min_val TEXT,
+        max_val TEXT,
+        enumvals TEXT[],
+        boot_val TEXT,
+        reset_val TEXT,
+        sourcefile TEXT,
+        sourceline INTEGER,
+        pending_restart BOOLEAN
+    )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 1;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        use crate::session::{search_path_setting, DEFAULT_SEARCH_PATH};
+
+        let setting = search_path_setting(conn);
+        let source = if setting.is_some() {
+            "session"
+        } else {
+            "default"
+        };
+        vec![vec![
+            Value::build_text("search_path"),
+            Value::build_text(setting.unwrap_or_else(|| DEFAULT_SEARCH_PATH.to_owned())),
+            Value::Null,
+            Value::build_text("Client Connection Defaults / Statement Behavior"),
+            Value::build_text(
+                "Sets the schema search order for names that are not schema-qualified.",
+            ),
+            Value::Null,
+            Value::build_text("user"),
+            Value::build_text("string"),
+            Value::build_text(source),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::build_text(DEFAULT_SEARCH_PATH),
+            Value::build_text(DEFAULT_SEARCH_PATH),
+            Value::Null,
+            Value::Null,
+            Value::from_i64(0),
+        ]]
+    }
 }
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
@@ -2719,6 +2796,8 @@ mod tests {
             "pg_attrdef",
             "pg_input_error_info",
             "pg_sequences",
+            "pg_settings",
+            "pg_extension",
             "pg_policy",
             "pg_trigger",
             "pg_statistic_ext",
@@ -2753,6 +2832,13 @@ mod tests {
                     "{name}"
                 );
             }
+            assert_eq!(
+                conn.prepare("SELECT setting FROM pg_settings WHERE name = 'search_path'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::build_text("\"$user\", public")]]
+            );
             let mut namespaces = conn
                 .prepare("SELECT nspname FROM pg_namespace() ORDER BY nspname")
                 .unwrap();

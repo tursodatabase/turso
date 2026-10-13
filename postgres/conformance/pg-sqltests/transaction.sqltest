@@ -39,3 +39,42 @@ test txn-rollback-insert {
 expect {
     1
 }
+
+@setup counter
+test txn-set-transaction-options-rollback {
+    BEGIN;
+    SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+    SET TRANSACTION READ WRITE;
+    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
+    SELECT 17;
+    UPDATE counter SET n = 23;
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    17
+    0
+}
+
+@setup counter
+test txn-set-transaction-read-write-keeps-earlier-changes {
+    BEGIN;
+    UPDATE counter SET n = 29;
+    SET TRANSACTION READ WRITE;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    29
+}
+
+test txn-set-transaction-lowercase-and-newline {
+    BEGIN;
+      set
+    transaction read only;
+    SELECT 17;
+    ROLLBACK;
+}
+expect {
+    17
+}
