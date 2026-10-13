@@ -32,6 +32,7 @@ pub const DEFAULT_MEM_BUDGET: usize = 32 * 1024;
 #[cfg(not(debug_assertions))]
 pub const DEFAULT_MEM_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_BUCKETS: usize = 1024;
+const MAX_AVERAGE_ENTRIES_PER_BUCKET: usize = 32;
 /// Minimum number of partitions for grace hash join.
 pub const MIN_PARTITIONS: usize = 16;
 /// Maximum number of partitions for adaptive partitioning.
@@ -1252,6 +1253,9 @@ impl HashTable {
 
         self.num_entries += 1;
         self.mem_used += entry_size;
+        if self.spill_state.is_none() {
+            self.grow_buckets_if_chains_too_long()?;
+        }
 
         Ok(HashInsertResult::Done)
     }
@@ -1370,7 +1374,46 @@ impl HashTable {
         ))?;
         self.num_entries += 1;
         self.mem_used += entry_size;
+        self.grow_buckets_if_chains_too_long()?;
         Ok(IOResult::Done(true))
+    }
+
+    fn grow_buckets_if_chains_too_long(&mut self) -> Result<()> {
+        let old_len = self.buckets.len();
+        if self.num_entries <= old_len * MAX_AVERAGE_ENTRIES_PER_BUCKET {
+            return Ok(());
+        }
+        turso_assert!(
+            self.state == HashTableState::Building,
+            "hash table buckets can only grow before the first probe",
+            { "state": format!("{:?}", self.state) }
+        );
+        let new_len = old_len * 2;
+        self.buckets.try_reserve_exact(old_len)?;
+        self.buckets.extend((0..old_len).map(|_| HashBucket::new()));
+        let (low_buckets, high_buckets) = self.buckets.split_at_mut(old_len);
+        for (low_bucket, high_bucket) in low_buckets.iter_mut().zip(high_buckets) {
+            let moved_entries = low_bucket
+                .entries
+                .extract_if(.., |entry| (entry.hash as usize) % new_len >= old_len);
+            for entry in moved_entries {
+                high_bucket.insert(entry)?;
+            }
+        }
+        self.non_empty_buckets.clear();
+        for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                self.non_empty_buckets.try_push(bucket_idx)?;
+            }
+        }
+        if self.track_matched {
+            self.matched_bits.clear();
+            for bucket in &self.buckets {
+                self.matched_bits
+                    .try_push(try_vec![false; bucket.entries.len()]?)?;
+            }
+        }
+        Ok(())
     }
 
     /// Clear all entries and reset spill state.
@@ -3499,6 +3542,108 @@ mod hashtests {
         // No more matches
         let result4 = ht.next_match().unwrap();
         assert!(result4.is_none());
+    }
+
+    #[test]
+    fn test_buckets_grow_so_chains_stay_short() {
+        let mut ht = in_memory_table_with_4_buckets(false);
+        for i in 0..10_000 {
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i * 10, vec![], None)
+                .unwrap();
+        }
+        let _ = ht.finalize_build(None);
+
+        let longest_chain = ht
+            .buckets
+            .iter()
+            .map(|bucket| bucket.entries.len())
+            .max()
+            .unwrap();
+        assert!(
+            longest_chain <= 2 * MAX_AVERAGE_ENTRIES_PER_BUCKET,
+            "longest chain has {longest_chain} entries in {} buckets",
+            ht.buckets.len()
+        );
+        for i in 0..10_000 {
+            let entry = ht.probe(vec![Value::from_i64(i)], None).unwrap().unwrap();
+            assert_eq!(entry.rowid, i * 10);
+        }
+    }
+
+    #[test]
+    fn test_duplicate_keys_keep_insert_order_when_buckets_grow() {
+        let mut ht = in_memory_table_with_4_buckets(false);
+        let duplicate_key = vec![Value::from_i64(-1)];
+        for i in 0..10_000 {
+            if i % 2_500 == 0 {
+                let _ = ht.insert(duplicate_key.clone(), -i, vec![], None).unwrap();
+            }
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap();
+        }
+        let _ = ht.finalize_build(None);
+        assert!(ht.buckets.len() > 4);
+
+        let mut rowids = vec![ht.probe(duplicate_key, None).unwrap().unwrap().rowid];
+        while let Some(entry) = ht.next_match().unwrap() {
+            rowids.push(entry.rowid);
+        }
+        assert_eq!(rowids, vec![0, -2_500, -5_000, -7_500]);
+    }
+
+    #[test]
+    fn test_unmatched_scan_after_buckets_grow() {
+        let mut ht = in_memory_table_with_4_buckets(true);
+        for i in 0..10_000 {
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap();
+        }
+        let _ = ht.finalize_build(None);
+        assert!(ht.buckets.len() > 4);
+
+        for i in (0..10_000).step_by(2) {
+            assert!(ht.probe(vec![Value::from_i64(i)], None).unwrap().is_some());
+            ht.mark_current_matched();
+        }
+        ht.begin_unmatched_scan();
+        let mut unmatched_rowids = vec![];
+        while let Some(entry) = ht.next_unmatched() {
+            unmatched_rowids.push(entry.rowid);
+        }
+        unmatched_rowids.sort_unstable();
+        assert_eq!(
+            unmatched_rowids,
+            (1..10_000).step_by(2).collect::<std::vec::Vec<i64>>()
+        );
+    }
+
+    #[test]
+    fn test_distinct_finds_duplicates_after_buckets_grow() {
+        let mut ht = in_memory_table_with_4_buckets(false);
+        for expect_inserted in [true, false] {
+            for i in 0..10_000 {
+                let inserted = ht
+                    .insert_distinct(&[Value::from_i64(i)], &[ValueRef::from_i64(i)], None)
+                    .unwrap();
+                assert!(
+                    matches!(inserted, IOResult::Done(inserted) if inserted == expect_inserted)
+                );
+            }
+        }
+        assert!(ht.buckets.len() > 4);
+    }
+
+    fn in_memory_table_with_4_buckets(track_matched: bool) -> HashTable {
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: usize::MAX,
+            track_matched,
+            ..Default::default()
+        };
+        HashTable::new(config, Arc::new(MemoryIO::new())).unwrap()
     }
 
     #[test]
