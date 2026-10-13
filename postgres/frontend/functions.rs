@@ -162,6 +162,8 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
     })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
+    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
+    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
     let role = if owner == 10 {
         "turso".to_string()
     } else {
