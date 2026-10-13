@@ -810,7 +810,6 @@ fn join_lhs_and_rhs<'a>(
             let hash_can_replace_build_index =
                 can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
-            let build_table_is_last = build_table_idx == last_lhs_table_idx;
             // The unmatched-right pass can set every earlier table cursor to NULL.
             // Hash materialization makes these values independent of that cursor state.
             let build_is_left_of_right_or_full_join =
@@ -892,7 +891,6 @@ fn join_lhs_and_rhs<'a>(
                             &prior_mask,
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
-                            || !build_table_is_last
                             || build_read_is_in_seek
                             || build_access_method_uses_constraints;
                         let estimated_materialized_rows = input_cardinality;
