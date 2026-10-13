@@ -1409,11 +1409,16 @@ fn output_tuple(shape: &QueryShape, binding: &Binding) -> Tuple {
 /// sorted bag.
 ///
 /// Each loop checks the outer join terms of its table, sets the match flag,
-/// then checks the other terms whose tables are all read. A `WHERE` term that
-/// reads a table left of a RIGHT or FULL JOIN waits for that join's loop. A
-/// LEFT or FULL JOIN loop adds a NULL row when no row matched. The unmatched
-/// right rows of a RIGHT or FULL JOIN run through the loop body after the main
-/// loop, with the tables before that loop set to NULL.
+/// then checks the other terms whose tables are all read. A LEFT or FULL JOIN
+/// loop adds a NULL row when no row matched. The unmatched right rows of a
+/// RIGHT or FULL JOIN run through the loop body after the main loop, with the
+/// tables before that loop set to NULL.
+///
+/// A `WHERE` term waits for every RIGHT or FULL JOIN loop, so the unmatched
+/// right rows see it. The emitter only waits for the joins whose left tables
+/// the term reads. Both rules give the same loop for the orders that the
+/// optimizer allows, because such an order keeps every table on the side of
+/// the join where the `FROM` list has it.
 fn plan_rows(shape: &QueryShape, instance: &Instance, order: &[usize]) -> Vec<Tuple> {
     let table_count = shape.tables.len();
     let mut loop_of = vec![0; table_count];
@@ -1452,19 +1457,21 @@ fn plan_rows(shape: &QueryShape, instance: &Instance, order: &[usize]) -> Vec<Tu
             }
         }
     }
+    let right_join_loops: Vec<usize> = shape
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table_shape)| table_shape.join.is_some_and(Join::null_extends_left))
+        .map(|(table, _)| loop_of[table])
+        .collect();
     for &term in &shape.where_terms {
         let read_tables = term.tables();
-        let mut at = (0..table_count)
+        let at = (0..table_count)
             .filter(|&read| read_tables & bit(read) != 0)
             .map(|read| loop_of[read])
+            .chain(right_join_loops.iter().copied())
             .max()
             .expect("a term reads a table");
-        for (right_table, table_shape) in shape.tables.iter().enumerate() {
-            let reads_left_table = read_tables & (bit(right_table) - 1) != 0;
-            if table_shape.join.is_some_and(Join::null_extends_left) && reads_left_table {
-                at = at.max(loop_of[right_table]);
-            }
-        }
         run.other_terms_at[at].push(term);
     }
     run.run_loop(0);
