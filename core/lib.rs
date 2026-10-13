@@ -50,6 +50,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
+mod coro;
 mod database;
 pub mod dialect;
 mod error;
