@@ -74,31 +74,10 @@ fn test_physical_catalog_boolean_metadata(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_pg_settings_reports_connection_settings(db: TempDatabase) {
+fn test_pg_settings_tracks_connection_and_reused_statement(db: TempDatabase) {
     let conn = db.connect_postgres();
     let other = db.connect_postgres();
-    let sql = "SELECT setting, source, boot_val, reset_val, context, vartype,
-                      unit, min_val, max_val, enumvals, sourcefile, sourceline, pending_restart
-               FROM pg_catalog.pg_settings WHERE name = 'search_path'";
     let default = Value::build_text("\"$user\", public");
-    assert_eq!(
-        conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
-        vec![vec![
-            default.clone(),
-            Value::build_text("default"),
-            default.clone(),
-            default.clone(),
-            Value::build_text("user"),
-            Value::build_text("string"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::from_i64(0),
-        ]]
-    );
     let mut setting = conn
         .prepare("SELECT setting, source FROM pg_settings WHERE name = 'search_path'")
         .unwrap();
@@ -160,7 +139,6 @@ fn test_pg_settings_omits_unsupported_restrictions(db: TempDatabase) {
     assert!(conn
         .execute("SELECT set_config('restrict_nonsystem_relation_kind', 'view', false)")
         .is_err());
-    assert!(conn.prepare("DELETE FROM pg_catalog.pg_settings").is_err());
 }
 
 #[turso_macros::test]

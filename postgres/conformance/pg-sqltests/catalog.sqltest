@@ -65,3 +65,56 @@ expect {
     c|catalog_color
     a|catalog_age
 }
+
+test pg-settings-default-search-path {
+    SELECT setting, source, boot_val, reset_val, context, vartype,
+           unit, min_val, max_val, enumvals, sourcefile, sourceline, pending_restart
+    FROM pg_catalog.pg_settings WHERE name = 'search_path';
+}
+expect {
+    "$user", public|default|"$user", public|"$user", public|user|string|||||||f
+}
+
+test pg-settings-search-path-preserves-setting-text {
+    SELECT quote_literal(set_config('search_path', ' "My,Schema", PUBLIC ', false));
+    SELECT quote_literal(setting), source
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    ' "My,Schema", PUBLIC '
+    ' "My,Schema", PUBLIC '|session
+}
+
+test pg-settings-empty-search-path {
+    SELECT quote_literal(set_config('search_path', '', false));
+    SELECT quote_literal(setting), source
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    ''
+    ''|session
+}
+
+test pg-settings-set-search-path {
+    SET search_path TO public;
+    SELECT setting, source FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    public|session
+}
+
+test pg-settings-reset-search-path {
+    SET search_path TO public;
+    SELECT set_config('search_path', NULL, false);
+    SELECT setting, source, reset_val
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    "$user", public
+    "$user", public|default|"$user", public
+}
+
+test pg-settings-delete-errors {
+    DELETE FROM pg_catalog.pg_settings;
+}
+expect error {}
