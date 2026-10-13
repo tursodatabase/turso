@@ -301,9 +301,11 @@ fn test_pg_current_schema_all_syntactic_forms(db: TempDatabase) {
 #[turso_macros::test(mvcc)]
 fn test_pg_derived_result_column_names(db: TempDatabase) {
     let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a integer)").unwrap();
 
     // PostgreSQL names unaliased function-call and keyword columns after the
-    // function, and other unaliased expressions `?column?`
+    // function, casts after the cast expression or else the target type, and
+    // other unaliased expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -318,6 +320,19 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT version() AS v", "v"),
         ("SELECT 1", "?column?"),
         ("SELECT * FROM (SELECT 1 + 1) AS s", "?column?"),
+        ("SELECT a::int FROM t", "a"),
+        ("SELECT CAST(a AS text) FROM t", "a"),
+        ("SELECT t.a::bigint FROM t", "a"),
+        ("SELECT a::int::text FROM t", "a"),
+        ("SELECT version()::text", "version"),
+        ("SELECT current_user::text", "current_user"),
+        ("SELECT 1::int", "int4"),
+        ("SELECT CAST(1 AS integer)", "int4"),
+        ("SELECT int '5'", "int4"),
+        ("SELECT '2'::varchar(3)", "varchar"),
+        ("SELECT 1::int::text", "text"),
+        ("SELECT (1 + 1)::int", "int4"),
+        ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");
