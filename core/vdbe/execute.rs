@@ -14566,6 +14566,9 @@ pub fn op_set_sequence_currval(
 /// committed successfully. At that point `SequenceCommitInnerTx` has restored
 /// the connection's MVCC transaction to the outer tx, so any active allocation
 /// is attributed to the transaction whose row changes may become visible later.
+///
+/// When the RMW ran inside an exclusive outer tx, nothing is committed yet. The
+/// new watermark stays in that tx and becomes visible only if the tx commits.
 pub fn op_sequence_track_allocation(
     program: &Program,
     state: &mut ProgramState,
@@ -14614,7 +14617,19 @@ pub fn op_sequence_track_allocation(
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        let exclusive_tx_id = program
+            .connection
+            .get_mv_tx_for_db(*db)
+            .map(|(tx_id, _)| tx_id)
+            .filter(|tx_id| mv_store.is_exclusive_tx(tx_id));
+        match exclusive_tx_id {
+            Some(tx_id) => mv_store.set_uncommitted_sequence_watermark(
+                tx_id,
+                &normalized_seq_name,
+                current_watermark,
+            )?,
+            None => mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark),
+        }
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
@@ -14778,10 +14793,14 @@ const SEQUENCE_INNER_TX_RETRY_BUDGET: u32 = 100;
 /// since the outer is suspended inside this opcode, the lock can
 /// never release. Same-thread deadlock. We avoid the inner-tx wrap
 /// entirely in that case — the cursor RMW below runs in the outer tx,
-/// and the matching `SequenceCommitInnerTx` is a no-op. Per the
-/// contract, exclusive blocks all other writers (in-process and
-/// cross-process), so any value emitted-then-rolled-back was never
-/// observed by a live reader; re-emission after rollback is acceptable.
+/// and the matching `SequenceCommitInnerTx` is a no-op. If the outer
+/// tx rolls back, the sequence advance rolls back with it and a later
+/// nextval hands out the same value again. This is intended (see the
+/// sequence design notes in `core/schema.rs`). The new watermark for
+/// `sequence_watermark_experimental()` stays in the outer tx until it
+/// commits, so readers never pass a value that can be handed out again.
+/// BEGIN CONCURRENT always takes the wrapped path. Its inner tx commits
+/// on its own, so a rolled-back value is never handed out again.
 pub fn op_sequence_begin_inner_tx(
     program: &Program,
     state: &mut ProgramState,

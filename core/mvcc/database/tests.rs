@@ -7533,6 +7533,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         write_set: Mutex::new(WriteSet::new()),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
+        uncommitted_sequence_watermarks: Mutex::new(HashMap::default()),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
@@ -9261,6 +9262,7 @@ fn transaction_display() {
         write_set,
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
+        uncommitted_sequence_watermarks: Mutex::new(HashMap::default()),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
@@ -23341,6 +23343,33 @@ fn test_sequence_watermark_reader_does_not_skip_row_reissued_after_rollback_to_s
         seen, committed,
         "reader advanced past the watermark and skipped a committed row"
     );
+}
+
+#[test]
+fn test_sequence_watermark_stays_bounded_until_committed_tx_is_removed() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+
+    writer.execute("BEGIN").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    let watermark = rows[0][0]
+        .as_int()
+        .expect("watermark must not be NULL while the commit of value 1 is not finished");
+    assert!(watermark <= 2, "watermark {watermark} is past value 2");
+
+    while !matches!(commit.step().unwrap(), StepResult::Done) {}
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
 fn read_ids_below_sequence_watermark(reader: &Arc<Connection>, last: i64) -> (Vec<i64>, i64) {

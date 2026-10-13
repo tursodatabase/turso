@@ -858,6 +858,7 @@ pub struct Savepoint<A: RowVersionAllocator = TursoAllocator> {
     deferred_fk_violations: isize,
     header: DatabaseHeader,
     header_dirty: bool,
+    uncommitted_sequence_watermarks: HashMap<String, i64>,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -878,6 +879,7 @@ impl<A: RowVersionAllocator> Default for Savepoint<A> {
             deferred_fk_violations: 0,
             header: DatabaseHeader::default(),
             header_dirty: false,
+            uncommitted_sequence_watermarks: HashMap::default(),
             created_table_versions: Vec::new(),
             created_index_versions: Vec::new(),
             deleted_table_versions: Vec::new(),
@@ -889,10 +891,15 @@ impl<A: RowVersionAllocator> Default for Savepoint<A> {
 
 impl<A: RowVersionAllocator> Savepoint<A> {
     /// Creates an internal statement savepoint used for per-statement rollback.
-    fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
+    fn statement(
+        header: DatabaseHeader,
+        header_dirty: bool,
+        uncommitted_sequence_watermarks: HashMap<String, i64>,
+    ) -> Self {
         Self {
             header,
             header_dirty,
+            uncommitted_sequence_watermarks,
             ..Default::default()
         }
     }
@@ -904,6 +911,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
         deferred_fk_violations: isize,
         header: DatabaseHeader,
         header_dirty: bool,
+        uncommitted_sequence_watermarks: HashMap<String, i64>,
     ) -> Self {
         Self {
             kind: SavepointKind::Named {
@@ -913,6 +921,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
             deferred_fk_violations,
             header,
             header_dirty,
+            uncommitted_sequence_watermarks,
             ..Default::default()
         }
     }
@@ -1018,6 +1027,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
     header_dirty: AtomicBool,
+    uncommitted_sequence_watermarks: Mutex<HashMap<String, i64>>,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
@@ -1073,6 +1083,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
+            uncommitted_sequence_watermarks: Mutex::new(HashMap::default()),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
@@ -1110,9 +1121,12 @@ impl<A: RowVersionAllocator> Transaction<A> {
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
         let header = *self.header.read();
         let header_dirty = self.header_dirty.load(Ordering::Acquire);
-        self.savepoint_stack
-            .write()
-            .push(Savepoint::statement(header, header_dirty));
+        let uncommitted_sequence_watermarks = self.uncommitted_sequence_watermarks.lock().clone();
+        self.savepoint_stack.write().push(Savepoint::statement(
+            header,
+            header_dirty,
+            uncommitted_sequence_watermarks,
+        ));
     }
 
     /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
@@ -1133,12 +1147,14 @@ impl<A: RowVersionAllocator> Transaction<A> {
         );
         let header = *self.header.read();
         let header_dirty = self.header_dirty.load(Ordering::Acquire);
+        let uncommitted_sequence_watermarks = self.uncommitted_sequence_watermarks.lock().clone();
         self.savepoint_stack.write().push(Savepoint::named(
             name,
             starts_transaction,
             deferred_fk_violations,
             header,
             header_dirty,
+            uncommitted_sequence_watermarks,
         ));
     }
 
@@ -1242,6 +1258,9 @@ impl<A: RowVersionAllocator> Transaction<A> {
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
         let header = savepoints[target_idx].header;
         let header_dirty = savepoints[target_idx].header_dirty;
+        let uncommitted_sequence_watermarks = savepoints[target_idx]
+            .uncommitted_sequence_watermarks
+            .clone();
 
         let drained: Vec<Savepoint<A>> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
@@ -1250,6 +1269,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             deferred_fk_violations,
             header,
             header_dirty,
+            uncommitted_sequence_watermarks,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -6715,6 +6735,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
+        self.publish_committed_sequence_watermarks(tx_id);
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6762,6 +6783,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
+    fn publish_committed_sequence_watermarks(&self, tx_id: TxID) {
+        let Some(entry) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let tx = entry.value();
+        if matches!(tx.state.load(), TransactionState::Committed(_)) {
+            self.sequence_watermarks
+                .lock()
+                .extend(tx.uncommitted_sequence_watermarks.lock().drain());
+        }
+    }
+
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
     fn insert_finalized_tx_state(
         &self,
@@ -6800,6 +6833,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
+    pub fn set_uncommitted_sequence_watermark(
+        &self,
+        tx_id: TxID,
+        sequence_name: &str,
+        watermark: i64,
+    ) -> Result<()> {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
+        };
+        tx.value()
+            .uncommitted_sequence_watermarks
+            .lock()
+            .insert(crate::util::normalize_ident(sequence_name), watermark);
+        Ok(())
+    }
+
     pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
         let sequence_name = crate::util::normalize_ident(sequence_name);
         self.sequence_watermarks
@@ -6824,7 +6873,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         self.txs.get(tx_id).is_some_and(|tx| {
                             matches!(
                                 tx.value().state.load(),
-                                TransactionState::Active | TransactionState::Preparing(_)
+                                TransactionState::Active
+                                    | TransactionState::Preparing(_)
+                                    | TransactionState::Committed(_)
                             )
                         })
                     });
@@ -7357,6 +7408,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let Savepoint {
             header,
             header_dirty,
+            uncommitted_sequence_watermarks,
             created_table_versions,
             created_index_versions,
             deleted_table_versions,
@@ -7468,6 +7520,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         *tx.header.write() = header;
         tx.header_dirty.store(header_dirty, Ordering::Release);
+        *tx.uncommitted_sequence_watermarks.lock() = uncommitted_sequence_watermarks;
     }
 
     // Rollback can make an old integer rowid visible again without going through INSERT.
