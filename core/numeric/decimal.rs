@@ -196,8 +196,9 @@ pub fn validate_precision_scale(
         return Ok(BigDecimal::new(BigInt::from(0), scale));
     }
 
-    // Round to the requested scale
-    let rounded = val.with_scale(scale);
+    // Round to the requested scale, ties away from zero like PostgreSQL.
+    // `with_scale` would truncate the extra digits instead.
+    let rounded = val.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp);
 
     // Count total significant digits (excluding leading zeros)
     let (bigint, _) = rounded.as_bigint_and_exponent();
@@ -258,6 +259,29 @@ mod tests {
         let val = BigDecimal::from_str("123.45").unwrap();
         let result = validate_precision_scale(&val, 5, 2);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_precision_scale_rounds_half_away_from_zero() {
+        for (input, expected) in [
+            ("1.005", "1.01"),
+            ("2.999", "3.00"),
+            ("0.995", "1.00"),
+            ("-1.005", "-1.01"),
+            ("1.004", "1.00"),
+            ("-1.004", "-1.00"),
+        ] {
+            let val = BigDecimal::from_str(input).unwrap();
+            let result = validate_precision_scale(&val, 10, 2).unwrap();
+            assert_eq!(result.to_string(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_validate_precision_scale_rounding_can_overflow() {
+        // 999.995 rounds to 1000.00, which no longer fits numeric(5,2).
+        let val = BigDecimal::from_str("999.995").unwrap();
+        assert!(validate_precision_scale(&val, 5, 2).is_err());
     }
 
     #[test]
