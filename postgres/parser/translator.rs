@@ -2109,7 +2109,9 @@ impl PostgreSQLTranslator {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 Some(match derived_column_name(val) {
-                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
+                                    Some((name, _)) => {
+                                        ast::As::Elided(ast::Name::from_string(name))
+                                    }
                                     None => ast::As::ImplicitColumnName(ast::Name::from_string(
                                         "?column?",
                                     )),
@@ -4072,9 +4074,11 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
-/// A cast keeps the name of the expression it casts, and falls back to the
-/// name of the outermost target type, so `1::int::text` is named `text`.
-fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+/// The returned flag marks a weak name that an enclosing cast or CASE replaces:
+/// a cast is named after the expression it casts unless that name is weak, and
+/// then after its target type, so `1::int::text` is named `text`. A CASE is
+/// named after its ELSE expression unless that name is weak, and then `case`.
+fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<(String, bool)> {
     use pg_query::protobuf::node::Node;
     let last_string = |names: &[pg_query::protobuf::Node]| {
         names
@@ -4085,19 +4089,39 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
             })
             .next_back()
     };
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname),
-        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields),
+    let name = match &node.node {
+        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname)?,
+        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields)?,
         Some(Node::TypeCast(type_cast)) => {
-            let mut arg = type_cast.arg.as_deref()?;
-            while let Some(Node::TypeCast(inner)) = &arg.node {
-                arg = inner.arg.as_deref()?;
+            return match derived_column_name(type_cast.arg.as_deref()?) {
+                Some((name, false)) => Some((name, false)),
+                _ => Some((last_string(&type_cast.type_name.as_ref()?.names)?, true)),
+            };
+        }
+        Some(Node::CaseExpr(case_expr)) => {
+            return match case_expr.defresult.as_deref().and_then(derived_column_name) {
+                Some((name, false)) => Some((name, false)),
+                _ => Some(("case".to_string(), true)),
+            };
+        }
+        Some(Node::CoalesceExpr(_)) => "coalesce".to_string(),
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
             }
-            derived_column_name(arg).or_else(|| last_string(&type_cast.type_name.as_ref()?.names))
+            .to_string()
+        }
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
+        {
+            "nullif".to_string()
         }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
-            let name = match Op::try_from(svf.op) {
+            match Op::try_from(svf.op) {
                 Ok(Op::SvfopCurrentDate) => "current_date",
                 Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
                 Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
@@ -4110,11 +4134,12 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
                 Ok(Op::SvfopCurrentCatalog) => "current_catalog",
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
-            };
-            Some(name.to_string())
+            }
+            .to_string()
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((name, false))
 }
 
 /// Extract a string value from a DefElem's arg.
