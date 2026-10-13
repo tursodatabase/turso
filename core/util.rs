@@ -1998,7 +1998,7 @@ fn view_source_from_select_table(
                 ast::SelectTable::Table(_, source_alias, _)
                 | ast::SelectTable::TableCall(_, _, source_alias, ..)
                 | ast::SelectTable::Select(_, source_alias)
-                | ast::SelectTable::Sub(_, source_alias) => *source_alias = alias.clone(),
+                | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
             view_source_from_select_table(&source_table, schema, ctes, tables)
         }
