@@ -1,0 +1,54 @@
+@database :memory:
+
+# A query with more than twelve tables uses the greedy join order search.
+# A table after a RIGHT JOIN must stay after it: the read of unmatched right
+# rows runs after the main loop, so a table moved before the join would not
+# be joined with those rows.
+
+test right-join-keeps-later-table-after-it-in-greedy-search {
+    CREATE TABLE t0(a);
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    CREATE TABLE t4(a);
+    CREATE TABLE t5(a);
+    CREATE TABLE t6(a);
+    CREATE TABLE t7(a);
+    CREATE TABLE t8(a);
+    CREATE TABLE t9(a);
+    CREATE TABLE t10(a);
+    CREATE TABLE t11(a);
+    CREATE TABLE t12(a);
+    INSERT INTO t0 VALUES (1);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+    INSERT INTO t4 VALUES (1);
+    INSERT INTO t5 VALUES (1);
+    INSERT INTO t6 VALUES (1);
+    INSERT INTO t7 VALUES (1);
+    INSERT INTO t8 VALUES (1);
+    INSERT INTO t9 VALUES (1);
+    INSERT INTO t10 VALUES (1);
+    INSERT INTO t11 VALUES (2);
+    INSERT INTO t12 VALUES (1), (1);
+
+    SELECT t11.a, t12.a
+      FROM t0
+      JOIN t1 ON t1.a = t0.a
+      JOIN t2 ON t2.a = t0.a
+      JOIN t3 ON t3.a = t0.a
+      JOIN t4 ON t4.a = t0.a
+      JOIN t5 ON t5.a = t0.a
+      JOIN t6 ON t6.a = t0.a
+      JOIN t7 ON t7.a = t0.a
+      JOIN t8 ON t8.a = t0.a
+      JOIN t9 ON t9.a = t0.a
+      JOIN t10 ON t10.a = t0.a
+      RIGHT JOIN t11 ON t11.a = t0.a
+      JOIN t12 ON t12.a = 1;
+}
+expect {
+    2|1
+    2|1
+}
