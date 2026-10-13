@@ -17,7 +17,7 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
@@ -1195,6 +1195,7 @@ pub fn translate_alter_table(
                 None
             };
 
+            let mut rewrite_rows_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1203,12 +1204,14 @@ pub fn translate_alter_table(
                 input,
                 |program| {
                     if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
-                        emit_rewrite_table_rows(
+                        rewrite_rows_result = emit_rewrite_table_rows(
                             program,
                             original_btree.clone(),
                             &btree,
                             source_column_by_schema_idx,
                             layout,
+                            None,
+                            resolver,
                             connection,
                             database_id,
                         );
@@ -1227,7 +1230,8 @@ pub fn translate_alter_table(
                         column_index: dropped_index,
                     })
                 },
-            )?
+            )?;
+            rewrite_rows_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def
@@ -1895,8 +1899,19 @@ pub fn translate_alter_table(
                         // changing NUMERIC -> TEXT). See issue #3706.
                         let affinity_changed =
                             old_column.affinity() != replacement_column.affinity();
-                        let rewrites_physical_layout =
-                            becomes_generated || virtuality_changed || affinity_changed;
+                        // In a STRICT table, existing values must also pass the type check
+                        // of the new type and go through its ENCODE, even when the
+                        // affinity stays the same (e.g. TEXT -> varchar(3)).
+                        let strict_type_changed = btree.is_strict
+                            && strict_column_type_changed(
+                                old_column,
+                                &replacement_column,
+                                resolver.schema(),
+                            );
+                        let rewrites_physical_layout = becomes_generated
+                            || virtuality_changed
+                            || affinity_changed
+                            || strict_type_changed;
                         (
                             rewrites_physical_layout,
                             old_column.is_virtual_generated()
@@ -1956,6 +1971,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
+                table.resolve_custom_type_affinities(resolver.schema());
                 table.prepare_generated_columns()?;
                 Some(table)
             } else {
@@ -2308,15 +2324,19 @@ pub fn translate_alter_table(
                         })
                         .collect();
                     let layout = altered_table.column_layout()?;
+                    let converted_column =
+                        source_column_by_schema_idx[column_index].map(|_| column_index);
                     emit_rewrite_table_rows(
                         program,
                         original_btree.clone(),
                         &altered_table,
                         &source_column_by_schema_idx,
                         &layout,
+                        converted_column,
+                        resolver,
                         connection,
                         database_id,
-                    );
+                    )?;
                 }
                 emit_rewrite_table_indexes(
                     program,
@@ -2527,6 +2547,22 @@ fn validate_indexes_can_be_rewritten(
     Ok(())
 }
 
+fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bool {
+    if old.array_dimensions() != new.array_dimensions() {
+        return true;
+    }
+    match (
+        schema.get_type_def(&old.ty_str, true),
+        schema.get_type_def(&new.ty_str, true),
+    ) {
+        (None, None) => old.strict_value_type() != new.strict_value_type(),
+        (Some(_), Some(_)) => {
+            !old.ty_str.eq_ignore_ascii_case(&new.ty_str) || old.ty_params != new.ty_params
+        }
+        _ => true,
+    }
+}
+
 fn emit_rewrite_table_indexes(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2555,15 +2591,18 @@ fn emit_rewrite_table_indexes(
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
 /// entry is either the physical column index to read from the old row image or `None`
 /// for virtual generated columns, which are omitted from the stored record entirely.
+#[allow(clippy::too_many_arguments)]
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
+    converted_column: Option<usize>,
+    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-) {
+) -> Result<()> {
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
         rewritten_table.columns().len()
@@ -2573,7 +2612,7 @@ fn emit_rewrite_table_rows(
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
     let affinity_str = non_virtual_affinity_str(rewritten_table);
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
 
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
@@ -2581,7 +2620,7 @@ fn emit_rewrite_table_rows(
         db: database_id,
     });
 
-    program.cursor_loop(cursor_id, |program, rowid| {
+    program.cursor_loop(cursor_id, |program, rowid| -> Result<()> {
         // Initialize all destination slots to NULL so that columns without a
         // source value (e.g. when a virtual generated column becomes stored,
         // there is no pre-existing value on the old row image) default to NULL.
@@ -2596,6 +2635,20 @@ fn emit_rewrite_table_rows(
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
             );
+        }
+
+        if let Some(column_index) = converted_column {
+            if rewritten_table.is_strict {
+                emit_strict_column_conversion(
+                    program,
+                    resolver,
+                    column_index,
+                    &original_btree,
+                    rewritten_table,
+                    base_dest_reg,
+                    layout,
+                )?;
+            }
         }
 
         let record = program.alloc_register();
@@ -2622,7 +2675,61 @@ fn emit_rewrite_table_rows(
             flag: crate::vdbe::insn::InsertFlags(0),
             table_name: table_name.clone(),
         });
+        Ok(())
+    })
+}
+
+/// Convert the stored value of the altered column the same way INSERT
+/// converts a new value: decode it with the old custom type (if any), check it
+/// against the new type, encode it with the new custom type (if any), and check
+/// the encoded value against the storage type.
+fn emit_strict_column_conversion(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    column_index: usize,
+    original_table: &BTreeTable,
+    rewritten_table: &BTreeTable,
+    start_reg: usize,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    let mut column_mask = ColumnMask::default();
+    column_mask.set(column_index)?;
+    let rewritten_table = Arc::new(rewritten_table.clone());
+
+    crate::translate::expr::emit_custom_type_decode_columns(
+        program,
+        resolver,
+        original_table.columns(),
+        start_reg,
+        Some(&column_mask),
+        layout,
+    )?;
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::input_type_check_table_ref(
+            &rewritten_table,
+            resolver.schema(),
+            Some(&column_mask),
+        )?,
     });
+    crate::translate::expr::emit_custom_type_encode_columns(
+        program,
+        resolver,
+        rewritten_table.columns(),
+        start_reg,
+        Some(&column_mask),
+        &rewritten_table.name,
+        layout,
+    )?;
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::type_check_table_ref(&rewritten_table, resolver.schema()),
+    });
+    Ok(())
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
