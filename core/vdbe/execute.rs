@@ -12572,7 +12572,12 @@ pub fn op_insert(
                     let cursor = cursor.as_btree_mut();
                     cursor.root_page()
                 };
-                if root_page != 1
+                // An MVCC cursor reports its table id as the root page, so the
+                // schema table shows up as SQLITE_SCHEMA_MVCC_TABLE_ID there
+                // instead of page 1.
+                let is_schema_root = root_page == 1
+                    || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
+                if !is_schema_root
                     && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
