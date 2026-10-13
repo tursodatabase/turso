@@ -215,6 +215,56 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     assert_eq!(schema_rows(), vec!["t"]);
 }
 
+#[turso_macros::test]
+fn drop_table_frees_pages_of_backing_btree_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE example (name TEXT)").unwrap();
+    conn.execute("CREATE INDEX example_idx ON example USING backing_btree (name)")
+        .unwrap();
+    conn.execute("DROP TABLE example").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_on_the_same_table(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("DROP TABLE vectors").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_after_table_rename(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("ALTER TABLE vectors RENAME TO renamed")
+        .unwrap();
+    conn.execute("DROP TABLE renamed").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
+}
+
 // This raw-cursor test manually opens pager write transactions.
 #[turso_macros::test(init_sql = "CREATE TABLE t(name, embedding)")]
 fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {

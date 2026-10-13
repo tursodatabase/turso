@@ -1477,6 +1477,31 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
+    pub fn get_unowned_backing_btrees(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.indexes
+            .get(&name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+            .filter(|i| i.is_backing_btree_index() && !self.backing_btree_has_owner(i))
+    }
+
+    fn backing_btree_has_owner(&self, backing_btree: &Index) -> bool {
+        self.indexes
+            .values()
+            .flatten()
+            .filter_map(|index| index.index_method.as_ref())
+            .filter(|method| !method.definition().backing_btree)
+            .any(|method| {
+                method.backing_schema().indexes.iter().any(|owned| {
+                    normalize_ident(&owned.name) == normalize_ident(&backing_btree.name)
+                })
+            })
+    }
+
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     pub fn has_fts_index(&self, table_name: &str) -> bool {
         self.get_indices(table_name).any(|idx| {
