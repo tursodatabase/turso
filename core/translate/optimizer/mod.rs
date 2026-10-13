@@ -87,6 +87,8 @@ pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
 pub(crate) mod join;
+#[cfg(test)]
+mod join_fuzz;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
