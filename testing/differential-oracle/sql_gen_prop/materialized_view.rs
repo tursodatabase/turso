@@ -508,10 +508,6 @@ fn comparison_filter(
 
 const COMPARISON_OPERATORS: [&str; 6] = ["=", "!=", "<", "<=", ">", ">="];
 
-/// Turso's IVM filter compares without column affinity: `int_col = '5'` keeps
-/// other rows than SQLite. Raise this weight once the filter applies affinity.
-const AFFINITY_CONVERTED_LITERAL_WEIGHT: u32 = 0;
-
 /// The column comes first and literals are never negative, because Turso
 /// refuses `1 < c` and `c < -1` in a materialized view.
 fn comparison(filterable: Vec<ColumnDef>) -> BoxedStrategy<String> {
@@ -526,34 +522,22 @@ fn comparison(filterable: Vec<ColumnDef>) -> BoxedStrategy<String> {
         .boxed()
 }
 
-/// A literal or column that SQLite compares with `column` without converting
-/// it, unless `AFFINITY_CONVERTED_LITERAL_WEIGHT` is raised.
 fn comparison_operand(column: &ColumnDef, filterable: &[ColumnDef]) -> BoxedStrategy<String> {
-    let text = column.data_type == DataType::Text;
     let other_columns: Vec<String> = filterable
         .iter()
-        .filter(|c| c.name != column.name && (c.data_type == DataType::Text) == text)
+        .filter(|c| c.name != column.name)
         .map(|c| c.name.clone())
         .collect();
     let mut operands = vec![
         (4, same_type_literal(column.data_type)),
         (2, Just("NULL".to_string()).boxed()),
         (2, other_type_literal(column.data_type)),
-        (
-            AFFINITY_CONVERTED_LITERAL_WEIGHT,
-            affinity_converted_literal(column.data_type),
-        ),
+        (2, affinity_converted_literal(column.data_type)),
     ];
     if !other_columns.is_empty() {
         operands.push((2, proptest::sample::select(other_columns).boxed()));
     }
-    proptest::strategy::Union::new_weighted(
-        operands
-            .into_iter()
-            .filter(|(weight, _)| *weight > 0)
-            .collect(),
-    )
-    .boxed()
+    proptest::strategy::Union::new_weighted(operands).boxed()
 }
 
 fn same_type_literal(data_type: DataType) -> BoxedStrategy<String> {
@@ -682,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_filters_cover_every_operator_null_and_or_but_no_affinity_converted_literal() {
+    fn comparison_filters_cover_every_operator_null_and_or_and_affinity_converted_literals() {
         let schema = schema_with_matview();
         let users = &schema.tables[0];
         let strategy = comparison_filter(users, users.filterable_columns().cloned().collect());
@@ -695,21 +679,23 @@ mod tests {
             assert!(sqls.iter().any(|sql| {
                 sql.contains(&format!("name {op} team")) || sql.contains(&format!("team {op} name"))
             }));
+            assert!(sqls.iter().any(|sql| {
+                sql.contains(&format!("name {op} id")) || sql.contains(&format!("id {op} name"))
+            }));
+            assert!(sqls.iter().any(|sql| {
+                (0..=5).any(|i| {
+                    sql.contains(&format!("id {op} '{i}'"))
+                        || sql.contains(&format!("name {op} {i}"))
+                })
+            }));
         }
         assert!(sqls.iter().any(|sql| sql.contains(" AND ")));
         assert!(sqls.iter().any(|sql| sql.contains(" OR ")));
         assert!(sqls.iter().any(|sql| sql.contains("X'62'")));
-        assert!(sqls.iter().any(|sql| {
-            COMPARISON_OPERATORS
-                .iter()
-                .any(|op| sql.contains(&format!("id {op} '")))
-        }));
         for sql in &sqls {
             assert!(!sql.contains('-'), "{sql}");
             for i in 0..=5 {
-                assert!(!sql.contains(&format!("'{i}'")), "{sql}");
                 for op in COMPARISON_OPERATORS {
-                    assert!(!sql.contains(&format!("name {op} {i}")), "{sql}");
                     assert!(!sql.contains(&format!("{i} {op} ")), "{sql}");
                 }
             }
