@@ -461,24 +461,25 @@ impl QueryShape {
     }
 
     fn random_with_table_count(rng: &mut ChaCha8Rng, table_count: usize) -> Self {
+        let swarm = Swarm::random(rng);
         let mut tables: Vec<TableShape> = Vec::with_capacity(table_count);
         for index in 0..table_count {
-            let join = (index > 0).then(|| Join::random(rng));
+            let join = (index > 0).then(|| swarm.random_join(rng));
             let visible: Vec<usize> = (0..index)
                 .filter(|&earlier| !tables[earlier].join.is_some_and(Join::hides_columns))
                 .collect();
             let on_terms = match join {
                 None => Vec::new(),
-                Some(join) => random_on_terms(rng, index, join, &visible),
+                Some(join) => random_on_terms(rng, &swarm, index, join, &visible),
             };
             tables.push(TableShape {
                 join,
                 on_terms,
-                rows: ROW_COUNTS[rng.random_range(0..ROW_COUNTS.len())],
-                indexes: random_indexes(rng),
+                rows: swarm.row_counts[rng.random_range(0..swarm.row_counts.len())],
+                indexes: random_indexes(rng, &swarm),
             });
         }
-        let where_terms = random_where_terms(rng, &tables);
+        let where_terms = random_where_terms(rng, &swarm, &tables);
         Self {
             tables,
             where_terms,
@@ -486,11 +487,122 @@ impl QueryShape {
     }
 }
 
-fn random_on_terms(rng: &mut ChaCha8Rng, table: usize, join: Join, visible: &[usize]) -> Vec<Term> {
+/// The features that one table list may use. Each list draws a random
+/// subset, as in swarm testing, so that a rare combination such as a chain
+/// of FULL JOINs with `IS` terms and no indexes gets many rounds.
+#[derive(Clone, Debug)]
+struct Swarm {
+    joins: Vec<Join>,
+    links: Links,
+    is_compare: bool,
+    local_on_terms: bool,
+    max_on_terms: usize,
+    where_terms: bool,
+    indexes: bool,
+    unique_indexes: bool,
+    row_counts: Vec<f64>,
+}
+
+/// The earlier table that a join term reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Links {
+    /// Any earlier table that shows its columns.
+    Any,
+    /// The nearest earlier table that shows its columns, which makes a chain.
+    Previous,
+    /// The first table, which makes a star.
+    First,
+}
+
+impl Swarm {
+    const ALL_JOINS: [Join; 7] = [
+        Join::Inner,
+        Join::Cross,
+        Join::Left,
+        Join::Right,
+        Join::Full,
+        Join::Semi,
+        Join::Anti,
+    ];
+
+    fn random(rng: &mut ChaCha8Rng) -> Self {
+        if rng.random_ratio(1, 4) {
+            return Self::everything();
+        }
+        Self {
+            joins: random_subset(rng, &Self::ALL_JOINS),
+            links: match rng.random_range(0..3) {
+                0 => Links::Any,
+                1 => Links::Previous,
+                _ => Links::First,
+            },
+            is_compare: rng.random_bool(0.5),
+            local_on_terms: rng.random_bool(0.5),
+            max_on_terms: rng.random_range(1..=3),
+            where_terms: rng.random_bool(0.5),
+            indexes: rng.random_bool(0.5),
+            unique_indexes: rng.random_bool(0.5),
+            row_counts: random_subset(rng, &ROW_COUNTS),
+        }
+    }
+
+    fn everything() -> Self {
+        Self {
+            joins: Self::ALL_JOINS.to_vec(),
+            links: Links::Any,
+            is_compare: true,
+            local_on_terms: true,
+            max_on_terms: 2,
+            where_terms: true,
+            indexes: true,
+            unique_indexes: true,
+            row_counts: ROW_COUNTS.to_vec(),
+        }
+    }
+
+    fn random_join(&self, rng: &mut ChaCha8Rng) -> Join {
+        if self.joins.len() == Self::ALL_JOINS.len() {
+            Join::random(rng)
+        } else {
+            self.joins[rng.random_range(0..self.joins.len())]
+        }
+    }
+
+    fn link_target(&self, rng: &mut ChaCha8Rng, visible: &[usize]) -> usize {
+        match self.links {
+            Links::Any => visible[rng.random_range(0..visible.len())],
+            Links::Previous => *visible
+                .last()
+                .expect("the caller checks for a visible table"),
+            Links::First => visible[0],
+        }
+    }
+}
+
+fn random_subset<T: Copy>(rng: &mut ChaCha8Rng, items: &[T]) -> Vec<T> {
+    loop {
+        let subset: Vec<T> = items
+            .iter()
+            .copied()
+            .filter(|_| rng.random_bool(0.5))
+            .collect();
+        if !subset.is_empty() {
+            return subset;
+        }
+    }
+}
+
+fn random_on_terms(
+    rng: &mut ChaCha8Rng,
+    swarm: &Swarm,
+    table: usize,
+    join: Join,
+    visible: &[usize],
+) -> Vec<Term> {
     let count = match join {
-        Join::Inner | Join::Cross => rng.random_range(0..=2),
+        Join::Inner | Join::Cross => rng.random_range(0..=swarm.max_on_terms),
         _ if rng.random_ratio(1, 20) => 0,
-        _ => rng.random_range(1..=2),
+        _ => rng.random_range(1..=swarm.max_on_terms),
     };
     (0..count)
         .map(|_| {
@@ -498,7 +610,7 @@ fn random_on_terms(rng: &mut ChaCha8Rng, table: usize, join: Join, visible: &[us
                 table,
                 column: random_column(rng),
             };
-            if visible.is_empty() || rng.random_ratio(1, 8) {
+            if visible.is_empty() || (swarm.local_on_terms && rng.random_ratio(1, 8)) {
                 if rng.random_ratio(1, 4) {
                     Term::IsNull { column }
                 } else {
@@ -508,11 +620,16 @@ fn random_on_terms(rng: &mut ChaCha8Rng, table: usize, join: Join, visible: &[us
                     }
                 }
             } else {
+                let compare = if swarm.is_compare {
+                    Compare::random(rng)
+                } else {
+                    Compare::Equal
+                };
                 Term::Columns {
                     left: column,
-                    compare: Compare::random(rng),
+                    compare,
                     right: ColumnRef {
-                        table: visible[rng.random_range(0..visible.len())],
+                        table: swarm.link_target(rng, visible),
                         column: random_column(rng),
                     },
                 }
@@ -521,7 +638,10 @@ fn random_on_terms(rng: &mut ChaCha8Rng, table: usize, join: Join, visible: &[us
         .collect()
 }
 
-fn random_where_terms(rng: &mut ChaCha8Rng, tables: &[TableShape]) -> Vec<Term> {
+fn random_where_terms(rng: &mut ChaCha8Rng, swarm: &Swarm, tables: &[TableShape]) -> Vec<Term> {
+    if !swarm.where_terms {
+        return Vec::new();
+    }
     let visible: Vec<usize> = (0..tables.len())
         .filter(|&table| !tables[table].join.is_some_and(Join::hides_columns))
         .collect();
@@ -540,8 +660,20 @@ fn random_where_terms(rng: &mut ChaCha8Rng, tables: &[TableShape]) -> Vec<Term> 
                 column: random_column(rng),
             };
             if visible.len() >= 2 && rng.random_ratio(3, 5) {
-                let second_position =
-                    (first_position + 1 + rng.random_range(0..visible.len() - 1)) % visible.len();
+                let second_position = match swarm.links {
+                    Links::Any => {
+                        (first_position + 1 + rng.random_range(0..visible.len() - 1))
+                            % visible.len()
+                    }
+                    Links::Previous => first_position.checked_sub(1).unwrap_or(1),
+                    Links::First => {
+                        if first_position == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                };
                 let second = ColumnRef {
                     table: visible[second_position],
                     column: random_column(rng),
@@ -572,11 +704,14 @@ fn random_column(rng: &mut ChaCha8Rng) -> usize {
     rng.random_range(0..COLUMN_NAMES.len())
 }
 
-fn random_indexes(rng: &mut ChaCha8Rng) -> Vec<(usize, bool)> {
+fn random_indexes(rng: &mut ChaCha8Rng, swarm: &Swarm) -> Vec<(usize, bool)> {
     let mut indexes = Vec::new();
+    if !swarm.indexes {
+        return indexes;
+    }
     for column in 0..COLUMN_NAMES.len() {
         if rng.random_ratio(1, 3) {
-            indexes.push((column, rng.random_ratio(1, 3)));
+            indexes.push((column, swarm.unique_indexes && rng.random_ratio(1, 3)));
         }
     }
     indexes
