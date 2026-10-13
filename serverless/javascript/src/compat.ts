@@ -229,18 +229,14 @@ class LibSQLClient implements Client {
     return "http";
   }
 
-  private normalizeStatement(stmt: InStatement): { sql: string; args: any[] } {
+  private normalizeStatement(stmt: InStatement): { sql: string; args: InArgs } {
     if (typeof stmt === 'string') {
       return { sql: stmt, args: [] };
     }
-    
-    const args = stmt.args || [];
-    if (Array.isArray(args)) {
-      return { sql: stmt.sql, args };
-    }
-    
-    // Convert named args to positional args (simplified)
-    return { sql: stmt.sql, args: Object.values(args) };
+
+    // An args object is kept as is, so its keys are sent as named args,
+    // the same as @libsql/client and the native API.
+    return { sql: stmt.sql, args: stmt.args || [] };
   }
 
   private convertResult(result: any): ResultSet {
@@ -307,14 +303,9 @@ class LibSQLClient implements Client {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
 
-      let normalizedStmt: { sql: string; args: any[] };
-
-      if (typeof stmtOrSql === 'string') {
-        const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
-        normalizedStmt = { sql: stmtOrSql, args: normalizedArgs };
-      } else {
-        normalizedStmt = this.normalizeStatement(stmtOrSql);
-      }
+      const normalizedStmt = this.normalizeStatement(
+        typeof stmtOrSql === 'string' ? { sql: stmtOrSql, args } : stmtOrSql,
+      );
 
       const result = await this.session.execute(normalizedStmt.sql, normalizedStmt.args, this._defaultSafeIntegers);
       return this.convertResult(result);
@@ -428,8 +419,7 @@ class LibSQLClient implements Client {
     return {
       execute: async (stmtOrSql: InStatement | string, args?: InArgs): Promise<ResultSet> => {
         if (typeof stmtOrSql === "string") {
-          const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
-          return executeInTx({ sql: stmtOrSql, args: normalizedArgs });
+          return executeInTx({ sql: stmtOrSql, args });
         }
         return executeInTx(stmtOrSql);
       },
