@@ -65,6 +65,7 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+    fn backing_schema(&self) -> BackingSchema;
 
     /// Returns the result expression this index provides for the captured query parameters.
     /// The planner compares it with the requested expression before using an index result

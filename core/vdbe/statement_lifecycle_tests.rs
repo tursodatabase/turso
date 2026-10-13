@@ -54,6 +54,10 @@ impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
     fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
         Ok(Box::new(FailingPrepareCursor::default()))
     }
+
+    fn backing_schema(&self) -> crate::index_method::BackingSchema {
+        crate::index_method::BackingSchema::default()
+    }
 }
 
 impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
