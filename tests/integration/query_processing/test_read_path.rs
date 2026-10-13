@@ -3,7 +3,7 @@ use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{ConnectOpts, LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
 fn current_time_literals_refresh_on_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1137,7 +1137,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
         for i in 0..ROWS {
             conn.execute(
@@ -1154,7 +1154,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     // A fresh Database over the same backing file starts with a cold page
     // cache, so every record (and its overflow chain) must be read back.
     let db = open(io.clone())?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
     let mut io_yields = 0usize;
     let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();

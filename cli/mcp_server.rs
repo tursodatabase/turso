@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use turso_core::{
-    Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect,
+    Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
@@ -531,7 +532,7 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect() {
+                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
                     Ok(c) => c,
                     Err(e) => return format!("Failed to connect to database '{path}': {e}"),
                 },

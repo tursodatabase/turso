@@ -313,6 +313,13 @@ impl TypeDef {
         }
     }
 
+    /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
+    pub fn decode_returns_value_unchanged(&self) -> bool {
+        self.decode().is_none_or(
+            |decode| matches!(decode, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")),
+        )
+    }
+
     /// Returns the base type name.
     pub fn base(&self) -> &str {
         match &self.kind {
@@ -784,7 +791,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1468,6 +1475,31 @@ impl Schema {
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
+    }
+
+    pub fn get_unowned_backing_btrees(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.indexes
+            .get(&name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+            .filter(|i| i.is_backing_btree_index() && !self.backing_btree_has_owner(i))
+    }
+
+    fn backing_btree_has_owner(&self, backing_btree: &Index) -> bool {
+        self.indexes
+            .values()
+            .flatten()
+            .filter_map(|index| index.index_method.as_ref())
+            .filter(|method| !method.definition().backing_btree)
+            .any(|method| {
+                method.backing_schema().indexes.iter().any(|owned| {
+                    normalize_ident(&owned.name) == normalize_ident(&backing_btree.name)
+                })
+            })
     }
 
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -4394,13 +4426,6 @@ fn is_current_time_expr(expr: &Expr) -> bool {
     ) || matches!(expr, Expr::Literal(literal) if is_current_time_literal(literal))
 }
 
-pub(crate) fn is_current_time_literal(literal: &ast::Literal) -> bool {
-    matches!(
-        literal,
-        ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
-    )
-}
-
 fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -6316,6 +6341,13 @@ impl Index {
         )?;
         Ok(Some(*expr))
     }
+}
+
+pub(crate) fn is_current_time_literal(literal: &ast::Literal) -> bool {
+    matches!(
+        literal,
+        ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+    )
 }
 
 #[cfg(test)]

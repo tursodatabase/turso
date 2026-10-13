@@ -3,8 +3,8 @@ use asserting::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 use turso_core::{
-    mvcc::persistent_storage::logical_log::LogTxFrameInfo, Database, DatabaseOpts, EncryptionKey,
-    EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
+    mvcc::persistent_storage::logical_log::LogTxFrameInfo, ConnectOpts, Database, DatabaseOpts,
+    EncryptionKey, EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -19,7 +19,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.close()?;
     Ok(())
@@ -201,7 +201,7 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
             recording.clone() as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>
         ),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
 
     // Cause a commit that should append to the MVCC logical log.
@@ -463,7 +463,7 @@ fn test_attach_rejects_incompatible_journal_mode(tmp_db: TempDatabase) -> anyhow
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect()?;
+    let aux_conn = aux_db.connect(ConnectOpts::new())?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
     aux_conn.close()?;
 
@@ -956,6 +956,27 @@ fn test_named_savepoint_release_commits_attached_mvcc(tmp_db: TempDatabase) -> a
     Ok(())
 }
 
+/// RELEASE that commits the transaction must not fail when the commit runs an
+/// automatic checkpoint that waits on I/O.
+#[turso_macros::test]
+fn test_named_savepoint_release_with_checkpoint_on_commit(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+
+    conn.execute("SAVEPOINT sp1")?;
+    conn.execute("INSERT INTO t(v) VALUES ('x')")?;
+    conn.execute("RELEASE sp1")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(1,)]);
+
+    Ok(())
+}
+
 /// Attaching a :memory: database must succeed even when the main DB uses MVCC,
 /// since in-memory databases do not have a journal mode to conflict with.
 #[turso_macros::test(mvcc)]
@@ -992,7 +1013,7 @@ fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
         Arc::new(SqliteDialect),
     )?;
     let key = EncryptionKey::from_hex_string(hex_key)?;
-    let conn = db.connect_with_encryption(Some(key))?;
+    let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
 
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.execute("CREATE TABLE main_t(x INTEGER)")?;
@@ -1100,7 +1121,7 @@ fn test_recover_table_with_create_virtual_substring_in_sql(db: TempDatabase) -> 
 
     // Reopen — triggers bootstrap / log replay; must not report corruption.
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let rows: Vec<(String,)> = conn.exec_rows("select x from t");
     assert_eq!(rows, vec![("create virtual".to_string(),)]);
 
@@ -1157,14 +1178,14 @@ fn test_create_rename_insert_same_tx_recover_then_checkpoint(
 
     {
         let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
         assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     }
 
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
     assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
 
@@ -1243,7 +1264,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect()?;
+                    let conn = db.connect(ConnectOpts::new())?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
                     conn.execute(format!(
                         "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"
@@ -1261,7 +1282,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect()?;
+                    let conn = db.connect(ConnectOpts::new())?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
 
                     let create_drop_transient_index = || -> anyhow::Result<()> {
@@ -1301,7 +1322,7 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                         path.to_str().unwrap(),
                         Arc::new(SqliteDialect),
                     )?;
-                    let conn = db.connect()?;
+                    let conn = db.connect(ConnectOpts::new())?;
 
                     let rows_sql = format!("SELECT id, v FROM {table} ORDER BY id");
                     let rows: Vec<(i64, String)> = conn.exec_rows(&rows_sql);
@@ -1470,7 +1491,7 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
     // Phase 2: reopen and UPDATE the btree-only row. Pre-fix this raised
     // a corruption error from MvccLazyCursor::delete().
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.execute("UPDATE quint_corrupt SET value = zeroblob(32) WHERE key = 'k0'")?;
 
@@ -1551,7 +1572,7 @@ fn open_file_conn(path: &str) -> Arc<turso_core::Connection> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    db.connect().unwrap()
+    db.connect(ConnectOpts::new()).unwrap()
 }
 
 fn collect(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<Vec<turso_core::Value>> {

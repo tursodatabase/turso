@@ -1,4 +1,5 @@
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
+use turso_core::ConnectOpts;
 
 fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
     matches!(detail, rusqlite::types::Value::Text(d)
@@ -212,6 +213,56 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(schema_rows(), vec!["t"]);
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_backing_btree_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE example (name TEXT)").unwrap();
+    conn.execute("CREATE INDEX example_idx ON example USING backing_btree (name)")
+        .unwrap();
+    conn.execute("DROP TABLE example").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_on_the_same_table(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("DROP TABLE vectors").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_after_table_rename(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("ALTER TABLE vectors RENAME TO renamed")
+        .unwrap();
+    conn.execute("DROP TABLE renamed").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
 }
 
 // This raw-cursor test manually opens pager write transactions.
@@ -2973,7 +3024,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -2999,7 +3050,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -6520,7 +6571,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
     let db1 = open();
     let db2 = open();
 
-    let setup = db1.connect().unwrap();
+    let setup = db1.connect(ConnectOpts::new()).unwrap();
     setup
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -6555,7 +6606,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 1: "process" 1, connection X pins an old snapshot and warms the
     // shared cache with FTS backing pages at that snapshot.
-    let conn_x = db1.connect().unwrap();
+    let conn_x = db1.connect(ConnectOpts::new()).unwrap();
     conn_x.execute("BEGIN").unwrap();
     let _ = run_rows(
         &conn_x,
@@ -6564,7 +6615,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 2: "process" 2 commits FTS churn — deletes make old postings
     // dead (tombstones) and add new ones. Process 1's cache sees none of it.
-    let writer = db2.connect().unwrap();
+    let writer = db2.connect(ConnectOpts::new()).unwrap();
     for id in 0..50 {
         writer
             .execute(format!(
@@ -6575,7 +6626,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 3: process 1, connection Z begins a fresh snapshot: its
     // changed-detection clears the shared cache and loads some NEW pages.
-    let conn_z = db1.connect().unwrap();
+    let conn_z = db1.connect(ConnectOpts::new()).unwrap();
     let _ = run_rows(&conn_z, "SELECT count(*) FROM docs WHERE id < 10");
 
     // Step 4: connection X (still pinned at the OLD snapshot) runs another

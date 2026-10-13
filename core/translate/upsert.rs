@@ -1289,7 +1289,7 @@ pub fn emit_upsert(
                 start_reg: del,
                 num_regs: k + 1,
                 cursor_id: pending.idx_cid,
-                raise_error_if_no_matching_entry: false,
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(label) = maybe_skip_del {
                 program.preassign_label_to_next_insn(label);

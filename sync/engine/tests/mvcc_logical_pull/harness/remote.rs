@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::{Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
+};
 use turso_sync_engine::Result;
 
 use super::replica::Replica;
@@ -24,7 +26,7 @@ impl Remote {
             &db_path.to_string_lossy(),
             OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.set_portable_logical_changes_enabled(true);
         for sql in setup {

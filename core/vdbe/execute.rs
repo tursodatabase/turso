@@ -73,9 +73,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
-    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, ConnectOpts, Connection,
+    Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -86,7 +86,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
+            exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -5595,6 +5596,12 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
+            // A RELEASE that commits the transaction may suspend on I/O inside
+            // op_auto_commit after the savepoint was already removed. On
+            // re-entry, resume that commit instead of looking up the savepoint again.
+            if !matches!(state.commit_state, CommitState::Ready) {
+                return op_auto_commit(program, state, &release_commit_insn(), pager);
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
@@ -5622,11 +5629,7 @@ pub fn op_savepoint(
                         SavepointMirror::Release(name),
                     )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
-                    let auto_commit = Insn::AutoCommit {
-                        auto_commit: true,
-                        rollback: false,
-                    };
-                    return op_auto_commit(program, state, &auto_commit, pager);
+                    return op_auto_commit(program, state, &release_commit_insn(), pager);
                 }
             }
 
@@ -5698,6 +5701,13 @@ pub fn op_savepoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
+    }
+}
+
+fn release_commit_insn() -> Insn {
+    Insn::AutoCommit {
+        auto_commit: true,
+        rollback: false,
     }
 }
 
@@ -10538,7 +10548,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 {
@@ -10592,7 +10603,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 'outer: {
@@ -11189,6 +11201,17 @@ pub fn op_function(
                         state.registers[*dest].set_int(cmp_result as i64)
                     }
                 };
+            }
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+                check_arg_count!(arg_count, 2);
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let result = match scalar_func {
+                    ScalarFunc::DatePlus => exec_date_plus(lhs, rhs)?,
+                    ScalarFunc::DateMinus => exec_date_minus(lhs, rhs)?,
+                    _ => unreachable!(),
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);
@@ -19499,8 +19522,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect_with_page_codec(codec)?,
-                    None => output_db.connect()?,
+                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
+                    None => output_db.connect(ConnectOpts::new())?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -19706,7 +19729,7 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -19719,7 +19742,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -19780,7 +19803,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -19845,7 +19868,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -19907,7 +19930,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -19932,7 +19955,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -19977,7 +20000,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -20660,7 +20683,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

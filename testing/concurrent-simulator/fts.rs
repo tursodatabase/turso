@@ -3,7 +3,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value,
+};
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::properties::{FtsResultComparisonProperty, IntegrityCheckProperty, Property};
@@ -313,7 +315,7 @@ impl Whopper {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let connection = database.connect()?;
+        let connection = database.connect(ConnectOpts::new())?;
         check_fts_connection(&connection, self.context.enable_mvcc)?;
         let rows = query(
             &connection,

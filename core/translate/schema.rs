@@ -145,6 +145,15 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
                     col.col_name.as_str()
                 );
             }
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
+            {
+                bail_parse_error!(
+                    "default value of column [{}] is not constant",
+                    col.col_name.as_str()
+                );
+            }
             _ => Ok(WalkControl::Continue),
         }
     })?;
@@ -2103,7 +2112,10 @@ pub fn translate_drop_table(
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(tbl_name.name.as_str()).cloned().collect()
+        s.get_indices(tbl_name.name.as_str())
+            .chain(s.get_unowned_backing_btrees(tbl_name.name.as_str()))
+            .cloned()
+            .collect()
     });
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {

@@ -643,14 +643,7 @@ pub fn resolve_window_and_aggregate_functions(
                             }
                         }
                     }
-                    _ => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-                    }
+                    _ => {}
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
@@ -698,13 +691,6 @@ pub fn resolve_window_and_aggregate_functions(
                         return Ok(WalkControl::SkipChildren);
                     }
                     Some(func) => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-
                         // Check if the function supports (*) syntax using centralized logic
                         if func.supports_star_syntax() {
                             return Ok(WalkControl::Continue);

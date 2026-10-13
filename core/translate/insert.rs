@@ -1,5 +1,7 @@
 use crate::schema::ColumnLayout;
-use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
+use crate::translate::emitter::{
+    emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
+};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -3855,34 +3857,28 @@ fn emit_replace_delete_conflicting_row(
         let index = resolver
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
-        let skip_delete_label = if index.where_clause.is_some() {
-            let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)?
-                .expect("index.where_clause was checked to be Some above");
+        let table_internal_id = table_references.joined_tables()[0].internal_id;
+        let skip_delete_label = emit_partial_index_where_old_image(
+            program,
+            resolver,
+            table_references,
+            main_cursor_id,
+            table_internal_id,
+            &index,
+        )?
+        .map(|where_reg| {
             let skip_label = program.allocate_label();
-            let reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &where_copy,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
             program.emit_insn(Insn::IfNot {
-                reg,
+                reg: where_reg,
                 jump_if_null: true,
                 target_pc: skip_label,
             });
-            Some(skip_label)
-        } else {
-            None
-        };
+            skip_label
+        });
 
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
 
-        let table_internal_id = table_references.joined_tables()[0].internal_id;
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             emit_index_column_value_old_image(
                 program,
@@ -3903,7 +3899,7 @@ fn emit_replace_delete_conflicting_row(
             start_reg,
             num_regs,
             cursor_id: *index_cursor_id,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
 
         if let Some(label) = skip_delete_label {

@@ -4321,7 +4321,8 @@ fn translate_create_enum(
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
+/// Maps PG types to their base SQLite storage types. Other names are kept as
+/// written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
@@ -4347,11 +4348,16 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
-        | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
-        | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "DATE" => "date",
+        "TIME" | "TIMETZ" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
+            "TEXT"
+        }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => return None,
+        _ => &pg_type,
     };
 
     Some(ast::Type {

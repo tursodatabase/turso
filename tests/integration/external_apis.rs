@@ -12,7 +12,7 @@ use std::{
         Arc,
     },
 };
-use turso_core::{Connection, LimboError, StepResult};
+use turso_core::{ConnectOpts, Connection, LimboError, StepResult};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -30,7 +30,7 @@ fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Res
     let first_clone = first.clone();
     let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
     let shared = db.connect_with_context(context.clone())?;
-    let plain = db.connect()?;
+    let plain = db.connect(ConnectOpts::new())?;
 
     assert!(std::ptr::eq(
         context.as_ref(),

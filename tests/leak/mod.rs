@@ -21,7 +21,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use turso_core::{Database, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Database, OpenFlags, StepResult};
 
 struct CountingAllocator;
 
@@ -107,7 +107,7 @@ fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Pat
     )
     .unwrap();
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     if mvcc {
         conn.pragma_update("journal_mode", "'mvcc'").unwrap();
     }

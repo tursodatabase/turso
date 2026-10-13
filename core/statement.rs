@@ -1795,7 +1795,7 @@ impl Drop for Statement {
 mod tests {
     use super::*;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1807,7 +1807,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        db.connect()
+        db.connect(ConnectOpts::new())
     }
 
     #[test]

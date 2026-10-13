@@ -13,7 +13,7 @@ use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
-use turso_core::{Connection, Result, StepResult};
+use turso_core::{ConnectOpts, Connection, Result, StepResult};
 
 use crate::{
     generation::Shadow,
@@ -981,7 +981,12 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
 
             // Enable MVCC via PRAGMA if requested
             if mvcc {
-                let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                let conn = env
+                    .db
+                    .as_ref()
+                    .expect("db to be Some")
+                    .connect(ConnectOpts::new())
+                    .unwrap();
                 conn.pragma_update("journal_mode", "'mvcc'")
                     .expect("enable mvcc");
             }

@@ -816,6 +816,10 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         Ok(Box::new(FtsCursor::new(self)))
     }
 
+    fn backing_schema(&self) -> BackingSchema {
+        FtsStore::new(&self.cfg.index_name).schema
+    }
+
     fn result_column(
         &self,
         pattern: &ast::Expr,

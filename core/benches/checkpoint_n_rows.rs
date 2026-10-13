@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, StepResult,
+    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect,
+    StepResult,
 };
 
 #[cfg(not(target_family = "wasm"))]
@@ -152,7 +153,7 @@ fn load_n_rows(n: usize) -> Loaded {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     exec(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
     exec(&conn, &db, "PRAGMA synchronous = OFF");

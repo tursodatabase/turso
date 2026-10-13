@@ -11,7 +11,6 @@ use super::{
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
-use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
@@ -1493,24 +1492,16 @@ fn update_write_set_reason(
             break 'requires Some(DmlSafetyReason::KeyMutation);
         }
 
+        // The UPDATE must not change entries of the index that it scans.
         let Some(index) = table_ref.op.index() else {
             break 'requires None;
         };
-
-        let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
-        for c in index.columns.iter() {
-            if let Some(ref expr) = c.expr {
-                let expr_idx_cols_mask =
-                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
-                if expr_idx_cols_mask
-                    .iter()
-                    .any(|cidx| affected_cols.get(cidx))
-                {
-                    break 'requires Some(DmlSafetyReason::KeyMutation);
-                }
-            } else if affected_cols.get(c.pos_in_table) {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
+        if plan
+            .indexes_to_update
+            .iter()
+            .any(|updated| updated.name == index.name)
+        {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
         }
         break 'requires None;
     };

@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
+    dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
@@ -14,7 +15,6 @@ use turso_parser::ast::RefAct;
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
-const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -192,11 +192,11 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{STORED_PG_SCHEMA_PREFIX}{sql}")
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
-    sql.strip_prefix(STORED_PG_SCHEMA_PREFIX)
+    sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
 }
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
@@ -534,7 +534,10 @@ impl SnapshotRows for PgAttributeTable {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
+                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
+                    _ => sqlite_type_to_pg_oid(&col.ty_str),
+                };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -1327,28 +1330,34 @@ impl SnapshotRows for PgTypeTable {
             }));
         }
 
-        // Dynamic: user-defined enum types from type_registry
         let schema = conn.current_schema();
         for (name, td) in &schema.type_registry {
             if td.is_builtin {
                 continue;
             }
-            // User-defined enums: typtype='e', typcategory='E'
-            let enum_oid = 50000
-                + (name
-                    .as_bytes()
+            let (typtype, typcategory, typbasetype) = if td.is_domain {
+                let base_oid = match schema.get_type_def_unchecked(td.base()) {
+                    Some(base) if !base.is_builtin => user_type_oid(&base.name),
+                    _ => sqlite_type_to_pg_oid(td.base()),
+                };
+                let base_category = PG_BASE_TYPES
                     .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                    % 10000) as i64;
+                    .find(|t| t.oid == base_oid)
+                    .map_or("U", |t| t.typcategory);
+                ("d", base_category, base_oid)
+            } else {
+                ("e", "E", 0)
+            };
+            let oid = user_type_oid(&td.name);
             rows.push(vec![
-                Value::from_i64(enum_oid),        // oid
+                Value::from_i64(oid),             // oid
                 Value::Text(name.clone().into()), // typname
-                Value::from_i64(11),              // typnamespace (pg_catalog)
+                Value::from_i64(2200),            // typnamespace (public)
                 Value::from_i64(10),              // typowner
                 Value::from_i64(4),               // typlen
                 Value::from_i64(1),               // typbyval
-                Value::build_text("e"),           // typtype (enum)
-                Value::build_text("E"),           // typcategory (enum)
+                Value::build_text(typtype),       // typtype
+                Value::build_text(typcategory),   // typcategory
                 Value::from_i64(0),               // typispreferred
                 Value::from_i64(1),               // typisdefined
                 Value::build_text(","),           // typdelim
@@ -1366,7 +1375,7 @@ impl SnapshotRows for PgTypeTable {
                 Value::build_text("i"),           // typalign
                 Value::build_text("p"),           // typstorage
                 Value::from_i64(0),               // typnotnull
-                Value::from_i64(0),               // typbasetype
+                Value::from_i64(typbasetype),     // typbasetype
                 Value::from_i64(-1),              // typtypmod
                 Value::from_i64(0),               // typndims
                 Value::from_i64(0),               // typcollation
@@ -1377,6 +1386,15 @@ impl SnapshotRows for PgTypeTable {
         }
         rows
     }
+}
+
+fn user_type_oid(name: &str) -> i64 {
+    50000
+        + (name
+            .as_bytes()
+            .iter()
+            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+            % 10000) as i64
 }
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
@@ -2682,6 +2700,7 @@ mod tests {
     use super::*;
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
+    use turso_core::ConnectOpts;
 
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
@@ -2723,7 +2742,7 @@ mod tests {
                 crate::DatabaseOpts::new(),
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.pragma_update("journal_mode", "'mvcc'").unwrap();
             }
@@ -2751,7 +2770,7 @@ mod tests {
                 .prepare("SELECT relname FROM pg_class WHERE relname = 'second_connection'")
                 .unwrap();
             assert!(tables.run_collect_rows().unwrap().is_empty());
-            let other = db.connect().unwrap();
+            let other = db.connect(ConnectOpts::new()).unwrap();
             other
                 .execute("CREATE TABLE second_connection (v INT)")
                 .unwrap();
@@ -2802,7 +2821,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut expected = Vec::new();
         for i in 0..12 {
             let name = format!("catalog_{i:02}");
@@ -2909,7 +2928,7 @@ mod tests {
                     opts,
                 )
                 .unwrap();
-                let conn = db.connect().unwrap();
+                let conn = db.connect(ConnectOpts::new()).unwrap();
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
@@ -2927,7 +2946,7 @@ mod tests {
                 opts,
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             assert_eq!(columns(&conn), expected);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
@@ -2963,7 +2982,7 @@ mod tests {
             opts,
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
             .unwrap();
         conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
@@ -2993,7 +3012,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             attached
-                .connect()
+                .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
                 .unwrap()
@@ -3002,7 +3021,7 @@ mod tests {
             vec![vec![Value::from_i64(3)]]
         );
         for temp_store in ["MEMORY", "FILE"] {
-            let temp_conn = db.connect().unwrap();
+            let temp_conn = db.connect(ConnectOpts::new()).unwrap();
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
@@ -3033,7 +3052,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output
-                .connect()
+                .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM catalog_names")
                 .unwrap()
@@ -3056,7 +3075,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = crate::Connection::new(db.connect().unwrap());
+        let conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
@@ -3104,7 +3123,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create test tables in SQLite mode (default)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3164,7 +3183,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create a test table with known columns
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
@@ -3229,7 +3248,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER)")
@@ -3268,7 +3287,7 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");
@@ -3311,7 +3330,7 @@ mod tests {
         .unwrap();
 
         // SQLite-mode connection: sqlite_master sees the user table.
-        let sqlite_conn = db.connect().unwrap();
+        let sqlite_conn = db.connect(ConnectOpts::new()).unwrap();
         sqlite_conn
             .execute("CREATE TABLE users (id INTEGER, name TEXT)")
             .unwrap();
@@ -3335,7 +3354,7 @@ mod tests {
         assert!(found, "users table not found in sqlite_master");
 
         // PostgreSQL-mode connection: pg_class sees the user table.
-        let pg_conn = crate::Connection::new(db.connect().unwrap());
+        let pg_conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
         let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
@@ -3369,7 +3388,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create multiple tables
         conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
@@ -3440,7 +3459,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Create test tables
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3488,7 +3507,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();

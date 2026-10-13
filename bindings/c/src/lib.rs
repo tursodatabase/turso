@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 use turso_core::SqliteDialect;
-use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
+use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
@@ -541,7 +541,7 @@ pub unsafe extern "C" fn sqlite3_open(
         Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             let filename = match filename_str {
                 ":memory:" => CString::new("".to_string()).unwrap(),
                 _ => CString::from(filename_cstr),
@@ -770,7 +770,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect() {
+    match db.connect(ConnectOpts::new()) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()

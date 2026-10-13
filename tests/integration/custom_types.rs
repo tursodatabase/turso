@@ -497,4 +497,28 @@ mod tests {
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
     }
+
+    #[test]
+    fn test_date_plus_and_minus_bound_integer() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t1(d date) STRICT").unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('2025-01-05')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT d + ?1, d - ?1 FROM t1").unwrap();
+        stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(3))
+            .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get::<String>(0)?, row.get::<String>(1)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
+        );
+    }
 }
