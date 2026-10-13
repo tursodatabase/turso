@@ -4039,17 +4039,29 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// A cast keeps the name of the expression it casts, and falls back to the
+/// name of the outermost target type, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => func_call
-            .funcname
+    let last_string = |names: &[pg_query::protobuf::Node]| {
+        names
             .iter()
             .filter_map(|n| match &n.node {
                 Some(Node::String(s)) => Some(s.sval.clone()),
                 _ => None,
             })
-            .next_back(),
+            .next_back()
+    };
+    match &node.node {
+        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => {
+            let mut arg = type_cast.arg.as_deref()?;
+            while let Some(Node::TypeCast(inner)) = &arg.node {
+                arg = inner.arg.as_deref()?;
+            }
+            derived_column_name(arg).or_else(|| last_string(&type_cast.type_name.as_ref()?.names))
+        }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
             let name = match Op::try_from(svf.op) {
