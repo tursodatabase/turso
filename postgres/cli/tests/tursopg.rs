@@ -624,11 +624,11 @@ fn tagged_dollar_quoted_string() {
 
 #[test]
 fn escape_string_backslash_n() {
-    let output = run_tursopg(b"SELECT E'line1\\nline2';\n");
+    let output = run_tursopg(b"\\x\nSELECT E'line1\\nline2';\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("line1") && out.contains("line2"),
+        out.contains("line1\nline2"),
         "expected two lines, got: {out}"
     );
 }

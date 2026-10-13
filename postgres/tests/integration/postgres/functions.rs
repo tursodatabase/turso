@@ -110,7 +110,7 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
     let conn = db.connect_postgres();
 
     // PostgreSQL names unaliased function-call and keyword columns after the
-    // function
+    // function, and other unaliased expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -123,6 +123,8 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT * FROM current_schema() AS cs", "cs"),
         ("SELECT count(*) FROM pg_catalog.pg_database", "count"),
         ("SELECT version() AS v", "v"),
+        ("SELECT 1", "?column?"),
+        ("SELECT * FROM (SELECT 1 + 1) AS s", "?column?"),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");

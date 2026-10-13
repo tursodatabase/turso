@@ -2108,8 +2108,12 @@ impl PostgreSQLTranslator {
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                derived_column_name(val)
-                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
+                                Some(match derived_column_name(val) {
+                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
+                                    None => ast::As::ImplicitColumnName(ast::Name::from_string(
+                                        "?column?",
+                                    )),
+                                })
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
