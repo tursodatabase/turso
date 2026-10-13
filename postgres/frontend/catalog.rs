@@ -2905,11 +2905,57 @@ mod tests {
             .map(Value::build_text)
             .map(|value| vec![value])
             .to_vec();
-        let columns = |conn: &Arc<Connection>| {
-            conn.prepare("SELECT name FROM pragma_table_info('catalog_names') ORDER BY cid")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap()
+        let hidden_expected = ["nspname", "tableoid"]
+            .map(Value::build_text)
+            .map(|value| vec![value])
+            .to_vec();
+        let views = [
+            ("catalog_names", "SELECT * FROM pg_namespace", false),
+            (
+                "catalog_qualified_names",
+                "SELECT pg_namespace.* FROM pg_namespace",
+                false,
+            ),
+            (
+                "catalog_group_names",
+                "SELECT * FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_qualified_group_names",
+                "SELECT namespaces.* FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_hidden",
+                "SELECT nspname, tableoid FROM pg_namespace",
+                true,
+            ),
+            (
+                "catalog_group_hidden",
+                "SELECT namespaces.nspname, namespaces.tableoid FROM (pg_namespace) AS namespaces",
+                true,
+            ),
+        ];
+        let check_columns = |conn: &Arc<Connection>| {
+            for (name, _, selects_hidden) in views {
+                let columns = conn
+                    .prepare(format!(
+                        "SELECT name FROM pragma_table_info('{name}') ORDER BY cid"
+                    ))
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert_eq!(
+                    &columns,
+                    if selects_hidden {
+                        &hidden_expected
+                    } else {
+                        &expected
+                    },
+                    "{name}"
+                );
+            }
         };
         let dir = tempdir().unwrap();
         for mvcc in [false, true] {
@@ -2930,12 +2976,16 @@ mod tests {
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
-                conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
-                    .unwrap();
+                let stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
+                assert_eq!(stmt.num_columns(), 4);
+                for (name, select, _) in views {
+                    conn.execute(format!("CREATE VIEW {name} AS {select}"))
+                        .unwrap();
+                }
                 conn.execute("CREATE VIEW catalog_join AS WITH namespaces AS (SELECT * FROM pg_namespace) SELECT namespaces.nspname FROM namespaces JOIN pg_namespace USING (oid)").unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
                 conn.force_reparse_schema().unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
             }
             let db = crate::session::open_database_with_io(
                 io,
@@ -2945,10 +2995,27 @@ mod tests {
             )
             .unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
-            assert_eq!(columns(&conn), expected);
+            check_columns(&conn);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
-            assert_eq!(columns(&conn), expected);
+            check_columns(&conn);
+            for name in ["catalog_hidden", "catalog_group_hidden"] {
+                let mut stmt = conn
+                    .prepare(format!("SELECT * FROM {name} ORDER BY nspname"))
+                    .unwrap();
+                assert_eq!(stmt.num_columns(), 2);
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![
+                        vec![
+                            Value::build_text("information_schema"),
+                            Value::from_i64(2615)
+                        ],
+                        vec![Value::build_text("pg_catalog"), Value::from_i64(2615)],
+                        vec![Value::build_text("public"), Value::from_i64(2615)],
+                    ]
+                );
+            }
             assert_eq!(
                 conn.prepare("SELECT nspname FROM catalog_join ORDER BY nspname")
                     .unwrap()

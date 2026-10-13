@@ -1992,6 +1992,16 @@ fn view_source_from_select_table(
                 join_info: None,
             })
         }
+        ast::SelectTable::Sub(from, alias) if from.joins.is_empty() => {
+            let mut source_table = from.select.as_ref().clone();
+            match &mut source_table {
+                ast::SelectTable::Table(_, source_alias, _)
+                | ast::SelectTable::TableCall(_, _, source_alias, ..)
+                | ast::SelectTable::Select(_, source_alias)
+                | ast::SelectTable::Sub(_, source_alias) => *source_alias = alias.clone(),
+            }
+            view_source_from_select_table(&source_table, schema, ctes, tables)
+        }
         ast::SelectTable::Sub(from, alias) => {
             let sources = view_sources_from_clause(from, schema, ctes, tables)?;
             Ok(ViewSource {
@@ -2177,7 +2187,11 @@ fn has_left_view_using_column(
 fn expand_view_star(sources: &[ViewSource]) -> Vec<ViewColumn> {
     let mut columns = Vec::new();
     for (source_index, source) in sources.iter().enumerate() {
-        for source_column in &source.columns {
+        for source_column in source
+            .columns
+            .iter()
+            .filter(|column| !column.column.hidden())
+        {
             let is_right_using_copy = view_column_name(source_column).is_some_and(|name| {
                 source
                     .join_info
@@ -2377,7 +2391,11 @@ fn extract_view_columns_inner(
                         .iter()
                         .any(|candidate| candidate.eq_ignore_ascii_case(&qualifier))
                 }) {
-                    for source_column in &sources[source_index].columns {
+                    for source_column in sources[source_index]
+                        .columns
+                        .iter()
+                        .filter(|column| !column.column.hidden())
+                    {
                         let mut column = view_star_column(&sources, source_index, source_column);
                         deduplicate_view_column_name(&mut column, &mut column_name_counts);
                         columns.push(column);
