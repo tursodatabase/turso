@@ -1388,14 +1388,18 @@ impl HashTable {
             "hash table buckets can only grow before the first probe",
             { "state": format!("{:?}", self.state) }
         );
-        let new_len = old_len * 2;
+        turso_assert!(
+            old_len.is_power_of_two(),
+            "hash table bucket count must be a power of two",
+            { "buckets": old_len }
+        );
         self.buckets.try_reserve_exact(old_len)?;
         self.buckets.extend((0..old_len).map(|_| HashBucket::new()));
         let (low_buckets, high_buckets) = self.buckets.split_at_mut(old_len);
         for (low_bucket, high_bucket) in low_buckets.iter_mut().zip(high_buckets) {
             let moved_entries = low_bucket
                 .entries
-                .extract_if(.., |entry| (entry.hash as usize) % new_len >= old_len);
+                .extract_if(.., |entry| ((entry.hash as usize) & old_len) != 0);
             for entry in moved_entries {
                 high_bucket.insert(entry)?;
             }
