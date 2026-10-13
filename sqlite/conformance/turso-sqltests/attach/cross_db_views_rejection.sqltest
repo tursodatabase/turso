@@ -76,6 +76,7 @@ expect error {
 }
 
 @requires materialized_views "materialized views are experimental"
+@skip-if mvcc "materialized views not supported in MVCC mode"
 test cross-db-materialized-view-rejected {
     CREATE TABLE inventory (id INTEGER, stock INTEGER);
     ATTACH ':memory:' AS aux;
