@@ -118,3 +118,36 @@ test pg-settings-delete-errors {
     DELETE FROM pg_catalog.pg_settings;
 }
 expect error {}
+
+test information-schema-schemata-lists-schemas {
+    CREATE SCHEMA catalog_schemata_extra;
+    SELECT schema_name
+    FROM information_schema.schemata
+    WHERE schema_name IN ('pg_catalog', 'public', 'information_schema', 'catalog_schemata_extra')
+    ORDER BY schema_name;
+}
+expect {
+    catalog_schemata_extra
+    information_schema
+    pg_catalog
+    public
+}
+
+test information-schema-schemata-qualified-column {
+    SELECT schemata.schema_name
+    FROM information_schema.schemata
+    WHERE schemata.schema_name = 'public';
+}
+expect {
+    public
+}
+
+test user-table-named-schemata-is-not-the-catalog {
+    CREATE TABLE schemata (id int, label text);
+    INSERT INTO schemata VALUES (1, 'mine');
+    UPDATE schemata SET label = 'updated' WHERE id = 1;
+    SELECT id, label FROM schemata;
+}
+expect {
+    1|updated
+}
