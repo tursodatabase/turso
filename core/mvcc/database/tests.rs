@@ -23435,3 +23435,227 @@ fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
         "row replayed from the logical log was not checkpointed: {rows:?}"
     );
 }
+
+#[test]
+fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join("prune-mark-again-oom.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    let fault = Arc::new(OneShotAllocFault::default());
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open(
+            io,
+            &path,
+            crate::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(opts)
+                .allocators(crate::DatabaseAllocators {
+                    mv_store: crate::alloc::DynAllocator::new(OneShotFaultAlloc(fault.clone())),
+                    fts: crate::alloc::DynAllocator::default(),
+                }),
+        )
+        .unwrap();
+        let checkpointer = db.connect(ConnectOpts::new()).unwrap();
+        checkpointer
+            .execute("PRAGMA journal_mode = 'mvcc'")
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        checkpointer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        checkpointer
+            .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        checkpointer
+            .execute("INSERT INTO t VALUES (1, 'old')")
+            .unwrap();
+        let mvstore = db.get_mv_store().clone().unwrap();
+        let root_page = get_rows(
+            &checkpointer,
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let key = RowID::new(
+            mvstore.get_table_id_from_root_page(root_page),
+            RowKey::Int(1),
+        );
+        let dirty_stamp = |key: &RowID| {
+            mvstore
+                .checkpoint_dirty_table_keys
+                .get(key)
+                .map(|entry| entry.value().load(Ordering::Acquire))
+        };
+        assert!(dirty_stamp(&key).is_some());
+
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("UPDATE t SET v = 'new' WHERE id = 1")
+            .unwrap();
+        let update_tx = writer.get_mv_tx_id().unwrap();
+
+        let checkpoint_hooks = Arc::new(ParkAfterCollectThenArmFault {
+            parked: AtomicBool::new(false),
+            fault: fault.clone(),
+        });
+        checkpointer.set_yield_injector(Some(checkpoint_hooks.clone()));
+        let pager_io = checkpointer.pager.load().io.clone();
+        mvstore.set_checkpoint_threshold(0);
+        let mut first_checkpoint = checkpointer
+            .prepare("INSERT INTO driver VALUES (1)")
+            .unwrap();
+        loop {
+            match first_checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield
+                    if checkpoint_hooks.parked.load(Ordering::SeqCst) =>
+                {
+                    break
+                }
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => {
+                    panic!("the auto-checkpoint ended before it collected table rows: {other:?}")
+                }
+            }
+        }
+        mvstore.set_checkpoint_threshold(-1);
+
+        let log_written =
+            FixedYieldInjector::new([CommitYieldPoint::LogRecordMarkedWritten.point()]);
+        writer.set_yield_injector(Some(log_written.clone()));
+        let mut commit = writer.prepare("COMMIT").unwrap();
+        loop {
+            match commit.step().unwrap() {
+                StepResult::IO | StepResult::Yield if log_written.is_empty() => break,
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => panic!("COMMIT ended before LogRecordMarkedWritten: {other:?}"),
+            }
+        }
+        let preparing_end_ts = || match mvstore
+            .txs
+            .get(&update_tx)
+            .map(|tx| tx.value().state.load())
+        {
+            Some(TransactionState::Preparing(end_ts)) => end_ts,
+            other => panic!("the UPDATE must still be Preparing, got {other:?}"),
+        };
+        let update_end_ts = preparing_end_ts();
+        assert_eq!(dirty_stamp(&key), Some(update_end_ts));
+
+        drive_statement_to_done(&mut first_checkpoint, &pager_io);
+        drop(first_checkpoint);
+        checkpointer.set_yield_injector(None);
+        fault.armed.store(false, Ordering::SeqCst);
+        assert_eq!(fault.fired.load(Ordering::SeqCst), 1);
+        let failed_allocation = fault.failed_allocation.lock().take().unwrap();
+        assert!(
+            failed_allocation.contains("prune_dirty_keys")
+                && failed_allocation.contains("mark_checkpoint_dirty_key"),
+            "the failed allocation must be the second mark in prune_dirty_keys:\n{failed_allocation}"
+        );
+
+        assert!(mvstore.checkpoint_snapshot_ts() < update_end_ts);
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        assert_eq!(preparing_end_ts(), update_end_ts);
+
+        drive_statement_to_done(&mut commit, &pager_io);
+        drop(commit);
+        writer.set_yield_injector(None);
+
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+    }
+
+    DATABASE_MANAGER.lock().clear();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &path,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let rows = get_rows(
+        &db.connect(ConnectOpts::new()).unwrap(),
+        "SELECT v FROM t WHERE id = 1",
+    );
+    assert_eq!(
+        rows[0][0].to_string(),
+        "new",
+        "the committed UPDATE was lost after restart"
+    );
+}
+
+#[derive(Debug)]
+struct ParkAfterCollectThenArmFault {
+    parked: AtomicBool,
+    fault: Arc<OneShotAllocFault>,
+}
+
+impl YieldInjector for ParkAfterCollectThenArmFault {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CheckpointYieldPoint::AfterCollectTableRows.point() {
+            return !self.parked.swap(true, Ordering::SeqCst);
+        }
+        if point == CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point() {
+            self.fault.armed.store(true, Ordering::SeqCst);
+        }
+        false
+    }
+}
+
+#[derive(Debug, Default)]
+struct OneShotAllocFault {
+    armed: AtomicBool,
+    fired: AtomicU64,
+    failed_allocation: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct OneShotFaultAlloc(Arc<OneShotAllocFault>);
+
+unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
+    fn allocate(
+        &self,
+        layout: crate::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        if self.0.armed.swap(false, Ordering::SeqCst) {
+            self.0.fired.fetch_add(1, Ordering::SeqCst);
+            *self.0.failed_allocation.lock() =
+                Some(std::backtrace::Backtrace::force_capture().to_string());
+            return Err(crate::alloc::AllocError);
+        }
+        <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::allocate(
+            &crate::alloc::TursoAllocator,
+            layout,
+        )
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+        unsafe {
+            <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::deallocate(
+                &crate::alloc::TursoAllocator,
+                ptr,
+                layout,
+            )
+        }
+    }
+}
