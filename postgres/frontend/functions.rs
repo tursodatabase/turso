@@ -155,11 +155,15 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
             "acldefault owner must be an OID".to_string(),
         ));
     }
-    let kind = kind_code.parse::<AclObjectKind>().map_err(|_| {
-        LimboError::InvalidArgument(format!(
-            "unrecognized object type abbreviation: {kind_code}"
-        ))
-    })?;
+    let kind = kind_code
+        .get(..1)
+        .unwrap_or("")
+        .parse::<AclObjectKind>()
+        .map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "unrecognized object type abbreviation: {kind_code}"
+            ))
+        })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
     // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
