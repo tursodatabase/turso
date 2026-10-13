@@ -34,6 +34,12 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
+    // The DBSP runtime reads and writes its backing B-trees directly through
+    // the pager, but MVCC tables live in the MVCC store and their root pages
+    // are MVCC table ids, so those reads panic. Reject loudly instead.
+    if connection.mvcc_enabled() {
+        crate::bail_parse_error!("materialized views are not supported in MVCC mode yet");
+    }
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| normalized_view_name.starts_with(prefix))

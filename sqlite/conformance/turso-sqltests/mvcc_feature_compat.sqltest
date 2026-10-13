@@ -54,3 +54,14 @@ expect {
     mvcc
     42
 }
+
+# The DBSP materialized view runtime does not support MVCC storage yet;
+# creating one used to panic in the pager.
+test mvcc-materialized-view-rejected {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t11(x);
+    CREATE MATERIALIZED VIEW mv11 AS SELECT * FROM t11;
+}
+expect error {
+    materialized views are not supported in MVCC mode
+}
