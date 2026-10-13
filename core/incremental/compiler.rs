@@ -14,7 +14,9 @@ use crate::incremental::operator::{
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::ConnectOpts;
 use crate::SqliteDialect;
 // Note: logical module must be made pub(crate) in translate/mod.rs
@@ -1059,6 +1061,8 @@ impl DbspCompiler {
                         database: None,
                         table_alias: None,
                         ty: Type::Integer,  // Computed expressions default to Integer
+                        affinity: Affinity::Blob,
+                        collation: CollationSeq::Binary,
                     });
                     let proj_schema = SchemaRef::new(LogicalSchema {
                         columns: proj_schema_columns,
@@ -1080,7 +1084,7 @@ impl DbspCompiler {
                     let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
                     let filter_executable: Box<dyn IncrementalOperator> =
-                        Box::new(FilterOperator::new(filter_predicate));
+                        Box::new(FilterOperator::new(filter_predicate, proj_schema));
 
                     // Create filter node
                     let filter_id = self.circuit.add_node(
@@ -1134,7 +1138,7 @@ impl DbspCompiler {
 
                     // Create executable operator
                     let executable: Box<dyn IncrementalOperator> =
-                        Box::new(FilterOperator::new(filter_predicate));
+                        Box::new(FilterOperator::new(filter_predicate, input_schema.clone()));
 
                     // Create filter node
                     let node_id = self.circuit.add_node(
@@ -1632,13 +1636,6 @@ impl DbspCompiler {
         // Convert LogicalExpr to AST Expr with proper column resolution
         let ast_expr = Self::logical_to_ast_expr_with_schema(expr, input_schema)?;
 
-        // Extract column names from schema for CompiledExpression::compile
-        let input_column_names: Vec<String> = input_schema
-            .columns
-            .iter()
-            .map(|col| col.name.clone())
-            .collect();
-
         // For all expressions (simple or complex), use CompiledExpression::compile
         // This handles both trivial cases and complex VDBE compilation
         // We need to set up the necessary context
@@ -1661,7 +1658,7 @@ impl DbspCompiler {
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(
             &ast_expr,
-            &input_column_names,
+            &input_schema.columns,
             &schema,
             &temp_syms,
             internal_conn,
@@ -4535,6 +4532,8 @@ mod tests {
             ColumnInfo {
                 name: "id".to_string(),
                 ty: Type::Integer,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: None,
                 table_alias: None,
@@ -4542,6 +4541,8 @@ mod tests {
             ColumnInfo {
                 name: "value".to_string(),
                 ty: Type::Integer,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: None,
                 table_alias: None,
@@ -4558,10 +4559,13 @@ mod tests {
             Box::new(InputOperator::new("test".to_string())),
         );
 
-        let filter_op = FilterOperator::new(FilterPredicate::GreaterThan {
-            column_idx: 1, // "value" is at index 1
-            value: Value::from_i64(10),
-        });
+        let filter_op = FilterOperator::new(
+            FilterPredicate::GreaterThan {
+                column_idx: 1, // "value" is at index 1
+                value: Value::from_i64(10),
+            },
+            schema.clone(),
+        );
 
         // Create the filter predicate using DbspExpr
         let predicate = DbspExpr::BinaryExpr {
@@ -5838,6 +5842,8 @@ mod tests {
         ColumnInfo {
             name: name.to_string(),
             ty,
+            affinity: Affinity::Blob,
+            collation: CollationSeq::Binary,
             database: None,
             table: Some(table.to_string()),
             table_alias: None,
@@ -5851,6 +5857,8 @@ mod tests {
             ColumnInfo {
                 name: "id".to_string(),
                 ty: Type::Integer,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: Some("left".to_string()),
                 table_alias: None,
@@ -5858,6 +5866,8 @@ mod tests {
             ColumnInfo {
                 name: "name".to_string(),
                 ty: Type::Text,
+                affinity: Affinity::Text,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: Some("left".to_string()),
                 table_alias: None,
@@ -5867,6 +5877,8 @@ mod tests {
             ColumnInfo {
                 name: "id".to_string(),
                 ty: Type::Integer,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: Some("right".to_string()),
                 table_alias: None,
@@ -5874,6 +5886,8 @@ mod tests {
             ColumnInfo {
                 name: "value".to_string(),
                 ty: Type::Integer,
+                affinity: Affinity::Integer,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: Some("right".to_string()),
                 table_alias: None,
