@@ -17271,7 +17271,7 @@ pub fn op_alter_column(
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
     } else {
-        (false, Vec::new())
+        (false, crate::alloc::vec![])
     };
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
