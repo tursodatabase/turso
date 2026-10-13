@@ -246,6 +246,14 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
     }
 }
 
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum RelationKind {
+    #[strum(serialize = "r")]
+    Table,
+    #[strum(serialize = "i")]
+    Index,
+}
+
 /// Virtual table implementation for pg_catalog.pg_class
 /// Maps SQLite's sqlite_master to PostgreSQL's pg_class system table
 #[derive(Debug)]
@@ -299,6 +307,7 @@ impl SnapshotRows for PgClassTable {
 
         let tables = user_tables_sorted(&schema);
         let num_tables = tables.len() as i64;
+        let relkind: &'static str = RelationKind::Table.into();
 
         for (i, (table_name, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
@@ -331,7 +340,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(relhasindex),              // relhasindex
                 Value::from_i64(0),                        // relisshared
                 Value::Text("p".into()),                   // relpersistence (permanent)
-                Value::Text("r".into()),                   // relkind (regular table)
+                Value::build_text(relkind),                // relkind (regular table)
                 Value::from_i64(relnatts),                 // relnatts
                 Value::from_i64(relchecks),                // relchecks
                 Value::from_i64(0),                        // relhasrules
@@ -353,6 +362,7 @@ impl SnapshotRows for PgClassTable {
 
         // Add index rows (relkind='i')
         let mut index_oid = USER_TABLE_OID_START + num_tables;
+        let relkind: &'static str = RelationKind::Index.into();
         for (table_name, _) in &tables {
             for idx in schema.get_indices(table_name) {
                 if idx.ephemeral {
@@ -376,7 +386,7 @@ impl SnapshotRows for PgClassTable {
                     Value::from_i64(0),                   // relhasindex
                     Value::from_i64(0),                   // relisshared
                     Value::Text("p".into()),              // relpersistence
-                    Value::Text("i".into()),              // relkind (index)
+                    Value::build_text(relkind),           // relkind (index)
                     Value::from_i64(indnatts),            // relnatts
                     Value::from_i64(0),                   // relchecks
                     Value::from_i64(0),                   // relhasrules
@@ -1558,6 +1568,18 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum ConstraintKind {
+    #[strum(serialize = "p")]
+    PrimaryKey,
+    #[strum(serialize = "u")]
+    Unique,
+    #[strum(serialize = "f")]
+    ForeignKey,
+    #[strum(serialize = "c")]
+    Check,
+}
+
 const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
@@ -1614,11 +1636,12 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let contype: &'static str = ConstraintKind::PrimaryKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
                     Value::from_i64(2200),
-                    Value::build_text("p"),
+                    Value::build_text(contype),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(1),
@@ -1646,7 +1669,11 @@ impl SnapshotRows for PgConstraintTable {
 
             // PK / UNIQUE constraints from unique_sets
             for us in &btree.unique_sets {
-                let contype = if us.is_primary_key { "p" } else { "u" };
+                let contype = if us.is_primary_key {
+                    ConstraintKind::PrimaryKey
+                } else {
+                    ConstraintKind::Unique
+                };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
                     format!("{table_name}_pkey")
@@ -1687,6 +1714,7 @@ impl SnapshotRows for PgConstraintTable {
                         .unwrap_or(0)
                 };
 
+                let contype: &'static str = contype.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
@@ -1752,11 +1780,12 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
+                let contype: &'static str = ConstraintKind::ForeignKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),                   // oid
                     Value::build_text(conname),                        // conname
                     Value::from_i64(2200),                             // connamespace
-                    Value::build_text("f"),                            // contype
+                    Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
                     Value::from_i64(1),                                // convalidated
@@ -1799,11 +1828,12 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .unwrap_or_default();
 
+                let contype: &'static str = ConstraintKind::Check.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
                     Value::from_i64(2200),           // connamespace
-                    Value::build_text("c"),          // contype
+                    Value::build_text(contype),      // contype
                     Value::from_i64(0),              // condeferrable
                     Value::from_i64(0),              // condeferred
                     Value::from_i64(1),              // convalidated
@@ -2219,12 +2249,32 @@ impl SnapshotRows for PgDependTable {
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
-        let constraints = PgConstraintTable::load_rows(conn);
+        let constraints: Vec<_> = PgConstraintTable::load_rows(conn)
+            .into_iter()
+            .map(|row| {
+                let kind = row[3]
+                    .to_text()
+                    .expect("catalog constraint kinds are text")
+                    .parse::<ConstraintKind>()
+                    .expect("catalog constraint kinds are valid");
+                (row, kind)
+            })
+            .collect();
         let indexes = PgIndexTable::load_rows(conn);
-        let relations = PgClassTable::load_rows(conn);
+        let relations: Vec<_> = PgClassTable::load_rows(conn)
+            .into_iter()
+            .map(|row| {
+                let kind = row[16]
+                    .to_text()
+                    .expect("catalog relation kinds are text")
+                    .parse::<RelationKind>()
+                    .expect("catalog relation kinds are valid");
+                (row, kind)
+            })
+            .collect();
 
-        for relation in &relations {
-            if !matches!(&relation[16], Value::Text(kind) if kind.as_str() == "r") {
+        for (relation, kind) in &relations {
+            if !matches!(kind, RelationKind::Table) {
                 continue;
             }
             let oid = relation[0].as_int().expect("catalog OIDs are integers");
@@ -2248,20 +2298,20 @@ impl SnapshotRows for PgDependTable {
             let oid = index[0].as_int().expect("catalog OIDs are integers");
             let table = index[1].as_int().expect("catalog OIDs are integers");
             let columns = catalog_column_numbers(&index[14]);
-            let automatic = relations.iter().any(|relation| {
+            let automatic = relations.iter().any(|(relation, _)| {
                 relation[0].as_int() == Some(oid)
                     && matches!(&relation[1], Value::Text(name) if name.as_str().starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX))
             });
             let constraint = if automatic {
-                constraints.iter().find(|constraint| {
-                    matches!(&constraint[3], Value::Text(kind) if matches!(kind.as_str(), "p" | "u"))
+                constraints.iter().find(|(constraint, kind)| {
+                    matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique)
                         && constraint[7].as_int() == Some(table)
                         && catalog_column_numbers(&constraint[18]) == columns
                 })
             } else {
                 None
             };
-            if let Some(constraint) = constraint {
+            if let Some((constraint, _)) = constraint {
                 let constraint_oid = constraint[0].as_int().expect("catalog OIDs are integers");
                 rows.push(dependency_row(
                     [1259, oid, 0],
@@ -2279,7 +2329,7 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
-        for constraint in &constraints {
+        for (constraint, _) in &constraints {
             let oid = constraint[0].as_int().expect("catalog OIDs are integers");
             let table = constraint[7].as_int().expect("catalog OIDs are integers");
             for column in catalog_column_numbers(&constraint[18]) {
