@@ -78,3 +78,8 @@ The FTS profiler depends on spin, distributed by the spin-rs authors:
 
 * License: licenses/perf/spin-mit-license.md (MIT License)
 * Homepage: https://github.com/mvdnes/spin-rs
+
+The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
+
+* License: licenses/chumsky-mit-license.md (MIT License)
+* Homepage: https://codeberg.org/zesterer/chumsky

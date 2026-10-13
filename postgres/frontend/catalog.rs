@@ -12,6 +12,8 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
 
+pub use turso_pg_parser::translator::is_catalog_table_name;
+
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -158,39 +160,6 @@ impl Dialect for PostgresDialect {
     }
 }
 
-pub fn is_catalog_table_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "pg_class"
-            | "pg_namespace"
-            | "pg_attribute"
-            | "pg_roles"
-            | "pg_proc"
-            | "pg_database"
-            | "pg_am"
-            | "pg_type"
-            | "pg_collation"
-            | "pg_attrdef"
-            | "pg_description"
-            | "pg_publication"
-            | "pg_publication_namespace"
-            | "pg_publication_rel"
-            | "pg_sequences"
-            | "pg_constraint"
-            | "pg_index"
-            | "pg_inherits"
-            | "pg_rewrite"
-            | "pg_foreign_table"
-            | "pg_partitioned_table"
-            | "pg_trigger"
-            | "pg_policy"
-            | "pg_input_error_info"
-            | "pg_get_tabledef"
-            | "pg_tables"
-            | "pg_indexes"
-    )
-}
-
 pub fn encode_pg_schema_sql(sql: &str) -> String {
     format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
 }
@@ -298,27 +267,29 @@ impl SnapshotRows for PgClassTable {
             reltuples REAL,
             relallvisible INTEGER,
             reltoastrelid INTEGER,
-            relhasindex INTEGER,
-            relisshared INTEGER,
+            relhasindex BOOLEAN,
+            relisshared BOOLEAN,
             relpersistence TEXT,
             relkind TEXT,
             relnatts INTEGER,
             relchecks INTEGER,
-            relhasrules INTEGER,
-            relhastriggers INTEGER,
-            relhassubclass INTEGER,
-            relrowsecurity INTEGER,
-            relforcerowsecurity INTEGER,
-            relispopulated INTEGER,
+            relhasrules BOOLEAN,
+            relhastriggers BOOLEAN,
+            relhassubclass BOOLEAN,
+            relrowsecurity BOOLEAN,
+            relforcerowsecurity BOOLEAN,
+            relispopulated BOOLEAN,
             relreplident TEXT,
-            relispartition INTEGER,
+            relispartition BOOLEAN,
             relrewrite INTEGER,
             relfrozenxid INTEGER,
             relminmxid INTEGER,
             relacl TEXT,
             reloptions TEXT,
-            relpartbound TEXT
+            relpartbound TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -441,8 +412,10 @@ impl SnapshotRows for PgNamespaceTable {
             oid INTEGER,
             nspname TEXT,
             nspowner INTEGER,
-            nspacl TEXT
+            nspacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -501,23 +474,25 @@ impl SnapshotRows for PgAttributeTable {
             attndims INTEGER,
             attcacheoff INTEGER,
             atttypmod INTEGER,
-            attbyval INTEGER,
+            attbyval BOOLEAN,
             attstorage TEXT,
             attalign TEXT,
-            attnotnull INTEGER,
-            atthasdef INTEGER,
-            atthasmissing INTEGER,
+            attnotnull BOOLEAN,
+            atthasdef BOOLEAN,
+            atthasmissing BOOLEAN,
             attidentity TEXT,
             attgenerated TEXT,
-            attisdropped INTEGER,
-            attislocal INTEGER,
+            attisdropped BOOLEAN,
+            attislocal BOOLEAN,
             attinhcount INTEGER,
             attcollation INTEGER,
             attacl TEXT,
             attoptions TEXT,
             attfdwoptions TEXT,
-            attmissingval TEXT
+            attmissingval TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1249);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -598,6 +573,7 @@ impl SnapshotRows for PgRolesTable {
             rolbypassrls INTEGER,
             rolconfig TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -638,10 +614,10 @@ impl SnapshotRows for PgProcTable {
             prorows REAL,
             provariadic INTEGER,
             prokind TEXT,
-            prosecdef INTEGER,
-            proleakproof INTEGER,
-            proisstrict INTEGER,
-            proretset INTEGER,
+            prosecdef BOOLEAN,
+            proleakproof BOOLEAN,
+            proisstrict BOOLEAN,
+            proretset BOOLEAN,
             provolatile TEXT,
             proparallel TEXT,
             pronargs INTEGER,
@@ -657,8 +633,10 @@ impl SnapshotRows for PgProcTable {
             probin TEXT,
             prosqlbody TEXT,
             proconfig TEXT,
-            proacl TEXT
+            proacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1255);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -765,8 +743,8 @@ impl SnapshotRows for PgDatabaseTable {
             datdba INTEGER,
             encoding INTEGER,
             datlocprovider TEXT,
-            datistemplate INTEGER,
-            datallowconn INTEGER,
+            datistemplate BOOLEAN,
+            datallowconn BOOLEAN,
             datconnlimit INTEGER,
             datfrozenxid INTEGER,
             datminmxid INTEGER,
@@ -775,8 +753,10 @@ impl SnapshotRows for PgDatabaseTable {
             datctype TEXT,
             daticulocale TEXT,
             daticurules TEXT,
-            datacl TEXT
+            datacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1262);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -823,8 +803,10 @@ impl SnapshotRows for PgAmTable {
             oid INTEGER,
             amname TEXT,
             amhandler TEXT,
-            amtype TEXT
+            amtype TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -937,6 +919,7 @@ impl SnapshotRows for PgTablesTable {
             hastriggers INTEGER,
             rowsecurity INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -972,6 +955,7 @@ impl SnapshotRows for PgIndexesTable {
             tablespace TEXT,
             indexdef TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1296,13 +1280,14 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (3807, "_jsonb", 3802),
 ];
 
-const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
+const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval BOOLEAN, typtype TEXT, typcategory TEXT, typispreferred BOOLEAN, typisdefined BOOLEAN, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull BOOLEAN, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
+    const TABLE_OID: Option<i64> = Some(1247);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1438,13 +1423,14 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
+    const TABLE_OID: Option<i64> = Some(2610);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1535,13 +1521,14 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT)";
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
+    const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1818,13 +1805,14 @@ impl SnapshotRows for PgConstraintTable {
 // ──────────────────────────────────────────────────────────────────────
 
 const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT)";
+    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
+    const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1881,6 +1869,7 @@ impl SnapshotRows for PgSequencesTable {
             cache_size INTEGER,
             last_value INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
@@ -2072,6 +2061,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
     const SCHEMA: &'static str;
+    const TABLE_OID: Option<i64>;
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
@@ -2104,6 +2094,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
+            table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
         })
@@ -2136,6 +2127,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 struct SnapshotCursor {
     conn: Arc<Connection>,
     load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -2151,11 +2143,17 @@ impl VirtualTableCursor for SnapshotCursor {
     }
 
     fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
-        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
-        } else {
-            Ok(IOResult::Done(Value::Null))
+        if self.current_row < self.rows.len() {
+            if column < self.rows[self.current_row].len() {
+                return Ok(IOResult::Done(self.rows[self.current_row][column].clone()));
+            }
+            if column == self.rows[self.current_row].len() {
+                if let Some(table_oid) = self.table_oid {
+                    return Ok(IOResult::Done(Value::from_i64(table_oid)));
+                }
+            }
         }
+        Ok(IOResult::Done(Value::Null))
     }
 
     fn filter(
@@ -2907,11 +2905,57 @@ mod tests {
             .map(Value::build_text)
             .map(|value| vec![value])
             .to_vec();
-        let columns = |conn: &Arc<Connection>| {
-            conn.prepare("SELECT name FROM pragma_table_info('catalog_names') ORDER BY cid")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap()
+        let hidden_expected = ["nspname", "tableoid"]
+            .map(Value::build_text)
+            .map(|value| vec![value])
+            .to_vec();
+        let views = [
+            ("catalog_names", "SELECT * FROM pg_namespace", false),
+            (
+                "catalog_qualified_names",
+                "SELECT pg_namespace.* FROM pg_namespace",
+                false,
+            ),
+            (
+                "catalog_group_names",
+                "SELECT * FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_qualified_group_names",
+                "SELECT namespaces.* FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_hidden",
+                "SELECT nspname, tableoid FROM pg_namespace",
+                true,
+            ),
+            (
+                "catalog_group_hidden",
+                "SELECT namespaces.nspname, namespaces.tableoid FROM (pg_namespace) AS namespaces",
+                true,
+            ),
+        ];
+        let check_columns = |conn: &Arc<Connection>| {
+            for (name, _, selects_hidden) in views {
+                let columns = conn
+                    .prepare(format!(
+                        "SELECT name FROM pragma_table_info('{name}') ORDER BY cid"
+                    ))
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert_eq!(
+                    &columns,
+                    if selects_hidden {
+                        &hidden_expected
+                    } else {
+                        &expected
+                    },
+                    "{name}"
+                );
+            }
         };
         let dir = tempdir().unwrap();
         for mvcc in [false, true] {
@@ -2932,12 +2976,16 @@ mod tests {
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
-                conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
-                    .unwrap();
+                let stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
+                assert_eq!(stmt.num_columns(), 4);
+                for (name, select, _) in views {
+                    conn.execute(format!("CREATE VIEW {name} AS {select}"))
+                        .unwrap();
+                }
                 conn.execute("CREATE VIEW catalog_join AS WITH namespaces AS (SELECT * FROM pg_namespace) SELECT namespaces.nspname FROM namespaces JOIN pg_namespace USING (oid)").unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
                 conn.force_reparse_schema().unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
             }
             let db = crate::session::open_database_with_io(
                 io,
@@ -2947,10 +2995,27 @@ mod tests {
             )
             .unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
-            assert_eq!(columns(&conn), expected);
+            check_columns(&conn);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
-            assert_eq!(columns(&conn), expected);
+            check_columns(&conn);
+            for name in ["catalog_hidden", "catalog_group_hidden"] {
+                let mut stmt = conn
+                    .prepare(format!("SELECT * FROM {name} ORDER BY nspname"))
+                    .unwrap();
+                assert_eq!(stmt.num_columns(), 2);
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![
+                        vec![
+                            Value::build_text("information_schema"),
+                            Value::from_i64(2615)
+                        ],
+                        vec![Value::build_text("pg_catalog"), Value::from_i64(2615)],
+                        vec![Value::build_text("public"), Value::from_i64(2615)],
+                    ]
+                );
+            }
             assert_eq!(
                 conn.prepare("SELECT nspname FROM catalog_join ORDER BY nspname")
                     .unwrap()
@@ -3075,7 +3140,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
@@ -3133,7 +3198,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for regular tables
         let mut stmt = conn
@@ -3189,7 +3255,8 @@ mod tests {
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for table details
         let mut stmt = conn
@@ -3254,7 +3321,8 @@ mod tests {
         conn.execute("CREATE TABLE test_table (id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Try to query sqlite_master - should fail
         let result = conn.prepare("SELECT * FROM sqlite_master");
@@ -3354,7 +3422,7 @@ mod tests {
         assert!(found, "users table not found in sqlite_master");
 
         // PostgreSQL-mode connection: pg_class sees the user table.
-        let pg_conn = crate::Connection::new(db.connect(ConnectOpts::new()).unwrap());
+        let pg_conn = crate::Connection::connect(&db).unwrap();
         let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
@@ -3397,7 +3465,8 @@ mod tests {
         conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Test various WHERE clause combinations
 
@@ -3467,7 +3536,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_tables
         let mut stmt = conn
@@ -3512,7 +3582,8 @@ mod tests {
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         let mut stmt = conn.prepare("SELECT tablename FROM pg_tables").unwrap();
 

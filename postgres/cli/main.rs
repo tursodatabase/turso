@@ -43,7 +43,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{ConnectOpts, DatabaseOpts, LimboError, OpenFlags, Statement, Value};
+use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
 use turso_pg::Connection;
 use turso_pg_server::TursoPgServer;
 
@@ -118,7 +118,7 @@ fn open_database(
 
     let (io, db) =
         turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect(ConnectOpts::new())?);
+    let conn = Connection::connect(&db)?;
     Ok((io, conn))
 }
 

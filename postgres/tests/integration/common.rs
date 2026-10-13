@@ -217,6 +217,6 @@ impl TempDatabase {
     }
 
     pub fn connect_postgres(&self) -> Connection {
-        Connection::new(self.connect_limbo())
+        Connection::connect(&self.db).unwrap()
     }
 }

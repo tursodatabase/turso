@@ -1247,16 +1247,18 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
                 .run_collect_rows()
                 .unwrap()
         };
-        let expected_columns = vec![
-            vec![Value::build_text("value")],
-            vec![Value::build_text("lower_bound")],
-        ];
+        let expected_columns = vec![vec![Value::build_text("value")]];
+        let expected_rows = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
         {
             let db = open();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             }
+            let mut direct = conn
+                .prepare("SELECT * FROM native_rows(8) ORDER BY value")
+                .unwrap();
+            assert_eq!(collect(&mut direct, &queue), expected_rows);
             conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
                 .unwrap();
             assert_eq!(columns(&conn), expected_columns);
@@ -1267,12 +1269,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         assert_eq!(columns(&conn), expected_columns);
         let mut stmt = conn
-            .prepare("SELECT value FROM native_view ORDER BY value")
+            .prepare("SELECT * FROM native_view ORDER BY value")
             .unwrap();
-        assert_eq!(
-            collect(&mut stmt, &queue),
-            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
-        );
+        assert_eq!(collect(&mut stmt, &queue), expected_rows);
     }
 }
 
