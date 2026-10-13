@@ -980,6 +980,40 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// Returns whether a domain in the column's type chain has NOT NULL, and the
+    /// domain CHECK constraints with `value` rewritten to the column name.
+    pub fn column_domain_constraints(
+        &self,
+        column: &Column,
+    ) -> Result<(bool, Vec<CheckConstraint>)> {
+        let mut not_null = false;
+        let mut checks = vec![];
+        let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
+            return Ok((not_null, checks));
+        };
+        if !resolved.is_domain() {
+            return Ok((not_null, checks));
+        }
+        let col_name = column.name.as_deref().unwrap_or("").to_string();
+        for td in &resolved.chain {
+            not_null |= td.not_null;
+            for (i, dc) in td.domain_checks.iter().enumerate() {
+                let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                let name = dc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", td.name, i));
+                checks.try_push(CheckConstraint {
+                    name: Some(name),
+                    expr: *rewritten,
+                    source: None,
+                    column: Some(col_name.clone()),
+                })?;
+            }
+        }
+        Ok((not_null, checks))
+    }
+
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_name.to_lowercase());
     }
@@ -3516,42 +3550,13 @@ impl BTreeTable {
         if !self.is_strict {
             return Ok(());
         }
-        // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = vec![];
-        let mut notnull_cols = vec![];
-
-        for (col_idx, col) in self.columns.iter().enumerate() {
-            let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
-                continue;
-            };
-            if !resolved.is_domain() {
-                continue;
+        for col in self.columns.iter_mut() {
+            let (not_null, checks) = schema.column_domain_constraints(col)?;
+            if not_null {
+                col.set_notnull(true);
             }
-            let col_name = col.name.as_deref().unwrap_or("").to_string();
-            for td in &resolved.chain {
-                if td.not_null {
-                    notnull_cols.try_push(col_idx)?;
-                }
-                for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
-                    let name = dc
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.try_push(CheckConstraint {
-                        name: Some(name),
-                        expr: *rewritten,
-                        source: None,
-                        column: Some(col_name.clone()),
-                    })?;
-                }
-            }
+            self.check_constraints.try_extend(checks)?;
         }
-
-        for col_idx in notnull_cols {
-            self.columns[col_idx].set_notnull(true);
-        }
-        self.check_constraints.try_extend(new_checks)?;
         Ok(())
     }
 
