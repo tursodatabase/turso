@@ -1892,6 +1892,41 @@ expect {
     75|750000
 }
 
+# A hash anti join emits its rows from the scan of unmatched build rows. A
+# later NOT EXISTS anti join in the same row must go back to that scan, not to
+# the outer loop, or the other unmatched build rows are lost. ANALYZE runs
+# before most of the inserts, so the planner sees almost empty tables and picks
+# a hash anti join on t1 and a nested loop anti join on t4.
+@cross-check-integrity
+test anti-join-after-hash-anti-join-keeps-all-unmatched-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (NULL, 1, NULL), (3, 3, 2);
+    INSERT INTO t2 VALUES (3, NULL, 3), (2, 1, NULL), (3, 1, 2), (3, NULL, NULL);
+    INSERT INTO t5 VALUES (1, 3, 1), (2, 2, 1);
+    ANALYZE;
+    INSERT INTO t0 VALUES (4, 4, 5), (6, 6, 7), (8, 8, 9);
+    INSERT INTO t1 VALUES (0, 0, 5);
+    INSERT INTO t4 VALUES (7, 0, 0);
+    SELECT t0.c, t2.c
+    FROM t0 JOIN t2 JOIN t5
+    WHERE t5.b = t2.c
+      AND NOT EXISTS (SELECT 1 FROM t1 WHERE t1.c = t0.c)
+      AND NOT EXISTS (SELECT 1 FROM t4 WHERE t4.a = t0.c)
+    ORDER BY 1, 2;
+}
+expect {
+    |2
+    |3
+    2|2
+    2|3
+    9|2
+    9|3
+}
+
 setup exists_filter_before_anti_join {
     CREATE TABLE exists_filter_outer(id INTEGER PRIMARY KEY, k INTEGER, flag INTEGER);
     CREATE TABLE exists_filter_probe(k INTEGER, v INTEGER);
