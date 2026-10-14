@@ -123,8 +123,8 @@ jobs:
         working-directory: sqlite/conformance
         run: make run-js MVCC=1
 
-  sqltest-run-pg:
-    name: Run SQL tests (pg backend)
+  sqltest-run-tursopg:
+    name: Run SQL tests (tursopg backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:

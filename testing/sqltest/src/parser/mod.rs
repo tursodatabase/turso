@@ -1478,6 +1478,31 @@ expect @invalid {
     }
 
     #[test]
+    fn test_parse_tursopg_backend() {
+        let input = r#"
+@database :memory:
+
+@backend tursopg
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @tursopg {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].modifiers.backend, Some(ast::Backend::Tursopg));
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Tursopg),
+            Expectation::Exact(rows) if rows == &vec!["2".to_string()]
+        ));
+    }
+
+    #[test]
     fn test_parse_duplicate_backend_expectation() {
         let input = r#"
 @database :memory:

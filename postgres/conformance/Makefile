@@ -1,7 +1,7 @@
 # Turso PostgreSQL conformance test Makefile
 #
 # The .sqltest corpora live here; the sqltest runner crate lives in
-# testing/sqltest. The pg backend spawns a tursopg server per database
+# testing/sqltest. The tursopg backend spawns a tursopg server per database
 # instance and drives it over the PostgreSQL wire protocol.
 
 # Paths
@@ -47,14 +47,14 @@ check: build-runner
 
 # Run all tests against a spawned tursopg server
 run: build
-	$(SQLTEST) run $(PG_TESTS) --timeout 600 --backend pg --binary $(TURSOPG)
+	$(SQLTEST) run $(PG_TESTS) --timeout 600 --backend tursopg --binary $(TURSOPG)
 
 # Alias for run
 test: run
 
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
-	$(SQLTEST) run $(FILE) --backend pg --binary $(TURSOPG)
+	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG)
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

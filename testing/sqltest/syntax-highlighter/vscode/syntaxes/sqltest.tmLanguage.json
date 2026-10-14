@@ -180,7 +180,7 @@
     },
     "decorator-backend": {
       "name": "meta.decorator.backend.sqltest",
-      "match": "(@backend)\\s+(rust|cli|js)",
+      "match": "(@backend)\\s+(rust|cli|js|tursopg)",
       "captures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" }
@@ -242,7 +242,7 @@
     },
     "expect-block": {
       "name": "meta.expect-block.sqltest",
-      "begin": "\\b(expect)(?:\\s+(@)(rust|cli|js))?(?:\\s+(error|pattern|unordered|raw))?\\s*(\\{)",
+      "begin": "\\b(expect)(?:\\s+(@)(rust|cli|js|tursopg))?(?:\\s+(error|pattern|unordered|raw))?\\s*(\\{)",
       "beginCaptures": {
         "1": { "name": "keyword.control.sqltest" },
         "2": { "name": "keyword.control.directive.sqltest" },

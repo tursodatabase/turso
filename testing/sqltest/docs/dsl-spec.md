@@ -214,7 +214,7 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
-| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`) |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 #### Skip Conditions

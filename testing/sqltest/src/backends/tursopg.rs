@@ -12,12 +12,12 @@ use turso_pg_client::{BackendEvent, ConnParams, PgConn, error_message};
 /// How long to wait for a spawned tursopg server to accept connections.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// PostgreSQL wire-protocol backend. Each database instance spawns its own
+/// Backend that runs tests on tursopg. Each database instance spawns its own
 /// `tursopg --server` on an ephemeral port and drives it over one connection
 /// using the simple query protocol — the same path any PostgreSQL client
 /// exercises, so results reflect the server's own value encoding rather than
 /// a rendering this runner would have to reimplement.
-pub struct PgBackend {
+pub struct TursopgBackend {
     /// Path to the tursopg binary
     binary_path: PathBuf,
     /// Timeout for query execution
@@ -26,8 +26,8 @@ pub struct PgBackend {
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
 }
 
-impl PgBackend {
-    /// Create a new pg backend with the given tursopg binary path
+impl TursopgBackend {
+    /// Create a new tursopg backend with the given tursopg binary path
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
         Self {
             binary_path: binary_path.into(),
@@ -50,13 +50,13 @@ impl PgBackend {
 }
 
 #[async_trait]
-impl SqlBackend for PgBackend {
+impl SqlBackend for TursopgBackend {
     fn name(&self) -> &str {
-        "pg"
+        "tursopg"
     }
 
     fn backend_type(&self) -> Backend {
-        Backend::Pg
+        Backend::Tursopg
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
@@ -164,7 +164,7 @@ impl SqlBackend for PgBackend {
         conn.set_read_timeout(Some(self.timeout))
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
 
-        Ok(Box::new(PgDatabaseInstance {
+        Ok(Box::new(TursopgDatabaseInstance {
             child,
             conn: Some(conn),
             timeout: self.timeout,
@@ -210,7 +210,7 @@ async fn read_stderr(child: &mut tokio::process::Child) -> String {
 }
 
 /// A database instance backed by a dedicated tursopg server process.
-pub struct PgDatabaseInstance {
+pub struct TursopgDatabaseInstance {
     child: tokio::process::Child,
     /// The single connection to the server. Taken while a query runs on the
     /// blocking pool and put back afterwards; left empty after a timeout,
@@ -222,7 +222,7 @@ pub struct PgDatabaseInstance {
 }
 
 #[async_trait]
-impl DatabaseInstance for PgDatabaseInstance {
+impl DatabaseInstance for TursopgDatabaseInstance {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
         let mut conn = self
             .conn

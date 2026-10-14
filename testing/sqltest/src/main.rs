@@ -4,9 +4,9 @@ use owo_colors::OwoColorize;
 use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::pg::PgBackend,
-    backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
-    generate_integrity_fixture, load_test_files, summarize, tcl_converter,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend,
+    backends::tursopg::TursopgBackend, create_output, find_all_pending_snapshots,
+    generate_database, generate_integrity_fixture, load_test_files, summarize, tcl_converter,
 };
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -34,7 +34,7 @@ enum Commands {
         paths: Vec<PathBuf>,
 
         /// Backend to use: "rust" (native), "cli" (subprocess), "js" (JavaScript
-        /// bindings), or "pg" (tursopg server over the PostgreSQL wire protocol)
+        /// bindings), or "tursopg" (tursopg server over the PostgreSQL wire protocol)
         #[arg(long, default_value = "rust")]
         backend: String,
 
@@ -423,15 +423,16 @@ async fn run_tests(
                 })
                 .await
         }
-        "pg" => {
-            // --binary defaults to tursodb for the cli backend; for pg the
+        "tursopg" => {
+            // --binary defaults to tursodb for the cli backend; for tursopg the
             // server binary is tursopg, so rewrite an untouched default.
             let binary = if binary == PathBuf::from("tursodb") {
                 PathBuf::from("tursopg")
             } else {
                 binary
             };
-            let mut backend = PgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+            let mut backend =
+                TursopgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
@@ -444,7 +445,7 @@ async fn run_tests(
                 .await
         }
         other => {
-            eprintln!("Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', or 'pg'");
+            eprintln!("Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', or 'tursopg'");
             return ExitCode::from(2);
         }
     };
