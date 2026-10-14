@@ -304,8 +304,9 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
     conn.execute("CREATE TABLE t (a integer)").unwrap();
 
     // PostgreSQL names unaliased function-call and keyword columns after the
-    // function, casts after the cast expression or else the target type, and
-    // other unaliased expressions `?column?`
+    // function, casts after the cast expression or else the target type,
+    // coalesce/greatest/least/nullif after the keyword, CASE after its ELSE
+    // expression or else `case`, and other unaliased expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -333,6 +334,22 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT 1::int::text", "text"),
         ("SELECT (1 + 1)::int", "int4"),
         ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
+        ("SELECT coalesce(1, 2)", "coalesce"),
+        ("SELECT greatest(1, 2)", "greatest"),
+        ("SELECT least(1, 2)", "least"),
+        ("SELECT nullif(1, 2)", "nullif"),
+        ("SELECT coalesce(1, 2)::text", "coalesce"),
+        ("SELECT CASE WHEN true THEN 1 END", "case"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1) END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1)::int END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END", "case"),
+        ("SELECT CASE WHEN true THEN 1 END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE now() END::text", "now"),
+        (
+            "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
+            "abs",
+        ),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");

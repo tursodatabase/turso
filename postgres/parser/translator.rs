@@ -4076,32 +4076,37 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
-/// A cast keeps the name of the expression it casts, and falls back to the
-/// name of the outermost target type, so `1::int::text` is named `text`.
+/// Casts and CASE pass through the name of the expression they wrap, and only
+/// when that expression has no name are they named after the outermost target
+/// type or `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    expression_name(node).or_else(|| cast_or_case_name(node))
+}
+
+fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    let last_string = |names: &[pg_query::protobuf::Node]| {
-        names
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .next_back()
-    };
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname),
-        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields),
-        Some(Node::TypeCast(type_cast)) => {
-            let mut arg = type_cast.arg.as_deref()?;
-            while let Some(Node::TypeCast(inner)) = &arg.node {
-                arg = inner.arg.as_deref()?;
+    let name = match &node.node {
+        Some(Node::FuncCall(func_call)) => return last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
+        Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CoalesceExpr(_)) => "coalesce",
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
             }
-            derived_column_name(arg).or_else(|| last_string(&type_cast.type_name.as_ref()?.names))
+        }
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
+        {
+            "nullif"
         }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
-            let name = match Op::try_from(svf.op) {
+            match Op::try_from(svf.op) {
                 Ok(Op::SvfopCurrentDate) => "current_date",
                 Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
                 Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
@@ -4114,11 +4119,30 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
                 Ok(Op::SvfopCurrentCatalog) => "current_catalog",
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
-            };
-            Some(name.to_string())
+            }
         }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
+        Some(Node::CaseExpr(_)) => Some("case".to_string()),
         _ => None,
     }
+}
+
+fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// Extract a string value from a DefElem's arg.
