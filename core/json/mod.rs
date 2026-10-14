@@ -1948,12 +1948,37 @@ mod tests {
             (r#"{"[]":3}"#, Value::build_text("[]"), "3"),
             (r#"{"a":1}"#, Value::build_text("a"), "1"),
             (r#"{"a b":7}"#, Value::build_text("a b"), "7"),
-            (r#"{"a":1}"#, Value::Blob(b"a".to_vec()), "1"),
-            (r#"{"a":1}"#, Value::Blob(b"A".to_vec()), "<NULL>"),
-            (r#"[1,2]"#, Value::Blob(b"[0]".to_vec()), "1"),
+            (
+                r#"{"a":1}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"a").expect("test blob allocation"),
+                ),
+                "1",
+            ),
+            (
+                r#"{"a":1}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"A").expect("test blob allocation"),
+                ),
+                "<NULL>",
+            ),
+            (
+                r#"[1,2]"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"[0]").expect("test blob allocation"),
+                ),
+                "1",
+            ),
             // The bytes of a BLOB operand are read as UTF-8 text, not byte by
             // byte, so this is the key "euro sign" and not three latin-1 keys.
-            (r#"{"€":2}"#, Value::Blob(b"\xe2\x82\xac".to_vec()), "2"),
+            (
+                r#"{"€":2}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"\xe2\x82\xac")
+                        .expect("test blob allocation"),
+                ),
+                "2",
+            ),
             (r#"{"1.0":8}"#, Value::from_f64(1.0), "8"),
             (r#"{"1.5":8}"#, Value::from_f64(1.5), "8"),
             (r#"[1,2]"#, Value::from_i64(1), "2"),
