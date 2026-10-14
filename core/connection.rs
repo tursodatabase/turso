@@ -1652,32 +1652,15 @@ impl Connection {
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
-                    // Type loading is best-effort: log and continue on error.
-                    let scan = (|| -> IOResultOr<()> {
-                        crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                            type_rows.push(row.get::<&str>(1)?.to_string());
-                            Ok(())
-                        }));
-                        Ok(IOResult::Done(()))
-                    })();
-                    match scan {
-                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                        Ok(IOResult::Done(())) => {
-                            let type_rows = std::mem::take(type_rows);
-                            if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
-                                tracing::warn!("Failed to load custom types: {}", e);
-                            }
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to load custom types: {}", e);
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
-                        }
-                    }
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        type_rows.push(row.get::<&str>(1)?.to_string());
+                        Ok(())
+                    }));
+                    let type_rows = std::mem::take(type_rows);
+                    inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = ReparsePhase::RefreshStats {
+                        stats: Default::default(),
+                    };
                 }
                 ReparsePhase::RefreshStats { stats } => {
                     // Best-effort load stats if sqlite_stat1 is present.
