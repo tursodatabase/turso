@@ -144,20 +144,24 @@ expect {
 
 # --- Backing-table compaction gate under MVCC ---
 
-# MVCC autocommit-write takes the SKIPPED path in
-# `op_sequence_begin_inner_tx` (autocommit Write is treated as
-# exclusive: it holds `pager_commit_lock` for the duration), so the
-# inline compaction fires and the backing table stays at one row even
-# without an MVCC checkpoint. Pre-gate the WAL path leaked a row per
-# nextval; MVCC autocommit was unaffected only because the checkpoint
-# compactor caught up later.
-test mvcc-autocommit-non-cycle-backing-table-compacts-inline {
+# MVCC autocommit writes run as concurrent transactions, so nextval
+# takes the WRAPPED path and skips the inline compaction (deleting the
+# shared prior-watermark row would conflict with concurrent
+# allocators). The backing table accumulates one row per nextval until
+# the checkpoint's SeqCompactDriver reclaims them: the first checkpoint
+# materializes the backing table, and the next checkpoint that has work
+# to write compacts it down to the watermark row.
+test mvcc-autocommit-non-cycle-backing-table-compacts-at-checkpoint {
     PRAGMA journal_mode='mvcc';
     CREATE SEQUENCE s;
     SELECT nextval('s');
     SELECT nextval('s');
     SELECT nextval('s');
     SELECT nextval('s');
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT nextval('s');
+    PRAGMA wal_checkpoint(TRUNCATE);
     SELECT count(*), max(value) FROM "__turso_internal_seq_s";
 }
 expect {
@@ -166,7 +170,11 @@ expect {
     2
     3
     4
-    1|4
+    4|4
+    0|0|0
+    5
+    0|0|0
+    1|5
 }
 
 # MVCC `BEGIN ... COMMIT` (exclusive outer) → SKIPPED path → compaction

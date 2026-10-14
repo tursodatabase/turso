@@ -54,6 +54,7 @@ expect {
 # correct watermark. Pre-fix WAL non-CYCLE backing tables grew without
 # bound (one row per nextval) because the only post-write compactor —
 # MVCC's SeqCompactDriver — does not run in WAL mode.
+@skip-if mvcc "MVCC autocommit writes are concurrent transactions; the backing table compacts at checkpoint instead"
 test wal-non-cycle-backing-table-stays-at-one-row {
     CREATE SEQUENCE s;
     SELECT nextval('s');
@@ -77,6 +78,7 @@ expect {
 # Descending non-CYCLE follows the same gate. After the compaction
 # leaves only the most-advanced (= lowest) row, `Rewind` must still
 # pick up the right watermark.
+@skip-if mvcc "MVCC autocommit writes are concurrent transactions; the backing table compacts at checkpoint instead"
 test wal-descending-non-cycle-backing-table-stays-at-one-row {
     CREATE SEQUENCE d START WITH 10 INCREMENT BY -1 MINVALUE 0 MAXVALUE 10;
     SELECT nextval('d');

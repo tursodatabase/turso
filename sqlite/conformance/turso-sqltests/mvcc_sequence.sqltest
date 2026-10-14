@@ -342,6 +342,8 @@ test mvcc-user-sequence-backing-table-compacted-after-commit {
     SELECT nextval('compact_seq');
     SELECT nextval('compact_seq');
     PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT nextval('compact_seq');
+    PRAGMA wal_checkpoint(TRUNCATE);
     SELECT COUNT(*) FROM "__turso_internal_seq_compact_seq";
     SELECT value FROM "__turso_internal_seq_compact_seq";
 }
@@ -353,8 +355,10 @@ expect {
     4
     5
     0|0|0
+    6
+    0|0|0
     1
-    5
+    6
 }
 
 test mvcc-autoincrement-backing-table-compacted-after-commit {
@@ -366,10 +370,13 @@ test mvcc-autoincrement-backing-table-compacted-after-commit {
     INSERT INTO compacted(v) VALUES ('row4');
     INSERT INTO compacted(v) VALUES ('row5');
     PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO compacted(v) VALUES ('row6');
+    PRAGMA wal_checkpoint(TRUNCATE);
     SELECT COUNT(*) FROM "__turso_internal_seq___turso_internal_autoincrement_compacted";
 }
 expect {
     mvcc
+    0|0|0
     0|0|0
     1
 }
@@ -413,7 +420,8 @@ test mvcc-user-sequence-rollback-does-not-pollute-watermark {
     SELECT nextval('rb_seq');
     ROLLBACK;
     PRAGMA wal_checkpoint(TRUNCATE);
-    SELECT value FROM "__turso_internal_seq_rb_seq";
+    SELECT max(value) FROM "__turso_internal_seq_rb_seq";
+    SELECT nextval('rb_seq');
 }
 expect {
     mvcc
@@ -427,4 +435,5 @@ expect {
     8
     0|0|0
     3
+    4
 }
