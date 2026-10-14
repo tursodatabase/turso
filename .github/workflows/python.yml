@@ -29,11 +29,6 @@ env:
 jobs:
   test:
     timeout-minutes: 30
-    env:
-      # `uv sync` builds the extension with maturin, which defaults to an
-      # optimized release build with LTO. The tests only need a working
-      # extension, and a debug build reuses what "Build Rust (debug)" built.
-      MATURIN_PEP517_ARGS: "--profile dev"
     strategy:
       matrix:
         os:
@@ -78,6 +73,16 @@ jobs:
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
+
+      # `uv sync` builds the extension with maturin, which defaults to an
+      # optimized release build with LTO. On pull requests, build it in debug
+      # mode instead: much faster, and it reuses what "Build Rust (debug)"
+      # built. main keeps testing the release build, which has code paths
+      # debug builds don't (e.g. panic=abort, release-only branches).
+      - name: Build the extension in debug mode on pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "MATURIN_PEP517_ARGS=--profile dev" >> "$GITHUB_ENV"
 
       - name: Install the project
         working-directory: ${{ env.working-directory }}
