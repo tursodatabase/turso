@@ -74,18 +74,24 @@ jobs:
         # One shard per workload profile; each shard runs the WAL and MVCC
         # variants of that workload (benchmarks are named "<mode>/<workload>"
         # and the filter is a regex over benchmark names).
-        # update-churn is the slowest workload, so it is split by mode: modes
-        # starting with "w" (wal) and all other modes. Together the two
-        # filters match every mode, including ones added later.
+        # The slowest workloads are split by mode: modes starting with "w"
+        # (wal) and all other modes. Together the two filters match every
+        # mode, including ones added later.
         include:
           - name: insert-heavy
             filter: insert-heavy
-          - name: read-heavy
-            filter: read-heavy
-          - name: mixed
-            filter: mixed
-          - name: scan-heavy
-            filter: scan-heavy
+          - name: read-heavy (wal)
+            filter: "::w[^:/]*/read-heavy/"
+          - name: read-heavy (other modes)
+            filter: "::([^w:/][^:/]*)?/read-heavy/"
+          - name: mixed (wal)
+            filter: "::w[^:/]*/mixed/"
+          - name: mixed (other modes)
+            filter: "::([^w:/][^:/]*)?/mixed/"
+          - name: scan-heavy (wal)
+            filter: "::w[^:/]*/scan-heavy/"
+          - name: scan-heavy (other modes)
+            filter: "::([^w:/][^:/]*)?/scan-heavy/"
           - name: series-blob
             filter: series-blob
           - name: update-churn (wal)
