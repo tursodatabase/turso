@@ -1179,6 +1179,31 @@ expect {
     1|
 }
 
+# The planner can move a correlated EXISTS of an inner ON term to a later loop
+# with fewer rows. That loop must come before a later RIGHT JOIN: its
+# unmatched-row pass runs the RIGHT JOIN loop again with NULL rows on the left,
+# and the ON term then removed the unmatched rows. ANALYZE runs before the last
+# insert, so the planner sees few rows in ij_d and wants to move the EXISTS.
+test inner-on-exists-left-of-right-join-keeps-unmatched-right-row {
+    CREATE TABLE ij_a(id INTEGER, k INTEGER);
+    CREATE TABLE ij_b(id INTEGER, k INTEGER);
+    CREATE TABLE ij_c(id INTEGER, k INTEGER);
+    CREATE TABLE ij_d(id INTEGER);
+    INSERT INTO ij_a VALUES (1, 2);
+    INSERT INTO ij_c VALUES (3, NULL);
+    ANALYZE;
+    INSERT INTO ij_d VALUES (4);
+    SELECT ij_a.id, ij_b.id, ij_c.id, ij_d.id
+      FROM ij_a
+      JOIN ij_b ON EXISTS (SELECT 1 FROM ij_c AS q WHERE q.id = ij_b.k)
+       AND ij_b.id = ij_a.k
+      RIGHT JOIN ij_c ON ij_c.k IS ij_b.k
+      JOIN ij_d;
+}
+expect {
+    ||3|4
+}
+
 # SQLite keeps an earlier LEFT JOIN when its only rejecting term comes from
 # an inner ON clause left of a later RIGHT JOIN.
 test inner-on-term-does-not-cascade-outer-join-reduction {
