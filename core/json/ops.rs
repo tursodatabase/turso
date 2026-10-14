@@ -1,11 +1,11 @@
 use super::{
-    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_edit_path,
-    json_path_from_db_value, json_string_to_db_type,
+    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_document_to_db_type,
+    json_edit_path, json_path_from_db_value,
     jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
 };
 use crate::{
-    types::{AsValueRef, Text, Value},
+    types::{AsValueRef, Value},
     ValueRef,
 };
 
@@ -39,14 +39,7 @@ pub fn json_patch(
 
     let element_type = target.element_type()?;
 
-    // A JSON null patch result stays JSON here: SQLite returns the
-    // text 'null', while json_string_to_db_type would map it to SQL
-    // NULL the way extraction does.
-    if element_type == super::jsonb::ElementType::NULL {
-        return Ok(Value::Text(Text::json("null".to_string())));
-    }
-
-    json_string_to_db_type(target, element_type, OutputVariant::String)
+    json_document_to_db_type(target, element_type, OutputVariant::String)
 }
 
 pub fn jsonb_patch(
@@ -74,14 +67,7 @@ pub fn jsonb_patch(
 
     let element_type = target.element_type()?;
 
-    // A JSON null patch result stays JSON here: SQLite returns the
-    // JSONB null blob, while json_string_to_db_type would map it to
-    // SQL NULL the way extraction does.
-    if element_type == super::jsonb::ElementType::NULL {
-        return Ok(Value::Blob(target.data()));
-    }
-
-    json_string_to_db_type(target, element_type, OutputVariant::Binary)
+    json_document_to_db_type(target, element_type, OutputVariant::Binary)
 }
 
 pub fn json_remove<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -114,7 +100,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::String)
+    json_document_to_db_type(json, el_type, OutputVariant::String)
 }
 
 pub fn jsonb_remove<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -184,7 +170,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, super::OutputVariant::String)
+    json_document_to_db_type(json, el_type, OutputVariant::String)
 }
 
 pub fn jsonb_replace<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -223,7 +209,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::Binary)
+    json_document_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
 pub fn json_insert<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -263,7 +249,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::String)
+    json_document_to_db_type(json, el_type, OutputVariant::String)
 }
 
 pub fn jsonb_insert<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -303,11 +289,12 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::Binary)
+    json_document_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::json::{json_set, jsonb_set};
     use crate::types::Text;
 
     use super::*;
@@ -506,5 +493,107 @@ mod tests {
             }
             _ => panic!("Expected Text value"),
         }
+    }
+
+    #[test]
+    fn test_edited_null_document_is_still_a_document() {
+        // A document that is JSON `null` was edited, so SQLite returns the text
+        // `null` rather than SQL NULL. json_extract() has to map `null` to SQL
+        // NULL, and the mutators used to share that conversion.
+        for (name, result) in [
+            (
+                "json_set",
+                json_set(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "json_insert",
+                json_insert(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "json_replace",
+                json_replace(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "json_remove",
+                json_remove(&[create_text("null")], &JsonCacheCell::new()).unwrap(),
+            ),
+            (
+                "json_set_root",
+                json_set(
+                    &[create_json("[1]"), create_text("$"), Value::Null],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!(result, create_json("null"), "{name}");
+        }
+
+        // The `jsonb_` variants return the JSONB encoding of `null` instead.
+        for (name, result) in [
+            (
+                "jsonb_set",
+                jsonb_set(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "jsonb_insert",
+                jsonb_insert(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "jsonb_replace",
+                jsonb_replace(
+                    &[create_text("null"), create_text("$.a"), Value::from_i64(1)],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "jsonb_remove",
+                jsonb_remove(&[create_text("null")], &JsonCacheCell::new()).unwrap(),
+            ),
+            (
+                "jsonb_set_root",
+                jsonb_set(
+                    &[create_json("[1]"), create_text("$"), Value::Null],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!(result, Value::Blob(vec![0x00]), "{name}");
+        }
+
+        // Removing the whole document is the one case where SQLite does give
+        // SQL NULL back, even though the edited document is a document.
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            json_remove(&[create_json("[1]"), create_text("$")], &cache).unwrap(),
+            Value::Null
+        );
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            jsonb_remove(&[create_json("[1]"), create_text("$")], &cache).unwrap(),
+            Value::Null
+        );
     }
 }
