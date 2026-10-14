@@ -17268,6 +17268,11 @@ pub fn op_alter_column(
         FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
     )?;
     let new_name = definition.col_name.as_str().to_owned();
+    let (domain_not_null, domain_checks) = if is_strict && !*rename {
+        conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
+    } else {
+        (false, crate::alloc::vec![])
+    };
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
@@ -17428,6 +17433,26 @@ pub fn op_alter_column(
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
             if clears_autoincrement_sequence {
                 btree.has_autoincrement = false;
+            }
+
+            btree
+                .check_constraints
+                .retain(|check| check.column.as_deref() != Some(new_name.as_str()));
+            for constraint in &definition.constraints {
+                if let ast::ColumnConstraint::Check { expr, source } = &constraint.constraint {
+                    btree
+                        .check_constraints
+                        .push(crate::schema::CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            source.as_deref(),
+                            Some(&new_name),
+                        ));
+                }
+            }
+            btree.check_constraints.extend(domain_checks);
+            if domain_not_null {
+                btree.columns_mut()[*column_index].set_notnull(true);
             }
         }
 

@@ -912,3 +912,12 @@ expect {
     2||null
     ok
 }
+
+test alter-column-adds-column-check {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    ALTER TABLE t ALTER COLUMN v TO v2 INTEGER CHECK (v2 > 0);
+    INSERT INTO t VALUES (1, -1);
+}
+expect error {
+    CHECK constraint failed
+}
