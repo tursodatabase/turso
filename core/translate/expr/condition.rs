@@ -272,6 +272,89 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
+            // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
+            // true label.
+            let jump_target_when_true = program.allocate_label();
+            translate_condition_expr(
+                program,
+                referenced_tables,
+                lhs,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true,
+                    ..condition_metadata
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(jump_target_when_true);
+            translate_condition_expr(
+                program,
+                referenced_tables,
+                rhs,
+                condition_metadata,
+                resolver,
+            )
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            // In a binary OR, never jump to the parent 'jump_target_when_false' or
+            // 'jump_target_when_null' label on the first condition, because the second
+            // condition CAN also be true. Instead we instruct the child expression to
+            // jump to a local false label so the right side of OR gets evaluated.
+            // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
+            // evaluates to NULL — we must still evaluate the right side.
+            let jump_target_when_false = program.allocate_label();
+            translate_condition_expr(
+                program,
+                referenced_tables,
+                lhs,
+                ConditionMetadata {
+                    jump_if_condition_is_true: true,
+                    jump_target_when_false,
+                    jump_target_when_null: jump_target_when_false,
+                    ..condition_metadata
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(jump_target_when_false);
+            translate_condition_expr(
+                program,
+                referenced_tables,
+                rhs,
+                condition_metadata,
+                resolver,
+            )
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => translate_condition_expr(
+            program,
+            referenced_tables,
+            &exprs[0],
+            condition_metadata,
+            resolver,
+        ),
+        _ => translate_leaf_condition_expr(
+            program,
+            referenced_tables,
+            expr,
+            condition_metadata,
+            resolver,
+        ),
+    }
+}
+
+/// Translates a condition that is not an AND, an OR, or a parenthesized
+/// condition. It is never inlined, so that the recursion over AND and OR in
+/// [translate_condition_expr()] does not pay for its stack frame at every level.
+#[inline(never)]
+fn translate_leaf_condition_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    expr: &ast::Expr,
+    condition_metadata: ConditionMetadata,
+    resolver: &Resolver,
+) -> Result<()> {
+    match expr {
         ast::Expr::SubqueryResult { query_type, .. } => match query_type {
             SubqueryType::Exists { result_reg } => {
                 emit_cond_jump(program, condition_metadata, *result_reg);
@@ -332,7 +415,7 @@ pub fn translate_condition_expr(
             translate_between_expr(
                 program,
                 Some(referenced_tables),
-                expr.clone(),
+                expr,
                 between_result_reg,
                 resolver,
             )?;
@@ -346,59 +429,8 @@ pub fn translate_condition_expr(
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
         }
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
-            // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
-            // true label.
-            let jump_target_when_true = program.allocate_label();
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                lhs,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true,
-                    ..condition_metadata
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(jump_target_when_true);
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                rhs,
-                condition_metadata,
-                resolver,
-            )?;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, never jump to the parent 'jump_target_when_false' or
-            // 'jump_target_when_null' label on the first condition, because the second
-            // condition CAN also be true. Instead we instruct the child expression to
-            // jump to a local false label so the right side of OR gets evaluated.
-            // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
-            // evaluates to NULL — we must still evaluate the right side.
-            let jump_target_when_false = program.allocate_label();
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                lhs,
-                ConditionMetadata {
-                    jump_if_condition_is_true: true,
-                    jump_target_when_false,
-                    jump_target_when_null: jump_target_when_false,
-                    ..condition_metadata
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(jump_target_when_false);
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                rhs,
-                condition_metadata,
-                resolver,
-            )?;
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _) => {
+            unreachable!("AND and OR are translated by translate_condition_expr()")
         }
         // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE in conditions
         // Delegate to translate_expr which handles these correctly with IsTrue instruction
@@ -477,6 +509,7 @@ pub fn translate_condition_expr(
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
         | ast::Expr::FunctionCall { .. }
+        | ast::Expr::MergedColumn(_)
         | ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Case { .. } => {
@@ -554,19 +587,10 @@ pub fn translate_condition_expr(
             }
         }
         ast::Expr::Parenthesized(exprs) => {
-            if exprs.len() == 1 {
-                translate_condition_expr(
-                    program,
-                    referenced_tables,
-                    &exprs[0],
-                    condition_metadata,
-                    resolver,
-                )?;
-            } else {
-                crate::bail_parse_error!(
-                    "parenthesized conditional should have exactly one expression"
-                );
-            }
+            turso_assert!(exprs.len() != 1);
+            crate::bail_parse_error!(
+                "parenthesized conditional should have exactly one expression"
+            );
         }
         ast::Expr::NotNull(expr) => {
             let cur_reg = program.alloc_register();

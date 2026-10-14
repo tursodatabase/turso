@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -928,9 +928,9 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                })?),
+                IoBackend::IoUring => Arc::new(
+                    turso_core::UringIO::new().map_err(|e| TursoError::Error(e.to_string()))?,
+                ),
                 #[cfg(all(target_os = "windows", not(miri)))]
                 IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
                     TursoError::Error(format!("unable to create win_iocp backend: {e}"))
@@ -1076,16 +1076,16 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect_with_page_codec(page_codec.clone())?
+            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
         } else {
-            // Parse encryption key if configured - needed for connect_with_encryption
+            // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
             let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
                 Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
             } else {
                 None
             };
-            db.connect_with_encryption(encryption_key)?
+            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
         };
 
         Ok(TursoConnection::new(&self.config, connection))

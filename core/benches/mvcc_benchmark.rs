@@ -7,8 +7,6 @@ use turso_core::SqliteDialect;
 use criterion::{
     async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -19,7 +17,7 @@ use turso_core::alloc::DynAllocator;
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
-use turso_core::{Connection, Database, MemoryIO, Statement, StepResult, Value};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -30,7 +28,7 @@ struct BenchDb {
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -322,7 +320,7 @@ impl HugeMultiWriteHarness {
         // CPU-bound index-probe path the eq-only seek bound affects.
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         // Keep everything in MvStore so the measurement reflects the in-memory
         // index path rather than checkpoint I/O.
@@ -338,7 +336,7 @@ impl HugeMultiWriteHarness {
             .unwrap();
 
         let ghost = (pending > 0).then(|| {
-            let ghost = db.connect().unwrap();
+            let ghost = db.connect(ConnectOpts::new()).unwrap();
             ghost.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             ghost.execute("BEGIN CONCURRENT").unwrap();
             ghost.execute(ghost_insert_sql(pending, placement)).unwrap();
@@ -428,14 +426,6 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write-rowid", GhostPlacement::RowidProbe);
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

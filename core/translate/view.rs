@@ -62,6 +62,9 @@ pub fn translate_create_materialized_view(
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    if connection.mvcc_enabled() {
+        bail_parse_error!("Materialized views are not supported in MVCC mode");
+    }
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -88,7 +91,7 @@ pub fn translate_create_materialized_view(
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
-    let view_columns = view_column_schema.flat_columns();
+    let view_columns = view_column_schema.flat_columns()?;
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);

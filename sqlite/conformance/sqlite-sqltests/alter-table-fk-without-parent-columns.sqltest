@@ -1,0 +1,40 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/8701
+# ALTER TABLE ADD COLUMN and DROP COLUMN rebuild the stored CREATE TABLE text.
+# A foreign key that names no parent columns must be written back as
+# REFERENCES p, not REFERENCES p(), which no engine can parse on reopen.
+
+@database :memory:
+
+setup parent {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+}
+
+@setup parent
+test alter-add-column-keeps-table-fk-without-parent-columns {
+    CREATE TABLE t(a INTEGER, FOREIGN KEY(a) REFERENCES p);
+    ALTER TABLE t ADD COLUMN c INTEGER;
+    SELECT sql LIKE '%REFERENCES p()%', sql LIKE '%REFERENCES p%' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    0|1
+}
+
+@setup parent
+test alter-drop-column-keeps-column-fk-without-parent-columns {
+    CREATE TABLE u(a INTEGER REFERENCES p, b INTEGER, d INTEGER);
+    ALTER TABLE u DROP COLUMN d;
+    SELECT sql LIKE '%REFERENCES p()%', sql LIKE '%REFERENCES p%' FROM sqlite_schema WHERE name = 'u';
+}
+expect {
+    0|1
+}
+
+@setup parent
+test alter-add-column-keeps-fk-without-parent-columns-with-actions {
+    CREATE TABLE t(a INTEGER, FOREIGN KEY(a) REFERENCES p ON DELETE CASCADE);
+    ALTER TABLE t ADD COLUMN c INTEGER;
+    SELECT sql LIKE '%REFERENCES p()%', sql LIKE '%REFERENCES p ON DELETE CASCADE%' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    0|1
+}

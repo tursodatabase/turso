@@ -55,7 +55,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync concurrency', async ({ 
     expect(values).toEqual(new Array(16).fill([{ cnt: 2000 }]))
 })
 
-test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy)', async ({ server }) => {
+test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy)', { timeout: 300_000 }, async ({ server }) => {
     {
         const db = await connect({
             path: ':memory:',
@@ -93,7 +93,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
 
     expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all()).toEqual([{ cnt: 2001 }]);
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
-}, { timeout: 300_000 })
+})
 
 test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy; large segment size)', async ({ server }) => {
     {
@@ -800,29 +800,21 @@ test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : u
         url: server.dbUrl(),
     });
     await db1.exec("PRAGMA busy_timeout=100");
-    async function pull(db: Database) {
-        try {
-            await db.pull();
-        } catch (e) {
-            console.error('pull error', e);
-        } finally {
-            console.error('pull ok');
-            setTimeout(async () => await pull(db), 0);
-        }
-    }
-    async function push(db: Database) {
-        try {
-            await db.push();
-        } catch (e) {
-            console.error('push error', e);
-        } finally {
-            console.error('push ok');
-            setTimeout(async () => await push(db), 0);
+    let stopped = false;
+    async function syncUntilStopped(name: string, sync: () => Promise<unknown>) {
+        while (!stopped) {
+            try {
+                await sync();
+                console.error(`${name} ok`);
+            } catch (e) {
+                console.error(`${name} error`, e);
+            }
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
     }
 
-    setTimeout(async () => await pull(db1), 0)
-    setTimeout(async () => await push(db1), 0)
+    const pullLoop = syncUntilStopped('pull', () => db1.pull());
+    const pushLoop = syncUntilStopped('push', () => db1.push());
     for (let i = 0; i < 1000; i++) {
         try {
             await Promise.all([
@@ -835,6 +827,9 @@ test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : u
         }
         await new Promise(resolve => setTimeout(resolve, 1));
     }
+    stopped = true;
+    await Promise.all([pullLoop, pushLoop]);
+    await db1.close();
 })
 
 test('corruption-bug-1', async ({ server }) => {

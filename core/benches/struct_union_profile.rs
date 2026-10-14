@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use turso_core::io::MemoryIO;
 use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, StepResult};
 
 fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
     let opts = DatabaseOpts::new().with_custom_types(true);
@@ -23,7 +23,7 @@ fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     (db, conn)
 }
 

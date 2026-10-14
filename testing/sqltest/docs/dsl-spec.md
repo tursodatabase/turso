@@ -400,6 +400,12 @@ Snapshots support all the same decorators as tests:
 | `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
 | `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
+| `@sqlite-reference` | Add SQLite's plan, bytecode, and an opcode diff to this snapshot |
+
+`@sqlite-reference` runs the setup and query against the bundled SQLite library.
+Use it only with `@database :memory:`. The runner rejects other database locations.
+The snapshot then shows both engines' EXPLAIN output and the difference in opcode order.
+Review this difference when the snapshot changes. The decorator also works with `snapshot-eqp`, but that form shows only the two query plans.
 
 ### Snapshot File Location
 

@@ -56,7 +56,8 @@ impl TursoPgServer {
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {})",
-            self.address, self.db_file
+            listener.local_addr()?,
+            self.db_file
         );
 
         let factory = Arc::new(TursoPgFactory {
@@ -637,6 +638,7 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
 fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
+        || upper.starts_with("SET")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
@@ -762,6 +764,50 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pg_is_in_recovery_returns_true_text_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        for sql in [
+            "SELECT pg_catalog.pg_is_in_recovery()",
+            "SELECT pg_is_in_recovery() AS recovery",
+            "SELECT (PG_IS_IN_RECOVERY())",
+        ] {
+            for format in [Format::UnifiedText, Format::UnifiedBinary] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let fields = Arc::new(build_field_info(&stmt, &format));
+                assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
+                let rows = stmt.run_collect_rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                let row = encoder.finish().unwrap();
+                assert_eq!(row.field_count, 1);
+                assert_eq!(&row.data[..], b"\0\0\0\x01t");
+            }
+        }
+        let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
+        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        assert_eq!(*fields[0].datatype(), Type::INT4);
+    }
+
+    #[test]
+    fn test_set_transaction_is_non_query() {
+        assert!(is_pg_non_query(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        ));
+        assert!(is_pg_non_query("  set\ntransaction read only"));
+        assert!(!is_pg_non_query(
+            "SELECT set_config('search_path', '', false)"
+        ));
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {

@@ -141,6 +141,7 @@ impl Parser {
                     | Token::AtRequires
                     | Token::AtBackend
                     | Token::AtCrossCheckIntegrity
+                    | Token::AtSqliteReference
                     | Token::AtVar
                     | Token::Test
                     | Token::Snapshot
@@ -273,6 +274,7 @@ impl Parser {
         let mut backend = None;
         let mut requires = Vec::new();
         let mut cross_check_integrity = false;
+        let mut sqlite_reference = false;
         let mut matrix_vars: Vec<MatrixVar> = Vec::new();
 
         // Parse decorators
@@ -341,6 +343,11 @@ impl Parser {
                     cross_check_integrity = true;
                     self.skip_newlines_and_comments();
                 }
+                Some(Token::AtSqliteReference) => {
+                    self.advance();
+                    sqlite_reference = true;
+                    self.skip_newlines_and_comments();
+                }
                 _ => break,
             }
         }
@@ -351,6 +358,9 @@ impl Parser {
         }
         match self.peek() {
             Some(Token::Matrix) => {
+                if sqlite_reference {
+                    return Err(self.error("@sqlite-reference requires a snapshot".to_string()));
+                }
                 self.advance();
                 let (name, name_span) = self.expect_identifier_with_span()?;
                 let sql_template = self.expect_block_content()?.trim().to_string();
@@ -395,6 +405,7 @@ impl Parser {
                     name_span,
                     sql,
                     eqp_only,
+                    sqlite_reference,
                     modifiers: CaseModifiers {
                         setups: test_setups,
                         skip,
@@ -405,6 +416,9 @@ impl Parser {
                 }))
             }
             Some(Token::Test) => {
+                if sqlite_reference {
+                    return Err(self.error("@sqlite-reference requires a snapshot".to_string()));
+                }
                 // Parse test as before
                 self.expect_token(Token::Test)?;
                 let (name, name_span) = self.expect_identifier_with_span()?;
@@ -1712,6 +1726,22 @@ snapshot query-plan {
         assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
         assert!(file.snapshots[0].modifiers.setups.is_empty());
         assert!(file.snapshots[0].modifiers.skip.is_empty());
+    }
+
+    #[test]
+    fn sqlite_reference_applies_only_to_snapshots() {
+        let snapshot =
+            parse("@database :memory:\n@sqlite-reference\nsnapshot plan { SELECT 1; }\n").unwrap();
+        assert!(snapshot.snapshots[0].sqlite_reference);
+
+        let test = parse(
+            "@database :memory:\n@sqlite-reference\ntest result { SELECT 1; }\nexpect { 1 }\n",
+        )
+        .unwrap_err();
+        assert!(
+            test.to_string()
+                .contains("@sqlite-reference requires a snapshot")
+        );
     }
 
     #[test]

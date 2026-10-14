@@ -1,5 +1,6 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
+use turso_core::ConnectOpts;
 use turso_core::Row;
 
 #[test]
@@ -99,7 +100,7 @@ fn test_checksum_detects_corruption() {
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
         // Connecting should fail with a checksum error because the header page is corrupted
-        let result = existing_db.db.connect();
+        let result = existing_db.db.connect(ConnectOpts::new());
 
         match result {
             Ok(_) => panic!("should return error when connecting to corrupted DB"),

@@ -8,8 +8,9 @@
 //! renders an invalid UTF-8 key with replacement characters instead of
 //! rejecting the document.
 
+use crate::assertions::NULL;
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
-use rusqlite::types::Value as RusqliteValue;
+use asserting::prelude::*;
 use std::sync::Arc;
 
 /// OBJECT holding a 7-byte TEXT5 key, then NULL. The key ends in a truncated
@@ -24,13 +25,9 @@ const INVALID_UTF8_KEY: &str = "x'9C79FFFFFFFFFFFFFF00'";
 /// Asserts the document is rejected rather than acted upon: the statement
 /// either fails, or evaluates to NULL for the opcodes that discard the error.
 fn assert_rejected(db: &TempDatabase, conn: &Arc<turso_core::Connection>, sql: &str) {
-    match limbo_exec_rows_fallible(db, conn, sql) {
-        Err(_) => {}
-        Ok(rows) => assert_eq!(
-            rows,
-            vec![vec![RusqliteValue::Null]],
-            "expected `{sql}` to be rejected"
-        ),
+    // A rejected document is either an error or a NULL result.
+    if let Ok(rows) = limbo_exec_rows_fallible(db, conn, sql) {
+        assert_that!(rows).is_equal_to(vec![row![NULL]]);
     }
 }
 
@@ -139,46 +136,32 @@ fn json_accepts_well_formed_blob(tmp_db: TempDatabase) {
         &conn,
         r#"SELECT json_extract(jsonb('{"a":{"b":[1,2,3]},"c":"é"}'), '$.a.b[1]')"#,
     );
-    assert_eq!(result, vec![vec![RusqliteValue::Integer(2)]]);
+    assert_that!(result).is_equal_to(vec![row![2]]);
 
     let result = limbo_exec_rows(
         &conn,
         r#"SELECT json(jsonb('{"a":{"b":[1,2,3]},"c":"é"}'))"#,
     );
-    assert_eq!(
-        result,
-        vec![vec![RusqliteValue::Text(
-            r#"{"a":{"b":[1,2,3]},"c":"é"}"#.to_string()
-        )]]
-    );
+    assert_that!(result).is_equal_to(vec![row![r#"{"a":{"b":[1,2,3]},"c":"é"}"#]]);
 
     let result = limbo_exec_rows(
         &conn,
         r#"SELECT json_remove(jsonb('{"a":1,"b":2}'), '$.a')"#,
     );
-    assert_eq!(
-        result,
-        vec![vec![RusqliteValue::Text(r#"{"b":2}"#.to_string())]]
-    );
+    assert_that!(result).is_equal_to(vec![row![r#"{"b":2}"#]]);
 
     // Non-ASCII keys and values survive the UTF-8 checks on text payloads.
     let result = limbo_exec_rows(
         &conn,
         r#"SELECT json_extract(jsonb('{"ключ":"значение"}'), '$."ключ"')"#,
     );
-    assert_eq!(
-        result,
-        vec![vec![RusqliteValue::Text("значение".to_string())]]
-    );
+    assert_that!(result).is_equal_to(vec![row!["значение"]]);
 
     // Nesting within the depth limit still round-trips through a blob.
     let result = limbo_exec_rows(&conn, &format!("SELECT json({})", nested_arrays(100)));
-    assert_eq!(
-        result,
-        vec![vec![RusqliteValue::Text(format!(
-            "{}[]{}",
-            "[".repeat(100),
-            "]".repeat(100)
-        ))]]
-    );
+    assert_that!(result).is_equal_to(vec![row![format!(
+        "{}[]{}",
+        "[".repeat(100),
+        "]".repeat(100)
+    )]]);
 }

@@ -1,0 +1,51 @@
+@database :memory:
+
+test mvcc-checkpoint-before-delete {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT value FROM generate_series(1, 3);
+    CREATE INDEX lol ON t(x);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    DELETE FROM t WHERE x = 2;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    mvcc
+    0|0|0
+    1
+    3
+}
+
+test mvcc-delete-then-checkpoint {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT value FROM generate_series(1, 3);
+    CREATE INDEX lol ON t(x);
+    DELETE FROM t WHERE x = 2;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    mvcc
+    0|0|0
+    1
+    3
+}
+
+test mvcc-checkpoint-delete-checkpoint {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT value FROM generate_series(1, 3);
+    CREATE INDEX lol ON t(x);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    DELETE FROM t WHERE x = 2;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    mvcc
+    0|0|0
+    0|0|0
+    1
+    3
+}

@@ -15,7 +15,7 @@ use crate::{
     busy::BusyHandlerState,
     parameters,
     schema::Trigger,
-    stats::refresh_analyze_stats,
+    stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
     turso_assert,
     vdbe::{
@@ -314,6 +314,9 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// Post-ANALYZE stats refresh still in flight. `_step` drives it, handing
+    /// its waits to the caller, and reports `Done` only once it has finished.
+    analyze_refresh: Option<RefreshAnalyzeStatsState>,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
     /// explicit checkpoints can subtract it — an open blob handle must not
@@ -402,6 +405,7 @@ impl Statement {
             counted_as_active_root: false,
             is_blob_handle: false,
             nested_guard_active,
+            analyze_refresh: None,
         }
     }
 
@@ -560,6 +564,12 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        // ANALYZE already ran to Done; only its stats refresh is outstanding.
+        // Checked first: the root-statement count was released at Done, so
+        // `prepare_step` must not re-register this statement as a root.
+        if self.analyze_refresh.is_some() {
+            return self.drive_analyze_refresh(waker);
+        }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
@@ -587,6 +597,35 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker),
         };
         self.finish_step(res, waker)
+    }
+
+    /// Advance the post-ANALYZE stats refresh. Returns `IO`/`Yield` while the
+    /// `sqlite_stat1` scan waits and `Done` once it finished or gave up; the
+    /// refresh is best-effort, so its errors are logged, not surfaced.
+    fn drive_analyze_refresh(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let Some(refresh) = self.analyze_refresh.as_mut() else {
+            return Ok(StepResult::Done);
+        };
+        match refresh_analyze_stats_nonblock(&self.program.connection, refresh) {
+            Ok(crate::IOResult::IO(io)) => {
+                self.busy = true;
+                io.set_waker(waker);
+                if io.is_explicit_yield() {
+                    return Ok(StepResult::Yield);
+                }
+                // Park the completion where `take_io_completions` finds it,
+                // like an instruction waiting on I/O would.
+                self.state.io_completions = Some(io);
+                return Ok(StepResult::IO);
+            }
+            Ok(crate::IOResult::Done(())) => {}
+            Err(err) => {
+                tracing::warn!("Failed to refresh analyze stats after ANALYZE: {err}");
+            }
+        }
+        self.analyze_refresh = None;
+        self.busy = false;
+        Ok(StepResult::Done)
     }
 
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
@@ -696,7 +735,13 @@ impl Statement {
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
                 self.release_active_root_if_counted();
-                refresh_analyze_stats(&self.program.connection);
+                // Drive the refresh as a state machine instead of pumping
+                // `io.step()` here: its `sqlite_stat1` scan can have to wait
+                // for another transaction, and only the caller's scheduler can
+                // let that transaction run. Until it finishes this statement
+                // keeps reporting IO/Yield, then Done.
+                self.analyze_refresh = Some(RefreshAnalyzeStatsState::Start);
+                return self.drive_analyze_refresh(waker);
             }
         } else {
             self.busy = true;
@@ -773,6 +818,12 @@ impl Statement {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
+    }
+
+    pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
+        let result = self.program.abort(&self.pager, err, &mut self.state, false);
+        self.state.execution_state = vdbe::ProgramExecutionState::Failed;
+        result
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -1514,7 +1565,16 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
-        if let Some(io) = self.state.io_completions.take() {
+        // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement
+        // is a read-only SELECT, so dropping it never has to block.
+        self.analyze_refresh = None;
+
+        let in_flight = self
+            .state
+            .io_completions
+            .take()
+            .filter(|io| !io.0.is_wait());
+        if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(
                     &mut reset_error,
@@ -1735,7 +1795,7 @@ impl Drop for Statement {
 mod tests {
     use super::*;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1747,7 +1807,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        db.connect()
+        db.connect(ConnectOpts::new())
     }
 
     #[test]
@@ -1833,6 +1893,22 @@ mod tests {
     }
 
     #[test]
+    fn finish_seek_counts_a_deferred_table_seek() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 10), (2, 2, 20)")
+            .unwrap();
+
+        // The index finds the row, and FinishSeek moves the table cursor to it.
+        let mut stmt = conn.prepare("UPDATE t SET b = 5 WHERE a = 1").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().btree_deferred_seeks, 1);
+        assert_eq!(stmt.metrics().btree_table_seeks, 1);
+    }
+
+    #[test]
     fn test_metrics_persist_across_reset() {
         let conn = open_test_connection().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
@@ -1868,6 +1944,45 @@ mod tests {
         assert_eq!(metrics.btree_table_seeks, 1);
         assert_eq!(metrics.btree_index_seeks, 1);
         assert_eq!(metrics.btree_deferred_seeks, 1);
+    }
+
+    #[test]
+    fn test_correlated_subquery_runs_after_selective_join() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, allowed_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE allowed(id INTEGER PRIMARY KEY, enabled INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE inner_rows(outer_id INTEGER, value INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX inner_outer_id ON inner_rows(outer_id)")
+            .unwrap();
+        conn.execute("INSERT INTO allowed VALUES (1, 0), (2, 1)")
+            .unwrap();
+        conn.execute("INSERT INTO outer_rows VALUES (1, 1), (2, 1), (3, 2)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inner_rows
+             SELECT id, CASE WHEN id = 3 THEN 0 ELSE id END FROM outer_rows",
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.id
+                 FROM outer_rows o CROSS JOIN allowed a
+                 WHERE a.id = o.allowed_id
+                   AND a.enabled = 1
+                   AND EXISTS (
+                       SELECT 1 FROM inner_rows i
+                       WHERE i.outer_id = o.id AND i.value <> o.id
+                   )",
+            )
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+
+        assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
+        assert_eq!(stmt.metrics().btree_index_seeks, 1);
     }
 
     #[test]

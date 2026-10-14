@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use turso_core::{Database, MemoryYieldIO, SqliteDialect, StepResult, IO};
+use turso_core::{ConnectOpts, Database, MemoryYieldIO, SqliteDialect, StepResult, IO};
 
 fn exec_sql(conn: &Arc<turso_core::Connection>, io: &dyn IO, sql: &str) -> turso_core::Result<()> {
     let mut stmt = conn.prepare(sql)?;
@@ -54,7 +54,7 @@ fn test_abandoned_create_index_does_not_poison_later_allocation() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let setup_conn = db.connect().unwrap();
+    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
 
     exec_sql(&setup_conn, io.as_ref(), "PRAGMA page_size = 512").unwrap();
     exec_sql(&setup_conn, io.as_ref(), "CREATE TABLE t(v BLOB)").unwrap();
@@ -77,7 +77,7 @@ fn test_abandoned_create_index_does_not_poison_later_allocation() {
     }
     drop(setup_conn);
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     exec_sql(&conn, io.as_ref(), "BEGIN").unwrap();
     drop_statement_at_io(&conn, io.as_ref(), "CREATE INDEX idx_t_v ON t(v)", 45);
 

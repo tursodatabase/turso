@@ -48,12 +48,12 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
+use super::sqlite3_ondisk::{read_varint, read_varint_len, split_varint};
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -137,7 +137,7 @@ mod page_inner {
         /// requests unpinning via [Page::unpin], the pin count will still be >0 if the outer
         /// code path has not yet requested to unpin the page as well.
         ///
-        /// Note that [PageCache::clear] evicts the pages even if pinned, so as long as
+        /// Note that `PageCache::clear` evicts the pages even if pinned, so as long as
         /// we clear the page cache on errors, pins will not 'leak'.
         pub pin_count: AtomicUsize,
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
@@ -147,8 +147,8 @@ mod page_inner {
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
         /// read does not go through the `Option`, the `Arc` and the `Buffer`
-        /// variant on every access. Null and 0 while `buffer` is `None`.
-        data_ptr: *mut u8,
+        /// variant on every access.
+        data_ptr: std::ptr::NonNull<u8>,
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
@@ -162,7 +162,7 @@ mod page_inner {
 
     // Methods moved from PageContent - these provide btree page access
     impl PageInner {
-        /// Creates a new PageInner from an Arc<Buffer>.
+        /// Creates a new PageInner from an `Arc<Buffer>`.
         pub fn new(buffer: Arc<Buffer>) -> Self {
             let mut inner = Self::unloaded(0);
             inner.set_buffer(buffer);
@@ -183,7 +183,7 @@ mod page_inner {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                data_ptr: std::ptr::null_mut(),
+                data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
             }
@@ -197,29 +197,34 @@ mod page_inner {
 
         /// Installs the page data buffer.
         pub fn set_buffer(&mut self, buffer: Arc<Buffer>) {
-            self.data_ptr = buffer.as_mut_ptr();
+            self.data_ptr = std::ptr::NonNull::new(buffer.as_mut_ptr())
+                .expect("a page buffer is never at address zero");
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
         pub fn take_buffer(&mut self) -> Option<Arc<Buffer>> {
-            self.data_ptr = std::ptr::null_mut();
+            self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
             self.buffer.take()
         }
 
-        /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+        /// Returns the page data as a mutable slice.
         #[inline(always)]
         #[allow(clippy::mut_from_ref)]
         pub fn as_ptr(&self) -> &mut [u8] {
-            turso_assert!(!self.data_ptr.is_null(), "buffer not loaded");
-            // SAFETY: `data_ptr`/`data_len` describe the bytes of the `Arc<Buffer>`
-            // held in `self.buffer`, which stays alive and does not move while it is
-            // installed. Handing out `&mut [u8]` from `&self` mirrors
-            // `Buffer::as_mut_slice`; the page byte range is mutated only under the
-            // pager's own exclusion rules, as before.
-            unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) }
+            // SAFETY: `set_buffer` caches the pointer and length from the same `Buffer`
+            // and stores its `Arc` in `buffer`, which keeps the allocation alive at a
+            // stable address. `unloaded` and `take_buffer` pair a dangling pointer with
+            // length zero, which is valid for an empty slice.
+            //
+            // The returned `&mut [u8]` must be exclusive: no other `&[u8]` or `&mut [u8]`
+            // into this buffer may be live while it exists. `Page::get` reaches
+            // `PageInner` through `UnsafeCell`. The locked flag marks I/O in flight, and
+            // the pin count prevents eviction; neither excludes another reader. Callers
+            // must enforce this exclusivity.
+            unsafe { std::slice::from_raw_parts_mut(self.data_ptr.as_ptr(), self.data_len) }
         }
 
         /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
@@ -429,6 +434,34 @@ impl PageInner {
         self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
+    #[inline(always)]
+    pub fn btree_free_space_fields(&self) -> BtreeFreeSpaceFields {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + LEAF_PAGE_HEADER_SIZE_BYTES];
+        let is_interior = window[BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
+        let cell_content_area = u16::from_be_bytes([
+            window[BTREE_CELL_CONTENT_AREA],
+            window[BTREE_CELL_CONTENT_AREA + 1],
+        ]);
+        BtreeFreeSpaceFields {
+            header_size: (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+                + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            cell_count: u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]])
+                as usize,
+            first_freeblock: u16::from_be_bytes([
+                window[BTREE_FIRST_FREEBLOCK],
+                window[BTREE_FIRST_FREEBLOCK + 1],
+            ]),
+            cell_content_area: if cell_content_area == 0 {
+                PageSize::MAX
+            } else {
+                cell_content_area as u32
+            },
+            num_frag_free_bytes: window[BTREE_FRAGMENTED_BYTES_COUNT],
+        }
+    }
+
     #[inline]
     pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
         match self.page_type()? {
@@ -547,8 +580,7 @@ impl PageInner {
         let (size, len) = read_varint(buf.get(cell_offset..)?).ok()?;
         let mut start = cell_offset + len;
         if is_table {
-            let (_, rowid_len) = read_varint(buf.get(start..)?).ok()?;
-            start += rowid_len;
+            start += read_varint_len(buf.get(start..)?).ok()?;
         }
         let max_local = if is_table {
             limits.max_local_table
@@ -572,24 +604,22 @@ impl PageInner {
     pub fn cell_table_leaf_read_header(&self, idx: usize) -> crate::Result<TableLeafCellHeader> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let pointer_slot =
+            self.offset() + LEAF_PAGE_HEADER_SIZE_BYTES + (idx * CELL_PTR_SIZE_BYTES);
         // Bound-check the array entry: `idx` is the untrusted on-disk cell count.
         crate::assert_or_bail_corrupt!(
-            self.offset() + cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
+            pointer_slot + CELL_PTR_SIZE_BYTES <= buf.len(),
             "cell pointer array index {} out of bounds for page size {}",
             idx,
             buf.len()
         );
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
-        let mut pos = cell_pointer;
-        let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
-        let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
+        let cell_start = u16::from_be_bytes([buf[pointer_slot], buf[pointer_slot + 1]]) as usize;
+        let cell = crate::slice_in_bounds_or_corrupt!(buf, cell_start..);
+        let (payload_size, cell) = split_varint(cell)?;
+        let (rowid, cell) = split_varint(cell)?;
         Ok(TableLeafCellHeader {
             rowid: rowid as i64,
-            payload_start: pos,
+            payload_start: buf.len() - cell.len(),
             payload_size,
         })
     }
@@ -728,6 +758,15 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(usize, usize)> {
+        let (start, len, _) = self.cell_get_raw_region_and_overflow(idx, usable_size)?;
+        Ok((start, len))
+    }
+
+    pub fn cell_get_raw_region_and_overflow(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let page_type = self.page_type()?;
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
@@ -751,10 +790,11 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> crate::Result<(usize, usize)> {
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
+        let mut overflows = false;
         let len = match page_type {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) =
@@ -765,6 +805,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     4 + local_size + n_payload
                 } else {
                     4 + len_payload as usize + n_payload
@@ -784,6 +825,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload
                 } else {
                     let mut size = len_payload as usize + n_payload;
@@ -804,6 +846,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload + n_rowid
                 } else {
                     let mut size = len_payload as usize + n_payload + n_rowid;
@@ -821,12 +864,31 @@ impl PageInner {
             start + len,
             buf.len()
         );
-        Ok((start, len))
+        let first_overflow_page = if overflows {
+            let at = start + len - 4;
+            Some(u32::from_be_bytes(
+                buf[at..at + 4].try_into().expect("four bytes"),
+            ))
+        } else {
+            None
+        };
+        Ok((start, len, first_overflow_page))
     }
 
     #[inline(always)]
     pub fn is_leaf(&self) -> bool {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    #[inline(always)]
+    pub fn leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let base = self.offset();
+        let header = &buf[base..base + BTREE_CELL_COUNT + 2];
+        (
+            header[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([header[BTREE_CELL_COUNT], header[BTREE_CELL_COUNT + 1]]) as usize,
+        )
     }
 
     /// True for table pages (interior or leaf). A corrupt page type byte
@@ -860,6 +922,14 @@ impl PageInner {
         }
         println!("--------------");
     }
+}
+
+pub struct BtreeFreeSpaceFields {
+    pub header_size: usize,
+    pub cell_count: usize,
+    pub first_freeblock: u16,
+    pub cell_content_area: u32,
+    pub num_frag_free_bytes: u8,
 }
 
 /// Type alias for backward compatibility - PageContent is now PageInner
@@ -972,7 +1042,7 @@ impl Page {
     }
 
     #[inline]
-    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
+    /// caller must ensure that `Pager::dirty_pages` will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id());
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -1504,6 +1574,36 @@ impl Savepoint {
     }
 }
 
+pub struct SharedPagerState {
+    init_lock: Mutex<()>,
+    init_page_1: ArcSwapOption<Page>,
+    page_size: AtomicU32,
+}
+
+impl SharedPagerState {
+    pub fn new(init_page_1: Option<PageRef>) -> Self {
+        let page_size = init_page_1.as_ref().map_or(0, |page| {
+            let contents = page.get_contents();
+            bytemuck::from_bytes::<DatabaseHeader>(&contents.as_ptr()[0..DatabaseHeader::SIZE])
+                .page_size
+                .get()
+        });
+        Self {
+            init_lock: Mutex::new(()),
+            init_page_1: ArcSwapOption::new(init_page_1),
+            page_size: AtomicU32::new(page_size),
+        }
+    }
+
+    pub(crate) fn initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
+
+    pub(crate) fn is_init_locked(&self) -> bool {
+        self.init_lock.try_lock().is_none()
+    }
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -1540,16 +1640,13 @@ pub struct Pager {
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
-    /// Mutex for synchronizing database initialization to prevent race conditions
-    init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
     /// The state of the current allocate page1 operation.
     allocate_page1_state: RwLock<AllocatePage1State>,
-    /// Cache page_size and reserved_space at Pager init and reuse for subsequent
+    /// Cache reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
-    pub(crate) page_size: AtomicU32,
     reserved_space: AtomicU16,
     /// Schema cookie cache.
     ///
@@ -1569,8 +1666,7 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
-    /// In Memory Page 1 for Empty Dbs
-    init_page_1: Arc<ArcSwapOption<Page>>,
+    shared: Arc<SharedPagerState>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
@@ -1826,10 +1922,9 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
-        init_lock: Arc<Mutex<()>>,
-        init_page_1: Arc<ArcSwapOption<Page>>,
+        shared: Arc<SharedPagerState>,
     ) -> Result<Self> {
-        let allocate_page1_state = if init_page_1.load().is_some() {
+        let allocate_page1_state = if shared.init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
             RwLock::new(AllocatePage1State::Done)
@@ -1860,9 +1955,7 @@ impl Pager {
             checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
-            init_lock,
             allocate_page1_state,
-            page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
@@ -1879,7 +1972,7 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
-            init_page_1,
+            shared,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
@@ -2035,10 +2128,6 @@ impl Pager {
         // No-op: FullFsync only has effect on Apple platforms
     }
 
-    pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
-        self.init_page_1.clone()
-    }
-
     /// Read page 1 (the database header page) using the header_ref_state state machine.
     /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
     fn read_header_page(&self) -> IOResultOr<PageRef> {
@@ -2048,7 +2137,7 @@ impl Pager {
             match state {
                 HeaderRefState::Start => {
                     // If db is not initialized, return the in-memory page
-                    if let Some(page1) = self.init_page_1.load_full() {
+                    if let Some(page1) = self.shared.init_page_1.load_full() {
                         return Ok(IOResult::Done(page1));
                     }
 
@@ -2140,7 +2229,7 @@ impl Pager {
             cur_savepoint.write_offset.load(Ordering::SeqCst)
         };
         let page_id = page.get().id();
-        let page_size = self.page_size.load(Ordering::SeqCst) as usize;
+        let page_size = self.shared.page_size.load(Ordering::SeqCst) as usize;
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
@@ -2455,7 +2544,7 @@ impl Pager {
 
         let mut rollback_bitset = RoaringBitmap::new();
         let mut current_offset = journal_start_offset;
-        let page_size = self.page_size.load(Ordering::SeqCst) as u64;
+        let page_size = self.shared.page_size.load(Ordering::SeqCst) as u64;
         let mut dirty_pages = self.dirty_pages.write();
 
         while current_offset < journal_end_offset {
@@ -2556,11 +2645,11 @@ impl Pager {
         PENDING_BYTE
     }
 
-    /// From SQLITE: https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608 \
-    /// The database page the [PENDING_BYTE] occupies. This page is never used.
+    /// From SQLITE: <https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608> \
+    /// The database page the `PENDING_BYTE` occupies. This page is never used.
     pub fn pending_byte_page_id(&self) -> Option<u32> {
         // PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
-        let page_size = self.page_size.load(Ordering::SeqCst);
+        let page_size = self.shared.page_size.load(Ordering::SeqCst);
         Self::get_pending_byte()
             .checked_div(page_size)
             .map(|val| val + 1)
@@ -2981,7 +3070,7 @@ impl Pager {
                 .io
                 .block(|| self.with_header(|header| header.page_size))
                 .unwrap_or_default();
-            self.page_size.store(size.get(), Ordering::SeqCst);
+            self.set_page_size(size);
             size
         });
 
@@ -3004,12 +3093,15 @@ impl Pager {
     }
 
     pub fn db_initialized(&self) -> bool {
-        self.init_page_1.load().is_none()
+        self.shared.initialized()
     }
 
-    /// Set the initial page size for the database. Should only be called before the database is initialized
+    /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
-        turso_assert!(!self.db_initialized());
+        let _lock = self.shared.init_lock.lock();
+        if self.db_initialized() {
+            return Ok(());
+        }
         if let Some(codec) = self.page_codec_external() {
             let reserved_space = codec.required_reserved_bytes();
             if !size.has_valid_reserved_space(reserved_space) {
@@ -3043,8 +3135,8 @@ impl Pager {
             (size.get() - header.reserved_space as u32) as usize,
         );
 
-        self.init_page_1.store(Some(page));
-        self.page_size.store(size.get(), Ordering::SeqCst);
+        self.shared.init_page_1.store(Some(page));
+        self.set_page_size(size);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
@@ -3088,7 +3180,7 @@ impl Pager {
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.page_size.load(Ordering::SeqCst);
+        let value = self.shared.page_size.load(Ordering::SeqCst);
         if value == 0 {
             None
         } else {
@@ -3098,7 +3190,7 @@ impl Pager {
 
     /// Get the current page size, panicking if not set.
     pub fn get_page_size_unchecked(&self) -> PageSize {
-        let value = self.page_size.load(Ordering::SeqCst);
+        let value = self.shared.page_size.load(Ordering::SeqCst);
         turso_assert_ne!(value, 0);
         PageSize::new(value).expect("invalid page size stored")
     }
@@ -3117,7 +3209,7 @@ impl Pager {
 
     /// Set the page size. Used internally when page size is determined.
     pub fn set_page_size(&self, size: PageSize) {
-        self.page_size.store(size.get(), Ordering::SeqCst);
+        self.shared.page_size.store(size.get(), Ordering::SeqCst);
     }
 
     /// Get the current reserved space. Returns None if not set yet.
@@ -3154,14 +3246,13 @@ impl Pager {
         self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
-    /// Get the schema cookie, using the cached value if available to avoid reading page 1.
     pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
-        // Try to use cached value first
-        if let Some(cookie) = self.get_schema_cookie_cached() {
-            return Ok(IOResult::Done(cookie));
-        }
-        // If not cached, read from header and cache it
-        self.with_header(|header| header.schema_cookie.get())
+        self.with_header(|header| {
+            if self.db_initialized() {
+                self.set_reserved_space(header.reserved_space);
+            }
+            header.schema_cookie.get()
+        })
     }
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
@@ -3220,7 +3311,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
         if !self.db_initialized() {
-            if let Some(_lock) = self.init_lock.try_lock() {
+            if let Some(_lock) = self.shared.init_lock.try_lock() {
                 return Ok(self.allocate_page1()?.map(|_| ()));
             }
             // Give a chance for the allocation to happen elsewhere
@@ -3296,8 +3387,8 @@ impl Pager {
     }
 
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
-    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
-    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
+    /// if update_transaction_state set to false, then `Connection::transaction_state` left unchanged
+    /// if update_transaction_state set to true, then `Connection::transaction_state` reset to `TransactionState::None` in case when method completes without error
     /// `sync_mode` belongs to this pager's database because attached databases
     /// can use a different synchronous mode from the connection's main database.
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3354,6 +3445,7 @@ impl Pager {
                 _ => {
                     return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
+                        connection.get_wal_autocheckpoint(),
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
@@ -3781,15 +3873,14 @@ impl Pager {
             io.open_file("test.db", OpenFlags::Create, true).unwrap(),
         ));
         let buffer_pool = BufferPool::begin_init(&io, (pages * page_size) as usize);
-        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
         Pager::new(
             db_file,
             None,
             io,
             PageCache::new(cache_capacity),
             buffer_pool,
-            Arc::new(Mutex::new(())),
-            init_page_1,
+            shared,
         )
         .unwrap()
     }
@@ -4398,6 +4489,7 @@ impl Pager {
     pub fn commit_wal(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4413,7 +4505,12 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(
+            allowed_auto_actions,
+            checkpoint_threshold,
+            sync_mode,
+            data_sync_retry,
+        );
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -4429,6 +4526,7 @@ impl Pager {
     fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4690,7 +4788,7 @@ impl Pager {
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
-                        && wal.should_checkpoint();
+                        && wal.should_checkpoint(checkpoint_threshold);
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -4787,9 +4885,12 @@ impl Pager {
             );
         }
         if header.page_number == 1 {
-            let db_size = self
-                .io
-                .block(|| self.with_header(|header| header.database_size))?;
+            let db_size = self.io.block(|| {
+                self.with_header(|header| {
+                    self.set_reserved_space(header.reserved_space);
+                    header.database_size
+                })
+            })?;
             tracing::debug!("truncate page_cache as first page was written: {}", db_size);
             let mut page_cache = self.page_cache.write();
             page_cache.truncate(db_size.get() as usize).map_err(|e| {
@@ -5364,7 +5465,7 @@ impl Pager {
     /// database handle, SQLite checks if if there are other connections to the
     /// same database, and if there are no other database connection (if the
     /// connection being closed is the last open connection to the database),
-    /// then SQLite performs a [checkpoint] before closing the connection and
+    /// then SQLite performs a checkpoint before closing the connection and
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
@@ -5592,9 +5693,7 @@ impl Pager {
                 default_header.reserved_space = reserved_space_bytes;
                 self.set_reserved_space(reserved_space_bytes);
 
-                if let Some(size) = self.get_page_size() {
-                    default_header.page_size = size;
-                }
+                turso_assert_eq!(Some(default_header.page_size), self.get_page_size());
 
                 tracing::debug!(
                     "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
@@ -5669,7 +5768,7 @@ impl Pager {
             LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
         })?;
         // After we wrote the header page, we may now set this None, to signify we initialized
-        self.init_page_1.store(None);
+        self.shared.init_page_1.store(None);
         page.unpin();
         *self.allocate_page1_state.write() = AllocatePage1State::Done;
         Ok(IOResult::Done(page))
@@ -5778,6 +5877,12 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
+                        if next_leaf_page_id < 2 || next_leaf_page_id > header.database_size.get() {
+                            crate::bail_corrupt_error!(
+                                "freelist leaf page {next_leaf_page_id} is outside the database of {} pages",
+                                header.database_size.get()
+                            );
+                        }
                         // Pin + state-advance happen only on `Done` so a
                         // spill yield doesn't double-pin the leaf page.
                         let (leaf_page, c) =
@@ -5809,12 +5914,12 @@ impl Pager {
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist trunk page has overflow cells",
-                        { "page_id": trunk_page.get().id() }
-                    );
+                    if !trunk_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist trunk page {} is in use by a b-tree",
+                            trunk_page.get().id()
+                        );
+                    }
                     trunk_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id());
                     {
@@ -5843,12 +5948,12 @@ impl Pager {
                     );
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
-                    // zero out the page
-                    turso_assert!(
-                        leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page has overflow cells",
-                        { "page_id": leaf_page.get().id() }
-                    );
+                    if !leaf_page.get_contents().overflow_cells.is_empty() {
+                        crate::bail_corrupt_error!(
+                            "freelist leaf page {} is in use by a b-tree",
+                            leaf_page.get().id()
+                        );
+                    }
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id());
                     {
@@ -6426,9 +6531,10 @@ mod tests {
     use crate::storage::page_cache::{PageCache, PageCacheKey};
     use crate::storage::wal::{Wal, WalFile, WalFileShared};
     use crate::util::IOExt;
-    use arc_swap::ArcSwapOption;
 
-    use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
+    use super::{
+        default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
+    };
     use crate::{Buffer, Completion, CompletionError, LimboError};
 
     #[test]
@@ -6450,6 +6556,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unloaded_page_exposes_an_empty_data_slice() {
+        let page = super::PageInner::unloaded(1);
+        assert!(page.as_ptr().is_empty());
+    }
+
     fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let buffer_pool = BufferPool::begin_init(&io, 4096 * 128);
@@ -6468,7 +6580,7 @@ mod tests {
             buffer_pool.clone(),
         ));
 
-        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
         let pager = Arc::new(
             Pager::new(
                 db_file,
@@ -6476,8 +6588,7 @@ mod tests {
                 io,
                 PageCache::new(cache_capacity),
                 buffer_pool,
-                Arc::new(crate::sync::Mutex::new(())),
-                init_page_1,
+                shared,
             )
             .unwrap(),
         );
@@ -6625,7 +6736,6 @@ mod ptrmap_tests {
     use crate::storage::pager::{default_page1, Pager};
     use crate::storage::sqlite3_ondisk::PageSize;
     use crate::storage::wal::{WalFile, WalFileShared};
-    use arc_swap::ArcSwapOption;
 
     pub fn run_until_done<T>(
         mut action: impl FnMut() -> IOResultOr<T>,
@@ -6666,15 +6776,14 @@ mod ptrmap_tests {
         ));
 
         // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
-        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
         let pager = Pager::new(
             db_file,
             Some(wal),
             io,
             PageCache::new(sz as usize),
             buffer_pool,
-            Arc::new(Mutex::new(())),
-            init_page_1,
+            shared,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -6733,8 +6842,7 @@ mod ptrmap_tests {
             io,
             PageCache::new(4),
             buffer_pool,
-            Arc::new(Mutex::new(())),
-            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+            Arc::new(SharedPagerState::new(Some(default_page1(None)))),
         )
         .unwrap();
 
@@ -7020,6 +7128,7 @@ mod checkpoint_phase_tests {
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
+    use crate::ConnectOpts;
     use crate::Database;
     use crate::SqliteDialect;
 
@@ -7074,7 +7183,7 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

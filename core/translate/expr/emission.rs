@@ -34,16 +34,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Blob(s) => {
-            let bytes = ast::blob_literal_hex(s)
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    // We assume that sqlite3-parser has already validated that
-                    // the input is valid hex string, thus unwrap is safe.
-                    let hex_byte = std::str::from_utf8(pair).unwrap();
-                    u8::from_str_radix(hex_byte, 16).unwrap()
-                })
-                .try_collect()?;
+            let bytes = ast::blob_literal_bytes(s).try_collect()?;
             program.emit_insn(Insn::Blob {
                 value: bytes,
                 dest: target_register,

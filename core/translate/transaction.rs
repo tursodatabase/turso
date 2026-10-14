@@ -29,15 +29,15 @@ pub fn translate_tx_begin(
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
             // SQLite emits Transaction for every open database (main, temp, each attached)
-            // on BEGIN IMMEDIATE / EXCLUSIVE. We match that exactly. For temp, this may
-            // trigger lazy initialization via `ensure_temp_database` in op_transaction:
-            // an acceptable one-time cost that keeps the opcode sequence identical to SQLite.
+            // on BEGIN IMMEDIATE / EXCLUSIVE. We match that exactly. As in SQLite, the temp
+            // Transaction is a no-op in op_transaction while the temp database has not been
+            // created yet, so BEGIN IMMEDIATE alone never materializes it.
             program.emit_insn(Insn::Transaction {
                 db: crate::MAIN_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            let temp_schema_cookie = temp_schema_cookie(resolver);
             program.emit_insn(Insn::Transaction {
                 db: crate::TEMP_DB_ID,
                 tx_mode: TransactionMode::Write,
@@ -65,7 +65,7 @@ pub fn translate_tx_begin(
             // Temp has no MVCC, so it uses a plain write lock even in
             // Concurrent mode. The op_transaction handler detects this via
             // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            let temp_schema_cookie = temp_schema_cookie(resolver);
             program.emit_insn(Insn::Transaction {
                 db: crate::TEMP_DB_ID,
                 tx_mode: TransactionMode::Write,
@@ -86,6 +86,17 @@ pub fn translate_tx_begin(
         }
     }
     Ok(())
+}
+
+/// Schema cookie for the temp Transaction emitted by BEGIN. Without a temp
+/// database the cookie is 0, the version of an empty schema; avoid
+/// `with_schema`, which would build a throwaway empty temp schema.
+fn temp_schema_cookie(resolver: &Resolver) -> u32 {
+    if resolver.has_temp_database() {
+        resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version)
+    } else {
+        0
+    }
 }
 
 pub fn translate_tx_commit(

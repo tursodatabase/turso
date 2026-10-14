@@ -109,13 +109,10 @@ For more detailed list of SQLite compatibility, please refer to [COMPAT.md](../C
 
 #### MVCC limitations
 
-The MVCC implementation is experimental and has the following limitations:
+MVCC is a supported journal mode. It has the following limitations:
 
-* Indexes cannot be created and databases with indexes cannot be used.
-* All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
-* Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
-* Many features may not work, work incorrectly, and/or cause a panic.
-* Queries may return incorrect results
+* `PRAGMA wal_checkpoint(TRUNCATE)` blocks both readers and writers. Passive checkpointing, which does not block them, is still behind the `--experimental-mvcc-passive-checkpoint` flag.
+* Indexes on `WITHOUT ROWID` tables are not supported.
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
 
 ## The SQL shell

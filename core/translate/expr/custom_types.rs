@@ -212,10 +212,17 @@ pub(super) struct ResolvedOperator {
 /// Operators fire when:
 /// 1. Both operands are columns of the same custom type, OR
 /// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type.
+///    is compatible with the custom type's `value` input type, OR
+/// 3. The operator is arithmetic, the type reads stored values back unchanged,
+///    one operand is a column of that type and the other is anything except a
+///    column of a different custom type. This lets `date + 1`, `date + int_col`
+///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
+///    uses the standard operator.
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
-/// function so both arguments are in the same (encoded) representation.
+/// function so both arguments are in the same (encoded) representation. In case 3
+/// the other operand is passed as is, which is only safe when encoded and decoded
+/// values look the same. The operator function checks its type.
 pub(super) fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -276,47 +283,34 @@ pub(super) fn find_custom_type_operator(
         return None;
     }
 
-    // Case 2: LHS is custom type, RHS is a compatible literal.
-    if let Some(ref lhs) = lhs_info {
-        if let Some(lit_type) = literal_type_name(e2) {
-            if literal_compatible_with_value_type(lit_type, lhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: lhs.column.clone(),
-                            type_def: lhs.type_def.clone(),
-                            which: EncodeArg::Second,
-                        }),
-                    });
-                }
+    let resolve_one_custom_operand =
+        |info: &ExprCustomTypeInfo, other: &ast::Expr, which: EncodeArg| {
+            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
+                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
+            });
+            let pass_other_unencoded =
+                !op.is_comparison() && info.type_def.decode_returns_value_unchanged();
+            if !encode_other && !pass_other_unencoded {
+                return None;
             }
-        }
-    }
+            let (func_name, swap_args, negate) = find_in_type_def(&info.type_def)?;
+            Some(ResolvedOperator {
+                func_name,
+                swap_args,
+                negate,
+                encode_info: encode_other.then(|| OperatorEncodeInfo {
+                    column: info.column.clone(),
+                    type_def: info.type_def.clone(),
+                    which,
+                }),
+            })
+        };
 
-    // Case 3: RHS is custom type, LHS is a compatible literal (reversed).
-    if let Some(ref rhs) = rhs_info {
-        if let Some(lit_type) = literal_type_name(e1) {
-            if literal_compatible_with_value_type(lit_type, rhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: rhs.column.clone(),
-                            type_def: rhs.type_def.clone(),
-                            which: EncodeArg::First,
-                        }),
-                    });
-                }
-            }
-        }
+    match (&lhs_info, &rhs_info) {
+        (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
+        (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
+        _ => None,
     }
-
-    None
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).

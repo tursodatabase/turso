@@ -1051,6 +1051,28 @@ expect {
     3|thirty
 }
 
+# A false inner ON term does not end a FROM query that has a later RIGHT JOIN.
+# The unmatched right row must still reach the target update.
+@cross-check-integrity
+test update-from-false-inner-on-keeps-unmatched-right-row {
+    CREATE TABLE false_on_target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE false_on_left(a INTEGER);
+    CREATE TABLE false_on_middle(b INTEGER);
+    CREATE TABLE false_on_right(id INTEGER, val TEXT);
+    INSERT INTO false_on_target VALUES(1, 'old');
+    INSERT INTO false_on_right VALUES(1, 'new');
+    UPDATE false_on_target
+       SET val = false_on_right.val
+      FROM false_on_left
+      JOIN false_on_middle ON false
+      RIGHT JOIN false_on_right ON true
+     WHERE false_on_target.id = false_on_right.id;
+    SELECT * FROM false_on_target;
+}
+expect {
+    1|new
+}
+
 # RIGHT JOIN ... USING(...) must preserve the matched right-row payload and must
 # not update target rows that only exist on the unmatched left side of the join.
 @cross-check-integrity

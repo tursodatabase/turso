@@ -43,11 +43,14 @@ pub enum Origin {
     TriggerWhen,
     TriggerBody,
 
-    // ---- SELECT / FROM features (not yet generated) ----
+    // ---- SELECT / FROM features ----
     Join,
     LeftJoin,
+    RightJoin,
+    FullJoin,
     CrossJoin,
     NaturalJoin,
+    ParenthesizedJoin,
     CompoundUnion,
     CompoundUnionAll,
     CompoundIntersect,

@@ -1032,6 +1032,51 @@ where
     exec_datetime_general(values, "unixepoch")
 }
 
+pub fn exec_date_plus(lhs: &Value, rhs: &Value) -> Result<Value> {
+    match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (date @ Value::Text(_), Value::Numeric(Numeric::Integer(days)))
+        | (Value::Numeric(Numeric::Integer(days)), date @ Value::Text(_)) => add_days(date, *days),
+        _ => Err(crate::LimboError::Constraint(
+            "a date can only be added to an integer number of days".to_string(),
+        )),
+    }
+}
+
+pub fn exec_date_minus(lhs: &Value, rhs: &Value) -> Result<Value> {
+    match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
+            add_days(lhs, days.saturating_neg())
+        }
+        (Value::Text(_), Value::Text(_)) => {
+            let days = julian_day(lhs)? - julian_day(rhs)?;
+            Ok(Value::from_i64(days.round() as i64))
+        }
+        _ => Err(crate::LimboError::Constraint(
+            "only an integer number of days or a date can be subtracted from a date".to_string(),
+        )),
+    }
+}
+
+fn add_days(date: &Value, days: i64) -> Result<Value> {
+    match exec_date([Value::from_f64(julian_day(date)? + days as f64)]) {
+        Value::Null => Err(crate::LimboError::Constraint(
+            "date out of range".to_string(),
+        )),
+        shifted => Ok(shifted),
+    }
+}
+
+fn julian_day(date: &Value) -> Result<f64> {
+    match exec_julianday([date]) {
+        Value::Numeric(Numeric::Float(jd)) => Ok(f64::from(jd)),
+        _ => Err(crate::LimboError::Constraint(format!(
+            "invalid date value: {date}"
+        ))),
+    }
+}
+
 pub fn exec_timediff<I, E, V>(values: I) -> Value
 where
     V: AsValueRef,

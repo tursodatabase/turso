@@ -211,7 +211,7 @@ jsonb_extract(json_text, path)
 | `json_text` | TEXT or BLOB | A JSON document |
 | `path` | TEXT | One or more JSON path expressions |
 
-**Returns:** With a single path, returns the extracted value using its natural SQL type (INTEGER, REAL, TEXT, or NULL). JSON objects and arrays are returned as TEXT. With multiple paths, returns a JSON array of the extracted values. `jsonb_extract` returns BLOB.
+**Returns:** With a single path, returns the extracted value using its natural SQL type (INTEGER, REAL, TEXT, or NULL). `json_extract` returns JSON objects and arrays as TEXT, while `jsonb_extract` returns them as a JSONB BLOB. With multiple paths, `json_extract` returns a JSON array of the extracted values as TEXT and `jsonb_extract` returns it as a JSONB BLOB.
 
 ```sql
 SELECT json_extract('{"name":"Alice","age":30}', '$.name');

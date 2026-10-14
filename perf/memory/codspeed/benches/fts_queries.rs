@@ -126,8 +126,7 @@ fn benchmark(
 }
 
 fn benchmark_workload(bencher: Bencher, config: FtsConfig) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(config.connections)
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();

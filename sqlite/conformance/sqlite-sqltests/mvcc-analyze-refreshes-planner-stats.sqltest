@@ -1,0 +1,55 @@
+@database :temp:
+@skip-file-if sqlite "MVCC and EXPLAIN QUERY PLAN FORMAT=JSON are not supported in SQLite"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/9109:
+# in MVCC mode an autocommit ANALYZE wrote sqlite_stat1 but did not reload
+# the planner statistics on the same connection, so the next plan still used
+# the default 1000000 row estimate instead of the 100 rows ANALYZE counted.
+
+test mvcc-analyze-writes-sqlite-stat1 {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);
+    WITH RECURSIVE seq(n) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT n + 1 FROM seq WHERE n < 100
+    )
+    INSERT INTO t SELECT n, n FROM seq;
+    ANALYZE;
+    SELECT tbl, idx, stat FROM sqlite_stat1;
+}
+expect {
+    mvcc
+    t||100
+}
+
+test mvcc-analyze-next-plan-uses-new-row-estimate {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);
+    WITH RECURSIVE seq(n) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT n + 1 FROM seq WHERE n < 100
+    )
+    INSERT INTO t SELECT n, n FROM seq;
+    ANALYZE;
+    EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;
+}
+expect pattern {
+    "rows_per_input":100,"output_rows":100,
+}
+
+test wal-analyze-next-plan-uses-new-row-estimate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);
+    WITH RECURSIVE seq(n) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT n + 1 FROM seq WHERE n < 100
+    )
+    INSERT INTO t SELECT n, n FROM seq;
+    ANALYZE;
+    EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;
+}
+expect pattern {
+    "rows_per_input":100,"output_rows":100,
+}

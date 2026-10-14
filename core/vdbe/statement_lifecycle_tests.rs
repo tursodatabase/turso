@@ -8,7 +8,9 @@ use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::sync::{Arc, Mutex};
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 use crate::StepResult;
-use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value};
+use crate::{
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value,
+};
 
 #[derive(Debug)]
 struct FailingPrepareIndexMethod;
@@ -51,6 +53,10 @@ impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
 
     fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
         Ok(Box::new(FailingPrepareCursor::default()))
+    }
+
+    fn backing_schema(&self) -> crate::index_method::BackingSchema {
+        crate::index_method::BackingSchema::default()
     }
 }
 
@@ -180,7 +186,7 @@ fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
         "failing_prepare".to_string(),
         Arc::new(FailingPrepareIndexMethod),
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -337,7 +343,7 @@ fn fts_backing_store_ddl_yields_its_io_instead_of_pumping_it() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -428,7 +434,7 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -495,6 +501,137 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
     );
 }
 
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+#[test]
+fn fts_optimize_resumes_and_rolls_back_at_each_merge_phase() {
+    fts_merge_resumes_and_rolls_back_at_each_phase(false);
+}
+
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+#[test]
+fn fts_auto_merge_resumes_and_rolls_back_at_each_merge_phase() {
+    fts_merge_resumes_and_rolls_back_at_each_phase(true);
+}
+
+#[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
+fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
+    use crate::index_method::{fts::FtsBackingRowDumper, IndexMethodYieldPoint};
+
+    let points = if auto_merge {
+        [
+            IndexMethodYieldPoint::FtsStatementFlushStaged.point(),
+            IndexMethodYieldPoint::FtsAutoMergeClaimStaged.point(),
+            IndexMethodYieldPoint::FtsAutoMergeStaged.point(),
+        ]
+    } else {
+        [
+            IndexMethodYieldPoint::FtsOptimizeFlushStaged.point(),
+            IndexMethodYieldPoint::FtsOptimizeClaimStaged.point(),
+            IndexMethodYieldPoint::FtsOptimizeMergeStaged.point(),
+        ]
+    };
+    for mvcc in [false, true] {
+        for abandon_after in [None, Some(1), Some(2), Some(3)] {
+            let io = Arc::new(crate::MemoryYieldIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                &format!("fts-merge-phases-{auto_merge}-{mvcc}-{abandon_after:?}.db"),
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+            conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+                .unwrap();
+            for id in [2, 7, 11] {
+                conn.execute(format!(
+                    "INSERT INTO docs VALUES ({id}, 'common document {id}')"
+                ))
+                .unwrap();
+            }
+            conn.execute("DELETE FROM docs WHERE id = 7").unwrap();
+            let sql = if auto_merge {
+                conn.execute("PRAGMA fts_merge_threshold = 2").unwrap();
+                "INSERT INTO docs VALUES (19, 'common document 19')"
+            } else {
+                "OPTIMIZE INDEX docs_fts"
+            };
+            conn.set_yield_injector(Some(FixedYieldInjector::new(points)));
+            let mut statement = conn.prepare(sql).unwrap();
+            let mut yields = 0;
+            loop {
+                match statement.step().unwrap() {
+                    StepResult::IO => io.step().unwrap(),
+                    StepResult::Yield => {
+                        yields += 1;
+                        if abandon_after == Some(yields) {
+                            break;
+                        }
+                    }
+                    StepResult::Done => {
+                        assert!(abandon_after.is_none());
+                        assert_eq!(yields, points.len());
+                        break;
+                    }
+                    other => panic!("unexpected result for {sql}: {other:?}"),
+                }
+            }
+            drop(statement);
+            conn.set_yield_injector(None);
+
+            let mut expected = vec![vec![Value::from_i64(2)], vec![Value::from_i64(11)]];
+            if auto_merge && abandon_after.is_none() {
+                expected.push(vec![Value::from_i64(19)]);
+            }
+            conn.execute("BEGIN").unwrap();
+            assert_eq!(get_rows(&conn, "SELECT id FROM docs ORDER BY id"), expected);
+            assert_eq!(
+                get_rows(
+                    &conn,
+                    "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+                ),
+                expected,
+                "mvcc={mvcc}, abandon_after={abandon_after:?}"
+            );
+            let mut dumper =
+                FtsBackingRowDumper::new(&conn, crate::MAIN_DB_ID, "docs_fts").unwrap();
+            loop {
+                match dumper.step().unwrap() {
+                    crate::IOResult::Done(()) => break,
+                    crate::IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
+                }
+            }
+            assert_eq!(
+                dumper
+                    .rows
+                    .iter()
+                    .filter(|(path, ..)| path.starts_with("fts2/seg/"))
+                    .count(),
+                if abandon_after.is_some() { 3 } else { 1 },
+                "mvcc={mvcc}, abandon_after={abandon_after:?}"
+            );
+            drop(dumper);
+            conn.execute("COMMIT").unwrap();
+            conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            assert_eq!(
+                get_rows(
+                    &conn,
+                    "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
+                ),
+                expected
+            );
+        }
+    }
+}
+
 /// Same contract on a backend with no synchronous completions:
 /// `MemoryYieldIO` finishes every read/write/sync only at `io.step()`, the
 /// way a WASM-style host behaves. Any I/O the backing-store DDL performs
@@ -517,7 +654,7 @@ fn fts_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         if mvcc {
             conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
@@ -589,7 +726,7 @@ fn toy_index_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         if mvcc {
             conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
@@ -659,7 +796,7 @@ fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -712,7 +849,7 @@ fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database>
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.close().unwrap();
     db
@@ -732,8 +869,8 @@ impl SameConnectionWal {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
-        let observer = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let observer = db.connect(ConnectOpts::new()).unwrap();
         Self { conn, observer }
     }
 
@@ -748,9 +885,9 @@ impl SameConnectionMvcc {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        let observer = db.connect().unwrap();
+        let observer = db.connect(ConnectOpts::new()).unwrap();
         Self { conn, observer }
     }
 
@@ -947,7 +1084,7 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:returning-owner-interrupted-drop-table";
     let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute(
@@ -1004,7 +1141,7 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
         "reopen should not fail; dropping a RETURNING owner must not commit another statement's interrupted DROP",
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let after = get_rows(
         &conn,
         "SELECT type, name FROM sqlite_schema \
@@ -1343,7 +1480,7 @@ fn test_wal_dropping_one_attached_reader_keeps_sibling_reader_locked() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     drive_attach(&conn, ":memory:wal-attached-sibling-readers-aux", "aux");
     conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY)")
         .unwrap();
@@ -1384,7 +1521,7 @@ fn review_attached_writer_success_is_not_lost_when_sibling_dropped() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let aux = ":memory:review-attached-writer-aux";
     drive_attach(&conn, aux, "aux");
     conn.execute("CREATE TABLE rows(id INTEGER PRIMARY KEY)")
@@ -1414,7 +1551,7 @@ fn review_transactionless_last_sibling_closes_attached_txn() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let aux = ":memory:review-attached-transactionless-aux";
     drive_attach(&conn, aux, "aux");
     conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY)")
@@ -1570,12 +1707,12 @@ fn test_attached_only_returning_writer_defers_shared_auto_txn_commit() {
     let aux_path = aux_dir.path().join("aux.db");
     let aux_path = aux_path.to_str().unwrap();
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     drive_attach(&conn, aux_path, "aux");
     conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
-    let observer = db.connect().unwrap();
+    let observer = db.connect(ConnectOpts::new()).unwrap();
     drive_attach(&observer, aux_path, "aux");
 
     let mut returning = conn
@@ -2065,9 +2202,9 @@ fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connecti
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-    let observer = db.connect().unwrap();
+    let observer = db.connect(ConnectOpts::new()).unwrap();
     (db, conn, observer)
 }
 
@@ -2121,15 +2258,14 @@ fn fts_writes_survive_deferred_shared_autocommit() {
 
 /// Dropping a connection mid-transaction is how the engine recovers when an
 /// application abandons its handle (e.g. after a panic): Connection::drop
-/// rolls the transaction back and releases its locks and leases. A
-/// transaction-owned index-method cursor registered on the connection holds a
-/// context whose Arc points back at that same connection, and the cycle must
-/// not keep the connection alive — otherwise the drop recovery never runs,
-/// the MVCC transaction stays active, and its FTS write lease blocks every
-/// other writer forever.
+/// rolls the transaction back and releases its locks. A transaction-owned
+/// index-method cursor registered on the connection holds a context whose
+/// Arc points back at that same connection, and the cycle must not keep the
+/// connection alive. Otherwise the drop recovery never runs and the MVCC
+/// transaction stays active with its rows locked.
 #[cfg(feature = "fts")]
 #[test]
-fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
+fn dropping_connection_mid_transaction_releases_its_fts_writes() {
     let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-conn-drop-mid-tx");
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -2145,7 +2281,7 @@ fn dropping_connection_mid_transaction_releases_its_fts_write_lease() {
 
     observer
         .execute("INSERT INTO docs VALUES (2, 'after the drop')")
-        .expect("dropping the writing connection must release its FTS write lease");
+        .expect("dropping the writing connection must release its FTS writes");
     assert!(
         weak.upgrade().is_none(),
         "a dropped connection must be freed; a registered index-method cursor must not keep it alive"
@@ -2171,7 +2307,7 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
@@ -2212,5 +2348,83 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
         ids_from_query(&conn, "SELECT id FROM docs WHERE fts_match(body, 'kept')"),
         vec![1],
         "the kept row's FTS document must survive the interrupt request"
+    );
+}
+
+static KEEPALIVE_CONTEXT_DESTROYED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn keepalive_destroy_context(_context: usize) {
+    KEEPALIVE_CONTEXT_DESTROYED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+unsafe extern "C" fn keepalive_init(_context: usize) -> *mut turso_ext::AggCtx {
+    unreachable!("the test never steps the statement")
+}
+
+unsafe extern "C" fn keepalive_step(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+    _argc: i32,
+    _argv: *const turso_ext::Value,
+) -> turso_ext::Value {
+    unreachable!("the test never steps the statement")
+}
+
+unsafe extern "C" fn keepalive_finalize(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+) -> turso_ext::Value {
+    unreachable!("the test never steps the statement")
+}
+
+fn register_keepalive_aggregate(conn: &Arc<Connection>) {
+    conn.syms.write().functions.insert(
+        "keepalive_agg".to_string(),
+        Arc::new(
+            crate::function::ExternalFunc::new_aggregate(
+                "keepalive_agg".to_string(),
+                1,
+                0,
+                (keepalive_init, keepalive_step, keepalive_finalize),
+                Some(keepalive_destroy_context),
+                None,
+                None,
+            )
+            .unwrap(),
+        ),
+    );
+    conn.bump_prepare_context_generation();
+}
+
+#[test]
+fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:external-aggregate-context-lifetime",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    register_keepalive_aggregate(&conn);
+    let stmt = conn.prepare("SELECT keepalive_agg(x) FROM t").unwrap();
+    register_keepalive_aggregate(&conn);
+    assert_eq!(
+        KEEPALIVE_CONTEXT_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the replaced registration is still used by the prepared statement"
+    );
+
+    drop(stmt);
+    assert_eq!(
+        KEEPALIVE_CONTEXT_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropping the last statement releases the replaced registration"
     );
 }

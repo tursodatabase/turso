@@ -1,15 +1,10 @@
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::{
-    criterion::{Output, PProfProfiler},
-    flamegraph::Options,
-};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO, SqliteDialect};
+use turso_core::{ConnectOpts, Database, PlatformIO, SqliteDialect};
 
 // Title: JSONB Function Benchmarking
 
@@ -30,7 +25,7 @@ fn bench(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Benchmark JSONB with different payload sizes
     let json_sizes = [
@@ -502,7 +497,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Select a subset of JSON payloads to use in the sequential test
     let json_payloads = [
@@ -662,7 +657,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let json_patch_cases = [
         (
@@ -951,14 +946,6 @@ fn bench_json_patch(criterion: &mut Criterion) {
     }
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(Some(Options::default()))));
-    targets = bench, bench_sequential_jsonb, bench_json_patch
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

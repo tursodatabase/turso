@@ -228,6 +228,127 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_delete_all_keeps_existing_reader_snapshots(tmp_db: TempDatabase) {
+    let table_reader = tmp_db.connect_limbo();
+    let index_reader = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    writer.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    writer
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX items_value ON items(value)")
+        .unwrap();
+    writer
+        .execute(
+            "WITH RECURSIVE c(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 300
+             ) INSERT INTO items SELECT x, printf('value-%04d', x) FROM c",
+        )
+        .unwrap();
+
+    table_reader.execute("BEGIN").unwrap();
+    index_reader.execute("BEGIN").unwrap();
+    let mut table_scan = table_reader
+        .prepare("SELECT id FROM items ORDER BY id")
+        .unwrap();
+    let mut index_scan = index_reader
+        .prepare("SELECT id FROM items INDEXED BY items_value ORDER BY value")
+        .unwrap();
+
+    let mut table_ids = Vec::new();
+    let mut index_ids = Vec::new();
+    for (statement, ids) in [
+        (&mut table_scan, &mut table_ids),
+        (&mut index_scan, &mut index_ids),
+    ] {
+        loop {
+            match statement.step().unwrap() {
+                StepResult::Row => {
+                    ids.push(statement.row().unwrap().get::<i64>(0).unwrap());
+                    break;
+                }
+                StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+                other => panic!("reader did not yield its first row: {other:?}"),
+            }
+        }
+    }
+
+    writer.execute("DELETE FROM items").unwrap();
+
+    for (statement, ids) in [
+        (&mut table_scan, &mut table_ids),
+        (&mut index_scan, &mut index_ids),
+    ] {
+        loop {
+            match statement.step().unwrap() {
+                StepResult::Row => ids.push(statement.row().unwrap().get::<i64>(0).unwrap()),
+                StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("reader failed after whole-table DELETE: {other:?}"),
+            }
+        }
+    }
+
+    let expected = (1..=300).collect::<Vec<_>>();
+    assert_eq!(table_ids, expected, "table reader lost its WAL snapshot");
+    assert_eq!(index_ids, expected, "index reader lost its WAL snapshot");
+    drop(table_scan);
+    drop(index_scan);
+    table_reader.execute("COMMIT").unwrap();
+    index_reader.execute("COMMIT").unwrap();
+
+    let fresh_reader = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = fresh_reader.exec_rows("SELECT id FROM items");
+    assert!(
+        rows.is_empty(),
+        "new readers must observe the committed DELETE"
+    );
+    let integrity: Vec<(String,)> = fresh_reader.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
+fn test_delete_all_while_same_connection_scans_table(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a, b)").unwrap();
+    conn.execute("CREATE TABLE t2(c, d)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(1, 2)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES(3, 4), (5, 6)").unwrap();
+
+    let mut scan = conn
+        .prepare("SELECT CASE WHEN c = 5 THEN b ELSE NULL END AS b, c, d FROM t1, t2")
+        .unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                conn.execute("DELETE FROM t1").unwrap();
+                rows.push(
+                    scan.row()
+                        .unwrap()
+                        .get_values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+            }
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("scan failed after whole-table DELETE: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null, Value::from_i64(3), Value::from_i64(4)],
+            vec![Value::Null, Value::from_i64(5), Value::from_i64(6)],
+        ]
+    );
+}
+
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
@@ -293,16 +414,6 @@ fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     let stmt = conn.query("SELECT COUNT(*) FROM child").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
     assert_eq!(row, vec![Value::from_i64(0)]);
-}
-
-#[turso_macros::test(mvcc)]
-fn test_mvcc_transactions_autocommit(tmp_db: TempDatabase) {
-    let conn1 = tmp_db.connect_limbo();
-
-    // This should work - basic CREATE TABLE in MVCC autocommit mode
-    conn1
-        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
-        .unwrap();
 }
 
 #[turso_macros::test(mvcc)]
@@ -836,26 +947,6 @@ fn test_mvcc_recovery_with_index_and_deletes() {
 }
 
 #[test]
-fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_mvcc(
-        "test_mvcc_checkpoint_before_delete_then_verify_same_session.db",
-    );
-    let conn = tmp_db.connect_limbo();
-
-    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
-    execute_and_log(
-        &conn,
-        "INSERT INTO t SELECT value FROM generate_series(1,3)",
-    )
-    .unwrap();
-    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
-    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
-
-    verify_table_contents(&conn, vec![1, 3]);
-}
-
-#[test]
 fn test_mvcc_checkpoint_before_delete_then_reopen() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_before_delete_then_reopen.db");
     let conn = tmp_db.connect_limbo();
@@ -876,25 +967,6 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
 
     let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
-
-    verify_table_contents(&conn, vec![1, 3]);
-}
-
-#[test]
-fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
-    let tmp_db =
-        TempDatabase::new_with_mvcc("test_mvcc_delete_then_checkpoint_then_verify_same_session.db");
-    let conn = tmp_db.connect_limbo();
-
-    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
-    execute_and_log(
-        &conn,
-        "INSERT INTO t SELECT value FROM generate_series(1,3)",
-    )
-    .unwrap();
-    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
-    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
-    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     verify_table_contents(&conn, vec![1, 3]);
 }
@@ -969,27 +1041,6 @@ fn test_mvcc_delete_then_reopen_no_checkpoint_2() {
     tracing::info!("Reopening database");
     let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
-
-    verify_table_contents(&conn, vec![1, 3]);
-}
-
-#[test]
-fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_mvcc(
-        "test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session.db",
-    );
-    let conn = tmp_db.connect_limbo();
-
-    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
-    execute_and_log(
-        &conn,
-        "INSERT INTO t SELECT value FROM generate_series(1,3)",
-    )
-    .unwrap();
-    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
-    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
-    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     verify_table_contents(&conn, vec![1, 3]);
 }
@@ -2142,100 +2193,6 @@ fn test_update_or_replace_notnull_stmt_rollback(tmp_db: TempDatabase) {
     conn.execute("COMMIT").unwrap();
 }
 
-/// Verify that sqlite_sequence has exactly one row per autoincrement
-/// table once durably committed. WAL achieves this at commit time
-/// (flush_dirty_sequences); MVCC achieves it at checkpoint
-/// (CheckpointState::CompactSequences). Both modes converge after a
-/// checkpoint.
-#[turso_macros::test(mvcc)]
-fn test_mvcc_autoincrement_sqlite_sequence_single_row(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    for i in 1..=5 {
-        conn.execute(format!("INSERT INTO t(v) VALUES ('row{i}')"))
-            .unwrap();
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0, "t");
-    assert_eq!(rows[0].1, 5);
-}
-
-/// Same as above but with two autoincrement tables.
-#[turso_macros::test(mvcc)]
-fn test_mvcc_autoincrement_multiple_tables_sqlite_sequence(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    for i in 1..=3 {
-        conn.execute(format!("INSERT INTO a(v) VALUES ('a{i}')"))
-            .unwrap();
-    }
-    for i in 1..=7 {
-        conn.execute(format!("INSERT INTO b(v) VALUES ('b{i}')"))
-            .unwrap();
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], ("a".to_string(), 3));
-    assert_eq!(rows[1], ("b".to_string(), 7));
-}
-
-/// Stress test: create enough autoincrement tables with enough inserts to
-/// verify sqlite_sequence has exactly one row per table with correct
-/// high-water marks after commit.
-#[turso_macros::test(mvcc)]
-fn test_mvcc_autoincrement_stress_multipage(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-
-    let num_tables = 20;
-    let inserts_per_table = 50;
-
-    for t in 0..num_tables {
-        conn.execute(format!(
-            "CREATE TABLE stress_{t:02}(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
-        ))
-        .unwrap();
-    }
-
-    for t in 0..num_tables {
-        for i in 0..inserts_per_table {
-            conn.execute(format!("INSERT INTO stress_{t:02}(v) VALUES ('r{i}')"))
-                .unwrap();
-        }
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
-    assert_eq!(
-        rows.len(),
-        num_tables,
-        "Exactly one row per table after commit + checkpoint"
-    );
-    for (i, (name, seq)) in rows.iter().enumerate() {
-        assert_eq!(name, &format!("stress_{i:02}"));
-        assert_eq!(
-            *seq, inserts_per_table as i64,
-            "Table {name} should have high-water mark {inserts_per_table}, got {seq}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // P1: High-water mark survives restart
 // ---------------------------------------------------------------------------
@@ -2405,262 +2362,57 @@ fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// P3: sqlite_sequence reflects correct watermark after MVCC commit
-// ---------------------------------------------------------------------------
-
-/// P3: After an MVCC commit + checkpoint, sqlite_sequence reflects the
-/// correct high-water mark with exactly one row per table. The MVCC
-/// contract defers sqlite_sequence sync to checkpoint
-/// (CheckpointState::CompactSequences) — between commit and
-/// checkpoint, sqlite_sequence may transiently lag or be empty for
-/// AUTOINCREMENT tables. The single-row invariant is enforced post-
-/// checkpoint.
-#[turso_macros::test(mvcc)]
-fn test_sqlite_sequence_correct_after_mvcc_commit(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
+/// BEGIN IMMEDIATE emits a write Transaction for temp, but must not create the
+/// per-connection temp database just to lock it (SQLite treats it as a no-op
+/// while temp is not open). Creating it costs a temp file and an fsync on
+/// every new connection.
+#[turso_macros::test]
+fn test_begin_immediate_does_not_create_temp_database(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE seq_commit(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    for i in 1..=5 {
-        conn.execute(format!("INSERT INTO seq_commit(v) VALUES ('row{i}')"))
-            .unwrap();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    for sql in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+        conn.execute(sql).unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("COMMIT").unwrap();
     }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 'seq_commit'");
-    assert_eq!(
-        rows.len(),
-        1,
-        "sqlite_sequence should have exactly one row for 'seq_commit' after checkpoint, \
-         got {} rows",
-        rows.len()
-    );
-    assert_eq!(rows[0].0, "seq_commit");
-    assert_eq!(
-        rows[0].1, 5,
-        "sqlite_sequence watermark should be 5, got {}",
-        rows[0].1
-    );
-}
-
-/// P3 (multiple tables): Same invariant with two autoincrement tables.
-#[turso_macros::test(mvcc)]
-fn test_sqlite_sequence_correct_after_mvcc_commit_multiple_tables(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE alpha(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-    conn.execute("CREATE TABLE beta(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    for i in 1..=3 {
-        conn.execute(format!("INSERT INTO alpha(v) VALUES ('a{i}')"))
-            .unwrap();
-    }
-    for i in 1..=7 {
-        conn.execute(format!("INSERT INTO beta(v) VALUES ('b{i}')"))
-            .unwrap();
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
-    assert_eq!(
-        rows.len(),
-        2,
-        "sqlite_sequence should have 2 rows (one per table) after checkpoint, got {}",
-        rows.len()
-    );
-    assert_eq!(rows[0], ("alpha".to_string(), 3));
-    assert_eq!(rows[1], ("beta".to_string(), 7));
-}
-
-// ---------------------------------------------------------------------------
-// P4: Backing table compacted to one row after commit
-// ---------------------------------------------------------------------------
-
-/// P4 (user sequence): After a commit + checkpoint that called nextval(),
-/// the sequence backing table holds exactly one row with value equal to
-/// the high-water mark. Between commit and checkpoint the backing table
-/// may transiently hold one row per nextval (the autonomous-inner-tx
-/// trail); the single-row invariant is enforced at checkpoint
-/// (CheckpointState::CompactSequences).
-#[turso_macros::test(mvcc)]
-fn test_user_sequence_backing_table_compacted_after_commit(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE SEQUENCE compact_seq START 1 INCREMENT 1")
-        .unwrap();
-
-    for _ in 0..5 {
-        conn.execute("SELECT nextval('compact_seq')").unwrap();
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(i64,)> =
-        conn.exec_rows("SELECT COUNT(*) FROM \"__turso_internal_seq_compact_seq\"");
-    assert_eq!(
-        rows[0].0, 1,
-        "Backing table should have exactly 1 row after checkpoint, got {}",
-        rows[0].0
-    );
-
-    let rows: Vec<(i64,)> =
-        conn.exec_rows("SELECT value FROM \"__turso_internal_seq_compact_seq\"");
-    assert_eq!(
-        rows[0].0, 5,
-        "Backing table value should be 5 (high-water mark), got {}",
-        rows[0].0
-    );
-}
-
-/// P4 (autoincrement): The autoincrement backing table compacts to one
-/// row at checkpoint.
-#[turso_macros::test(mvcc)]
-fn test_autoincrement_backing_table_compacted_after_commit(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE compacted(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    for i in 1..=5 {
-        conn.execute(format!("INSERT INTO compacted(v) VALUES ('row{i}')"))
-            .unwrap();
-    }
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let rows: Vec<(i64,)> = conn.exec_rows(
-        "SELECT COUNT(*) FROM \"__turso_internal_seq___turso_internal_autoincrement_compacted\"",
-    );
-    assert_eq!(
-        rows[0].0, 1,
-        "Autoincrement backing table should have exactly 1 row after checkpoint, got {}",
-        rows[0].0
-    );
-}
-
-// ---------------------------------------------------------------------------
-// P5: Rollback does not pollute the watermark
-// ---------------------------------------------------------------------------
-
-/// P5 (autoincrement): After rolling back a transaction that inserted
-/// into an AUTOINCREMENT table, sqlite_sequence must NOT reflect the
-/// rolled-back high-water mark. The next committed insert may produce
-/// a gap (acceptable), but the watermark tracks committed state only.
-#[turso_macros::test(mvcc)]
-fn test_autoincrement_rollback_does_not_pollute_sqlite_sequence(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE rollback_t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-        .unwrap();
-
-    // Commit 3 rows — watermark should be 3
-    for i in 1..=3 {
-        conn.execute(format!("INSERT INTO rollback_t(v) VALUES ('committed{i}')"))
-            .unwrap();
-    }
-
-    // Begin a transaction, insert more rows, then rollback
-    conn.execute("BEGIN").unwrap();
-    for i in 1..=5 {
-        conn.execute(format!(
-            "INSERT INTO rollback_t(v) VALUES ('rolledback{i}')"
-        ))
-        .unwrap();
-    }
-    conn.execute("ROLLBACK").unwrap();
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    // BEGIN-without-mode (DEFERRED) upgrades to Write on first INSERT,
-    // which under MVCC takes the exclusive lock. The autonomous
-    // sequence inner-tx wrap (`Insn::SequenceBeginInnerTx`) detects
-    // the exclusive outer and runs inline — so the rolled-back tx
-    // *does* roll its nextval writes back with the outer (Path A).
-    // sqlite_sequence therefore reflects the committed watermark (3),
-    // not the in-flight one (8).
-    let rows: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 'rollback_t'");
-    assert_eq!(
-        rows.len(),
-        1,
-        "sqlite_sequence should have one row for rollback_t after checkpoint"
-    );
-    assert_eq!(
-        rows[0].1, 3,
-        "sqlite_sequence watermark should be 3 (committed), not {} (rolled-back)",
-        rows[0].1
-    );
-
-    conn.execute("INSERT INTO rollback_t(v) VALUES ('after_rollback')")
-        .unwrap();
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM rollback_t WHERE v = 'after_rollback'");
+    let dbs: Vec<(i64, String, String)> = conn.exec_rows("PRAGMA database_list");
     assert!(
-        rows[0].0 > 3,
-        "After rollback, next ID should be > 3, got {}",
-        rows[0].0
+        dbs.iter().all(|(_, name, _)| name != "temp"),
+        "temp database should not be initialized: {dbs:?}"
     );
 }
 
-/// P5 (user sequence): Rolling back a transaction containing nextval()
-/// must not advance the persisted watermark. The in-memory sequence
-/// may have gaps, but the backing table reflects committed state only.
-#[turso_macros::test(mvcc)]
-fn test_user_sequence_rollback_does_not_pollute_watermark(tmp_db: TempDatabase) {
-    if !tmp_db.enable_mvcc {
-        return;
-    }
+/// When BEGIN IMMEDIATE skips the not-yet-created temp database, temp objects
+/// created later in the same transaction must still commit and roll back with it.
+#[turso_macros::test]
+fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE SEQUENCE rb_seq START 1 INCREMENT 1")
-        .unwrap();
+    conn.execute("CREATE TABLE t (x)").unwrap();
 
-    // Commit: advance to 3
-    for _ in 0..3 {
-        conn.execute("SELECT nextval('rb_seq')").unwrap();
-    }
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT currval('rb_seq')");
-    assert_eq!(rows, vec![(3,)]);
-
-    // Rollback: advance to 8 but don't commit. BEGIN-without-mode
-    // (DEFERRED) becomes exclusive on first write — the autonomous
-    // sequence inner-tx detects the exclusive outer and runs inline
-    // (Path A), so the rolled-back nextvals are reverted with the
-    // outer.
-    conn.execute("BEGIN").unwrap();
-    for _ in 0..5 {
-        conn.execute("SELECT nextval('rb_seq')").unwrap();
-    }
+    // Temp created inside an IMMEDIATE transaction, then rolled back.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("CREATE TEMP TABLE tt (x)").unwrap();
+    conn.execute("INSERT INTO tt VALUES (1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
     conn.execute("ROLLBACK").unwrap();
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM temp.sqlite_schema WHERE name = 'tt'");
+    assert!(rows.is_empty(), "temp table survived rollback: {rows:?}");
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(0,)]);
 
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Temp created inside an IMMEDIATE transaction, then committed.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("CREATE TEMP TABLE tt (x)").unwrap();
+    conn.execute("INSERT INTO tt VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
+    assert_eq!(rows, vec![(1,)]);
 
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT value FROM \"__turso_internal_seq_rb_seq\"");
-    assert_eq!(
-        rows.len(),
-        1,
-        "Backing table should have exactly 1 row after checkpoint, got {}",
-        rows.len()
-    );
-    assert_eq!(
-        rows[0].0, 3,
-        "Backing table watermark should be 3 (committed), not {} (includes rolled-back)",
-        rows[0].0
-    );
+    // Temp now exists, so BEGIN IMMEDIATE locks it and a rollback reverts it.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO tt VALUES (2)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
+    assert_eq!(rows, vec![(1,)]);
 }

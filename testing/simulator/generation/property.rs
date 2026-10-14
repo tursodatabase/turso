@@ -286,7 +286,7 @@ impl Property {
     }
 
     /// interactions construct a list of interactions, which is an executable representation of the property.
-    /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
+    /// the requirement of property -> `vec<interaction>` conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
     pub(crate) fn interactions(
         &self,

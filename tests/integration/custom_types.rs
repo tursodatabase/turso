@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
+    use asserting::prelude::*;
     use tempfile::TempDir;
 
     #[test]
@@ -28,11 +29,10 @@ mod tests {
                 "INSERT INTO t1 VALUES (1, '01945ca0-3189-76c0-9a8f-caf310fc8b8e') \
                  ON CONFLICT(a) DO UPDATE SET b = 42",
             ] {
-                let err = conn.execute(sql).unwrap_err();
-                assert!(
-                    err.to_string().contains("invalid UUID value"),
-                    "mvcc={mvcc}, {sql}: {err}"
-                );
+                assert_that!(conn.execute(sql))
+                    .err()
+                    .display_string()
+                    .contains("invalid UUID value");
                 let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
                 assert_eq!(rows, vec![(1, uuid.to_string())], "mvcc={mvcc}, {sql}");
             }
@@ -75,11 +75,10 @@ mod tests {
                 "UPDATE t1 SET b = CASE WHEN a = 1 THEN '550e8400-e29b-41d4-a716-446655440000' \
                  ELSE 42 END WHERE a < 3",
             ] {
-                let err = conn.execute(sql).unwrap_err();
-                assert!(
-                    err.to_string().contains("invalid UUID value"),
-                    "mvcc={mvcc}, {sql}: {err}"
-                );
+                assert_that!(conn.execute(sql))
+                    .err()
+                    .display_string()
+                    .contains("invalid UUID value");
                 let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
                 assert_eq!(rows, expected, "mvcc={mvcc}, {sql}");
             }
@@ -496,6 +495,30 @@ mod tests {
                 (3, "1".to_string()),
             ],
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
+        );
+    }
+
+    #[test]
+    fn test_date_plus_and_minus_bound_integer() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t1(d date) STRICT").unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('2025-01-05')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT d + ?1, d - ?1 FROM t1").unwrap();
+        stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(3))
+            .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get::<String>(0)?, row.get::<String>(1)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
         );
     }
 }

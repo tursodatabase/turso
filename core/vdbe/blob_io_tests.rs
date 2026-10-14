@@ -8,14 +8,14 @@ use std::sync::Arc;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Insn, RegisterOrLiteral};
 use crate::{
-    Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect, Statement,
-    Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags,
+    SqliteDialect, Statement, Value, IO,
 };
 
 fn fresh_db() -> Arc<Connection> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    db.connect().unwrap()
+    db.connect(ConnectOpts::new()).unwrap()
 }
 
 fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
@@ -29,7 +29,7 @@ fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    db.connect().unwrap()
+    db.connect(ConnectOpts::new()).unwrap()
 }
 
 fn fresh_db_with_generated_columns() -> Arc<Connection> {

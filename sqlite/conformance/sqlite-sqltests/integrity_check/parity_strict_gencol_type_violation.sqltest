@@ -1,0 +1,20 @@
+# The fixture holds a STRICT table whose virtual generated INT column computes
+# a TEXT value, because the base column stores an empty string.
+
+@database database/integrity_strict_gencol_type_violation.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-strict-gencol-type-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    non-INT value in t.b
+}
+
+test quick-check-strict-gencol-type-violation {
+    PRAGMA quick_check;
+}
+expect {
+    non-INT value in t.b
+}

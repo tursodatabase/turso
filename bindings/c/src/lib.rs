@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 use turso_core::SqliteDialect;
-use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
+use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
@@ -239,6 +239,8 @@ impl sqlite3 {
         conn: Arc<turso_core::Connection>,
         filename: CString,
     ) -> Self {
+        #[cfg(feature = "csv")]
+        register_csv_module(&conn);
         let inner = sqlite3Inner {
             _io: io,
             _db: db,
@@ -293,6 +295,16 @@ pub struct sqlite3_stmt {
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
+}
+
+#[cfg(feature = "csv")]
+fn register_csv_module(conn: &Arc<turso_core::Connection>) {
+    unsafe {
+        let mut api = conn._build_turso_ext();
+        let registered = limbo_csv::register_extension_static(&mut api).is_ok();
+        conn._free_extension_ctx(api);
+        assert!(registered, "failed to register the csv module");
+    }
 }
 
 impl sqlite3_stmt {
@@ -529,7 +541,7 @@ pub unsafe extern "C" fn sqlite3_open(
         Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             let filename = match filename_str {
                 ":memory:" => CString::new("".to_string()).unwrap(),
                 _ => CString::from(filename_cstr),
@@ -758,7 +770,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect() {
+    match db.connect(ConnectOpts::new()) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()

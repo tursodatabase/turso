@@ -2,9 +2,9 @@
 name: mvcc
 description: MVCC feature - snapshot isolation, versioning, limitations
 ---
-# MVCC Guide (Experimental)
+# MVCC Guide
 
-Multi-Version Concurrency Control. **Work in progress, not production-ready.**
+Multi-Version Concurrency Control. A supported journal mode.
 
 **CRITICAL**: Ignore MVCC when debugging unless the bug is MVCC-specific.
 
@@ -73,13 +73,9 @@ Process: acquire lock → begin pager txn → write rows → commit → truncate
 
 ## Current Limitations
 
-**Not implemented:**
-- Garbage collection (old versions accumulate)
-- Recovery from logical log on restart
-
-**Known issues:**
-- Checkpoint blocks other transactions, even reads!
-- No spilling to disk; memory use concerns
+- `PRAGMA wal_checkpoint(TRUNCATE)` blocks other transactions, including reads. Passive checkpointing does not, but is still behind `--experimental-mvcc-passive-checkpoint`.
+- Row versions live in memory, so large working sets use a lot of memory.
+- Indexes on `WITHOUT ROWID` tables are not supported.
 
 ## Testing
 

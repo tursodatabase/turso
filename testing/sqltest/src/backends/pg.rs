@@ -3,7 +3,6 @@ use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,25 +93,16 @@ impl SqlBackend for PgBackend {
             }
         };
 
-        // Reserve an ephemeral port, then hand it to the server. The port
-        // could in principle be claimed between the drop and the spawn, in
-        // which case the server fails to bind and the readiness loop below
-        // reports the exit.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map_err(|e| BackendError::CreateDatabase(format!("allocating port: {e}")))?
-            .port();
-
         let mut cmd = tokio::process::Command::new(&self.binary_path);
         cmd.arg(&db_path)
             .arg("--server")
-            .arg(format!("127.0.0.1:{port}"))
+            .arg("127.0.0.1:0")
             .arg("-q");
         if config.readonly {
             cmd.arg("--readonly");
         }
         cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
@@ -121,6 +111,26 @@ impl SqlBackend for PgBackend {
                 self.binary_path.display()
             ))
         })?;
+
+        let port = match tokio::time::timeout(
+            SERVER_STARTUP_TIMEOUT,
+            read_listening_port(&mut child),
+        )
+        .await
+        {
+            Ok(Some(port)) => port,
+            Ok(None) => {
+                let stderr = read_stderr(&mut child).await;
+                return Err(BackendError::CreateDatabase(format!(
+                    "tursopg did not report its listening address: {stderr}"
+                )));
+            }
+            Err(_) => {
+                return Err(BackendError::CreateDatabase(format!(
+                    "tursopg did not report its listening address within {SERVER_STARTUP_TIMEOUT:?}"
+                )));
+            }
+        };
 
         let params = ConnParams {
             host: "127.0.0.1".to_string(),
@@ -170,6 +180,24 @@ async fn connect(params: &ConnParams) -> Result<PgConn, turso_pg_client::Error> 
     })
     .await
     .expect("connect task panicked")
+}
+
+/// Reads the server's `PostgreSQL server listening on <host>:<port> ...`
+/// line and returns the port. Returns `None` if the server exits first.
+async fn read_listening_port(child: &mut tokio::process::Child) -> Option<u16> {
+    use tokio::io::AsyncBufReadExt;
+    let stdout = child.stdout.take()?;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Some(rest) = line.strip_prefix("PostgreSQL server listening on ") else {
+            continue;
+        };
+        let address = rest.split_whitespace().next()?;
+        let port = address.rsplit_once(':')?.1.parse().ok()?;
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        return Some(port);
+    }
+    None
 }
 
 async fn read_stderr(child: &mut tokio::process::Child) -> String {

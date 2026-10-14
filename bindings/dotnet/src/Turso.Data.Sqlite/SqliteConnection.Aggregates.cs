@@ -31,14 +31,14 @@ public partial class SqliteConnection
         if (HasNativeCallbackHandle)
         {
             using var syncOperation = _managedConnection?.EnterSyncOperation();
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            registration.Register(DatabaseHandle);
         }
     }
 
     private void RegisterAggregateFunctions()
     {
         foreach (var registration in _aggregateFunctions.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            registration.Register(DatabaseHandle);
     }
 
     private static object? InvokeNullableAggregateStep<TAccumulate>(Func<TAccumulate?, TAccumulate> function, object? accumulator, object?[] args)
@@ -67,8 +67,7 @@ public partial class SqliteConnection
 
     private static IntPtr InitializeAggregate(IntPtr context)
     {
-        var registration = (AggregateFunctionRegistration?)GCHandle.FromIntPtr(context).Target
-            ?? throw new ObjectDisposedException(nameof(AggregateFunctionRegistration));
+        var registration = ResolveCallbackContext<AggregateFunctionRegistration>(context);
         return registration.CreateInvocationHandle();
     }
 
@@ -76,8 +75,7 @@ public partial class SqliteConnection
     {
         try
         {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
-                ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
+            var invocation = ResolveCallbackContext<AggregateInvocation>(aggregateContext);
             invocation.Step(ReadArguments(argc, argv));
             return CreateResult(null);
         }
@@ -95,8 +93,7 @@ public partial class SqliteConnection
     {
         try
         {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
-                ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
+            var invocation = ResolveCallbackContext<AggregateInvocation>(aggregateContext);
             return CreateResult(invocation.FinalizeResult());
         }
         catch (SqliteException ex)
@@ -167,7 +164,7 @@ public partial class SqliteConnection
             }
         }
 
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
+        public void Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
             var handle = GCHandle.Alloc(this);
             try
@@ -184,7 +181,6 @@ public partial class SqliteConnection
                     ContextDestructorCallback,
                     AggregateDestructorCallback,
                     ValueDestructorCallback);
-                return handle;
             }
             catch
             {

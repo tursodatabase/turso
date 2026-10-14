@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use turso_core::{
-    Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect, Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect,
+    Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
@@ -168,6 +169,7 @@ pub struct TursoMcpServer {
 
 impl TursoMcpServer {
     pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+        conn.set_load_extension_enabled(false);
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
@@ -530,7 +532,7 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect() {
+                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
                     Ok(c) => c,
                     Err(e) => return format!("Failed to connect to database '{path}': {e}"),
                 },
@@ -806,6 +808,24 @@ mod tests {
         server.execute_query(&query_arg(
             "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
         ))
+    }
+
+    #[test]
+    fn execute_query_cannot_load_extensions() {
+        let (_io, conn) = Connection::from_uri(
+            ":memory:",
+            DatabaseOpts::new().turso_cli(),
+            Arc::new(SqliteDialect),
+        )
+        .expect("open memory database");
+        let server = TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)));
+
+        let result = server.execute_query(&query_arg("SELECT load_extension('nonexistent')"));
+
+        assert!(
+            result.contains("runtime extension loading is disabled"),
+            "expected extension loading to be disabled, got: {result}"
+        );
     }
 
     #[test]

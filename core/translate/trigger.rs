@@ -1,3 +1,4 @@
+use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -98,6 +99,15 @@ pub fn translate_create_trigger(
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_trigger_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            trigger_name.name.as_str()
+        );
+    }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
