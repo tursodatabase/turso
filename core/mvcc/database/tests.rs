@@ -23402,6 +23402,36 @@ fn test_sequence_watermark_does_not_go_back_when_older_commit_finishes_last() {
     assert_eq!(rows[0][0].as_int().unwrap(), 3);
 }
 
+#[test]
+fn test_sequence_watermark_after_failed_statement_inside_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'a')")
+        .unwrap();
+    let err = writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'b'), (1, 'dup')")
+        .unwrap_err();
+    assert!(matches!(err, LimboError::Constraint(_)), "{err:?}");
+    writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    writer
+        .execute("INSERT INTO t VALUES (nextval('s'), 'c')")
+        .unwrap();
+    let (ids, _) = read_ids_below_sequence_watermark(&reader, 0);
+    assert_eq!(ids, vec![1, 2]);
+}
+
 fn read_ids_below_sequence_watermark(reader: &Arc<Connection>, last: i64) -> (Vec<i64>, i64) {
     let watermark = get_rows(reader, "SELECT sequence_watermark_experimental('s')")[0][0].as_int();
     let upper_bound = watermark.unwrap_or(i64::MAX);
