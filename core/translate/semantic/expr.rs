@@ -789,15 +789,16 @@ fn validate_json_arguments(function: &JsonFunc, count: usize) -> Result<()> {
     };
 
     match function {
-        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonValid | JsonFunc::JsonQuote => {
-            require_exact(1)
-        }
+        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonQuote => require_exact(1),
         JsonFunc::JsonErrorPosition if count != 1 => {
             crate::bail_parse_error!("{} function with not exactly 1 argument", function)
         }
         JsonFunc::JsonErrorPosition => Ok(()),
         JsonFunc::JsonPatch | JsonFunc::JsonbPatch => require_exact(2),
-        JsonFunc::JsonArrayLength | JsonFunc::JsonType | JsonFunc::JsonPretty => require_max(2),
+        JsonFunc::JsonArrayLength
+        | JsonFunc::JsonType
+        | JsonFunc::JsonPretty
+        | JsonFunc::JsonValid => require_max(2),
         JsonFunc::JsonObject | JsonFunc::JsonbObject if count % 2 != 0 => {
             crate::bail_parse_error!("{} function requires an even number of arguments", function)
         }
@@ -5177,6 +5178,7 @@ mod tests {
             "SELECT json_pretty('{}')",
             "SELECT json_pretty('{}', '  ')",
             "SELECT json_array()",
+            "SELECT json_valid('{}', 6)",
         ] {
             let analyzed = analyze_expression(
                 &expression(sql),
@@ -5212,6 +5214,10 @@ mod tests {
             (
                 "SELECT json_object('key')",
                 "json_object function requires an even number of arguments",
+            ),
+            (
+                "SELECT json_valid('{}', 6, 1)",
+                "json_valid function called with more than 2 arguments",
             ),
         ] {
             let error = analyze_expression(
