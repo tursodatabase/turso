@@ -74,8 +74,10 @@ jobs:
           ]
         # The main nextest run and the smaller suites (sync-dir, leak check,
         # doctests) run on separate machines at the same time instead of one
-        # after another.
-        suite: [nextest, extra]
+        # after another. On pull requests the nextest run is also split in two
+        # with nextest's --partition (every test runs in exactly one part); on
+        # main it stays one job so coverage covers the whole suite.
+        suite: ${{ github.event_name == 'pull_request' && fromJSON('["nextest 1/2", "nextest 2/2", "extra"]') || fromJSON('["nextest", "extra"]') }}
 
     runs-on: ${{ matrix.os }}
 
@@ -150,11 +152,21 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: (runner.os != 'Linux' || github.event_name == 'pull_request') && matrix.suite == 'nextest'
+        if: (runner.os != 'Linux' || github.event_name == 'pull_request') && startsWith(matrix.suite, 'nextest')
+        shell: bash
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' --failure-output=final
+          SUITE: ${{ matrix.suite }}
+        run: |
+          # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
+          part="${SUITE#nextest}"
+          part="${part# }"
+          partition=()
+          if [ -n "$part" ]; then
+            partition=(--partition "slice:$part")
+          fi
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' "${partition[@]}" --failure-output=final
         timeout-minutes: 30
       # Same suite against a --sync-dir server, so directory mode's per-database
       # routing gets the coverage the single-database run above provides.
