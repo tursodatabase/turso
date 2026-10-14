@@ -356,6 +356,9 @@ pub struct ProgramBuilder {
     /// Plan of the HIR statement being lowered. Expression subqueries emit
     /// their bodies from it where the expression is evaluated.
     hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
+    /// Registers already holding the value of exact HIR expression nodes,
+    /// keyed by node address, such as GROUP BY keys while a group is output.
+    expression_registers: Vec<(usize, usize)>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -835,6 +838,7 @@ impl ProgramBuilder {
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
             hir_plan: None,
+            expression_registers: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -1050,6 +1054,32 @@ impl ProgramBuilder {
 
     pub(crate) fn hir_plan(&self) -> Option<Arc<crate::translate::semantic_to_plan::HirPlan>> {
         self.hir_plan.clone()
+    }
+
+    /// Read `expression` from `register` instead of evaluating it, until
+    /// [Self::clear_expression_registers].
+    pub(crate) fn bind_expression_register(
+        &mut self,
+        expression: &crate::translate::semantic::hir::Expr,
+        register: usize,
+    ) {
+        self.expression_registers
+            .push((std::ptr::from_ref(expression) as usize, register));
+    }
+
+    pub(crate) fn expression_register(
+        &self,
+        expression: &crate::translate::semantic::hir::Expr,
+    ) -> Option<usize> {
+        let address = std::ptr::from_ref(expression) as usize;
+        self.expression_registers
+            .iter()
+            .find(|(bound, _)| *bound == address)
+            .map(|(_, register)| *register)
+    }
+
+    pub(crate) fn clear_expression_registers(&mut self) {
+        self.expression_registers.clear();
     }
 
     pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {

@@ -143,6 +143,13 @@ fn hir_expression_subqueries_match_legacy_rows() {
         "SELECT id FROM items WHERE value > (SELECT avg(value) FROM items) ORDER BY id",
         "SELECT id, sum(value) OVER (ORDER BY id) FROM items WHERE id IN (SELECT item_id FROM tags)",
         "SELECT id FROM items LIMIT (SELECT 2)",
+        // Group output reads key expressions from the key and the outer
+        // columns of correlated subqueries from the captured group row.
+        "SELECT (SELECT tag FROM tags WHERE item_id = items.id LIMIT 1) AS t, sum(value) \
+         FROM items GROUP BY (SELECT tag FROM tags WHERE item_id = items.id LIMIT 1)",
+        "SELECT extra, (SELECT count(*) FROM tags WHERE item_id = items.id) FROM items GROUP BY extra",
+        "SELECT count(*), (SELECT items.value + 1) FROM items WHERE id = 3",
+        "SELECT value + 1, count(*) FROM items GROUP BY value + 1 HAVING value + 1 > 11 ORDER BY value + 1",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),

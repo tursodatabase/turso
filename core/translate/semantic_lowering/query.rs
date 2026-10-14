@@ -1133,7 +1133,7 @@ fn emit_hir_grouped_aggregate<'a>(
     if matches!(runtime.rows, HirGroupRows::Sorter(_)) {
         emit_hir_group_sorter_rows(program, &plan.document, &runtime)?;
     }
-    emit_hir_group_result(program, &plan.document, block, output, &runtime)
+    emit_hir_group_result(program, &plan.document, query, block, output, &runtime)
 }
 
 fn initialize_hir_group_runtime<'a>(
@@ -1153,7 +1153,16 @@ fn initialize_hir_group_runtime<'a>(
         )));
     }
     let aggregates = initialize_hir_aggregates(program, &plan.document, query, block)?;
-    let usage = query.direct_column_usage(|source| plan.document.source(source));
+    let mut usage = query
+        .direct_column_usage(|source| plan.document.source(source))
+        .into_iter()
+        .map(|usage| usage.reference)
+        .collect::<Vec<_>>();
+    for reference in hir_nested_outer_column_reads(&plan.document, query) {
+        if !usage.contains(&reference) {
+            usage.push(reference);
+        }
+    }
     let rowids = hir_group_rowids(query, block);
     let mut inputs = (0..grouping.keys.len())
         .map(HirGroupInput::Key)
@@ -1187,8 +1196,8 @@ fn initialize_hir_group_runtime<'a>(
         };
         for column in usage
             .iter()
-            .filter(|usage| usage.reference.source == source.id)
-            .map(|usage| usage.reference.column)
+            .filter(|reference| reference.source == source.id)
+            .map(|reference| reference.column)
         {
             inputs.push(HirGroupInput::Column {
                 reference: hir::ColumnRef {
@@ -1565,9 +1574,44 @@ fn emit_hir_group_row(
     Ok(())
 }
 
+/// Read every group-output expression equal to a GROUP BY key from the key's
+/// register, as legacy and SQLite do. Re-evaluating it would need columns the
+/// group row does not keep, such as the inputs of a virtual generated column
+/// or the outer values of a correlated subquery.
+fn bind_hir_group_key_registers(
+    program: &mut ProgramBuilder,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    runtime: &HirGroupRuntime<'_>,
+) {
+    let keys = &runtime.grouping.keys;
+    let mut bind = |root: &hir::Expr| {
+        root.for_each(&mut |expression| {
+            if let Some(key) = keys.iter().position(|key| key.equivalent(expression)) {
+                program.bind_expression_register(expression, runtime.state.previous_keys + key);
+            }
+        });
+    };
+    for output in &block.outputs {
+        bind(&output.expr);
+    }
+    if let Some(having) = &runtime.grouping.having {
+        bind(having);
+    }
+    for term in &query.order_by {
+        bind(&term.expr);
+    }
+    for window in &block.windows {
+        for expression in hir_window_expressions(window) {
+            bind(expression);
+        }
+    }
+}
+
 fn emit_hir_group_result(
     program: &mut ProgramBuilder,
     document: &HirDocument,
+    query: &hir::Query,
     block: &hir::QueryBlock,
     output: &HirRowOutput<'_>,
     runtime: &HirGroupRuntime<'_>,
@@ -1595,6 +1639,7 @@ fn emit_hir_group_result(
     program.preassign_label_to_next_insn(runtime.state.finalize_group);
     finalize_hir_aggregates(program, &runtime.aggregates)?;
     bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Group);
+    bind_hir_group_key_registers(program, query, block, runtime);
     if let Some(having) = &runtime.grouping.having {
         let emit_row = program.allocate_label();
         super::expr::translate_condition_expr(
@@ -1620,6 +1665,7 @@ fn emit_hir_group_result(
         start,
         runtime.state.output_done,
     )?;
+    program.clear_expression_registers();
     program.emit_insn(Insn::Return {
         return_reg: runtime.state.output_return,
         can_fallthrough: false,
@@ -2356,6 +2402,38 @@ struct HirAggregateCollector<'a> {
     aggregates: Vec<Option<&'a hir::FunctionCall>>,
 }
 
+/// Columns of `query`'s own sources that its nested queries read. Only a
+/// nested query can see them, through correlation. A correlated subquery
+/// evaluated after aggregation reads them from the captured group row, like
+/// the bare columns of the query itself.
+fn hir_nested_outer_column_reads(
+    document: &HirDocument,
+    query: &hir::Query,
+) -> Vec<hir::ColumnRef> {
+    let owned_by_query = |source: SourceId| {
+        matches!(
+            document.source(source).map(|source| source.owner),
+            Some(hir::SourceOwner::QueryBlock(block)) if block.query == query.id
+        )
+    };
+    let mut reads = Vec::new();
+    for nested in document
+        .queries
+        .iter()
+        .filter(|nested| nested.id != query.id)
+    {
+        if !nested.captures.iter().any(|source| owned_by_query(*source)) {
+            continue;
+        }
+        for usage in nested.direct_column_usage(|source| document.source(source)) {
+            if owned_by_query(usage.reference.source) && !reads.contains(&usage.reference) {
+                reads.push(usage.reference);
+            }
+        }
+    }
+    reads
+}
+
 struct HirBareAggregateColumnCollector<'a> {
     document: &'a HirDocument,
     columns: Vec<hir::ColumnRef>,
@@ -2649,6 +2727,11 @@ fn initialize_hir_aggregates<'a>(
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
             bare.collect(expression)?;
+        }
+    }
+    for reference in hir_nested_outer_column_reads(document, query) {
+        if !bare.columns.contains(&reference) {
+            bare.columns.push(reference);
         }
     }
     bare.columns

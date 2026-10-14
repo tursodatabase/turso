@@ -458,6 +458,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             .iter()
             .find(|input| std::ptr::eq(input.expression, expression))
             .map(|input| input.register)
+            .or_else(|| self.program.expression_register(expression))
     }
 
     fn schema_call_child(
