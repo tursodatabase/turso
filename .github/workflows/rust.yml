@@ -72,6 +72,10 @@ jobs:
             blacksmith-6vcpu-macos-latest,
             blacksmith-8vcpu-windows-2025,
           ]
+        # The main nextest run and the smaller suites (sync-dir, leak check,
+        # doctests) run on separate machines at the same time instead of one
+        # after another.
+        suite: [nextest, extra]
 
     runs-on: ${{ matrix.os }}
 
@@ -86,15 +90,17 @@ jobs:
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: "./.github/shared/setup-mold"
+      # Both suites get the same cache key. The nextest suite builds a superset
+      # of what the extra suite needs, so only it saves.
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'nextest' }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
-        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
       # pg_query, whose bindgen needs libclang.dll.
@@ -121,7 +127,7 @@ jobs:
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
-        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -133,7 +139,7 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: runner.os != 'Linux' || github.event_name == 'pull_request'
+        if: (runner.os != 'Linux' || github.event_name == 'pull_request') && matrix.suite == 'nextest'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -142,21 +148,23 @@ jobs:
       # Same suite against a --sync-dir server, so directory mode's per-database
       # routing gets the coverage the single-database run above provides.
       - name: Test sync suite against --sync-dir
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
       - name: Memory leak check (repeated database open/workload/drop)
+        if: matrix.suite == 'extra'
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
         timeout-minutes: 10
       - name: Test doctests
+        if: matrix.suite == 'extra'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
-        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
