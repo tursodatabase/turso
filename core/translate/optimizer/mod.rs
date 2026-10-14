@@ -1640,6 +1640,7 @@ fn build_update_write_set_plan(
     let write_set_select = SelectPlan {
         table_references: write_set_tables,
         result_columns,
+        decode_result_casts: false,
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,     // N/A
         order_by: vec![],   // N/A

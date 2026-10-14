@@ -421,68 +421,22 @@ fn resolve_scalar_func_return_type(
     columns: &[&ast::ColumnDefinition],
     resolver: &Resolver,
 ) -> Result<CheckExprType> {
+    if let Some(ty) = func.return_type() {
+        return Ok(match ty {
+            crate::types::ValueType::Integer => CheckExprType::Integer,
+            crate::types::ValueType::Float => CheckExprType::Real,
+            crate::types::ValueType::Text => CheckExprType::Text,
+            crate::types::ValueType::Blob => CheckExprType::Blob,
+            crate::types::ValueType::Null => CheckExprType::Null,
+            crate::types::ValueType::Error => unreachable!(),
+        });
+    }
     match func {
         // Functions that always return INTEGER
-        ScalarFunc::Length
-        | ScalarFunc::OctetLength
-        | ScalarFunc::Instr
-        | ScalarFunc::Unicode
-        | ScalarFunc::Sign
-        | ScalarFunc::Random
-        | ScalarFunc::Changes
-        | ScalarFunc::TotalChanges
-        | ScalarFunc::LastInsertRowid
-        | ScalarFunc::Glob
-        | ScalarFunc::Like
-        | ScalarFunc::Likely
+        ScalarFunc::Likely
         | ScalarFunc::Unlikely
         | ScalarFunc::Likelihood
-        | ScalarFunc::BooleanToInt
-        | ScalarFunc::IntToBoolean
-        | ScalarFunc::IsAutocommit
-        | ScalarFunc::ConnTxnId
-        | ScalarFunc::TestUintLt
-        | ScalarFunc::TestUintEq
-        | ScalarFunc::NumericLt
-        | ScalarFunc::NumericEq
-        | ScalarFunc::ValidateIpAddr
-        | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
-
-        // Functions that always return TEXT
-        ScalarFunc::Upper
-        | ScalarFunc::Lower
-        | ScalarFunc::Trim
-        | ScalarFunc::LTrim
-        | ScalarFunc::RTrim
-        | ScalarFunc::Hex
-        | ScalarFunc::Soundex
-        | ScalarFunc::Quote
-        | ScalarFunc::Replace
-        | ScalarFunc::Substr
-        | ScalarFunc::Substring
-        | ScalarFunc::Char
-        | ScalarFunc::Concat
-        | ScalarFunc::ConcatWs
-        | ScalarFunc::Typeof
-        | ScalarFunc::SqliteVersion
-        | ScalarFunc::TursoVersion
-        | ScalarFunc::SqliteSourceId
-        | ScalarFunc::Date
-        | ScalarFunc::Time
-        | ScalarFunc::DateTime
-        | ScalarFunc::StrfTime
-        | ScalarFunc::TimeDiff
-        | ScalarFunc::Printf
-        | ScalarFunc::StringReverse => Ok(CheckExprType::Text),
-
-        // Functions that always return REAL
-        ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
-
-        // Functions that always return BLOB
-        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {
-            Ok(CheckExprType::Blob)
-        }
 
         // Functions whose return type depends on arguments
         ScalarFunc::Abs | ScalarFunc::Nullif => {
@@ -520,19 +474,12 @@ fn resolve_scalar_func_return_type(
             }
         }
 
-        // Internal/custom type functions
         ScalarFunc::TestUintEncode
         | ScalarFunc::TestUintDecode
         | ScalarFunc::TestUintAdd
         | ScalarFunc::TestUintSub
         | ScalarFunc::TestUintMul
-        | ScalarFunc::TestUintDiv
-        | ScalarFunc::NumericEncode
-        | ScalarFunc::NumericDecode
-        | ScalarFunc::NumericAdd
-        | ScalarFunc::NumericSub
-        | ScalarFunc::NumericMul
-        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+        | ScalarFunc::TestUintDiv => Ok(CheckExprType::Blob),
 
         // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),

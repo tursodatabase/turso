@@ -14,7 +14,7 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
+        expr_is_array, translate_expr, translate_expr_no_constant_opt, translate_result_expr,
         walk_expr, NoConstantOptReason, WalkControl,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
@@ -86,7 +86,16 @@ pub fn emit_select_result(
                 || reg_nonagg_emit_once_flag.is_none()
         }) {
             let reg = start_reg + i;
-            if disable_constant_opt {
+            if plan.decode_result_casts {
+                translate_result_expr(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    reg,
+                    resolver,
+                    true,
+                )?;
+            } else if disable_constant_opt {
                 translate_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
@@ -121,13 +130,17 @@ pub fn emit_select_result(
     // Emit ArrayDecode for result columns that produce array blobs.
     // Array values are stored as record-format blobs internally; decode
     // them to JSON text for user-facing display.
-    if !skip_column_eval {
+    if !skip_column_eval
+        && matches!(
+            plan.query_destination,
+            QueryDestination::ResultRows | QueryDestination::RowValueSubqueryResult { .. }
+        )
+    {
         emit_array_decode_for_results(
             program,
             &plan.result_columns,
             &plan.table_references,
             start_reg,
-            resolver,
         )?;
     }
 
@@ -528,7 +541,6 @@ pub(crate) fn emit_array_decode_for_results(
     result_columns: &[ResultSetColumn],
     table_references: &TableReferences,
     start_reg: usize,
-    resolver: &Resolver,
 ) -> Result<()> {
     for (i, rc) in result_columns.iter().enumerate() {
         // Check if this is a column reference to an array column
@@ -553,11 +565,7 @@ pub(crate) fn emit_array_decode_for_results(
                 target_pc: skip,
             });
 
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
+            program.emit_insn(Insn::ArrayDecode { reg });
 
             program.preassign_label_to_next_insn(skip);
         }

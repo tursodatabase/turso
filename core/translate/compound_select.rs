@@ -10,7 +10,7 @@ use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::result_row::{emit_array_decode_for_results, emit_columns_to_destination};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
@@ -24,6 +24,14 @@ use tracing::Level;
 /// or None for top-level queries.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &mut Plan,
+) -> crate::Result<Option<usize>> {
+    emit_program_for_compound_select_with_resolver(program, &resolver.fork(), plan)
+}
+
+pub(crate) fn emit_program_for_compound_select_with_resolver(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut Plan,
@@ -44,7 +52,7 @@ pub fn emit_program_for_compound_select(
     let offset_owned = offset.clone();
     let right_most_ctx = Box::new(TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
     ));
@@ -282,7 +290,7 @@ fn emit_compound_select(
     }
     let mut right_most_ctx = Box::new(TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
     ));
@@ -404,6 +412,7 @@ fn emit_compound_select(
                         offset_reg,
                         reg_result_cols_start,
                         query_destination,
+                        left.first().map(|(select, _)| select).unwrap_or(plan),
                     )?;
                 }
             }
@@ -463,6 +472,7 @@ fn emit_compound_select(
                     offset_reg,
                     reg_result_cols_start,
                     &intersect_destination,
+                    left.first().map(|(select, _)| select).unwrap_or(plan),
                 )?;
             }
             CompoundOperator::Except => {
@@ -521,6 +531,7 @@ fn emit_compound_select(
                         offset_reg,
                         reg_result_cols_start,
                         query_destination,
+                        left.first().map(|(select, _)| select).unwrap_or(plan),
                     )?;
                 }
             }
@@ -622,6 +633,7 @@ fn read_deduplicated_union_or_except_rows(
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
+    output_plan: &SelectPlan,
 ) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_dedupe_next = program.allocate_label();
@@ -649,6 +661,17 @@ fn read_deduplicated_union_or_except_rows(
             dest: dedupe_cols_start_reg + col_idx,
             default: None,
         });
+    }
+    if matches!(
+        query_destination,
+        QueryDestination::ResultRows | QueryDestination::RowValueSubqueryResult { .. }
+    ) {
+        emit_array_decode_for_results(
+            program,
+            &output_plan.result_columns,
+            &output_plan.table_references,
+            dedupe_cols_start_reg,
+        )?;
     }
     emit_columns_to_destination(
         program,
@@ -688,6 +711,7 @@ fn read_intersect_rows(
     offset_reg: Option<usize>,
     reg_result_cols_start: Option<usize>,
     query_destination: &QueryDestination,
+    output_plan: &SelectPlan,
 ) -> crate::Result<()> {
     let label_close = program.allocate_label();
     let label_loop_start = program.allocate_label();
@@ -730,6 +754,17 @@ fn read_intersect_rows(
         });
     }
 
+    if matches!(
+        query_destination,
+        QueryDestination::ResultRows | QueryDestination::RowValueSubqueryResult { .. }
+    ) {
+        emit_array_decode_for_results(
+            program,
+            &output_plan.result_columns,
+            &output_plan.table_references,
+            cols_start_reg,
+        )?;
+    }
     emit_columns_to_destination(program, query_destination, cols_start_reg, column_count)?;
 
     if let Some(limit_ctx) = limit_ctx {
@@ -1141,6 +1176,17 @@ fn emit_compound_order_by(
         program.emit_column_or_rowid(pseudo_cursor, sorter_idx, result_start_reg + col_idx);
     }
 
+    if matches!(
+        real_destination,
+        QueryDestination::ResultRows | QueryDestination::RowValueSubqueryResult { .. }
+    ) {
+        emit_array_decode_for_results(
+            program,
+            &program.result_columns.clone(),
+            &program.table_references.clone(),
+            result_start_reg,
+        )?;
+    }
     // Emit to real destination
     emit_columns_to_destination(program, real_destination, result_start_reg, num_result_cols)?;
 

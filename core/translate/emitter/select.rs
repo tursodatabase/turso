@@ -1008,6 +1008,7 @@ fn build_materialized_build_input_plan(
         table_references,
         join_order,
         result_columns,
+        decode_result_casts: false,
         where_clause,
         group_by: None,
         order_by: vec![],

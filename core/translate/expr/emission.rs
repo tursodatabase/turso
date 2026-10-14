@@ -303,7 +303,6 @@ pub(crate) fn emit_returning_results<'a>(
             result_columns,
             table_references,
             result_start_reg,
-            resolver,
         )?;
 
         if let Some(buf) = returning_buffer {

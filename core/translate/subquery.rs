@@ -19,7 +19,9 @@ use crate::{
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
-        compound_select::emit_program_for_compound_select,
+        compound_select::{
+            emit_program_for_compound_select, emit_program_for_compound_select_with_resolver,
+        },
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
@@ -945,6 +947,18 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let element_type = array_subquery_element_type(&plan)?;
+                match &mut plan {
+                    Plan::Select(select) => select.decode_result_casts = true,
+                    Plan::CompoundSelect {
+                        left, right_most, ..
+                    } => {
+                        for (select, _) in left {
+                            select.decode_result_casts = true;
+                        }
+                        right_most.decode_result_casts = true;
+                    }
+                    _ => unreachable!("ARRAY subquery must have a SELECT plan"),
+                }
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
@@ -1162,18 +1176,7 @@ fn array_subquery_element_type(plan: &Plan) -> Result<Option<String>> {
             if super::expr::expr_is_array(expr, Some(tables)) {
                 crate::bail_parse_error!("array-valued ARRAY subqueries are not supported yet");
             }
-            let ty = match expr {
-                ast::Expr::Column { table, column, .. } => tables
-                    .find_table_by_internal_id(*table)
-                    .and_then(|(_, t)| t.get_column_at(*column))
-                    .map(|c| c.ty_str.clone()),
-                ast::Expr::Cast {
-                    type_name: Some(ty),
-                    ..
-                } => Some(ty.name.clone()),
-                _ => crate::statement::infer_expression_primitive(expr, Some(tables))
-                    .map(str::to_owned),
-            };
+            let ty = crate::statement::infer_expression_type(expr, Some(tables)).map(|ty| ty.name);
             if let (Some(existing), Some(next)) = (&element_type, &ty) {
                 if existing != next {
                     crate::bail_parse_error!(
@@ -2194,7 +2197,15 @@ pub fn emit_non_from_clause_subquery(
                     }
                 }
                 mut compound @ Plan::CompoundSelect { .. } => {
-                    emit_program_for_compound_select(program, resolver, &mut compound)?;
+                    if preserve_outer_expr_cache {
+                        emit_program_for_compound_select_with_resolver(
+                            program,
+                            resolver,
+                            &mut compound,
+                        )?;
+                    } else {
+                        emit_program_for_compound_select(program, resolver, &mut compound)?;
+                    }
                     Ok(())
                 }
                 _ => unreachable!("DML plans cannot be subqueries"),
@@ -2469,31 +2480,46 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
         return false;
     };
-    let Plan::Select(select) = plan.as_ref() else {
-        return false;
+    let selects = match plan.as_ref() {
+        Plan::Select(select) => either::Left(std::iter::once(select.as_ref())),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => either::Right(
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref())),
+        ),
+        _ => return false,
     };
     let mut found = false;
-    for rc in &select.result_columns {
-        let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-            if let ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } = e
-            {
-                let is_plain_aggregate = filter_over.over_clause.is_none()
-                    && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
-                    );
-                if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
+    for select in selects {
+        for rc in &select.result_columns {
+            let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::FunctionCall {
+                    name,
+                    args,
+                    filter_over,
+                    ..
+                } = e
+                {
+                    let is_plain_aggregate = filter_over.over_clause.is_none()
+                        && matches!(
+                            crate::function::Func::resolve_function(name.as_str(), args.len()),
+                            Ok(Some(crate::function::Func::Agg(_)))
+                        );
+                    if is_plain_aggregate
+                        && !select.aggregates.iter().any(|a| a.original_expr == *e)
+                    {
+                        found = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
                 }
+                Ok(WalkControl::Continue)
+            });
+            if found {
+                break;
             }
-            Ok(WalkControl::Continue)
-        });
+        }
         if found {
             break;
         }

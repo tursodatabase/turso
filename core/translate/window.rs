@@ -224,6 +224,7 @@ fn prepare_window_subquery(
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
         table_references: mem::replace(&mut outer_plan.table_references, new_table_references),
         result_columns: subquery_result_columns,
+        decode_result_casts: false,
         where_clause: mem::take(&mut outer_plan.where_clause),
         group_by: mem::take(&mut outer_plan.group_by),
         order_by: subquery_order_by,

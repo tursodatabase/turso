@@ -250,6 +250,21 @@ pub(crate) fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        Expr::FunctionCall { name, args, .. } => {
+            let crate::function::Func::Scalar(func) =
+                crate::function::Func::resolve_function(name.as_str(), args.len()).ok()??
+            else {
+                return None;
+            };
+            match func.return_type()? {
+                crate::types::ValueType::Integer => Some("INTEGER"),
+                crate::types::ValueType::Float => Some("REAL"),
+                crate::types::ValueType::Text => Some("TEXT"),
+                crate::types::ValueType::Blob => Some("BLOB"),
+                crate::types::ValueType::Null => None,
+                crate::types::ValueType::Error => unreachable!(),
+            }
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
@@ -288,6 +303,167 @@ fn combine_arithmetic_primitive(
         | (Some("REAL"), Some("REAL")) => "REAL",
         _ => "NUMERIC",
     }
+}
+
+pub(crate) fn infer_expression_type(
+    expr: &turso_parser::ast::Expr,
+    tables: Option<&translate::plan::TableReferences>,
+) -> Option<turso_parser::ast::Type> {
+    use crate::function::{AggFunc, Func, ScalarFunc};
+    use turso_parser::ast::{Expr, SubqueryType, Type, TypeSize};
+
+    match expr {
+        Expr::Column { table, column, .. } => {
+            let (_, table) = tables?.find_table_by_internal_id(*table)?;
+            if let crate::schema::Table::FromClauseSubquery(subquery) = table {
+                if let Some(ty) = infer_query_column_type(&subquery.plan, *column) {
+                    return Some(ty);
+                }
+            }
+            let column = table.get_column_at(*column)?;
+            Some(Type {
+                name: column.ty_str.clone(),
+                size: match column.ty_params.as_slice() {
+                    [one] => Some(TypeSize::MaxSize(one.clone())),
+                    [one, two] => Some(TypeSize::TypeSize(one.clone(), two.clone())),
+                    _ => None,
+                },
+                array_dimensions: column.array_dimensions(),
+            })
+        }
+        Expr::Cast { type_name, .. } => type_name.clone(),
+        Expr::SubqueryResult {
+            query_type: SubqueryType::Array { element_type, .. },
+            ..
+        } => Some(Type {
+            name: element_type.clone().unwrap_or_else(|| "TEXT".to_owned()),
+            size: None,
+            array_dimensions: 1,
+        }),
+        Expr::Parenthesized(args) if args.len() == 1 => infer_expression_type(&args[0], tables),
+        Expr::Collate(inner, _)
+        | Expr::Unary(turso_parser::ast::UnaryOperator::Positive, inner) => {
+            infer_expression_type(inner, tables)
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let func = Func::resolve_function(name.as_str(), args.len()).ok()??;
+            match func {
+                Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Min | ScalarFunc::Max,
+                ) => common_expression_type(args.iter().map(|arg| arg.as_ref()), tables),
+                Func::Scalar(ScalarFunc::Iif) => common_expression_type(
+                    args.iter()
+                        .enumerate()
+                        .filter(|(i, _)| i % 2 != 0 || *i == args.len() - 1)
+                        .map(|(_, arg)| arg.as_ref()),
+                    tables,
+                ),
+                Func::Scalar(
+                    ScalarFunc::Nullif
+                    | ScalarFunc::Likely
+                    | ScalarFunc::Unlikely
+                    | ScalarFunc::Likelihood,
+                ) => infer_expression_type(args.first()?, tables),
+                Func::Scalar(ScalarFunc::Array) | Func::Agg(AggFunc::ArrayAgg) => {
+                    let mut ty =
+                        common_expression_type(args.iter().map(|arg| arg.as_ref()), tables)?;
+                    ty.array_dimensions += 1;
+                    Some(ty)
+                }
+                Func::Scalar(func) if func.returns_array_blob() => args
+                    .iter()
+                    .filter_map(|arg| infer_expression_type(arg, tables))
+                    .find(|ty| ty.is_array()),
+                _ => infer_expression_primitive(expr, tables).map(|name| Type {
+                    name: name.to_owned(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            }
+        }
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => common_expression_type(
+            when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.iter().map(|expr| expr.as_ref())),
+            tables,
+        ),
+        _ => infer_expression_primitive(expr, tables).map(|name| Type {
+            name: name.to_owned(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+fn infer_query_column_type(
+    plan: &translate::plan::Plan,
+    column: usize,
+) -> Option<turso_parser::ast::Type> {
+    use translate::plan::Plan;
+    let selects = match plan {
+        Plan::Select(select) => either::Left(std::iter::once(select.as_ref())),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => either::Right(
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref())),
+        ),
+        Plan::RecursiveCte(plan) => return infer_query_column_type(&plan.initial_query, column),
+        _ => unreachable!("only queries have output columns"),
+    };
+    let mut result: Option<turso_parser::ast::Type> = None;
+    for select in selects {
+        let expressions = if select.values.is_empty() {
+            either::Left(std::iter::once(&select.result_columns.get(column)?.expr))
+        } else {
+            either::Right(select.values.iter().map(|row| &row[column]))
+        };
+        for expr in expressions {
+            let Some(ty) = infer_expression_type(expr, Some(&select.table_references)) else {
+                continue;
+            };
+            if let Some(existing) = &result {
+                if !existing.name.eq_ignore_ascii_case(&ty.name)
+                    || existing.size != ty.size
+                    || existing.array_dimensions != ty.array_dimensions
+                {
+                    return None;
+                }
+            } else {
+                result = Some(ty);
+            }
+        }
+    }
+    result
+}
+
+fn common_expression_type<'a>(
+    expressions: impl Iterator<Item = &'a turso_parser::ast::Expr>,
+    tables: Option<&translate::plan::TableReferences>,
+) -> Option<turso_parser::ast::Type> {
+    let mut result: Option<turso_parser::ast::Type> = None;
+    for expr in expressions {
+        let Some(ty) = infer_expression_type(expr, tables) else {
+            continue;
+        };
+        if let Some(existing) = &result {
+            if !existing.name.eq_ignore_ascii_case(&ty.name)
+                || existing.array_dimensions != ty.array_dimensions
+                || existing.size != ty.size
+            {
+                return None;
+            }
+        } else {
+            result = Some(ty);
+        }
+    }
+    result
 }
 
 pub struct Statement {
@@ -1307,15 +1483,9 @@ impl Statement {
                     table_ref.is_strict(),
                 ))
             }
-            turso_parser::ast::Expr::SubqueryResult {
-                query_type: turso_parser::ast::SubqueryType::Array { element_type, .. },
-                ..
-            } => Some((
-                element_type.clone().unwrap_or_else(|| "TEXT".to_owned()),
-                1,
-                true,
-            )),
-            _ => None,
+            expr => infer_expression_type(expr, Some(&self.program.table_references))
+                .filter(|ty| ty.is_array())
+                .map(|ty| (ty.name, ty.array_dimensions, true)),
         };
         if let Some((declared_name, array_dimensions, is_strict)) = declared_type {
             let schema = self.program.connection.schema.read();

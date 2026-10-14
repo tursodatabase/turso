@@ -843,9 +843,7 @@ fn assign_new_subquery_output(
             )
         }
     };
-    *plan
-        .select_query_destination_mut()
-        .expect("a subquery must have a query destination") = destination;
+    crate::translate::compound_select::set_select_plan_destination(plan, &destination);
     subquery.query_type = query_type.clone();
     query_type
 }

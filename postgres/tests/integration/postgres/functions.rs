@@ -93,6 +93,73 @@ fn test_pg_array_subquery(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn test_pg_array_subquery_custom_elements(db: TempDatabase) {
+    let native = db.connect_limbo();
+    native
+        .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+        .unwrap();
+    native
+        .execute("CREATE TABLE prices(id INTEGER, v cents)")
+        .unwrap();
+    native
+        .execute("INSERT INTO prices VALUES (1, 42), (2, NULL)")
+        .unwrap();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        query_text(&conn, "SELECT ARRAY(SELECT CAST(42 AS cents))"),
+        ["{42}"]
+    );
+    assert_eq!(query_integer(&conn, "SELECT CAST(42 AS cents)"), [4200]);
+    for (sql, expected) in [
+        ("SELECT ARRAY(SELECT CASE WHEN id = 1 THEN v ELSE CAST(17 AS cents) END FROM prices ORDER BY id)", "{42,17}"),
+        ("SELECT ARRAY(SELECT COALESCE(v, CAST(17 AS cents)) FROM prices ORDER BY id)", "{42,17}"),
+        ("SELECT ARRAY(SELECT CAST(42 AS cents) UNION ALL SELECT CAST(17 AS cents))", "{42,17}"),
+        ("SELECT ARRAY(SELECT x FROM (SELECT CAST(42 AS cents) AS x) AS q)", "{42}"),
+        ("WITH q AS MATERIALIZED (SELECT CAST(42 AS cents) AS x) SELECT ARRAY(SELECT x FROM q)", "{42}"),
+    ] {
+        assert_eq!(query_text(&conn, sql), [expected], "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY(SELECT v FROM prices ORDER BY id)",
+        "SELECT (SELECT ARRAY(SELECT v FROM prices ORDER BY id))",
+        "SELECT a FROM (SELECT ARRAY(SELECT v FROM prices ORDER BY id) AS a) AS q",
+        "SELECT COALESCE(ARRAY(SELECT v FROM prices ORDER BY id), ARRAY(SELECT v FROM prices WHERE false))",
+        "SELECT ARRAY(SELECT COALESCE(v, CAST(NULL AS cents)) FROM prices ORDER BY id)",
+        "SELECT ARRAY(SELECT CASE WHEN CAST(v AS INTEGER) = 42 THEN v ELSE CAST(NULL AS cents) END FROM prices ORDER BY id)",
+    ] {
+        assert_eq!(query_text(&conn, sql), ["{42,NULL}"], "{sql}");
+    }
+    assert_eq!(
+        query_integer(
+            &conn,
+            "SELECT a[1] FROM (SELECT ARRAY(SELECT v FROM prices ORDER BY id) AS a) AS q"
+        ),
+        [42]
+    );
+    native
+        .execute("CREATE TABLE price_arrays(v cents[])")
+        .unwrap();
+    native
+        .execute("INSERT INTO price_arrays VALUES (ARRAY[42,NULL])")
+        .unwrap();
+    for sql in [
+        "SELECT v FROM price_arrays",
+        "SELECT v FROM (SELECT v FROM price_arrays) AS q",
+        "SELECT CASE WHEN true THEN v ELSE ARRAY(SELECT v FROM prices ORDER BY id) END FROM price_arrays",
+        "SELECT COALESCE(v, ARRAY(SELECT v FROM prices ORDER BY id)) FROM price_arrays",
+        "SELECT ARRAY(SELECT v FROM prices ORDER BY id) UNION SELECT v FROM price_arrays",
+    ] {
+        assert_eq!(query_text(&conn, sql), ["{42,NULL}"], "{sql}");
+    }
+    assert_eq!(query_integer(&conn, "SELECT v[1] FROM price_arrays"), [42]);
+    assert!(conn
+        .prepare("WITH q AS MATERIALIZED (SELECT CASE WHEN id = 1 THEN v ELSE CAST(17 AS cents) END AS x FROM prices) SELECT ARRAY(SELECT x FROM q)")
+        .unwrap_err()
+        .to_string()
+        .contains("differing encodings"));
+}
+
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut result = Vec::new();

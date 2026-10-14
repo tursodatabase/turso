@@ -415,3 +415,46 @@ test array-subquery-collects-more-than-1024-rows {
 expect {
     2050
 }
+
+test array-subquery-custom-cast {
+    SELECT ARRAY(SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS uuid));
+}
+expect {
+    {550e8400-e29b-41d4-a716-446655440000}
+}
+
+test array-subquery-copied-right-join {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO r VALUES (1), (2);
+    SELECT r.x FROM l RIGHT JOIN r ON false
+    WHERE r.x = array_length(ARRAY(SELECT 1 UNION ALL SELECT 2), 1);
+}
+expect {
+    2
+}
+
+test array-subquery-copied-full-join {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO l VALUES (3);
+    INSERT INTO r VALUES (1), (2);
+    SELECT r.x FROM l FULL JOIN r ON false
+    WHERE r.x = array_length(ARRAY(SELECT 1 UNION ALL SELECT 2), 1);
+}
+expect {
+    2
+}
+
+test array-subquery-compound-outer-aggregate {
+    CREATE TABLE t(g INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1,10), (1,20), (2,7);
+    SELECT g, ARRAY(SELECT sum(t.x) UNION ALL SELECT 0)
+    FROM t GROUP BY g ORDER BY g;
+    SELECT ARRAY(SELECT sum(t.x) UNION ALL SELECT 0) FROM t;
+}
+expect {
+    1|{30,0}
+    2|{7,0}
+    {37,0}
+}
