@@ -58,6 +58,38 @@ expect {
     0|from public
 }
 
+setup empty_search_path {
+    CREATE TABLE t1 (a int);
+    INSERT INTO t1 VALUES (99);
+    SELECT set_config('search_path', '', false);
+}
+
+@setup empty_search_path
+test search-path-empty-still-finds-ctes {
+    WITH t1 AS (SELECT 17 AS a) SELECT a FROM t1;
+    WITH t1 AS (SELECT 23 AS a) SELECT (SELECT a FROM t1);
+    WITH RECURSIVE t2(a) AS (
+        SELECT 31
+        UNION ALL
+        SELECT a + 2 FROM t2 WHERE a < 35
+    ) SELECT a FROM t2 ORDER BY a;
+    SELECT a FROM public.t1;
+}
+expect {
+    17
+    23
+    31
+    33
+    35
+    99
+}
+
+@setup empty_search_path
+test search-path-empty-does-not-find-stored-tables {
+    SELECT a FROM t1;
+}
+expect error {}
+
 test public-schema-qualified-column-reference {
     DROP TABLE IF EXISTS demo;
     CREATE TABLE demo (id int, label text);

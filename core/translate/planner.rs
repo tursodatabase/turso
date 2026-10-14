@@ -2030,7 +2030,6 @@ fn parse_table(
         if let Some(outer_ref) =
             table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
-            let database_id = crate::MAIN_DB_ID;
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
                     // SQLite resolves the recursive self-reference as a plain
@@ -2092,7 +2091,6 @@ fn parse_table(
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
                 }
-                joined_table.database_id = database_id;
                 table_references.add_joined_table(joined_table);
             } else {
                 // All recursive arms read the same one-row pseudo-cursor.
@@ -2111,7 +2109,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
-                    database_id,
+                    database_id: crate::MAIN_DB_ID,
                     indexed: None,
                     plan_estimate: None,
                 });
