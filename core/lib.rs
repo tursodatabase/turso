@@ -1,3 +1,4 @@
+// DO NOT MERGE: no-op change to measure CI time
 #![cfg_attr(
     nightly,
     feature(
