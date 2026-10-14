@@ -225,11 +225,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Add wasm32 Rust target
         run: rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No Rust cache: the job takes ~1 min uncached, and the cache space is
+      # worth more to the jobs with long builds.
       - name: Check turso builds for wasm32-unknown-unknown
         run: cargo check -p turso --target wasm32-unknown-unknown --locked
 
@@ -239,11 +236,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No Rust cache: the job takes ~1 min uncached, and the cache space is
+      # worth more to the jobs with long builds.
       - name: Check turso_core builds without default features
         run: cargo check -p turso_core --no-default-features --features fs --locked
 
