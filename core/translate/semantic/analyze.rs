@@ -4380,6 +4380,59 @@ mod tests {
     }
 
     #[test]
+    fn long_cte_chains_bind_without_deep_recursion() {
+        // Legacy planning handles this chain on a 2 MiB stack. Lazy binding
+        // used to recurse once per link and overflow there.
+        const LINKS: usize = 90;
+        let mut sql = String::from("WITH c0 AS (SELECT 1 AS v)");
+        for index in 1..LINKS {
+            sql.push_str(&format!(", c{index} AS (SELECT v FROM c{})", index - 1));
+        }
+        sql.push_str(&format!(" SELECT v FROM c{}", LINKS - 1));
+        let document = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || analyze_sql(&sql).expect("long CTE chain binds"))
+            .expect("analysis thread starts")
+            .join()
+            .expect("analysis does not overflow its stack");
+        assert_eq!(document.ctes.len(), LINKS);
+    }
+
+    #[test]
+    fn cte_bodies_ignore_with_clauses_nested_at_the_reference() {
+        let document = analyze_sql(
+            "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS v) \
+             SELECT * FROM (WITH b AS (SELECT 2 AS v) SELECT * FROM a)",
+        )
+        .expect("outer CTE binds against its own WITH clause");
+        document
+            .validate()
+            .expect("lexically bound CTEs produce closed HIR");
+        let a = document
+            .ctes
+            .iter()
+            .find(|cte| cte.name == "a")
+            .expect("a is referenced");
+        let CteBody::Query(a_body) = a.body else {
+            panic!("a is not recursive");
+        };
+        let a_block = &document.query(a_body).expect("a body exists").blocks[0];
+        let from = a_block.from.as_ref().expect("a reads b");
+        let SourceKind::Cte(b) = document.source(from.first).expect("b source").kind else {
+            panic!("a reads a CTE");
+        };
+        let CteBody::Query(b_body) = document.cte(b).expect("b exists").body else {
+            panic!("b is not recursive");
+        };
+        let b_output = &document.query(b_body).expect("b body exists").blocks[0].outputs[0];
+        assert!(
+            matches!(&b_output.expr, Expr::Literal(ast::Literal::Numeric(value)) if value == "1"),
+            "a reads the b from its own WITH clause: {:?}",
+            b_output.expr
+        );
+    }
+
+    #[test]
     fn recursive_cte_reference_counting_respects_nested_cte_scopes() {
         let shadowed = analyze_sql(
             "WITH outer_seq(x) AS (\
