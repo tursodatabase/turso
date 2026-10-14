@@ -15,12 +15,19 @@ pub enum Backend {
     Js,
     /// tursopg server, driven over the PostgreSQL wire protocol
     Tursopg,
+    /// A real PostgreSQL server, driven over the PostgreSQL wire protocol
+    Postgres,
 }
 
 impl Backend {
     /// All known backend variants
-    pub const ALL: &'static [Backend] =
-        &[Backend::Rust, Backend::Cli, Backend::Js, Backend::Tursopg];
+    pub const ALL: &'static [Backend] = &[
+        Backend::Rust,
+        Backend::Cli,
+        Backend::Js,
+        Backend::Tursopg,
+        Backend::Postgres,
+    ];
 }
 
 impl Display for Backend {
@@ -30,6 +37,7 @@ impl Display for Backend {
             Backend::Cli => write!(f, "cli"),
             Backend::Js => write!(f, "js"),
             Backend::Tursopg => write!(f, "tursopg"),
+            Backend::Postgres => write!(f, "postgres"),
         }
     }
 }
@@ -43,8 +51,9 @@ impl FromStr for Backend {
             "cli" => Ok(Backend::Cli),
             "js" => Ok(Backend::Js),
             "tursopg" => Ok(Backend::Tursopg),
+            "postgres" => Ok(Backend::Postgres),
             _ => Err(format!(
-                "unknown backend '{s}', valid backends are: rust, cli, js, tursopg"
+                "unknown backend '{s}', valid backends are: rust, cli, js, tursopg, postgres"
             )),
         }
     }
@@ -313,6 +322,8 @@ pub enum SkipCondition {
     Mvcc,
     /// Skip when running against the sqlite CLI backend
     Sqlite,
+    /// Skip when running against a real PostgreSQL server
+    Postgres,
 }
 
 /// What we expect from executing the SQL

@@ -214,7 +214,7 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
-| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`) |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`, `postgres`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 #### Skip Conditions
@@ -225,6 +225,7 @@ The `@skip-if` decorator supports the following conditions:
 |-----------|-------------|
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 | `sqlite` | Skip when running with the sqlite CLI backend |
+| `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
 
 #### Capabilities
 
@@ -541,6 +542,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
 
 skip_condition  = "mvcc"
                 | "sqlite"
+                | "postgres"
 
 capability      = "trigger" | "strict" | "materialized_views"
 
