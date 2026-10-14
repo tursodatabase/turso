@@ -6931,7 +6931,10 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
     let mv_store = db.get_mvcc_store();
     let pager = conn.pager.load().clone();
 
-    mv_store.set_sequence_watermark("turso_cdc_pk_autoincrement", 13);
+    mv_store.set_sequence_watermark(
+        "turso_cdc_pk_autoincrement",
+        SequenceWatermark::ascending(13),
+    );
     let tx1 = mv_store.begin_tx(pager.clone()).unwrap();
     let tx2 = mv_store.begin_tx(pager.clone()).unwrap();
     mv_store
@@ -6970,7 +6973,7 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
     let pager = conn.pager.load().clone();
 
     conn.execute("CREATE SEQUENCE s").unwrap();
-    mv_store.set_sequence_watermark("s", 42);
+    mv_store.set_sequence_watermark("s", SequenceWatermark::ascending(42));
     let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
 
     assert_eq!(rows.len(), 1);
@@ -23251,11 +23254,9 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
 }
 
-/// A sync-style reader that trusts `sequence_watermark_experimental()` must
-/// never skip a committed row. After a plain `BEGIN ... nextval ... ROLLBACK`
-/// the in-memory watermark keeps the rolled-back advance, but the disk value
-/// goes back, so the same id is reissued *below* the watermark the reader
-/// already passed.
+/// After a plain `BEGIN ... nextval ... ROLLBACK`, a later nextval hands out
+/// the same id again. A reader that trusts `sequence_watermark_experimental()`
+/// must still see that row once it commits.
 #[test]
 fn test_sequence_watermark_reader_does_not_skip_row_reissued_after_rollback() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -23469,13 +23470,12 @@ fn test_dropped_commit_publishes_sequence_watermark_before_releasing_exclusive_l
     assert!(mvcc_store.is_exclusive_tx(&tx_id));
 
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let store = mvcc_store.clone();
     let observer = std::thread::spawn(move || {
-        let _watermarks = store.sequence_watermarks.lock();
+        let _watermarks = mvcc_store.sequence_watermarks.lock();
         locked_tx.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
-            if !store.is_exclusive_tx(&tx_id) {
+            if !mvcc_store.is_exclusive_tx(&tx_id) {
                 return true;
             }
             std::thread::yield_now();
@@ -23556,4 +23556,37 @@ fn test_sequence_watermark_does_not_go_back_when_older_allocation_is_tracked_las
 
     let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
     assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_restarts_after_drop_and_recreate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..5 {
+        conn.execute("SELECT nextval('s')").unwrap();
+    }
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 6);
+
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_follows_cycle_wraparound() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s MAXVALUE 2 CYCLE").unwrap();
+    let mut watermarks = Vec::new();
+    for _ in 0..3 {
+        conn.execute("SELECT nextval('s')").unwrap();
+        let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+        watermarks.push(rows[0][0].as_int().unwrap());
+    }
+    assert_eq!(watermarks, vec![1, 2, 1]);
 }

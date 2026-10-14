@@ -1608,11 +1608,14 @@ impl Connection {
                             watermark_stmt,
                             watermark_row,
                         ));
-                        let watermark = Self::sequence_watermark_from_row(
-                            &backing_table_name,
+                        let watermark = crate::mvcc::database::SequenceWatermark::new(
                             sequence,
-                            *watermark_row,
-                        )?;
+                            Self::sequence_watermark_from_row(
+                                &backing_table_name,
+                                sequence,
+                                *watermark_row,
+                            )?,
+                        );
                         if let Some(mv_store) = self.db.get_mv_store().as_ref() {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
@@ -4208,11 +4211,14 @@ impl Connection {
                         watermark_stmt,
                         watermark_row,
                     ));
-                    let watermark = Self::sequence_watermark_from_row(
-                        &backing_table_name,
+                    let watermark = crate::mvcc::database::SequenceWatermark::new(
                         sequence,
-                        *watermark_row,
-                    )?;
+                        Self::sequence_watermark_from_row(
+                            &backing_table_name,
+                            sequence,
+                            *watermark_row,
+                        )?,
+                    );
                     if let Some(mv_store) = self.db.get_mv_store().as_ref() {
                         mv_store.set_sequence_watermark(&normalized, watermark);
                     }
@@ -4523,7 +4529,9 @@ impl Connection {
                                 let first_unsafe = watermark.checked_add(1).unwrap_or(watermark);
                                 mv_store.set_sequence_watermark(
                                     &autoincrement_sequence_name(&rows[*idx].0),
-                                    first_unsafe,
+                                    crate::mvcc::database::SequenceWatermark::ascending(
+                                        first_unsafe,
+                                    ),
                                 );
                             }
                             *idx += 1;

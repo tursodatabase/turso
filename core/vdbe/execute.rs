@@ -14372,6 +14372,9 @@ pub fn op_drop_sequence(
         }
         schema.remove_sequence(seq_name);
     })?;
+    if let Some(mv_store) = conn.mv_store_for_db(*db) {
+        mv_store.clear_sequence_watermark(seq_name);
+    }
     // Drop this connection's stale currval. Otherwise a same-session
     // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
     // return the prior sequence's last value instead of erroring with
@@ -14566,10 +14569,6 @@ pub fn op_set_sequence_currval(
 /// that point the connection's MVCC transaction is the outer tx again, so any
 /// active allocation is attributed to the transaction whose row changes may
 /// become visible later.
-///
-/// When the RMW ran inside an exclusive outer tx, nothing is committed yet. The
-/// new watermark stays in that tx. The commit publishes it before it releases
-/// the exclusive lock. A rollback drops it.
 pub fn op_sequence_track_allocation(
     program: &Program,
     state: &mut ProgramState,
@@ -14616,8 +14615,10 @@ pub fn op_sequence_track_allocation(
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
             })?;
-        let current_watermark =
-            crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
+        let current_watermark = crate::mvcc::database::SequenceWatermark::new(
+            &seq,
+            crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true),
+        );
         let exclusive_tx_id = program
             .connection
             .get_mv_tx_for_db(*db)
@@ -14797,11 +14798,7 @@ const SEQUENCE_INNER_TX_RETRY_BUDGET: u32 = 100;
 /// and the matching `SequenceCommitInnerTx` is a no-op. If the outer
 /// tx rolls back, the sequence advance rolls back with it and a later
 /// nextval hands out the same value again. This is intended (see the
-/// sequence design notes in `core/schema.rs`). The new watermark for
-/// `sequence_watermark_experimental()` stays in the outer tx until it
-/// commits, so readers never pass a value that can be handed out again.
-/// BEGIN CONCURRENT always takes the wrapped path. Its inner tx commits
-/// on its own, so a rolled-back value is never handed out again.
+/// sequence design notes in `core/schema.rs`).
 pub fn op_sequence_begin_inner_tx(
     program: &Program,
     state: &mut ProgramState,

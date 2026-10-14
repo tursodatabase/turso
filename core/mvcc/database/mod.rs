@@ -109,10 +109,47 @@ pub(crate) fn first_unsafe_sequence_watermark(seq: &Sequence, value: i64, is_cal
     if !is_called {
         return value;
     }
-    if seq.increment_by > 0 && !seq.cycle {
+    if sequence_watermark_only_rises(seq) {
         value.checked_add(seq.increment_by).unwrap_or(value)
     } else {
         value
+    }
+}
+
+fn sequence_watermark_only_rises(seq: &Sequence) -> bool {
+    seq.increment_by > 0 && !seq.cycle
+}
+
+fn merge_sequence_watermark(
+    watermarks: &mut HashMap<String, i64>,
+    sequence_name: String,
+    watermark: SequenceWatermark,
+) {
+    let current = watermarks.entry(sequence_name).or_insert(watermark.value);
+    if !watermark.only_rises || watermark.value > *current {
+        *current = watermark.value;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SequenceWatermark {
+    value: i64,
+    only_rises: bool,
+}
+
+impl SequenceWatermark {
+    pub(crate) fn new(seq: &Sequence, value: i64) -> Self {
+        Self {
+            value,
+            only_rises: sequence_watermark_only_rises(seq),
+        }
+    }
+
+    pub(crate) fn ascending(value: i64) -> Self {
+        Self {
+            value,
+            only_rises: true,
+        }
     }
 }
 
@@ -860,7 +897,7 @@ pub struct Savepoint<A: RowVersionAllocator = TursoAllocator> {
     header_dirty: bool,
     /// Copy of the tx's unpublished sequence watermarks when the savepoint began.
     /// Rolling back to the savepoint restores it.
-    uncommitted_sequence_watermarks: HashMap<String, i64>,
+    uncommitted_sequence_watermarks: HashMap<String, SequenceWatermark>,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -896,7 +933,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
     fn statement(
         header: DatabaseHeader,
         header_dirty: bool,
-        uncommitted_sequence_watermarks: HashMap<String, i64>,
+        uncommitted_sequence_watermarks: HashMap<String, SequenceWatermark>,
     ) -> Self {
         Self {
             header,
@@ -913,7 +950,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
         deferred_fk_violations: isize,
         header: DatabaseHeader,
         header_dirty: bool,
-        uncommitted_sequence_watermarks: HashMap<String, i64>,
+        uncommitted_sequence_watermarks: HashMap<String, SequenceWatermark>,
     ) -> Self {
         Self {
             kind: SavepointKind::Named {
@@ -1029,10 +1066,8 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
     header_dirty: AtomicBool,
-    /// Sequence watermarks raised by nextval/setval inside this exclusive tx.
-    /// The commit publishes them to `MvStore::sequence_watermarks` before it
-    /// releases the exclusive lock. A rollback drops them.
-    uncommitted_sequence_watermarks: Mutex<HashMap<String, i64>>,
+    /// Unpublished sequence watermarks from nextval in this tx, restored on ROLLBACK TO.
+    uncommitted_sequence_watermarks: Mutex<HashMap<String, SequenceWatermark>>,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
@@ -3307,7 +3342,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.publish_committed_sequence_watermarks(self.tx_id);
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
@@ -3382,7 +3416,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     );
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.publish_committed_sequence_watermarks(self.tx_id);
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.unlock_pager_commit_lock();
                     }
@@ -3714,13 +3747,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // `inject_transition_failure!` so an Err at `AfterRemoveTx`
                 // cannot strand the atomic — matches the ordering at the
                 // two fast-path CommitEnd sites.
-                //
-                // Publish the sequence watermarks while we still hold the
-                // lock. Once it is released, the next writer can publish a
-                // higher watermark, and a later publish from us would move it
-                // back.
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                    mvcc_store.publish_committed_sequence_watermarks(self.tx_id);
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
@@ -4486,8 +4513,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Per-sequence first value not guaranteed safe to read past based only on
     /// durable/current sequence state. Active allocations can lower this.
     sequence_watermarks: Mutex<HashMap<String, i64>>,
-    /// Per-sequence minimum allocated value for each transaction, from the
-    /// allocation until `remove_tx`. A committed tx keeps its entry until then.
+    /// Per-sequence minimum allocated value for each active transaction.
     ///
     /// This is in-memory and therefore only correct while all MVCC writers for a
     /// database live in one process. Multi-process MVCC will need a shared
@@ -6749,7 +6775,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
-        self.publish_committed_sequence_watermarks(tx_id);
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6797,21 +6822,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Moves the sequence watermarks of a committed tx to the shared map.
-    ///
-    /// The commit calls this before it releases the exclusive lock, because a
-    /// publish after the release can overwrite a higher watermark from the
-    /// next writer. `remove_tx` calls it again for commit paths that never
-    /// reach that point. The drain makes the second call a no-op.
     fn publish_committed_sequence_watermarks(&self, tx_id: TxID) {
         let Some(entry) = self.txs.get(&tx_id) else {
             return;
         };
         let tx = entry.value();
-        if matches!(tx.state.load(), TransactionState::Committed(_)) {
-            self.sequence_watermarks
-                .lock()
-                .extend(tx.uncommitted_sequence_watermarks.lock().drain());
+        if !matches!(tx.state.load(), TransactionState::Committed(_)) {
+            return;
+        }
+        let mut watermarks = self.sequence_watermarks.lock();
+        for (sequence_name, watermark) in tx.uncommitted_sequence_watermarks.lock().drain() {
+            merge_sequence_watermark(&mut watermarks, sequence_name, watermark);
         }
     }
 
@@ -6857,7 +6878,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         tx_id: TxID,
         sequence_name: &str,
-        watermark: i64,
+        watermark: SequenceWatermark,
     ) -> Result<()> {
         let Some(tx) = self.txs.get(&tx_id) else {
             return Err(LimboError::NoSuchTransactionID(tx_id.to_string()));
@@ -6869,19 +6890,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
+    pub fn set_sequence_watermark(&self, sequence_name: &str, watermark: SequenceWatermark) {
         let sequence_name = crate::util::normalize_ident(sequence_name);
+        merge_sequence_watermark(
+            &mut self.sequence_watermarks.lock(),
+            sequence_name,
+            watermark,
+        );
+    }
+
+    pub fn clear_sequence_watermark(&self, sequence_name: &str) {
         self.sequence_watermarks
             .lock()
-            .insert(sequence_name, watermark);
+            .remove(&crate::util::normalize_ident(sequence_name));
     }
 
     /// Returns the first sequence value that is not safe for cursor scans to pass.
     ///
     /// Readers can safely consume rows with sequence values less than this
     /// watermark. The value is the minimum of the current sequence boundary and
-    /// any lower value allocated by a transaction that is still in `txs`. This
-    /// includes a committed transaction that `remove_tx` did not remove yet.
+    /// any lower value allocated by an active or preparing transaction, or by a
+    /// committed transaction that `remove_tx` did not remove yet.
     pub fn sequence_watermark(&self, sequence_name: &str) -> Option<i64> {
         let sequence_name = crate::util::normalize_ident(sequence_name);
         let mut allocations = self.sequence_allocations.lock();
@@ -7715,6 +7744,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Release the exclusive transaction lock if held by the this transaction.
     fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
+        self.publish_committed_sequence_watermarks(*tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
         turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
     }
