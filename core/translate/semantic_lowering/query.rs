@@ -49,7 +49,7 @@ use crate::{
         builder::{
             CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding, SubqueryBinding,
         },
-        insn::{HashDistinctData, Insn, SorterOpenData},
+        insn::{to_u32, HashDistinctData, InsertFlags, Insn, SorterOpenData},
         BranchOffset, CursorID,
     },
     LimboError, Numeric, Result, Value,
@@ -325,10 +325,18 @@ fn plan_hir_window_layer_inputs<'a>(
     Ok(plan)
 }
 
+/// The seen-values set of a DISTINCT aggregate. Each emission of the step
+/// gets its own skip label, because a RIGHT or FULL join emits the loop body
+/// twice.
+struct HirAggregateDistinctSet {
+    hash_table: usize,
+    collation: CollationSeq,
+}
+
 struct HirAggregateRuntime<'a> {
     call: &'a hir::FunctionCall,
     accumulator: usize,
-    distinct: Option<HirAggregateDistinct>,
+    distinct: Option<HirAggregateDistinctSet>,
     percentile_fraction: Option<usize>,
 }
 
@@ -2391,18 +2399,47 @@ struct HirBtreeLoop {
     left_join: Option<usize>,
 }
 
+/// An outer join's ON predicates, evaluated once its right side is positioned.
+/// LEFT and FULL joins also NULL-extend that side when no row matched.
 struct HirLeftJoin {
     owner: SourceId,
     first_loop: usize,
     last_loop: usize,
+    null_extends: bool,
     metadata: LeftJoinMetadata,
     null_cursors: Vec<CursorID>,
+}
+
+/// A RIGHT or FULL join. Its right source records each row that matched a
+/// left row; after the loops finish, a second pass emits the right rows no
+/// left row matched, with the left side NULL. This is SQLite's nested-loop
+/// RIGHT JOIN, and keeps legacy's order: matched rows first, then the rest.
+struct HirRightOuterJoin {
+    source: SourceId,
+    loop_index: usize,
+    matched: CursorID,
+    empty_record: usize,
+}
+
+/// The joins of one FROM clause that loop lowering supports.
+#[derive(Default)]
+struct HirOuterJoins {
+    /// Sources owning ON predicates, and whether each is NULL-extended.
+    owners: Vec<(SourceId, bool)>,
+    /// Right sources of RIGHT and FULL joins.
+    right_outer: Vec<(SourceId, hir::JoinKind)>,
 }
 
 #[derive(Clone, Copy)]
 enum HirPredicateKind {
     Join(SourceId),
-    Where,
+    Where {
+        /// The loop of the block's RIGHT or FULL join, in the main pass.
+        /// WHERE-clause terms ready before it wait for it: SQLite records a
+        /// right row as matched once the ON terms pass, before any WHERE term
+        /// runs, so a WHERE term must not hide a match.
+        right_join_loop: Option<usize>,
+    },
 }
 
 fn is_hir_ungrouped_aggregate(block: &hir::QueryBlock) -> bool {
@@ -2715,14 +2752,13 @@ fn initialize_hir_aggregates<'a>(
             program.emit_insn(Insn::HashClear {
                 hash_table_id: hash_table,
             });
-            Some(HirAggregateDistinct {
+            Some(HirAggregateDistinctSet {
                 hash_table,
                 collation: facts[0]
                     .collation
                     .as_ref()
                     .map(|collation| *collation.value())
                     .unwrap_or(CollationSeq::Binary),
-                on_conflict: program.allocate_label(),
             })
         } else {
             None
@@ -2806,8 +2842,15 @@ fn emit_hir_aggregate_steps(
 ) -> Result<()> {
     for aggregate in &state.aggregates {
         let filter = aggregate.call.evaluation.filter();
-        let skip = aggregate
+        let distinct = aggregate
             .distinct
+            .as_ref()
+            .map(|distinct| HirAggregateDistinct {
+                hash_table: distinct.hash_table,
+                collation: distinct.collation,
+                on_conflict: program.allocate_label(),
+            });
+        let skip = distinct
             .as_ref()
             .map(|distinct| distinct.on_conflict)
             .or_else(|| filter.map(|_| program.allocate_label()));
@@ -2825,7 +2868,7 @@ fn emit_hir_aggregate_steps(
             document,
             aggregate.call,
             aggregate.accumulator,
-            aggregate.distinct.as_ref(),
+            distinct.as_ref(),
             aggregate.percentile_fraction,
         )?;
         if let Some(skip) = skip {
@@ -3000,17 +3043,18 @@ fn emit_btree_loops(
         )));
     }
     let from = block.from.as_ref().expect("FROM query block has a source");
-    let mut left_join_owners = Vec::new();
-    if !supported_btree_from(document, from, &mut left_join_owners) {
+    let mut joins = HirOuterJoins::default();
+    if !supported_btree_from(document, from, &mut joins) {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} contains an unsupported join",
             block.id
         )));
     }
+    check_hir_full_join_shape(document, from, &joins)?;
     if block_plan.predicates.iter().any(|predicate| {
         predicate
             .from_outer_join
-            .is_some_and(|source| !left_join_owners.contains(&source))
+            .is_some_and(|source| !joins.owners.iter().any(|(owner, _)| *owner == source))
     }) {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} contains an unsupported outer-join predicate owner",
@@ -3032,89 +3076,33 @@ fn emit_btree_loops(
             initialize_hir_aggregate_captures(program, document, block_plan, state)
         })
         .transpose()?;
-    let left_joins =
-        prepare_hir_left_joins(program, block_plan, &prepared_loops, &left_join_owners)?;
+    let left_joins = prepare_hir_left_joins(program, block_plan, &prepared_loops, &joins.owners)?;
+    let right_outer = prepare_hir_right_outer_join(program, document, block_plan, &joins)?;
 
+    let nest = HirLoopNest {
+        document,
+        block,
+        block_plan,
+        prepared_loops: &prepared_loops,
+        left_joins: &left_joins,
+        right_outer: right_outer.as_ref(),
+        body: &body,
+        aggregate_captures: aggregate_captures.as_ref(),
+    };
     emit_ready_predicates(
         program,
         document,
         block_plan,
         None,
         block_done,
-        HirPredicateKind::Where,
+        HirPredicateKind::Where {
+            right_join_loop: None,
+        },
         &left_joins,
     )?;
-    let mut loops = Vec::with_capacity(prepared_loops.len());
-    for (loop_index, prepared_loop) in prepared_loops.iter().enumerate() {
-        let mut starting_left_joins = left_joins
-            .iter()
-            .enumerate()
-            .filter(|(_, left_join)| left_join.first_loop == loop_index);
-        let left_join = starting_left_joins.next().map(|(index, left_join)| {
-            left_join.metadata.reset(program);
-            index
-        });
-        if starting_left_joins.next().is_some() {
-            return Err(LimboError::InternalError(format!(
-                "HIR loop {loop_index} starts overlapping LEFT JOIN boundaries"
-            )));
-        }
-        let hir_loop = start_hir_loop(program, document, prepared_loop, left_join)?;
-        for left_join in left_joins
-            .iter()
-            .filter(|left_join| left_join.last_loop == loop_index)
-        {
-            emit_ready_predicates(
-                program,
-                document,
-                block_plan,
-                Some(loop_index),
-                hir_loop.next,
-                HirPredicateKind::Join(left_join.owner),
-                &left_joins,
-            )?;
-            left_join.metadata.mark_matched(program);
-        }
-        emit_ready_predicates(
-            program,
-            document,
-            block_plan,
-            Some(loop_index),
-            hir_loop.next,
-            HirPredicateKind::Where,
-            &left_joins,
-        )?;
-        loops.push(hir_loop);
-    }
-
-    let innermost_next = loops.last().expect("loop list is non-empty").next;
-    match body {
-        HirLoopBody::Rows(output) => {
-            let start = query_output_registers(program, &block.outputs, output.needs_values())?;
-            emit_query_row(
-                program,
-                document,
-                output,
-                &block.outputs,
-                block.outputs.iter().map(|output| &output.expr),
-                start,
-                innermost_next,
-            )?;
-        }
-        HirLoopBody::UngroupedAggregate(state) => {
-            let (first_row, captures) = aggregate_captures
-                .as_ref()
-                .expect("aggregate loop initializes first-row captures");
-            emit_hir_aggregate_capture(program, document, *first_row, captures)?;
-            emit_hir_aggregate_steps(program, document, state)?;
-        }
-        HirLoopBody::Group(runtime) => {
-            emit_hir_group_input(program, document, runtime)?;
-        }
-    }
-
-    for hir_loop in loops.iter().rev() {
-        close_hir_btree_loop(program, hir_loop, &left_joins);
+    nest.emit_loops(program, 0, block_done, false)?;
+    if let Some(right_outer) = &right_outer {
+        nest.emit_unmatched_right_rows(program, right_outer)?;
     }
     program.preassign_label_to_next_insn(block_done);
     if let Some((_, captures)) = aggregate_captures {
@@ -3123,16 +3111,356 @@ fn emit_btree_loops(
     Ok(())
 }
 
+/// Everything needed to emit the nested loops of one block, or a suffix of
+/// them, followed by the block's row body.
+struct HirLoopNest<'n, 'a> {
+    document: &'n HirDocument,
+    block: &'n hir::QueryBlock,
+    block_plan: &'n HirQueryBlockPlan,
+    prepared_loops: &'n [PreparedHirLoop<'a>],
+    left_joins: &'n [HirLeftJoin],
+    right_outer: Option<&'n HirRightOuterJoin>,
+    body: &'n HirLoopBody<'n>,
+    aggregate_captures: Option<&'n (usize, Vec<HirAggregateCapture>)>,
+}
+
+impl HirLoopNest<'_, '_> {
+    /// Emit loops `first..` around the body. `outer_next` continues the
+    /// enclosing iteration when a row is rejected and no loop is emitted here.
+    /// The unmatched-right pass sets `unmatched_pass`: it re-emits the loops
+    /// after the right source, which does not record matches again.
+    fn emit_loops(
+        &self,
+        program: &mut ProgramBuilder,
+        first: usize,
+        outer_next: BranchOffset,
+        unmatched_pass: bool,
+    ) -> Result<()> {
+        // Match flags and their labels belong to one emission of the loops.
+        let pass_left_joins;
+        let left_joins = if unmatched_pass {
+            pass_left_joins = self
+                .left_joins
+                .iter()
+                .map(|left_join| HirLeftJoin {
+                    owner: left_join.owner,
+                    first_loop: left_join.first_loop,
+                    last_loop: left_join.last_loop,
+                    null_extends: left_join.null_extends,
+                    metadata: LeftJoinMetadata::new(program),
+                    null_cursors: left_join.null_cursors.clone(),
+                })
+                .collect::<Vec<_>>();
+            &pass_left_joins
+        } else {
+            self.left_joins
+        };
+        let mut loops = Vec::with_capacity(self.prepared_loops.len() - first);
+        for loop_index in first..self.prepared_loops.len() {
+            let mut starting_left_joins = left_joins.iter().enumerate().filter(|(_, left_join)| {
+                left_join.null_extends && left_join.first_loop == loop_index
+            });
+            let left_join = starting_left_joins.next().map(|(index, left_join)| {
+                left_join.metadata.reset(program);
+                index
+            });
+            if starting_left_joins.next().is_some() {
+                return Err(LimboError::InternalError(format!(
+                    "HIR loop {loop_index} starts overlapping LEFT JOIN boundaries"
+                )));
+            }
+            let hir_loop = start_hir_loop(
+                program,
+                self.document,
+                &self.prepared_loops[loop_index],
+                left_join,
+            )?;
+            for left_join in left_joins
+                .iter()
+                .filter(|left_join| left_join.last_loop == loop_index)
+            {
+                emit_ready_predicates(
+                    program,
+                    self.document,
+                    self.block_plan,
+                    Some(loop_index),
+                    hir_loop.next,
+                    HirPredicateKind::Join(left_join.owner),
+                    left_joins,
+                )?;
+                if let Some(right_outer) = self
+                    .right_outer
+                    .filter(|right_outer| right_outer.source == left_join.owner)
+                {
+                    if unmatched_pass {
+                        return Err(LimboError::InternalError(
+                            "HIR unmatched-row pass re-entered its right source".into(),
+                        ));
+                    }
+                    right_outer.emit_mark_matched(program, self.document)?;
+                }
+                if left_join.null_extends {
+                    left_join.metadata.mark_matched(program);
+                }
+            }
+            emit_ready_predicates(
+                program,
+                self.document,
+                self.block_plan,
+                Some(loop_index),
+                hir_loop.next,
+                HirPredicateKind::Where {
+                    right_join_loop: self
+                        .right_outer
+                        .filter(|_| !unmatched_pass)
+                        .map(|right_outer| right_outer.loop_index),
+                },
+                left_joins,
+            )?;
+            loops.push(hir_loop);
+        }
+
+        let innermost_next = loops.last().map_or(outer_next, |hir_loop| hir_loop.next);
+        match self.body {
+            HirLoopBody::Rows(output) => {
+                let start =
+                    query_output_registers(program, &self.block.outputs, output.needs_values())?;
+                emit_query_row(
+                    program,
+                    self.document,
+                    output,
+                    &self.block.outputs,
+                    self.block.outputs.iter().map(|output| &output.expr),
+                    start,
+                    innermost_next,
+                )?;
+            }
+            HirLoopBody::UngroupedAggregate(state) => {
+                let (first_row, captures) = self
+                    .aggregate_captures
+                    .expect("aggregate loop initializes first-row captures");
+                emit_hir_aggregate_capture(program, self.document, *first_row, captures)?;
+                emit_hir_aggregate_steps(program, self.document, state)?;
+            }
+            HirLoopBody::Group(runtime) => {
+                emit_hir_group_input(program, self.document, runtime)?;
+            }
+        }
+
+        for hir_loop in loops.iter().rev() {
+            close_hir_btree_loop(program, hir_loop, left_joins);
+        }
+        Ok(())
+    }
+
+    /// After the main loops: scan the right source of a RIGHT or FULL join
+    /// and run the rest of the block for every row no left row matched. The
+    /// left sources read NULL, and every WHERE term up to the right source
+    /// runs again, including terms the planner used for index seeks.
+    fn emit_unmatched_right_rows(
+        &self,
+        program: &mut ProgramBuilder,
+        right_outer: &HirRightOuterJoin,
+    ) -> Result<()> {
+        let right = right_outer.loop_index;
+        for prepared in &self.prepared_loops[..right] {
+            match prepared {
+                PreparedHirLoop::BTree(_) | PreparedHirLoop::Materialized(_) => {}
+                PreparedHirLoop::Virtual(_) | PreparedHirLoop::Registers(_) => {
+                    return Err(LimboError::InternalError(
+                        "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
+                    ));
+                }
+            }
+            for cursor in prepared.cursor().into_iter().chain(prepared.table_cursor()) {
+                program.emit_insn(Insn::NullRow { cursor_id: cursor });
+            }
+        }
+        let PreparedHirLoop::BTree(prepared) = &self.prepared_loops[right] else {
+            return Err(LimboError::InternalError(
+                "HIR RIGHT or FULL JOIN right source is not a B-tree table".into(),
+            ));
+        };
+        let hir::SourceKind::Table(table) = &prepared.source.kind else {
+            unreachable!("B-tree loops read table sources")
+        };
+        let Some(table) = table.value().btree() else {
+            unreachable!("B-tree loops read B-tree tables")
+        };
+        let database = prepared
+            .source
+            .database
+            .expect("B-tree loop sources have a database");
+        let scan = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: scan,
+            root_page: table.root_page,
+            db: database.index(),
+        });
+        let original = program.source_binding(right_outer.source).cloned();
+        program.bind_source(
+            right_outer.source,
+            SourceBinding::BTree {
+                scan_cursor: scan,
+                table_cursor: None,
+            },
+        );
+
+        let done = program.allocate_label();
+        let loop_start = program.allocate_label();
+        let next = program.allocate_label();
+        let unmatched = program.allocate_label();
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: scan,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::RowId {
+            cursor_id: scan,
+            dest: rowid,
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor: right_outer.matched,
+            rowid_reg: rowid,
+            target_pc: unmatched,
+        });
+        program.emit_insn(Insn::Goto { target_pc: next });
+        program.preassign_label_to_next_insn(unmatched);
+        // Like SQLite, the unmatched pass checks WHERE terms only. ON terms,
+        // including those of inner joins left of the RIGHT JOIN, would reject
+        // every row whose left side is NULL.
+        for predicate in &self.block_plan.predicates[self.block_plan.where_start..] {
+            let ready_at = predicate_loop(
+                program,
+                self.document,
+                &predicate.expr,
+                &self.block_plan.loops,
+            )?;
+            if ready_at.is_some_and(|ready_at| ready_at > right) {
+                continue;
+            }
+            let passed = program.allocate_label();
+            super::expr::translate_condition_expr(
+                program,
+                self.document,
+                &predicate.expr,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: passed,
+                    jump_target_when_false: next,
+                    jump_target_when_null: next,
+                },
+            )?;
+            program.preassign_label_to_next_insn(passed);
+        }
+        self.emit_loops(program, right + 1, next, true)?;
+        program.preassign_label_to_next_insn(next);
+        program.emit_insn(Insn::Next {
+            cursor_id: scan,
+            pc_if_next: loop_start,
+            fullscan: true,
+        });
+        program.preassign_label_to_next_insn(done);
+        if let Some(original) = original {
+            program.bind_source(right_outer.source, original);
+        }
+        Ok(())
+    }
+}
+
+/// Open the matched-row set of the block's RIGHT or FULL join, if any.
+fn prepare_hir_right_outer_join(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block_plan: &HirQueryBlockPlan,
+    joins: &HirOuterJoins,
+) -> Result<Option<HirRightOuterJoin>> {
+    let source = match joins.right_outer.as_slice() {
+        [] => return Ok(None),
+        [(source, _)] => *source,
+        _ => {
+            return Err(LimboError::InternalError(
+                "HIR query block has more than one RIGHT or FULL JOIN".into(),
+            ))
+        }
+    };
+    let rowid_table = document
+        .source(source)
+        .and_then(|source| match &source.kind {
+            hir::SourceKind::Table(table) => table.value().btree(),
+            _ => None,
+        })
+        .filter(|table| table.has_rowid);
+    let Some(table) = rowid_table else {
+        return Err(LimboError::InternalError(format!(
+            "HIR RIGHT or FULL JOIN source {source} is not a rowid table"
+        )));
+    };
+    let loop_index = block_plan
+        .loops
+        .iter()
+        .position(|planned_loop| planned_loop.source == source)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR RIGHT or FULL JOIN source {source} has no loop"
+            ))
+        })?;
+    let matched = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: matched,
+        is_table: true,
+    });
+    let empty_record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(empty_record),
+        count: 0,
+        dest_reg: to_u32(empty_record),
+        index_name: None,
+        affinity_str: None,
+    });
+    Ok(Some(HirRightOuterJoin {
+        source,
+        loop_index,
+        matched,
+        empty_record,
+    }))
+}
+
+impl HirRightOuterJoin {
+    /// Remember that the current right row matched a left row.
+    fn emit_mark_matched(
+        &self,
+        program: &mut ProgramBuilder,
+        document: &HirDocument,
+    ) -> Result<()> {
+        let rowid = program.alloc_register();
+        super::expr::translate_expr(program, document, &hir::Expr::RowId(self.source), rowid)?;
+        program.emit_insn(Insn::Insert {
+            cursor: self.matched,
+            key_reg: rowid,
+            record_reg: self.empty_record,
+            // The cursor is not positioned, and the matched-row set must not
+            // change last_insert_rowid() or change counts.
+            flag: InsertFlags::new()
+                .require_seek()
+                .is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        Ok(())
+    }
+}
+
 fn supported_btree_from(
     document: &HirDocument,
     from: &hir::From,
-    left_join_owners: &mut Vec<SourceId>,
+    joins: &mut HirOuterJoins,
 ) -> bool {
     let Some(first) = document.source(from.first) else {
         return false;
     };
     if let hir::SourceKind::FromGroup(group) = &first.kind {
-        if !supported_btree_from(document, &group.from, left_join_owners) {
+        if !supported_btree_from(document, &group.from, joins) {
             return false;
         }
     }
@@ -3143,7 +3471,7 @@ fn supported_btree_from(
         match join.kind {
             hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => {
                 if let hir::SourceKind::FromGroup(group) = &source.kind {
-                    if !supported_btree_from(document, &group.from, left_join_owners) {
+                    if !supported_btree_from(document, &group.from, joins) {
                         return false;
                     }
                 }
@@ -3154,12 +3482,73 @@ fn supported_btree_from(
                         return false;
                     }
                 }
-                left_join_owners.push(join.right);
+                joins.owners.push((join.right, true));
             }
-            hir::JoinKind::Right | hir::JoinKind::Full => return false,
+            hir::JoinKind::Right | hir::JoinKind::Full => {
+                if matches!(source.kind, hir::SourceKind::FromGroup(_)) {
+                    return false;
+                }
+                joins
+                    .owners
+                    .push((join.right, join.kind == hir::JoinKind::Full));
+                joins.right_outer.push((join.right, join.kind));
+            }
         }
     }
     true
+}
+
+/// Legacy runs FULL joins as hash joins and reports these shapes, which have
+/// no hash plan, as errors. Keep the same errors.
+fn check_hir_full_join_shape(
+    document: &HirDocument,
+    from: &hir::From,
+    joins: &HirOuterJoins,
+) -> Result<()> {
+    let Some(full_join) = from
+        .joins
+        .iter()
+        .position(|join| join.kind == hir::JoinKind::Full)
+    else {
+        return Ok(());
+    };
+    let outer_join_before_full = from.joins[..full_join].iter().any(|join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+        )
+    });
+    if joins.right_outer.len() > 1 || outer_join_before_full {
+        crate::bail_parse_error!("FULL OUTER JOIN chaining is not yet supported");
+    }
+    let mut sources = Vec::new();
+    collect_hir_from_sources(document, from, &mut sources);
+    if sources.iter().any(|source| {
+        document
+            .source(*source)
+            .is_some_and(|source| matches!(source.kind, hir::SourceKind::RecursiveInput(_)))
+    }) {
+        crate::bail_parse_error!("FULL OUTER JOIN with a recursive reference is not yet supported");
+    }
+    let full_join = &from.joins[full_join];
+    if matches!(
+        full_join.constraint,
+        hir::JoinConstraint::Using(_) | hir::JoinConstraint::Natural(_)
+    ) {
+        crate::bail_parse_error!("FULL OUTER JOIN requires an equality condition in the ON clause");
+    }
+    Ok(())
+}
+
+fn collect_hir_from_sources(document: &HirDocument, from: &hir::From, sources: &mut Vec<SourceId>) {
+    for source in std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right)) {
+        sources.push(source);
+        if let Some(hir::SourceKind::FromGroup(group)) =
+            document.source(source).map(|source| &source.kind)
+        {
+            collect_hir_from_sources(document, &group.from, sources);
+        }
+    }
 }
 
 fn ordinary_btree_from(document: &HirDocument, from: &hir::From) -> bool {
@@ -3185,11 +3574,11 @@ fn prepare_hir_left_joins(
     program: &mut ProgramBuilder,
     block_plan: &HirQueryBlockPlan,
     prepared_loops: &[PreparedHirLoop<'_>],
-    owners: &[SourceId],
+    owners: &[(SourceId, bool)],
 ) -> Result<Vec<HirLeftJoin>> {
     owners
         .iter()
-        .map(|owner| {
+        .map(|(owner, null_extends)| {
             let loop_indices = if let Some(group) = block_plan
                 .groups
                 .iter()
@@ -3241,6 +3630,7 @@ fn prepare_hir_left_joins(
                 owner: *owner,
                 first_loop,
                 last_loop,
+                null_extends: *null_extends,
                 metadata: LeftJoinMetadata::new(program),
                 null_cursors,
             })
@@ -4178,10 +4568,13 @@ fn emit_ready_predicates(
     kind: HirPredicateKind,
     left_joins: &[HirLeftJoin],
 ) -> Result<()> {
-    for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
+    for (index, predicate) in block_plan.predicates.iter().enumerate() {
+        if predicate.consumed {
+            continue;
+        }
         let selected = match kind {
             HirPredicateKind::Join(source) => predicate.from_outer_join == Some(source),
-            HirPredicateKind::Where => predicate.from_outer_join.is_none(),
+            HirPredicateKind::Where { .. } => predicate.from_outer_join.is_none(),
         };
         if !selected {
             continue;
@@ -4206,7 +4599,11 @@ fn emit_ready_predicates(
                 }
                 Some(owner)
             }
-            HirPredicateKind::Where => references_ready_at.map(|ready| {
+            HirPredicateKind::Where { right_join_loop } => references_ready_at.map(|ready| {
+                let ready = match right_join_loop {
+                    Some(right) if index >= block_plan.where_start => ready.max(right),
+                    _ => ready,
+                };
                 left_joins.iter().fold(ready, |ready, left_join| {
                     if left_join.first_loop <= ready && ready <= left_join.last_loop {
                         left_join.last_loop

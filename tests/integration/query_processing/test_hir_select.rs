@@ -222,3 +222,78 @@ fn hir_views_expand_like_legacy() {
         assert!(error.to_string().contains("circularly defined"), "{error}");
     }
 }
+
+#[test]
+fn hir_right_and_full_joins_match_legacy_rows() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for sql in [
+        "SELECT i.id, t.tag FROM items i RIGHT JOIN tags t ON t.item_id = i.id ORDER BY 2, 1",
+        "SELECT i.id, t.tag FROM items i FULL JOIN tags t ON t.item_id = i.id ORDER BY 1, 2",
+        "SELECT i.id, t.tag FROM items i FULL JOIN tags t ON t.item_id = i.id \
+         WHERE i.id IS NULL OR t.tag IS NULL ORDER BY 1, 2",
+        "SELECT i.id, t.tag FROM items i RIGHT JOIN tags t ON t.item_id < i.id AND i.value > 25 \
+         ORDER BY 2, 1",
+        "SELECT count(*), count(i.id), count(t.tag) FROM items i FULL JOIN tags t ON t.item_id = i.id",
+        "SELECT t.tag, count(i.id) FROM items i RIGHT JOIN tags t ON t.item_id = i.id \
+         GROUP BY t.tag ORDER BY 1",
+        "SELECT i.id, t.tag FROM items i FULL JOIN tags t ON 1 WHERE i.id = 1 ORDER BY 1, 2",
+        "SELECT i.id, t.tag, j.id FROM items i FULL JOIN tags t ON t.item_id = i.id \
+         LEFT JOIN items j ON j.id = t.item_id ORDER BY 1, 2, 3",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+
+    // HIR must match SQLite here. Legacy returns wrong rows for the last two.
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SETUP).unwrap();
+    for sql in [
+        // The unmatched-row pass checks WHERE terms only, not inner ON terms.
+        "SELECT i.id, j.id, t.tag FROM items i JOIN items j ON j.id = i.id \
+         FULL JOIN tags t ON t.item_id = i.id ORDER BY 1, 2, 3",
+        // A WHERE term on the left side runs after the match is recorded, so
+        // every tag counts as matched and no NULL-extended row appears.
+        "SELECT i.id, t.tag FROM items i RIGHT JOIN tags t ON 1 WHERE i.id IS NULL",
+        // Legacy puts the inner join's columns before the RIGHT JOIN's.
+        "SELECT * FROM items i RIGHT JOIN tags t ON t.item_id = i.id \
+         JOIN items j ON j.id = t.item_id ORDER BY t.tag, i.id",
+        // Legacy emits extra rows when a comma join comes before FULL JOIN.
+        "SELECT i.id, j.id, t.tag FROM items i, items j FULL JOIN tags t ON t.item_id = j.id \
+         WHERE i.id = 1 ORDER BY 1, 2, 3",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+
+    for (sql, message) in [
+        (
+            "SELECT * FROM items a FULL JOIN items b ON a.id = b.id FULL JOIN tags t ON t.item_id = b.id",
+            "FULL OUTER JOIN chaining is not yet supported",
+        ),
+        (
+            "SELECT * FROM items a FULL JOIN items b USING (id)",
+            "FULL OUTER JOIN requires an equality condition in the ON clause",
+        ),
+    ] {
+        for conn in [&legacy, &hir] {
+            let error = conn.prepare(sql).err().expect("FULL JOIN shape fails");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+}

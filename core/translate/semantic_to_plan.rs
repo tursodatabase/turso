@@ -124,6 +124,10 @@ pub(crate) struct HirQueryBlockPlanInput {
     pub(crate) sources: Vec<HirPlanSource>,
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    /// Index of the first predicate from the WHERE clause. Earlier predicates
+    /// come from the FROM clause: join constraints and table-function
+    /// arguments.
+    pub(crate) where_start: usize,
 }
 
 /// Access choices for one resolved HIR query block.
@@ -132,6 +136,10 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    /// Index of the first predicate from the WHERE clause. Earlier predicates
+    /// come from the FROM clause. Planning only marks predicates consumed; it
+    /// never reorders them.
+    pub(crate) where_start: usize,
     pub(crate) group_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
@@ -281,10 +289,12 @@ impl<'a> HirPlanContext<'a> {
             sources: vec![self.plan_source(update.target, None, &usage)?],
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
         if let Some(from) = &update.from {
             self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
         }
+        input.where_start = input.predicates.len();
         if let Some(predicate) = &update.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
@@ -307,6 +317,7 @@ impl<'a> HirPlanContext<'a> {
             sources: vec![self.plan_source(delete.target, None, &usage)?],
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
         if let Some(predicate) = &delete.predicate {
             append_predicates(&mut input.predicates, predicate, None);
@@ -712,11 +723,13 @@ impl<'a> HirPlanContext<'a> {
             sources: Vec::new(),
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
 
         if let Some(from) = &block.from {
             self.append_from(from, HirFromContext::default(), &mut input, usage)?;
         }
+        input.where_start = input.predicates.len();
 
         if let hir::QueryBlockBody::Select {
             filter: Some(filter),
@@ -850,6 +863,7 @@ impl<'a> HirPlanContext<'a> {
                 groups: input.groups,
                 loops: Vec::new(),
                 predicates: input.predicates,
+                where_start: input.where_start,
                 group_sort_elided: false,
                 output_cardinality,
                 cost: Cost(0.0),
@@ -857,6 +871,7 @@ impl<'a> HirPlanContext<'a> {
         }
 
         let input = self.query_block_input(block, order_by, &usage)?;
+        let where_start = input.where_start;
         let order_target = if order_by.is_empty() {
             self.grouping_target(block)
         } else {
@@ -884,6 +899,7 @@ impl<'a> HirPlanContext<'a> {
             groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
+            where_start,
             group_sort_elided: access.group_sort_elided,
             output_cardinality: access.output_cardinality,
             cost: access.cost,

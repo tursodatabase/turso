@@ -147,12 +147,12 @@ subquery emits the same shell when its loop opens.
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. After the fixes
 above, a run passed 13808 and failed 363, before views were supported (43
-failures named views). Legacy passes all of them. Known gaps, largest first:
+failures named views). With views and RIGHT and FULL joins, a run passed 13941
+and failed 230. Legacy passes all of them. Known gaps, largest first:
 
 | Gap | Failing tests | Example |
 |---|---|---|
 | Wrong results and EXPLAIN QUERY PLAN text (see below) | ~105 | `explain-query-plan-json`, `partial_idx: plan-*` |
-| RIGHT and FULL joins | 97 | `full-join-on-clause-operand-order` |
 | Indexes on generated columns produce invalid HIR | 52 | `gencol-virtual-constant-index-lookup` |
 | `no such column` for derived-table and CTE columns in ON and nested scopes | ~24 | `joins/derived_subquery_on_predicate` |
 | Compound ORDER BY on qualified result columns | 10 | `union-all-order-by-qualified-result-column` |
@@ -168,6 +168,20 @@ index seek literals; compound subquery affinity; `avg` of large integers;
 three-level outer references; array display; temp schema rows. `SELECT a FROM
 t HAVING max(a) > 0` returns the row's value where legacy returns NULL (SQLite
 rejects it).
+
+RIGHT and FULL joins use SQLite's nested-loop method instead of legacy's hash
+join. The right loop records each matched rowid in an ephemeral table, and
+after the main loops a second pass scans the right table for rows not in it,
+with the left tables reading NULL. As in SQLite, WHERE terms run only after the
+match is recorded, and the second pass checks WHERE terms but not ON terms.
+HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
+(chaining, a recursive CTE reference, USING or NATURAL). It accepts correlated
+subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:
+`a, b FULL JOIN c ... WHERE ...` (legacy returns extra rows), RIGHT JOIN
+followed by another join (legacy returns columns in the wrong order), and
+`outer_hash_join: full-outer-with-where-equijoin` (legacy ignores a WHERE term
+that repeats the ON term). Both still reject a RIGHT JOIN after another join,
+during analysis.
 
 Legacy runs FROM subqueries and CTEs as coroutines when it can, so the outer
 loop pulls rows on demand. HIR always materializes them first. Results match
