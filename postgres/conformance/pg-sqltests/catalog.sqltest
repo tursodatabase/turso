@@ -254,3 +254,283 @@ expect {
     1259|dump_indexed|1|{owner=arwdDxt/owner}||||heap
     1259|dump_plain|0|{owner=arwdDxt/owner}||||heap
 }
+
+test physical-catalog-tableoid {
+    CREATE TABLE indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE DEFAULT 'a');
+    SELECT tableoid FROM pg_catalog.pg_class LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_namespace LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_attribute LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_proc LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_database LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_am LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_type LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_index LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_constraint LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_attrdef LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_depend LIMIT 1;
+    CREATE TABLE refresh_schema (value TEXT);
+    SELECT tableoid FROM pg_namespace LIMIT 1;
+}
+expect {
+    1259
+    2615
+    1249
+    1255
+    1262
+    2601
+    1247
+    2610
+    2606
+    2604
+    2608
+    2615
+}
+
+test pg-namespace-builtins {
+    SELECT nspname FROM pg_namespace
+    WHERE nspname IN ('pg_catalog', 'public') ORDER BY nspname;
+}
+expect {
+    pg_catalog
+    public
+}
+
+test pg-class-lists-created-tables {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE widgets (id INT, label TEXT);
+    SELECT relname, relkind FROM pg_class
+    WHERE relkind = 'r' AND relname IN ('users', 'widgets') ORDER BY relname;
+}
+expect {
+    users|r
+    widgets|r
+}
+
+test pg-attribute-no-user-columns-without-tables {
+    SELECT count(*) FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public';
+}
+expect {
+    0
+}
+
+test pg-tables-lists-created-tables {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);
+    CREATE TABLE items (id INT PRIMARY KEY, name TEXT);
+    SELECT schemaname, tablename FROM pg_tables
+    WHERE schemaname = 'public' ORDER BY tablename;
+}
+expect {
+    public|items
+    public|orders
+    public|users
+}
+
+test pg-tables-no-internal-tables {
+    CREATE TABLE mydata (id INTEGER PRIMARY KEY);
+    SELECT tablename FROM pg_tables WHERE substr(tablename, 1, 7) = 'sqlite_';
+}
+expect {}
+
+test pg-type-builtin-oids {
+    SELECT typname, oid FROM pg_type
+    WHERE typname IN ('int4', 'text', 'bool', 'uuid') ORDER BY typname;
+}
+expect {
+    bool|16
+    int4|23
+    text|25
+    uuid|2950
+}
+
+test pg-type-array-elements {
+    SELECT typname, oid, typelem FROM pg_type
+    WHERE typname IN ('_int4', '_text') ORDER BY typname;
+}
+expect {
+    _int4|1007|23
+    _text|1009|25
+}
+
+test pg-indexes-lists-index-definitions {
+    CREATE TABLE items (id INT, name TEXT, price INT);
+    CREATE INDEX items_name_idx ON items (name);
+    CREATE UNIQUE INDEX items_price_idx ON items (price) WHERE price > 0;
+    SELECT schemaname, tablename, indexname, tablespace,
+           replace(replace(indexdef, 'public.', ''),
+                   'WHERE (price > 0)', 'WHERE price > 0')
+    FROM pg_catalog.pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
+}
+expect {
+    public|items|items_name_idx||CREATE INDEX items_name_idx ON items USING btree (name)
+    public|items|items_price_idx||CREATE UNIQUE INDEX items_price_idx ON items USING btree (price) WHERE price > 0
+}
+
+test pg-index-columns {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_items_name ON items(name);
+    SELECT c.relname, i.indkey,
+           CASE WHEN i.indisunique THEN 1 ELSE 0 END,
+           CASE WHEN i.indisprimary THEN 1 ELSE 0 END
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'idx_items_name';
+}
+expect {
+    idx_items_name|2|0|0
+}
+
+test pg-index-composite-primary-key {
+    CREATE TABLE pk_test (a TEXT, b TEXT, PRIMARY KEY (a, b));
+    SELECT CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
+           CASE WHEN i.indisunique THEN 1 ELSE 0 END, i.indkey
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+    WHERE c.relname = 'pk_test' AND i.indisprimary;
+}
+expect {
+    1|1|1 2
+}
+
+test pg-constraint-primary-and-foreign-keys {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY,
+                       parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    SELECT conname, contype FROM pg_constraint
+    JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'parent' AND contype = 'p';
+    SELECT conname, contype, confdeltype FROM pg_constraint
+    JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'child' AND contype = 'f';
+}
+expect {
+    parent_pkey|p
+    child_parent_id_fkey|f|c
+}
+
+test pg-constraint-check-expression {
+    CREATE TABLE checked (id INTEGER, val INTEGER CHECK(val > 0));
+    SELECT contype,
+           CASE WHEN pg_get_expr(conbin, conrelid) LIKE '%val%'
+                     AND pg_get_expr(conbin, conrelid) LIKE '%0%'
+                THEN 1 ELSE 0 END
+    FROM pg_constraint JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'checked' AND contype = 'c';
+}
+expect {
+    c|1
+}
+
+test pg-class-includes-indexes {
+    CREATE TABLE indexed (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE INDEX idx_indexed_data ON indexed(data);
+    SELECT relname, relkind, relam FROM pg_class
+    WHERE relname = 'idx_indexed_data' AND relkind = 'i';
+}
+expect {
+    idx_indexed_data|i|403
+}
+
+test pg-catalog-schema-qualified-tables {
+    CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT);
+    SELECT c.relname FROM pg_catalog.pg_class c
+    WHERE c.relkind = 'r' AND c.relname = 'widgets';
+    SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public';
+    SELECT n.nspname, c.relname FROM pg_catalog.pg_class c
+    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r' AND c.relname = 'widgets';
+}
+expect {
+    widgets
+    public
+    public|widgets
+}
+
+test public-schema-qualified-tables {
+    CREATE TABLE gadgets (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO gadgets (id, name) VALUES (1, 'phone');
+    SELECT name FROM public.gadgets WHERE id = 1;
+}
+expect {
+    phone
+}
+
+test pg-get-constraintdef {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child (id INTEGER PRIMARY KEY,
+                       parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                       age INTEGER CHECK(age > 0));
+    SELECT c.relname, con.contype,
+           CASE WHEN length(pg_get_constraintdef(con.oid)) > 0 THEN 1 ELSE 0 END,
+           CASE WHEN con.contype = 'p' THEN
+                     CASE WHEN pg_get_constraintdef(con.oid) LIKE 'PRIMARY KEY%'
+                          THEN 1 ELSE 0 END
+                WHEN con.contype = 'f' THEN
+                     CASE WHEN pg_get_constraintdef(con.oid) LIKE '%FOREIGN KEY%REFERENCES%'
+                          THEN 1 ELSE 0 END
+                ELSE 1 END
+    FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+    WHERE c.relname IN ('parent', 'child') ORDER BY c.relname, con.contype;
+}
+expect {
+    child|c|1|1
+    child|f|1|1
+    child|p|1|1
+    parent|p|1|1
+    parent|u|1|1
+}
+
+test pg-get-indexdef {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    CREATE INDEX idx_items_name ON items(name);
+    CREATE UNIQUE INDEX idx_items_price ON items(price);
+    SELECT relname, replace(pg_get_indexdef(oid), 'public.', '')
+    FROM pg_class WHERE relkind = 'i'
+      AND relname IN ('idx_items_name', 'idx_items_price') ORDER BY relname;
+}
+expect {
+    idx_items_name|CREATE INDEX idx_items_name ON items USING btree (name)
+    idx_items_price|CREATE UNIQUE INDEX idx_items_price ON items USING btree (price)
+}
+
+test pg-attrdef-default-columns {
+    CREATE TABLE defaults_test (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed',
+                               score INTEGER DEFAULT 0);
+    SELECT adnum FROM pg_attrdef JOIN pg_class c ON c.oid = adrelid
+    WHERE c.relname = 'defaults_test' ORDER BY adnum;
+}
+expect {
+    2
+    3
+}
+
+test pg-attribute-created-table-columns {
+    CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT);
+    SELECT a.attname, t.typname FROM pg_attribute a
+    JOIN pg_class c ON a.attrelid = c.oid
+    JOIN pg_type t ON a.atttypid = t.oid
+    WHERE c.relname = 'products' AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum;
+}
+expect {
+    id|int4
+    name|text
+    price|int4
+}
+
+test pg-create-table-insert-and-select {
+    CREATE TABLE kv (k TEXT, v INT);
+    INSERT INTO kv VALUES ('hello', 42);
+    SELECT k, v FROM kv;
+}
+expect {
+    hello|42
+}
+
+test pg-database-is-not-empty {
+    SELECT CASE WHEN EXISTS (SELECT datname FROM pg_database) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}

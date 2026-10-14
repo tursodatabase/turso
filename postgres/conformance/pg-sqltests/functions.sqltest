@@ -315,3 +315,62 @@ test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
 expect error {}
+
+test format-type-expanded {
+    SELECT format_type(16, -1);
+    SELECT format_type(23, -1);
+    SELECT format_type(25, -1);
+    SELECT format_type(114, -1);
+    SELECT format_type(3802, -1);
+    SELECT format_type(2950, -1);
+    SELECT format_type(1082, -1);
+    SELECT format_type(1114, -1);
+    SELECT format_type(1184, -1);
+    SELECT format_type(1186, -1);
+    SELECT format_type(2278, -1);
+    SELECT format_type(2205, -1);
+    SELECT format_type(2206, -1);
+    SELECT format_type(1000, -1);
+    SELECT format_type(1007, -1);
+    SELECT format_type(1009, -1);
+    SELECT format_type(1043, 54);
+}
+expect {
+    boolean
+    integer
+    text
+    json
+    jsonb
+    uuid
+    date
+    timestamp without time zone
+    timestamp with time zone
+    interval
+    void
+    regclass
+    regtype
+    boolean[]
+    integer[]
+    text[]
+    character varying(50)
+}
+
+test pg-type-is-visible {
+    SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test lpad-rpad {
+    SELECT quote_literal(lpad('hi', 5, '*'));
+    SELECT quote_literal(rpad('hi', 5, '-'));
+    SELECT quote_literal(lpad('hi', 5));
+    SELECT quote_literal(lpad('hello world', 5));
+}
+expect {
+    '***hi'
+    'hi---'
+    '   hi'
+    'hello'
+}
