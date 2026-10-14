@@ -3716,6 +3716,45 @@ fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
     assert_eq!(rows[0][0].as_int().unwrap(), 19);
 }
 
+/// What this test checks: in MVCC mode a bare (autocommit) write runs as a
+/// concurrent transaction, so while a DDL transaction is in flight (a CREATE
+/// INDEX inside BEGIN CONCURRENT upgrades it to exclusive) the bare write
+/// aborts at commit with a write-write conflict instead of refusing to start,
+/// the connection returns to autocommit, and writes proceed once the DDL
+/// commits.
+#[test]
+fn test_autocommit_writes_run_as_concurrent_transactions() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE INDEX i ON t(id)").unwrap();
+
+    let writer = db.connect();
+    let err = writer
+        .execute("INSERT INTO other VALUES (1)")
+        .expect_err("a bare write must fail while an exclusive DDL transaction is in flight");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "got {err:?}");
+    assert!(
+        writer.get_auto_commit(),
+        "writer must be back in autocommit"
+    );
+
+    ddl.execute("COMMIT").unwrap();
+    writer.execute("INSERT INTO other VALUES (1)").unwrap();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT count(*) FROM other");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
+
 /// Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 #[test]
 #[cfg_attr(
@@ -8815,29 +8854,27 @@ fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
     );
 
     let conn_b = db.connect();
-    let mut insert_b = conn_b
-        .prepare("INSERT INTO t VALUES ('b', zeroblob(16))")
-        .unwrap();
+    let mut begin_b = conn_b.prepare("BEGIN IMMEDIATE").unwrap();
     let mut saw_busy = false;
     for _ in 0..64 {
-        match insert_b.step() {
+        match begin_b.step() {
             Ok(StepResult::IO | StepResult::Yield) => continue,
             Ok(StepResult::Busy) | Err(LimboError::Busy) => {
                 saw_busy = true;
                 break;
             }
             Ok(StepResult::Done) => {
-                panic!("exclusive insert started while another tx was Preparing")
+                panic!("exclusive transaction started while another tx was Preparing")
             }
-            Ok(other) => panic!("unexpected insert step result: {other:?}"),
-            Err(err) => panic!("unexpected insert error: {err:?}"),
+            Ok(other) => panic!("unexpected begin step result: {other:?}"),
+            Err(err) => panic!("unexpected begin error: {err:?}"),
         }
     }
     assert!(
         saw_busy,
-        "exclusive insert should return Busy instead of waiting while holding the log lock",
+        "exclusive begin should return Busy instead of waiting while holding the log lock",
     );
-    insert_b.reset().unwrap();
+    begin_b.reset().unwrap();
 
     let mut committed = false;
     for _ in 0..1024 {
@@ -21074,7 +21111,15 @@ fn test_descending_sequence_compaction() {
     let last_val = rows[0][0].as_int().unwrap();
     assert_eq!(last_val, 95, "6th call should return 95");
 
-    // Checkpoint → compaction runs. Should keep the most advanced (lowest) value.
+    // The first checkpoint materializes the backing table; compaction runs
+    // on the next checkpoint that has work to write.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        94,
+        "7th call should return 94"
+    );
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     let rows = get_rows(&conn, "PRAGMA integrity_check");
@@ -21086,7 +21131,7 @@ fn test_descending_sequence_compaction() {
     assert_eq!(rows.len(), 1, "compaction should leave exactly 1 row");
     let compacted_val = rows[0][0].as_int().unwrap();
     assert_eq!(
-        compacted_val, 95,
+        compacted_val, 94,
         "compaction should keep the most advanced (lowest) value for descending"
     );
 
@@ -21095,11 +21140,11 @@ fn test_descending_sequence_compaction() {
     db.restart();
     let conn = db.connect();
 
-    // After restart, nextval should resume from the most advanced value (95)
+    // After restart, nextval should resume from the most advanced value (94)
     let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
     let resumed_val = rows[0][0].as_int().unwrap();
     assert_eq!(
-        resumed_val, 94,
+        resumed_val, 93,
         "after restart, descending seq should resume from most advanced value"
     );
 }
@@ -21405,18 +21450,20 @@ fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
 
+    conn_b.execute("BEGIN IMMEDIATE").unwrap();
+    conn_b.execute("INSERT INTO u VALUES (1)").unwrap();
     let injector = FixedYieldInjector::new([CommitYieldPoint::CommitValidation.point()]);
     conn_b.set_yield_injector(Some(injector.clone()));
-    let mut insert_b = conn_b.prepare("INSERT INTO u VALUES (1)").unwrap();
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
     loop {
-        match insert_b.step().unwrap() {
+        match commit_b.step().unwrap() {
             StepResult::IO | StepResult::Yield => {
                 if injector.is_empty() {
                     break;
                 }
                 conn_b.pager.load().io.step().unwrap();
             }
-            other => panic!("B's insert should yield inside its commit, got {other:?}"),
+            other => panic!("B's commit should yield inside commit validation, got {other:?}"),
         }
     }
 
@@ -21437,8 +21484,8 @@ fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
     conn_a.set_yield_injector(None);
 
     conn_b.set_yield_injector(None);
-    insert_b.run_collect_rows().unwrap();
-    drop(insert_b);
+    commit_b.run_collect_rows().unwrap();
+    drop(commit_b);
 
     next_a.run_collect_rows().unwrap();
     drop(next_a);

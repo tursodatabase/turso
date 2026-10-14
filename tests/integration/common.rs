@@ -1932,7 +1932,11 @@ mod tests {
             let transient = |e: &turso_core::LimboError| {
                 matches!(e, turso_core::LimboError::Busy)
                     || (allow_ww_conflict
-                        && matches!(e, turso_core::LimboError::WriteWriteConflict))
+                        && matches!(
+                            e,
+                            turso_core::LimboError::WriteWriteConflict
+                                | turso_core::LimboError::CommitDependencyAborted
+                        ))
             };
             let backoff = || {
                 if tries < 100 {

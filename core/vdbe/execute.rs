@@ -4755,8 +4755,15 @@ pub fn op_transaction_inner(
                             // Use the same tx_mode as the main DB's active
                             // transaction when available, so BEGIN CONCURRENT
                             // applies to all databases uniformly.
-                            let effective_mode =
+                            let mut effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                            if statement_writes_db && conn.get_auto_commit() {
+                                // In MVCC mode autocommit writes run as
+                                // concurrent transactions. DDL upgrades the
+                                // transaction to exclusive when it touches
+                                // the schema.
+                                effective_mode = TransactionMode::Concurrent;
+                            }
                             #[cfg(any(test, injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
@@ -4876,17 +4883,28 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
+                            // In MVCC mode autocommit writes run as
+                            // concurrent transactions: a bare statement
+                            // behaves like one wrapped in BEGIN CONCURRENT.
+                            // DDL upgrades the transaction to exclusive when
+                            // it touches the schema. A deferred BEGIN keeps
+                            // its SQLite-style exclusive upgrade.
+                            let fresh_mode = if conn.get_auto_commit() && statement_writes_db {
+                                TransactionMode::Concurrent
+                            } else {
+                                *tx_mode
+                            };
                             match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
-                                tx_mode,
+                                &fresh_mode,
                                 &conn,
                                 expected_schema_generation,
                             ) {
                                 Ok(tx_id) => {
                                     program
                                         .connection
-                                        .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                        .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
                                     if started_read_tx && conn.get_auto_commit() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }

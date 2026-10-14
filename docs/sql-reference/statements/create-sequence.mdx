@@ -66,7 +66,7 @@ SELECT nextval('counter');
 
 On the first call, `nextval()` returns the `START` value. Each subsequent call increments by `INCREMENT BY`.
 
-Sequence persistence under WAL mode is transactional: the sequence backing-table update is committed or rolled back with the transaction that called `nextval()`. Under MVCC mode (`journal_mode=experimental_mvcc`) inside `BEGIN CONCURRENT`, the backing-table write is autonomous and survives an outer `ROLLBACK` (postgres-like). For BEGIN / BEGIN IMMEDIATE / autocommit, the inner write is bundled with the outer and rolls back with it (SQLite-like).
+Sequence persistence under WAL mode is transactional: the sequence backing-table update is committed or rolled back with the transaction that called `nextval()`. Under MVCC mode (`journal_mode=experimental_mvcc`) inside `BEGIN CONCURRENT`, and for autocommit statements (which run as concurrent transactions in MVCC mode), the backing-table write is autonomous and survives a `ROLLBACK` of the calling transaction (postgres-like). For BEGIN / BEGIN IMMEDIATE, the inner write is bundled with the outer and rolls back with it (SQLite-like).
 
 Turso does not guarantee gap-free sequences, and it also does not guarantee PostgreSQL-style permanent burning of values from rolled-back transactions in WAL mode or under an exclusive (BEGIN IMMEDIATE / BEGIN DEFERRED) MVCC outer.
 
@@ -236,9 +236,10 @@ transaction that commits immediately and independently of the outer's eventual
 commit or rollback. This lets multiple concurrent `BEGIN CONCURRENT` callers
 each get a fresh value (serialized by the standard MVCC PK conflict + bounded
 retry on the backing table), and matches PostgreSQL's "burnt value" semantics
-for this case. For autocommit, `BEGIN`, `BEGIN IMMEDIATE`, and `BEGIN DEFERRED`,
-the outer holds the exclusive lock and the inner write runs inline — under
-those modes a `ROLLBACK` un-burns the value (SQLite-like).
+for this case. Autocommit statements run as concurrent transactions in MVCC
+mode and take the same autonomous path. For `BEGIN`, `BEGIN IMMEDIATE`, and
+`BEGIN DEFERRED`, the outer holds the exclusive lock and the inner write runs
+inline — under those modes a `ROLLBACK` un-burns the value (SQLite-like).
 
 In rollback cases, generated values are not guaranteed to be reused and are
 not guaranteed to remain gaps. Reuse depends on the outer transaction mode

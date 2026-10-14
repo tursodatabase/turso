@@ -3480,10 +3480,16 @@ impl Program {
             match err {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
-                // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-                Some(LimboError::TableLocked) => {}
-                // Busy errors do not cause a rollback.
-                Some(LimboError::Busy) => {}
+                // Table locked and busy errors do not roll back an explicit
+                // transaction: it stays open so the statement can be retried.
+                // An implicit (autocommit) transaction this statement created
+                // must die with it instead — leaving it open would attach
+                // later statements to a transaction nothing ever commits.
+                Some(LimboError::TableLocked) | Some(LimboError::Busy) => {
+                    if self.connection.get_auto_commit() && must_rollback_tx_if_needed {
+                        self.rollback_current_txn(pager);
+                    }
+                }
                 // Same-connection "SQL statements in progress" rejections do
                 // not cause a rollback either: the rejected operation was
                 // refused before it touched any transaction or savepoint
