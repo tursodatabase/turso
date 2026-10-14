@@ -4,6 +4,7 @@ use crate::translate::{
     aggregation::agg_arg_collation,
     order_by::{custom_type_comparator, EmitOrderBy},
     planner::determine_where_to_eval_term,
+    subquery::emit_non_from_clause_subquery,
     window::EmitWindow,
 };
 use crate::vdbe::insn::AggStepData;
@@ -504,20 +505,25 @@ fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<
 /// exited. Skipping a condition whose columns are all readable silently drops it
 /// from the null-extended rows, letting through rows the query filtered out.
 ///
-/// A correlated subquery result is readable only if every table the subquery
-/// reads is one of `allowed`. Otherwise the subquery runs inside the inner
-/// loop, and its result register still holds the value from an earlier row.
+/// A correlated subquery result is readable if the unmatched scan runs the
+/// subquery again, or if every table the subquery reads is one of `allowed`.
+/// Otherwise the subquery runs inside the inner loop, and its result register
+/// still holds the value from an earlier row.
 fn condition_operands_are_available(
     expr: &Expr,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    subqueries_run_again: &[TableInternalId],
     allowed: &TableMask,
     resolver: &Resolver,
     payload_regs: Range<usize>,
 ) -> Result<bool> {
     let mut ok = true;
     walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
-        if let Expr::SubqueryResult { .. } = e {
+        if let Expr::SubqueryResult { subquery_id, .. } = e {
+            if subqueries_run_again.contains(subquery_id) {
+                return Ok(WalkControl::Continue);
+            }
             if !allowed.contains_all_set_bits_of(&table_mask_from_expr(
                 e,
                 table_references,
@@ -609,6 +615,22 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         &plan.non_from_clause_subqueries,
         probe_join_index,
     )?;
+    let subqueries_run_again = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter_map(|subquery| match &subquery.state {
+            SubqueryState::Evaluated {
+                evaluated_at: EvalAt::Loop(loop_index),
+                plan_for_unmatched_build_rows: Some(subquery_plan),
+                ..
+            } if *loop_index == probe_join_index => Some((subquery, subquery_plan)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let subquery_ids_run_again = subqueries_run_again
+        .iter()
+        .map(|(subquery, _)| subquery.internal_id)
+        .collect::<Vec<_>>();
     let mut conditions = Vec::new();
     for (condition_idx, condition) in plan
         .where_clause
@@ -643,6 +665,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                 &condition.expr,
                 &plan.table_references,
                 &plan.non_from_clause_subqueries,
+                &subquery_ids_run_again,
                 &allowed_tables,
                 &t_ctx.resolver,
                 payload_regs.clone(),
@@ -651,6 +674,18 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             continue;
         }
         conditions.push(condition);
+    }
+    for (subquery, subquery_plan) in subqueries_run_again {
+        program.without_query_plan_lines(|program| {
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                subquery_plan.as_ref().clone(),
+                &subquery.query_type,
+                true,
+                true,
+            )
+        })?;
     }
     for cond in conditions {
         super::conditions::emit_where_term(

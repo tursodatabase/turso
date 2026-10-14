@@ -4253,6 +4253,7 @@ pub enum SubqueryState {
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
         outer_ref_ids: Vec<TableInternalId>,
+        plan_for_unmatched_build_rows: Option<Box<Plan>>,
     },
 }
 
@@ -4355,6 +4356,22 @@ impl NonFromClauseSubquery {
         Ok(required_eval_at.max(preferred_eval_at))
     }
 
+    pub fn consume_plan_and_keep_copy_for_unmatched_build_rows(
+        &mut self,
+        evaluated_at: EvalAt,
+    ) -> Box<Plan> {
+        let plan = self.consume_plan(evaluated_at);
+        let SubqueryState::Evaluated {
+            plan_for_unmatched_build_rows,
+            ..
+        } = &mut self.state
+        else {
+            unreachable!("consume_plan sets the evaluated state");
+        };
+        *plan_for_unmatched_build_rows = Some(plan.clone());
+        plan
+    }
+
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
     ///
     /// This captures any outer references before the plan is moved so later
@@ -4370,6 +4387,7 @@ impl NonFromClauseSubquery {
                 self.state = SubqueryState::Evaluated {
                     evaluated_at,
                     outer_ref_ids,
+                    plan_for_unmatched_build_rows: None,
                 };
                 plan
             }

@@ -77,9 +77,18 @@ fn emit_correlated_subqueries(
         }
     }
 
+    let unmatched_build_rows_check_conditions_of_this_loop_again = !from_outer_join
+        && matches!(
+            &table_references.joined_tables()[join_order[join_index].original_idx].op,
+            Operation::HashJoin(hash_join) if hash_join.join_type.keeps_unmatched_build_rows()
+        );
     for subquery_index in subqueries_to_emit {
         let subquery = &mut subqueries[subquery_index];
-        let subquery_plan = subquery.consume_plan(EvalAt::Loop(join_index));
+        let subquery_plan = if unmatched_build_rows_check_conditions_of_this_loop_again {
+            subquery.consume_plan_and_keep_copy_for_unmatched_build_rows(EvalAt::Loop(join_index))
+        } else {
+            subquery.consume_plan(EvalAt::Loop(join_index))
+        };
         emit_non_from_clause_subquery(
             program,
             resolver,
