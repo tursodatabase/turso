@@ -90,14 +90,13 @@ fn find_context_param(func: &ItemFn) -> syn::Result<syn::Ident> {
 }
 
 fn is_mut_context_type(ty: &Type) -> bool {
-    if let Type::Reference(type_ref) = ty {
-        if type_ref.mutability.is_some() {
-            if let Type::Path(type_path) = type_ref.elem.as_ref() {
-                // Check if the last segment is "Context"
-                if let Some(segment) = type_path.path.segments.last() {
-                    return segment.ident == "Context";
-                }
-            }
+    if let Type::Reference(type_ref) = ty
+        && type_ref.mutability.is_some()
+        && let Type::Path(type_path) = type_ref.elem.as_ref()
+    {
+        // Check if the last segment is "Context"
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident == "Context";
         }
     }
     false

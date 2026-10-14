@@ -111,10 +111,9 @@ pub fn run_worker(
                     ref error_kind,
                     ref message,
                 } = response
+                    && (error_kind == "Panic" || error_kind == "Internal")
                 {
-                    if error_kind == "Panic" || error_kind == "Internal" {
-                        eprintln!("WORKER SQL ERROR [{error_kind}]: {message} (sql: {sql})");
-                    }
+                    eprintln!("WORKER SQL ERROR [{error_kind}]: {message} (sql: {sql})");
                 }
                 send_response(&response)?;
             }

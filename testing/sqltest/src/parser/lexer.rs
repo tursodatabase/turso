@@ -24,13 +24,13 @@ fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
         match ch {
             '\\' => {
                 // Escape sequence: check next character
-                if let Some(&(_, next_ch)) = chars.peek() {
-                    if next_ch == '}' || next_ch == '{' || next_ch == '\\' {
-                        // Consume the escaped character and add it literally
-                        chars.next();
-                        content.push(next_ch);
-                        continue;
-                    }
+                if let Some(&(_, next_ch)) = chars.peek()
+                    && (next_ch == '}' || next_ch == '{' || next_ch == '\\')
+                {
+                    // Consume the escaped character and add it literally
+                    chars.next();
+                    content.push(next_ch);
+                    continue;
                 }
                 // Not a recognized escape sequence, keep the backslash
                 content.push(ch);

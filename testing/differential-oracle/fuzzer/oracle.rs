@@ -527,13 +527,12 @@ pub fn check_differential(
         && !stmt.is_ddl
         && !stmt.mutates_data
         && !stmt.has_unordered_limit
+        && let Some(invariant_result) = check_subquery_unnesting_invariant(turso_conn, stmt)
     {
-        if let Some(invariant_result) = check_subquery_unnesting_invariant(turso_conn, stmt) {
-            if !invariant_result.is_pass() {
-                return invariant_result;
-            }
-            return OracleResult::PassWithUnnestingInvariant;
+        if !invariant_result.is_pass() {
+            return invariant_result;
         }
+        return OracleResult::PassWithUnnestingInvariant;
     }
 
     if !stmt.mutates_data {

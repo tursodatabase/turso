@@ -286,10 +286,10 @@ impl SelectStatement {
             }
         }
         // Check WHERE clause
-        if let Some(w) = &self.where_clause {
-            if w.has_unordered_limit() {
-                return true;
-            }
+        if let Some(w) = &self.where_clause
+            && w.has_unordered_limit()
+        {
+            return true;
         }
         // Check ORDER BY expressions
         for item in &self.order_by {

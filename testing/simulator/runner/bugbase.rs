@@ -342,10 +342,10 @@ fn find_git_dir(start_path: impl AsRef<Path>) -> Option<PathBuf> {
             return Some(git_path);
         } else if git_path.is_file() {
             // Handle git worktrees - .git is a file containing "gitdir: <path>"
-            if let Ok(contents) = read_to_string(&git_path) {
-                if let Some(gitdir) = contents.strip_prefix("gitdir: ") {
-                    return Some(PathBuf::from(gitdir));
-                }
+            if let Ok(contents) = read_to_string(&git_path)
+                && let Some(gitdir) = contents.strip_prefix("gitdir: ")
+            {
+                return Some(PathBuf::from(gitdir));
             }
         }
         if !current.pop() {

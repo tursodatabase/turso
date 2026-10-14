@@ -6931,7 +6931,13 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
-            .read_frames_batch(1, &[target_page.clone()], buffer_pool, None, None)
+            .read_frames_batch(
+                1,
+                std::slice::from_ref(&target_page),
+                buffer_pool,
+                None,
+                None,
+            )
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());

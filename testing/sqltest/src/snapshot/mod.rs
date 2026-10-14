@@ -508,10 +508,10 @@ pub async fn find_pending_snapshots(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "new") {
                 // Check if it's a .snap.new file
-                if let Some(stem) = path.file_stem() {
-                    if stem.to_string_lossy().ends_with(".snap") {
-                        pending.push(path);
-                    }
+                if let Some(stem) = path.file_stem()
+                    && stem.to_string_lossy().ends_with(".snap")
+                {
+                    pending.push(path);
                 }
             }
         }
@@ -528,17 +528,16 @@ pub async fn find_all_pending_snapshots(base_dir: &Path) -> Vec<PathBuf> {
     async fn scan_dir(dir: &Path, pending: &mut Vec<PathBuf>) {
         // Check for snapshots directory
         let snapshots_dir = dir.join("snapshots");
-        if snapshots_dir.exists() {
-            if let Ok(mut entries) = fs::read_dir(&snapshots_dir).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "new") {
-                        if let Some(stem) = path.file_stem() {
-                            if stem.to_string_lossy().ends_with(".snap") {
-                                pending.push(path);
-                            }
-                        }
-                    }
+        if snapshots_dir.exists()
+            && let Ok(mut entries) = fs::read_dir(&snapshots_dir).await
+        {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "new")
+                    && let Some(stem) = path.file_stem()
+                    && stem.to_string_lossy().ends_with(".snap")
+                {
+                    pending.push(path);
                 }
             }
         }
