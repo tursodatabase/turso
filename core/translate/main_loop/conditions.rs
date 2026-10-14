@@ -35,18 +35,18 @@ fn emit_correlated_subqueries(
             .iter()
             .filter(|condition| {
                 !condition.consumed
-                    && condition.origin.is_outer_join() == from_outer_join
                     && expr_references_subquery_id(&condition.expr, subquery.internal_id)
             })
             .peekable();
         if conditions.peek().is_some() {
             if conditions.any(|condition| {
-                condition.should_eval_at_loop(
-                    join_index,
-                    join_order,
-                    subqueries,
-                    Some(table_references),
-                )
+                condition.origin.is_outer_join() == from_outer_join
+                    && condition.should_eval_at_loop(
+                        join_index,
+                        join_order,
+                        subqueries,
+                        Some(table_references),
+                    )
             }) {
                 subqueries_to_emit.push(subquery_index);
             }
