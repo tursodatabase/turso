@@ -377,3 +377,50 @@ expect {
     '   hi'
     'hello'
 }
+
+test oid-functions-of-null-are-null {
+    SELECT pg_get_userbyid(NULL), pg_table_is_visible(NULL), pg_type_is_visible(NULL),
+           pg_function_is_visible(NULL), format_type(NULL, NULL), pg_get_constraintdef(NULL),
+           pg_get_indexdef(NULL);
+}
+expect {
+    ||||||
+}
+
+test format-type-accepts-quoted-oid {
+    SELECT format_type('23', NULL);
+}
+expect {
+    integer
+}
+
+test oid-function-of-invalid-oid-text-errors {
+    SELECT format_type('abc', NULL);
+}
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-function-accepts-negative-oid-text {
+    SELECT CASE WHEN pg_get_indexdef('-1040') IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test oid-function-accepts-hex-and-octal-oid-text {
+    SELECT format_type('0x17', NULL);
+    SELECT format_type('027', NULL);
+}
+expect {
+    integer
+    integer
+}
+
+test oid-function-of-out-of-range-oid-text-errors {
+    SELECT format_type('4294967296', NULL);
+}
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
