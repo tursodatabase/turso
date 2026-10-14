@@ -14,22 +14,6 @@ use turso_parser::ast::RefAct;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
-// These are PostgreSQL's fixed system-catalog OIDs, not generated user-object OIDs.
-// Catalog tableoid values and pg_depend classid/refclassid must match PostgreSQL
-// so clients such as pg_dump can identify the catalog containing each object.
-/// OID of pg_class, which describes tables and indexes.
-const PG_CLASS_OID: i64 = 1259;
-/// OID of pg_namespace, which describes schemas.
-const PG_NAMESPACE_OID: i64 = 2615;
-/// OID of pg_am, which lists table and index access methods.
-const PG_AM_OID: i64 = 2601;
-/// OID of pg_constraint, which describes primary keys, unique constraints, foreign keys and checks.
-const PG_CONSTRAINT_OID: i64 = 2606;
-/// OID of pg_attrdef, which describes column default expressions.
-const PG_ATTRDEF_OID: i64 = 2604;
-/// OID of pg_depend, which records dependencies between database objects.
-const PG_DEPEND_OID: i64 = 2608;
-
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
 /// pg_depend uses column zero for a whole object; table columns are numbered from one.
@@ -320,7 +304,9 @@ impl SnapshotRows for PgClassTable {
             relpartbound TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
+    /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -448,7 +434,9 @@ impl SnapshotRows for PgNamespaceTable {
             nspacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
+    /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -876,7 +864,9 @@ impl SnapshotRows for PgAmTable {
             amtype TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(PG_AM_OID);
+    /// Fixed PostgreSQL OID of pg_am, which lists table and index access methods.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -1610,7 +1600,10 @@ struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
-    const TABLE_OID: Option<i64> = Some(PG_CONSTRAINT_OID);
+    /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
+    /// unique constraints, foreign keys and checks.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1902,7 +1895,9 @@ struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
-    const TABLE_OID: Option<i64> = Some(PG_ATTRDEF_OID);
+    /// Fixed PostgreSQL OID of pg_attrdef, which describes column default expressions.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2302,7 +2297,9 @@ impl SnapshotRows for PgDependTable {
         refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT,
         tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(PG_DEPEND_OID);
+    /// Fixed PostgreSQL OID of pg_depend, which records dependencies between objects.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2608);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -2311,11 +2308,15 @@ impl SnapshotRows for PgDependTable {
         let constraint_rows = PgConstraintTable::load_rows(conn);
         let constraints = constraint_rows
             .iter()
-            .map(|row| ConstraintRow::from_row(row));
+            .map(Vec::as_slice)
+            .map(ConstraintRow::from_row);
         let index_rows = PgIndexTable::load_rows(conn);
-        let indexes = index_rows.iter().map(|row| IndexRow::from_row(row));
+        let indexes = index_rows.iter().map(Vec::as_slice).map(IndexRow::from_row);
         let relation_rows = PgClassTable::load_rows(conn);
-        let relations = relation_rows.iter().map(|row| RelationRow::from_row(row));
+        let relations = relation_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(RelationRow::from_row);
 
         for relation in relations.clone() {
             if !matches!(relation.kind, RelationKind::Table) {
@@ -2406,7 +2407,8 @@ impl SnapshotRows for PgDependTable {
         let default_rows = PgAttrdefTable::load_rows(conn);
         let defaults = default_rows
             .iter()
-            .map(|row| ColumnDefaultRow::from_row(row));
+            .map(Vec::as_slice)
+            .map(ColumnDefaultRow::from_row);
         for default in defaults {
             rows.push(dependency_row(
                 ObjectAddress::whole::<PgAttrdefTable>(default.oid),
