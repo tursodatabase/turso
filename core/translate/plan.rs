@@ -933,6 +933,10 @@ pub enum DmlSafetyReason {
     /// triggers on referencing tables that write back to the target,
     /// which would invalidate the live scan iterator.
     FkCascade,
+    /// The DELETE target is a parent or child in a foreign key and foreign keys
+    /// are enabled. FK actions can change rows the scan has not reached yet, so
+    /// SQLite collects the rowids before deleting.
+    ForeignKey,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.
