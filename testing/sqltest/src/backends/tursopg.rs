@@ -1,3 +1,4 @@
+use super::pg_connection::PgConnection;
 use super::{BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend};
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
@@ -7,16 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
-use turso_pg_client::{BackendEvent, ConnParams, PgConn, error_message};
+use turso_pg_client::ConnParams;
 
 /// How long to wait for a spawned tursopg server to accept connections.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Backend that runs tests on tursopg. Each database instance spawns its own
-/// `tursopg --server` on an ephemeral port and drives it over one connection
-/// using the simple query protocol — the same path any PostgreSQL client
-/// exercises, so results reflect the server's own value encoding rather than
-/// a rendering this runner would have to reimplement.
+/// `tursopg --server` on an ephemeral port and drives it over one
+/// [PgConnection].
 pub struct TursopgBackend {
     /// Path to the tursopg binary
     binary_path: PathBuf,
@@ -143,7 +142,7 @@ impl SqlBackend for TursopgBackend {
         // Wait for the server to accept the startup handshake.
         let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
         let conn = loop {
-            match connect(&params).await {
+            match PgConnection::connect(&params, self.timeout).await {
                 Ok(conn) => break conn,
                 Err(e) => {
                     if let Some(status) = child.try_wait().ok().flatten() {
@@ -161,25 +160,13 @@ impl SqlBackend for TursopgBackend {
                 }
             }
         };
-        conn.set_read_timeout(Some(self.timeout))
-            .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
 
         Ok(Box::new(TursopgDatabaseInstance {
             child,
-            conn: Some(conn),
-            timeout: self.timeout,
+            conn,
             _temp_file: temp_file,
         }))
     }
-}
-
-async fn connect(params: &ConnParams) -> Result<PgConn, turso_pg_client::Error> {
-    let params = params.clone();
-    tokio::task::spawn_blocking(move || {
-        PgConn::connect(&params, &[("application_name", "sqltest")])
-    })
-    .await
-    .expect("connect task panicked")
 }
 
 /// Reads the server's `PostgreSQL server listening on <host>:<port> ...`
@@ -212,11 +199,8 @@ async fn read_stderr(child: &mut tokio::process::Child) -> String {
 /// A database instance backed by a dedicated tursopg server process.
 pub struct TursopgDatabaseInstance {
     child: tokio::process::Child,
-    /// The single connection to the server. Taken while a query runs on the
-    /// blocking pool and put back afterwards; left empty after a timeout,
-    /// since the wire state is indeterminate mid-protocol.
-    conn: Option<PgConn>,
-    timeout: Duration,
+    /// The single connection to the server.
+    conn: PgConnection,
     /// Keep temp file alive - it's deleted when this is dropped
     _temp_file: Option<NamedTempFile>,
 }
@@ -224,57 +208,10 @@ pub struct TursopgDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for TursopgDatabaseInstance {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
-        let mut conn = self
-            .conn
-            .take()
-            .ok_or_else(|| BackendError::Execute("connection lost by earlier timeout".into()))?;
-        let sql = sql.to_string();
-        let (conn, events) = tokio::task::spawn_blocking(move || {
-            let events = conn.simple_query(&sql);
-            (conn, events)
-        })
-        .await
-        .expect("query task panicked");
-
-        let events = match events {
-            Ok(events) => {
-                self.conn = Some(conn);
-                events
-            }
-            Err(turso_pg_client::Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(BackendError::Timeout(self.timeout));
-            }
-            Err(e) => return Err(BackendError::Execute(e.to_string())),
-        };
-
-        // The simple query protocol runs statements in order and aborts the
-        // rest of the string after an error, so the first ErrorResponse is
-        // the query's outcome. NULL renders as an empty string, matching the
-        // list-mode convention the comparison layer expects.
-        let mut rows = Vec::new();
-        for event in events {
-            match event {
-                BackendEvent::DataRow(row) => rows.push(
-                    row.into_iter()
-                        .map(|v| v.unwrap_or_default())
-                        .collect::<Vec<String>>(),
-                ),
-                BackendEvent::ErrorResponse(fields) => {
-                    return Ok(QueryResult::error(error_message(&fields).to_string()));
-                }
-                _ => {}
-            }
-        }
-        Ok(QueryResult::success(rows))
+        self.conn.execute(sql).await
     }
 
     async fn close(mut self: Box<Self>) -> Result<DatabaseFileHandle, BackendError> {
-        self.conn.take();
         let _ = self.child.kill().await;
         match self._temp_file {
             Some(tf) => Ok(DatabaseFileHandle::temp(tf)),

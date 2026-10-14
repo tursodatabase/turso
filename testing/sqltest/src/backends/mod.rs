@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod js;
+pub mod pg_connection;
 pub mod rust;
 pub mod tursopg;
 
