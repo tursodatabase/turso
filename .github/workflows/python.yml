@@ -185,7 +185,11 @@ jobs:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        # On pull requests, skip the aarch64 wheel: the macOS test job
+        # already builds the same extension for aarch64 (uv sync builds a
+        # wheel through maturin) and runs the tests against it. x86_64 is
+        # the only PR build for that target, so it stays.
+        target: ${{ github.event_name == 'pull_request' && fromJSON('["x86_64"]') || fromJSON('["x86_64", "aarch64"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
