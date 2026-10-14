@@ -335,6 +335,8 @@ pub(super) struct QueryFunctionState {
     window_function_count: usize,
     named_windows: Vec<NamedFunctionWindow>,
     windows: Vec<hir::ResolvedWindow>,
+    /// The `OVER name` of each window in `windows`, if any.
+    window_names: Vec<Option<String>>,
 }
 
 impl QueryFunctionState {
@@ -345,6 +347,7 @@ impl QueryFunctionState {
             window_function_count: 0,
             named_windows: Vec::new(),
             windows: Vec::new(),
+            window_names: Vec::new(),
         }
     }
 
@@ -369,18 +372,84 @@ impl QueryFunctionState {
     }
 
     pub(super) fn take_windows(&mut self) -> Vec<hir::ResolvedWindow> {
+        self.window_names.clear();
         std::mem::take(&mut self.windows)
     }
 
+    /// Return the block window for one call, sharing an earlier window the
+    /// way legacy planning does: a call with an inline OVER clause reuses any
+    /// window with the same frame, PARTITION BY, and ORDER BY; a call naming
+    /// its window reuses the latest window with that name and frame.
     fn allocate_resolved_window(
         &mut self,
         window: FunctionWindow,
         function: &Func,
     ) -> Result<hir::WindowId> {
+        let name = window.name.clone();
         let id = hir::WindowId::new(self.block, self.windows.len());
-        self.windows.push(window.into_hir(id, function)?);
+        let resolved = window.into_hir(id, function)?;
+        let existing = match &name {
+            Some(name) => self.windows.iter().zip(&self.window_names).rposition(
+                |(existing, existing_name)| {
+                    existing_name.as_ref() == Some(name)
+                        && frames_are_equivalent(&existing.frame, &resolved.frame)
+                },
+            ),
+            None => self
+                .windows
+                .iter()
+                .position(|existing| windows_are_equivalent(existing, &resolved)),
+        };
+        if let Some(index) = existing {
+            return Ok(self.windows[index].id);
+        }
+        self.windows.push(resolved);
+        self.window_names.push(name);
         Ok(id)
     }
+}
+
+fn windows_are_equivalent(left: &hir::ResolvedWindow, right: &hir::ResolvedWindow) -> bool {
+    frames_are_equivalent(&left.frame, &right.frame)
+        && left.partition_by.len() == right.partition_by.len()
+        && left
+            .partition_by
+            .iter()
+            .zip(&right.partition_by)
+            .all(|(left, right)| left.expr.equivalent(&right.expr))
+        && left.order_by.len() == right.order_by.len()
+        && left
+            .order_by
+            .iter()
+            .zip(&right.order_by)
+            .all(|(left, right)| {
+                left.expr.equivalent(&right.expr)
+                    && left.order == right.order
+                    && left.nulls == right.nulls
+            })
+}
+
+fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> bool {
+    let bounds_are_equivalent = |left: &hir::WindowFrameBound, right: &hir::WindowFrameBound| {
+        use hir::WindowFrameBound::*;
+        match (left, right) {
+            (CurrentRow, CurrentRow)
+            | (UnboundedPreceding, UnboundedPreceding)
+            | (UnboundedFollowing, UnboundedFollowing) => true,
+            (Preceding(left), Preceding(right)) | (Following(left), Following(right)) => {
+                left.equivalent(right)
+            }
+            _ => false,
+        }
+    };
+    left.mode == right.mode
+        && left.exclude == right.exclude
+        && bounds_are_equivalent(&left.start, &right.start)
+        && match (&left.end, &right.end) {
+            (Some(left), Some(right)) => bounds_are_equivalent(left, right),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 enum FunctionContext<'state> {
@@ -429,6 +498,9 @@ struct FunctionWindow {
     partition_by: ExprChildren,
     order_by: Vec<FunctionOrderTerm>,
     frame: Option<FunctionWindowFrame>,
+    /// Set when the call names its window (`OVER name`). Calls naming a
+    /// window share it only with calls using the same name and frame.
+    name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1332,6 +1404,7 @@ fn take_function_window(
             partition_by,
             order_by,
             frame,
+            name: None,
         },
     }))
 }
@@ -1768,6 +1841,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             partition_by,
             order_by,
             frame: None,
+            name: None,
         })
     }
 
@@ -1824,6 +1898,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .rfind(|window| window.name == name)
                     .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
                 let mut window = named.window.clone();
+                window.name = Some(name);
                 if !function_ignores_user_frame(function) {
                     window.frame = named
                         .frame

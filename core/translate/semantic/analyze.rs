@@ -9874,6 +9874,54 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_windows_share_one_block_window_like_legacy() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            // Same inline definition and frame.
+            (
+                "SELECT sum(score) OVER (ORDER BY id), avg(score) OVER (ORDER BY id) FROM items",
+                1,
+            ),
+            // lag and lead coerce different frames, as in legacy.
+            (
+                "SELECT lag(score) OVER (ORDER BY id), lead(score) OVER (ORDER BY id) FROM items",
+                2,
+            ),
+            // An inline definition joins an earlier named window.
+            (
+                "SELECT sum(score) OVER w, sum(score) OVER (ORDER BY id) FROM items \
+                 WINDOW w AS (ORDER BY id)",
+                1,
+            ),
+            // Named windows merge only by name, as in legacy.
+            (
+                "SELECT sum(score) OVER a, sum(score) OVER b FROM items \
+                 WINDOW a AS (ORDER BY id), b AS (ORDER BY id)",
+                2,
+            ),
+            // Different coerced frames keep separate windows.
+            (
+                "SELECT row_number() OVER (ORDER BY id), sum(score) OVER (ORDER BY id) FROM items",
+                2,
+            ),
+            (
+                "SELECT sum(score) OVER (ORDER BY id DESC), sum(score) OVER (ORDER BY id) FROM items",
+                2,
+            ),
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            document.validate().expect("merged windows produce closed HIR");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let block = &document.query(root.query).expect("query exists").blocks[0];
+            assert_eq!(block.windows.len(), expected, "{sql}");
+            assert_eq!(block.window_function_count, 2, "{sql}");
+        }
+    }
+
+    #[test]
     fn named_windows_resolve_inheritance_into_block_owned_windows() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(

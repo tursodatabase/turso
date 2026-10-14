@@ -2463,19 +2463,21 @@ mod tests {
         );
         let (query, block) = root_query(&document);
         let mut program = program();
-        assert_eq!(block.windows.len(), 2);
-        for window in &block.windows {
-            let plan =
-                plan_hir_window_buffer(query, block, window.id).expect("window buffer plans");
-            let runtimes =
-                prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
-            let [runtime] = runtimes.as_slice() else {
-                panic!("one function belongs to each effective window");
-            };
+        assert_eq!(
+            block.windows.len(),
+            1,
+            "calls naming the same window and frame share it"
+        );
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let runtimes =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        assert_eq!(runtimes.len(), 2);
+        for (function, runtime) in plan.functions.iter().zip(&runtimes) {
             assert_eq!(runtime.argument_collations(), &[CollationSeq::NoCase]);
             assert!(runtime.has_minmax_state());
             assert_eq!(
-                program.window_result_register(plan.functions[0].id),
+                program.window_result_register(function.id),
                 Some(runtime.result_register())
             );
         }
@@ -2485,7 +2487,8 @@ mod tests {
                 .iter()
                 .filter(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. }))
                 .count(),
-            2
+            2,
+            "each moving min/max function keeps its own ordered state"
         );
     }
 
