@@ -23365,7 +23365,7 @@ fn test_sequence_watermark_stays_bounded_until_committed_tx_is_removed() {
     let watermark = rows[0][0]
         .as_int()
         .expect("watermark must not be NULL while the commit of value 1 is not finished");
-    assert!(watermark <= 2, "watermark {watermark} is past value 2");
+    assert_eq!(watermark, 1);
 
     while !matches!(commit.step().unwrap(), StepResult::Done) {}
     let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");

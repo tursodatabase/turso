@@ -14562,13 +14562,14 @@ pub fn op_set_sequence_currval(
 
 /// Publish sequence allocation metadata used by `sequence_watermark_experimental()`.
 ///
-/// The translator emits this only after the sequence backing-table RMW has
-/// committed successfully. At that point `SequenceCommitInnerTx` has restored
-/// the connection's MVCC transaction to the outer tx, so any active allocation
-/// is attributed to the transaction whose row changes may become visible later.
+/// The translator emits this only after `SequenceCommitInnerTx` succeeds. At
+/// that point the connection's MVCC transaction is the outer tx again, so any
+/// active allocation is attributed to the transaction whose row changes may
+/// become visible later.
 ///
 /// When the RMW ran inside an exclusive outer tx, nothing is committed yet. The
-/// new watermark stays in that tx and becomes visible only if the tx commits.
+/// new watermark stays in that tx. The commit publishes it before it releases
+/// the exclusive lock. A rollback drops it.
 pub fn op_sequence_track_allocation(
     program: &Program,
     state: &mut ProgramState,
