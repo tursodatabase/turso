@@ -952,6 +952,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         versions: &[RowVersion],
         table_id: MVTableId,
     ) -> smallvec::SmallVec<[RowVersion; 1]> {
+        self.checkpointable_versions_and_db_file_presence(versions, table_id)
+            .0
+    }
+
+    /// Returns all checkpointable [RowVersion]s for that `table_id`, together with
+    /// whether some version of the row is present in the database file before this
+    /// checkpoint writes anything.
+    fn checkpointable_versions_and_db_file_presence(
+        &self,
+        versions: &[RowVersion],
+        table_id: MVTableId,
+    ) -> (smallvec::SmallVec<[RowVersion; 1]>, bool) {
         let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
             smallvec::SmallVec::with_capacity(1);
         let mut exists_in_db_file = false;
@@ -1080,7 +1092,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
 
-        versions_to_checkpoint
+        // Versions newer than the durable watermark never change `exists_in_db_file`,
+        // so after the oldest-to-newest walk it tells whether the row is in the
+        // database file as of the previous checkpoint.
+        (versions_to_checkpoint, exists_in_db_file)
     }
 
     /// Resolve the table/index id whose B-tree binding owned `root_page` at the moment of the
@@ -1180,12 +1195,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 let row_versions = entry.value().read();
 
-                for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
+                let (versions_to_checkpoint, mut row_in_db_file) =
+                    self.checkpointable_versions_and_db_file_presence(&row_versions, key.table_id);
+                for version in versions_to_checkpoint {
                     let is_delete = version.end().is_some();
 
                     let mut special_write = None;
                     // Set to true for schema deletes of never-checkpointed tables/indexes.
                     // These don't need to be written to the B-tree, we just need to track them.
+                    // For sqlite_schema rows the physical delete is decided per rowid below.
                     let mut skip_write = false;
 
                     if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
@@ -1292,30 +1310,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 }
                             }
                         }
-                    } else if is_delete
-                        && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && !version.btree_resident
-                    {
-                        // Schema row without a B-tree identity (e.g. sequence, trigger, view).
-                        // If it was never checkpointed to the B-tree, skip the delete — there
-                        // is nothing to remove from the pager.
-                        let begin_ts = match &version.begin() {
-                            Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
-                            _ => None,
-                        };
-                        let was_checkpointed =
-                            self.durable_txid_max_old.is_some_and(|txid_max_old| {
-                                begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
-                            });
-                        if !was_checkpointed {
-                            skip_write = true;
-                        }
                     } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
                         && is_delete
                         && !self.table_exists_for_snapshot(key.table_id)
                     {
                         // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
                         skip_write = true;
+                    }
+                    if key.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        // A sqlite_schema rowid can be reused by an unrelated object (e.g. a
+                        // trigger taking the rowid of a dropped table after a restart), so the
+                        // versions selected above may hold several deletes, or a delete of an
+                        // object that was never checkpointed while an older object's row is
+                        // still in the database file. Decide the physical row delete once per
+                        // rowid from whether the row is in the B-tree at this point: delete it
+                        // at most once, and always delete it if it is there. Deletes carrying a
+                        // special write (B-tree destroy) keep their own handling.
+                        if is_delete {
+                            if special_write.is_none() {
+                                skip_write = !row_in_db_file;
+                            }
+                            if !skip_write {
+                                row_in_db_file = false;
+                            }
+                        } else {
+                            row_in_db_file = true;
+                        }
                     }
                     if !skip_write {
                         tracing::trace!("adding to write_set {:?}", (&version, &special_write));
