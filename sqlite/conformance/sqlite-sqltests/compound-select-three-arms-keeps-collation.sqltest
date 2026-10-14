@@ -1,0 +1,15 @@
+@database :memory:
+
+test union-three-arms-keeps-first-arm-collation {
+    SELECT 'Hello' COLLATE NOCASE UNION SELECT 'hello' UNION SELECT 'HELLO';
+}
+expect {
+    HELLO
+}
+
+test union-three-arms-keeps-first-arm-collation-count {
+    SELECT count(*) FROM (SELECT 'Hello' COLLATE NOCASE UNION SELECT 'hello' UNION SELECT 'HELLO');
+}
+expect {
+    1
+}
