@@ -366,7 +366,9 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-windows-2025
+    # Each job builds tursodb (the local sync server) before testing; the
+    # larger runner shortens that build, which set the end of the workflow.
+    runs-on: blacksmith-8vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
