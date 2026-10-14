@@ -179,6 +179,9 @@ jobs:
       run: cargo install cargo-fuzz@0.13.0
     - name: Build all libFuzzer targets
       run: cargo +nightly-2025-12-17 fuzz build --dev
+    # A failure here never fails the job, so on pull requests it only costs
+    # time. Run it on main and tags, where someone can look at the output.
     - name: Run scalar_func fuzzer
+      if: github.event_name != 'pull_request'
       continue-on-error: true
       run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300
