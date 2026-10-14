@@ -477,7 +477,8 @@ fn translate_subquery_result_expr(
                     rhs: column_check_reg,
                     target_pc: label_null_checks_next,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                    collation: program.resolve_index_for_cursor_id(*cursor_id).columns[i]
+                        .collation,
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL

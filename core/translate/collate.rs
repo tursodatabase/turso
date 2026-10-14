@@ -492,12 +492,28 @@ pub fn resolve_comparison_collseq_with_symbols(
     referenced_tables: &TableReferences,
     symbol_table: Option<&SymbolTable>,
 ) -> Result<CollationSeq> {
+    resolve_comparison_collseq_across_scopes(
+        lhs_expr,
+        referenced_tables,
+        rhs_expr,
+        referenced_tables,
+        symbol_table,
+    )
+}
+
+pub fn resolve_comparison_collseq_across_scopes(
+    lhs_expr: &Expr,
+    lhs_tables: &TableReferences,
+    rhs_expr: &Expr,
+    rhs_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
+) -> Result<CollationSeq> {
     let (lhs_explicit, _) =
-        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table, None)?;
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, lhs_tables, symbol_table, None)?;
     let (rhs_explicit, _) =
-        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table, None)?;
-    let lhs_column = comparison_operand_column_collseq(lhs_expr, referenced_tables)?;
-    let rhs_column = comparison_operand_column_collseq(rhs_expr, referenced_tables)?;
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, rhs_tables, symbol_table, None)?;
+    let lhs_column = comparison_operand_column_collseq(lhs_expr, lhs_tables)?;
+    let rhs_column = comparison_operand_column_collseq(rhs_expr, rhs_tables)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)
