@@ -217,6 +217,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0,
             &["name", "builtin", "type", "enc", "narg", "flags"],
         ),
+        CollationList => Pragma::new(PragmaFlags::Result0, &["seq", "name"]),
         PragmaName::CacheSpill => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
