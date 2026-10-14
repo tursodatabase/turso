@@ -72,6 +72,12 @@ jobs:
     name: Run SQL tests (JS backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # napi-build uses the release-official profile (full LTO, one codegen
+    # unit) meant for published packages. These tests only need a working
+    # binding, so turn off LTO to build it faster.
+    env:
+      CARGO_PROFILE_RELEASE_OFFICIAL_LTO: "false"
+      CARGO_PROFILE_RELEASE_OFFICIAL_CODEGEN_UNITS: "16"
     defaults:
       run:
         working-directory: bindings/javascript
