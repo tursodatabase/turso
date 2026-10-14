@@ -168,7 +168,7 @@ impl PostgreSQLTranslator {
             NodeRef::UpdateStmt(update) => self.translate_update(update)?,
             NodeRef::DeleteStmt(delete) => self.translate_delete(delete)?,
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
-            NodeRef::LockStmt(lock) => self.translate_lock(lock)?,
+            NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
@@ -213,7 +213,10 @@ impl PostgreSQLTranslator {
         })
     }
 
-    fn translate_lock(&self, lock: &pg_query::protobuf::LockStmt) -> Result<ast::Stmt, ParseError> {
+    fn translate_lock_stub(
+        &self,
+        lock: &pg_query::protobuf::LockStmt,
+    ) -> Result<ast::Stmt, ParseError> {
         if lock.mode != 1 || lock.nowait {
             return Err(ParseError::ParseError(
                 "only LOCK IN ACCESS SHARE MODE without NOWAIT is supported".to_string(),
@@ -228,7 +231,7 @@ impl PostgreSQLTranslator {
                         Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
                         None,
                     )],
-                    from: Some(self.translate_from_items(&lock.relations)?),
+                    from: None,
                     where_clause: None,
                     group_by: None,
                     window_clause: vec![],
