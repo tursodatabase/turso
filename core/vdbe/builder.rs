@@ -353,6 +353,9 @@ pub struct ProgramBuilder {
     window_result_registers: HashMap<WindowFunctionId, usize>,
     /// Runtime results for resolved non-FROM subqueries.
     subquery_bindings: HashMap<QueryId, SubqueryBinding>,
+    /// Plan of the HIR statement being lowered. Expression subqueries emit
+    /// their bodies from it where the expression is evaluated.
+    hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -831,6 +834,7 @@ impl ProgramBuilder {
             aggregate_result_registers: HashMap::default(),
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
+            hir_plan: None,
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -1038,6 +1042,14 @@ impl ProgramBuilder {
 
     pub(crate) fn window_result_register(&self, window: WindowFunctionId) -> Option<usize> {
         self.window_result_registers.get(&window).copied()
+    }
+
+    pub(crate) fn set_hir_plan(&mut self, plan: Arc<crate::translate::semantic_to_plan::HirPlan>) {
+        self.hir_plan = Some(plan);
+    }
+
+    pub(crate) fn hir_plan(&self) -> Option<Arc<crate::translate::semantic_to_plan::HirPlan>> {
+        self.hir_plan.clone()
     }
 
     pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {

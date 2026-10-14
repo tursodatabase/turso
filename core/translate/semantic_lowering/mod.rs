@@ -1,7 +1,7 @@
 //! Bytecode lowering from resolved semantic HIR.
 
 pub(super) mod expr;
-mod query;
+pub(super) mod query;
 mod window;
 
 use turso_parser::ast;
@@ -58,12 +58,17 @@ pub(crate) fn translate_select(
         },
         SemanticRootInput::Statement(statement),
     )?;
-    let plan = HirPlan::build(Arc::new(document), schema, cost_model_params())?;
+    let plan = Arc::new(HirPlan::build(
+        Arc::new(document),
+        schema,
+        cost_model_params(),
+    )?);
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
         ));
     };
+    program.set_hir_plan(plan.clone());
     query::emit_planned_query_body(program, &plan, root.query, &QueryDestination::ResultRows)?;
     program.resolved_result_columns = resolved_result_columns(&plan.document, root.query)?;
     Ok(())

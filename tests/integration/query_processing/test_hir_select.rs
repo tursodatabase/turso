@@ -5,7 +5,9 @@ use crate::common::{limbo_exec_rows, TempDatabase};
 
 const SETUP: &str = "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, extra TEXT);
 CREATE INDEX items_value ON items(value);
-INSERT INTO items VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, NULL, 'c'), (5, 50, 'c'), (6, 20, 'b');";
+INSERT INTO items VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, NULL, 'c'), (5, 50, 'c'), (6, 20, 'b');
+CREATE TABLE tags(item_id INTEGER, tag TEXT);
+INSERT INTO tags VALUES (1, 'x'), (1, 'y'), (3, 'x'), (9, 'z');";
 
 type ColumnMetadata = (String, Option<String>, Option<String>);
 
@@ -120,4 +122,32 @@ fn hir_window_select_matches_legacy_rows() {
             ("count(*) OVER (PARTITION BY extra)".to_string(), None, None),
         ]
     );
+}
+
+#[test]
+fn hir_expression_subqueries_match_legacy_rows() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for sql in [
+        "SELECT (SELECT max(value) FROM items)",
+        "SELECT id, (SELECT count(*) FROM tags WHERE item_id = items.id) FROM items",
+        "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM tags WHERE item_id = id)",
+        "SELECT id FROM items WHERE NOT EXISTS (SELECT 1 FROM tags WHERE item_id = id)",
+        "SELECT id FROM items WHERE id IN (SELECT item_id FROM tags)",
+        "SELECT id FROM items WHERE id NOT IN (SELECT item_id FROM tags)",
+        "SELECT id, value IN (SELECT value FROM items WHERE extra = 'a') FROM items",
+        "SELECT a.id, b.id FROM items a, items b \
+         WHERE b.id IN (SELECT item_id FROM tags WHERE item_id = a.id)",
+        "SELECT (SELECT 1, 2) = (1, 2)",
+        "SELECT extra, (SELECT count(*) FROM tags WHERE tag = extra) FROM items GROUP BY extra",
+        "SELECT id FROM items WHERE value > (SELECT avg(value) FROM items) ORDER BY id",
+        "SELECT id, sum(value) OVER (ORDER BY id) FROM items WHERE id IN (SELECT item_id FROM tags)",
+        "SELECT id FROM items LIMIT (SELECT 2)",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
 }

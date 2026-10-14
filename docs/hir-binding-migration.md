@@ -135,9 +135,16 @@ table and no declared type, like SQLite. `get_column_type_info` and
 `get_column_inferred_type` report the resolved affinity for expression outputs
 instead of legacy's AST-shape rules.
 
+Expression subqueries (scalar, row, EXISTS, IN) run where their expression is
+evaluated, the way SQLite codes subselects: the statement plan is installed in
+`ProgramBuilder`, and expression lowering emits the prepared subquery shell
+right before reading its result. Uncorrelated subqueries run once through
+`Once`; correlated ones run again on every evaluation, with outer values read
+through the source bindings in effect at that point. An IN seek driven by a
+subquery emits the same shell when its loop opens.
+
 Known gaps found by running SELECT through HIR:
 
-- Expression subqueries (scalar, EXISTS, IN) are not emitted by query lowering.
 - A block with more than one window needs one layer per window.
 
 ### Non-lowering phase complete

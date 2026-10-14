@@ -3112,9 +3112,8 @@ pub(crate) enum HirInSeekSource {
         values: Vec<hir::Expr>,
         affinity: Affinity,
     },
-    Query {
-        query: hir::QueryId,
-    },
+    /// The IN subquery whose ephemeral index supplies the seek keys.
+    Query(hir::SubqueryExpr),
 }
 
 pub(crate) type HirBtreeOperation = SelectedBtreeOperation<hir::Expr, HirInSeekSource>;
@@ -3225,8 +3224,8 @@ impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder
                 values: values.clone(),
                 affinity,
             }),
-            hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. }) => {
-                Ok(HirInSeekSource::Query { query: *query })
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::In { .. }) => {
+                Ok(HirInSeekSource::Query(subquery.clone()))
             }
             _ => Err(LimboError::InternalError(
                 "HIR IN-seek term is not an IN list or IN subquery".into(),

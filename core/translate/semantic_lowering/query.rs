@@ -417,7 +417,15 @@ fn open_hir_in_seek_source_cursor(
                     .map(|_| ())
             },
         ),
-        HirInSeekSource::Query { query } => {
+        HirInSeekSource::Query(subquery) => {
+            if let Some(plan) = program.hir_plan() {
+                emit_expression_subquery(program, &plan, subquery)?;
+            }
+            let SubqueryExpr::In { query, .. } = subquery else {
+                return Err(LimboError::InternalError(
+                    "HIR IN seek source is not an IN subquery".into(),
+                ));
+            };
             let Some(SubqueryBinding::InIndex { cursor }) = program.subquery_binding(*query) else {
                 return Err(LimboError::InternalError(format!(
                     "HIR IN seek query {query} has no index runtime binding"
@@ -524,7 +532,6 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
 ///
 /// The matching expression binding is installed at the same time so query
 /// emission and expression lowering cannot choose different storage.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prepare_subquery(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -638,7 +645,6 @@ pub(crate) fn prepare_subquery(
 }
 
 /// Emit the execution shell shared by all non-FROM expression subqueries.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn emit_prepared_subquery(
     program: &mut ProgramBuilder,
     prepared: &PreparedSubquery,
@@ -743,6 +749,20 @@ pub(crate) fn emit_prepared_subquery(
             program.preassign_label_to_next_insn(once_done);
         }
         Ok(())
+    })
+}
+
+/// Run one expression subquery from the plan and bind its result for the
+/// expression reading it. Like SQLite, the subquery is coded where its value
+/// is needed: an uncorrelated one runs once, a correlated one on every use.
+pub(crate) fn emit_expression_subquery(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    expression: &SubqueryExpr,
+) -> Result<()> {
+    let prepared = prepare_subquery(program, &plan.document, expression)?;
+    emit_prepared_subquery(program, &prepared, |program, query, destination| {
+        emit_planned_query_body(program, plan, query, destination)
     })
 }
 
@@ -9143,7 +9163,7 @@ mod tests {
                 .access,
             HirSourceAccess::BTree {
                 operation: HirBtreeOperation::InSeek {
-                    source: HirInSeekSource::Query { query },
+                    source: HirInSeekSource::Query(SubqueryExpr::In { query, .. }),
                     ..
                 },
                 ..

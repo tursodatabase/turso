@@ -444,6 +444,15 @@ struct ExprLowerer<'program, 'document, 'inputs> {
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
+    /// Run a subquery before its result is read, when a statement plan is
+    /// being lowered. Without one, the caller has already bound the result.
+    fn emit_subquery(&mut self, subquery: &hir::SubqueryExpr) -> Result<()> {
+        let Some(plan) = self.program.hir_plan() else {
+            return Ok(());
+        };
+        super::query::emit_expression_subquery(self.program, &plan, subquery)
+    }
+
     fn input_register(&self, expression: &hir::Expr) -> Option<usize> {
         self.inputs
             .iter()
@@ -1725,7 +1734,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 }
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Scalar { query, output }) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::RowValue { start, count }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1745,7 +1755,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Row { query }) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::RowValue { start, count }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1776,7 +1787,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Exists(query)) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::Exists { register }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1791,15 +1803,18 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::In {
-                query,
-                negated,
-                comparison,
-                ..
-            }) => {
+            hir::Expr::Subquery(
+                subquery @ hir::SubqueryExpr::In {
+                    query,
+                    negated,
+                    comparison,
+                    ..
+                },
+            ) => {
                 let ExprRegisters::InSubquery(registers) = context.registers else {
                     unreachable!("IN-subquery registers were allocated")
                 };
+                self.emit_subquery(subquery)?;
                 if children.len() != registers.width {
                     return Err(LimboError::InternalError(format!(
                         "HIR IN-subquery has {} lowered operands for comparison width {}",
