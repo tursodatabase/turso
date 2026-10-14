@@ -7,6 +7,7 @@ use crate::expression::Expression;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 use crate::select::optional_where_clause;
+use crate::spelling::table_name_spelling;
 
 // =============================================================================
 // DELETE STATEMENT PROFILE
@@ -51,11 +52,12 @@ pub fn delete_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<DeleteStatement> {
-    let table_name = table.qualified_name();
-
-    optional_where_clause(table, schema, profile)
-        .prop_map(move |where_clause| DeleteStatement {
-            table: table_name.clone(),
+    (
+        optional_where_clause(table, schema, profile),
+        table_name_spelling(table, &profile.generation.table_spelling),
+    )
+        .prop_map(|(where_clause, table)| DeleteStatement {
+            table,
             where_clause,
         })
         .boxed()

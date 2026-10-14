@@ -2,7 +2,7 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Schema};
+use crate::schema::{BTreeTable, Schema, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -294,8 +294,39 @@ impl IncrementalView {
         schema: &Schema,
     ) -> Result<ViewColumnSchema> {
         crate::util::validate_select_for_unsupported_features(select)?;
+        Self::reject_unmaintainable_source(select, schema)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
+    }
+
+    /// Rows reach these tables through DDL and the AUTOINCREMENT machinery
+    /// rather than through row maintenance, so a view over one would populate
+    /// once and then stay stale. Checking the resolved name covers the
+    /// `sqlite_master` and temp spellings too. Existing views are still loaded,
+    /// only new ones refused.
+    fn reject_unmaintainable_source(select: &ast::Select, schema: &Schema) -> Result<()> {
+        let mut referenced_tables = Vec::new();
+        let mut aliases = HashMap::default();
+        let mut qualified_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
+        Self::extract_all_tables(
+            select,
+            schema,
+            &mut referenced_tables,
+            &mut aliases,
+            &mut qualified_names,
+            &mut table_conditions,
+        )?;
+        let unmaintainable = referenced_tables.iter().find(|table| {
+            table.name == SCHEMA_TABLE_NAME || table.name == SQLITE_SEQUENCE_TABLE_NAME
+        });
+        if let Some(table) = unmaintainable {
+            return Err(LimboError::ParseError(format!(
+                "view cannot reference the internal table: {}",
+                table.name
+            )));
+        }
+        Ok(())
     }
 
     pub fn from_sql(
@@ -468,16 +499,15 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
-
-                // Store the alias mapping if there is an alias
+                let resolved_name = table.name.clone();
+                qualified_names.insert(resolved_name.clone(), qualified_name);
                 if let Some(alias_enum) = alias {
                     aliases.insert(
                         alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
+                        resolved_name.clone(),
                     );
                 }
+                table_map.insert(resolved_name, table);
             } else {
                 return Err(LimboError::ParseError(format!(
                     "Table '{table_name}' not found in schema"
