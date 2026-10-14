@@ -3659,10 +3659,6 @@ fn test_header_only_mutation_is_replayed_and_checkpointed() {
     }
 }
 
-/// Header PRAGMAs inside BEGIN CONCURRENT record their change on the
-/// transaction's header copy; the real header write happens at commit, where
-/// the change is re-applied on top of the then-current global header. An
-/// unrelated commit in between does not invalidate the transaction.
 #[test]
 fn test_mvcc_header_updates_work_in_concurrent_transactions() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -6731,7 +6727,6 @@ fn test_future_row() {
         .unwrap();
     assert_eq!(row, None);
 }
-
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
@@ -9045,9 +9040,6 @@ fn test_commit_without_tx() {
     }
 }
 
-/// Drive a statement until an injected yield point fires. Returns true if
-/// it yielded, false if it ran to Done (or the step budget) without
-/// yielding.
 fn step_until_yield(stmt: &mut crate::Statement, max_steps: usize) -> bool {
     for _ in 0..max_steps {
         match stmt.step().unwrap() {
@@ -9104,13 +9096,6 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
         "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
     );
 
-    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
-    // but the global schema view still doesn't know about the new index `i`.
-    // The INSERT compiles its bytecode against the stale schema and would
-    // emit IdxInsert ops only for the indexes the stale schema knows about.
-    // The DDL table block is held until T1's commit fully finalizes, so the
-    // dangerous write is refused outright instead of being allowed and
-    // aborted at T2's commit (which the old global cookie check did).
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     let insert_result = conn_b.execute("INSERT INTO t VALUES (2, 20)");
     assert!(
@@ -9119,23 +9104,16 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
          is still in flight, got {insert_result:?}"
     );
 
-    // T1 finishes finalizing the CREATE INDEX, releasing its DDL locks.
     create_idx.run_ignore_rows().unwrap();
     drop(create_idx);
 
-    // The retried INSERT runs (compiled against the published schema), but
-    // the transaction used a table whose schema changed after it began, so
-    // scoped validation aborts it at COMMIT. Postgres would have blocked the
-    // INSERT and then committed; aborting where postgres serializes is the
-    // accepted trade, and issue #6338's transaction restart makes it
-    // transparent.
+    // #6338: COMMIT returns SchemaConflict here, where a restart would commit.
     conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     let commit_err = conn_b
         .execute("COMMIT")
         .expect_err("transaction used t, whose schema changed after it began");
     assert!(matches!(commit_err, LimboError::SchemaConflict));
 
-    // A fresh transaction sees the new index and commits cleanly.
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     conn_b.execute("COMMIT").unwrap();
@@ -19429,9 +19407,7 @@ fn test_ddl_busy_while_writer_in_flight_then_succeeds() {
         .execute("UPDATE t SET c = 'writer' WHERE id = 1")
         .unwrap();
 
-    // An ALTER must observe a stable table: with an uncommitted writer on t
-    // it returns Busy (postgres queues behind the writer instead). The
-    // writer is left untouched and commits.
+    // TableLocked, not Busy, while a writer of t is open.
     let ddl = db.connect();
     let err = ddl
         .execute("ALTER TABLE t ADD COLUMN extra INTEGER")
@@ -19467,8 +19443,7 @@ fn test_create_index_busy_while_writer_in_flight_then_succeeds() {
     writer.execute("BEGIN CONCURRENT").unwrap();
     writer.execute("INSERT INTO t VALUES(3, 'c', 30)").unwrap();
 
-    // The index build would miss the writer's uncommitted row: Busy until
-    // the writer finishes (postgres queues behind it instead).
+    // TableLocked, not Busy, while a writer of t is open.
     let ddl = db.connect();
     let err = ddl
         .execute("CREATE INDEX idx_t_c ON t(c)")
@@ -19530,8 +19505,6 @@ fn test_ddl_succeeds_after_unrelated_commit() {
     writer.execute("BEGIN CONCURRENT").unwrap();
     writer.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
 
-    // A commit elsewhere does not invalidate the DDL: the DDL locks protect
-    // its objects, nothing requires a globally quiescent database.
     let other = db.connect();
     other.execute("INSERT INTO t VALUES(3, 'c')").unwrap();
 
@@ -19597,15 +19570,12 @@ fn test_unrelated_writer_survives_ddl_commit() {
         .execute("UPDATE t SET c = 'writer' WHERE id = 1")
         .unwrap();
 
-    // Another transaction creates an unrelated table and commits first.
     let ddl = db.connect();
     ddl.execute("BEGIN CONCURRENT").unwrap();
     ddl.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
         .unwrap();
     ddl.execute("COMMIT").unwrap();
 
-    // The writer never used `u`, so it must not abort (postgres does not
-    // even notice; the old global check aborted every overlapping writer).
     writer.execute("COMMIT").unwrap();
 
     let verify = db.connect();
@@ -19631,11 +19601,6 @@ fn test_writer_of_changed_table_aborts_at_commit() {
         .unwrap();
     setup.close().unwrap();
 
-    // The writer transaction uses `t` (reads it) before the DDL, writes only
-    // `other`, then the DDL on `t` commits. Scoped validation aborts the
-    // writer because a table it used changed under it. Postgres would have
-    // blocked the DDL instead; failing where postgres serializes is the
-    // accepted trade.
     let writer = db.connect();
     writer.execute("BEGIN CONCURRENT").unwrap();
     writer.execute("INSERT INTO other VALUES (1)").unwrap();
@@ -19652,10 +19617,6 @@ fn test_writer_of_changed_table_aborts_at_commit() {
     assert!(matches!(commit_err, LimboError::SchemaConflict));
     assert!(writer.get_auto_commit());
 }
-// --- DDL concurrency matrix. Validated against live PostgreSQL 18; where
-// postgres blocks (queues) we return Busy for the caller to retry, and
-// readers are never blocked at all (postgres's ACCESS EXCLUSIVE blocks even
-// SELECTs). See the per-test comments for the postgres behavior.
 
 #[test]
 fn test_matrix_multi_ddl_in_one_concurrent_tx() {
@@ -19719,8 +19680,7 @@ fn test_matrix_ddl_vs_ddl_same_table_busy() {
     a.execute("BEGIN CONCURRENT").unwrap();
     a.execute("ALTER TABLE t ADD COLUMN x1 INTEGER").unwrap();
 
-    // Postgres blocks each of these behind A's lock and proceeds after A
-    // commits; we return Busy and the retry succeeds.
+    // TableLocked, not Busy, while the other DDL holds t.
     let b = db.connect();
     for stmt in [
         "ALTER TABLE t ADD COLUMN x2 INTEGER",
@@ -19749,9 +19709,7 @@ fn test_matrix_create_vs_create_same_name() {
     let a = db.connect();
     let b = db.connect();
 
-    // Postgres blocks the second creator on the catalog unique index; after
-    // a rollback of the first it succeeds, after a commit it fails with
-    // "already exists". The name lock gives the same outcomes via Busy.
+    // TableLocked, not Busy, while the other CREATE holds the name.
     a.execute("BEGIN CONCURRENT").unwrap();
     a.execute("CREATE TABLE newt(id INTEGER PRIMARY KEY)")
         .unwrap();
@@ -19783,10 +19741,6 @@ fn test_matrix_pending_drop_blocks_recreate() {
     a.execute("BEGIN CONCURRENT").unwrap();
     a.execute("DROP TABLE t").unwrap();
 
-    // The uncommitted drop is invisible to B, so name resolution fails at
-    // prepare time with "already exists" — the same outcome live postgres
-    // produces for this interleaving. After the drop commits, the recreate
-    // succeeds.
     let b = db.connect();
     let err = b
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
@@ -19800,9 +19754,6 @@ fn test_matrix_pending_drop_blocks_recreate() {
 #[test]
 fn test_matrix_name_lock_lifecycle_churn() {
     let db = MvccTestDbNoConn::new_with_random_db();
-    // Create/drop/recreate the same name across transactions: locks must be
-    // fully released at every commit and rollback, never leaking an entry
-    // that would make the name permanently Busy.
     let conn = db.connect();
     for _ in 0..3 {
         conn.execute("BEGIN CONCURRENT").unwrap();
@@ -19818,7 +19769,6 @@ fn test_matrix_name_lock_lifecycle_churn() {
         .unwrap();
     conn.execute("ROLLBACK").unwrap();
 
-    // After the rollback another connection can take the name immediately.
     let other = db.connect();
     other
         .execute("CREATE TABLE churn(id INTEGER PRIMARY KEY)")
@@ -19841,19 +19791,12 @@ fn test_matrix_rename_abba_busy_without_deadlock() {
     t1.execute("BEGIN CONCURRENT").unwrap();
     t1.execute("ALTER TABLE a1 RENAME TO c1").unwrap();
 
-    // T1's rename is uncommitted, so T2 still sees a1 and fails at prepare
-    // time with "already exists" — live postgres resolves the ABBA shape the
-    // same way. Nothing waits, so no deadlock.
     let t2 = db.connect();
     let err = t2
         .execute("ALTER TABLE b1 RENAME TO a1")
         .expect_err("a1 is still visible while T1's rename is uncommitted");
     assert!(err.to_string().contains("already"), "got {err:?}");
 
-    // TODO: the rename sweep rewrites every sqlite_schema row even when the
-    // row is unchanged (the sqlite_rename_table UPDATE), so any concurrent
-    // DDL write-write conflicts with an in-flight rename. Eliding the no-op
-    // row writes would let disjoint renames run concurrently like postgres.
     let err = t2
         .execute("ALTER TABLE b1 RENAME TO d1")
         .expect_err("concurrent rename currently conflicts on the schema sweep");
@@ -19883,8 +19826,7 @@ fn test_matrix_index_and_table_names_share_namespace() {
     a.execute("BEGIN CONCURRENT").unwrap();
     a.execute("CREATE INDEX iname ON t(c)").unwrap();
 
-    // Postgres blocks this on pg_class's unique name index and fails it
-    // after the commit; the shared-namespace name lock returns Busy.
+    // TableLocked, not Busy. The index name and a new table name are one namespace.
     let b = db.connect();
     let err = b
         .execute("CREATE TABLE iname(id INTEGER PRIMARY KEY)")
@@ -19903,9 +19845,6 @@ fn test_matrix_reader_never_blocked_by_ddl() {
     setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
     setup.close().unwrap();
 
-    // Postgres blocks the ALTER behind the open reader (and new readers
-    // behind the ALTER). Our readers are snapshot-isolated: neither side
-    // blocks, and the reader keeps its pre-DDL view.
     let reader = db.connect();
     reader.execute("BEGIN CONCURRENT").unwrap();
     let rows = get_rows(&reader, "SELECT id FROM t");
@@ -19939,9 +19878,6 @@ fn test_matrix_concurrent_ddl_on_different_tables() {
             .unwrap()
     };
 
-    // Both transactions hold DDL locks on disjoint names: fully concurrent,
-    // like postgres. The deferred cookie bump assigns each commit its own
-    // increment, keeping the cookie strictly monotonic.
     let t1 = db.connect();
     let t2 = db.connect();
     t1.execute("BEGIN CONCURRENT").unwrap();
@@ -19995,10 +19931,7 @@ fn test_matrix_autoincrement_table_in_concurrent_tx() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    // Inserting into the AUTOINCREMENT table within the same concurrent
-    // transaction that created it conflicts with the sequence machinery's
-    // inner transaction (issue #9505 / #9509); exercise the committed table
-    // instead.
+    // #9505 / #9509: insert after commit. The creating transaction conflicts with sqlite_sequence.
     conn.execute("INSERT INTO seq_t(v) VALUES ('a')").unwrap();
     conn.execute("INSERT INTO seq_t(v) VALUES ('b')").unwrap();
 
@@ -20011,9 +19944,6 @@ fn test_matrix_autoincrement_table_in_concurrent_tx() {
 
 #[test]
 fn test_matrix_ddl_refused_when_table_changed_since_snapshot() {
-    // Deterministic regression for the fuzzer-found corruption: a DDL that
-    // rewrites or scans the whole table (drop column, index build) under a
-    // snapshot that predates a committed write would silently miss that row.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20024,7 +19954,6 @@ fn test_matrix_ddl_refused_when_table_changed_since_snapshot() {
 
     let ddl = db.connect();
     ddl.execute("BEGIN CONCURRENT").unwrap();
-    // Pin the snapshot before the other connection's write commits.
     let rows = get_rows(&ddl, "SELECT count(*) FROM t");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 
@@ -20037,7 +19966,6 @@ fn test_matrix_ddl_refused_when_table_changed_since_snapshot() {
     assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
     ddl.execute("ROLLBACK").unwrap();
 
-    // A fresh transaction sees the row and the rewrite succeeds.
     ddl.execute("ALTER TABLE t DROP COLUMN c").unwrap();
     let verify = db.connect();
     let rows = get_rows(&verify, "SELECT id FROM t ORDER BY id");
@@ -20062,8 +19990,6 @@ fn test_matrix_exclusive_upgrade_blocked_by_ddl_locks() {
     ddl.execute("BEGIN CONCURRENT").unwrap();
     ddl.execute("CREATE INDEX i ON t(c)").unwrap();
 
-    // A deferred BEGIN's first write upgrades to the exclusive transaction,
-    // which is mutually exclusive with in-flight DDL locks.
     let writer = db.connect();
     writer.execute("BEGIN").unwrap();
     let err = writer
@@ -20078,10 +20004,6 @@ fn test_matrix_exclusive_upgrade_blocked_by_ddl_locks() {
 
 #[test]
 fn test_matrix_name_only_ddl_aborts_overlapping_writer() {
-    // Views carry no target tables, so their commits fall back to the global
-    // schema-change marker: every overlapping writer aborts, like the old
-    // whole-database check. Registering targets for name-only DDL would
-    // scope this.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20104,15 +20026,6 @@ fn test_matrix_name_only_ddl_aborts_overlapping_writer() {
 
 #[test]
 fn test_matrix_overlapping_header_commits_do_not_lose_updates() {
-    // Two header-dirty commits overlapping in the commit pipeline: the first
-    // (header-only, so no schema rows that would hand the second a commit
-    // dependency) is suspended right after reserving its commit timestamp,
-    // the second runs to completion, then the first finishes. Both header
-    // changes must survive, and the schema cookie must advance for the DDL.
-    // Two cookie-bumping DDLs cannot be overlapped this way: the second's
-    // schema scan takes a commit dependency on the first's Preparing commit,
-    // which serializes them; the cookie reservation counter covers the
-    // orderings dependencies do not (group-commit reordering).
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -20135,7 +20048,6 @@ fn test_matrix_overlapping_header_commits_do_not_lose_updates() {
         "COMMIT should yield at CommitValidation"
     );
 
-    // conn_b's DDL commits fully while conn_a's commit is parked.
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     conn_b
         .execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
@@ -20146,8 +20058,6 @@ fn test_matrix_overlapping_header_commits_do_not_lose_updates() {
     drop(commit_a);
     conn_a.set_yield_injector(None);
 
-    // conn_a's user_version must not be lost to conn_b's whole-header
-    // publish, and conn_b's cookie bump must not be reverted by conn_a's.
     let verify = db.connect();
     let rows = get_rows(&verify, "PRAGMA user_version");
     assert_eq!(rows[0][0].as_int().unwrap(), 42);
@@ -20164,10 +20074,6 @@ fn test_matrix_overlapping_header_commits_do_not_lose_updates() {
 
 #[test]
 fn test_matrix_concurrent_autoincrement_creates_serialize_on_sqlite_sequence() {
-    // Both creators see sqlite_sequence as absent at prepare time; without a
-    // lock on the name, both would commit a definition for it, bricking the
-    // database with a duplicate schema row ("table sqlite_sequence already
-    // exists" on every later statement, reopen fails).
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let a = db.connect();
@@ -20205,9 +20111,7 @@ fn test_matrix_concurrent_autoincrement_creates_serialize_on_sqlite_sequence() {
 
 #[test]
 fn test_matrix_savepoint_rolled_back_ddl_does_not_abort_others() {
-    // A DDL undone by ROLLBACK TO must not publish its target tables at
-    // commit: no schema change committed, so a transaction that used the
-    // table has nothing to conflict with.
+    // ROLLBACK TO must not publish the DDL. The other transaction has nothing to conflict with.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20245,10 +20149,7 @@ fn test_matrix_savepoint_rolled_back_ddl_does_not_abort_others() {
 
 #[test]
 fn test_matrix_nested_savepoint_inner_ddl_rollback_keeps_outer_ddl() {
-    // Two DDLs at different savepoint depths; only the inner one is rolled
-    // back. The outer DDL must commit AND publish (a transaction that used
-    // its table aborts), while the inner one must do neither: the savepoint
-    // watermarks have to restore to the inner savepoint's mark, not further.
+    // The inner ROLLBACK TO must not publish, and must not drop the outer DDL's targets.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20301,9 +20202,7 @@ fn test_matrix_nested_savepoint_inner_ddl_rollback_keeps_outer_ddl() {
 
 #[test]
 fn test_matrix_ddl_after_savepoint_rollback_publishes() {
-    // Rollback truncates the recorded targets; a NEW DDL on the same table
-    // after the rollback must re-record and publish them (the dedup in
-    // record_ddl_targets must not treat the truncated entry as present).
+    // A DDL after ROLLBACK TO must publish. The truncated target must not count as already recorded.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20339,9 +20238,7 @@ fn test_matrix_ddl_after_savepoint_rollback_publishes() {
 
 #[test]
 fn test_matrix_released_savepoint_ddl_undone_by_outer_rollback() {
-    // RELEASE merges the inner savepoint's undo records into its parent;
-    // rolling back the parent must still undo the released DDL and must not
-    // publish anything at commit.
+    // Rolling back the parent must undo the released DDL and must not publish it.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20381,10 +20278,7 @@ fn test_matrix_released_savepoint_ddl_undone_by_outer_rollback() {
 
 #[test]
 fn test_matrix_nested_savepoint_created_tables_partial_rollback() {
-    // Tables created at two savepoint depths; the inner rollback must make
-    // its table vanish for everyone (including the creating transaction:
-    // prepare says "no such table") and drop its slots, while the outer
-    // table commits, persists across reopen, and publishes.
+    // The inner ROLLBACK TO must drop its table and must not publish it.
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let ddl = db.connect();
@@ -20424,15 +20318,11 @@ fn test_matrix_nested_savepoint_created_tables_partial_rollback() {
 
 #[test]
 fn test_matrix_rolled_back_create_does_not_poison_name_for_others() {
-    // A CREATE undone by ROLLBACK TO must not publish its name timestamp:
-    // another transaction whose snapshot predates this commit must still be
-    // able to create the same name (a published entry would refuse it with
-    // TableLocked as a supposed stale-snapshot recreate).
+    // ROLLBACK TO must not publish the name, or a later CREATE of it returns TableLocked.
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let other = db.connect();
     other.execute("BEGIN CONCURRENT").unwrap();
-    // Pin a snapshot that predates the rolled-back CREATE's commit.
     let _ = get_rows(&other, "SELECT count(*) FROM sqlite_schema");
 
     let ddl = db.connect();
@@ -20456,9 +20346,7 @@ fn test_matrix_rolled_back_create_does_not_poison_name_for_others() {
 
 #[test]
 fn test_matrix_repeated_rollback_to_same_savepoint_with_ddl() {
-    // ROLLBACK TO re-pushes the target savepoint with its ORIGINAL
-    // watermarks; a second DDL + rollback cycle must truncate back to the
-    // same marks, leaving nothing to publish.
+    // A second ROLLBACK TO the same savepoint must not publish either DDL.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20494,13 +20382,6 @@ fn test_matrix_repeated_rollback_to_same_savepoint_with_ddl() {
 
 #[test]
 fn test_matrix_overlapping_header_commits_survive_reopen() {
-    // Same overlap as test_matrix_overlapping_header_commits_do_not_lose_updates,
-    // but parked after the commit timestamp is assigned and the log record is
-    // prepared: the pragma commit (older end_ts) then reaches the log AFTER
-    // the DDL commit (newer end_ts). Recovery applies header entries
-    // last-record-wins, so the log writer must have merged the pragma
-    // record's header onto the DDL's; otherwise the reopen loses the DDL's
-    // cookie bump (and in the reverse interleaving, the pragma value).
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let cookie_running;
     {
@@ -20558,17 +20439,10 @@ fn test_matrix_overlapping_header_commits_survive_reopen() {
 
 #[test]
 fn test_matrix_stale_snapshot_create_same_name_refused() {
-    // The DDL name locks only exclude in-flight holders. A transaction whose
-    // snapshot predates a committed CREATE still resolves the name as free at
-    // prepare time (its connection schema is pinned inside the open
-    // transaction); without the committed-name timestamp check it would
-    // commit a second schema row for the same name, making the database
-    // unopenable.
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let stale = db.connect();
         stale.execute("BEGIN CONCURRENT").unwrap();
-        // Pin the snapshot before the other connection's CREATE commits.
         let _ = get_rows(&stale, "SELECT count(*) FROM sqlite_schema");
 
         let creator = db.connect();
@@ -20598,14 +20472,10 @@ fn test_matrix_stale_snapshot_create_same_name_refused() {
 
 #[test]
 fn test_matrix_stale_snapshot_autoincrement_create_refused() {
-    // Same stale-snapshot hole through the inline sqlite_sequence creation:
-    // the second creator targets a different table name, but both would
-    // define sqlite_sequence.
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let stale = db.connect();
         stale.execute("BEGIN CONCURRENT").unwrap();
-        // Pin the snapshot before the other connection's CREATE commits.
         let _ = get_rows(&stale, "SELECT count(*) FROM sqlite_schema");
 
         let creator = db.connect();
@@ -20619,7 +20489,6 @@ fn test_matrix_stale_snapshot_autoincrement_create_refused() {
         assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
         stale.execute("COMMIT").unwrap();
 
-        // A fresh statement sees sqlite_sequence and succeeds.
         stale
             .execute("CREATE TABLE sb(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
@@ -20639,10 +20508,7 @@ fn test_matrix_stale_snapshot_autoincrement_create_refused() {
 
 #[test]
 fn test_matrix_failed_ddl_statement_does_not_abort_others() {
-    // A DDL statement that fails mid-execution rolls back through the
-    // statement savepoint, which must undo its recorded target tables: the
-    // transaction's later COMMIT (of nothing) must not publish a schema
-    // change for t and abort every transaction that used it.
+    // The failed statement's savepoint must not publish a schema change for t.
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20831,10 +20697,7 @@ fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
-/// Regression for #6754: dropping a Statement that paused mid-IO inside
-/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
-/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
-/// next INSERT into the same table from any connection makes progress.
+/// #6754: dropping a statement paused in op_new_rowid must release the rowid allocator lock.
 #[test]
 fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
     use std::time::{Duration, Instant};

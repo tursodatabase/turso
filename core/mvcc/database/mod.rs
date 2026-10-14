@@ -66,7 +66,6 @@ pub use checkpoint_state_machine::{
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
-
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
     parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
@@ -499,18 +498,9 @@ pub enum RowVersionState {
 }
 pub type TxID = u64;
 
-/// A committed transaction's header change, carried on the [`LogRecord`]
-/// and serialized into the frame only at write time, when the frame's
-/// position in the log is fixed. The log writer merges it onto the header
-/// it last wrote, so header entries are cumulative in file order and
-/// recovery's last-record-wins application reconstructs the runtime merge
-/// even when overlapping commits reach the log out of end_ts order.
 #[derive(Debug, Clone, Copy)]
 pub enum PendingLogHeader {
-    /// An exclusive transaction saw everything; its header replaces wholesale.
     Replace(DatabaseHeader),
-    /// A concurrent transaction re-applies its own changes (`modified`
-    /// relative to `snapshot`) on top of the last logged header.
     Merge {
         snapshot: DatabaseHeader,
         modified: DatabaseHeader,
@@ -532,9 +522,6 @@ pub struct LogRecord {
     pub buf: DynVec<u8>,
     /// Number of op entries appended to `buf`. Includes any header op.
     pub op_count: u32,
-    /// Header change serialized by the log writer at write time; see
-    /// [`PendingLogHeader`]. Boxed: the two header copies would otherwise
-    /// grow every queued commit by ~200 bytes.
     pub pending_header: Option<Box<PendingLogHeader>>,
     /// Portable logical-change metadata stored alongside the MVCC recovery log.
     ///
@@ -598,21 +585,10 @@ impl LogRecord {
         }
     }
 
-    /// True iff the record carries no ops: no row versions and no header
-    /// deferred to write time.
     pub fn is_empty(&self) -> bool {
         self.op_count == 0 && self.pending_header.is_none()
     }
 
-    /// Test-only constructor that eagerly serializes a list of row versions
-    /// and an optional `DatabaseHeader` into the payload buffer using the
-    /// production wire format, for reader/parser fixtures that need
-    /// deterministic bytes. Production code uses
-    /// [`DurableStorage::serialize_row_version`] for rows and defers the
-    /// header to the log writer via `pending_header`. The header is a
-    /// constructor argument, not a setter, so a record with two header ops
-    /// is as unrepresentable in tests as `pending_header.take()` makes it
-    /// in production.
     #[cfg(test)]
     pub(crate) fn for_test(
         tx_timestamp: TxID,
@@ -861,18 +837,7 @@ enum SavepointKind {
     },
 }
 
-/// Transaction-scoped state captured when a savepoint begins and restored
-/// when it rolls back. The three lengths are watermarks into the
-/// transaction's `ddl_target_tables` / `created_table_ids` /
-/// `ddl_lock_names` vectors, so restore is a truncate: a rolled-back DDL
-/// must not publish its targets or names at commit, where they would abort
-/// other transactions despite no schema change committing.
-///
-/// Watermarks are a complete undo record because (1) the vectors are
-/// append-only within a transaction, (2) savepoints are LIFO, so marks are
-/// monotone non-decreasing up the stack, and (3) rollback truncates only to
-/// a popped savepoint's mark, which is >= every surviving mark. Asserted at
-/// the restore site.
+/// Lengths into append-only vectors. Rollback truncates to this mark, and a popped mark is never below a surviving one.
 #[derive(Debug, Default, Clone, Copy)]
 struct SavepointTxState {
     header: DatabaseHeader,
@@ -1096,20 +1061,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
-    /// Database header as of this transaction's snapshot. Concurrent
-    /// transactions defer the real header write to commit, where their
-    /// changes (relative to this snapshot) are re-applied on top of the
-    /// then-current global header.
+    /// Header at begin. Commit applies only this transaction's changes onto
+    /// the global header, so a concurrent commit's fields stay.
     snapshot_header: DatabaseHeader,
-    /// Tables this transaction opened cursors on (reads and writes), for
-    /// scoped commit-time schema validation.
     used_tables: Mutex<HashSet<MVTableId>>,
-    /// Tables whose schema this transaction changes, recorded when the DDL
-    /// locks are acquired and published to `MvStore::ddl_commit_ts` at commit.
     ddl_target_tables: Mutex<Vec<MVTableId>>,
-    /// Object names this transaction's DDL statements locked, published to
-    /// `MvStore::ddl_name_commit_ts` at commit so later stale-snapshot
-    /// transactions cannot recreate or re-drop them.
     ddl_lock_names: Mutex<Vec<String>>,
 }
 
@@ -1165,7 +1121,6 @@ impl<A: RowVersionAllocator> Transaction<A> {
         self.write_set.lock().insert(id, row_versions);
     }
 
-    /// Snapshot the transaction-scoped state a savepoint must restore.
     fn savepoint_tx_state(&self) -> SavepointTxState {
         SavepointTxState {
             header: *self.header.read(),
@@ -1607,10 +1562,6 @@ pub struct BuildLogRecordCtx {
     /// data-row pass. Schema rows are emitted first so log replay sees
     /// CREATE TABLE before related INSERTs.
     pub schema_process: bool,
-    /// Header change captured when `header_dirty` was observed at the
-    /// start of BuildLogRecord. Handed to the log record after both
-    /// row-version passes complete; the log writer serializes it last
-    /// (ops first, header last) at write time.
     pub pending_header: Option<Box<PendingLogHeader>>,
 }
 
@@ -2039,12 +1990,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
         }
-        // The owner statement was dropped, so the normal commit tail never
-        // runs; without this an abandoned DDL commit would hold its locks
-        // forever and wedge every later DDL and write to its tables.
-        // TODO: this path also skips the schema/global-header publication the
-        // commit tail would have done (pre-existing; the committed change only
-        // becomes visible on reopen or the next schema refresh).
+        // Drop skips the commit tail, so these locks would stay held.
+        // Schema publication also waits until reopen or the next schema refresh.
         mvcc_store.release_ddl_locks(owner_tx);
         crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx).expect(ALLOC_ERR_MSG));
         Ok(())
@@ -2096,10 +2043,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         Ok(())
     }
 
-    /// The single place deciding how a transaction's header change applies:
-    /// exclusive replaces wholesale, concurrent re-applies its own changes.
-    /// Consumed both by the in-memory publish (`publish_committed_header`)
-    /// and, boxed onto the log record, by the log writer.
     fn pending_log_header(is_exclusive: bool, tx: &Transaction<A>) -> Option<PendingLogHeader> {
         if !tx.header_dirty.load(Ordering::Acquire) {
             return None;
@@ -2818,10 +2761,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             return Ok(TransitionResult::Continue);
         }
 
-        // The header op is not serialized here: its final value depends on
-        // the headers logged before it, and this record's position in the
-        // log is only decided at write time. The log writer serializes it
-        // after the row ops; see `PendingLogHeader`.
         ctx.log_record.pending_header = ctx.pending_header.take();
 
         // Move the assembled log record out and transition to
@@ -3131,15 +3070,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     }
 }
 
-/// Re-apply a concurrent transaction's header changes on top of the current
-/// global header at publish time. The transaction's schema cookie was
-/// reserved from the monotonic counter at commit prepare, so the merged
-/// cookie is the max of the published value and the reservation; the other
-/// SetCookie-reachable fields are applied as values when this transaction
-/// changed them relative to its snapshot, last committer wins. SQLite bumps
-/// the cookie at statement time; deferring it to commit is externally
-/// indistinguishable because other connections only ever observe committed
-/// state.
 pub(crate) fn merge_concurrent_header_commit(
     base: DatabaseHeader,
     snapshot: &DatabaseHeader,
@@ -3173,9 +3103,8 @@ pub(crate) fn merge_concurrent_header_commit(
     if modified.application_id.get() != snapshot.application_id.get() {
         merged.application_id = modified.application_id;
     }
-    // Today only VACUUM writes these, under an exclusive transaction that
-    // takes the Replace path; carried here so a future non-exclusive writer
-    // cannot silently lose them.
+    // Only VACUUM writes these today, and only on the Replace path.
+    // A non-exclusive writer must not lose them.
     if modified.read_version != snapshot.read_version {
         merged.read_version = modified.read_version;
     }
@@ -3185,17 +3114,8 @@ pub(crate) fn merge_concurrent_header_commit(
     merged
 }
 
-/// Publish a committed transaction's header into `target` (the commit
-/// machine's cached header and, later, the global header — both sites
-/// must apply the same rule, and it is the same rule the log writer
-/// applies on disk; see [`PendingLogHeader`]). Header-clean transactions
-/// never publish (`pending` is None): their snapshot may legitimately
-/// predate a DDL commit, so their stale copy would regress the schema
-/// cookie. An exclusive transaction saw everything, so its header replaces
-/// wholesale, guarded by `exclusive_ts_ok` (a newer commit may already
-/// have published); a concurrent one re-applies only its own changes onto
-/// the current value, so overlapping header commits cannot overwrite each
-/// other's fields with stale bases.
+/// A transaction with no header change must not publish.
+/// Its snapshot can predate a DDL commit and would move the schema cookie backward.
 fn publish_committed_header(
     target: &mut Option<DatabaseHeader>,
     pending: Option<PendingLogHeader>,
@@ -3294,13 +3214,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         turso_assert_reachable!("commit aborted due to exclusive tx conflict");
                         exclusive_conflict = true;
                     }
-                    // Scoped schema validation: a transaction aborts only if a
-                    // table it used (read or wrote through a cursor) changed
-                    // schema after the transaction began. A DDL therefore never
-                    // aborts unrelated transactions (postgres-like); the old
-                    // global last_committed_schema_change_ts check aborted every
-                    // overlapping writer. Same-table interleavings are already
-                    // excluded while the DDL is in flight by the DDL locks.
                     {
                         let ddl_ts = mvcc_store.ddl_commit_ts.lock();
                         if !ddl_ts.is_empty() {
@@ -3320,32 +3233,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     if mvcc_store.unscoped_schema_change_ts.load(Ordering::Acquire) > tx.begin_ts {
                         schema_conflict = true;
                     }
-                    // Revalidate the DDL's snapshot freshness: the acquisition
-                    // check races with a writer whose first row write passed
-                    // the block check but had not yet reached the write set.
-                    // Both data_commit_ts publication and this check run under
-                    // the commit clock, so whichever side commits second sees
-                    // the other; an index build or rewrite that missed such a
-                    // row must not commit.
+                    // The lock check races a writer that passed the block check
+                    // before its rows were in the write set. The later commit must see it.
                     {
                         let targets = tx.ddl_target_tables.lock();
                         if mvcc_store.any_target_written_after(&targets, tx.begin_ts) {
                             schema_conflict = true;
                         }
                     }
-                    // The header_write guard makes cookie_bumped mean "this
-                    // transaction changed the schema": the exclusive upgrade
-                    // refreshes tx.header from the global header without
-                    // setting header_dirty, so a bare cookie comparison would
-                    // misread that refresh as a schema change. (The upgrade
-                    // refuses snapshots older than the last commit with Busy,
-                    // so the cookies cannot actually differ there today; the
-                    // guard keeps the meaning robust rather than leaning on
-                    // that.) A LOWER cookie than the snapshot does not count
-                    // either: no statement produces one today (PRAGMA
-                    // schema_version writes are a no-op), and reserving from
-                    // a wrapped-negative bump would poison the monotonic
-                    // counter.
+                    // An exclusive upgrade copies the global header and is not a schema
+                    // change. A lower cookie is not one either: schema_version writes are a no-op.
                     let cookie_bumped = header_write
                         && tx.header.read().schema_cookie.get()
                             > tx.snapshot_header.schema_cookie.get();
@@ -3355,17 +3252,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         && !exclusive_conflict
                         && cookie_bumped
                     {
-                        // Reserve this commit's schema cookie from the
-                        // monotonic counter. The global header may still lag
-                        // behind another in-flight header commit (it is only
-                        // published after durability), so basing the new value
-                        // on it could hand two commits the same cookie — and a
-                        // collapsed bump lets a statement compiled without a
-                        // concurrent index pass the cookie check and corrupt
-                        // that index. The other header fields keep this
-                        // transaction's own changes; they are re-applied
-                        // field-wise onto the then-current global header at
-                        // publish time.
+                        // The global header can lag, so the cookie comes from the counter.
+                        // Two commits must not share a value.
                         let global_cookie = mvcc_store
                             .global_header
                             .read()
@@ -3383,10 +3271,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
                     if can_commit_tx {
-                        // Publish this transaction's schema changes for the
-                        // scoped validation of others. Done at Preparing, before
-                        // durability: if the commit later fails, the entries only
-                        // cause a false SchemaConflict, never a missed one.
                         let names = tx.ddl_lock_names.lock();
                         if !names.is_empty() {
                             let mut name_ts = mvcc_store.ddl_name_commit_ts.lock();
@@ -3402,22 +3286,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                                 ddl_ts.insert(*t, ts);
                             }
                         } else if cookie_bumped {
-                            // A schema change without target information (today:
-                            // view, trigger and sequence DDL, and ANALYZE when
-                            // sqlite_stat1 exists). The global marker aborts
-                            // every overlapping transaction, like the old
-                            // whole-database check; registering targets for
-                            // those statements would scope it.
+                            // Views, triggers, sequences, and ANALYZE on an existing
+                            // sqlite_stat1 have no target table.
                             mvcc_store
                                 .unscoped_schema_change_ts
                                 .fetch_max(ts, Ordering::AcqRel);
                         }
                     }
                     if can_commit_tx && !written_tables.is_empty() {
-                        // Publish per-table data-commit timestamps before the
-                        // Preparing store: a DDL acquisition that misses these
-                        // entries still sees this transaction as Active in its
-                        // in-flight-writer scan.
+                        // Publish before the Preparing store. A DDL lock check that
+                        // misses these entries still sees this transaction as Active.
                         let mut data_ts = mvcc_store.data_commit_ts.lock();
                         for t in &written_tables {
                             data_ts.insert(*t, ts);
@@ -4613,14 +4491,8 @@ pub(crate) struct GcDebugSnapshot {
     pub backfill_floor: WalPos,
 }
 
-/// Schema-object DDL locks. `names` is keyed by normalized object name —
-/// tables, indexes, views and triggers share one namespace in the schema,
-/// exactly like the unique name index postgres relies on. `table_blocks`
-/// lists tables whose data writes are excluded while a DDL on them is in
-/// flight: an index build or a drop must observe a stable table. Readers are
-/// never blocked; their snapshots stay consistent through row versions.
-/// Postgres runs two CREATE INDEX on one table in parallel (SHARE locks are
-/// self-compatible); we serialize them for simplicity.
+/// Tables, indexes, views, and triggers share one name map.
+/// table_blocks stops data writes so an index build or a drop sees a stable table.
 #[derive(Default, Debug)]
 struct DdlLocks {
     names: StdHashMap<String, TxID>,
@@ -4686,47 +4558,20 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
-    /// DDL locks held by in-flight transactions; see [`DdlLocks`]. Held from
-    /// the DDL statement's start until the transaction ends. Contention
-    /// returns TableLocked for the caller to retry (#6338 turns that into a
-    /// transparent wait).
     ddl_locks: Mutex<DdlLocks>,
-    /// Number of names in `ddl_locks`, so the row-write hot path can skip
-    /// the mutex with one load in the common no-DDL case.
     ddl_locks_active: AtomicUsize,
-    /// Monotonic schema-cookie allocator for concurrent header commits. The
-    /// global header is only published after durability, so basing a new
-    /// cookie on it could hand two overlapping commits the same value;
-    /// reservations come from this counter instead (seeded from the global
-    /// header on use).
     schema_cookie_counter: AtomicU64,
-    /// Prepare timestamp of the last committed data write per table. DDL
-    /// lock acquisition consults it: a table-rewriting DDL (drop, alter,
-    /// index build) whose transaction snapshot predates a committed write to
-    /// the target would rewrite the table without seeing that row.
+    /// Last committed data write per table.
+    /// A rewriting DDL with an older snapshot would miss that row.
     data_commit_ts: Mutex<StdHashMap<MVTableId, u64>>,
-    /// Prepare timestamp of the last schema-changing commit that carried no
-    /// per-table target information. Scoped validation cannot attribute such
-    /// a change, so every overlapping transaction aborts, like the old global
-    /// check. This is the live mechanism for name-only DDL (views, triggers,
-    /// sequences, ANALYZE on an existing sqlite_stat1), not just insurance;
-    /// registering targets for those statements would scope it further.
+    /// Last schema commit with no per-table targets.
+    /// Scoped validation cannot name the table, so every overlapping transaction aborts.
     unscoped_schema_change_ts: AtomicU64,
-    /// Prepare timestamp of the last committed schema change per table.
-    /// Commit validation aborts only transactions that used a changed table,
-    /// so a DDL never aborts unrelated writers (postgres-like). Entries are
-    /// recorded at Preparing: a transaction that later aborts leaves a
-    /// spurious entry, which can only cause a false SchemaConflict, never a
-    /// missed one. Entries are never pruned; they are one timestamp per
-    /// DDL-touched table.
+    /// Last schema commit per table, recorded at Preparing.
+    /// A later abort can report a false SchemaConflict and cannot miss one.
     ddl_commit_ts: Mutex<StdHashMap<MVTableId, u64>>,
-    /// Prepare timestamp of the last committed DDL per object name. The DDL
-    /// name locks only exclude in-flight holders; without this a transaction
-    /// whose snapshot predates a committed CREATE would re-create the same
-    /// name and commit a duplicate schema row, which makes the database
-    /// unopenable. Checked at lock acquisition against the transaction's
-    /// begin timestamp. Same spurious-entry and no-pruning tradeoffs as
-    /// `ddl_commit_ts`.
+    /// Last committed DDL per name.
+    /// Locks miss a snapshot from before a CREATE, which would write a duplicate schema row.
     ddl_name_commit_ts: Mutex<StdHashMap<String, u64>>,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
@@ -5722,10 +5567,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
-        // A DDL on this table is in flight in another transaction (index
-        // builds and drops must observe a stable table). Postgres queues the
-        // write behind the DDL; TableLocked aborts just this statement so the
-        // caller can retry without losing its transaction.
         if self.ddl_write_blocked(tx_id, row.id.table_id) {
             return Err(LimboError::TableLocked);
         }
@@ -5939,7 +5780,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         btree_record: Option<&ImmutableRecord>,
     ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
-        // See the matching check in insert_to_table_or_index.
         if self.ddl_write_blocked(tx_id, id.table_id) {
             return Err(LimboError::TableLocked);
         }
@@ -7458,11 +7298,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         if let Some(connection) = connection {
-            // Revert the connection-local schema only when this transaction
-            // actually changed it. A version comparison alone misfires: a
-            // read-only internal transaction (e.g. the schema reparse) runs on
-            // a connection whose schema is legitimately ahead of the shared
-            // one, and reverting it would throw the fresh reparse away.
+            // Revert the connection schema only when this transaction changed it.
+            // A read-only reparse can be ahead of the shared schema, and a version compare would discard it.
             if tx_changed_schema
                 && connection.schema.read().schema_version
                     > connection.db.schema.lock().schema_version
@@ -7828,19 +7665,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         *tx.header.write() = header;
         tx.header_dirty.store(header_dirty, Ordering::Release);
-        // Undo the savepoint's DDL bookkeeping: a rolled-back DDL must not
-        // publish ddl_commit_ts / ddl_name_commit_ts entries at commit (they
-        // would abort or block transactions despite no schema change
-        // committing) and a table created inside the savepoint never existed
-        // for anyone, so its slots are dropped the same way a full rollback
-        // drops them. The name locks stay held until transaction end; that
-        // is merely conservative.
-        //
-        // The watermark restore is sound because the vectors are append-only
-        // and savepoints are LIFO: every surviving savepoint's mark is <= the
-        // popped one's, so truncating to the popped mark never cuts below a
-        // surviving mark. A mark past the vector means that discipline broke
-        // somewhere; Vec::truncate would silently ignore it, so assert.
         {
             let mut targets = tx.ddl_target_tables.lock();
             turso_assert!(
@@ -7949,35 +7773,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
-    /// Acquires the exclusive transaction lock to the given transaction ID.
-    /// Acquire the DDL locks for one statement: every schema-object `name`
-    /// exclusively, plus a data-write block on every `target` table. All or
-    /// nothing: on contention nothing is left behind and the caller gets
-    /// TableLocked to retry (issue #6338 turns this into a transparent
-    /// wait). TableLocked rather than Busy: Busy keeps the statement
-    /// resumable, so dropping it inside an explicit transaction poisons the
-    /// COMMIT; TableLocked aborts just the statement and the transaction
-    /// stays usable. Re-entrant for the holding transaction, so several DDL
-    /// statements in one transaction extend the same set.
+    /// TableLocked aborts the statement and leaves the transaction usable.
+    /// Busy stays resumable and poisons COMMIT (#6338).
     pub(crate) fn acquire_ddl_locks(
         &self,
         tx_id: TxID,
         names: &[String],
         targets: &[MVTableId],
     ) -> Result<()> {
-        // `ddl_locks_active` counts names only, and `ddl_write_blocked`'s
-        // fast path trusts it: a target without a name would populate
-        // `table_blocks` while the counter stays zero, silently disabling
-        // the write block.
+        // ddl_locks_active counts names only. A target with no name would
+        // leave the count at zero and the write block would not run.
         turso_assert!(
             !names.is_empty() || targets.is_empty(),
             "DDL targets require at least one lock name"
         );
         let mut locks = self.ddl_locks.lock();
-        // Exclusivity and DDL locks are mutually exclusive modes: an
-        // exclusive transaction assumes nobody else touches the schema. Both
-        // this check and acquire_exclusive_tx's converse run under the
-        // ddl_locks mutex, so the two modes cannot slip past each other.
+        // Exclusive mode and DDL locks exclude each other. This check and
+        // acquire_exclusive_tx both hold ddl_locks, so neither can pass the other.
         if self.has_exclusive_tx() && !self.is_exclusive_tx(&tx_id) {
             return Err(LimboError::TableLocked);
         }
@@ -7995,19 +7807,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Err(LimboError::TableLocked);
             }
         }
-        // An index build or a drop must observe a stable table: no other
-        // transaction may hold uncommitted writes to a target. Postgres
-        // queues the DDL behind such writers instead.
+        // An index build or a drop would miss another transaction's
+        // uncommitted writes to the target.
         for target in targets {
             if self.other_tx_writes_table(tx_id, *target) {
                 return Err(LimboError::TableLocked);
             }
         }
-        // The table must also be current in this transaction's snapshot: a
-        // rewrite (drop column, index build) under a snapshot that predates a
-        // committed write would silently miss that row.
-        // A missing transaction is an invariant violation, but one statement's
-        // problem: fail the statement, never the process.
         let begin_ts = self
             .txs
             .get(&tx_id)
@@ -8017,14 +7823,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.any_target_written_after(targets, begin_ts) {
             return Err(LimboError::TableLocked);
         }
-        // The names must be current too: the locks only exclude in-flight
-        // holders, so without this a transaction whose snapshot predates a
-        // committed CREATE would re-create the same name and commit a
-        // duplicate schema row, making the database unopenable. Committed
-        // name timestamps are published before the holder's locks release,
-        // so an acquirer sees either the lock or the timestamp. No
-        // commit-time revalidation is needed for names: overlapping
-        // same-name DDL is fully serialized by the lock itself.
+        // The timestamp is published before these locks drop.
         {
             let name_ts = self.ddl_name_commit_ts.lock();
             for name in names {
@@ -8065,8 +7864,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         false
     }
 
-    /// True when data writes to `table` are blocked by a DDL held by another
-    /// transaction. One atomic load in the common no-DDL case.
     pub(crate) fn ddl_write_blocked(&self, tx_id: TxID, table: MVTableId) -> bool {
         if self.ddl_locks_active.load(Ordering::Acquire) == 0 {
             return false;
@@ -8085,8 +7882,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.ddl_locks.lock().names.values().any(|h| *h == tx_id)
     }
 
-    /// Release every DDL lock held by `tx_id`. Called when the transaction
-    /// reaches a terminal state; safe to call more than once.
     pub(crate) fn release_ddl_locks(&self, tx_id: TxID) {
         if self.ddl_locks_active.load(Ordering::Acquire) == 0 {
             return;
@@ -8098,10 +7893,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .store(locks.names.len(), Ordering::Release);
     }
 
-    /// True if any `target` table has a committed data write newer than
-    /// `begin_ts`, i.e. a snapshot taken at `begin_ts` would miss that row.
-    /// Checked at DDL lock acquisition and revalidated at the DDL's own
-    /// commit; both sides must apply the same comparison.
+    /// Lock acquisition and the DDL commit recheck must both use this comparison.
     fn any_target_written_after(&self, targets: &[MVTableId], begin_ts: u64) -> bool {
         if targets.is_empty() {
             return false;
@@ -8112,8 +7904,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .any(|t| data_ts.get(t).is_some_and(|&c| c > begin_ts))
     }
 
-    /// Allocate `bumps` schema-cookie increments on top of whatever is
-    /// larger: the counter or the currently published global header.
     fn reserve_schema_cookies(&self, global_cookie: u32, bumps: u32) -> u32 {
         self.schema_cookie_counter
             .fetch_max(u64::from(global_cookie), Ordering::AcqRel);
@@ -8123,8 +7913,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             + u64::from(bumps)) as u32
     }
 
-    /// Record the tables whose schema `tx_id` changes; published to
-    /// `ddl_commit_ts` at commit for the scoped validation of others.
     pub(crate) fn record_ddl_targets(&self, tx_id: TxID, targets: &[MVTableId]) -> Result<()> {
         let tx = self
             .txs
@@ -8139,9 +7927,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Record the object names `tx_id`'s DDL statements lock; published to
-    /// `ddl_name_commit_ts` at commit so later stale-snapshot transactions
-    /// cannot recreate or re-drop them.
     pub(crate) fn record_ddl_names(&self, tx_id: TxID, names: &[String]) -> Result<()> {
         let tx = self
             .txs
@@ -8156,8 +7941,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Record that `tx_id` opened a cursor on `table`, for scoped commit-time
-    /// schema validation.
     pub(crate) fn record_table_use(&self, tx_id: TxID, table: MVTableId) -> Result<()> {
         let tx = self
             .txs
@@ -8167,6 +7950,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
+    /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
@@ -8178,12 +7962,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
         }
-        // Exclusivity and DDL locks are mutually exclusive modes: a DDL in
-        // flight under its scoped locks must not be overtaken by a
-        // whole-database exclusive transaction. Hold the ddl_locks mutex
-        // across the check and the CAS below so a DDL acquisition cannot
-        // interleave (acquire_ddl_locks checks has_exclusive_tx under the
-        // same mutex).
+        // A DDL transaction must not be overtaken by an exclusive one. This
+        // check and the CAS share the ddl_locks mutex with acquire_ddl_locks.
         let ddl_locks_guard = self.ddl_locks.lock();
         if ddl_locks_guard.names.values().any(|h| *h != *tx_id) {
             return Err(LimboError::Busy);
@@ -10226,15 +10006,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             );
             max_commit_ts_seen = max_commit_ts_seen.max(frame_commit_ts);
             if frame_commit_ts <= replay_cutoff_ts {
-                // Rows at-or-below the cutoff are already in the database
-                // file, but the frame's header entry must still be applied:
-                // header entries are cumulative in file order and records
-                // reach the log out of commit-timestamp order, so a skipped
-                // frame can carry a more complete header than both the
-                // page-1 header and every replayed frame. One narrow case
-                // needs this: a commit that was durable (counted into the
-                // cutoff) but had not yet published its header when a
-                // checkpoint staged page 1, followed by a crash.
+                // Still apply the header below the cutoff. A commit can be durable
+                // before its header reaches page 1, and skipping this frame would lose it.
                 for parsed_op in &frame {
                     if let ParsedOp::UpdateHeader { header, .. } = parsed_op {
                         self.global_header.write().replace(*header);
@@ -10743,17 +10516,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
                         StreamingResult::UpdateHeader { header, commit_ts } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
-                            // No replay-cutoff skip here, unlike row ops: the
-                            // log writer makes header entries cumulative in
-                            // file order (each is the merge of every header
-                            // commit logged before it), so the LAST entry in
-                            // the file is a superset of the page-1 header and
-                            // of every earlier entry. Records reach the log
-                            // out of commit-timestamp order, so a
-                            // timestamp-based skip can drop that last entry
-                            // and resurrect an earlier, less complete header.
-                            // The applied value is later staged to pager
-                            // page-1 during checkpoint.
+                            // Do not skip this header by commit timestamp, unlike a row.
+                            // Skipping it can put back an older header than the last frame in the file.
                             self.global_header.write().replace(header);
                         }
                         StreamingResult::Eof => {

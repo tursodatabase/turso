@@ -269,15 +269,9 @@ pub struct ProgramBuilder {
     mvcc_enabled: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
-    /// Normalized schema-object names this statement changes (tables, indexes,
-    /// views and triggers share one namespace per database). Under MVCC,
-    /// op_transaction acquires the DDL locks for them on the owning
-    /// database's store before the statement runs.
     ddl_lock_names: Vec<(usize, String)>,
-    /// Root pages (MVCC table ids) of existing tables whose data writes must
-    /// be excluded while this DDL is in flight (index builds, drops, alters),
-    /// paired with the owning database id: a TEMP table's root must not be
-    /// resolved against the main database's store.
+    /// Tables whose data writes this DDL blocks, with the database id.
+    /// A TEMP root must not be resolved on the main store.
     ddl_target_tables: Vec<(usize, i64)>,
     /// Set of database IDs that need write transactions (for attached databases).
     write_databases: BitSet,
@@ -2085,9 +2079,6 @@ impl ProgramBuilder {
         self.txn_mode = TransactionMode::Concurrent;
     }
 
-    /// Register a schema-object name this statement creates, drops or alters.
-    /// Pass the normalized name; under MVCC the statement acquires the DDL
-    /// lock for it before running.
     pub fn ddl_lock_name(&mut self, database_id: usize, name: &str) {
         if !self
             .ddl_lock_names
@@ -2098,8 +2089,6 @@ impl ProgramBuilder {
         }
     }
 
-    /// Register an existing table (by root page / MVCC table id) whose data
-    /// writes must be excluded while this DDL is in flight.
     pub fn ddl_target_table(&mut self, database_id: usize, root_page: i64) {
         if !self.ddl_target_tables.contains(&(database_id, root_page)) {
             self.ddl_target_tables.push((database_id, root_page));

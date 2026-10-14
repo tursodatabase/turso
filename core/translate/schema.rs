@@ -1314,9 +1314,7 @@ pub fn translate_create_table(
         && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
         }) {
-        // Two concurrent AUTOINCREMENT creates would otherwise both see
-        // sqlite_sequence as absent and both commit a definition for it,
-        // leaving a duplicate schema row that breaks every later statement.
+        // Two creates can both miss sqlite_sequence and both insert a schema row for it.
         program.ddl_lock_name(database_id, SQLITE_SEQUENCE_TABLE_NAME);
         let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
         let sqlite_schema_cursor_id =
@@ -1895,8 +1893,8 @@ pub fn translate_drop_table(
     if let Some(btree) = table.btree() {
         program.ddl_target_table(database_id, btree.root_page);
     }
-    // Dropping the table also drops its indexes; lock their names so a
-    // concurrent CREATE cannot reuse one while this drop is pending.
+    // This drop removes the indexes too. A concurrent CREATE must not take
+    // one of those names while the drop is open.
     resolver.with_schema(database_id, |s| {
         for index in s.get_indices(name) {
             program.ddl_lock_name(database_id, &index.name);

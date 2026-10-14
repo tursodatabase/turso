@@ -138,9 +138,7 @@ pub fn translate_create_trigger(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
 
-    // A new trigger changes what writers of the table must execute: lock the
-    // trigger name and block concurrent data writes to the table (the target
-    // is registered below once the table is resolved).
+    // A new trigger changes what a concurrent writer of the table runs.
     program.ddl_lock_name(database_id, &normalized_trigger_name);
     program.ddl_lock_name(target_table_database_id, &normalized_table_name);
 

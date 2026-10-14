@@ -902,8 +902,8 @@ pub fn translate_alter_table(
     program.ddl_lock_name(database_id, &normalize_ident(table_name));
     program.ddl_target_table(database_id, original_btree.root_page);
     if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
-        // A rename holds both names, all or nothing, so crossing renames
-        // cannot deadlock (acquisition never waits) and cannot interleave.
+        // A rename holds both names or neither. Acquisition does not wait,
+        // so two renames cannot deadlock.
         program.ddl_lock_name(database_id, &normalize_ident(new_name.as_str()));
     }
 

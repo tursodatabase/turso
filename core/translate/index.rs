@@ -157,10 +157,7 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    // The index build must observe a stable table: lock both names and block
-    // concurrent data writes to the table. Postgres runs two CREATE INDEX on
-    // one table in parallel (SHARE locks are self-compatible); we serialize
-    // them for simplicity.
+    // A writer can change rows while the index build scans the table.
     program.ddl_lock_name(database_id, &idx_name);
     program.ddl_lock_name(database_id, &tbl_name);
     program.ddl_target_table(database_id, tbl.root_page);

@@ -252,7 +252,6 @@ use crate::{
     util::IOExt as _,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
-
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
@@ -597,17 +596,11 @@ pub struct LogicalLog {
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
     pending_header_upgrade: Option<(LogHeader, Completion)>,
-    /// The `DatabaseHeader` value carried by the last header-bearing frame
-    /// this writer committed. Deferred [`PendingLogHeader::Merge`] ops are
-    /// merged onto it at write time so header entries are cumulative in
-    /// file order (recovery applies them last-record-wins). `None` until
-    /// the first header-bearing write of this process: the first merge then
-    /// bases on the transaction's own header, whose untouched fields come
-    /// from its begin snapshot of the global header.
+    /// Recovery is last-record-wins, and commits can hit the log out of end_ts order.
+    /// Merge onto this header at write time.
     last_logged_db_header: Option<DatabaseHeader>,
-    /// Staged counterpart of `last_logged_db_header` for a deferred-offset
-    /// write; promoted by `advance_offset_after_success`, dropped by
-    /// `discard_pending_write` — mirrors `pending_running_crc`.
+    /// Staged last header for a deferred write.
+    /// Success promotes it and discard drops it, same as pending_running_crc.
     pending_logged_db_header: Option<DatabaseHeader>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
@@ -920,19 +913,8 @@ impl LogicalLog {
         Ok((c, buffer_len as u64))
     }
 
-    /// Serialize the record's deferred header op now that the frame's
-    /// position in the log is fixed (this writer decides file order). A
-    /// concurrent commit's header is merged onto the last logged header, so
-    /// header entries are cumulative in file order and recovery's
-    /// last-record-wins application reconstructs the runtime merge even
-    /// when overlapping commits reached the log out of end_ts order. The
-    /// base is the *committed* last-logged value: a deferred write that was
-    /// discarded never contributes (its bytes get overwritten), matching
-    /// how the CRC chain is seeded from `running_crc`.
-    /// Returns the materialized header so the caller can stage it only once
-    /// the whole frame write has been issued — staging it here would let a
-    /// failure later in the framing leak a header from a commit that never
-    /// happened into the merge chain.
+    /// The caller stages this after the frame write is issued.
+    /// A failed frame must not enter the chain.
     fn materialize_pending_header(&mut self, tx: &mut LogRecord) -> Result<Option<DatabaseHeader>> {
         let Some(pending) = tx.pending_header.take() else {
             return Ok(None);
@@ -1113,9 +1095,8 @@ impl LogicalLog {
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
-        // `last_logged_db_header` stays: it tracks header VALUES, which a
-        // checkpoint truncation does not change. The staged slot belongs to
-        // a write that will never confirm.
+        // Truncation does not change header values, so last_logged_db_header stays.
+        // The staged header belongs to a write that will not confirm.
         self.pending_logged_db_header = None;
         self.header = Some(header);
 

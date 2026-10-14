@@ -4422,16 +4422,8 @@ fn begin_fresh_mvcc_tx(
     }
 }
 
-/// Acquire a DDL statement's locks at the end of op_transaction's
-/// BeginStatement state — after the statement savepoint exists, so a DDL
-/// statement that fails mid-execution rolls its recorded targets and names
-/// back with the savepoint and the commit does not publish schema changes
-/// that never happened. On contention an explicit transaction stays open so
-/// the statement can be retried; a transaction this statement created (the
-/// cleanup flag is set exactly then) is dropped here instead, because
-/// TableLocked deliberately skips transaction rollback in the generic abort
-/// path — and an autocommit transaction shared with sibling statements must
-/// not be destroyed under them.
+/// Runs after the statement savepoint, so a failed DDL does not publish its targets.
+/// TableLocked does not roll back, so drop a transaction this statement opened and keep a shared one.
 #[allow(clippy::too_many_arguments)]
 fn acquire_ddl_locks_at_statement_start(
     program: &Program,
@@ -4450,8 +4442,6 @@ fn acquire_ddl_locks_at_statement_start(
     }
     let conn = &program.connection;
     let Some((tx_id, _)) = conn.get_mv_tx_for_db(db) else {
-        // Invariant violation (Start always installs a transaction before
-        // this state), but one statement's problem: fail it, not the process.
         return Err(LimboError::InternalError(
             "DDL statement reached BeginStatement without an MVCC transaction".to_string(),
         ));
@@ -4470,18 +4460,11 @@ fn acquire_ddl_locks_at_statement_start(
     Ok(())
 }
 
-/// True when the statement registered DDL names on `db`. Registrations are
-/// database-scoped: a TEMP table's DDL must not take locks on (or resolve
-/// roots against) the main database's store.
+/// A TEMP registration must not take locks on the main store.
 fn statement_has_ddl_on_db(program: &Program, db: usize) -> bool {
     program.ddl_lock_names.iter().any(|(d, _)| *d == db)
 }
 
-/// Acquire the statement's DDL locks on `db`'s transaction. A no-op for
-/// statements without DDL metadata on this database, for exclusive
-/// transactions (exclusivity already excludes everyone) and for nested
-/// statements (the parent statement acquired them). TableLocked on
-/// contention; the transaction stays open so the caller can retry.
 fn acquire_statement_ddl_locks(
     program: &Program,
     conn: &Connection,
@@ -4501,10 +4484,8 @@ fn acquire_statement_ddl_locks(
     if names.is_empty() {
         return Ok(());
     }
-    // Target roots come from the compiled schema: negative MVCC table ids
-    // before a checkpoint, positive physical pages after one. Resolve them
-    // through the same root-to-table-id mapping cursors use; a root the
-    // snapshot no longer knows means the program is stale.
+    // Roots are negative MVCC ids before a checkpoint and positive pages after.
+    // A root the snapshot does not know means the program is stale.
     let snapshot_ts = mv_store.read_snapshot_ts(tx_id);
     let mut targets = Vec::with_capacity(program.ddl_target_tables.len());
     for (target_db, root) in &program.ddl_target_tables {
@@ -4517,10 +4498,8 @@ fn acquire_statement_ddl_locks(
         targets.push(table_id);
     }
     if mv_store.is_exclusive_tx(&tx_id) {
-        // Exclusivity already excludes everyone, so no locks are needed — but
-        // the targets and names must still be recorded so commit publishes
-        // them for the scoped validation and the name-freshness check of
-        // other transactions.
+        // An exclusive transaction takes no locks. Still record the targets and
+        // names, or commit publishes nothing for other transactions to check.
         mv_store.record_ddl_targets(tx_id, &targets)?;
         mv_store.record_ddl_names(tx_id, &names)?;
         return Ok(());
@@ -4866,9 +4845,6 @@ pub fn op_transaction_inner(
                             let mut effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
                             if is_ddl_statement {
-                                // DDL runs on a regular transaction under its
-                                // scoped DDL locks instead of the
-                                // whole-database exclusive one.
                                 effective_mode = TransactionMode::Concurrent;
                             }
                             #[cfg(any(test, injected_yields))]
@@ -4990,12 +4966,8 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            // An autocommit DDL statement runs on a regular
-                            // transaction under its scoped DDL locks instead of
-                            // the whole-database exclusive one, so it neither
-                            // aborts nor is aborted by unrelated concurrent
-                            // writers. A deferred BEGIN keeps its SQLite-style
-                            // exclusive upgrade.
+                            // Autocommit DDL stays concurrent so an unrelated writer
+                            // is not aborted. A deferred BEGIN still upgrades to exclusive.
                             let fresh_mode = if conn.get_auto_commit() && is_ddl_statement {
                                 TransactionMode::Concurrent
                             } else {
@@ -13819,9 +13791,6 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            // Backstop: schema writes run either under the statement's DDL
-            // locks (acquired in op_transaction) or in an exclusive
-            // transaction.
             if !mv_store.is_exclusive_tx(&tx_id) && !mv_store.tx_holds_ddl_locks(tx_id) {
                 return Err(LimboError::TxError(
                     "DDL statements require the schema locks or an exclusive transaction"
@@ -15868,11 +15837,6 @@ pub fn op_set_cookie(
     );
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
-    // In MVCC the write below lands in the transaction's header copy. A
-    // non-exclusive transaction defers the real header write to commit, where
-    // its changes are re-applied on top of the then-current global header
-    // (the schema cookie as an increment, other fields as values); see
-    // merge_concurrent_header_commit.
     if mv_store.is_some() && program.connection.get_mv_tx_id_for_db(*db).is_none() {
         return Err(LimboError::InternalError(
             "Header updates in MVCC mode require an active transaction".to_string(),

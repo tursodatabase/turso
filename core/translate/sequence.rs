@@ -12,7 +12,6 @@
 // `StepResult::IO` rather than blocking).
 
 use std::sync::Arc;
-
 use crate::bail_parse_error;
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
@@ -917,7 +916,6 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
-    // Sequences are schema objects: take the DDL lock on the name.
     program.ddl_lock_name(database_id, &normalized_name);
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
