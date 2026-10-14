@@ -215,6 +215,61 @@ impl<'catalog> SemanticContext<'catalog> {
         snapshots
     }
 
+    /// Whether `name` resolves to a table, without reporting a missing one.
+    pub(crate) fn table_exists(&self, name: &turso_parser::ast::QualifiedName) -> Result<bool> {
+        let table_name = normalize_ident(name.name.as_str());
+        Ok(match &name.db_name {
+            Some(database) => {
+                let database = self.database(database.as_str()).ok_or_else(|| {
+                    LimboError::InvalidArgument(format!(
+                        "no such database: {}",
+                        normalize_ident(database.as_str())
+                    ))
+                })?;
+                self.schema(database)?.get_table(&table_name).is_some()
+            }
+            None => self
+                .unqualified_database_search_path
+                .iter()
+                .any(|database| {
+                    self.database_schemas
+                        .get(database)
+                        .is_some_and(|schema| schema.get_table(&table_name).is_some())
+                }),
+        })
+    }
+
+    /// Find a view by name when no table has it, searching databases in the
+    /// same order as tables.
+    pub(crate) fn resolve_view(
+        &self,
+        name: &turso_parser::ast::QualifiedName,
+    ) -> Result<Option<&'catalog crate::schema::View>> {
+        let view_name = normalize_ident(name.name.as_str());
+        let has_view = |database: &DatabaseId| {
+            self.database_schemas
+                .get(database)
+                .is_some_and(|schema| schema.views.contains_key(&view_name))
+        };
+        let database = match &name.db_name {
+            Some(database) => Some(self.database(database.as_str()).ok_or_else(|| {
+                LimboError::InvalidArgument(format!(
+                    "no such database: {}",
+                    normalize_ident(database.as_str())
+                ))
+            })?),
+            None => self
+                .unqualified_database_search_path
+                .iter()
+                .copied()
+                .find(has_view),
+        };
+        Ok(database
+            .and_then(|database| self.database_schemas.get(&database).copied())
+            .and_then(|schema| schema.views.get(&view_name))
+            .map(AsRef::as_ref))
+    }
+
     pub(crate) fn resolve_table(
         &self,
         name: &turso_parser::ast::QualifiedName,

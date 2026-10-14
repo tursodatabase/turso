@@ -143,6 +143,11 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
     pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
+    /// Views whose stored SELECT is being analyzed, to reject circular views.
+    pub(super) views_in_progress: Vec<String>,
+    /// Stored view SELECTs live in the catalog and are analyzed like the
+    /// statement's own AST, so the catalog must outlive the AST borrow.
+    _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
 }
 
 pub(super) struct SelectContext<'scope> {
@@ -181,6 +186,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
+            views_in_progress: Vec::new(),
+            _catalog_outlives_ast: std::marker::PhantomData,
         }
     }
 

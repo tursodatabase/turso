@@ -317,8 +317,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         });
                     }
                 }
-                let id =
-                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?;
+                let id = if self.context().table_exists(name)? {
+                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?
+                } else if let Some(view) = self.context().resolve_view(name)? {
+                    if let Some(ast::Indexed::IndexedBy(index)) = indexed {
+                        crate::bail_parse_error!("no such index: {}", index.as_str());
+                    }
+                    self.analyze_view_source(view, alias.as_ref(), context)?
+                } else {
+                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?
+                };
                 Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
@@ -668,6 +676,84 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(ast::As::name)
                     .map(ast::Name::as_str)
                     .map(crate::util::normalize_ident),
+                kind: hir::SourceKind::Derived(query),
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available: false,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(source)
+    }
+
+    /// Expand a view like legacy planning: its stored SELECT becomes a
+    /// derived source named after the view, with the view's column names.
+    /// The SELECT resolves against the catalog only, so the statement's CTEs
+    /// are hidden while it is analyzed, and it cannot read outer columns.
+    fn analyze_view_source(
+        &mut self,
+        view: &'ast crate::schema::View,
+        alias: Option<&ast::As>,
+        context: FromContext<'_>,
+    ) -> Result<hir::SourceId> {
+        let name = crate::util::normalize_ident(&view.name);
+        if self.views_in_progress.contains(&name) {
+            crate::bail_parse_error!("view {} is circularly defined", view.name);
+        }
+        let owner = context.source_owner();
+        self.views_in_progress.push(name.clone());
+        let statement_ctes = std::mem::take(&mut self.cte_scopes);
+        let query = self.analyze_select_with_scope(
+            &view.select_stmt,
+            context.query_parent(),
+            None,
+            None,
+            context.expr_policies(self.context().dqs_dml()),
+        );
+        assert!(
+            self.cte_scopes.is_empty(),
+            "view analysis leaked a CTE scope"
+        );
+        self.cte_scopes = statement_ctes;
+        self.views_in_progress.pop();
+        let query = query?;
+
+        let mut columns = self.query_source_columns(query)?;
+        if columns.len() != view.columns.len() {
+            return Err(crate::LimboError::InternalError(format!(
+                "view {} has {} columns but its SELECT returns {}",
+                view.name,
+                view.columns.len(),
+                columns.len()
+            )));
+        }
+        for (column, view_column) in columns.iter_mut().zip(&view.columns) {
+            if let Some(view_name) = &view_column.name {
+                column.name.clone_from(view_name);
+            }
+        }
+        let width = columns.len();
+        let source = self.reserve_source();
+        self.insert_source(
+            source,
+            hir::Source {
+                id: source,
+                owner,
+                database: None,
+                name: name.clone(),
+                alias: Some(
+                    alias
+                        .map(ast::As::name)
+                        .map(ast::Name::as_str)
+                        .map(crate::util::normalize_ident)
+                        .unwrap_or(name),
+                ),
                 kind: hir::SourceKind::Derived(query),
                 columns,
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],

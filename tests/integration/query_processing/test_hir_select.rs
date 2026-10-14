@@ -173,3 +173,52 @@ fn hir_expression_subqueries_match_legacy_rows() {
         );
     }
 }
+
+#[test]
+fn hir_views_expand_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE VIEW cheap AS SELECT id, value FROM items WHERE value < 25",
+        "CREATE VIEW renamed(n, label) AS SELECT value * 10, upper(extra) FROM items",
+        "CREATE VIEW nested AS SELECT n FROM renamed WHERE n > 100",
+        "CREATE VIEW loop_a AS SELECT * FROM items",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT * FROM cheap ORDER BY id",
+        "SELECT * FROM renamed ORDER BY n DESC",
+        "SELECT r.n, c.id FROM renamed r JOIN cheap c ON r.n = c.value * 10 ORDER BY 1, 2",
+        "SELECT * FROM nested ORDER BY n",
+        // The view's SELECT reads the table, not the statement's CTE.
+        "WITH items AS (SELECT 99 AS id, 99 AS value) SELECT * FROM cheap ORDER BY id",
+        "SELECT count(*), (SELECT max(n) FROM renamed) FROM cheap",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+        assert_eq!(column_names(&hir, sql), column_names(&legacy, sql), "{sql}");
+    }
+
+    legacy.execute("DROP VIEW loop_a").unwrap();
+    legacy
+        .execute("CREATE VIEW loop_b AS SELECT 1 AS one")
+        .unwrap();
+    legacy
+        .execute("CREATE VIEW loop_a AS SELECT * FROM loop_b")
+        .unwrap();
+    legacy.execute("DROP VIEW loop_b").unwrap();
+    legacy
+        .execute("CREATE VIEW loop_b AS SELECT * FROM loop_a")
+        .unwrap();
+    for conn in [&legacy, &hir] {
+        let error = conn
+            .prepare("SELECT * FROM loop_a")
+            .err()
+            .expect("circular view fails");
+        assert!(error.to_string().contains("circularly defined"), "{error}");
+    }
+}
