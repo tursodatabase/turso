@@ -108,6 +108,72 @@ expect {
     2|twenty
 }
 
+test inner-on-exists-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (2, 3, 3), (NULL, NULL, 1), (2, 3, 2), (NULL, 1, 2);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (3, 3, 1, 3), (4, 1, NULL, NULL), (5, 3, 1, 2);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (4, 3, 3, 2), (5, 1, 2, 2), (6, 2, 3, NULL);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (1, 3, NULL), (3, 1, 3), (NULL, 2, 1), (NULL, 2, NULL);
+    ANALYZE;
+    SELECT count(*) FROM t3
+      CROSS JOIN t1 AS x
+      RIGHT JOIN t1 ON t3.a IS NULL
+      JOIN t0 ON EXISTS (SELECT 1 FROM t2 AS q WHERE q.b = t1.c)
+      LEFT JOIN t2 ON t2.a = 2 AND t2.c = t0.b
+     WHERE x.c = 2;
+}
+expect {
+    16
+}
+
+test where-in-subquery-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (3, 1, 1);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, NULL, 3, NULL), (2, 1, 3, 1), (3, 3, 3, 1);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (3, NULL, 1), (NULL, 3, 1);
+    CREATE INDEX t3_b ON t3(b);
+    ANALYZE;
+    SELECT * FROM (t3 JOIN t1 AS s1 JOIN t1 ON t1.b = t3.b)
+      LEFT JOIN t0 ON t0.b = t3.a AND coalesce(t0.c, 0) = s1.c + 0
+     WHERE t1.a IS NULL AND s1.b IN (SELECT q.a FROM t1 AS q WHERE q.b = t3.c);
+}
+expect {
+}
+
+test where-in-subquery-reads-materialized-build-input-for-unmatched-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (2, 3, 1), (2, 1, 2);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (NULL, 2, 1), (2, 1, 2);
+    ANALYZE;
+    SELECT * FROM t2
+      JOIN (SELECT * FROM t0) AS s1 ON s1.c = t2.c
+      LEFT JOIN t0 ON t0.c = 3 AND t0.c = t2.a
+     WHERE t0.c IN (SELECT q.b FROM t0 AS q WHERE q.b = s1.c);
+}
+expect {
+}
+
+test full-join-on-exists-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (5, 1, NULL, 3);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    SELECT * FROM (SELECT a, count(*) AS b, max(c) AS c FROM t3 GROUP BY a) AS d1
+      JOIN t3 ON NOT EXISTS (SELECT 1 FROM t4 AS q WHERE q.c = d1.b)
+      FULL JOIN t1 ON EXISTS (SELECT 1 FROM t1 AS q WHERE q.a = d1.c) AND coalesce(t1.a, 0) = t3.b + 0
+     WHERE d1.c = 3;
+}
+expect {
+    1|1|3|5|1||3|||
+}
+
 setup outer-column-in-join-condition {
     CREATE TABLE oc_outer(id INTEGER PRIMARY KEY, x INT);
     CREATE TABLE oc_items(id INTEGER PRIMARY KEY, b INT);
