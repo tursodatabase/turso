@@ -17,6 +17,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    turso_assert,
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
@@ -4590,7 +4591,24 @@ fn resolve_outer_ref_loop(
             }
         }
     }
-    None
+    let table_is_in_this_query = tables
+        .joined_tables()
+        .iter()
+        .any(|table| table.internal_id == table_id);
+    if !table_is_in_this_query {
+        return None;
+    }
+    let probe_loop_of_materialized_build_input = join_order.iter().position(|member| {
+        matches!(
+            &tables.joined_tables()[member.original_idx].op,
+            Operation::HashJoin(hj) if hj.materialize_build_input
+        )
+    });
+    turso_assert!(
+        probe_loop_of_materialized_build_input.is_some(),
+        "a table of the query can leave the join order only inside a materialized hash build input"
+    );
+    probe_loop_of_materialized_build_input
 }
 
 #[cfg(test)]

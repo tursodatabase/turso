@@ -237,3 +237,41 @@ test exists-in-left-join-on-term-with-materialized-build-input {
 }
 expect {
 }
+
+# The main plan has no loop for t3, a table of the materialized hash build
+# input. The probe of the hash join reads the columns of t3 from the hash
+# payload. A subquery that reads t3 must run in the probe loop and read the
+# payload, not before the loops with the old row of the t3 cursor.
+setup materialized-build-input-with-subquery-schema {
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t2_c ON t2(c);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    INSERT INTO t2 VALUES (1, 5, NULL), (2, 6, NULL);
+    INSERT INTO t0 VALUES (1, 5, 3, 7);
+}
+
+@setup materialized-build-input-with-subquery-schema
+test exists-in-left-join-on-term-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id FROM t3
+    CROSS JOIN t2
+    LEFT JOIN t0 ON t0.a = t2.b AND EXISTS (SELECT 1 FROM t0 AS q WHERE q.b = t3.b)
+    WHERE t2.c IS NULL;
+}
+expect unordered {
+    2|5|1
+    2|6|
+}
+
+@setup materialized-build-input-with-subquery-schema
+test result-column-subquery-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id, (SELECT count(*) FROM t0 AS q WHERE q.b = t3.b) FROM t3
+    CROSS JOIN t2
+    JOIN t0 ON t0.a = t2.b
+    WHERE t2.c IS NULL;
+}
+expect {
+    2|5|1|1
+}
