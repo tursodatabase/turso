@@ -1865,11 +1865,24 @@ fn validate_select_table_no_cross_db(
 
 pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
     walk_select_expressions(select_stmt, &mut |expr| {
-        if let ast::Expr::FunctionCall { order_by, .. } = expr {
+        if let ast::Expr::FunctionCall {
+            name,
+            order_by,
+            distinctness,
+            filter_over,
+            ..
+        } = expr
+        {
             if !order_by.is_empty() {
-                crate::bail_parse_error!(
-                    "ORDER BY clause is not supported yet in aggregate functions"
-                );
+                if !name.as_str().eq_ignore_ascii_case("array_agg") {
+                    crate::bail_parse_error!("ORDER BY is only supported in array_agg");
+                }
+                if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
+                    crate::bail_parse_error!("ORDER BY with DISTINCT array_agg is not supported");
+                }
+                if filter_over.over_clause.is_some() {
+                    crate::bail_parse_error!("ORDER BY in window array_agg is not supported");
+                }
             }
         }
         Ok(WalkControl::Continue)

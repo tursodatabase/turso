@@ -352,6 +352,7 @@ pub struct AggStepData {
     pub col: usize,
     pub delimiter: usize,
     pub func: AccumulatorFunc,
+    pub order_by: Vec<(usize, crate::types::KeyInfo)>,
     /// Optional custom type comparator for MIN/MAX aggregates.
     pub comparator: Option<SortComparatorType>,
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at

@@ -1063,6 +1063,10 @@ pub enum AggContext {
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
     Native(crate::native_ext::AggregateState),
+    OrderedArray {
+        keys: Vec<KeyInfo>,
+        rows: Vec<(Vec<Value>, Value)>,
+    },
 }
 
 impl AggContext {
@@ -1089,8 +1093,8 @@ impl AggContext {
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload_mut() called on extension aggregate")
+            Self::External(_) | Self::Native(_) | Self::OrderedArray { .. } => {
+                panic!("payload_mut() called on non-builtin aggregate")
             }
         }
     }
@@ -1100,8 +1104,8 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload_vec_mut() called on extension aggregate")
+            Self::External(_) | Self::Native(_) | Self::OrderedArray { .. } => {
+                panic!("payload_vec_mut() called on non-builtin aggregate")
             }
         }
     }
@@ -1110,8 +1114,8 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) | Self::Native(_) => {
-                panic!("payload() called on extension aggregate")
+            Self::External(_) | Self::Native(_) | Self::OrderedArray { .. } => {
+                panic!("payload() called on non-builtin aggregate")
             }
         }
     }

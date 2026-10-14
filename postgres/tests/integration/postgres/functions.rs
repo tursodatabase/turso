@@ -2,6 +2,79 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[turso_macros::test(mvcc)]
+fn test_pg_ordered_array_aggregate(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ordered_items (g INTEGER, v TEXT, k INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO ordered_items VALUES (1,'nine',9), (2,'other',2), (1,NULL,4), (1,'two',2), (1,'last',NULL), (2,'first',1)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT array_to_string(array_agg(v ORDER BY k), '|', '<null>'),
+            array_to_string(array_agg(v ORDER BY k DESC), '|', '<null>'),
+            array_to_string(array_agg(v ORDER BY k DESC NULLS LAST), '|', '<null>')
+            FROM ordered_items WHERE g = 1"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("two|<null>|nine|last"),
+            Value::build_text("last|nine|<null>|two"),
+            Value::build_text("nine|<null>|two|last")
+        ]]
+    );
+    for indexed in [false, true] {
+        if indexed {
+            conn.execute("CREATE INDEX ordered_groups ON ordered_items(g)")
+                .unwrap();
+        }
+        assert_eq!(
+            conn.prepare("SELECT g, array_to_string(array_agg(v ORDER BY k NULLS FIRST) FILTER (WHERE k <> 4 OR k IS NULL), '|', '<null>')
+                FROM ordered_items GROUP BY g ORDER BY g")
+                .unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(1), Value::build_text("last|two|nine")],
+                vec![Value::from_i64(2), Value::build_text("first|other")]]
+        );
+    }
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT array_to_string(array_agg(v ORDER BY k), '|') FROM ordered_items WHERE g = 3"
+        ),
+        vec!["NULL"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_ordered_array_aggregate_correlated_and_collated(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ordered_words (g INTEGER, v TEXT, k TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO ordered_words VALUES (1,'lower','a'), (1,'upper','B'), (1,'tie','a'), (2,'other','z')").unwrap();
+    assert_eq!(query_text(&conn,
+        "SELECT array_to_string(array_agg(v ORDER BY k COLLATE NOCASE, v DESC), '|') FROM ordered_words WHERE g=1"),
+        vec!["tie|lower|upper"]);
+    assert_eq!(
+        conn.prepare("SELECT g, (SELECT array_to_string(array_agg(v ORDER BY k, v DESC), '|') FROM ordered_words i WHERE i.g = src.g)
+            FROM (SELECT 2 AS g UNION ALL SELECT 1 UNION ALL SELECT 3 UNION ALL SELECT 2) src")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(2), Value::build_text("other")],
+            vec![Value::from_i64(1), Value::build_text("upper|tie|lower")],
+            vec![Value::from_i64(3), Value::Null],
+            vec![Value::from_i64(2), Value::build_text("other")]]
+    );
+    for sql in [
+        "SELECT array_agg(DISTINCT v ORDER BY v) FROM ordered_words",
+        "SELECT array_agg(v ORDER BY k) OVER () FROM ordered_words",
+        "SELECT string_agg(v, ',' ORDER BY k) FROM ordered_words",
+        "SELECT array_agg(v ORDER BY ARRAY[1,2]) FROM ordered_words",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn test_pg_function_column_alias_view_survives_reopen() {
     for mvcc in [false, true] {

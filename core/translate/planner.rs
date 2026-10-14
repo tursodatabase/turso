@@ -560,9 +560,17 @@ pub fn resolve_window_and_aggregate_functions(
                 }
 
                 if !order_by.is_empty() {
-                    crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
-                    );
+                    if !name.as_str().eq_ignore_ascii_case("array_agg") {
+                        crate::bail_parse_error!("ORDER BY is only supported in array_agg");
+                    }
+                    if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
+                        crate::bail_parse_error!(
+                            "ORDER BY with DISTINCT array_agg is not supported"
+                        );
+                    }
+                    if filter_over.over_clause.is_some() {
+                        crate::bail_parse_error!("ORDER BY in window array_agg is not supported");
+                    }
                 }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
