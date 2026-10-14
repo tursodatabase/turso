@@ -918,6 +918,79 @@ pub fn format_float(v: f64) -> String {
     }
 }
 
+/// C's `printf("%.*g")`: `precision` significant digits, trailing zeroes and a
+/// bare decimal point dropped, and exponential notation only when the decimal
+/// exponent falls outside `[-4, precision)`.
+pub fn format_float_g(v: f64, precision: usize) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+
+    let negative = v.is_sign_negative();
+    let mut magnitude = v.abs();
+    let (mut digits, mut exp) = float_digits(magnitude, precision);
+
+    // Rust rounds an exact halfway value to even. SQLite walks the digits
+    // adding a half to each remainder, so a tie goes away from zero: re-render
+    // from the value the tie rounds up to whenever one is hit.
+    let tie_scale = precision as i32 - 1 - exp;
+    if tie_scale > 0 {
+        if let Some(tie) = round_half_away_from_zero_tie(magnitude, tie_scale as usize) {
+            magnitude = tie;
+            (digits, exp) = float_digits(magnitude, precision);
+        }
+    }
+
+    let mut res = String::with_capacity(digits.len() + 16);
+    if negative {
+        res.push('-');
+    }
+
+    let decimal_pos = exp + 1;
+    if exp < -4 || exp >= precision as i32 {
+        res.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            res.push('.');
+            res.push_str(&digits[1..]);
+        }
+        let exponent = if exp < 0 { '-' } else { '+' };
+        res.push_str(&format!("e{exponent}{:02}", exp.abs()));
+    } else if decimal_pos <= 0 {
+        res.push_str("0.");
+        res.push_str(&"0".repeat(-decimal_pos as usize));
+        res.push_str(&digits);
+    } else if decimal_pos as usize >= digits.len() {
+        res.push_str(&digits);
+        res.push_str(&"0".repeat(decimal_pos as usize - digits.len()));
+    } else {
+        res.push_str(&digits[..decimal_pos as usize]);
+        res.push('.');
+        res.push_str(&digits[decimal_pos as usize..]);
+    }
+
+    res
+}
+
+/// The `precision` significant digits of a non-zero finite `v`, rounded to
+/// nearest with ties going to even, and the decimal exponent of the first one.
+fn float_digits(v: f64, precision: usize) -> (String, i32) {
+    let formatted = format!("{:.*e}", precision - 1, v);
+    let (mantissa, exponent) = formatted
+        .split_once('e')
+        .expect("`{:e}` always emits an exponent");
+    let exp = exponent.parse().expect("`{:e}` emits a decimal exponent");
+
+    let mut digits = mantissa
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    while digits.ends_with('0') && digits.len() > 1 {
+        digits.pop();
+    }
+
+    (digits, exp)
+}
+
 pub fn format_float_for_quote(v: f64) -> String {
     let default = format_float(v);
     if str_to_f64(&default).map(f64::from) == Some(v) {
@@ -935,6 +1008,44 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_format_float_g() {
+    // SQLite's printf("%.16g", …) for the same doubles
+    let cases: &[(f64, &str)] = &[
+        (0.0, "0"),
+        (1.0, "1"),
+        (0.5, "0.5"),
+        (-0.5, "-0.5"),
+        (0.30000000000000004, "0.3"),
+        (0.3333333333333333, "0.3333333333333333"),
+        (999999.999, "999999.999"),
+        (2451544.5, "2451544.5"),
+        (2459946.0, "2459946"),
+        // exactly halfway between two representable 16-digit values, so the
+        // tie decides the last digit
+        (2451630.0009765625, "2451630.000976563"),
+        (2460310.5000057870, "2460310.500005787"),
+        (0.0001, "0.0001"),
+        (1e-05, "1e-05"),
+        (-1e-05, "-1e-05"),
+        (864.0 / 86400000.0, "1e-05"),
+        (9.953703703703704e-07, "9.953703703703704e-07"),
+        (1.234e10, "12340000000"),
+        (1.23456789012345678e15, "1234567890123457"),
+        (1.23456789012345678e16, "1.234567890123457e+16"),
+        (1e-300, "1e-300"),
+        (1e300, "1e+300"),
+    ];
+
+    for (value, expected) in cases {
+        assert_eq!(
+            format_float_g(*value, 16),
+            *expected,
+            "printf('%.16g', {value})"
+        );
+    }
 }
 
 #[test]
