@@ -4,7 +4,7 @@ use std::borrow::Cow;
 /// Formats a path for the bad-path message the way SQLite's %Q does:
 /// every apostrophe in the path is doubled inside the quoted output.
 /// %Q reads a C string, so anything after an embedded NUL is dropped.
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     let path = &path[..path.find('\0').unwrap_or(path.len())];
     path.replace('\'', "''")
 }
