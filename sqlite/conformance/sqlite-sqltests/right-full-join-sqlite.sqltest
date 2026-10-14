@@ -1200,6 +1200,47 @@ expect {
     NULL|NULL|NULL|7
 }
 
+# A correlated EXISTS in the ON clause of a later outer join reads a table on
+# the left of an earlier RIGHT or FULL JOIN. The unmatched-row pass of the
+# earlier join runs the later join again with a NULL row on the left, so the
+# EXISTS must run again in the loop of the later join.
+test full-join-on-exists-reads-null-row-from-earlier-full-join {
+    CREATE TABLE fj_left(id INTEGER, k INTEGER);
+    CREATE TABLE fj_middle(id INTEGER, k INTEGER);
+    CREATE TABLE fj_right(id INTEGER, k INTEGER);
+    INSERT INTO fj_left VALUES (1, 2);
+    INSERT INTO fj_middle VALUES (10, NULL);
+    INSERT INTO fj_right VALUES (100, 2);
+    SELECT fj_left.id, fj_middle.id, fj_right.id
+      FROM fj_left
+      FULL JOIN fj_middle ON fj_middle.k = fj_left.k
+      FULL JOIN fj_right ON fj_middle.id = 10
+       AND EXISTS (SELECT 1 FROM fj_right AS q WHERE q.k = fj_left.k)
+     ORDER BY 1, 2, 3;
+}
+expect {
+    ||100
+    |10|
+    1||
+}
+
+test left-join-on-exists-reads-null-row-from-earlier-right-join {
+    CREATE TABLE rl_left(id INTEGER, k INTEGER);
+    CREATE TABLE rl_middle(id INTEGER, k INTEGER);
+    CREATE TABLE rl_right(id INTEGER, k INTEGER);
+    INSERT INTO rl_left VALUES (1, 2);
+    INSERT INTO rl_middle VALUES (10, NULL);
+    INSERT INTO rl_right VALUES (100, 2);
+    SELECT rl_left.id, rl_middle.id, rl_right.id
+      FROM rl_left
+      RIGHT JOIN rl_middle ON rl_middle.k = rl_left.k
+      LEFT JOIN rl_right ON rl_middle.id = 10
+       AND EXISTS (SELECT 1 FROM rl_right AS q WHERE q.k = rl_left.k);
+}
+expect {
+    |10|
+}
+
 @cross-check-integrity
 test inner-or-on-before-right-join-keeps-row-outside-implied-in-filters {
     CREATE TABLE or_inner_left(k INTEGER);
