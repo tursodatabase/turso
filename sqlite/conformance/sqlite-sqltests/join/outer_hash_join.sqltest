@@ -1722,6 +1722,45 @@ expect {
     4|-1
 }
 
+# The LEFT JOIN to t6 runs as a hash join with build table t5, so its
+# unmatched t5 rows come from a scan of the hash table. That scan runs in the
+# loop body of the RIGHT JOIN to t4, and the unmatched-row pass of t4 runs that
+# body again with NULL rows for t0 and t1. The scan must not check the ON term
+# of the inner join of t0 and t1 again, or it removes the unmatched t5 row.
+@cross-check-integrity
+test hash-left-join-in-right-join-body-keeps-unmatched-build-row {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (2, 1, NULL);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (NULL, 1, NULL);
+    INSERT INTO t1 VALUES (1, 2, 1);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, NULL, 1);
+    INSERT INTO t2 VALUES (1, 2, 1);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t4 VALUES (NULL, 1, 1);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t5 VALUES (NULL, NULL, NULL);
+    CREATE TABLE t6(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (1, 1, 1);
+    INSERT INTO t3 VALUES (1, 2, 2);
+    INSERT INTO t5 VALUES (1, 1, 1);
+    INSERT INTO t6 VALUES (1, 1, 1);
+    ANALYZE;
+    SELECT t4.b, t5.a, t6.a FROM t0
+      JOIN t1 ON t1.c = t0.c
+      JOIN t2
+      FULL JOIN t3 ON t3.c = t2.a
+      RIGHT JOIN t4 ON t4.a = t0.c
+      JOIN t5
+      LEFT JOIN t6 ON t6.b = t5.b;
+}
+expect unordered {
+    1||
+    1|1|1
+}
+
 # Regression: non-equijoin FULL OUTER JOIN preserves duplicate and multi-match
 # rows (the ON predicate is applied as a residual inside a single-bucket hash join).
 @cross-check-integrity
