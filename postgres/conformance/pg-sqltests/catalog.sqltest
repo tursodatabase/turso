@@ -768,3 +768,16 @@ test pg-database-is-not-empty {
 expect {
     1
 }
+
+test catalog-schema-qualified-column-references {
+    SELECT pg_catalog.pg_namespace.nspname
+    FROM pg_catalog.pg_namespace
+    WHERE pg_catalog.pg_namespace.nspname = 'pg_catalog';
+    SELECT information_schema.schemata.schema_name
+    FROM information_schema.schemata
+    WHERE information_schema.schemata.schema_name = 'public';
+}
+expect {
+    pg_catalog
+    public
+}
