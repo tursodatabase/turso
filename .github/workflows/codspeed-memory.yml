@@ -62,7 +62,7 @@ jobs:
         run: cargo test -p memory-benchmark --features fts --locked
 
   run:
-    name: "memory benchmarks (${{ matrix.workload }})"
+    name: "memory benchmarks (${{ matrix.name }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build
     timeout-minutes: 30
@@ -74,14 +74,25 @@ jobs:
         # One shard per workload profile; each shard runs the WAL and MVCC
         # variants of that workload (benchmarks are named "<mode>/<workload>"
         # and the filter is a regex over benchmark names).
-        workload:
-          - insert-heavy
-          - read-heavy
-          - mixed
-          - scan-heavy
-          - series-blob
-          - update-churn
-          - fts-queries
+        # update-churn is the slowest workload, so it is split by mode: modes
+        # starting with "w" (wal) and all other modes. Together the two
+        # filters match every mode, including ones added later.
+        include:
+          - name: insert-heavy
+            filter: insert-heavy
+          - name: read-heavy
+            filter: read-heavy
+          - name: mixed
+            filter: mixed
+          - name: scan-heavy
+            filter: scan-heavy
+          - name: series-blob
+            filter: series-blob
+          - name: update-churn (wal)
+            filter: "::w[^:/]*/update-churn/"
+          - name: update-churn (other modes)
+            filter: "::([^w:/][^:/]*)?/update-churn/"
+          - name: fts-queries
     steps:
       - uses: actions/checkout@v4
 
@@ -111,9 +122,11 @@ jobs:
         uses: CodSpeedHQ/action@v4.17.0
         with:
           mode: memory
+          # The CodSpeed runner runs this with `bash -c`; the single quotes
+          # keep the filter's regex characters away from the shell.
           run: |
-            if [ "${{ matrix.workload }}" = "fts-queries" ]; then
+            if [ "${{ matrix.name }}" = "fts-queries" ]; then
               cargo codspeed run -m memory -p memory-benchmark-codspeed --bench fts_queries
             else
-              cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "${{ matrix.workload }}"
+              cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles '${{ matrix.filter }}'
             fi
