@@ -1,6 +1,7 @@
 use super::*;
 use crate::translate::{
-    plan::IndexMethodQuery, planner::on_term_of_outer_join_outside_plan,
+    plan::{IndexMethodQuery, JoinInfo},
+    planner::{determine_where_to_eval_term, on_term_of_outer_join_outside_plan},
     subquery::emit_non_from_clause_subquery,
 };
 
@@ -64,7 +65,13 @@ fn emit_correlated_subqueries(
         // The non-outer pass also emits correlated subqueries used outside
         // predicates, such as a subquery in the result list.
         if !from_outer_join
-            && subquery.get_eval_at(join_order, Some(table_references))? == EvalAt::Loop(join_index)
+            && eval_at_for_subquery_without_conditions(
+                subquery,
+                predicates,
+                join_order,
+                subqueries,
+                table_references,
+            )? == EvalAt::Loop(join_index)
         {
             subqueries_to_emit.push(subquery_index);
         }
@@ -83,6 +90,66 @@ fn emit_correlated_subqueries(
         )?;
     }
     Ok(())
+}
+
+fn eval_at_for_subquery_without_conditions(
+    subquery: &NonFromClauseSubquery,
+    predicates: &[WhereTerm],
+    join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
+    table_references: &TableReferences,
+) -> Result<EvalAt> {
+    let earliest_eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
+    let mut first_loop_that_reads_result: Option<usize> = None;
+    for term in predicates.iter().filter(|term| {
+        term.consumed
+            && !on_term_of_outer_join_outside_plan(term, join_order, Some(table_references))
+            && expr_references_subquery_id(&term.expr, subquery.internal_id)
+    }) {
+        if let EvalAt::Loop(term_loop) =
+            determine_where_to_eval_term(term, join_order, subqueries, Some(table_references))?
+        {
+            first_loop_that_reads_result =
+                Some(first_loop_that_reads_result.map_or(term_loop, |first| first.min(term_loop)));
+        }
+    }
+    let Some(first_loop_that_reads_result) = first_loop_that_reads_result else {
+        return Ok(earliest_eval_at);
+    };
+    let SubqueryState::Unevaluated {
+        plan: Some(subquery_plan),
+    } = &subquery.state
+    else {
+        unreachable!("a subquery that has not run yet must have a plan");
+    };
+    let tables = table_references.joined_tables();
+    let read_table_indexes = subquery_plan
+        .used_outer_query_ref_ids()
+        .into_iter()
+        .filter_map(|table_id| {
+            tables
+                .iter()
+                .position(|table| table.internal_id == table_id)
+        })
+        .collect::<Vec<_>>();
+    let mut eval_at = earliest_eval_at;
+    for (loop_index, member) in join_order
+        .iter()
+        .enumerate()
+        .take(first_loop_that_reads_result)
+    {
+        let unmatched_right_rows_run_this_loop_again = tables[member.original_idx]
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows);
+        let reads_table_on_the_left = read_table_indexes
+            .iter()
+            .any(|&table_index| table_index < member.original_idx);
+        if unmatched_right_rows_run_this_loop_again && reads_table_on_the_left {
+            eval_at = eval_at.max(EvalAt::Loop(loop_index));
+        }
+    }
+    Ok(eval_at)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

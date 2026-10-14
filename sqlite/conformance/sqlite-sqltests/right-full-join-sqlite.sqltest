@@ -1241,6 +1241,29 @@ expect {
     |10|
 }
 
+# The WHERE term becomes the seek key of fs, so no open condition uses its
+# subquery. The subquery reads fl, a table on the left of the FULL JOIN. Its
+# unmatched-row pass seeks fs again with a NULL row for fl, so the subquery
+# must run again in that pass, before the seek.
+test where-subquery-in-seek-key-reads-null-row-from-earlier-full-join {
+    CREATE TABLE fl(a INTEGER);
+    CREATE TABLE fe(a INTEGER);
+    CREATE TABLE fr(b INTEGER, c INTEGER);
+    CREATE TABLE fs(c INTEGER);
+    CREATE INDEX fs_c ON fs(c);
+    INSERT INTO fl VALUES (3);
+    INSERT INTO fr VALUES (1, 3);
+    INSERT INTO fs VALUES (1);
+    SELECT fl.a, fr.b, fs.c
+      FROM fl
+      CROSS JOIN fe
+      FULL JOIN fr ON fr.b = fe.a
+      CROSS JOIN fs
+     WHERE fs.c = (SELECT max(q.b) FROM fr AS q WHERE q.c = fl.a);
+}
+expect {
+}
+
 @cross-check-integrity
 test inner-or-on-before-right-join-keeps-row-outside-implied-in-filters {
     CREATE TABLE or_inner_left(k INTEGER);
