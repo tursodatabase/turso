@@ -12,8 +12,10 @@ use crate::function::AggFunc;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert_ne;
 use crate::types::Value;
+use crate::vdbe::affinity::Affinity;
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -37,6 +39,8 @@ type JoinConditionsResult = (Vec<(LogicalExpr, LogicalExpr)>, Option<LogicalExpr
 pub struct ColumnInfo {
     pub name: String,
     pub ty: Type,
+    pub affinity: Affinity,
+    pub collation: CollationSeq,
     pub database: Option<String>,
     pub table: Option<String>,
     pub table_alias: Option<String>,
@@ -934,10 +938,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                         None => Self::expr_to_column_name(expr),
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
+                    let (affinity, collation) =
+                        Self::infer_expr_affinity_and_collation(&logical_expr, input_schema);
 
                     schema_columns.push(ColumnInfo {
                         name: col_name.clone(),
                         ty: col_type,
+                        affinity,
+                        collation,
                         database: None,
                         table: None,
                         table_alias: None,
@@ -1008,9 +1016,13 @@ impl<'a> LogicalPlanBuilder<'a> {
             if let LogicalExpr::Column(col) = expr {
                 pre_projection_exprs.push(expr.clone());
                 let col_type = Self::infer_expr_type(expr, input_schema)?;
+                let (affinity, collation) =
+                    Self::infer_expr_affinity_and_collation(expr, input_schema);
                 pre_projection_schema.push(ColumnInfo {
                     name: col.name.clone(),
                     ty: col_type,
+                    affinity,
+                    collation,
                     database: None,
                     table: col.table.clone(),
                     table_alias: None,
@@ -1027,6 +1039,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 pre_projection_schema.push(ColumnInfo {
                     name: proj_col_name.clone(),
                     ty: col_type,
+                    affinity: Affinity::Blob,
+                    collation: CollationSeq::Binary,
                     database: None,
                     table: None,
                     table_alias: None,
@@ -1058,10 +1072,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                             if !pre_projection_exprs.iter().any(|e| e == arg) {
                                 pre_projection_exprs.push(arg.clone());
                                 let col_type = Self::infer_expr_type(arg, input_schema)?;
+                                let (affinity, collation) =
+                                    Self::infer_expr_affinity_and_collation(arg, input_schema);
                                 if let LogicalExpr::Column(col) = arg {
                                     pre_projection_schema.push(ColumnInfo {
                                         name: col.name.clone(),
                                         ty: col_type,
+                                        affinity,
+                                        collation,
                                         database: None,
                                         table: col.table.clone(),
                                         table_alias: None,
@@ -1081,6 +1099,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                             pre_projection_schema.push(ColumnInfo {
                                 name: proj_col_name.clone(),
                                 ty: col_type,
+                                affinity: Affinity::Blob,
+                                collation: CollationSeq::Binary,
                                 database: None,
                                 table: None,
                                 table_alias: None,
@@ -1219,6 +1239,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                         aggregate_schema_columns.push(ColumnInfo {
                             name: col.name.clone(),
                             ty: col_type,
+                            affinity: Affinity::Blob,
+                            collation: CollationSeq::Binary,
                             database: None,
                             table: col.table.clone(),
                             table_alias: None,
@@ -1232,6 +1254,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     aggregate_schema_columns.push(ColumnInfo {
                         name: col_name,
                         ty: col_type,
+                        affinity: Affinity::Blob,
+                        collation: CollationSeq::Binary,
                         database: None,
                         table: None,
                         table_alias: None,
@@ -1270,6 +1294,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                             aggregate_schema_columns.push(ColumnInfo {
                                 name: col_name.clone(),
                                 ty: col_type,
+                                affinity: Affinity::Blob,
+                                collation: CollationSeq::Binary,
                                 database: None,
                                 table: None,
                                 table_alias: None,
@@ -1300,6 +1326,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                             aggregate_schema_columns.push(ColumnInfo {
                                 name: agg_name,
                                 ty: agg_type,
+                                affinity: Affinity::Blob,
+                                collation: CollationSeq::Binary,
                                 database: None,
                                 table: None,
                                 table_alias: None,
@@ -1395,11 +1423,15 @@ impl<'a> LogicalPlanBuilder<'a> {
             };
 
             // For type inference, we need the aggregate schema for column references
-            let aggregate_schema = LogicalSchema::new(aggregate_schema_columns.clone());
-            let col_type = Self::infer_expr_type(expr, &Arc::new(aggregate_schema))?;
+            let aggregate_schema = Arc::new(LogicalSchema::new(aggregate_schema_columns.clone()));
+            let col_type = Self::infer_expr_type(expr, &aggregate_schema)?;
+            let (affinity, collation) =
+                Self::infer_expr_affinity_and_collation(expr, &aggregate_schema);
             projection_schema_columns.push(ColumnInfo {
                 name: col_name,
                 ty: col_type,
+                affinity,
+                collation,
                 database: None,
                 table: None,
                 table_alias: None,
@@ -1501,6 +1533,8 @@ impl<'a> LogicalPlanBuilder<'a> {
             schema_columns.push(ColumnInfo {
                 name: format!("column{}", i + 1),
                 ty: Type::Text,
+                affinity: Affinity::Blob,
+                collation: CollationSeq::Binary,
                 database: None,
                 table: None,
                 table_alias: None,
@@ -2296,6 +2330,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                 columns.push(ColumnInfo {
                     name: name.clone(),
                     ty: col.ty(),
+                    affinity: col.affinity(),
+                    collation: col.collation(),
                     database: database.clone(),
                     table: Some(actual_table.clone()),
                     table_alias: alias.map(|s| s.to_string()),
@@ -2304,6 +2340,23 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         Ok(Arc::new(LogicalSchema::new(columns)))
+    }
+
+    fn infer_expr_affinity_and_collation(
+        expr: &LogicalExpr,
+        schema: &SchemaRef,
+    ) -> (Affinity, CollationSeq) {
+        match expr {
+            LogicalExpr::Column(col) => schema
+                .find_column(&col.name, col.table.as_deref())
+                .map_or((Affinity::Blob, CollationSeq::Binary), |(_, col_info)| {
+                    (col_info.affinity, col_info.collation)
+                }),
+            LogicalExpr::Alias { expr, .. } => {
+                Self::infer_expr_affinity_and_collation(expr, schema)
+            }
+            _ => (Affinity::Blob, CollationSeq::Binary),
+        }
     }
 
     // Infer expression type

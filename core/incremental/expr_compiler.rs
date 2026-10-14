@@ -8,6 +8,7 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::emitter::{DoubleQuotedDml, Resolver};
 use crate::translate::expr::translate_expr;
+use crate::translate::logical::ColumnInfo;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
@@ -286,15 +287,17 @@ impl CompiledExpression {
     /// For complex expressions or those requiring type coercion, compiles to VDBE bytecode.
     pub fn compile(
         expr: &Expr,
-        input_column_names: &[String],
+        input_columns: &[ColumnInfo],
         schema: &Schema,
         syms: &SymbolTable,
         connection: Arc<Connection>,
     ) -> Result<Self> {
+        let input_column_names: Vec<String> =
+            input_columns.iter().map(|col| col.name.clone()).collect();
         let input_count = input_column_names.len();
 
         // First, check if this is a trivial expression
-        if let Some(trivial) = Self::try_get_trivial_expr(expr, input_column_names) {
+        if let Some(trivial) = Self::try_get_trivial_expr(expr, &input_column_names) {
             return Ok(CompiledExpression {
                 executor: ExpressionExecutor::Trivial(trivial),
                 input_count,
@@ -318,13 +321,13 @@ impl CompiledExpression {
         let temp_result_register = builder.alloc_register();
 
         // Transform the expression to replace column references with Register expressions
-        let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
+        let transformed_expr = transform_expr_for_dbsp(expr, &input_column_names);
 
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
         let temp_database = RwLock::new(None);
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(
+        let mut resolver = Resolver::new(
             schema,
             &database_schemas,
             &temp_database,
@@ -335,6 +338,14 @@ impl CompiledExpression {
             std::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,
         );
+        for (register, column) in input_columns.iter().enumerate() {
+            resolver
+                .register_affinities
+                .insert(register, column.affinity);
+            resolver
+                .register_collations
+                .insert(register, column.collation);
+        }
 
         // Translate the transformed expression to bytecode
         translate_expr(

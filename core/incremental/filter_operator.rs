@@ -8,9 +8,15 @@ use crate::incremental::operator::{
 };
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::translate::collate::CollationSeq;
+use crate::translate::expr::comparison_affinity;
+use crate::translate::logical::SchemaRef;
+use crate::types::compare_immutable_single;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::Value;
+use either::Either;
 use std::cmp::Ordering;
 
 /// Filter predicate for filtering rows
@@ -59,13 +65,15 @@ pub enum FilterPredicate {
 #[derive(Debug)]
 pub struct FilterOperator {
     predicate: FilterPredicate,
+    input_schema: SchemaRef,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 }
 
 impl FilterOperator {
-    pub fn new(predicate: FilterPredicate) -> Self {
+    pub fn new(predicate: FilterPredicate, input_schema: SchemaRef) -> Self {
         Self {
             predicate,
+            input_schema,
             tracker: None,
         }
     }
@@ -76,92 +84,73 @@ impl FilterOperator {
     }
 
     pub fn evaluate_predicate(&self, values: &[Value]) -> bool {
-        match &self.predicate {
+        self.evaluate(&self.predicate, values)
+    }
+
+    fn evaluate(&self, predicate: &FilterPredicate, values: &[Value]) -> bool {
+        match predicate {
             FilterPredicate::None => true,
-            FilterPredicate::Equals { column_idx, value } => {
-                let v = &values[*column_idx];
-                v == value
-            }
-            FilterPredicate::NotEquals { column_idx, value } => {
-                let v = &values[*column_idx];
-                v != value
-            }
-            FilterPredicate::GreaterThan { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Greater
-            }
-            FilterPredicate::GreaterThanOrEqual { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Less
-            }
-            FilterPredicate::LessThan { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Less
-            }
-            FilterPredicate::LessThanOrEqual { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Greater
-            }
+            FilterPredicate::Equals { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o == Ordering::Equal),
+            FilterPredicate::NotEquals { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o != Ordering::Equal),
+            FilterPredicate::GreaterThan { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o == Ordering::Greater),
+            FilterPredicate::GreaterThanOrEqual { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o != Ordering::Less),
+            FilterPredicate::LessThan { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o == Ordering::Less),
+            FilterPredicate::LessThanOrEqual { column_idx, value } => self
+                .compare_column_to_value(values, *column_idx, value)
+                .is_some_and(|o| o != Ordering::Greater),
             FilterPredicate::And(left, right) => {
-                // Temporarily create sub-filters to evaluate
-                let left_filter = FilterOperator::new((**left).clone());
-                let right_filter = FilterOperator::new((**right).clone());
-                left_filter.evaluate_predicate(values) && right_filter.evaluate_predicate(values)
+                self.evaluate(left, values) && self.evaluate(right, values)
             }
             FilterPredicate::Or(left, right) => {
-                let left_filter = FilterOperator::new((**left).clone());
-                let right_filter = FilterOperator::new((**right).clone());
-                left_filter.evaluate_predicate(values) || right_filter.evaluate_predicate(values)
+                self.evaluate(left, values) || self.evaluate(right, values)
             }
 
             FilterPredicate::ColumnEquals {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left == right
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o == Ordering::Equal),
             FilterPredicate::ColumnNotEquals {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left != right
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o != Ordering::Equal),
             FilterPredicate::ColumnGreaterThan {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Greater
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o == Ordering::Greater),
             FilterPredicate::ColumnGreaterThanOrEqual {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Less
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o != Ordering::Less),
             FilterPredicate::ColumnLessThan {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Less
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o == Ordering::Less),
             FilterPredicate::ColumnLessThanOrEqual {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Greater
-            }
+            } => self
+                .compare_columns(values, *left_idx, *right_idx)
+                .is_some_and(|o| o != Ordering::Greater),
             FilterPredicate::IsNull { column_idx } => {
                 matches!(values[*column_idx], Value::Null)
             }
@@ -170,6 +159,55 @@ impl FilterOperator {
             }
         }
     }
+
+    fn compare_column_to_value(
+        &self,
+        values: &[Value],
+        column_idx: usize,
+        value: &Value,
+    ) -> Option<Ordering> {
+        let column = &self.input_schema.columns[column_idx];
+        let affinity = comparison_affinity(column.affinity, Affinity::None, None, None);
+        sql_compare(&values[column_idx], value, affinity, column.collation)
+    }
+
+    fn compare_columns(
+        &self,
+        values: &[Value],
+        left_idx: usize,
+        right_idx: usize,
+    ) -> Option<Ordering> {
+        let left = &self.input_schema.columns[left_idx];
+        let right = &self.input_schema.columns[right_idx];
+        let affinity = comparison_affinity(left.affinity, right.affinity, None, None);
+        sql_compare(
+            &values[left_idx],
+            &values[right_idx],
+            affinity,
+            left.collation,
+        )
+    }
+}
+
+/// SQL three-valued logic: NULL on either side yields NULL (`None`), which WHERE treats as not-true.
+fn sql_compare(
+    left: &Value,
+    right: &Value,
+    affinity: Affinity,
+    collation: CollationSeq,
+) -> Option<Ordering> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return None;
+    }
+    let left_converted = affinity.convert_for_compare(left);
+    let right_converted = affinity.convert_for_compare(right);
+    let left = left_converted
+        .as_ref()
+        .map_or(Either::Left(left), Either::Right);
+    let right = right_converted
+        .as_ref()
+        .map_or(Either::Left(right), Either::Right);
+    Some(compare_immutable_single(left, right, collation))
 }
 
 impl IncrementalOperator for FilterOperator {
@@ -245,6 +283,25 @@ impl IncrementalOperator for FilterOperator {
 }
 
 #[cfg(test)]
+pub(crate) fn schema_without_affinity(column_count: usize) -> SchemaRef {
+    use crate::schema::Type;
+    use crate::translate::logical::{ColumnInfo, LogicalSchema};
+    SchemaRef::new(LogicalSchema::new(
+        (0..column_count)
+            .map(|i| ColumnInfo {
+                name: format!("c{i}"),
+                ty: Type::Null,
+                affinity: Affinity::Blob,
+                collation: CollationSeq::Binary,
+                database: None,
+                table: None,
+                table_alias: None,
+            })
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::Text;
@@ -252,7 +309,7 @@ mod tests {
     #[test]
     fn test_is_null_predicate() {
         let predicate = FilterPredicate::IsNull { column_idx: 1 };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
 
         // Test with NULL value
         let values_with_null = vec![
@@ -289,7 +346,7 @@ mod tests {
     #[test]
     fn test_is_not_null_predicate() {
         let predicate = FilterPredicate::IsNotNull { column_idx: 1 };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
 
         // Test with NULL value
         let values_with_null = vec![
@@ -334,7 +391,7 @@ mod tests {
             }),
             Box::new(FilterPredicate::IsNull { column_idx: 1 }),
         );
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
 
         // Should match: column_0 = 1 AND column_1 IS NULL
         let values_match = vec![
@@ -371,7 +428,7 @@ mod tests {
             }),
             Box::new(FilterPredicate::IsNotNull { column_idx: 1 }),
         );
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
 
         // Should match: column_0 = 1 (regardless of column_1)
         let values_first_matches = vec![
@@ -411,7 +468,7 @@ mod tests {
                 value: Value::Text(Text::from("test")),
             }),
         );
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
 
         // Should match: column_0 IS NULL, column_2 = 'test'
         let values1 = vec![Value::Null, Value::Null, Value::Text(Text::from("test"))];
@@ -449,7 +506,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_f64(1.5),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_i64(2)])); // 2 > 1.5
         assert!(!filter.evaluate_predicate(&[Value::from_i64(1)])); // 1 > 1.5
 
@@ -458,7 +515,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_i64(2),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_f64(2.5)])); // 2.5 > 2
         assert!(!filter.evaluate_predicate(&[Value::from_f64(1.5)])); // 1.5 > 2
 
@@ -467,7 +524,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_f64(2.0),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_i64(2)])); // 2 >= 2.0
         assert!(filter.evaluate_predicate(&[Value::from_i64(3)])); // 3 >= 2.0
         assert!(!filter.evaluate_predicate(&[Value::from_i64(1)])); // 1 >= 2.0
@@ -477,7 +534,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_i64(2),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_f64(2.0)])); // 2.0 >= 2
         assert!(!filter.evaluate_predicate(&[Value::from_f64(1.9)])); // 1.9 >= 2
 
@@ -486,7 +543,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_f64(1.5),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_i64(1)])); // 1 < 1.5
         assert!(!filter.evaluate_predicate(&[Value::from_i64(2)])); // 2 < 1.5
 
@@ -495,7 +552,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_i64(2),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_f64(1.5)])); // 1.5 < 2
         assert!(!filter.evaluate_predicate(&[Value::from_f64(2.5)])); // 2.5 < 2
 
@@ -504,7 +561,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_f64(2.0),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_i64(2)])); // 2 <= 2.0
         assert!(filter.evaluate_predicate(&[Value::from_i64(1)])); // 1 <= 2.0
         assert!(!filter.evaluate_predicate(&[Value::from_i64(3)])); // 3 <= 2.0
@@ -514,7 +571,7 @@ mod tests {
             column_idx: 0,
             value: Value::from_i64(2),
         };
-        let filter = FilterOperator::new(predicate);
+        let filter = FilterOperator::new(predicate, schema_without_affinity(3));
         assert!(filter.evaluate_predicate(&[Value::from_f64(2.0)])); // 2.0 <= 2
         assert!(!filter.evaluate_predicate(&[Value::from_f64(2.1)])); // 2.1 <= 2
     }

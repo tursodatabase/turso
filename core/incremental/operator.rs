@@ -234,6 +234,7 @@ mod tests {
     use super::*;
     use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
     use crate::incremental::dbsp::HashableRow;
+    use crate::incremental::filter_operator::schema_without_affinity;
     use crate::storage::btree::CursorTrait;
     use crate::storage::pager::CreateBTreeFlags;
     use crate::sync::Arc;
@@ -1449,10 +1450,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
-            column_idx: 1, // "b" is at index 1
-            value: Value::from_i64(2),
-        });
+        let mut filter = FilterOperator::new(
+            FilterPredicate::GreaterThan {
+                column_idx: 1, // "b" is at index 1
+                value: Value::from_i64(2),
+            },
+            schema_without_affinity(2),
+        );
 
         // Initialize with a row (rowid=3, values=[3, 3])
         let mut init_data = Delta::new();
@@ -1508,10 +1512,13 @@ mod tests {
             BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
-        let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
-            column_idx: 2, // "age" is at index 2
-            value: Value::from_i64(25),
-        });
+        let mut filter = FilterOperator::new(
+            FilterPredicate::GreaterThan {
+                column_idx: 2, // "age" is at index 2
+                value: Value::from_i64(25),
+            },
+            schema_without_affinity(3),
+        );
 
         // Initialize with some data
         let mut init_data = Delta::new();

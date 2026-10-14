@@ -1,0 +1,90 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires-file materialized_views ""
+
+# The text literal takes the INTEGER column's affinity, so '5' compares as 5.
+test ivm-where-integer-column-equals-text-literal {
+    CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO n VALUES (1, 5);
+    CREATE MATERIALIZED VIEW vn AS SELECT id, x FROM n WHERE x = '5';
+    INSERT INTO n VALUES (2, 5);
+    INSERT INTO n VALUES (3, 6);
+    SELECT id, x FROM vn ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+}
+
+test ivm-where-integer-column-less-than-text-literal {
+    CREATE TABLE r (id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW vr AS SELECT id, x FROM r WHERE x < '10';
+    INSERT INTO r VALUES (1, 5), (2, 20), (3, 9);
+    UPDATE r SET x = 30 WHERE id = 1;
+    SELECT id, x FROM vr ORDER BY id;
+}
+expect {
+    3|9
+}
+
+# The integer literal takes the TEXT column's affinity, so 5 compares as '5'.
+test ivm-where-text-column-equals-integer-literal {
+    CREATE TABLE s (id INTEGER PRIMARY KEY, c TEXT);
+    INSERT INTO s VALUES (1, '5');
+    CREATE MATERIALIZED VIEW vs AS SELECT id, c FROM s WHERE c = 5;
+    INSERT INTO s VALUES (2, '5'), (3, '6');
+    DELETE FROM s WHERE id = 1;
+    SELECT id, c FROM vs ORDER BY id;
+}
+expect {
+    2|5
+}
+
+test ivm-where-text-column-in-integer-list {
+    CREATE TABLE i (id INTEGER PRIMARY KEY, c TEXT);
+    INSERT INTO i VALUES (1, '5');
+    CREATE MATERIALIZED VIEW vi AS SELECT id, c FROM i WHERE c IN (1, 5, 9);
+    INSERT INTO i VALUES (2, '9'), (3, '7'), (4, 'x');
+    SELECT id, c FROM vi ORDER BY id;
+}
+expect {
+    1|5
+    2|9
+}
+
+# One side has numeric affinity, so both sides compare as numbers.
+test ivm-where-text-column-equals-integer-column {
+    CREATE TABLE cc (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    INSERT INTO cc VALUES (1, '7', 7);
+    CREATE MATERIALIZED VIEW vcc AS SELECT id FROM cc WHERE a = b;
+    INSERT INTO cc VALUES (2, '8', 8), (3, '8', 9);
+    SELECT id FROM vcc ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test ivm-where-nocase-column-equals-literal {
+    CREATE TABLE nc (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+    INSERT INTO nc VALUES (1, 'Alice');
+    CREATE MATERIALIZED VIEW vnc AS SELECT id, name FROM nc WHERE name = 'alice';
+    INSERT INTO nc VALUES (2, 'ALICE'), (3, 'Bob');
+    SELECT id, name FROM vnc ORDER BY id;
+}
+expect {
+    1|Alice
+    2|ALICE
+}
+
+test ivm-where-nocase-column-in-list {
+    CREATE TABLE ni (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+    INSERT INTO ni VALUES (1, 'Alice');
+    CREATE MATERIALIZED VIEW vni AS SELECT id, name FROM ni WHERE name IN ('alice', 'carol');
+    INSERT INTO ni VALUES (2, 'CAROL'), (3, 'Bob');
+    SELECT id, name FROM vni ORDER BY id;
+}
+expect {
+    1|Alice
+    2|CAROL
+}
