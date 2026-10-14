@@ -1067,6 +1067,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             None => None,
         };
+        // Aggregates that appear only in ORDER BY are analyzed later and do
+        // not count, as in legacy planning.
+        if syntax.exprs.is_empty() && having.is_some() && functions.aggregate_count() == 0 {
+            crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+        }
         Ok(super::hir::Grouping {
             keys,
             key_type_facts,
@@ -3239,6 +3244,29 @@ mod tests {
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
+    }
+
+    #[test]
+    fn having_without_group_by_requires_an_aggregate() {
+        let schema = schema_with_items();
+        for sql in [
+            "SELECT id FROM items HAVING id = 1",
+            "SELECT id FROM items HAVING id = 1 ORDER BY count(*)",
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("HAVING needs an aggregate query");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: HAVING clause on a non-aggregate query",
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT count(*) FROM items HAVING count(*) > 0",
+            "SELECT id FROM items HAVING max(id) > 0",
+        ] {
+            analyze_sql_with_schema(&schema, sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
     }
 
     #[test]
