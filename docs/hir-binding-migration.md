@@ -150,7 +150,6 @@ largest first:
 
 | Gap | Failing tests | Example |
 |---|---|---|
-| More than one window in a block (needs one layer per window) | 134 | `nulls-first-last: window-two-different-nulls-orderings` |
 | Wrong results (see below) | ~60 | `gencol: gencol_group_by_virtual` |
 | EXPLAIN QUERY PLAN text differs from legacy | ~45 | `explain-query-plan-json`, `partial_idx: plan-*` |
 | RIGHT and FULL joins | 97 | `full-join-on-clause-operand-order` |
@@ -163,9 +162,8 @@ largest first:
 | Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
 | `no such column` for derived-table columns in ON and nested scopes | ~20 | `joins/derived_subquery_on_predicate` |
 
-Wrong results seen so far: virtual generated columns and correlated
-subqueries read as NULL in GROUP BY output; row order of ORDER BY and GROUP BY
-ties; aggregates of outer columns inside subqueries (`count(outer.x)`);
+Wrong results seen so far: row order of ORDER BY, GROUP BY, and window ties
+where legacy reads an index in order instead of sorting; aggregates of outer columns inside subqueries (`count(outer.x)`);
 nested correlated EXISTS; DISTINCT with OFFSET inside EXISTS; REAL affinity of
 index seek literals; compound subquery affinity; `avg` of large integers;
 three-level outer references; array display; temp schema rows.
@@ -1089,9 +1087,16 @@ order, both as in legacy. A window with no keys streams rows straight into the
 buffer. The sorted rows then run the shared window step, and the flush emits
 the SELECT output subroutine, so DISTINCT, ORDER BY, LIMIT, and OFFSET apply to
 window output rows. Aggregates, grouped rowids, and bare columns used only by a
-window definition are now collected too. Several windows in one block still
-return an internal error; they need one layer per window, as legacy nests one
-source subquery per window.
+window definition are now collected too.
+
+Several windows in one block lower as one layer per window, nested like the
+legacy window source subqueries: the first window is the outermost layer. The
+block's rows feed the innermost layer, and each finished row of an inner layer
+feeds the next outer layer instead of the SELECT output. Each layer buffers
+only what its consumer reads: the final SELECT outputs and ORDER BY terms for
+the outermost layer, and the outer layer's buffer columns and stored-value
+sort keys for the others. A layer's own window results stay bound to their
+result registers, and other windows' results are buffered like any value.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

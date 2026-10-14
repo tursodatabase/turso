@@ -295,6 +295,36 @@ fn plan_hir_window_output_inputs<'a>(
     Ok(plan)
 }
 
+/// Plan what an inner window layer stores for the next outer layer: every
+/// value the outer layer's buffer columns and stored-value sort keys read.
+fn plan_hir_window_layer_inputs<'a>(
+    outer: &super::window::HirWindowBufferPlan<'a>,
+    outer_keys: &[super::window::HirWindowInputKey<'a>],
+    buffer: &mut super::window::HirWindowBufferPlan<'a>,
+) -> Result<HirWindowOutputPlan<'a>> {
+    let mut plan = HirWindowOutputPlan::default();
+    let encoded_keys = outer_keys
+        .iter()
+        .filter(|key| key.is_encoded())
+        .map(|key| (key.expression, true));
+    for (expression, encoded) in outer.column_expressions().chain(encoded_keys) {
+        expression.walk(
+            (),
+            &mut HirWindowOutputCollector {
+                buffer,
+                columns: &mut plan.columns,
+                inputs: if encoded {
+                    &mut plan.sort_keys
+                } else {
+                    &mut plan.values
+                },
+                encoded,
+            },
+        )?;
+    }
+    Ok(plan)
+}
+
 struct HirAggregateRuntime<'a> {
     call: &'a hir::FunctionCall,
     accumulator: usize,
@@ -4805,7 +4835,7 @@ fn emit_query_row_with_inputs<'expr>(
                 "HIR window input rows cannot apply SELECT DISTINCT".into(),
             ));
         }
-        return window.emit_source_row(program);
+        return window.emit_source_row(program, &HirRowInputs::default());
     }
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
@@ -4885,12 +4915,27 @@ struct HirWindowInputSorter {
     buffer_positions: Vec<usize>,
 }
 
-/// Runtime state for the window over one query block's rows.
+/// Where a window layer sends each finished row.
+#[derive(Clone, Copy)]
+enum HirWindowConsumer<'p, 'a> {
+    /// The SELECT outputs and ORDER BY of the block.
+    Select,
+    /// The next outer window layer, which reads these buffer columns and keys.
+    Layer {
+        plan: &'p super::window::HirWindowBufferPlan<'a>,
+        keys: &'p [super::window::HirWindowInputKey<'a>],
+    },
+}
+
+/// Runtime state for one window over a query block's rows.
 ///
-/// The block's rows play the role of the legacy window source subquery: they
-/// are sorted by PARTITION BY and ORDER BY, or streamed as produced when the
-/// window has neither. Each row then runs the shared window frame code, which
-/// calls the SELECT output subroutine for every finished row.
+/// A block with several windows lowers one layer per window, nested like the
+/// legacy window source subqueries: the first window is the outermost layer.
+/// The block's rows feed the innermost layer, and every other layer is fed by
+/// the finished rows of the layer inside it. Each layer sorts its input by
+/// PARTITION BY and ORDER BY, or streams it when the window has neither, then
+/// runs the shared window frame code, which calls the layer's output
+/// subroutine for every finished row.
 struct HirWindowLayer<'a> {
     document: &'a HirDocument,
     plan: super::window::HirWindowBufferPlan<'a>,
@@ -4905,6 +4950,7 @@ struct HirWindowLayer<'a> {
     offsets: WindowFrameOffsets,
     tracking: WindowFrameTracking,
     labels: WindowLabels,
+    /// Buffer columns the consumer reads, loaded into `outputs` per row.
     output_columns: Vec<usize>,
     outputs: HirWindowOutputRegisters<'a>,
     output_return: usize,
@@ -4916,16 +4962,17 @@ impl<'a> HirWindowLayer<'a> {
         document: &'a HirDocument,
         query: &'a hir::Query,
         block: &'a hir::QueryBlock,
+        window: hir::WindowId,
+        consumer: HirWindowConsumer<'_, 'a>,
+        grouped_rows: bool,
     ) -> Result<Self> {
-        let [window] = block.windows.as_slice() else {
-            return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} has {} windows; only one window layer is lowered",
-                block.id,
-                block.windows.len()
-            )));
+        let mut plan = super::window::plan_hir_window_buffer(query, block, window)?;
+        let output_plan = match consumer {
+            HirWindowConsumer::Select => plan_hir_window_output_inputs(query, block, &mut plan)?,
+            HirWindowConsumer::Layer { plan: outer, keys } => {
+                plan_hir_window_layer_inputs(outer, keys, &mut plan)?
+            }
         };
-        let mut plan = super::window::plan_hir_window_buffer(query, block, window.id)?;
-        let output_plan = plan_hir_window_output_inputs(query, block, &mut plan)?;
         let keys = plan.input_sort_keys();
         for key in &keys {
             check_hir_window_key_is_orderable(document, key)?;
@@ -4950,9 +4997,8 @@ impl<'a> HirWindowLayer<'a> {
         };
         // Like the legacy source subquery's ORDER BY, grouped rows carry a
         // sequence number so equal keys keep their group order.
-        let sorter = (!keys.is_empty()).then(|| {
-            open_hir_window_input_sorter(program, &plan, &keys, hir_grouping(block).is_some())
-        });
+        let sorter = (!keys.is_empty())
+            .then(|| open_hir_window_input_sorter(program, &plan, &keys, grouped_rows));
         Ok(Self {
             document,
             plan,
@@ -4973,9 +5019,21 @@ impl<'a> HirWindowLayer<'a> {
         })
     }
 
-    /// Hand the block's current row to the window: queue it in the sorter,
-    /// or step the window directly when the window has no keys.
-    fn emit_source_row(&self, program: &mut ProgramBuilder) -> Result<()> {
+    /// Hand the current input row to the window: queue it in the sorter, or
+    /// step the window directly when the window has no keys. Rows from an
+    /// inner layer supply their values through `inputs`.
+    fn emit_source_row(
+        &self,
+        program: &mut ProgramBuilder,
+        inputs: &HirRowInputs<'_>,
+    ) -> Result<()> {
+        let column_inputs = |column: usize| {
+            if self.plan.column_is_encoded(column) {
+                inputs.sort_keys
+            } else {
+                inputs.values
+            }
+        };
         let Some(sorter) = &self.sorter else {
             for column in 0..self.input.count {
                 super::window::emit_hir_window_input_column(
@@ -4984,13 +5042,19 @@ impl<'a> HirWindowLayer<'a> {
                     &self.plan,
                     column,
                     self.input.start + column,
+                    column_inputs(column),
                 )?;
             }
             return self.emit_step(program);
         };
         for (position, key) in self.keys.iter().enumerate() {
             if key.is_encoded() {
-                key.emit(program, self.document, sorter.row + position)?;
+                key.emit(
+                    program,
+                    self.document,
+                    sorter.row + position,
+                    inputs.sort_keys,
+                )?;
             }
         }
         if let Some(sequence) = sorter.sequence {
@@ -5006,6 +5070,7 @@ impl<'a> HirWindowLayer<'a> {
                 &self.plan,
                 column,
                 sorter.row + position,
+                column_inputs(column),
             )?;
         }
         sorter_insert(
@@ -5092,13 +5157,14 @@ impl<'a> HirWindowLayer<'a> {
         )
     }
 
-    /// Finish the last partition and emit the SELECT output subroutine that
-    /// every finished row calls.
+    /// Finish the last partition and emit the output subroutine that every
+    /// finished row calls: the SELECT output, or the next outer layer's input.
     fn emit_flush(
         &self,
         program: &mut ProgramBuilder,
         block: &hir::QueryBlock,
         output: &HirRowOutput<'_>,
+        outer: Option<&HirWindowLayer<'a>>,
     ) -> Result<()> {
         super::window::emit_hir_window_partition_flush(
             program,
@@ -5114,8 +5180,8 @@ impl<'a> HirWindowLayer<'a> {
             self.labels,
             HIR_CUSTOM_TYPES_CHECKED,
             |program| self.emit_row_results(program),
-            |program| {
-                emit_hir_window_output_subroutine(
+            |program| match outer {
+                None => emit_hir_window_output_subroutine(
                     program,
                     self.document,
                     block,
@@ -5123,7 +5189,16 @@ impl<'a> HirWindowLayer<'a> {
                     &self.outputs.row_inputs(),
                     self.labels.row_output,
                     self.output_return,
-                )
+                ),
+                Some(outer) => {
+                    program.preassign_label_to_next_insn(self.labels.row_output);
+                    outer.emit_source_row(program, &self.outputs.row_inputs())?;
+                    program.emit_insn(Insn::Return {
+                        return_reg: self.output_return,
+                        can_fallthrough: false,
+                    });
+                    Ok(())
+                }
             },
         )
     }
@@ -5234,7 +5309,31 @@ fn emit_hir_window_block(
     block_plan: &HirQueryBlockPlan,
     output: &HirRowOutput<'_>,
 ) -> Result<()> {
-    let layer = HirWindowLayer::prepare(program, &plan.document, query, block)?;
+    // `layers[0]` is the outermost layer; the block's rows feed the last one.
+    let mut layers: Vec<HirWindowLayer<'_>> = Vec::with_capacity(block.windows.len());
+    for (position, window) in block.windows.iter().enumerate() {
+        let consumer = match layers.last() {
+            None => HirWindowConsumer::Select,
+            Some(outer) => HirWindowConsumer::Layer {
+                plan: &outer.plan,
+                keys: &outer.keys,
+            },
+        };
+        let innermost = position + 1 == block.windows.len();
+        let layer = HirWindowLayer::prepare(
+            program,
+            &plan.document,
+            query,
+            block,
+            window.id,
+            consumer,
+            innermost && hir_grouping(block).is_some(),
+        )?;
+        layers.push(layer);
+    }
+    let innermost = layers.last().ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query block {:?} has no windows", block.id))
+    })?;
     let rows_done = program.allocate_label();
     emit_planned_block_rows(
         program,
@@ -5243,14 +5342,18 @@ fn emit_hir_window_block(
         block,
         block_plan,
         &HirRowOutput {
-            target: HirRowTarget::Window(&layer),
+            target: HirRowTarget::Window(innermost),
             distinct: None,
         },
         rows_done,
     )?;
     program.preassign_label_to_next_insn(rows_done);
-    layer.emit_sorted_rows(program)?;
-    layer.emit_flush(program, block, output)
+    for (position, layer) in layers.iter().enumerate().rev() {
+        layer.emit_sorted_rows(program)?;
+        let outer = position.checked_sub(1).map(|outer| &layers[outer]);
+        layer.emit_flush(program, block, output, outer)?;
+    }
+    Ok(())
 }
 
 /// Emit once; every window RETURN_ROW calls this after preparing buffered inputs
@@ -6622,21 +6725,32 @@ mod tests {
     }
 
     #[test]
-    fn planned_query_with_two_windows_is_an_internal_gap() {
+    fn planned_query_with_two_windows_nests_one_layer_per_window() {
         let plan = analyze_plan(
             indexed_items_schema(),
             "SELECT row_number() OVER (ORDER BY value), rank() OVER (ORDER BY extra) FROM items",
         );
-        let mut program = program();
-        let error = emit_planned_query_body(
-            &mut program,
-            &plan,
-            root_query(&plan.document),
-            &QueryDestination::ResultRows,
-        )
-        .err()
-        .expect("only one window layer is lowered");
-        assert!(matches!(error, LimboError::InternalError(_)), "{error}");
+        let program = emit_planned_root(&plan);
+
+        let sorters = insn_positions(&program, |insn| matches!(insn, Insn::SorterOpen { .. }));
+        assert_eq!(sorters.len(), 2, "each window sorts its own input");
+        let sorts = insn_positions(&program, |insn| matches!(insn, Insn::SorterSort { .. }));
+        let inserts = insn_positions(&program, |insn| matches!(insn, Insn::SorterInsert { .. }));
+        let scan_end = *insn_positions(&program, |insn| matches!(insn, Insn::Next { .. }))
+            .first()
+            .unwrap();
+        assert!(
+            inserts[0] < scan_end,
+            "table rows feed the innermost (last) window"
+        );
+        assert!(
+            sorts[0] < inserts[1] && inserts[1] < sorts[1],
+            "inner window output feeds the outer window before it sorts"
+        );
+        assert_eq!(
+            insn_positions(&program, |insn| matches!(insn, Insn::ResultRow { .. })).len(),
+            1
+        );
     }
 
     #[test]

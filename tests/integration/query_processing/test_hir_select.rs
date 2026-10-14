@@ -102,6 +102,15 @@ fn hir_window_select_matches_legacy_rows() {
         "SELECT id, first_value(id) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
         "SELECT extra, count(*), sum(count(*)) OVER (PARTITION BY count(*)) FROM items GROUP BY extra",
         "SELECT DISTINCT extra, count(*) OVER (PARTITION BY extra) FROM items",
+        // Several windows nest one layer per window, first window outermost.
+        "SELECT id, row_number() OVER (ORDER BY value), rank() OVER (ORDER BY extra) FROM items",
+        "SELECT id, lag(value) OVER (ORDER BY id), lead(value) OVER (ORDER BY id) FROM items",
+        "SELECT id, sum(value) OVER (PARTITION BY extra), count(*) OVER (ORDER BY id DESC), \
+         max(value) OVER () FROM items ORDER BY id",
+        "SELECT extra, count(*), rank() OVER (ORDER BY count(*)), \
+         sum(sum(value)) OVER (ORDER BY extra) FROM items GROUP BY extra",
+        "SELECT id, sum(value) OVER (ORDER BY id) + row_number() OVER (ORDER BY value DESC, id) \
+         FROM items LIMIT 3 OFFSET 1",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),
