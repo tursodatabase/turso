@@ -1429,6 +1429,99 @@ expect {
     a|b|c|Z
 }
 
+# ORDER BY uses a column collation only when the term is that column, possibly
+# behind unary +, CAST, or parentheses. An explicit COLLATE anywhere in the
+# term still wins. Any other expression, including `x || ''`, sorts as BINARY.
+
+test collate_orderby_concat_nocase_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY x || '';
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+test collate_orderby_concat_rtrim_is_binary {
+    CREATE TABLE r(x TEXT COLLATE RTRIM);
+    INSERT INTO r VALUES ('a '), ('a');
+    SELECT group_concat(quote(x)) FROM (SELECT x FROM r ORDER BY x || '');
+}
+expect {
+    'a','a '
+}
+
+test collate_orderby_function_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY substr(x, 1);
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+test collate_orderby_unary_plus_keeps_column_collation {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY +x;
+}
+expect {
+    a
+    A
+    B
+    b
+}
+
+test collate_orderby_cast_keeps_column_collation {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY CAST(x AS TEXT);
+}
+expect {
+    a
+    A
+    B
+    b
+}
+
+test collate_orderby_explicit_collate_in_concat {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT
+        (SELECT group_concat(x, '|') FROM (SELECT x FROM t ORDER BY (x COLLATE NOCASE) || '')),
+        (SELECT group_concat(x, '|') FROM (SELECT x FROM t ORDER BY x || '' COLLATE NOCASE));
+}
+expect {
+    a|A|B|b|a|A|B|b
+}
+
+test collate_orderby_concat_alias_and_ordinal {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT
+        (SELECT group_concat(y, '|') FROM (SELECT x || '' AS y FROM t ORDER BY y)),
+        (SELECT group_concat(c, '|') FROM (SELECT x || '' AS c FROM t ORDER BY 1));
+}
+expect {
+    A|B|a|b|A|B|a|b
+}
+
+test collate_orderby_concat_limit_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY x || '' LIMIT 2;
+}
+expect {
+    A
+    B
+}
+
 # =============================================================================
 # COLLATION PROPAGATION THROUGH CONCAT (||)
 # =============================================================================

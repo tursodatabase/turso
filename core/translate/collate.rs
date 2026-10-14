@@ -378,6 +378,25 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+/// Collation for an ORDER BY term.
+///
+/// An explicit COLLATE anywhere in the term wins, and the leftmost one is used.
+/// Otherwise a column contributes its collation only when the term is that
+/// column, possibly behind unary "+", CAST, or parentheses. A column nested in
+/// any other expression, such as `x || ''` or a function call, does not.
+pub fn get_sort_collseq_from_expr_with_symbols(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, _) =
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table, None)?;
+    if let Some(explicit) = explicit {
+        return Ok(Some(explicit));
+    }
+    comparison_operand_column_collseq(top_expr, referenced_tables)
+}
+
 pub fn resolve_comparison_collseq_with_resolver(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
