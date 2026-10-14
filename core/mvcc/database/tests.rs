@@ -3670,22 +3670,26 @@ fn test_header_only_mutation_is_replayed_and_checkpointed() {
     }
 }
 
-/// What this test checks: Header PRAGMAs in MVCC require an exclusive transaction and reject
-/// BEGIN CONCURRENT writes.
+/// What this test checks: Header PRAGMAs in MVCC run under an exclusive transaction. A
+/// BEGIN CONCURRENT transaction is upgraded to exclusive in place.
 /// Why this matters: Header updates have no row-level conflict keys, so they must not run under
 /// optimistic concurrent write mode.
 #[test]
-fn test_mvcc_header_updates_require_exclusive_transaction() {
+fn test_mvcc_header_updates_upgrade_concurrent_tx_to_exclusive() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
-    let err = conn.execute("PRAGMA user_version = 42").unwrap_err();
-    assert!(
-        err.to_string().contains("exclusive transaction"),
-        "expected exclusive-transaction error, got: {err:?}"
-    );
+    conn.execute("PRAGMA user_version = 42").unwrap();
     conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        0,
+        "rolled-back header update must not stick"
+    );
 
     conn.execute("BEGIN").unwrap();
     conn.execute("PRAGMA user_version = 7").unwrap();
