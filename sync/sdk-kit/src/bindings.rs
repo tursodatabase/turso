@@ -140,7 +140,7 @@ impl Default for turso_sync_database_config_t {
 pub struct turso_sync_database {
     _unused: [u8; 0],
 }
-#[doc = " opaque pointer to the TursoDatabaseSync instance"]
+#[doc = " opaque pointer to the TursoDatabaseSync instance\n SAFETY: at most one sync operation (connect, stats, checkpoint, push_changes, wait_changes, apply_changes)\n may be in progress on a database at a time; one started while another is running fails at its first resume"]
 pub type turso_sync_database_t = turso_sync_database;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -222,7 +222,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error\n\n the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call\n So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)\n\n AsyncOperation returns None"]
+    #[doc = " Apply remote changes locally\n SAFETY: no other sync operation (connect/stats/checkpoint/push/wait) may be in progress on this database;\n an operation started while another is running fails at its first resume\n\n the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call\n So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)\n\n AsyncOperation returns None"]
     pub fn turso_sync_database_apply_changes(
         self_: *const turso_sync_database_t,
         changes: *const turso_sync_changes_t,
