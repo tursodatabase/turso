@@ -73,11 +73,14 @@ jobs:
           # The filters of one target split on a single character using
           # character sets that together cover every character, so each
           # benchmark, including ones added later, runs in exactly one job.
-          #   fts_benchmark: last letter of the benchmark function's name.
+          #   fts_benchmark: last letter of the benchmark function's name;
+          #     functions ending in "n" are split again on the character
+          #     before the final "]" (0-1 / anything else, incl. no "]").
           #   prepare_benchmark: the character before the final "]".
           splits='{
             "fts_benchmark": [
-              "^[^:]*::[^:]*::[^:]*n(::|$)",
+              "^[^:]*::[^:]*::[^:]*n::.*[01]\\]$",
+              "^[^:]*::[^:]*::[^:]*n(::(.*[^01]\\]|.*[^\\]]|\\]?))?$",
               "^[^:]*::[^:]*::[^:]*e(::|$)",
               "^[^:]*::[^:]*::[^:]*[^ne:](::|$)"
             ],
