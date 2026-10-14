@@ -11,7 +11,6 @@ use turso_core::{
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
-use turso_pg_parser::translator::INFORMATION_SCHEMA_SCHEMATA_TABLE;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
@@ -421,17 +420,41 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_ROWS: u32 = 5;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        namespaces(conn)
-            .into_iter()
-            .map(|(oid, name)| {
-                vec![
-                    Value::from_i64(oid),    // oid
-                    Value::build_text(name), // nspname
-                    Value::from_i64(10),     // nspowner (bootstrap superuser)
-                    Value::Null,             // nspacl
-                ]
-            })
-            .collect()
+        // PostgreSQL standard namespaces
+        let mut rows = vec![
+            vec![
+                Value::from_i64(11),              // oid
+                Value::Text("pg_catalog".into()), // nspname
+                Value::from_i64(10),              // nspowner
+                Value::Null,                      // nspacl
+            ],
+            vec![
+                Value::from_i64(2200),        // oid
+                Value::Text("public".into()), // nspname
+                Value::from_i64(10),          // nspowner
+                Value::Null,                  // nspacl
+            ],
+            vec![
+                Value::from_i64(11394),                   // oid
+                Value::Text("information_schema".into()), // nspname
+                Value::from_i64(10),                      // nspowner
+                Value::Null,                              // nspacl
+            ],
+        ];
+
+        // Add attached schemas (CREATE SCHEMA creates attached databases)
+        let schema_names = conn.attached_database_names();
+        let mut oid = 16384i64;
+        for name in schema_names {
+            rows.push(vec![
+                Value::from_i64(oid),
+                Value::build_text(name),
+                Value::from_i64(10), // nspowner (bootstrap superuser)
+                Value::Null,         // nspacl
+            ]);
+            oid += 1;
+        }
+        rows
     }
 }
 
@@ -455,33 +478,21 @@ impl SnapshotRows for SchemataTable {
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
-        namespaces(conn)
+        PgNamespaceTable::load_rows(conn)
             .into_iter()
-            .map(|(_, name)| {
+            .map(|namespace| {
                 vec![
-                    Value::build_text(db_name.clone()), // catalog_name
-                    Value::build_text(name),            // schema_name
-                    Value::build_text("turso"),         // schema_owner
-                    Value::Null,                        // default_character_set_catalog
-                    Value::Null,                        // default_character_set_schema
-                    Value::Null,                        // default_character_set_name
-                    Value::Null,                        // sql_path
+                    Value::build_text(db_name.clone()),
+                    namespace[1].clone(),
+                    Value::build_text("turso"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
                 ]
             })
             .collect()
     }
-}
-
-/// Returns the (oid, name) of every schema: the PostgreSQL standard schemas
-/// plus the attached databases that CREATE SCHEMA creates.
-fn namespaces(conn: &Connection) -> Vec<(i64, String)> {
-    let mut namespaces = vec![
-        (11, "pg_catalog".to_string()),
-        (2200, "public".to_string()),
-        (11394, "information_schema".to_string()),
-    ];
-    namespaces.extend((16384i64..).zip(conn.attached_database_names()));
-    namespaces
 }
 
 /// Virtual table implementation for pg_catalog.pg_attribute
@@ -1978,7 +1989,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgIndexesTable>(PhantomData),
     );
     options = options.native_module(
-        INFORMATION_SCHEMA_SCHEMATA_TABLE,
+        "pg_information_schema_schemata",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<SchemataTable>(PhantomData),
     );

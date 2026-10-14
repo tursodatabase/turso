@@ -9,11 +9,6 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
-/// Internal name of the catalog table behind `information_schema.schemata`.
-/// It is not registered as plain `schemata` because that name would clash
-/// with user tables called `schemata`.
-pub const INFORMATION_SCHEMA_SCHEMATA_TABLE: &str = "pg_information_schema_schemata";
-
 /// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
 #[derive(Debug)]
@@ -41,8 +36,12 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = if is_information_schema_schemata(range_var) {
-            INFORMATION_SCHEMA_SCHEMATA_TABLE.to_string()
+        let is_schemata = range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && range_var.relname.eq_ignore_ascii_case("schemata");
+        let mapped_name = if is_schemata {
+            "pg_information_schema_schemata".to_string()
         } else {
             self.map_table_name(&range_var.relname)
         };
@@ -1802,14 +1801,13 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::SelectTable, ParseError> {
         let qualified_name = self.qualified_name_from_range_var(range_var);
         let alias = match &range_var.alias {
-            Some(a) => Some(ast::As::Elided(ast::Name::from_string(a.aliasname.clone()))),
-            // Keep `schemata.schema_name` working after the table is renamed
-            // to its internal name.
-            None if is_information_schema_schemata(range_var) => Some(ast::As::Elided(
-                ast::Name::from_string(range_var.relname.clone()),
-            )),
+            Some(a) => Some(a.aliasname.clone()),
+            None if qualified_name.name.as_str() != range_var.relname => {
+                Some(range_var.relname.clone())
+            }
             None => None,
-        };
+        }
+        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -4083,7 +4081,6 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_extension"
             | "pg_tables"
             | "pg_indexes"
-            | INFORMATION_SCHEMA_SCHEMATA_TABLE
     )
 }
 
@@ -5083,13 +5080,6 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .strip_prefix("Object")
         .unwrap_or(&debug)
         .to_ascii_uppercase()
-}
-
-fn is_information_schema_schemata(range_var: &pg_query::protobuf::RangeVar) -> bool {
-    range_var
-        .schemaname
-        .eq_ignore_ascii_case("information_schema")
-        && range_var.relname.eq_ignore_ascii_case("schemata")
 }
 
 #[cfg(test)]
