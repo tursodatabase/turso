@@ -215,6 +215,177 @@ test pg-dump-function-discovery-excludes-builtins {
 }
 expect {}
 
+test pg-object-native-function-languages {
+    SET search_path TO '';
+    SELECT p.proname, l.lanname, CASE WHEN l.lanispl THEN 1 ELSE 0 END, l.tableoid
+    FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+    WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname;
+}
+expect {
+    abs|internal|0|2612
+    pg_is_in_recovery|c|0|2612
+}
+
+test pg-object-dump-language-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
+           lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner
+    FROM pg_language WHERE lanispl ORDER BY oid;
+}
+expect {}
+
+test pg-object-unsupported-catalogs-are-empty {
+    SET search_path TO '';
+    SELECT tableoid FROM pg_operator;
+    SELECT tableoid FROM pg_catalog.pg_operator;
+    SELECT tableoid FROM pg_opclass;
+    SELECT tableoid FROM pg_catalog.pg_opclass;
+    SELECT tableoid FROM pg_opfamily;
+    SELECT tableoid FROM pg_catalog.pg_opfamily;
+    SELECT tableoid FROM pg_ts_parser;
+    SELECT tableoid FROM pg_catalog.pg_ts_parser;
+    SELECT tableoid FROM pg_ts_template;
+    SELECT tableoid FROM pg_catalog.pg_ts_template;
+    SELECT tableoid FROM pg_ts_dict;
+    SELECT tableoid FROM pg_catalog.pg_ts_dict;
+    SELECT tableoid FROM pg_ts_config;
+    SELECT tableoid FROM pg_catalog.pg_ts_config;
+    SELECT tableoid FROM pg_foreign_data_wrapper;
+    SELECT tableoid FROM pg_catalog.pg_foreign_data_wrapper;
+    SELECT tableoid FROM pg_foreign_server;
+    SELECT tableoid FROM pg_catalog.pg_foreign_server;
+    SELECT tableoid FROM pg_default_acl;
+    SELECT tableoid FROM pg_catalog.pg_default_acl;
+    SELECT tableoid FROM pg_conversion;
+    SELECT tableoid FROM pg_catalog.pg_conversion;
+    SELECT tableoid FROM pg_range;
+    SELECT tableoid FROM pg_catalog.pg_range;
+    SELECT tableoid FROM pg_event_trigger;
+    SELECT tableoid FROM pg_catalog.pg_event_trigger;
+    SELECT tableoid FROM pg_subscription;
+    SELECT tableoid FROM pg_catalog.pg_subscription;
+    SELECT tableoid FROM pg_largeobject_metadata;
+    SELECT tableoid FROM pg_catalog.pg_largeobject_metadata;
+    SELECT tableoid FROM pg_amop;
+    SELECT tableoid FROM pg_catalog.pg_amop;
+    SELECT tableoid FROM pg_amproc;
+    SELECT tableoid FROM pg_catalog.pg_amproc;
+
+    SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
+           oprright, oprcode::oid AS oprcode FROM pg_operator;
+    SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass;
+    SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily;
+    SELECT tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,
+           prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser;
+    SELECT tableoid, oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid
+    FROM pg_ts_template;
+    SELECT tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+           dictinitoption FROM pg_ts_dict;
+    SELECT tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config;
+    SELECT oid, tableoid, defaclrole, defaclnamespace, defaclobjtype, defaclacl,
+           CASE WHEN defaclnamespace = 0 THEN acldefault(
+             CASE WHEN defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END,
+             defaclrole) ELSE '{}' END AS acldefault FROM pg_default_acl;
+    SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion;
+    SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
+    FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
+      WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid) ORDER BY 3,4;
+    SELECT s.tableoid, s.oid, s.subname, s.subowner, s.subconninfo, s.subslotname,
+           s.subsynccommit, s.subpublications, s.subbinary, s.substream,
+           s.subtwophasestate, s.subdisableonerr, s.subpasswordrequired,
+           s.subrunasowner, s.suborigin
+    FROM pg_subscription s WHERE s.subdbid = (
+      SELECT oid FROM pg_database WHERE datname = current_database());
+    SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS acldefault
+    FROM pg_largeobject_metadata;
+}
+expect {}
+
+test pg-object-operator-is-read-only {
+    DELETE FROM pg_operator;
+}
+expect error {cannot delete from pg_catalog table "pg_operator"}
+
+test pg-object-opclass-is-read-only {
+    DELETE FROM pg_opclass;
+}
+expect error {cannot delete from pg_catalog table "pg_opclass"}
+
+test pg-object-opfamily-is-read-only {
+    DELETE FROM pg_opfamily;
+}
+expect error {cannot delete from pg_catalog table "pg_opfamily"}
+
+test pg-object-ts-parser-is-read-only {
+    DELETE FROM pg_ts_parser;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_parser"}
+
+test pg-object-ts-template-is-read-only {
+    DELETE FROM pg_ts_template;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_template"}
+
+test pg-object-ts-dict-is-read-only {
+    DELETE FROM pg_ts_dict;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_dict"}
+
+test pg-object-ts-config-is-read-only {
+    DELETE FROM pg_ts_config;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_config"}
+
+test pg-object-foreign-data-wrapper-is-read-only {
+    DELETE FROM pg_foreign_data_wrapper;
+}
+expect error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
+
+test pg-object-foreign-server-is-read-only {
+    DELETE FROM pg_foreign_server;
+}
+expect error {cannot delete from pg_catalog table "pg_foreign_server"}
+
+test pg-object-default-acl-is-read-only {
+    DELETE FROM pg_default_acl;
+}
+expect error {cannot delete from pg_catalog table "pg_default_acl"}
+
+test pg-object-conversion-is-read-only {
+    DELETE FROM pg_conversion;
+}
+expect error {cannot delete from pg_catalog table "pg_conversion"}
+
+test pg-object-range-is-read-only {
+    DELETE FROM pg_range;
+}
+expect error {cannot delete from pg_catalog table "pg_range"}
+
+test pg-object-event-trigger-is-read-only {
+    DELETE FROM pg_event_trigger;
+}
+expect error {cannot delete from pg_catalog table "pg_event_trigger"}
+
+test pg-object-subscription-is-read-only {
+    DELETE FROM pg_subscription;
+}
+expect error {cannot delete from pg_catalog table "pg_subscription"}
+
+test pg-object-largeobject-metadata-is-read-only {
+    DELETE FROM pg_largeobject_metadata;
+}
+expect error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
+
+test pg-object-amop-is-read-only {
+    DELETE FROM pg_amop;
+}
+expect error {cannot delete from pg_catalog table "pg_amop"}
+
+test pg-object-amproc-is-read-only {
+    DELETE FROM pg_amproc;
+}
+expect error {cannot delete from pg_catalog table "pg_amproc"}
+
 test pg-depend-tracks-live-objects {
     CREATE TABLE dep_parent (id TEXT UNIQUE);
     CREATE TABLE dep_child (parent_id TEXT REFERENCES dep_parent(id), qty INTEGER DEFAULT 17);
