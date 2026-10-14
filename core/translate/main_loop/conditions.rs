@@ -1,5 +1,8 @@
 use super::*;
-use crate::translate::{plan::IndexMethodQuery, subquery::emit_non_from_clause_subquery};
+use crate::translate::{
+    plan::IndexMethodQuery, planner::on_term_of_outer_join_outside_plan,
+    subquery::emit_non_from_clause_subquery,
+};
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
@@ -35,6 +38,11 @@ fn emit_correlated_subqueries(
             .iter()
             .filter(|condition| {
                 !condition.consumed
+                    && !on_term_of_outer_join_outside_plan(
+                        condition,
+                        join_order,
+                        Some(table_references),
+                    )
                     && expr_references_subquery_id(&condition.expr, subquery.internal_id)
             })
             .peekable();
