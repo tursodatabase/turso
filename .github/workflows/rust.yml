@@ -103,17 +103,28 @@ jobs:
         if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
-      # pg_query, whose bindgen needs libclang.dll.
+      # pg_query, whose bindgen needs libclang.dll and clang's own headers.
+      # Unpack just those from the LLVM installer instead of running it: the
+      # installer writes ~3 GB and took ~42 s. libclang finds the headers in
+      # ../lib/clang next to itself, so the layout is kept.
       - name: Install LLVM (libclang for bindgen)
         if: runner.os == 'Windows'
         run: |
+          $version = "22.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+          $installer = "$env:RUNNER_TEMP\llvm-installer.exe"
+          $dest = "$env:RUNNER_TEMP\llvm"
           for ($attempt = 1; $attempt -le 5; $attempt++) {
-            choco install llvm -y --no-progress
-            if ($LASTEXITCODE -eq 0 -and (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) { break }
-            if ($attempt -eq 5) { throw "LLVM install failed after $attempt attempts" }
+            curl.exe -fsSL -o $installer $url
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 5) { throw "LLVM download failed after $attempt attempts" }
             Start-Sleep -Seconds (30 * $attempt)
           }
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          7z x $installer "-o$dest" "bin\libclang.dll" "lib\clang" -y | Out-Null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$dest\bin\libclang.dll")) {
+            throw "Extracting libclang from the LLVM installer failed"
+          }
+          echo "LIBCLANG_PATH=$dest\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
