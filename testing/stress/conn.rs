@@ -8,7 +8,7 @@ use turso_stress::ThreadId;
 pub struct StressDb {
     db: Option<turso::Database>,
     db_file: String,
-    vfs: Option<String>,
+    io: Arc<dyn turso_core::IO>,
     sql_logger: Arc<SqlLogger>,
     fts: bool,
 }
@@ -17,34 +17,34 @@ impl StressDb {
     pub(crate) fn new(
         db_file: String,
         sql_logger: Arc<SqlLogger>,
-        vfs: Option<String>,
+        io: Arc<dyn turso_core::IO>,
         fts: bool,
     ) -> Self {
         Self {
             db: None,
             db_file,
             sql_logger,
-            vfs,
+            io,
             fts,
         }
     }
 
     async fn get_or_init(&mut self) -> turso::Result<&turso::Database> {
         if self.db.is_none() {
-            let mut builder = Builder::new_local(&self.db_file).experimental_index_method(self.fts);
-            if let Some(ref vfs) = self.vfs {
-                builder = builder.with_io(vfs.clone());
-            }
-            self.db = Some(builder.build().await?);
+            self.db = Some(
+                Builder::new_local(&self.db_file)
+                    .experimental_index_method(self.fts)
+                    .with_io_impl(self.io.clone())
+                    .build()
+                    .await?,
+            );
         }
         Ok(self.db.as_ref().unwrap())
     }
 
     pub fn reset(&mut self) {
-        let old = self.db.take();
-        if old.is_none() {
-            panic!("cannot reset uninitialized StressDb");
-        }
+        drop(self.db.take().expect("cannot reset uninitialized StressDb"));
+        turso_core::DATABASE_MANAGER.remove_path_with_io(&self.db_file, self.io.as_ref());
     }
 
     pub async fn connect(
