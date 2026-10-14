@@ -1,5 +1,7 @@
 //! ATTACH and DETACH: SQLite's namespaces, one for each database.
 
+#[cfg(feature = "fs")]
+use crate::error::io_error;
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
@@ -14,11 +16,13 @@ use crate::translate::{
 };
 use crate::types::IOResultOr;
 use crate::util::normalize_ident;
+#[cfg(feature = "fs")]
+use crate::util::OpenOptions;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::NamespaceCatalog;
 #[cfg(feature = "fs")]
-use crate::{is_memory_like, DatabaseOpts, EncryptionKey, IOResult};
+use crate::{is_memory_like, DatabaseOpts, EncryptionKey, EncryptionOpts, IOResult, OpenFlags};
 use crate::{
     turso_assert, Connection, Database, LimboError, Pager, Result, MAIN_DB_ID, TEMP_DB_ID,
 };
@@ -277,6 +281,7 @@ pub(crate) enum AttachDatabaseState {
 pub(crate) enum AttachDatabaseState {
     #[default]
     Start,
+    Open(Box<AttachDatabaseOpenState>),
     Init(Box<AttachDatabaseInitState>),
     Bootstrap(Box<AttachDatabaseBootstrapState>),
     Publish {
@@ -285,6 +290,17 @@ pub(crate) enum AttachDatabaseState {
         pager: Arc<Pager>,
     },
     Done,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseOpenState {
+    io: Arc<dyn IO>,
+    path: String,
+    options: crate::OpenOptions,
+    db: Option<Arc<Database>>,
+    modeof: Option<String>,
+    encryption_key: Option<EncryptionKey>,
+    state: crate::OpenDbAsyncState,
 }
 
 #[cfg(feature = "fs")]
@@ -544,15 +560,33 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) = Self::from_uri_attached(
+                    let open = Self::prepare_attached_database_open(
                         path,
                         db_opts,
                         main_db_flags,
                         io,
                         self.db.dialect(),
                     )?;
+                    *state = AttachDatabaseState::Open(Box::new(open));
+                }
+                AttachDatabaseState::Open(open) => {
+                    let db = match open.db.take() {
+                        Some(db) => db,
+                        None => crate::return_if_io!(Database::open_async(
+                            &mut open.state,
+                            open.io.clone(),
+                            &open.path,
+                            &open.options,
+                        )),
+                    };
+                    if let Some(modeof) = &open.modeof {
+                        let perms =
+                            std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
+                        std::fs::set_permissions(&open.path, perms.permissions())
+                            .map_err(|e| io_error(e, "set_permissions"))?;
+                    }
                     let attached_is_fresh = !db.initialized();
-                    if !is_memory_db {
+                    if !is_memory_like(path) {
                         Self::validate_attach_target(&db, attached_is_fresh, alias)?;
                     }
                     self.reject_unsupported_fresh_mvcc_attach_durable_storage(
@@ -560,12 +594,7 @@ impl Connection {
                         &db,
                         attached_is_fresh,
                     )?;
-
-                    let encryption_key = if let Some(ref enc) = encryption_opts {
-                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-                    } else {
-                        None
-                    };
+                    let encryption_key = open.encryption_key.take();
 
                     *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
                         alias: alias.to_string(),
@@ -690,6 +719,57 @@ impl Connection {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "fs")]
+    fn prepare_attached_database_open(
+        uri: &str,
+        mut db_opts: DatabaseOpts,
+        main_db_flags: OpenFlags,
+        io: Arc<dyn IO>,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<AttachDatabaseOpenState> {
+        let opts = OpenOptions::parse(uri)?;
+        let mut flags = opts.get_flags()?;
+        if main_db_flags.contains(OpenFlags::ReadOnly) {
+            flags |= OpenFlags::ReadOnly;
+        }
+        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
+            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
+            (Some(_), None) => {
+                return Err(LimboError::InvalidArgument(
+                    "hexkey is required when cipher is provided".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(LimboError::InvalidArgument(
+                    "cipher is required when hexkey is provided".to_string(),
+                ));
+            }
+            (None, None) => None,
+        };
+        if encryption_opts.is_some() {
+            db_opts = db_opts.with_encryption(true);
+        }
+        let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|enc| EncryptionKey::from_hex_string(&enc.hexkey))
+            .transpose()?;
+        let mut options = crate::OpenOptions::new(dialect)
+            .flags(flags)
+            .db_opts(db_opts)
+            .encryption(encryption_opts);
+        let db = Database::resolve_default_storage(&io, &opts.path, &mut options, true)?;
+        Ok(AttachDatabaseOpenState {
+            io,
+            path: opts.path,
+            options,
+            db,
+            modeof: opts.modeof,
+            encryption_key,
+            state: crate::OpenDbAsyncState::new(),
+        })
     }
 
     // Detach a database by alias name
