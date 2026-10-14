@@ -89,9 +89,36 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// Upper bound on the recursion depth of [translate_expr]. The parser bounds
+/// statement-wide expression nesting at `MAX_EXPR_DEPTH` (100); this leaves room
+/// for the extra levels the translator itself can add (generated columns, custom
+/// type ENCODE/DECODE chains, synthetic rewrites) while still failing gracefully
+/// instead of overflowing the stack on programmatically constructed trees.
+const MAX_EXPR_TRANSLATION_DEPTH: usize = 150;
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if program.expr_translation_depth >= MAX_EXPR_TRANSLATION_DEPTH {
+        crate::bail_parse_error!(
+            "Expression tree is too large (maximum depth {MAX_EXPR_TRANSLATION_DEPTH})"
+        );
+    }
+    program.expr_translation_depth += 1;
+    let result =
+        translate_expr_dispatch(program, referenced_tables, expr, target_register, resolver);
+    program.expr_translation_depth -= 1;
+    result
+}
+
+/// Translates `expr` once [translate_expr] has accounted for its depth.
+fn translate_expr_dispatch(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
@@ -1807,13 +1834,13 @@ fn translate_function_call_expr(
                         if let Ok(probability) = value.parse::<f64>() {
                             if !(0.0..=1.0).contains(&probability) {
                                 crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                        );
+                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                                );
                             }
                             if !value.contains('.') {
                                 crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a floating point number with decimal point",
-                                        );
+                                    "second argument to likelihood() must be a floating point number with decimal point",
+                                );
                             }
                         } else {
                             crate::bail_parse_error!(
@@ -1822,8 +1849,8 @@ fn translate_function_call_expr(
                         }
                     } else {
                         crate::bail_parse_error!(
-                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                );
+                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
+                        );
                     }
                     translate_expr(
                         program,
