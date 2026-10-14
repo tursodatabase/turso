@@ -3,6 +3,8 @@
 # Simple EXPLAIN is intentionally mapped to SQLite's EXPLAIN QUERY PLAN.
 # PostgreSQL EXPLAIN options are rejected until their output semantics exist.
 
+@skip-file-if postgres "EXPLAIN shows the Turso query plan, and Turso rejects EXPLAIN options that PostgreSQL accepts"
+
 @database :memory:
 
 setup explain_table {
