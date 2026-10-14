@@ -512,7 +512,7 @@ pub(super) fn build_prefilter_where_terms(
         {
             continue;
         }
-        if expr_references_outer_query(&cond.expr, table_references) {
+        if expr_reads_an_outer_query(&cond.expr, table_references, subqueries)? {
             continue;
         }
         term_indices.push(cond_idx);
