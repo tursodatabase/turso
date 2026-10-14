@@ -837,6 +837,105 @@ fn test_mvcc_commit_time_conflict_is_reported_not_retried() {
 }
 
 #[test]
+fn test_mvcc_autocommit_update_is_not_retried_while_another_statement_is_open() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_no_retry_with_open_statement.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first'), (2, 'other')")
+        .unwrap();
+
+    conn2.set_busy_timeout(Duration::from_secs(5));
+    let mut reader = conn2.prepare("SELECT id FROM test ORDER BY id").unwrap();
+    loop {
+        match reader.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            result => panic!("expected the reader's first row, got {result:?}"),
+        }
+    }
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+
+    let mut stmt = conn2
+        .prepare("UPDATE test SET value = 'third' WHERE id = 1")
+        .unwrap();
+    let err = loop {
+        match stmt.step() {
+            Ok(StepResult::IO | StepResult::Yield) => tmp_db.io.step().unwrap(),
+            Ok(StepResult::Sleep { .. }) => panic!(
+                "the conflict rolls back the transaction the open reader shares, so it must be reported"
+            ),
+            Ok(result) => panic!("expected a write-write conflict, got {result:?}"),
+            Err(err) => break err,
+        }
+    };
+    assert!(matches!(err, LimboError::WriteWriteConflict));
+}
+
+#[test]
+fn test_mvcc_statement_run_while_an_update_waits_is_committed_on_its_own() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_statement_during_retry_wait.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let conn3 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+
+    conn2.set_busy_timeout(Duration::from_secs(5));
+    let mut stmt = conn2
+        .prepare("UPDATE test SET value = 'third' WHERE id = 1")
+        .unwrap();
+    let step_until_sleep = |stmt: &mut Statement| loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => break duration,
+            result => panic!("expected Sleep after a write-write conflict, got {result:?}"),
+        }
+    };
+    let delay = step_until_sleep(&mut stmt);
+
+    conn2
+        .execute("INSERT INTO audit (id, note) VALUES (1, 'written while the update waits')")
+        .unwrap();
+    let rows: Vec<(i64,)> = conn3.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "a statement that returned Ok while the update waits must already be committed"
+    );
+
+    std::thread::sleep(delay);
+    step_until_sleep(&mut stmt);
+    let rows: Vec<(i64,)> = conn3.exec_rows("SELECT count(*) FROM audit");
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "a second conflict of the waiting update must not undo the committed statement"
+    );
+}
+
+#[test]
 fn test_mvcc_autocommit_returning_rows_come_only_from_the_successful_attempt() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_autocommit_returning_after_retry.db");
     let conn1 = tmp_db.connect_limbo();

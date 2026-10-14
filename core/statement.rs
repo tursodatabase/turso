@@ -931,6 +931,7 @@ impl Statement {
             || !self.started_in_autocommit
             || self.has_returned_row
             || self.query_mode != QueryMode::Normal
+            || self.shares_connection_with_another_open_statement()
         {
             return Ok(None);
         }
@@ -950,7 +951,7 @@ impl Statement {
         }
 
         let parameters = std::mem::take(&mut self.state.parameters);
-        self.reset_internal(None, None, self.counted_as_active_root)?;
+        self.reset_internal(None, None, false)?;
         self.state.parameters = parameters;
 
         let delay = retry_state.get_delay(now);
@@ -959,6 +960,15 @@ impl Statement {
             waker.wake_by_ref();
         }
         Ok(Some(StepResult::Sleep { duration: delay }))
+    }
+
+    fn shares_connection_with_another_open_statement(&self) -> bool {
+        let own = i32::from(self.counted_as_active_root);
+        self.program
+            .connection
+            .n_active_root_statements
+            .load(Ordering::SeqCst)
+            > own
     }
 
     #[inline]
