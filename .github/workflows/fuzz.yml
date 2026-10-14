@@ -27,9 +27,13 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
+    # run-fuzz-tests, run-long-fuzz-tests and simple-stress-test build the
+    # same --all-features dependencies, so they share one cache entry. Only
+    # this job saves it.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
+        shared-key: "fuzz-all-features"
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Install cargo-nextest
@@ -58,8 +62,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        cache-on-failure: true
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        shared-key: "fuzz-all-features"
+        save-if: false
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -85,8 +89,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        cache-on-failure: true
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        shared-key: "fuzz-all-features"
+        save-if: false
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
