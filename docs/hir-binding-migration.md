@@ -143,9 +143,36 @@ right before reading its result. Uncorrelated subqueries run once through
 through the source bindings in effect at that point. An IN seek driven by a
 subquery emits the same shell when its loop opens.
 
-Known gaps found by running SELECT through HIR:
+`scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
+one process per file, and groups failures by cause. On 2026-10-14 HIR passed
+13602 conformance tests and failed 568; legacy passes all of them. Known gaps,
+largest first:
 
-- A block with more than one window needs one layer per window.
+| Gap | Failing tests | Example |
+|---|---|---|
+| More than one window in a block (needs one layer per window) | 134 | `nulls-first-last: window-two-different-nulls-orderings` |
+| Wrong results (see below) | ~60 | `gencol: gencol_group_by_virtual` |
+| EXPLAIN QUERY PLAN text differs from legacy | ~45 | `explain-query-plan-json`, `partial_idx: plan-*` |
+| RIGHT and FULL joins | 97 | `full-join-on-clause-operand-order` |
+| Indexes on generated columns produce invalid HIR | 52 | `gencol-virtual-constant-index-lookup` |
+| HAVING/ORDER BY read an output with no runtime binding | 38 | `agg-functions: filter-with-having` |
+| `json_valid` with a flags argument rejected | 31 | `json-valid-strict` |
+| Views are not expanded (`no such table: v`) | ~20 | `views`, `gencol_view_virtual` |
+| Compound ORDER BY on qualified result columns | 10 | `union-all-order-by-qualified-result-column` |
+| Correlated derived and CTE sources | 4+ | `subquery-correlated-from-clause-nested` |
+| Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
+| `no such column` for derived-table columns in ON and nested scopes | ~20 | `joins/derived_subquery_on_predicate` |
+
+Wrong results seen so far: virtual generated columns and correlated
+subqueries read as NULL in GROUP BY output; row order of ORDER BY and GROUP BY
+ties; aggregates of outer columns inside subqueries (`count(outer.x)`);
+nested correlated EXISTS; DISTINCT with OFFSET inside EXISTS; REAL affinity of
+index seek literals; compound subquery affinity; `avg` of large integers;
+three-level outer references; array display; temp schema rows.
+
+Legacy runs FROM subqueries and CTEs as coroutines when it can, so the outer
+loop pulls rows on demand. HIR always materializes them first. Results match
+except when the source never ends, but the plans differ.
 
 ### Non-lowering phase complete
 
