@@ -1444,6 +1444,21 @@ impl ProgramBuilder {
         Ok(emitted)
     }
 
+    pub fn without_query_plan_lines<T>(
+        &mut self,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if !self.mode.is_explain_query_plan() {
+            return emit(self);
+        }
+        let mode = std::mem::replace(&mut self.mode, BuilderQueryMode::Normal);
+        let next_subquery_eqp_id = self.next_subquery_eqp_id;
+        let emitted = emit(self);
+        self.mode = mode;
+        self.next_subquery_eqp_id = next_subquery_eqp_id;
+        emitted
+    }
+
     pub fn pop_current_parent_explain(&mut self) {
         let BuilderQueryMode::ExplainQueryPlan {
             current_parent_idx: Some(current),
