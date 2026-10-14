@@ -53,9 +53,13 @@ fn test_pg_ordered_array_aggregate_correlated_and_collated(db: TempDatabase) {
     conn.execute("CREATE TABLE ordered_words (g INTEGER, v TEXT, k TEXT)")
         .unwrap();
     conn.execute("INSERT INTO ordered_words VALUES (1,'lower','a'), (1,'upper','B'), (1,'tie','a'), (2,'other','z')").unwrap();
-    assert_eq!(query_text(&conn,
-        "SELECT array_to_string(array_agg(v ORDER BY k COLLATE NOCASE, v DESC), '|') FROM ordered_words WHERE g=1"),
-        vec!["tie|lower|upper"]);
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT array_to_string(array_agg(v ORDER BY k COLLATE NOCASE, v DESC), '|') FROM ordered_words WHERE g=1"
+        ),
+        vec!["tie|lower|upper"]
+    );
     assert_eq!(
         conn.prepare("SELECT g, (SELECT array_to_string(array_agg(v ORDER BY k, v DESC), '|') FROM ordered_words i WHERE i.g = src.g)
             FROM (SELECT 2 AS g UNION ALL SELECT 1 UNION ALL SELECT 3 UNION ALL SELECT 2) src")
@@ -239,12 +243,15 @@ fn test_pg_unnest_preserves_values_and_aliases(db: TempDatabase) {
         ]
     );
     assert_eq!(
-        conn.prepare("SELECT t.x, u.unnest FROM unnest(ARRAY[17]) AS t(x), unnest(ARRAY[2]) u")
+        conn.prepare("SELECT t.x, u.u FROM unnest(ARRAY[17]) AS t(x), unnest(ARRAY[2]) u")
             .unwrap()
             .run_collect_rows()
             .unwrap(),
         vec![vec![Value::from_i64(17), Value::from_i64(2)]]
     );
+    assert!(conn
+        .prepare("SELECT u.unnest FROM unnest(ARRAY[2]) u")
+        .is_err());
     assert!(conn
         .prepare("SELECT * FROM unnest(17)")
         .unwrap()
@@ -257,6 +264,135 @@ fn test_pg_unnest_preserves_values_and_aliases(db: TempDatabase) {
         array_to_string(array(SELECT quote_literal(x) FROM unnest(evttags) AS t(x)), ', ') AS evttags,
         e.evtfoid::regproc AS evtfname FROM pg_event_trigger e ORDER BY e.oid")
         .unwrap().run_collect_rows().unwrap().is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_generate_series_and_array_upper(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT generate_series.generate_series FROM pg_catalog.generate_series(4, 5)"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::from_i64(4)], vec![Value::from_i64(5)]]
+    );
+    assert!(conn
+        .prepare("SELECT gs.value FROM generate_series(2, 4) gs")
+        .is_err());
+    assert_eq!(
+        conn.prepare(
+            "SELECT s FROM pg_catalog.generate_series(2, 8, 3) s
+             UNION ALL SELECT s FROM pg_catalog.generate_series(8, 2, -3) s"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(8)],
+            vec![Value::from_i64(8)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(2)],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT array_upper(ARRAY[17, NULL, 2]::pg_catalog.int2[], 1),
+                    array_upper(ARRAY[]::pg_catalog.int2[], 1),
+                    array_upper(NULL::pg_catalog.int2[], 1),
+                    array_upper(ARRAY[8, 5], NULL),
+                    array_upper(ARRAY[8, 5], 0),
+                    array_upper(ARRAY[8, 5], 2)"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::from_i64(3),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]]
+    );
+    for query in [
+        "SELECT * FROM pg_catalog.generate_series(1, 3, 0)",
+        "SELECT pg_catalog.array_upper(ARRAY[[1]], 1)",
+        "SELECT * FROM pg_catalog.generate_series('yesterday', 'today')",
+    ] {
+        assert!(conn.prepare(query).unwrap().run_collect_rows().is_err());
+    }
+    for query in [
+        "SELECT * FROM pg_catalog.generate_series(NULL, 3)",
+        "SELECT * FROM pg_catalog.generate_series(3, 1)",
+        "SELECT * FROM pg_catalog.generate_series(1, 3, -1)",
+    ] {
+        assert!(conn
+            .prepare(query)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        conn.prepare(
+            "SELECT b.n, s FROM (SELECT 2 n UNION ALL SELECT 5) b,
+             pg_catalog.generate_series(b.n, b.n + 1) s ORDER BY b.n, s"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::from_i64(2), Value::from_i64(2)],
+            vec![Value::from_i64(2), Value::from_i64(3)],
+            vec![Value::from_i64(5), Value::from_i64(5)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+        ]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT s FROM pg_catalog.generate_series(9223372036854775806, 9223372036854775807) s"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::from_i64(i64::MAX - 1)],
+            vec![Value::from_i64(i64::MAX)],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT s FROM pg_catalog.generate_series(-9223372036854775807, -9223372036854775808, -2) s")
+            .unwrap().run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(i64::MIN + 1)]]
+    );
+    conn.execute("CREATE TABLE series_probe (id INTEGER, name TEXT, ignored TEXT)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT (SELECT array_to_string(array_agg(attname ORDER BY s), ',')
+                     FROM pg_catalog.generate_series(0, pg_catalog.array_upper(src.attrs, 1)) s,
+                          pg_catalog.pg_attribute
+                     WHERE attrelid = rel.oid AND attnum = src.attrs[s])
+             FROM (SELECT ARRAY[2,1]::int2[] attrs UNION ALL SELECT ARRAY[1,3]::int2[]
+                   UNION ALL SELECT ARRAY[]::int2[]) src, pg_catalog.pg_class rel
+             WHERE rel.relname = 'series_probe'"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::build_text("name,id")],
+            vec![Value::build_text("id,ignored")],
+            vec![Value::Null]
+        ]
+    );
 }
 
 #[turso_macros::test(mvcc)]
@@ -504,6 +640,46 @@ fn test_pg_set_config_empty_and_quoted_search_paths(db: TempDatabase) {
     );
     conn.execute("SET search_path TO public").unwrap();
     assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_current_schemas_uses_existing_search_path_entries(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(false)"),
+        ["{public}"]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(true)"),
+        ["{pg_catalog,public}"]
+    );
+
+    conn.execute("CREATE SCHEMA turso").unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(false)"),
+        ["{public}"]
+    );
+    conn.execute("CREATE SCHEMA alpha").unwrap();
+    conn.execute("CREATE SCHEMA \"comma,schema\"").unwrap();
+    conn.execute("SELECT set_config('search_path', 'missing, alpha, public, alpha, \"comma,schema\", pg_catalog', false)")
+        .unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(false)"),
+        ["{alpha,public,\"comma,schema\",pg_catalog}"]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(true)"),
+        ["{alpha,public,\"comma,schema\",pg_catalog}"]
+    );
+
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(query_text(&conn, "SELECT current_schemas(false)"), ["{}"]);
+    assert_eq!(
+        query_text(&conn, "SELECT current_schemas(true)"),
+        ["{pg_catalog}"]
+    );
+    assert_eq!(query_text(&conn, "SELECT current_schemas(NULL)"), ["NULL"]);
 }
 
 #[turso_macros::test(mvcc)]
