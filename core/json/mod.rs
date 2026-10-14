@@ -11,7 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, quote_path, JsonPath, PathElement};
-use crate::numeric::{str_to_i64, Numeric};
+use crate::numeric::{format_float, str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
@@ -827,7 +827,12 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::ArrayLocator(Some(i as i32)),
+                        // SQLite renders the operand into "$[N]" text and its path
+                        // parser clamps an index that does not fit. Truncating here
+                        // instead lets 4294967296 name the first element.
+                        PathElement::ArrayLocator(Some(
+                            i.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                        )),
                     ],
                 }));
             }
@@ -835,7 +840,9 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
+                        // A REAL operand becomes its text form first, the way a CAST
+                        // renders it, so 1.0 names the key "1.0" rather than "1".
+                        PathElement::Key(Cow::Owned(format_float(f64::from(f))), false),
                     ],
                 }));
             }
@@ -1921,8 +1928,10 @@ mod tests {
     #[test]
     fn test_json_arrow_operands_match_sqlite() {
         // The right operand of -> and ->> is classified the way SQLite's
-        // jsonPathFromDbValue() classifies it: "[...]" is an abbreviated path
-        // and the operand ends at an embedded NUL.
+        // jsonPathFromDbValue() classifies it: "[...]" is an abbreviated path,
+        // a BLOB or REAL is turned into its text form, an integer index that
+        // does not fit is out of range rather than truncated, and the operand
+        // ends at an embedded NUL.
         let cases: &[(&str, Value, &str)] = &[
             (r#"["a","b",["c","d"]]"#, Value::build_text("[0]"), "a"),
             (r#"["a","b",["c","d"]]"#, Value::build_text("[2][1]"), "d"),
@@ -1939,6 +1948,18 @@ mod tests {
             (r#"{"[]":3}"#, Value::build_text("[]"), "3"),
             (r#"{"a":1}"#, Value::build_text("a"), "1"),
             (r#"{"a b":7}"#, Value::build_text("a b"), "7"),
+            (r#"{"a":1}"#, Value::Blob(b"a".to_vec()), "1"),
+            (r#"{"a":1}"#, Value::Blob(b"A".to_vec()), "<NULL>"),
+            (r#"[1,2]"#, Value::Blob(b"[0]".to_vec()), "1"),
+            // The bytes of a BLOB operand are read as UTF-8 text, not byte by
+            // byte, so this is the key "euro sign" and not three latin-1 keys.
+            (r#"{"€":2}"#, Value::Blob(b"\xe2\x82\xac".to_vec()), "2"),
+            (r#"{"1.0":8}"#, Value::from_f64(1.0), "8"),
+            (r#"{"1.5":8}"#, Value::from_f64(1.5), "8"),
+            (r#"[1,2]"#, Value::from_i64(1), "2"),
+            (r#"[1,2]"#, Value::from_i64(-1), "2"),
+            (r#"[1,2]"#, Value::from_i64(4294967296), "<NULL>"),
+            (r#"[1,2]"#, Value::from_i64(-4294967295), "<NULL>"),
             (r#"{"a":1}"#, Value::build_text("a\0b"), "1"),
         ];
         let cache = JsonCacheCell::new();
