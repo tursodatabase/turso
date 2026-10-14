@@ -218,3 +218,22 @@ expect {
     2|0|2|3
     2|5|2|3
 }
+
+# The materialized hash build input runs as its own plan. That plan keeps the
+# EXISTS subquery, because the subquery reads only t3, a table of the input.
+# The only term that uses the subquery is an ON term of the LEFT JOIN to t0,
+# the probe table, so that term never runs in the plan of the build input.
+test exists-in-left-join-on-term-with-materialized-build-input {
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t2_c ON t2(c);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    SELECT * FROM t3
+    CROSS JOIN t2
+    LEFT JOIN t0 ON t0.a = t2.b AND EXISTS (SELECT 1 FROM t0 AS q WHERE q.a = t3.b)
+    WHERE t2.c IS NULL;
+}
+expect {
+}
