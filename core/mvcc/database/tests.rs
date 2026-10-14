@@ -23372,6 +23372,36 @@ fn test_sequence_watermark_stays_bounded_until_committed_tx_is_removed() {
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
+#[test]
+fn test_sequence_watermark_does_not_go_back_when_older_commit_finishes_last() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let first = db.connect();
+    let second = db.connect();
+    let reader = db.connect();
+    first
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    first.execute("CREATE SEQUENCE s").unwrap();
+
+    first.execute("BEGIN").unwrap();
+    first
+        .execute("INSERT INTO t VALUES (nextval('s'), 'first')")
+        .unwrap();
+    first.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut commit = first.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+    second
+        .execute("INSERT INTO t VALUES (nextval('s'), 'second')")
+        .unwrap();
+    while !matches!(commit.step().unwrap(), StepResult::Done) {}
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
 fn read_ids_below_sequence_watermark(reader: &Arc<Connection>, last: i64) -> (Vec<i64>, i64) {
     let watermark = get_rows(reader, "SELECT sequence_watermark_experimental('s')")[0][0].as_int();
     let upper_bound = watermark.unwrap_or(i64::MAX);
