@@ -1,0 +1,157 @@
+# An index range for a LIKE or GLOB prefix must still find BLOB values,
+# which sort after all text, and must keep the index order.
+
+@database :memory:
+
+setup blob_schema {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, f TEXT, g TEXT COLLATE NOCASE, n INTEGER);
+    CREATE INDEX tf ON t(f);
+    CREATE INDEX tg ON t(g);
+    CREATE INDEX tn ON t(n);
+    INSERT INTO t VALUES (1, 'ghij', 'ghij', 12);
+    INSERT INTO t VALUES (2, 'ghijk', 'GHIJK', 123);
+    INSERT INTO t VALUES (3, 'ghik', 'ghik', 2);
+    INSERT INTO t VALUES (4, 'GHIJ', 'gHiJz', 13);
+    INSERT INTO t VALUES (5, x'6768696a', x'4748696a', 1);
+    INSERT INTO t VALUES (6, x'67686a', x'67486a', 3);
+}
+
+setup desc_schema {
+    CREATE TABLE d(x, y TEXT);
+    CREATE INDEX dxy ON d(x, y DESC);
+    INSERT INTO d VALUES (1, 'abc');
+    INSERT INTO d VALUES (1, x'616263');
+    INSERT INTO d VALUES (1, 'abd');
+    INSERT INTO d VALUES (1, 'ab');
+    INSERT INTO d VALUES (2, 'abc');
+    INSERT INTO d VALUES (1, x'6162');
+    INSERT INTO d VALUES (1, 'b');
+}
+
+@setup blob_schema
+test glob-prefix-finds-blob-values {
+    SELECT a FROM t WHERE f GLOB 'ghij*' ORDER BY a;
+}
+expect {
+    1
+    2
+    5
+}
+
+@setup blob_schema
+test glob-prefix-keeps-index-order-with-blobs {
+    SELECT a FROM t WHERE f GLOB 'ghi*' ORDER BY f;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup blob_schema
+test glob-prefix-keeps-descending-order-with-blobs {
+    SELECT a FROM t WHERE f GLOB 'ghi*' ORDER BY f DESC;
+}
+expect {
+    5
+    3
+    2
+    1
+}
+
+@setup blob_schema
+test like-prefix-finds-blob-values-in-any-case {
+    SELECT a FROM t WHERE g LIKE 'ghij%' ORDER BY a;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+@setup blob_schema
+test glob-prefix-in-or-finds-blob-values {
+    SELECT a FROM t WHERE n = 3 OR f GLOB 'ghij*' ORDER BY a;
+}
+expect {
+    1
+    2
+    5
+    6
+}
+
+@setup blob_schema
+test glob-prefix-with-other-range-on-same-column {
+    SELECT a FROM t WHERE f GLOB 'ghij*' AND f > 'ghij' ORDER BY a;
+}
+expect {
+    2
+    5
+}
+
+@setup blob_schema
+test glob-prefix-on-numeric-column {
+    SELECT a FROM t WHERE n GLOB '12*' ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@setup blob_schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test glob-prefix-on-numeric-column-scans-plan {
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE n GLOB '12*';
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX tn
+}
+
+@setup blob_schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test glob-prefix-on-nocase-index-scans-plan {
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE g GLOB 'ghij*';
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX tg
+}
+
+@setup desc_schema
+test glob-prefix-on-descending-index-column {
+    SELECT rowid FROM d WHERE x = 1 AND y GLOB 'ab*' ORDER BY y;
+}
+expect {
+    4
+    1
+    3
+    6
+    2
+}
+
+@setup desc_schema
+test glob-prefix-on-descending-index-column-reversed {
+    SELECT rowid FROM d WHERE x = 1 AND y GLOB 'ab*' ORDER BY y DESC;
+}
+expect {
+    2
+    6
+    3
+    1
+    4
+}
+
+@setup desc_schema
+test glob-prefix-update-and-delete {
+    UPDATE d SET y = y || 'z' WHERE x = 1 AND y GLOB 'ab*';
+    DELETE FROM d WHERE x = 1 AND y GLOB 'abcz*';
+    SELECT rowid, y FROM d ORDER BY rowid;
+}
+expect {
+    3|abdz
+    4|abz
+    5|abc
+    6|abz
+    7|b
+}

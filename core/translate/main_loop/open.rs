@@ -575,7 +575,7 @@ pub(super) fn emit_table_read_start(
                         .size(&seek_def.start)
                         .max(seek_def.size(&seek_def.end));
                     let start_reg = program.alloc_registers(max_registers);
-                    SeekEmitter::new(
+                    let blob_pass = SeekEmitter::new(
                         program,
                         table_references,
                         seek_def,
@@ -586,6 +586,7 @@ pub(super) fn emit_table_read_start(
                         index.as_ref(),
                     )
                     .emit(loop_start, bloom_filter)?;
+                    t_ctx.meta_blob_passes[joined_table_index] = blob_pass;
 
                     if let Some(materialized_subquery_storage) = materialized_subquery_storage {
                         let index_cursor_id = index_cursor_id
