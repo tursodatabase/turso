@@ -344,6 +344,8 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT CASE WHEN true THEN 1 ELSE abs(1)::int END", "abs"),
         ("SELECT CASE WHEN true THEN 1 ELSE 1::int END", "case"),
         ("SELECT CASE WHEN true THEN 1 END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE now() END::text", "now"),
         (
             "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
             "abs",

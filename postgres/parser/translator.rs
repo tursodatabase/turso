@@ -4072,45 +4072,21 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// Casts and CASE pass through the name of the expression they wrap, and only
+/// when that expression has no name are they named after the outermost target
+/// type or `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
-    derived_column_name_and_is_fallback(node).map(|(name, _)| name)
+    expression_name(node).or_else(|| cast_or_case_name(node))
 }
 
-/// The returned flag marks a fallback name that an enclosing cast or CASE replaces:
-/// a cast is named after the expression it casts unless that name is a fallback,
-/// and then after its target type, so `1::int::text` is named `text`. A CASE is
-/// named after its ELSE expression unless that name is a fallback, and then `case`.
-fn derived_column_name_and_is_fallback(node: &pg_query::protobuf::Node) -> Option<(String, bool)> {
+fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    let last_string = |names: &[pg_query::protobuf::Node]| {
-        names
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .next_back()
-    };
     let name = match &node.node {
-        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname)?,
-        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields)?,
-        Some(Node::TypeCast(type_cast)) => {
-            return match derived_column_name_and_is_fallback(type_cast.arg.as_deref()?) {
-                Some((name, false)) => Some((name, false)),
-                _ => Some((last_string(&type_cast.type_name.as_ref()?.names)?, true)),
-            };
-        }
-        Some(Node::CaseExpr(case_expr)) => {
-            return match case_expr
-                .defresult
-                .as_deref()
-                .and_then(derived_column_name_and_is_fallback)
-            {
-                Some((name, false)) => Some((name, false)),
-                _ => Some(("case".to_string(), true)),
-            };
-        }
-        Some(Node::CoalesceExpr(_)) => "coalesce".to_string(),
+        Some(Node::FuncCall(func_call)) => return last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
+        Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CoalesceExpr(_)) => "coalesce",
         Some(Node::MinMaxExpr(min_max)) => {
             use pg_query::protobuf::MinMaxOp;
             match MinMaxOp::try_from(min_max.op) {
@@ -4118,12 +4094,11 @@ fn derived_column_name_and_is_fallback(node: &pg_query::protobuf::Node) -> Optio
                 Ok(MinMaxOp::IsLeast) => "least",
                 _ => return None,
             }
-            .to_string()
         }
         Some(Node::AExpr(a_expr))
             if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
         {
-            "nullif".to_string()
+            "nullif"
         }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
@@ -4141,11 +4116,29 @@ fn derived_column_name_and_is_fallback(node: &pg_query::protobuf::Node) -> Optio
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
             }
-            .to_string()
         }
         _ => return None,
     };
-    Some((name, false))
+    Some(name.to_string())
+}
+
+fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
+        Some(Node::CaseExpr(_)) => Some("case".to_string()),
+        _ => None,
+    }
+}
+
+fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// Extract a string value from a DefElem's arg.
