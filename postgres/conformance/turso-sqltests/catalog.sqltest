@@ -1,0 +1,33 @@
+@database :memory:
+
+test pg-function-support-catalogs-are-empty {
+    SET search_path TO '';
+    SELECT * FROM pg_init_privs;
+    SELECT * FROM pg_catalog.pg_init_privs;
+    SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_init_privs;
+    SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_catalog.pg_init_privs;
+    SELECT * FROM pg_cast;
+    SELECT * FROM pg_catalog.pg_cast;
+    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_cast;
+    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_catalog.pg_cast;
+    SELECT * FROM pg_transform;
+    SELECT * FROM pg_catalog.pg_transform;
+    SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_transform;
+    SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_catalog.pg_transform;
+}
+expect {}
+
+test pg-init-privs-is-read-only {
+    DELETE FROM pg_init_privs;
+}
+expect error {cannot delete from pg_catalog table "pg_init_privs"}
+
+test pg-cast-is-read-only {
+    DELETE FROM pg_cast;
+}
+expect error {cannot delete from pg_catalog table "pg_cast"}
+
+test pg-transform-is-read-only {
+    DELETE FROM pg_transform;
+}
+expect error {cannot delete from pg_catalog table "pg_transform"}

@@ -152,6 +152,37 @@ expect {
     1|updated
 }
 
+test pg-dump-builtins-belong-to-pg-catalog {
+    SET search_path TO '';
+    SELECT DISTINCT p.proname, n.nspname FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname;
+}
+expect {
+    abs|pg_catalog
+    pg_is_in_recovery|pg_catalog
+}
+
+test pg-dump-function-discovery-excludes-builtins {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes,
+           p.prorettype, p.proacl, acldefault('f', p.proowner) AS acldefault,
+           p.pronamespace, p.proowner
+    FROM pg_proc p LEFT JOIN pg_init_privs pip
+      ON (p.oid = pip.objoid AND pip.classoid = 'pg_proc'::regclass AND pip.objsubid = 0)
+    WHERE p.prokind <> 'a'
+      AND NOT EXISTS (SELECT 1 FROM pg_depend
+          WHERE classid = 'pg_proc'::regclass AND objid = p.oid AND deptype = 'i')
+      AND (pronamespace != (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')
+           OR EXISTS (SELECT 1 FROM pg_cast
+               WHERE pg_cast.oid > 16383 AND p.oid = pg_cast.castfunc)
+           OR EXISTS (SELECT 1 FROM pg_transform
+               WHERE pg_transform.oid > 16383
+                 AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))
+           OR p.proacl IS DISTINCT FROM pip.initprivs);
+}
+expect {}
+
 test pg-depend-tracks-live-objects {
     CREATE TABLE dep_parent (id TEXT UNIQUE);
     CREATE TABLE dep_child (parent_id TEXT REFERENCES dep_parent(id), qty INTEGER DEFAULT 17);
