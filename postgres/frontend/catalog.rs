@@ -2249,31 +2249,27 @@ impl SnapshotRows for PgDependTable {
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
-        let constraints: Vec<_> = PgConstraintTable::load_rows(conn)
-            .into_iter()
-            .map(|row| {
-                let kind = row[3]
-                    .to_text()
-                    .expect("catalog constraint kinds are text")
-                    .parse::<ConstraintKind>()
-                    .expect("catalog constraint kinds are valid");
-                (row, kind)
-            })
-            .collect();
+        let constraint_rows = PgConstraintTable::load_rows(conn);
+        let constraints = constraint_rows.iter().map(|row| {
+            let kind = row[3]
+                .to_text()
+                .expect("catalog constraint kinds are text")
+                .parse::<ConstraintKind>()
+                .expect("catalog constraint kinds are valid");
+            (row, kind)
+        });
         let indexes = PgIndexTable::load_rows(conn);
-        let relations: Vec<_> = PgClassTable::load_rows(conn)
-            .into_iter()
-            .map(|row| {
-                let kind = row[16]
-                    .to_text()
-                    .expect("catalog relation kinds are text")
-                    .parse::<RelationKind>()
-                    .expect("catalog relation kinds are valid");
-                (row, kind)
-            })
-            .collect();
+        let relation_rows = PgClassTable::load_rows(conn);
+        let relations = relation_rows.iter().map(|row| {
+            let kind = row[16]
+                .to_text()
+                .expect("catalog relation kinds are text")
+                .parse::<RelationKind>()
+                .expect("catalog relation kinds are valid");
+            (row, kind)
+        });
 
-        for (relation, kind) in &relations {
+        for (relation, kind) in relations.clone() {
             if !matches!(kind, RelationKind::Table) {
                 continue;
             }
@@ -2298,12 +2294,12 @@ impl SnapshotRows for PgDependTable {
             let oid = index[0].as_int().expect("catalog OIDs are integers");
             let table = index[1].as_int().expect("catalog OIDs are integers");
             let columns = catalog_column_numbers(&index[14]);
-            let automatic = relations.iter().any(|(relation, _)| {
+            let automatic = relations.clone().any(|(relation, _)| {
                 relation[0].as_int() == Some(oid)
                     && matches!(&relation[1], Value::Text(name) if name.as_str().starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX))
             });
             let constraint = if automatic {
-                constraints.iter().find(|(constraint, kind)| {
+                constraints.clone().find(|(constraint, kind)| {
                     matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique)
                         && constraint[7].as_int() == Some(table)
                         && catalog_column_numbers(&constraint[18]) == columns
@@ -2329,7 +2325,7 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
-        for (constraint, _) in &constraints {
+        for (constraint, _) in constraints {
             let oid = constraint[0].as_int().expect("catalog OIDs are integers");
             let table = constraint[7].as_int().expect("catalog OIDs are integers");
             for column in catalog_column_numbers(&constraint[18]) {
