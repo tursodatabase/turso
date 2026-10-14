@@ -37,12 +37,12 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
-    # run-fuzz-tests and run-long-fuzz-tests build the same test binaries,
-    # so they share one cache entry. Only part 1 of this job saves it.
+    # run-fuzz-tests and run-long-fuzz-tests build the same things, so they
+    # share one cache entry. Only part 1 of this job saves it.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        shared-key: "fuzz-nextest"
+        shared-key: "fuzz-all-features"
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
     - name: Install cargo-nextest
@@ -51,6 +51,11 @@ jobs:
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
+    # Needed: nextest compiles every workspace package's test binaries
+    # before filtering, and one of them links the turso_sqlite3 library
+    # this step builds ("library not found: turso_sqlite3" without it).
+    - name: Build
+      run: cargo build --verbose --locked --all-features
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
@@ -69,7 +74,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        shared-key: "fuzz-nextest"
+        shared-key: "fuzz-all-features"
         save-if: false
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
@@ -77,6 +82,9 @@ jobs:
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
+    # Needed for the same reason as in run-fuzz-tests.
+    - name: Build
+      run: cargo build --verbose --locked --all-features
     - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
