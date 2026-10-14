@@ -963,6 +963,15 @@ fn optimize_select_plan_form(
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
+/// Cost model used by the planner: the loaded parameters when the
+/// `optimizer_params` feature is on, the built-in defaults otherwise.
+pub(crate) fn cost_model_params() -> &'static cost_params::CostModelParams {
+    #[cfg(feature = "optimizer_params")]
+    return &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    return &cost_params::DEFAULT_PARAMS;
+}
+
 /// Find the table reads for one version of a query.
 fn find_select_plan_form(
     plan: &mut SelectPlan,
@@ -972,10 +981,7 @@ fn find_select_plan_form(
     cost_limit: Option<Cost>,
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
-    #[cfg(feature = "optimizer_params")]
-    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
-    #[cfg(not(feature = "optimizer_params"))]
-    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+    let params = cost_model_params();
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 

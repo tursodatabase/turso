@@ -78,7 +78,7 @@ use update::translate_update;
 #[turso_macros::trace_stack]
 #[allow(clippy::too_many_arguments)]
 pub fn translate(
-    schema: &Schema,
+    schema: &Arc<Schema>,
     stmt: ast::Stmt,
     pager: Arc<Pager>,
     connection: Arc<Connection>,
@@ -142,6 +142,17 @@ pub fn translate(
                 connection.clone(),
                 &mut program,
             )?;
+        }
+        stmt @ ast::Stmt::Select(_)
+            if connection.experimental_hir_enabled() && !connection.is_nested_stmt() =>
+        {
+            semantic_lowering::translate_select(
+                &stmt,
+                schema,
+                &resolver,
+                &mut program,
+                &connection,
+            )?
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
@@ -670,7 +681,7 @@ mod tests {
         };
 
         let err = translate(
-            &schema,
+            &Arc::new(schema),
             stmt,
             pager,
             conn,
@@ -714,7 +725,7 @@ mod tests {
         };
 
         let err = translate(
-            &schema,
+            &Arc::new(schema),
             stmt,
             pager,
             conn,

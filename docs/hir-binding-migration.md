@@ -116,6 +116,30 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
+### Opt-in production entry point
+
+Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
+calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
+statements through HIR: the owned semantic catalog, `analyze_root`,
+`HirPlan::build`, and HIR lowering. Nested engine statements still use the
+legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
+prepare, so running the test suites with the variable set lists the remaining
+gaps. The variable and the legacy path are removed at cutover.
+
+Result-column names, table names, and declared types come from the HIR outputs
+and the same alias, `full_column_names`, and `short_column_names` rules as
+legacy. Two known differences are legacy artifacts: legacy reports its internal
+window subquery as the table of every output of a window query, and BLOB as
+the declared type of expressions such as `count(*)` there. HIR reports the real
+table and no declared type, like SQLite. `get_column_type_info` and
+`get_column_inferred_type` report the resolved affinity for expression outputs
+instead of legacy's AST-shape rules.
+
+Known gaps found by running SELECT through HIR:
+
+- Expression subqueries (scalar, EXISTS, IN) are not emitted by query lowering.
+- A block with more than one window needs one layer per window.
+
 ### Non-lowering phase complete
 
 Validated HIR and HIR access planning now cover query roots, INSERT-owned

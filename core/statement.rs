@@ -10,6 +10,7 @@ use std::{
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
+use crate::translate::semantic_lowering::{ResolvedResultColumn, ResolvedResultValue};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
     busy::BusyHandlerState,
@@ -262,6 +263,18 @@ fn infer_expression_primitive(
 /// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
 /// `infer_expression_primitive` returns. `Blob` collapses to `None` because
 /// SQLite's "no determined affinity" sentinel isn't a usable wire type.
+/// The `get_column_type_name` answer for a column storage type.
+fn type_name(ty: crate::schema::Type) -> Option<&'static str> {
+    match ty {
+        crate::schema::Type::Integer => Some("INTEGER"),
+        crate::schema::Type::Real => Some("REAL"),
+        crate::schema::Type::Text => Some("TEXT"),
+        crate::schema::Type::Blob => Some("BLOB"),
+        crate::schema::Type::Numeric => Some("NUMERIC"),
+        crate::schema::Type::Null => None,
+    }
+}
+
 fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
     match affinity {
         crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
@@ -995,6 +1008,9 @@ impl Statement {
 
     pub fn num_columns(&self) -> usize {
         match self.query_mode {
+            QueryMode::Normal if !self.program.resolved_result_columns.is_empty() => {
+                self.program.resolved_result_columns.len()
+            }
             QueryMode::Normal => self.program.result_columns.len(),
             QueryMode::Explain => EXPLAIN_COLUMNS.len(),
             QueryMode::ExplainQueryPlan {
@@ -1018,6 +1034,14 @@ impl Statement {
             return Cow::Owned(columns.get(idx).expect("No column").to_string());
         }
         match self.query_mode {
+            QueryMode::Normal if !self.program.resolved_result_columns.is_empty() => {
+                let column = self
+                    .program
+                    .resolved_result_columns
+                    .get(idx)
+                    .expect("No column");
+                self.resolved_column_name(column)
+            }
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
 
@@ -1099,6 +1123,12 @@ impl Statement {
         ) {
             return None;
         }
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) => Some(Cow::Borrowed(&source.table_name)),
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId(_) => None,
+            };
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self
@@ -1134,6 +1164,14 @@ impl Statement {
                 EqpFormat::Json => &EXPLAIN_QUERY_PLAN_JSON_COLUMNS_TYPE,
             };
             return Some(column_types.get(idx).expect("No column").to_string());
+        }
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) if !source.declared_type.is_empty() => {
+                    Some(source.declared_type.clone())
+                }
+                _ => None,
+            };
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
@@ -1194,6 +1232,11 @@ impl Statement {
         }
         if self.query_mode != QueryMode::Normal {
             return Ok(None);
+        }
+        if !self.program.resolved_result_columns.is_empty() {
+            return Ok(self
+                .resolved_result_column(idx)
+                .and_then(|column| self.resolved_column_type_info(column)));
         }
         let Some(column) = self.program.result_columns.get(idx) else {
             return Ok(None);
@@ -1290,6 +1333,12 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
+        if let Some(column) = self.resolved_result_column(idx) {
+            return match &column.value {
+                ResolvedResultValue::Column(source) => type_name(source.ty).map(str::to_string),
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId(_) => None,
+            };
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column {
@@ -1323,6 +1372,10 @@ impl Statement {
         if self.query_mode != QueryMode::Normal {
             return None;
         }
+        if !self.program.resolved_result_columns.is_empty() {
+            let column = self.resolved_result_column(idx)?;
+            return affinity_to_primitive(column.affinity).map(str::to_string);
+        }
         let column = &self.program.result_columns.get(idx)?;
         let affinity = translate::expr::get_expr_affinity(
             &column.expr,
@@ -1330,6 +1383,83 @@ impl Statement {
             None,
         );
         affinity_to_primitive(affinity).map(str::to_string)
+    }
+
+    fn resolved_result_column(&self, idx: usize) -> Option<&ResolvedResultColumn> {
+        if self.program.resolved_result_columns.is_empty() {
+            return None;
+        }
+        Some(
+            self.program
+                .resolved_result_columns
+                .get(idx)
+                .expect("No column"),
+        )
+    }
+
+    /// Column naming for a statement prepared from semantic HIR, following
+    /// the same alias, `full_column_names`, and `short_column_names` rules as
+    /// the legacy result columns.
+    fn resolved_column_name<'a>(&self, column: &'a ResolvedResultColumn) -> Cow<'a, str> {
+        if column.name_is_alias {
+            return Cow::Borrowed(&column.name);
+        }
+        match &column.value {
+            ResolvedResultValue::Column(source) => {
+                let full = self.program.connection.get_full_column_names();
+                let short = self.program.connection.get_short_column_names();
+                if full {
+                    Cow::Owned(format!("{}.{}", source.table_name, source.column_name))
+                } else if short {
+                    Cow::Borrowed(&source.column_name)
+                } else {
+                    Cow::Borrowed(&column.name)
+                }
+            }
+            ResolvedResultValue::RowId(name) => Cow::Borrowed(name),
+            ResolvedResultValue::Expression => Cow::Borrowed(&column.name),
+        }
+    }
+
+    /// Type information for a statement prepared from semantic HIR. Table
+    /// columns use the same schema rules as legacy; expressions report their
+    /// resolved affinity.
+    fn resolved_column_type_info(&self, column: &ResolvedResultColumn) -> Option<ColumnTypeInfo> {
+        let ResolvedResultValue::Column(source) = &column.value else {
+            return affinity_to_primitive(column.affinity).map(|name| ColumnTypeInfo {
+                declared_name: name.to_string(),
+                array_dimensions: 0,
+                base_type: None,
+                kind: ColumnTypeKind::Builtin,
+            });
+        };
+        let schema = self.program.connection.schema.read();
+        let resolved = schema
+            .resolve_type(&source.declared_type, source.table_is_strict)
+            .ok()
+            .flatten();
+        let (base_type, kind) = match resolved {
+            Some(resolved) => {
+                let leaf = resolved.leaf();
+                let kind = if leaf.is_struct() {
+                    ColumnTypeKind::Struct
+                } else if leaf.is_union() {
+                    ColumnTypeKind::Union
+                } else if leaf.is_domain {
+                    ColumnTypeKind::Domain
+                } else {
+                    ColumnTypeKind::Custom
+                };
+                (Some(resolved.primitive.to_uppercase()), kind)
+            }
+            None => (None, ColumnTypeKind::Builtin),
+        };
+        Some(ColumnTypeInfo {
+            declared_name: source.declared_type.clone(),
+            array_dimensions: source.array_dimensions,
+            base_type,
+            kind,
+        })
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

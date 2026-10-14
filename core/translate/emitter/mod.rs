@@ -392,6 +392,10 @@ impl<'a> Resolver<'a> {
         self.enable_custom_types
     }
 
+    pub(crate) fn unqualified_database_search_path(&self) -> &Option<Vec<String>> {
+        &self.unqualified_database_search_path
+    }
+
     pub(crate) fn with_self_table_context<T>(
         &self,
         program: &mut ProgramBuilder,
