@@ -19,6 +19,11 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  # The bench profile inherits release, which uses thin LTO. Every bench
+  # target is its own binary, so the LTO step runs once per benchmark and
+  # made up most of the build time. CodSpeed compares each PR against main
+  # built the same way, so the comparison does not need LTO.
+  CARGO_PROFILE_BENCH_LTO: "false"
 
 jobs:
   memory:
@@ -88,6 +93,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed
@@ -157,6 +163,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed

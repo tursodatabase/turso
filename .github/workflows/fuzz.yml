@@ -16,6 +16,9 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Keeps file and line numbers in backtraces but drops the rest of the
+  # debug info, which makes the Rust cache entries smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   run-fuzz-tests:
@@ -27,10 +30,15 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
+    # run-fuzz-tests, run-long-fuzz-tests and simple-stress-test build the
+    # same --all-features dependencies, so they share one cache entry. Only
+    # this job saves it.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
+        shared-key: "fuzz-all-features"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -57,7 +65,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        cache-on-failure: true
+        shared-key: "fuzz-all-features"
+        save-if: false
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -83,7 +92,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        cache-on-failure: true
+        shared-key: "fuzz-all-features"
+        save-if: false
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
@@ -116,6 +126,7 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Run FTS stress test
       env:
         RUST_BACKTRACE: 1
@@ -136,6 +147,7 @@ jobs:
       with:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Run shuttle mvcc tests
       env:
         RUST_BACKTRACE: "full"
@@ -169,10 +181,14 @@ jobs:
       with:
         prefix-key: "v1-rust-fuzz"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz@0.13.0
     - name: Build all libFuzzer targets
       run: cargo +nightly-2025-12-17 fuzz build --dev
+    # A failure here never fails the job, so on pull requests it only costs
+    # time. Run it on main and tags, where someone can look at the output.
     - name: Run scalar_func fuzzer
+      if: github.event_name != 'pull_request'
       continue-on-error: true
       run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300

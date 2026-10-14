@@ -42,12 +42,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
             artifact: db-bindings-x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-gnu
             artifact: sync-bindings-x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
@@ -60,15 +60,15 @@ jobs:
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: blacksmith-4vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: blacksmith-4vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: db-bindings-wasm32-wasip1-threads
             setup: |
@@ -83,7 +83,7 @@ jobs:
               yarn workspace @tursodatabase/database-common build
               yarn workspace @tursodatabase/database-wasm-common build
               yarn workspace @tursodatabase/database-wasm build
-          - host: ubuntu-latest
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: sync-bindings-wasm32-wasip1-threads
             setup: |
@@ -137,6 +137,15 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
+      # release-official uses full LTO with one codegen unit, which is what we
+      # publish but makes each build several times slower. Pull requests only
+      # need to know that the bindings build and pass tests.
+      - name: Use a faster build profile on pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_OFFICIAL_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_OFFICIAL_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: yarn install
       - name: Build common
@@ -153,6 +162,8 @@ jobs:
         working-directory: .
         run: |
           docker run --rm --user 0:0 \
+            -e CARGO_PROFILE_RELEASE_OFFICIAL_LTO \
+            -e CARGO_PROFILE_RELEASE_OFFICIAL_CODEGEN_UNITS \
             -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db \
             -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache \
             -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index \
@@ -315,6 +326,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked
@@ -371,6 +383,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked
@@ -426,6 +439,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked
