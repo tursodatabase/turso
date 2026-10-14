@@ -1020,7 +1020,20 @@ remain at output time. Equivalent terminals reuse slots while every exact HIR
 node gets a register mapping. Encoded sort terminals use separate slots and
 source emission suppresses custom decoding only for those slots. Prepared
 registers feed shared row-result reads and the HIR output subroutine.
-Source-row ordering and production entry-point wiring remain later checkpoints.
+Planned SELECT blocks with one window now lower end to end. The block's rows
+play the role of the legacy window source subquery: plain, grouped, ungrouped
+aggregate, and FROM-less rows go to a window input target instead of the SELECT
+output. Rows are sorted by PARTITION BY ascending and then ORDER BY, skipping
+terms equal to an earlier key, with resolved collations, NULL order, and
+custom comparators. Keys of custom types that decode values sort by their
+stored value, and grouped rows add a sequence column so equal keys keep group
+order, both as in legacy. A window with no keys streams rows straight into the
+buffer. The sorted rows then run the shared window step, and the flush emits
+the SELECT output subroutine, so DISTINCT, ORDER BY, LIMIT, and OFFSET apply to
+window output rows. Aggregates, grouped rowids, and bare columns used only by a
+window definition are now collected too. Several windows in one block still
+return an internal error; they need one layer per window, as legacy nests one
+source subquery per window.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

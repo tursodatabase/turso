@@ -3,6 +3,7 @@
 use std::ops::ControlFlow;
 
 use smallvec::SmallVec;
+use turso_parser::ast::{NullsOrder, SortOrder};
 
 use crate::{
     function::{AccumulatorFunc, Func, WindowFunc},
@@ -547,16 +548,118 @@ pub(super) fn emit_hir_window_input_row(
         start: program.alloc_registers(plan.columns.len()),
         count: plan.columns.len(),
     };
-    for (offset, column) in plan.columns.iter().enumerate() {
-        let previous = program.flags.suppress_custom_type_decode();
-        if matches!(column, HirWindowBufferColumn::Encoded(_)) {
-            program.flags.set_suppress_custom_type_decode(true);
-        }
-        let result = translate_expr(program, document, column.expression(), row.start + offset);
-        program.flags.set_suppress_custom_type_decode(previous);
-        result?;
+    for column in 0..plan.columns.len() {
+        emit_hir_window_input_column(program, document, plan, column, row.start + column)?;
     }
     Ok(row)
+}
+
+/// Lower one buffer column of the current source row into `target`.
+pub(super) fn emit_hir_window_input_column(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    plan: &HirWindowBufferPlan<'_>,
+    column: usize,
+    target: usize,
+) -> Result<()> {
+    let column = &plan.columns[column];
+    emit_hir_window_value(
+        program,
+        document,
+        column.expression(),
+        matches!(column, HirWindowBufferColumn::Encoded(_)),
+        target,
+    )
+}
+
+fn emit_hir_window_value(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    encoded: bool,
+    target: usize,
+) -> Result<()> {
+    let previous = program.flags.suppress_custom_type_decode();
+    if encoded {
+        program.flags.set_suppress_custom_type_decode(true);
+    }
+    let result = translate_expr(program, document, expression, target);
+    program.flags.set_suppress_custom_type_decode(previous);
+    result.map(|_| ())
+}
+
+/// One key that orders source rows before they enter the window buffer.
+#[derive(Debug)]
+pub(super) struct HirWindowInputKey<'a> {
+    pub(super) expression: &'a hir::Expr,
+    /// Buffer column holding the decoded value of `expression`.
+    pub(super) slot: usize,
+    pub(super) order: SortOrder,
+    pub(super) nulls: Option<NullsOrder>,
+    pub(super) collation: Option<CollationSeq>,
+    pub(super) type_fact: &'a hir::TypeFact,
+}
+
+impl HirWindowInputKey<'_> {
+    /// Custom types with a decode program sort by their stored value, like
+    /// legacy ORDER BY keys, so the key cannot reuse the decoded buffer value.
+    pub(super) fn is_encoded(&self) -> bool {
+        self.type_fact
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.custom())
+            .is_some_and(|custom| custom.value().decode().is_some())
+    }
+
+    pub(super) fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        document: &hir::HirDocument,
+        target: usize,
+    ) -> Result<()> {
+        emit_hir_window_value(program, document, self.expression, true, target)
+    }
+}
+
+impl<'a> HirWindowBufferPlan<'a> {
+    /// Source-row ordering for this window: PARTITION BY terms ascending, then
+    /// ORDER BY terms, skipping any term equivalent to an earlier key. This is
+    /// the ORDER BY of the legacy window source subquery.
+    pub(super) fn input_sort_keys(&self) -> Vec<HirWindowInputKey<'a>> {
+        let window = self.window;
+        let partition =
+            window
+                .partition_by
+                .iter()
+                .zip(&self.partition_slots)
+                .map(|(term, slot)| HirWindowInputKey {
+                    expression: &term.expr,
+                    slot: *slot,
+                    order: SortOrder::Asc,
+                    nulls: None,
+                    collation: term.collation.as_ref().map(|collation| *collation.value()),
+                    type_fact: &term.type_fact,
+                });
+        let order = window
+            .order_by
+            .iter()
+            .zip(&self.order_slots)
+            .map(|(term, slot)| HirWindowInputKey {
+                expression: &term.expr,
+                slot: *slot,
+                order: term.order,
+                nulls: term.nulls,
+                collation: term.collation.as_ref().map(|collation| *collation.value()),
+                type_fact: &term.type_fact,
+            });
+        let mut keys: Vec<HirWindowInputKey<'a>> = Vec::new();
+        for key in partition.chain(order) {
+            if keys.iter().all(|existing| existing.slot != key.slot) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1779,17 +1882,20 @@ mod tests {
                 .iter()
                 .zip([(1, output), (1, output + 1), (0, output + 2)])
         {
-            assert!(matches!(
-                instruction,
-                Insn::Column {
-                    cursor_id,
-                    column: actual_column,
-                    dest,
-                    default: None,
-                } if *cursor_id == runtime.cursors.csr_current
-                    && *actual_column == column
-                    && *dest == destination
-            ), "unexpected key read {instruction:?}; expected column {column}, register {destination}");
+            assert!(
+                matches!(
+                    instruction,
+                    Insn::Column {
+                        cursor_id,
+                        column: actual_column,
+                        dest,
+                        default: None,
+                    } if *cursor_id == runtime.cursors.csr_current
+                        && *actual_column == column
+                        && *dest == destination
+                ),
+                "unexpected key read {instruction:?}; expected column {column}, register {destination}"
+            );
         }
     }
 
@@ -3824,7 +3930,9 @@ mod tests {
             "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES",
         ] {
             for function in ["sum(value)", "nth_value(value, 2)"] {
-                let document = analyze_sql(&format!("SELECT {function} OVER (PARTITION BY group_id ORDER BY sort_key {frame}) FROM items"));
+                let document = analyze_sql(&format!(
+                    "SELECT {function} OVER (PARTITION BY group_id ORDER BY sort_key {frame}) FROM items"
+                ));
                 let (query, block) = root_query(&document);
                 let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
                 let mut program = program();
