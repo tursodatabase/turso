@@ -2787,7 +2787,7 @@ mod tests {
         // a REAL format argument goes through the same text conversion as
         // CAST(… AS TEXT), which is 15 significant digits, not Rust's
         // shortest round-trip form
-        let fmt = Value::Numeric(Numeric::Float(NonNan::new(2460324.8751736111).unwrap()));
+        let fmt = Value::Numeric(Numeric::Float(NonNan::new(2_460_324.875_173_611).unwrap()));
         let date = Value::Numeric(Numeric::Integer(0));
         assert_eq!(
             exec_strftime(&DefaultClock, &[fmt, date]),
