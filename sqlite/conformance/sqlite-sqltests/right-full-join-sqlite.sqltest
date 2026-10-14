@@ -1179,6 +1179,31 @@ expect {
     1|
 }
 
+# The planner can move a correlated EXISTS of an inner ON term to a later loop
+# with fewer rows. That loop must come before a later RIGHT JOIN: its
+# unmatched-row pass runs the RIGHT JOIN loop again with NULL rows on the left,
+# and the ON term then removed the unmatched rows. ANALYZE runs before the last
+# insert, so the planner sees few rows in ij_d and wants to move the EXISTS.
+test inner-on-exists-left-of-right-join-keeps-unmatched-right-row {
+    CREATE TABLE ij_a(id INTEGER, k INTEGER);
+    CREATE TABLE ij_b(id INTEGER, k INTEGER);
+    CREATE TABLE ij_c(id INTEGER, k INTEGER);
+    CREATE TABLE ij_d(id INTEGER);
+    INSERT INTO ij_a VALUES (1, 2);
+    INSERT INTO ij_c VALUES (3, NULL);
+    ANALYZE;
+    INSERT INTO ij_d VALUES (4);
+    SELECT ij_a.id, ij_b.id, ij_c.id, ij_d.id
+      FROM ij_a
+      JOIN ij_b ON EXISTS (SELECT 1 FROM ij_c AS q WHERE q.id = ij_b.k)
+       AND ij_b.id = ij_a.k
+      RIGHT JOIN ij_c ON ij_c.k IS ij_b.k
+      JOIN ij_d;
+}
+expect {
+    ||3|4
+}
+
 # SQLite keeps an earlier LEFT JOIN when its only rejecting term comes from
 # an inner ON clause left of a later RIGHT JOIN.
 test inner-on-term-does-not-cascade-outer-join-reduction {
@@ -1198,6 +1223,70 @@ test inner-on-term-does-not-cascade-outer-join-reduction {
 }
 expect {
     NULL|NULL|NULL|7
+}
+
+# A correlated EXISTS in the ON clause of a later outer join reads a table on
+# the left of an earlier RIGHT or FULL JOIN. The unmatched-row pass of the
+# earlier join runs the later join again with a NULL row on the left, so the
+# EXISTS must run again in the loop of the later join.
+test full-join-on-exists-reads-null-row-from-earlier-full-join {
+    CREATE TABLE fj_left(id INTEGER, k INTEGER);
+    CREATE TABLE fj_middle(id INTEGER, k INTEGER);
+    CREATE TABLE fj_right(id INTEGER, k INTEGER);
+    INSERT INTO fj_left VALUES (1, 2);
+    INSERT INTO fj_middle VALUES (10, NULL);
+    INSERT INTO fj_right VALUES (100, 2);
+    SELECT fj_left.id, fj_middle.id, fj_right.id
+      FROM fj_left
+      FULL JOIN fj_middle ON fj_middle.k = fj_left.k
+      FULL JOIN fj_right ON fj_middle.id = 10
+       AND EXISTS (SELECT 1 FROM fj_right AS q WHERE q.k = fj_left.k)
+     ORDER BY 1, 2, 3;
+}
+expect {
+    ||100
+    |10|
+    1||
+}
+
+test left-join-on-exists-reads-null-row-from-earlier-right-join {
+    CREATE TABLE rl_left(id INTEGER, k INTEGER);
+    CREATE TABLE rl_middle(id INTEGER, k INTEGER);
+    CREATE TABLE rl_right(id INTEGER, k INTEGER);
+    INSERT INTO rl_left VALUES (1, 2);
+    INSERT INTO rl_middle VALUES (10, NULL);
+    INSERT INTO rl_right VALUES (100, 2);
+    SELECT rl_left.id, rl_middle.id, rl_right.id
+      FROM rl_left
+      RIGHT JOIN rl_middle ON rl_middle.k = rl_left.k
+      LEFT JOIN rl_right ON rl_middle.id = 10
+       AND EXISTS (SELECT 1 FROM rl_right AS q WHERE q.k = rl_left.k);
+}
+expect {
+    |10|
+}
+
+# The WHERE term becomes the seek key of fs, so no open condition uses its
+# subquery. The subquery reads fl, a table on the left of the FULL JOIN. Its
+# unmatched-row pass seeks fs again with a NULL row for fl, so the subquery
+# must run again in that pass, before the seek.
+test where-subquery-in-seek-key-reads-null-row-from-earlier-full-join {
+    CREATE TABLE fl(a INTEGER);
+    CREATE TABLE fe(a INTEGER);
+    CREATE TABLE fr(b INTEGER, c INTEGER);
+    CREATE TABLE fs(c INTEGER);
+    CREATE INDEX fs_c ON fs(c);
+    INSERT INTO fl VALUES (3);
+    INSERT INTO fr VALUES (1, 3);
+    INSERT INTO fs VALUES (1);
+    SELECT fl.a, fr.b, fs.c
+      FROM fl
+      CROSS JOIN fe
+      FULL JOIN fr ON fr.b = fe.a
+      CROSS JOIN fs
+     WHERE fs.c = (SELECT max(q.b) FROM fr AS q WHERE q.c = fl.a);
+}
+expect {
 }
 
 @cross-check-integrity

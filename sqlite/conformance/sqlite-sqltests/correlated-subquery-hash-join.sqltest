@@ -181,3 +181,209 @@ test correlated-scalar-subquery-reads-table-outside-materialized-build-input {
 expect {
     1
 }
+
+# The materialized hash build input has a hash join of its own. Its build
+# filter must not read the EXISTS term, because the subquery of that term
+# reads a table outside the input. ANALYZE runs before most of the inserts,
+# so the planner sees almost empty tables and picks this plan.
+setup nested-hash-join-in-build-input-schema {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t5_c ON t5(c);
+    INSERT INTO t5 VALUES (NULL, NULL, 1), (1, 1, 1), (NULL, 3, 3);
+    INSERT INTO t0 VALUES (2, NULL, 3), (NULL, 1, 2), (1, NULL, 3), (3, NULL, 3);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    INSERT INTO t1 VALUES (2, 0, 0), (2, 5, 5);
+    INSERT INTO t3 VALUES (0, 0, 2), (0, 0, 1);
+    INSERT INTO t4 VALUES (2, 0, 0);
+}
+
+@setup nested-hash-join-in-build-input-schema
+test correlated-exists-reads-table-outside-build-input-with-nested-hash-join {
+    SELECT t0.a, t1.b, t3.c, t5.c
+    FROM t0
+    LEFT JOIN t1 ON t1.a = 2
+    JOIN t3 ON t3.c = t0.a
+    JOIN t5 ON t5.c = t0.c
+    WHERE EXISTS (SELECT 1 FROM t4 WHERE t4.a = t1.a)
+    ORDER BY 1, 2;
+}
+expect {
+    1|0|1|3
+    1|5|1|3
+    2|0|2|3
+    2|5|2|3
+}
+
+# The materialized hash build input runs as its own plan. That plan keeps the
+# EXISTS subquery, because the subquery reads only t3, a table of the input.
+# The only term that uses the subquery is an ON term of the LEFT JOIN to t0,
+# the probe table, so that term never runs in the plan of the build input.
+test exists-in-left-join-on-term-with-materialized-build-input {
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t2_c ON t2(c);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    SELECT * FROM t3
+    CROSS JOIN t2
+    LEFT JOIN t0 ON t0.a = t2.b AND EXISTS (SELECT 1 FROM t0 AS q WHERE q.a = t3.b)
+    WHERE t2.c IS NULL;
+}
+expect {
+}
+
+# The main plan has no loop for t3, a table of the materialized hash build
+# input. The probe of the hash join reads the columns of t3 from the hash
+# payload. A subquery that reads t3 must run in the probe loop and read the
+# payload, not before the loops with the old row of the t3 cursor.
+setup materialized-build-input-with-subquery-schema {
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t2_c ON t2(c);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    INSERT INTO t2 VALUES (1, 5, NULL), (2, 6, NULL);
+    INSERT INTO t0 VALUES (1, 5, 3, 7);
+}
+
+@setup materialized-build-input-with-subquery-schema
+test exists-in-left-join-on-term-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id FROM t3
+    CROSS JOIN t2
+    LEFT JOIN t0 ON t0.a = t2.b AND EXISTS (SELECT 1 FROM t0 AS q WHERE q.b = t3.b)
+    WHERE t2.c IS NULL;
+}
+expect unordered {
+    2|5|1
+    2|6|
+}
+
+@setup materialized-build-input-with-subquery-schema
+test result-column-subquery-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id, (SELECT count(*) FROM t0 AS q WHERE q.b = t3.b) FROM t3
+    CROSS JOIN t2
+    JOIN t0 ON t0.a = t2.b
+    WHERE t2.c IS NULL;
+}
+expect {
+    2|5|1|1
+}
+
+# The optimizer can choose a later table for an EXISTS, to cut its calls. Here
+# it chose t6, the probe table of the hash join. The plan of the materialized
+# hash build input has no loop for t6, so the subquery runs at its earliest
+# loop in that plan.
+test exists-with-later-table-outside-plan-of-materialized-build-input {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 1, 1);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t5 VALUES (2, 1, NULL);
+    CREATE TABLE t6(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t6 VALUES (NULL, 2, NULL);
+    CREATE TABLE t7(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t7 VALUES (NULL, 2, 1);
+    CREATE TABLE t8(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t9(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t10(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t11(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t11_a ON t11(a);
+    CREATE TABLE t12(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t13(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t14(a INTEGER, b INTEGER, c INTEGER);
+    ANALYZE;
+    SELECT * FROM t0
+      JOIN t1 ON t1.a = t0.b
+      JOIN t2 ON t2.b = t0.b
+      JOIN t3 ON t1.c = 3
+      JOIN t4 ON t4.b = t1.b
+      JOIN t5 ON t5.b = t4.b
+      JOIN t6 ON t6.c = t5.a
+      JOIN t7 ON t7.a = t5.a
+      JOIN t8 ON t8.c = t5.c
+      JOIN t11 ON t11.b = t3.c
+      JOIN t12
+      JOIN t13 ON t13.a IS t11.b
+      JOIN t14
+     WHERE t11.c IS t7.b AND t11.a = 1
+       AND EXISTS (SELECT 1 FROM t9 WHERE t9.a = t7.c)
+       AND EXISTS (SELECT 1 FROM t10 WHERE t10.b = t3.c AND t10.c IS NULL);
+}
+expect {
+}
+
+test inner-on-exists-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (2, 3, 3), (NULL, NULL, 1), (2, 3, 2), (NULL, 1, 2);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (3, 3, 1, 3), (4, 1, NULL, NULL), (5, 3, 1, 2);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (4, 3, 3, 2), (5, 1, 2, 2), (6, 2, 3, NULL);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (1, 3, NULL), (3, 1, 3), (NULL, 2, 1), (NULL, 2, NULL);
+    ANALYZE;
+    SELECT count(*) FROM t3
+      CROSS JOIN t1 AS x
+      RIGHT JOIN t1 ON t3.a IS NULL
+      JOIN t0 ON EXISTS (SELECT 1 FROM t2 AS q WHERE q.b = t1.c)
+      LEFT JOIN t2 ON t2.a = 2 AND t2.c = t0.b
+     WHERE x.c = 2;
+}
+expect {
+    16
+}
+
+test where-in-subquery-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (3, 1, 1);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, NULL, 3, NULL), (2, 1, 3, 1), (3, 3, 3, 1);
+    CREATE INDEX t1_a ON t1(a);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (3, NULL, 1), (NULL, 3, 1);
+    CREATE INDEX t3_b ON t3(b);
+    ANALYZE;
+    SELECT * FROM (t3 JOIN t1 AS s1 JOIN t1 ON t1.b = t3.b)
+      LEFT JOIN t0 ON t0.b = t3.a AND coalesce(t0.c, 0) = s1.c + 0
+     WHERE t1.a IS NULL AND s1.b IN (SELECT q.a FROM t1 AS q WHERE q.b = t3.c);
+}
+expect {
+}
+
+test where-in-subquery-reads-materialized-build-input-for-unmatched-build-rows {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (2, 3, 1), (2, 1, 2);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (NULL, 2, 1), (2, 1, 2);
+    ANALYZE;
+    SELECT * FROM t2
+      JOIN (SELECT * FROM t0) AS s1 ON s1.c = t2.c
+      LEFT JOIN t0 ON t0.c = 3 AND t0.c = t2.a
+     WHERE t0.c IN (SELECT q.b FROM t0 AS q WHERE q.b = s1.c);
+}
+expect {
+}
+
+test full-join-on-exists-runs-again-for-unmatched-hash-build-rows {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (5, 1, NULL, 3);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    SELECT * FROM (SELECT a, count(*) AS b, max(c) AS c FROM t3 GROUP BY a) AS d1
+      JOIN t3 ON NOT EXISTS (SELECT 1 FROM t4 AS q WHERE q.c = d1.b)
+      FULL JOIN t1 ON EXISTS (SELECT 1 FROM t1 AS q WHERE q.a = d1.c) AND coalesce(t1.a, 0) = t3.b + 0
+     WHERE d1.c = 3;
+}
+expect {
+    1|1|3|5|1||3|||
+}
