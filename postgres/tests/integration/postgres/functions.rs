@@ -2,6 +2,190 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[test]
+fn test_pg_function_column_alias_view_survives_reopen() {
+    for mvcc in [false, true] {
+        let db = TempDatabase::builder()
+            .with_views(true)
+            .with_mvcc(mvcc)
+            .build();
+        let conn = db.connect_postgres();
+        conn.execute(
+            "CREATE VIEW public.dump_values AS
+            SELECT v.value FROM pg_catalog.unnest(ARRAY[9,2]) AS v(value)",
+        )
+        .unwrap();
+        let expected = vec![vec![Value::from_i64(9)], vec![Value::from_i64(2)]];
+        assert_eq!(
+            conn.prepare("SELECT * FROM public.dump_values")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            expected
+        );
+        let path = db.path.clone();
+        let io = db.io.clone();
+        conn.close().unwrap();
+        drop(conn);
+        drop(db);
+        let reopened = turso_pg::open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_views(true)
+                .with_custom_types(true),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&reopened).unwrap();
+        assert_eq!(
+            conn.prepare("SELECT * FROM public.dump_values")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_array_casts_preserve_elements(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for (input, ty, expected) in [
+        ("'{17,NULL,2}'", "pg_catalog.oid[]", "17|<null>|2"),
+        ("'{17,NULL,hello}'", "text[]", "17|<null>|hello"),
+        ("'{3.5,2.25}'", "float8[]", "3.5|2.25"),
+        ("'{}'", "integer[]", ""),
+        ("ARRAY[17, 2]", "integer[]", "17|2"),
+        ("'{t,NULL,f}'", "boolean[]", "1|<null>|0"),
+    ] {
+        assert_eq!(
+            query_text(
+                &conn,
+                &format!("SELECT array_to_string({input}::{ty}, '|', '<null>')")
+            ),
+            vec![expected],
+            "{input}::{ty}"
+        );
+    }
+    assert_eq!(
+        conn.prepare("SELECT NULL::integer[], NULL::boolean[]")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::Null, Value::Null]]
+    );
+    assert!(conn
+        .prepare("SELECT '{hello}'::integer[]")
+        .unwrap()
+        .run_collect_rows()
+        .is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_unnest_preserves_values_and_aliases(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for input in ["ARRAY[17, NULL, 2]", "'{17,NULL,2}'::pg_catalog.oid[]"] {
+        assert_eq!(
+            conn.prepare(format!("SELECT x FROM pg_catalog.unnest({input}) AS t(x)"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![
+                vec![Value::from_i64(17)],
+                vec![Value::Null],
+                vec![Value::from_i64(2)],
+            ]
+        );
+    }
+    for input in ["NULL", "ARRAY[]", "'{}'::pg_catalog.oid[]"] {
+        assert!(conn
+            .prepare(format!("SELECT * FROM unnest({input})"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        conn.prepare("SELECT a, b FROM pg_options_to_table(ARRAY['z=17']) AS t(a, b)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("z"), Value::build_text("17")]]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT a.x, a.option_value, b.option_name
+            FROM pg_options_to_table(ARRAY['z=17']) AS a(x),
+                 pg_options_to_table(ARRAY['y=9']) AS b"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![
+            Value::build_text("z"),
+            Value::build_text("17"),
+            Value::build_text("y")
+        ]]
+    );
+    conn.execute("CREATE TABLE public.unnest_probe (v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO public.unnest_probe VALUES (17), (2)")
+        .unwrap();
+    for query in [
+        "SELECT p.v FROM unnest('{17}'::pg_catalog.oid[]) AS src(tbloid)
+            JOIN public.unnest_probe p ON src.tbloid = p.v",
+        "SELECT p.v FROM public.unnest_probe p
+            JOIN unnest('{17}'::pg_catalog.oid[]) AS src(tbloid) ON src.tbloid = p.v",
+    ] {
+        assert_eq!(
+            conn.prepare(query).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(17)]]
+        );
+    }
+    conn.execute("CREATE TABLE public.unnest_sets (id INTEGER, vals INTEGER[])")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO public.unnest_sets VALUES (1, ARRAY[17, 2]), (2, ARRAY[9]), (3, ARRAY[])",
+    )
+    .unwrap();
+    assert_eq!(
+        conn.prepare(
+            "SELECT _turso_function_rows.id, t.x FROM public.unnest_sets _turso_function_rows,
+            unnest(_turso_function_rows.vals) AS t(x) ORDER BY 1, 2"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(1), Value::from_i64(17)],
+            vec![Value::from_i64(2), Value::from_i64(9)],
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT t.x, u.unnest FROM unnest(ARRAY[17]) AS t(x), unnest(ARRAY[2]) u")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17), Value::from_i64(2)]]
+    );
+    assert!(conn
+        .prepare("SELECT * FROM unnest(17)")
+        .unwrap()
+        .run_collect_rows()
+        .is_err());
+    assert!(conn
+        .prepare("SELECT * FROM unnest(ARRAY[17]) AS t(a, b)")
+        .is_err());
+    assert!(conn.prepare("SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
+        array_to_string(array(SELECT quote_literal(x) FROM unnest(evttags) AS t(x)), ', ') AS evttags,
+        e.evtfoid::regproc AS evtfname FROM pg_event_trigger e ORDER BY e.oid")
+        .unwrap().run_collect_rows().unwrap().is_empty());
+}
+
 #[turso_macros::test(mvcc)]
 fn test_pg_array_subquery_preserves_query_results(db: TempDatabase) {
     let conn = db.connect_postgres();

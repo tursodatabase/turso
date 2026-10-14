@@ -2925,10 +2925,17 @@ impl<'a> Parser<'a> {
                                 let exprs = self.parse_expr_list()?;
                                 eat_expect!(self, TK_RP);
                                 let alias = self.parse_as()?;
+                                let columns = if alias.is_some() {
+                                    self.parse_nm_list_opt()?
+                                } else {
+                                    vec![]
+                                };
                                 let on_using = self.parse_on_using()?;
                                 result.push(JoinedSelectTable {
                                     operator: op,
-                                    table: Box::new(SelectTable::TableCall(name, exprs, alias)),
+                                    table: Box::new(SelectTable::TableCall(
+                                        name, exprs, alias, columns,
+                                    )),
                                     constraint: on_using,
                                 });
                             }
@@ -3004,8 +3011,15 @@ impl<'a> Parser<'a> {
                             let exprs = self.parse_expr_list()?;
                             eat_expect!(self, TK_RP);
                             let alias = self.parse_as()?;
+                            let columns = if alias.is_some() {
+                                self.parse_nm_list_opt()?
+                            } else {
+                                vec![]
+                            };
                             Ok(FromClause {
-                                select: Box::new(SelectTable::TableCall(name, exprs, alias)),
+                                select: Box::new(SelectTable::TableCall(
+                                    name, exprs, alias, columns,
+                                )),
                                 joins: self.parse_joined_tables()?,
                             })
                         }
@@ -9472,6 +9486,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     None,
+                                    vec![],
                                 )),
                                 joins: vec![]
                             }),
@@ -10205,6 +10220,7 @@ mod tests {
                                                 Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                             ],
                                             None,
+                                            vec![],
                                         )),
                                         constraint: None,
                                     }
@@ -13145,6 +13161,32 @@ mod tests {
                 let result_str = result.to_string();
                 assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
+        }
+    }
+
+    #[test]
+    fn function_column_aliases_roundtrip() {
+        for sql in [
+            "SELECT v.value FROM main.unnest(array(9, 2)) AS v(value)",
+            "SELECT t.id, v.value FROM t JOIN unnest(t.vals) AS v(value) ON v.value = t.id",
+            "SELECT * FROM pg_options_to_table(array('x=9')) AS v(\"Key\", \"Value\")",
+            "CREATE VIEW v AS SELECT t.value FROM unnest(array(9, 2)) t(value)",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            let formatted = cmd.to_string();
+            let reparsed = Parser::new(formatted.as_bytes())
+                .next_cmd()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reparsed.to_string(), formatted);
+            assert_eq!(cmd, reparsed);
+        }
+        for sql in [
+            "SELECT * FROM unnest(array(9))(value)",
+            "SELECT * FROM unnest(array(9)) AS t()",
+            "SELECT * FROM unnest(array(9)) AS t(value,)",
+        ] {
+            assert!(Parser::new(sql.as_bytes()).next_cmd().is_err(), "{sql}");
         }
     }
 

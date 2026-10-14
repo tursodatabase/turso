@@ -1236,7 +1236,7 @@ where
 {
     match select_table {
         ast::SelectTable::Table(..) => {}
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::TableCall(_, args, ..) => {
             for arg in args {
                 rewrite_expression_tree(arg, rewrite_expr)?;
             }
