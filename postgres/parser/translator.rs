@@ -2109,9 +2109,7 @@ impl PostgreSQLTranslator {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 Some(match derived_column_name(val) {
-                                    Some((name, _)) => {
-                                        ast::As::Elided(ast::Name::from_string(name))
-                                    }
+                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
                                     None => ast::As::ImplicitColumnName(ast::Name::from_string(
                                         "?column?",
                                     )),
@@ -4074,11 +4072,15 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
-/// The returned flag marks a weak name that an enclosing cast or CASE replaces:
-/// a cast is named after the expression it casts unless that name is weak, and
-/// then after its target type, so `1::int::text` is named `text`. A CASE is
-/// named after its ELSE expression unless that name is weak, and then `case`.
-fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<(String, bool)> {
+fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    derived_column_name_and_is_fallback(node).map(|(name, _)| name)
+}
+
+/// The returned flag marks a fallback name that an enclosing cast or CASE replaces:
+/// a cast is named after the expression it casts unless that name is a fallback,
+/// and then after its target type, so `1::int::text` is named `text`. A CASE is
+/// named after its ELSE expression unless that name is a fallback, and then `case`.
+fn derived_column_name_and_is_fallback(node: &pg_query::protobuf::Node) -> Option<(String, bool)> {
     use pg_query::protobuf::node::Node;
     let last_string = |names: &[pg_query::protobuf::Node]| {
         names
@@ -4093,13 +4095,17 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<(String, bool)
         Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname)?,
         Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields)?,
         Some(Node::TypeCast(type_cast)) => {
-            return match derived_column_name(type_cast.arg.as_deref()?) {
+            return match derived_column_name_and_is_fallback(type_cast.arg.as_deref()?) {
                 Some((name, false)) => Some((name, false)),
                 _ => Some((last_string(&type_cast.type_name.as_ref()?.names)?, true)),
             };
         }
         Some(Node::CaseExpr(case_expr)) => {
-            return match case_expr.defresult.as_deref().and_then(derived_column_name) {
+            return match case_expr
+                .defresult
+                .as_deref()
+                .and_then(derived_column_name_and_is_fallback)
+            {
                 Some((name, false)) => Some((name, false)),
                 _ => Some(("case".to_string(), true)),
             };
