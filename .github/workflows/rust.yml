@@ -686,19 +686,32 @@ jobs:
           - name: fts-recovery-mvcc
             iterations: 10
             args: "--mode fts-recovery --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
-          # The multiprocess profiles are the slowest, so their iterations
-          # are split across two jobs each.
-          - name: multiprocess (1/2)
-            iterations: 5
+          # The multiprocess profiles are the slowest, so their 10 iterations
+          # are split across four jobs each (3+3+2+2). The step below runs up
+          # to 4 iterations at once, so each job finishes in one round.
+          - name: multiprocess (1/4)
+            iterations: 3
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
-          - name: multiprocess (2/2)
-            iterations: 5
+          - name: multiprocess (2/4)
+            iterations: 3
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
-          - name: multiprocess-kill (1/2)
-            iterations: 5
+          - name: multiprocess (3/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess (4/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess-kill (1/4)
+            iterations: 3
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
-          - name: multiprocess-kill (2/2)
-            iterations: 5
+          - name: multiprocess-kill (2/4)
+            iterations: 3
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (3/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (4/4)
+            iterations: 2
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
