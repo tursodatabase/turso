@@ -38,6 +38,12 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The release profile uses thin LTO, meant for the packages published
+      # from tags. Pull requests only need to know the libraries build.
+      - name: Use a faster build profile on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+
       - name: Build iOS libraries
         run: make ios-build
         working-directory: ${{ env.working-directory }}
@@ -80,6 +86,12 @@ jobs:
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
+
+      # The release profile uses thin LTO, meant for the packages published
+      # from tags. Pull requests only need to know the libraries build.
+      - name: Use a faster build profile on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
 
       - name: Build Android libraries
         run: make android
