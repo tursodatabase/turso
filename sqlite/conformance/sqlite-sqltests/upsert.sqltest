@@ -929,3 +929,63 @@ expect {
     11
     ok
 }
+
+@cross-check-integrity
+test upsert-or-ignore-do-update-pk-returning {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES(1,1);
+    INSERT OR IGNORE INTO t VALUES(1,10) ON CONFLICT(a) DO UPDATE SET b=excluded.b RETURNING a,b;
+    SELECT a, b, changes() FROM t;
+}
+expect {
+    1|10
+    1|10|1
+}
+
+@cross-check-integrity
+test upsert-or-ignore-do-update-fires-after-update-trigger {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tg AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES(NEW.b);
+    END;
+    INSERT INTO t VALUES(1,1);
+    INSERT OR IGNORE INTO t VALUES(1,10) ON CONFLICT(a) DO UPDATE SET b=excluded.b;
+    SELECT x FROM log;
+}
+expect {
+    10
+}
+
+@cross-check-integrity
+test upsert-or-ignore-do-update-unique-index {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER);
+    INSERT INTO t VALUES(1,'x',1);
+    INSERT OR IGNORE INTO t VALUES(2,'x',5) ON CONFLICT(b) DO UPDATE SET c=excluded.c;
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|x|5
+}
+
+@cross-check-integrity
+test upsert-or-ignore-conflict-outside-target-is-ignored {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER);
+    INSERT INTO t VALUES(1,'x',1);
+    INSERT OR IGNORE INTO t VALUES(1,'y',5) ON CONFLICT(b) DO UPDATE SET c=excluded.c;
+    SELECT a, b, c, changes() FROM t;
+}
+expect {
+    1|x|1|0
+}
+
+@cross-check-integrity
+test upsert-or-ignore-do-update-without-target {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES(1,1);
+    INSERT OR IGNORE INTO t VALUES(1,10) ON CONFLICT DO UPDATE SET b=excluded.b;
+    SELECT a, b FROM t;
+}
+expect {
+    1|10
+}
