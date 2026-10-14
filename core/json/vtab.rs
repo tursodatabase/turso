@@ -279,6 +279,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             let path = "$";
             (path, jsonb)
         } else {
+            // Like SQLite, a NULL path is an empty result once the JSON has parsed.
+            if args[1] == Value::Null {
+                return Ok(false);
+            }
             let Value::Text(path) = &args[1] else {
                 return Err(LimboError::InvalidArgument(
                     "root path should be text".to_owned(),
