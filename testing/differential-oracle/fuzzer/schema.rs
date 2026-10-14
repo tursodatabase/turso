@@ -35,7 +35,7 @@ impl SchemaIntrospector {
             None => String::new(),
         };
         let query = format!(
-            "SELECT name, sql FROM {prefix}sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
+            "SELECT name, sql FROM {prefix}sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' AND name NOT IN ('turso_cdc', 'turso_cdc_version') ORDER BY name"
         );
         let mut rows = conn
             .query(&query)
@@ -68,7 +68,7 @@ impl SchemaIntrospector {
             None => String::new(),
         };
         let query = format!(
-            "SELECT name, sql FROM {prefix}sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY name"
+            "SELECT name, sql FROM {prefix}sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' AND name NOT IN ('turso_cdc', 'turso_cdc_version') ORDER BY name"
         );
         let mut stmt = conn
             .prepare(&query)

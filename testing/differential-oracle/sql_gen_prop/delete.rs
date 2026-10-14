@@ -3,10 +3,10 @@
 use proptest::prelude::*;
 use std::fmt;
 
+use crate::constant_false::delete_or_update_where_clause;
 use crate::expression::Expression;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
-use crate::select::optional_where_clause;
 
 // =============================================================================
 // DELETE STATEMENT PROFILE
@@ -53,7 +53,7 @@ pub fn delete_for_table(
 ) -> BoxedStrategy<DeleteStatement> {
     let table_name = table.qualified_name();
 
-    optional_where_clause(table, schema, profile)
+    delete_or_update_where_clause(table, schema, profile)
         .prop_map(move |where_clause| DeleteStatement {
             table: table_name.clone(),
             where_clause,
