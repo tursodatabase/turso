@@ -1,0 +1,47 @@
+@database :memory:
+
+@cross-check-integrity
+test aggregate-argument-under-group-by-uses-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'a'),(1,'A'),(2,'a');
+    SELECT g, sum(a='A') FROM t GROUP BY g;
+}
+expect {
+    1|2
+    2|1
+}
+
+@cross-check-integrity
+test aggregate-filter-under-group-by-uses-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'a'),(1,'A'),(2,'a');
+    SELECT g, count(*) FILTER (WHERE a='A') FROM t GROUP BY g;
+}
+expect {
+    1|2
+    2|1
+}
+
+@cross-check-integrity
+test aggregate-under-group-by-into-keyed-table-uses-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    CREATE TABLE u(g INT PRIMARY KEY, n INT);
+    INSERT INTO t VALUES(1,'a'),(1,'A'),(2,'a');
+    INSERT INTO u SELECT g, sum(a='A') FROM t GROUP BY g;
+    SELECT group_concat(n) FROM (SELECT n FROM u ORDER BY g);
+}
+expect {
+    2,1
+}
+
+@cross-check-integrity
+test aggregate-under-group-by-with-partial-index-uses-column-collation {
+    CREATE TABLE t(g INT, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES(1,'a'),(1,'A'),(2,'a');
+    CREATE INDEX tp ON t(g) WHERE g>0;
+    SELECT g, sum(a='A') FROM t GROUP BY g;
+}
+expect {
+    1|2
+    2|1
+}

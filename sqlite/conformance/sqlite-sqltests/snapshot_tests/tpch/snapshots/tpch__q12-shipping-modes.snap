@@ -85,12 +85,12 @@ addr  opcode                  p1  p2  p3  p4                                    
   38            Copy          32  37   0                                          0  r[37]=r[32]
   39            String8        0  38   0  1-URGENT                                0  r[38]='1-URGENT'
   40            Integer        1  35   0                                          0  r[35]=1
-  41            Eq            37  38  43                                          0  if r[37]==r[38] goto 43
+  41            Eq            37  38  43  Binary                                  0  if r[37]==r[38] goto 43
   42            ZeroOrNull    37  35  38                                          0  ((r[37]=NULL)|(r[38]=NULL)) ? r[35]=NULL : r[35]=0
   43            Copy          32  39   0                                          0  r[39]=r[32]
   44            String8        0  40   0  2-HIGH                                  0  r[40]='2-HIGH'
   45            Integer        1  36   0                                          0  r[36]=1
-  46            Eq            39  40  48                                          0  if r[39]==r[40] goto 48
+  46            Eq            39  40  48  Binary                                  0  if r[39]==r[40] goto 48
   47            ZeroOrNull    39  36  40                                          0  ((r[39]=NULL)|(r[40]=NULL)) ? r[36]=NULL : r[36]=0
   48            Or            36  35  34                                          0  r[34]=(r[35] || r[36])
   49            IfNot         34  52   1                                          0  if !r[34] goto 52
@@ -101,12 +101,12 @@ addr  opcode                  p1  p2  p3  p4                                    
   54            Copy          32  45   0                                          0  r[45]=r[32]
   55            String8        0  46   0  1-URGENT                                0  r[46]='1-URGENT'
   56            Integer        1  43   0                                          0  r[43]=1
-  57            Ne            45  46  59                                          0  if r[45]!=r[46] goto 59
+  57            Ne            45  46  59  Binary                                  0  if r[45]!=r[46] goto 59
   58            ZeroOrNull    45  43  46                                          0  ((r[45]=NULL)|(r[46]=NULL)) ? r[43]=NULL : r[43]=0
   59            Copy          32  47   0                                          0  r[47]=r[32]
   60            String8        0  48   0  2-HIGH                                  0  r[48]='2-HIGH'
   61            Integer        1  44   0                                          0  r[44]=1
-  62            Ne            47  48  64                                          0  if r[47]!=r[48] goto 64
+  62            Ne            47  48  64  Binary                                  0  if r[47]!=r[48] goto 64
   63            ZeroOrNull    47  44  48                                          0  ((r[47]=NULL)|(r[48]=NULL)) ? r[44]=NULL : r[44]=0
   64            And           44  43  42                                          0  r[42]=(r[43] && r[44])
   65            IfNot         42  68   1                                          0  if !r[42] goto 68
