@@ -29,6 +29,11 @@ env:
 jobs:
   test:
     timeout-minutes: 30
+    env:
+      # `uv sync` builds the extension with maturin, which defaults to an
+      # optimized release build with LTO. The tests only need a working
+      # extension, and a debug build reuses what "Build Rust (debug)" built.
+      MATURIN_PEP517_ARGS: "--profile dev"
     strategy:
       matrix:
         os:
