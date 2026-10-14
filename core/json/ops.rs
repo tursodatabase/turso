@@ -85,6 +85,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let ValueRef::Text(s) = arg.as_value_ref() {
@@ -92,10 +96,13 @@ where
                 return Ok(Value::Null);
             }
         }
-        if let Some(path) = json_path_from_db_value(&arg, true)? {
-            let mut op = DeleteOperation::new();
-            let _ = json.operate_on_path(&path, &mut op);
-        }
+        // Unlike json_set() and friends, which drop a pair with a SQL NULL
+        // path, json_remove() makes the whole result SQL NULL.
+        let Some(path) = json_path_from_db_value(&arg, true)? else {
+            return Ok(Value::Null);
+        };
+        let mut op = DeleteOperation::new();
+        let _ = json.operate_on_path(&path, &mut op);
     }
 
     let el_type = json.element_type()?;
@@ -118,6 +125,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let ValueRef::Text(s) = arg.as_value_ref() {
@@ -125,10 +136,13 @@ where
                 return Ok(Value::Null);
             }
         }
-        if let Some(path) = json_path_from_db_value(&arg, true)? {
-            let mut op = DeleteOperation::new();
-            let _ = json.operate_on_path(&path, &mut op);
-        }
+        // Unlike json_set() and friends, which drop a pair with a SQL NULL
+        // path, json_remove() makes the whole result SQL NULL.
+        let Some(path) = json_path_from_db_value(&arg, true)? else {
+            return Ok(Value::Null);
+        };
+        let mut op = DeleteOperation::new();
+        let _ = json.operate_on_path(&path, &mut op);
     }
 
     Ok(Value::Blob(json.data()))
@@ -149,6 +163,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
@@ -188,6 +206,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
@@ -227,6 +249,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -267,6 +293,10 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    // A SQL NULL document is SQL NULL, whatever the paths are.
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -496,6 +526,31 @@ mod tests {
     }
 
     #[test]
+    fn test_null_document_decides_result_before_arguments() {
+        // SQLite returns SQL NULL as soon as it sees a SQL NULL document, so
+        // the invalid path and the value that is not JSON below are never read.
+        let args = [Value::Null, create_text("bad path"), create_text("nope")];
+        let cache = JsonCacheCell::new();
+        assert_eq!(json_set(&args, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(jsonb_set(&args, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(json_insert(&args, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(jsonb_insert(&args, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(json_replace(&args, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(jsonb_replace(&args, &cache).unwrap(), Value::Null);
+
+        let paths = [Value::Null, create_text("bad path")];
+        let cache = JsonCacheCell::new();
+        assert_eq!(json_remove(&paths, &cache).unwrap(), Value::Null);
+        let cache = JsonCacheCell::new();
+        assert_eq!(jsonb_remove(&paths, &cache).unwrap(), Value::Null);
+    }
+
+    #[test]
     fn test_edited_null_document_is_still_a_document() {
         // A document that is JSON `null` was edited, so SQLite returns the text
         // `null` rather than SQL NULL. json_extract() has to map `null` to SQL
@@ -595,5 +650,86 @@ mod tests {
             jsonb_remove(&[create_json("[1]"), create_text("$")], &cache).unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn test_null_path_drops_pair_without_reading_value() {
+        // A PATH/VALUE pair whose path is SQL NULL is skipped, so the value is
+        // never converted and a BLOB in it is not an error.
+        for (name, result) in [
+            (
+                "json_set",
+                json_set(
+                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "json_insert",
+                json_insert(
+                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "json_replace",
+                json_replace(
+                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &JsonCacheCell::new(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!(result, create_json("[1]"), "{name}");
+        }
+
+        // Only the pair with the NULL path is dropped, whichever side of it the
+        // usable pair is on.
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            json_set(
+                &[
+                    create_json("[1]"),
+                    Value::Null,
+                    Value::from_i64(2),
+                    create_text("$[0]"),
+                    Value::from_i64(3)
+                ],
+                &cache
+            )
+            .unwrap(),
+            create_json("[3]")
+        );
+
+        // A value that is SQL NULL at a real path is still stored, so this is
+        // JSON `null` in the document and not a dropped pair.
+        let cache = JsonCacheCell::new();
+        assert_eq!(
+            json_set(
+                &[create_json(r#"{"a":1}"#), create_text("$.b"), Value::Null],
+                &cache
+            )
+            .unwrap(),
+            create_json(r#"{"a":1,"b":null}"#)
+        );
+    }
+
+    #[test]
+    fn test_null_path_makes_json_remove_null() {
+        // json_remove() treats a SQL NULL path the other way round: the whole
+        // result becomes SQL NULL, whatever the other paths are.
+        for args in [
+            vec![create_json("[1]"), Value::Null],
+            vec![create_json("[1]"), create_text("$"), Value::Null],
+            vec![create_json("[1]"), Value::Null, create_text("$")],
+            vec![create_json("[1]"), create_text("$[0]"), Value::Null],
+        ] {
+            let cache = JsonCacheCell::new();
+            assert_eq!(json_remove(&args, &cache).unwrap(), Value::Null);
+            let cache = JsonCacheCell::new();
+            assert_eq!(jsonb_remove(&args, &cache).unwrap(), Value::Null);
+        }
     }
 }
