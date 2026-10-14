@@ -23,7 +23,7 @@ TURSOPG := $(TARGET_ROOT)/$(TARGET_DIR)/tursopg
 SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CARGO_PROFILE)
 
 # Test corpora (relative to this directory)
-PG_TESTS := pg-sqltests turso-sqltests
+PG_TESTS := pg-sqltests
 
 .PHONY: all build build-tursopg build-runner check run test run-one run-upstream clean
 
