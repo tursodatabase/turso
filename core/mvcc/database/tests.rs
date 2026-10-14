@@ -23448,3 +23448,112 @@ fn read_ids_below_sequence_watermark(reader: &Arc<Connection>, last: i64) -> (Ve
     };
     (ids, new_last)
 }
+
+#[test]
+fn test_dropped_commit_publishes_sequence_watermark_before_releasing_exclusive_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer.execute("CREATE SEQUENCE s").unwrap();
+    let mvcc_store = db.get_mvcc_store();
+
+    writer.execute("BEGIN").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let tx_id = writer.get_mv_tx_id().unwrap();
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+    assert!(mvcc_store.is_exclusive_tx(&tx_id));
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let store = mvcc_store.clone();
+    let observer = std::thread::spawn(move || {
+        let _watermarks = store.sequence_watermarks.lock();
+        locked_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if !store.is_exclusive_tx(&tx_id) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    });
+    locked_rx.recv().unwrap();
+    drop(commit);
+    assert!(
+        !observer.join().unwrap(),
+        "dropped commit released the exclusive lock before it published its sequence watermark"
+    );
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_does_not_go_back_when_concurrent_allocation_is_tracked_after_begin_commits(
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    let reader = db.connect();
+    concurrent.execute("CREATE SEQUENCE s").unwrap();
+
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut concurrent_nextval = concurrent.prepare("SELECT nextval('s')").unwrap();
+    assert!(matches!(
+        concurrent_nextval.step().unwrap(),
+        StepResult::Yield
+    ));
+
+    exclusive.execute("BEGIN").unwrap();
+    let rows = get_rows(&exclusive, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    exclusive.execute("COMMIT").unwrap();
+
+    while !matches!(concurrent_nextval.step().unwrap(), StepResult::Row) {}
+    assert_eq!(
+        concurrent_nextval.row().unwrap().get_value(0).as_int(),
+        Some(1)
+    );
+    while !matches!(concurrent_nextval.step().unwrap(), StepResult::Done) {}
+    concurrent.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_does_not_go_back_when_older_allocation_is_tracked_last() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let first = db.connect();
+    let second = db.connect();
+    let reader = db.connect();
+    first.execute("CREATE SEQUENCE s").unwrap();
+
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut first_nextval = first.prepare("SELECT nextval('s')").unwrap();
+    assert!(matches!(first_nextval.step().unwrap(), StepResult::Yield));
+
+    second.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&second, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    second.execute("COMMIT").unwrap();
+
+    while !matches!(first_nextval.step().unwrap(), StepResult::Row) {}
+    assert_eq!(first_nextval.row().unwrap().get_value(0).as_int(), Some(1));
+    while !matches!(first_nextval.step().unwrap(), StepResult::Done) {}
+    first.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
