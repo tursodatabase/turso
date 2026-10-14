@@ -545,6 +545,28 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+@skip-if mvcc "attach is not supported for mvcc"
+test drop-type-in-use-by-attached-table {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.p(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by column amount in table p
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-temp-table {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TEMP TABLE p(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by column amount in table p
+}
+
+@requires strict "uses STRICT tables"
 test add-column-custom-type {
     CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
