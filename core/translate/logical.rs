@@ -437,6 +437,14 @@ impl<'a> LogicalPlanBuilder<'a> {
         name.as_str().to_string()
     }
 
+    /// Identifier used as a lookup key: table, alias, CTE or column name.
+    /// SQL folds these ASCII-case-insensitively, and the delta stream feeding a
+    /// materialized view is keyed by the schema's normalized table name, so the
+    /// plan must record identity under the same spelling.
+    fn normalized_name(name: &ast::Name) -> String {
+        crate::util::normalize_ident(name.as_str())
+    }
+
     // Build a SELECT statement
     // Build a logical plan from a SELECT statement
     fn build_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
@@ -458,7 +466,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Build each CTE
         for cte in &with.ctes {
             let cte_plan = self.build_select(&cte.select)?;
-            let cte_name = Self::name_to_string(&cte.tbl_name);
+            let cte_name = Self::normalized_name(&cte.tbl_name);
             cte_plans.insert(cte_name.clone(), Arc::new(cte_plan));
             self.ctes
                 .insert(cte_name.clone(), cte_plans[&cte_name].clone());
@@ -471,7 +479,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         // Clear CTEs from builder context
         for cte in &with.ctes {
-            self.ctes.remove(&Self::name_to_string(&cte.tbl_name));
+            self.ctes.remove(&Self::normalized_name(&cte.tbl_name));
         }
 
         Ok(LogicalPlan::WithCTE(WithCTE {
@@ -595,7 +603,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
             ast::SelectTable::Table(name, alias, _indexed) => {
-                let table_name = Self::name_to_string(&name.name);
+                let table_name = Self::normalized_name(&name.name);
                 // Check if it's a CTE reference
                 if let Some(cte_plan) = self.ctes.get(&table_name) {
                     return Ok(LogicalPlan::CTERef(CTERef {
@@ -605,7 +613,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
+                let table_alias = alias.as_ref().map(|a| Self::normalized_name(a.name()));
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
@@ -799,7 +807,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         let mut conditions = Vec::new();
 
         for col_name in columns {
-            let name = Self::name_to_string(col_name);
+            let name = Self::normalized_name(col_name);
 
             // Find the column in both schemas
             let _left_idx = left_schema
@@ -930,7 +938,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     let logical_expr = self.build_expr(expr, input_schema)?;
                     let explicit_alias = alias.as_ref().filter(|a| a.is_explicit());
                     let col_name = match explicit_alias {
-                        Some(as_alias) => Self::name_to_string(as_alias.name()),
+                        Some(as_alias) => Self::normalized_name(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
@@ -944,7 +952,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     });
 
                     if let Some(as_alias) = explicit_alias {
-                        let alias_name = Self::name_to_string(as_alias.name());
+                        let alias_name = Self::normalized_name(as_alias.name());
                         proj_exprs.push(LogicalExpr::Alias {
                             expr: Box::new(logical_expr),
                             alias: alias_name,
@@ -962,7 +970,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
                 ast::ResultColumn::TableStar(table) => {
                     // Expand table.* to all columns from that table
-                    let table_name = Self::name_to_string(table);
+                    let table_name = Self::normalized_name(table);
                     for col in &input_schema.columns {
                         // Simple check - would need proper table tracking in real implementation
                         proj_exprs.push(LogicalExpr::Column(Column::with_table(
@@ -1163,7 +1171,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 select_exprs.push(logical_expr.clone());
 
                 if let Some(alias) = alias.as_ref().filter(|a| a.is_explicit()) {
-                    alias_to_expr.insert(Self::name_to_string(alias.name()), logical_expr);
+                    alias_to_expr.insert(Self::normalized_name(alias.name()), logical_expr);
                 }
             }
         }
@@ -1250,7 +1258,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
                     // Determine the column name for this expression
                     let col_name = match alias.as_ref().filter(|a| a.is_explicit()) {
-                        Some(as_alias) => Self::name_to_string(as_alias.name()),
+                        Some(as_alias) => Self::normalized_name(as_alias.name()),
                         None => Self::expr_to_column_name(expr),
                     };
 
@@ -1384,7 +1392,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 match &columns[i] {
                     ast::ResultColumn::Expr(e, alias) => {
                         match alias.as_ref().filter(|a| a.is_explicit()) {
-                            Some(as_alias) => Self::name_to_string(as_alias.name()),
+                            Some(as_alias) => Self::normalized_name(as_alias.name()),
                             None => Self::expr_to_column_name(e),
                         }
                     }
@@ -1617,22 +1625,21 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Build expression from AST
     fn build_expr(&mut self, expr: &ast::Expr, _schema: &SchemaRef) -> Result<LogicalExpr> {
         match expr {
-            ast::Expr::Id(name) => Ok(LogicalExpr::Column(Column::new(Self::name_to_string(name)))),
+            ast::Expr::Id(name) => Ok(LogicalExpr::Column(Column::new(Self::normalized_name(
+                name,
+            )))),
 
-            ast::Expr::DoublyQualified(db, table, col) => {
-                Ok(LogicalExpr::Column(Column::with_table(
-                    Self::name_to_string(col),
-                    format!(
-                        "{}.{}",
-                        Self::name_to_string(db),
-                        Self::name_to_string(table)
-                    ),
-                )))
-            }
+            // A view may only reference tables in its own database (enforced by
+            // `validate_no_cross_db_references`), so `db.table.col` names the same column
+            // as `table.col`. `TableScan` records the bare table name, so key on
+            // that.
+            ast::Expr::DoublyQualified(_db, table, col) => Ok(LogicalExpr::Column(
+                Column::with_table(Self::normalized_name(col), Self::normalized_name(table)),
+            )),
 
             ast::Expr::Qualified(table, col) => Ok(LogicalExpr::Column(Column::with_table(
-                Self::name_to_string(col),
-                Self::name_to_string(table),
+                Self::normalized_name(col),
+                Self::normalized_name(table),
             ))),
 
             ast::Expr::Literal(lit) => Ok(LogicalExpr::Literal(Self::build_literal(lit)?)),
@@ -2264,8 +2271,8 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Get column name from expression
     fn expr_to_column_name(expr: &ast::Expr) -> String {
         match expr {
-            ast::Expr::Id(name) => Self::name_to_string(name),
-            ast::Expr::Qualified(_, col) => Self::name_to_string(col),
+            ast::Expr::Id(name) => Self::normalized_name(name),
+            ast::Expr::Qualified(_, col) => Self::normalized_name(col),
             ast::Expr::FunctionCall { name, .. } => Self::name_to_string(name),
             ast::Expr::FunctionCallStar { name, .. } => {
                 format!("{}(*)", Self::name_to_string(name))
@@ -2294,7 +2301,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         for col in table.columns() {
             if let Some(ref name) = col.name {
                 columns.push(ColumnInfo {
-                    name: name.clone(),
+                    name: crate::util::normalize_ident(name),
                     ty: col.ty(),
                     database: database.clone(),
                     table: Some(actual_table.clone()),
