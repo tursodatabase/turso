@@ -174,6 +174,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         false
     }
+
+    /// Whether `ALTER TABLE ... ADD COLUMN` with a default that is not a
+    /// constant fills the column of the existing rows with the default.
+    ///
+    /// SQLite allows such a default only when the table is empty.
+    /// PostgreSQL evaluates the default for every existing row.
+    fn add_column_fills_existing_rows(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
