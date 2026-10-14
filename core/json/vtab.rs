@@ -597,7 +597,9 @@ mod columns {
                 jsonb::ElementType::NULL => Ok(Value::Null),
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
                 jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
-                jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
+                jsonb::ElementType::INT | jsonb::ElementType::INT5 => {
+                    json_string_to_db_type(value.clone(), element_type, OutputVariant::ElementType)
+                }
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
                 }
@@ -617,13 +619,6 @@ mod columns {
             };
 
             string
-        }
-
-        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string()?;
-            let int = string.parse::<i64>()?;
-
-            Ok(Value::from_i64(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {

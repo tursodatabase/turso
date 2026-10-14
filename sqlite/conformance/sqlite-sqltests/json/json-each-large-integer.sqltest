@@ -1,0 +1,139 @@
+@database :memory:
+
+# JSON integers outside i64 are REAL from json_each.value and json_tree.atom,
+# with JSON type still integer, matching json_extract and ->>.
+#
+# JSON5 hex literals follow SQLite 3.50.4: the hex digits are read as a 64-bit
+# two's complement integer, so 0x8000000000000000 is i64::MIN and
+# 0xffffffffffffffff is -1, and more than 16 significant hex digits is
+# malformed JSON.
+
+test json-each-integer-above-i64-max {
+    SELECT value, typeof(value), type FROM json_each('[9223372036854775808]');
+}
+expect {
+    9.22337203685478e+18|real|integer
+}
+expect @js {
+    9223372036854776000|real|integer
+}
+
+test json-tree-wide-integer-atom {
+    SELECT atom, typeof(atom), type FROM json_tree('123456789012345678901234567890');
+}
+expect {
+    1.23456789012346e+29|real|integer
+}
+expect @js {
+    1.2345678901234568e+29|real|integer
+}
+
+test json-each-integer-below-i64-min {
+    SELECT value, typeof(value), type FROM json_each('-9223372036854775809');
+}
+expect {
+    -9.22337203685478e+18|real|integer
+}
+expect @js {
+    -9223372036854776000|real|integer
+}
+
+test json-each-i64-bounds {
+    SELECT value, typeof(value), type
+    FROM json_each('[9223372036854775807,-9223372036854775808,9223372036854775808,-9223372036854775809]');
+}
+expect {
+    9223372036854775807|integer|integer
+    -9223372036854775808|integer|integer
+    9.22337203685478e+18|real|integer
+    -9.22337203685478e+18|real|integer
+}
+expect @js {
+    9223372036854775807|integer|integer
+    -9223372036854775808|integer|integer
+    9223372036854776000|real|integer
+    -9223372036854776000|real|integer
+}
+
+test json-each-large-integer-nested-matches-extract {
+    SELECT
+        (SELECT value FROM json_each('{"n":9223372036854775808}'))
+            = json_extract('{"n":9223372036854775808}', '$.n'),
+        (SELECT atom FROM json_each('{"n":9223372036854775808}'))
+            = ('{"n":9223372036854775808}' ->> '$.n'),
+        (SELECT value FROM json_each('[9223372036854775808]'))
+            = json_extract('[9223372036854775808]', '$[0]'),
+        (SELECT atom FROM json_tree('{"n":9223372036854775808}') WHERE key = 'n')
+            = json_extract('{"n":9223372036854775808}', '$.n'),
+        (SELECT atom FROM json_tree('[9223372036854775808]') WHERE key = 0)
+            = ('[9223372036854775808]' ->> '$[0]');
+}
+expect {
+    1|1|1|1|1
+}
+
+test json-each-large-integer-jsonb-matches-extract {
+    SELECT
+        (SELECT value FROM json_each(jsonb('{"n":9223372036854775808}')))
+            = json_extract(jsonb('{"n":9223372036854775808}'), '$.n'),
+        (SELECT atom FROM json_each(jsonb('[9223372036854775808]')))
+            = (jsonb('[9223372036854775808]') ->> '$[0]'),
+        (SELECT atom FROM json_tree(jsonb('{"n":9223372036854775808}')) WHERE key = 'n')
+            = (jsonb('{"n":9223372036854775808}') ->> '$.n'),
+        (SELECT value FROM json_tree(jsonb('[9223372036854775808]')) WHERE key = 0)
+            = json_extract(jsonb('[9223372036854775808]'), '$[0]');
+}
+expect {
+    1|1|1|1
+}
+
+test json-each-json5-hex-integer {
+    SELECT value, typeof(value), type
+    FROM json_each('[0x10,-0x1,0x7fffffffffffffff,0x8000000000000000,-0x8000000000000000,0xffffffffffffffff,0x0000000000000000000001]');
+}
+expect {
+    16|integer|integer
+    -1|integer|integer
+    9223372036854775807|integer|integer
+    -9223372036854775808|integer|integer
+    -9223372036854775808|integer|integer
+    -1|integer|integer
+    1|integer|integer
+}
+
+test json-each-json5-hex-integer-matches-extract {
+    SELECT
+        (SELECT value FROM json_each('[0x8000000000000000]'))
+            = json_extract('[0x8000000000000000]', '$[0]'),
+        (SELECT atom FROM json_tree('[0xffffffffffffffff]') WHERE key = 0)
+            = ('[0xffffffffffffffff]' ->> '$[0]'),
+        json_extract('[0x8000000000000000]', '$[0]'),
+        typeof(json_extract('[0x8000000000000000]', '$[0]')),
+        json('[0x8000000000000000]');
+}
+expect {
+    1|1|-9223372036854775808|integer|[9223372036854775808]
+}
+
+test json-each-json5-hex-integer-too-many-digits {
+    SELECT value FROM json_each('[0x10000000000000000]');
+}
+expect error {
+    ^malformed JSON$
+}
+
+test json-extract-json5-hex-integer-too-many-digits {
+    SELECT json_extract('[-0x10000000000000000]', '$[0]');
+}
+expect error {
+    ^malformed JSON$
+}
+
+# INT payload "1e+" renders as text that is neither an i64 nor an f64.
+# json_extract already rejects that as a malformed JSON constraint.
+test json-each-unparseable-integer {
+    SELECT value FROM json_each(X'C30331652b');
+}
+expect error {
+    ^malformed JSON$
+}

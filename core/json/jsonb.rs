@@ -1028,6 +1028,10 @@ impl Jsonb {
     /// rendering translates the JSON5 \v escape to \u0009 for SQLite
     /// bug-compatibility, while extraction must yield the real 0x0B.
     pub fn scalar_string_value(&self) -> Result<String> {
+        Ok(unescape_string(self.scalar_payload_text()?))
+    }
+
+    pub fn scalar_payload_text(&self) -> Result<&str> {
         let (JsonbHeader(_, len), header_size) = self.read_header(0)?;
         // The 8-byte size format lets a crafted header declare a length
         // near usize::MAX, so the end must be computed without overflow.
@@ -1038,9 +1042,8 @@ impl Jsonb {
             .data
             .get(header_size..payload_end)
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        let text = from_utf8(payload)
-            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))?;
-        Ok(unescape_string(text))
+        from_utf8(payload)
+            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
