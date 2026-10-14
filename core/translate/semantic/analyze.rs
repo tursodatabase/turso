@@ -3168,7 +3168,7 @@ mod tests {
             ),
             (
                 "SELECT id FROM items WHERE row_number() OVER () > 1",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
             (
                 "SELECT sum(score) AS total FROM items WHERE total > 1",
@@ -3291,7 +3291,7 @@ mod tests {
             ),
             (
                 "SELECT id FROM items GROUP BY row_number() OVER ()",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
             (
                 "SELECT sum(id) AS total FROM items GROUP BY total",
@@ -3303,7 +3303,7 @@ mod tests {
             ),
             (
                 "SELECT id FROM items GROUP BY id HAVING row_number() OVER () > 1",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
             (
                 "SELECT row_number() OVER () AS position FROM items \
@@ -3664,7 +3664,7 @@ mod tests {
             ),
             (
                 "SELECT id FROM items LIMIT row_number() OVER ()",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
@@ -8060,7 +8060,7 @@ mod tests {
             ),
             (
                 "INSERT INTO writable(id) VALUES (1) RETURNING row_number() OVER ()",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
             (
                 "INSERT INTO writable(id) VALUES (1) RETURNING (SELECT id, value)",
@@ -9741,6 +9741,14 @@ mod tests {
         );
         let window = &block.windows[window.index];
         assert_eq!(window.partition_by.len(), 1);
+        assert_eq!(window.partition_by[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            window.partition_by[0]
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value()),
+            Some(crate::translate::collate::CollationSeq::NoCase)
+        );
         assert_eq!(window.order_by.len(), 1);
         assert_eq!(window.order_by[0].order, ast::SortOrder::Desc);
         assert_eq!(window.order_by[0].nulls, Some(ast::NullsOrder::Last));
@@ -9791,7 +9799,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "SELECT row_number() FROM items",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
             (
                 "SELECT length(value) OVER () FROM items",
@@ -9818,17 +9826,50 @@ mod tests {
                 "Parse error: array_agg() does not yet support window frames with a moving start; use a frame with UNBOUNDED PRECEDING start",
             ),
             (
-                "SELECT sum(max(score)) OVER () FROM items",
-                "Parse error: misuse of aggregate function max()",
-            ),
-            (
                 "SELECT sum(row_number() OVER ()) FROM items",
-                "Parse error: misuse of window function: row_number()",
+                "Parse error: misuse of window function row_number()",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
                 .expect_err("unsupported inline window form is rejected");
             assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn window_calls_accept_aggregate_operands_but_not_nested_windows() {
+        let schema = schema_with_items();
+        for sql in [
+            "SELECT sum(max(score)) OVER () FROM items",
+            "SELECT sum(score) FILTER (WHERE count(*) > 0) OVER () FROM items",
+            "SELECT sum(score) OVER (PARTITION BY max(score)) FROM items",
+            "SELECT sum(score) OVER (ROWS BETWEEN max(score) PRECEDING AND CURRENT ROW) FROM items",
+            "SELECT value, sum(count(*)) OVER (ORDER BY count(*)) FROM items GROUP BY value",
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            document
+                .validate()
+                .expect("window over aggregates produces closed HIR");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let block = &document.query(root.query).expect("query exists").blocks[0];
+            assert!(block.aggregate_count > 0, "{sql}");
+            assert_eq!(block.window_function_count, 1, "{sql}");
+        }
+        for sql in [
+            "SELECT sum(row_number() OVER ()) OVER () FROM items",
+            "SELECT sum(max(score) + row_number() OVER ()) OVER () FROM items",
+            "SELECT sum(score) OVER (PARTITION BY row_number() OVER ()) FROM items",
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("window calls cannot nest windows");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: misuse of window function row_number()",
+                "{sql}"
+            );
         }
     }
 

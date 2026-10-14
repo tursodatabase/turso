@@ -1975,7 +1975,13 @@ impl<'document> HirValidator<'document> {
     }
 
     fn visit_resolved_window(&self, window: &ResolvedWindow) -> ValidationResult {
-        self.visit_exprs(&window.partition_by)?;
+        for term in &window.partition_by {
+            self.visit_expr(&term.expr)?;
+            self.visit_type_fact(&term.type_fact)?;
+            if let Some(collation) = &term.collation {
+                self.visit_catalog_object(collation, "PARTITION BY collation")?;
+            }
+        }
         self.visit_order_terms(&window.order_by)?;
         let frame = &window.frame;
         self.visit_window_bound(&frame.start)?;

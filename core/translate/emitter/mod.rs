@@ -388,6 +388,10 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    pub(crate) const fn custom_types_enabled(&self) -> bool {
+        self.enable_custom_types
+    }
+
     pub(crate) fn with_self_table_context<T>(
         &self,
         program: &mut ProgramBuilder,

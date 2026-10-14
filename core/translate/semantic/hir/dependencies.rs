@@ -163,8 +163,8 @@ fn visit_query_parts<'hir>(
             }
         }
         for window in &block.windows {
-            for expression in &window.partition_by {
-                visit(QueryPart::Expression(expression));
+            for term in &window.partition_by {
+                visit(QueryPart::Expression(&term.expr));
             }
             for term in &window.order_by {
                 visit(QueryPart::Expression(&term.expr));
@@ -517,7 +517,9 @@ fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut ColumnUsageCollec
 }
 
 fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut ColumnUsageCollector) {
-    collect_exprs_column_reads(&window.partition_by, reads);
+    for term in &window.partition_by {
+        collect_expr_column_reads(&term.expr, reads);
+    }
     collect_order_column_reads(&window.order_by, reads);
     let frame = &window.frame;
     collect_window_bound_column_reads(&frame.start, reads);
@@ -703,7 +705,9 @@ fn collect_order_references(terms: &[OrderTerm], references: &mut HashSet<Source
 }
 
 fn collect_window_references(window: &ResolvedWindow, references: &mut HashSet<SourceId>) {
-    collect_exprs_references(&window.partition_by, references);
+    for term in &window.partition_by {
+        collect_expr_references(&term.expr, references);
+    }
     collect_order_references(&window.order_by, references);
     let frame = &window.frame;
     collect_window_bound_references(&frame.start, references);

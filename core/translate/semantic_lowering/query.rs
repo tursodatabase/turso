@@ -37,6 +37,10 @@ use crate::{
         semantic_to_plan::{
             BtreeTableLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan, HirSourceAccess,
         },
+        window::{
+            WindowBufferInput, WindowBufferRuntime, WindowFrameOffsets, WindowFrameTracking,
+            WindowFunctionRuntime, WindowInputState, WindowLabels, WindowPeerState,
+        },
     },
     types::KeyInfo,
     util::parse_numeric_literal,
@@ -99,11 +103,196 @@ enum HirRowTarget<'a> {
         done: BranchOffset,
     },
     Sorter(&'a HirSorterOutput<'a>),
+    /// The block's rows feed a window; its output subroutine produces the
+    /// SELECT outputs later.
+    Window(&'a HirWindowLayer<'a>),
 }
 
 struct HirRowOutput<'a> {
     target: HirRowTarget<'a>,
     distinct: Option<&'a HirDistinctOutput>,
+}
+
+/// Values supplied by a buffered row. Sort inputs are prepared separately because
+/// custom ORDER BY keys can need encoded values while SELECT needs decoded ones.
+#[derive(Default)]
+struct HirRowInputs<'a> {
+    values: &'a [super::expr::ExprRegisterInput<'a>],
+    sort_keys: &'a [super::expr::ExprRegisterInput<'a>],
+}
+
+/// Each terminal keeps its exact HIR node identity, even when equivalent nodes
+/// share a buffer column. Scalars above these terminals still run at output time.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct HirWindowOutputPlan<'a> {
+    columns: Vec<usize>,
+    values: Vec<(&'a hir::Expr, usize)>,
+    sort_keys: Vec<(&'a hir::Expr, usize)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct HirWindowOutputRegisters<'a> {
+    start: usize,
+    values: Vec<super::expr::ExprRegisterInput<'a>>,
+    sort_keys: Vec<super::expr::ExprRegisterInput<'a>>,
+}
+
+impl<'a> HirWindowOutputPlan<'a> {
+    /// Row-result preparation reads `columns` into this contiguous register range.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn prepare_registers(&self, program: &mut ProgramBuilder) -> HirWindowOutputRegisters<'a> {
+        let start = program.alloc_registers(self.columns.len());
+        let bind = |entries: &[(&'a hir::Expr, usize)]| {
+            entries
+                .iter()
+                .map(|(expr, slot)| super::expr::ExprRegisterInput::new(expr, start + slot))
+                .collect()
+        };
+        HirWindowOutputRegisters {
+            start,
+            values: bind(&self.values),
+            sort_keys: bind(&self.sort_keys),
+        }
+    }
+}
+
+impl HirWindowOutputRegisters<'_> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn row_inputs(&self) -> HirRowInputs<'_> {
+        HirRowInputs {
+            values: &self.values,
+            sort_keys: &self.sort_keys,
+        }
+    }
+}
+
+struct HirWindowOutputCollector<'plan, 'expr> {
+    buffer: &'plan mut super::window::HirWindowBufferPlan<'expr>,
+    columns: &'plan mut Vec<usize>,
+    inputs: &'plan mut Vec<(&'expr hir::Expr, usize)>,
+    encoded: bool,
+}
+
+impl HirWindowOutputCollector<'_, '_> {
+    fn is_terminal(expression: &hir::Expr) -> bool {
+        matches!(
+            expression,
+            hir::Expr::Column(_)
+                | hir::Expr::RowId(_)
+                | hir::Expr::Subquery(_)
+                | hir::Expr::Function(hir::FunctionCall {
+                    evaluation: hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. },
+                    ..
+                })
+        )
+    }
+}
+
+impl<'expr> hir::ExprVisitor<'expr> for HirWindowOutputCollector<'_, 'expr> {
+    type Context = ();
+    type Output = ();
+    type Error = LimboError;
+
+    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        if Self::is_terminal(expression) {
+            None
+        } else {
+            expression.child(index)
+        }
+    }
+
+    fn pre_order(
+        &mut self,
+        _parent: &'expr hir::Expr,
+        _context: &mut (),
+        _index: usize,
+        _child: &'expr hir::Expr,
+    ) -> Result<std::ops::ControlFlow<(), ()>> {
+        Ok(std::ops::ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &'expr hir::Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<()> {
+        if !Self::is_terminal(expression) {
+            return Ok(());
+        }
+        if let hir::Expr::Function(hir::FunctionCall {
+            evaluation: hir::FunctionEvaluation::Window { window, .. },
+            ..
+        }) = expression
+        {
+            if *window == self.buffer.window.id {
+                return Ok(());
+            }
+        }
+        let column =
+            super::window::push_hir_window_output_column(self.buffer, expression, self.encoded);
+        let slot = self
+            .columns
+            .iter()
+            .position(|existing| *existing == column)
+            .unwrap_or_else(|| {
+                let slot = self.columns.len();
+                self.columns.push(column);
+                slot
+            });
+        self.inputs.push((expression, slot));
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn plan_hir_window_output_inputs<'a>(
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+    buffer: &mut super::window::HirWindowBufferPlan<'a>,
+) -> Result<HirWindowOutputPlan<'a>> {
+    if buffer.window.id.block != block.id {
+        return Err(LimboError::InternalError(
+            "HIR window output belongs to a different query block".into(),
+        ));
+    }
+    let mut plan = HirWindowOutputPlan::default();
+    for output in &block.outputs {
+        output.expr.walk(
+            (),
+            &mut HirWindowOutputCollector {
+                buffer,
+                columns: &mut plan.columns,
+                inputs: &mut plan.values,
+                encoded: false,
+            },
+        )?;
+    }
+    for term in &query.order_by {
+        let encoded = term
+            .type_fact
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.custom())
+            .is_some_and(|custom| custom.value().decode().is_some());
+        let expression = match hir_order_output_position(block, &term.expr) {
+            Some(output) if encoded => &block.outputs[output].expr,
+            Some(_) => continue, // The sorter copies an already evaluated SELECT output.
+            None => &term.expr,
+        };
+        expression.walk(
+            (),
+            &mut HirWindowOutputCollector {
+                buffer,
+                columns: &mut plan.columns,
+                inputs: &mut plan.sort_keys,
+                encoded,
+            },
+        )?;
+    }
+    Ok(plan)
 }
 
 struct HirAggregateRuntime<'a> {
@@ -206,6 +395,7 @@ impl HirRowOutput<'_> {
                     !matches!(destination, QueryDestination::ExistsSubqueryResult { .. })
                 }
                 HirRowTarget::Sorter(_) => true,
+                HirRowTarget::Window(_) => false,
             }
     }
 }
@@ -802,13 +992,31 @@ fn emit_planned_query_block_with_output(
             block.id, block_plan.block
         )));
     }
+    if !block.windows.is_empty() {
+        return emit_hir_window_block(program, plan, query, block, block_plan, output);
+    }
+    emit_planned_block_rows(program, plan, query, block, block_plan, output, block_done)
+}
+
+/// Emit the rows of one planned block into `output`. A block with windows
+/// sends them to its window layer; other blocks send them to the query output.
+fn emit_planned_block_rows(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
+) -> Result<()> {
+    let feeds_window = matches!(output.target, HirRowTarget::Window(_));
+    if block.windows.is_empty() == feeds_window {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} rows do not match its window layer",
+            block.id
+        )));
+    }
     if block.from.is_none() {
-        if block.window_function_count != 0 || !block.windows.is_empty() {
-            return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} is not a supported non-FROM query body",
-                block.id
-            )));
-        }
         if is_hir_ungrouped_aggregate(block) {
             return emit_hir_ungrouped_without_from(
                 program,
@@ -1096,6 +1304,11 @@ fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId
     }
     for term in &query.order_by {
         collect(&term.expr);
+    }
+    for window in &block.windows {
+        for expression in hir_window_expressions(window) {
+            collect(expression);
+        }
     }
     rowids.sort_unstable();
     rowids
@@ -2273,6 +2486,11 @@ fn collect_hir_aggregates<'a>(
     for term in &query.order_by {
         collect(&term.expr)?;
     }
+    for window in &block.windows {
+        for expression in hir_window_expressions(window) {
+            collect(expression)?;
+        }
+    }
     collector
         .aggregates
         .into_iter()
@@ -2286,6 +2504,26 @@ fn collect_hir_aggregates<'a>(
             })
         })
         .collect()
+}
+
+/// Expressions owned by a window definition rather than by a window call.
+fn hir_window_expressions(window: &hir::ResolvedWindow) -> impl Iterator<Item = &hir::Expr> {
+    let bounds = [Some(&window.frame.start), window.frame.end.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|bound| match bound {
+            hir::WindowFrameBound::Preceding(expression)
+            | hir::WindowFrameBound::Following(expression) => Some(expression.as_ref()),
+            hir::WindowFrameBound::CurrentRow
+            | hir::WindowFrameBound::UnboundedPreceding
+            | hir::WindowFrameBound::UnboundedFollowing => None,
+        });
+    window
+        .partition_by
+        .iter()
+        .map(|term| &term.expr)
+        .chain(window.order_by.iter().map(|term| &term.expr))
+        .chain(bounds)
 }
 
 fn initialize_hir_aggregates<'a>(
@@ -2387,6 +2625,11 @@ fn initialize_hir_aggregates<'a>(
     }
     for term in &query.order_by {
         bare.collect(&term.expr)?;
+    }
+    for window in &block.windows {
+        for expression in hir_window_expressions(window) {
+            bare.collect(expression)?;
+        }
     }
     bare.columns
         .sort_unstable_by_key(|reference| (reference.source.index(), reference.column));
@@ -2599,12 +2842,6 @@ fn emit_btree_loops(
     body: HirLoopBody<'_>,
 ) -> Result<()> {
     let document = &plan.document;
-    if block.window_function_count != 0 || !block.windows.is_empty() {
-        return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} is not a supported B-tree loop",
-            block.id
-        )));
-    }
     let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} has unsupported B-tree loop clauses",
@@ -2620,7 +2857,7 @@ fn emit_btree_loops(
             return Err(LimboError::InternalError(format!(
                 "HIR query block {:?} has a mismatched loop body",
                 block.id
-            )))
+            )));
         }
     }
     if block_plan.loops.is_empty() {
@@ -4122,6 +4359,7 @@ fn emit_hir_sorter_insert(
     outputs: &[hir::Output],
     output_start: usize,
     sorter: &HirSorterOutput<'_>,
+    inputs: &[super::expr::ExprRegisterInput<'_>],
 ) -> Result<()> {
     for (key, (term, source)) in sorter.order_by.iter().zip(&sorter.key_sources).enumerate() {
         let target = sorter.row + key;
@@ -4137,10 +4375,16 @@ fn emit_hir_sorter_insert(
                 &outputs[*output].expr,
                 &term.type_fact,
                 target,
+                inputs,
             )?,
-            HirSortKeySource::Expression => {
-                emit_hir_sort_key(program, document, &term.expr, &term.type_fact, target)?
-            }
+            HirSortKeySource::Expression => emit_hir_sort_key(
+                program,
+                document,
+                &term.expr,
+                &term.type_fact,
+                target,
+                inputs,
+            )?,
         }
     }
     for (output, column) in sorter.output_columns.iter().enumerate() {
@@ -4169,6 +4413,7 @@ fn emit_hir_sort_key(
     expression: &hir::Expr,
     type_fact: &hir::TypeFact,
     target: usize,
+    inputs: &[super::expr::ExprRegisterInput<'_>],
 ) -> Result<()> {
     let suppress_decode = type_fact
         .declared
@@ -4178,7 +4423,9 @@ fn emit_hir_sort_key(
     if suppress_decode {
         program.flags.set_suppress_custom_type_decode(true);
     }
-    let result = super::expr::translate_expr_no_constant_opt(program, document, expression, target);
+    let result = super::expr::translate_expr_with_inputs_no_constant_opt(
+        program, document, expression, target, inputs,
+    );
     if suppress_decode {
         program.flags.set_suppress_custom_type_decode(false);
     }
@@ -4450,6 +4697,37 @@ fn emit_query_row<'expr>(
     start: usize,
     skip_row: BranchOffset,
 ) -> Result<()> {
+    emit_query_row_with_inputs(
+        program,
+        document,
+        output,
+        outputs,
+        expressions,
+        start,
+        skip_row,
+        &HirRowInputs::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_query_row_with_inputs<'expr>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    output: &HirRowOutput<'_>,
+    outputs: &[hir::Output],
+    expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
+    start: usize,
+    skip_row: BranchOffset,
+    inputs: &HirRowInputs<'_>,
+) -> Result<()> {
+    if let HirRowTarget::Window(window) = output.target {
+        if output.distinct.is_some() {
+            return Err(LimboError::InternalError(
+                "HIR window input rows cannot apply SELECT DISTINCT".into(),
+            ));
+        }
+        return window.emit_source_row(program);
+    }
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
             "HIR row width {} does not match output width {}",
@@ -4463,11 +4741,12 @@ fn emit_query_row<'expr>(
         }
     } else {
         for (position, expression) in expressions.enumerate() {
-            super::expr::translate_expr_no_constant_opt(
+            super::expr::translate_expr_with_inputs_no_constant_opt(
                 program,
                 document,
                 expression,
                 start + position,
+                inputs.values,
             )?;
             program.bind_output(outputs[position].id, start + position);
         }
@@ -4505,9 +4784,428 @@ fn emit_query_row<'expr>(
             );
         }
         HirRowTarget::Sorter(sorter) => {
-            emit_hir_sorter_insert(program, document, outputs, start, sorter)?;
+            emit_hir_sorter_insert(program, document, outputs, start, sorter, inputs.sort_keys)?;
+        }
+        HirRowTarget::Window(_) => {
+            unreachable!("window input rows return before output evaluation")
         }
     }
+    Ok(())
+}
+
+/// Sorter that orders a block's rows by window keys before they are buffered.
+struct HirWindowInputSorter {
+    cursor: CursorID,
+    record: usize,
+    /// First register of one sorter record: the keys, the optional sequence
+    /// number, then the buffer columns that are not keys.
+    row: usize,
+    column_count: usize,
+    sequence: Option<usize>,
+    /// Sorter record position holding each window-buffer column.
+    buffer_positions: Vec<usize>,
+}
+
+/// Runtime state for the window over one query block's rows.
+///
+/// The block's rows play the role of the legacy window source subquery: they
+/// are sorted by PARTITION BY and ORDER BY, or streamed as produced when the
+/// window has neither. Each row then runs the shared window frame code, which
+/// calls the SELECT output subroutine for every finished row.
+struct HirWindowLayer<'a> {
+    document: &'a HirDocument,
+    plan: super::window::HirWindowBufferPlan<'a>,
+    keys: Vec<super::window::HirWindowInputKey<'a>>,
+    sorter: Option<HirWindowInputSorter>,
+    functions: Vec<WindowFunctionRuntime<&'a hir::Expr>>,
+    accumulators: usize,
+    buffer: WindowBufferRuntime,
+    input: WindowBufferInput,
+    state: WindowInputState,
+    peers: WindowPeerState,
+    offsets: WindowFrameOffsets,
+    tracking: WindowFrameTracking,
+    labels: WindowLabels,
+    output_columns: Vec<usize>,
+    outputs: HirWindowOutputRegisters<'a>,
+    output_return: usize,
+}
+
+impl<'a> HirWindowLayer<'a> {
+    fn prepare(
+        program: &mut ProgramBuilder,
+        document: &'a HirDocument,
+        query: &'a hir::Query,
+        block: &'a hir::QueryBlock,
+    ) -> Result<Self> {
+        let [window] = block.windows.as_slice() else {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} has {} windows; only one window layer is lowered",
+                block.id,
+                block.windows.len()
+            )));
+        };
+        let mut plan = super::window::plan_hir_window_buffer(query, block, window.id)?;
+        let output_plan = plan_hir_window_output_inputs(query, block, &mut plan)?;
+        let keys = plan.input_sort_keys();
+        for key in &keys {
+            check_hir_window_key_is_orderable(document, key)?;
+        }
+        let tracking = super::window::prepare_hir_window_frame_tracking(program, &plan);
+        let buffer = super::window::open_hir_window_buffer(program, &plan);
+        let accumulators = program.alloc_registers(plan.functions.len());
+        let functions = super::window::prepare_hir_window_runtime(program, &plan)?;
+        let outputs = output_plan.prepare_registers(program);
+        let state = super::window::prepare_hir_window_input_state(program, &plan);
+        let peers = super::window::prepare_hir_window_peer_state(program, &plan);
+        let offsets = super::window::prepare_hir_window_frame_offsets(program, &plan);
+        let labels = WindowLabels {
+            flush_buffer: program.allocate_label(),
+            row_output: program.allocate_label(),
+            window_processing_end: program.allocate_label(),
+        };
+        let output_return = program.alloc_register();
+        let input = WindowBufferInput {
+            start: program.alloc_registers(plan.columns.len()),
+            count: plan.columns.len(),
+        };
+        // Like the legacy source subquery's ORDER BY, grouped rows carry a
+        // sequence number so equal keys keep their group order.
+        let sorter = (!keys.is_empty()).then(|| {
+            open_hir_window_input_sorter(program, &plan, &keys, hir_grouping(block).is_some())
+        });
+        Ok(Self {
+            document,
+            plan,
+            keys,
+            sorter,
+            functions,
+            accumulators,
+            buffer,
+            input,
+            state,
+            peers,
+            offsets,
+            tracking,
+            labels,
+            output_columns: output_plan.columns,
+            outputs,
+            output_return,
+        })
+    }
+
+    /// Hand the block's current row to the window: queue it in the sorter,
+    /// or step the window directly when the window has no keys.
+    fn emit_source_row(&self, program: &mut ProgramBuilder) -> Result<()> {
+        let Some(sorter) = &self.sorter else {
+            for column in 0..self.input.count {
+                super::window::emit_hir_window_input_column(
+                    program,
+                    self.document,
+                    &self.plan,
+                    column,
+                    self.input.start + column,
+                )?;
+            }
+            return self.emit_step(program);
+        };
+        for (position, key) in self.keys.iter().enumerate() {
+            if key.is_encoded() {
+                key.emit(program, self.document, sorter.row + position)?;
+            }
+        }
+        if let Some(sequence) = sorter.sequence {
+            program.emit_insn(Insn::Sequence {
+                cursor_id: sorter.cursor,
+                target_reg: sorter.row + sequence,
+            });
+        }
+        for (column, position) in sorter.buffer_positions.iter().enumerate() {
+            super::window::emit_hir_window_input_column(
+                program,
+                self.document,
+                &self.plan,
+                column,
+                sorter.row + position,
+            )?;
+        }
+        sorter_insert(
+            program,
+            sorter.row,
+            sorter.column_count,
+            sorter.cursor,
+            sorter.record,
+        );
+        Ok(())
+    }
+
+    /// Read the sorted rows back into the window input registers, stepping the
+    /// window for each one.
+    fn emit_sorted_rows(&self, program: &mut ProgramBuilder) -> Result<()> {
+        let Some(sorter) = &self.sorter else {
+            return Ok(());
+        };
+        let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: sorter.column_count,
+        }));
+        program.emit_insn(Insn::OpenPseudo {
+            cursor_id: pseudo_cursor,
+            content_reg: sorter.record,
+            num_fields: sorter.column_count,
+        });
+        let sorted_done = program.allocate_label();
+        let loop_start = program.allocate_label();
+        program.emit_insn(Insn::SorterSort {
+            cursor_id: sorter.cursor,
+            pc_if_empty: sorted_done,
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::SorterData {
+            cursor_id: sorter.cursor,
+            dest_reg: sorter.record,
+            pseudo_cursor,
+        });
+        for (column, position) in sorter.buffer_positions.iter().enumerate() {
+            program.emit_column_or_rowid(pseudo_cursor, *position, self.input.start + column);
+        }
+        self.emit_step(program)?;
+        program.emit_insn(Insn::SorterNext {
+            cursor_id: sorter.cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(sorted_done);
+        Ok(())
+    }
+
+    fn emit_step(&self, program: &mut ProgramBuilder) -> Result<()> {
+        super::window::emit_hir_window_buffer_step(
+            program,
+            self.document,
+            &self.plan,
+            &self.functions,
+            self.accumulators,
+            &self.buffer,
+            self.input,
+            self.state,
+            self.peers,
+            self.offsets,
+            self.tracking,
+            self.labels,
+            HIR_CUSTOM_TYPES_CHECKED,
+            |program| self.emit_row_results(program),
+        )
+    }
+
+    fn emit_row_results(&self, program: &mut ProgramBuilder) -> Result<()> {
+        super::window::emit_hir_window_row_results(
+            program,
+            self.document,
+            &self.plan,
+            &self.functions,
+            self.buffer.cursors,
+            self.tracking,
+            self.accumulators,
+            &self.output_columns,
+            self.outputs.start,
+            self.labels.row_output,
+            self.output_return,
+            HIR_CUSTOM_TYPES_CHECKED,
+        )
+    }
+
+    /// Finish the last partition and emit the SELECT output subroutine that
+    /// every finished row calls.
+    fn emit_flush(
+        &self,
+        program: &mut ProgramBuilder,
+        block: &hir::QueryBlock,
+        output: &HirRowOutput<'_>,
+    ) -> Result<()> {
+        super::window::emit_hir_window_partition_flush(
+            program,
+            self.document,
+            &self.plan,
+            &self.functions,
+            self.accumulators,
+            &self.buffer,
+            self.state,
+            self.peers,
+            self.offsets,
+            self.tracking,
+            self.labels,
+            HIR_CUSTOM_TYPES_CHECKED,
+            |program| self.emit_row_results(program),
+            |program| {
+                emit_hir_window_output_subroutine(
+                    program,
+                    self.document,
+                    block,
+                    output,
+                    &self.outputs.row_inputs(),
+                    self.labels.row_output,
+                    self.output_return,
+                )
+            },
+        )
+    }
+}
+
+/// Window lowering always passes this to the shared aggregate step code.
+/// Semantic analysis owns the custom-type feature check.
+const HIR_CUSTOM_TYPES_CHECKED: bool = true;
+
+/// Legacy sorts window keys through the source subquery's ORDER BY, which
+/// rejects a custom-type column that decodes values but cannot be compared.
+fn check_hir_window_key_is_orderable(
+    document: &HirDocument,
+    key: &super::window::HirWindowInputKey<'_>,
+) -> Result<()> {
+    let hir::Expr::Column(column) = key.expression else {
+        return Ok(());
+    };
+    let Some(custom) = key
+        .type_fact
+        .declared
+        .as_ref()
+        .and_then(|declared| declared.custom())
+        .filter(|custom| custom.value().decode().is_some())
+    else {
+        return Ok(());
+    };
+    if custom
+        .value()
+        .operators()
+        .iter()
+        .any(|operator| operator.op == "<")
+    {
+        return Ok(());
+    }
+    let name = document
+        .source(column.source)
+        .and_then(|source| source.columns.get(column.column))
+        .map(|column| column.name.as_str())
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR window key references missing column {column:?}"
+            ))
+        })?;
+    crate::bail_parse_error!(
+        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+        name,
+        custom.value().name
+    )
+}
+
+fn open_hir_window_input_sorter(
+    program: &mut ProgramBuilder,
+    plan: &super::window::HirWindowBufferPlan<'_>,
+    keys: &[super::window::HirWindowInputKey<'_>],
+    sequence: bool,
+) -> HirWindowInputSorter {
+    let mut next = keys.len() + usize::from(sequence);
+    let buffer_positions = (0..plan.columns.len())
+        .map(|column| {
+            keys.iter()
+                .position(|key| !key.is_encoded() && key.slot == column)
+                .unwrap_or_else(|| {
+                    let position = next;
+                    next += 1;
+                    position
+                })
+        })
+        .collect();
+    let column_count = next;
+    let mut order_collations_nulls = keys
+        .iter()
+        .map(|key| (key.order, key.collation, key.nulls))
+        .collect::<Vec<_>>();
+    let mut comparators = keys
+        .iter()
+        .map(|key| custom_type_comparator_from_type_fact(key.type_fact))
+        .collect::<Vec<_>>();
+    if sequence {
+        order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
+        comparators.push(None);
+    }
+    let cursor = program.alloc_cursor_id(CursorType::Sorter);
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(SorterOpenData {
+            cursor_id: cursor,
+            columns: order_collations_nulls.len(),
+            order_collations_nulls,
+            comparators,
+        }),
+    });
+    HirWindowInputSorter {
+        cursor,
+        record: program.alloc_register(),
+        row: program.alloc_registers(column_count),
+        column_count,
+        sequence: sequence.then_some(keys.len()),
+        buffer_positions,
+    }
+}
+
+/// Emit one query block whose SELECT outputs read window results.
+fn emit_hir_window_block(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    output: &HirRowOutput<'_>,
+) -> Result<()> {
+    let layer = HirWindowLayer::prepare(program, &plan.document, query, block)?;
+    let rows_done = program.allocate_label();
+    emit_planned_block_rows(
+        program,
+        plan,
+        query,
+        block,
+        block_plan,
+        &HirRowOutput {
+            target: HirRowTarget::Window(&layer),
+            distinct: None,
+        },
+        rows_done,
+    )?;
+    program.preassign_label_to_next_insn(rows_done);
+    layer.emit_sorted_rows(program)?;
+    layer.emit_flush(program, block, output)
+}
+
+/// Emit once; every window RETURN_ROW calls this after preparing buffered inputs
+/// and binding computed window results. DISTINCT and OFFSET skips return to the
+/// window loop, while a satisfied direct LIMIT exits through the output target.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_window_output_subroutine(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    inputs: &HirRowInputs<'_>,
+    output_label: BranchOffset,
+    output_return: usize,
+) -> Result<()> {
+    program.preassign_label_to_next_insn(output_label);
+    let skip_row = program.allocate_label();
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+    emit_query_row_with_inputs(
+        program,
+        document,
+        output,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+        skip_row,
+        inputs,
+    )?;
+    program.preassign_label_to_next_insn(skip_row);
+    program.emit_insn(Insn::Return {
+        return_reg: output_return,
+        can_fallthrough: false,
+    });
     Ok(())
 }
 
@@ -5238,6 +5936,365 @@ mod tests {
     }
 
     #[test]
+    fn planned_window_inputs_feed_select_and_order_by_from_the_buffer() {
+        use super::super::window::{open_hir_window_buffer, plan_hir_window_buffer};
+        let document = analyze_sql(
+            rowid_items_schema(),
+            "SELECT DISTINCT sum(value) OVER () + value, value + 1 FROM items ORDER BY id + value LIMIT 2 OFFSET 1",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert_eq!(
+            buffer.columns.len(),
+            2,
+            "SELECT reuses the window argument; ORDER BY adds id"
+        );
+        assert_eq!(inputs.columns.len(), 2);
+        assert_eq!(inputs.values.len(), 2);
+        assert_eq!(inputs.values[0].1, inputs.values[1].1);
+        assert!(
+            !std::ptr::eq(inputs.values[0].0, inputs.values[1].0),
+            "each occurrence keeps its own substitution"
+        );
+        let mut program = program();
+        let runtime = open_hir_window_buffer(&mut program, &buffer);
+        let registers = inputs.prepare_registers(&mut program);
+        let result = program.alloc_register();
+        program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
+        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        let distinct = initialize_hir_distinct(&mut program, block).unwrap();
+        let done = program.allocate_label();
+        let output_label = program.allocate_label();
+        let output_return = program.alloc_register();
+        let limit = initialize_limit(&mut program, &document, query.limit.as_ref(), done).unwrap();
+        let read_start = program.insns.len();
+        crate::translate::window::emit_window_row_results(
+            &mut program,
+            runtime.cursors.csr_current,
+            inputs.columns.iter().copied(),
+            registers.start,
+            false,
+            output_label,
+            output_return,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        program.emit_insn(Insn::Goto { target_pc: done });
+        emit_hir_window_output_subroutine(
+            &mut program,
+            &document,
+            block,
+            &HirRowOutput {
+                target: HirRowTarget::Sorter(&sorter),
+                distinct: distinct.as_ref(),
+            },
+            &registers.row_inputs(),
+            output_label,
+            output_return,
+        )
+        .expect("no source bindings needed after buffering");
+        let output_end = program.insns.len();
+        emit_hir_sorted_rows(
+            &mut program,
+            block,
+            &sorter,
+            &QueryDestination::ResultRows,
+            limit,
+            done,
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(done);
+        program.resolve_labels().unwrap();
+        assert!(program.insns[read_start..output_end]
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SorterInsert { .. })));
+        for (insn, _) in &program.insns[read_start..output_end] {
+            if let Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } = insn {
+                assert_eq!(*cursor_id, runtime.cursors.csr_current);
+            }
+        }
+    }
+
+    #[test]
+    fn window_input_planning_stops_at_aggregates_subqueries_and_other_windows() {
+        use super::super::window::plan_hir_window_buffer;
+        for sql in [
+            "SELECT row_number() OVER (), sum(value), (SELECT value FROM items LIMIT 1) FROM items",
+            "SELECT row_number() OVER (), sum(value) OVER (ORDER BY id), random() FROM items",
+        ] {
+            let document = analyze_sql(rowid_items_schema(), sql);
+            let query = document.query(root_query(&document)).unwrap();
+            let block = &query.blocks[0];
+            let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+            let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+            let expected = if block.windows.len() == 1 { 2 } else { 1 };
+            assert_eq!(inputs.values.len(), expected);
+            assert_eq!(buffer.columns.len(), expected);
+            assert!(std::ptr::eq(inputs.values[0].0, &block.outputs[1].expr));
+            assert!(inputs
+                .values
+                .iter()
+                .all(|(expr, _)| !matches!(expr, hir::Expr::Column(_))));
+        }
+        let document = analyze_sql(
+            rowid_items_schema(),
+            "SELECT row_number() OVER (), random() FROM items",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert!(
+            inputs.columns.is_empty(),
+            "current window and volatile scalar stay at output"
+        );
+    }
+
+    #[test]
+    fn planned_custom_window_inputs_encode_sort_keys_and_decode_select_values() {
+        use super::super::window::{
+            emit_hir_window_input_row, plan_hir_window_buffer, HirWindowBufferColumn,
+        };
+        let (document, schema) = analyze_sql_with_schema(
+            ordered_custom_items_schema(),
+            "SELECT value, row_number() OVER () FROM items ORDER BY value",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert_eq!(buffer.columns.len(), 2);
+        assert_ne!(inputs.values[0].1, inputs.sort_keys[0].1);
+        assert!(matches!(
+            buffer.columns[1],
+            HirWindowBufferColumn::Encoded(_)
+        ));
+        let hir::Expr::Column(reference) = block.outputs[0].expr else {
+            panic!("column output");
+        };
+        let mut program = program();
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(
+            schema.get_btree_table("items").unwrap(),
+        ));
+        program.bind_source(
+            reference.source,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        let row = emit_hir_window_input_row(&mut program, &document, &buffer).unwrap();
+        assert!(!program.flags.suppress_custom_type_decode());
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Divide { dest, .. } if *dest == row.start)));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Divide { dest, .. } if *dest == row.start + 1)));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Column { dest, .. } if *dest == row.start + 1)));
+    }
+
+    #[test]
+    fn window_output_uses_buffered_values_and_returns_after_skipped_rows() {
+        for ordered in [false, true] {
+            let order = if ordered { " ORDER BY id + 2" } else { "" };
+            let document = analyze_sql(
+                rowid_items_schema(),
+                &format!(
+                    "SELECT DISTINCT sum(value) OVER () + 1, value COLLATE nocase \
+                          FROM items{order} LIMIT 2 OFFSET 1"
+                ),
+            );
+            let query = document.query(root_query(&document)).unwrap();
+            let block = &query.blocks[0];
+            let mut program = program();
+            let done = program.allocate_label();
+            let label = program.allocate_label();
+            let return_reg = program.alloc_register();
+            let buffered = program.alloc_register();
+            let result = program.alloc_register();
+            let key = program.alloc_register();
+            program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
+            let distinct = initialize_hir_distinct(&mut program, block).unwrap();
+            let sorter =
+                ordered.then(|| initialize_hir_sorter(&mut program, query, block).unwrap());
+            let limit =
+                initialize_limit(&mut program, &document, query.limit.as_ref(), done).unwrap();
+            let output = HirRowOutput {
+                target: match &sorter {
+                    Some(sorter) => HirRowTarget::Sorter(sorter),
+                    None => HirRowTarget::Direct {
+                        destination: &QueryDestination::ResultRows,
+                        limit,
+                        done,
+                    },
+                },
+                distinct: distinct.as_ref(),
+            };
+            let values = [super::super::expr::ExprRegisterInput::new(
+                &block.outputs[1].expr,
+                buffered,
+            )];
+            let keys: Vec<_> = query
+                .order_by
+                .iter()
+                .map(|term| super::super::expr::ExprRegisterInput::new(&term.expr, key))
+                .collect();
+            program.emit_insn(Insn::Gosub {
+                target_pc: label,
+                return_reg,
+            });
+            program.emit_insn(Insn::Goto { target_pc: done });
+            let start = program.insns.len();
+            let constant_spans = program.constant_spans.len();
+            emit_hir_window_output_subroutine(
+                &mut program,
+                &document,
+                block,
+                &output,
+                &HirRowInputs {
+                    values: &values,
+                    sort_keys: &keys,
+                },
+                label,
+                return_reg,
+            )
+            .expect("window output lowers without original source cursor bindings");
+            assert_eq!(
+                program.constant_spans.len(),
+                constant_spans,
+                "row expressions cannot be hoisted outside the output subroutine"
+            );
+            let return_position = program.insns.len() - 1;
+            if let Some(sorter) = &sorter {
+                emit_hir_sorted_rows(
+                    &mut program,
+                    block,
+                    sorter,
+                    &QueryDestination::ResultRows,
+                    limit,
+                    done,
+                )
+                .unwrap();
+            }
+            program.preassign_label_to_next_insn(done);
+            program.resolve_labels().unwrap();
+            let insns = &program.insns[start..];
+            for source in [buffered, result] {
+                assert!(insns.iter().any(|(insn, _)| matches!(insn,
+                    Insn::Copy { src_reg, .. } if *src_reg == source)));
+            }
+            let distinct_position = insns
+                .iter()
+                .position(|(insn, _)| match insn {
+                    Insn::HashDistinct { data } => {
+                        assert_eq!(data.collations[1], CollationSeq::NoCase);
+                        assert_eq!(
+                            data.target_pc,
+                            BranchOffset::Offset(return_position.try_into().unwrap())
+                        );
+                        true
+                    }
+                    _ => false,
+                })
+                .unwrap();
+            let offset_position = insns
+                .iter()
+                .position(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+                .unwrap();
+            assert!(distinct_position < offset_position);
+            assert!(matches!(program.insns[return_position].0,
+                Insn::Return { return_reg: actual, can_fallthrough: false } if actual == return_reg));
+            if ordered {
+                assert!(insns.iter().any(
+                    |(insn, _)| matches!(insn, Insn::Copy { src_reg, .. } if *src_reg == key)
+                ));
+                let sort = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
+                    .unwrap();
+                let insert = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::SorterInsert { .. }))
+                    .unwrap();
+                assert!(distinct_position < insert && insert < sort && sort < offset_position);
+            } else {
+                assert!(matches!(insns[offset_position].0,
+                    Insn::IfPos { target_pc, .. } if target_pc == BranchOffset::Offset(return_position.try_into().unwrap())));
+                let row = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::ResultRow { .. }))
+                    .unwrap();
+                let limit = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
+                    .unwrap();
+                assert!(offset_position < row && row < limit);
+            }
+        }
+    }
+
+    #[test]
+    fn window_output_keeps_encoded_sort_keys_separate_from_decoded_values() {
+        let document = analyze_sql(
+            ordered_custom_items_schema(),
+            "SELECT value, row_number() OVER () FROM items ORDER BY value",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut program = program();
+        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        assert!(matches!(
+            sorter.key_sources[0],
+            HirSortKeySource::EncodedOutput(0)
+        ));
+        let decoded = program.alloc_register();
+        let encoded = program.alloc_register();
+        let window_result = program.alloc_register();
+        program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), window_result);
+        let values = [super::super::expr::ExprRegisterInput::new(
+            &block.outputs[0].expr,
+            decoded,
+        )];
+        let keys = [super::super::expr::ExprRegisterInput::new(
+            &block.outputs[0].expr,
+            encoded,
+        )];
+        let label = program.allocate_label();
+        let return_reg = program.alloc_register();
+        let start = program.insns.len();
+        emit_hir_window_output_subroutine(
+            &mut program,
+            &document,
+            block,
+            &HirRowOutput {
+                target: HirRowTarget::Sorter(&sorter),
+                distinct: None,
+            },
+            &HirRowInputs {
+                values: &values,
+                sort_keys: &keys,
+            },
+            label,
+            return_reg,
+        )
+        .unwrap();
+        let insns = &program.insns[start..];
+        assert!(insns.iter().any(|(insn, _)| matches!(insn,
+            Insn::Copy { src_reg, dst_reg, .. } if *src_reg == encoded && *dst_reg == sorter.row)));
+        assert!(insns.iter().any(|(insn, _)| matches!(insn,
+            Insn::Copy { src_reg, .. } if *src_reg == decoded)));
+        assert!(!program.flags.suppress_custom_type_decode());
+    }
+
+    #[test]
     fn planned_distinct_uses_hir_collations_before_offset() {
         let plan = analyze_plan(
             rowid_items_schema(),
@@ -5330,6 +6387,177 @@ mod tests {
             .expect("OFFSET emits");
         assert!(sorter_open < sorter_insert && sorter_insert < sorter_sort);
         assert!(sorter_sort < offset, "LIMIT/OFFSET applies after sorting");
+    }
+
+    fn emit_planned_root(plan: &HirPlan) -> ProgramBuilder {
+        let mut program = program();
+        emit_planned_query_body(
+            &mut program,
+            plan,
+            root_query(&plan.document),
+            &QueryDestination::ResultRows,
+        )
+        .expect("HIR query emits");
+        program.resolve_labels().expect("HIR labels resolve");
+        program
+    }
+
+    fn insn_positions(program: &ProgramBuilder, matches: impl Fn(&Insn) -> bool) -> Vec<usize> {
+        program
+            .insns
+            .iter()
+            .enumerate()
+            .filter(|(_, (insn, _))| matches(insn))
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    #[test]
+    fn planned_window_sorts_source_rows_by_partition_then_order_before_buffering() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT value, sum(value) OVER (PARTITION BY extra COLLATE nocase \
+             ORDER BY value DESC NULLS FIRST) FROM items LIMIT 3",
+        );
+        let program = emit_planned_root(&plan);
+
+        let window_sorter = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::SorterOpen { data } => Some(data),
+                _ => None,
+            })
+            .expect("window keys open a source sorter");
+        assert_eq!(
+            window_sorter.order_collations_nulls,
+            [
+                (SortOrder::Asc, Some(CollationSeq::NoCase), None),
+                (
+                    SortOrder::Desc,
+                    None,
+                    Some(turso_parser::ast::NullsOrder::First)
+                ),
+            ]
+        );
+        let table_scan = insn_positions(&program, |insn| matches!(insn, Insn::Next { .. }));
+        let sorter_insert =
+            insn_positions(&program, |insn| matches!(insn, Insn::SorterInsert { .. }));
+        let sorter_sort = insn_positions(&program, |insn| matches!(insn, Insn::SorterSort { .. }));
+        let buffer_insert = insn_positions(&program, |insn| matches!(insn, Insn::Insert { .. }));
+        let result_row = insn_positions(&program, |insn| matches!(insn, Insn::ResultRow { .. }));
+        assert_eq!(sorter_insert.len(), 1);
+        assert_eq!(sorter_sort.len(), 1);
+        assert!(
+            sorter_insert[0] < table_scan[0],
+            "source rows are queued in the scan"
+        );
+        assert!(
+            table_scan[0] < sorter_sort[0],
+            "sorting starts after the scan"
+        );
+        assert!(
+            buffer_insert.iter().all(|insert| *insert > sorter_sort[0]),
+            "only sorted rows enter the window buffer"
+        );
+        assert_eq!(
+            result_row.len(),
+            1,
+            "one output subroutine serves every row"
+        );
+        assert!(result_row[0] > *buffer_insert.last().unwrap());
+        assert!(
+            insn_positions(&program, |insn| matches!(insn, Insn::DecrJumpZero { .. })).len() == 1,
+            "LIMIT applies to window output rows, not source rows"
+        );
+    }
+
+    #[test]
+    fn planned_window_without_keys_streams_scan_rows_into_the_buffer() {
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT id, row_number() OVER () FROM items",
+        );
+        let program = emit_planned_root(&plan);
+
+        assert!(
+            insn_positions(&program, |insn| matches!(insn, Insn::SorterOpen { .. })).is_empty()
+        );
+        let rewind = insn_positions(&program, |insn| matches!(insn, Insn::Rewind { .. }));
+        let next = insn_positions(&program, |insn| matches!(insn, Insn::Next { .. }));
+        let buffer_insert = insn_positions(&program, |insn| matches!(insn, Insn::Insert { .. }));
+        let scan_start = rewind[0];
+        let scan_end = *next.last().unwrap();
+        assert!(
+            buffer_insert
+                .iter()
+                .all(|insert| scan_start < *insert && *insert < scan_end),
+            "each scanned row is buffered inside the scan loop"
+        );
+    }
+
+    #[test]
+    fn planned_window_over_groups_keeps_group_order_for_equal_keys() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT extra, count(*), sum(count(*)) OVER (PARTITION BY count(*)) \
+             FROM items GROUP BY extra",
+        );
+        let program = emit_planned_root(&plan);
+
+        let sorters = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::SorterOpen { data } => Some(data.order_collations_nulls.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sorters.contains(&2),
+            "window sorter has the partition key plus a sequence column: {sorters:?}"
+        );
+        assert_eq!(
+            insn_positions(&program, |insn| matches!(insn, Insn::Sequence { .. })).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn planned_window_drops_order_terms_equal_to_partition_terms() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT rank() OVER (PARTITION BY value ORDER BY value DESC) FROM items",
+        );
+        let program = emit_planned_root(&plan);
+
+        let keys = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::SorterOpen { data } => Some(data.order_collations_nulls.clone()),
+                _ => None,
+            })
+            .expect("window keys open a source sorter");
+        assert_eq!(keys, [(SortOrder::Asc, None, None)]);
+    }
+
+    #[test]
+    fn planned_query_with_two_windows_is_an_internal_gap() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT row_number() OVER (ORDER BY value), rank() OVER (ORDER BY extra) FROM items",
+        );
+        let mut program = program();
+        let error = emit_planned_query_body(
+            &mut program,
+            &plan,
+            root_query(&plan.document),
+            &QueryDestination::ResultRows,
+        )
+        .err()
+        .expect("only one window layer is lowered");
+        assert!(matches!(error, LimboError::InternalError(_)), "{error}");
     }
 
     #[test]

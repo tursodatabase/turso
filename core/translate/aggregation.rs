@@ -323,6 +323,15 @@ pub(crate) struct HirAggregateDistinct {
     pub(crate) on_conflict: crate::vdbe::BranchOffset,
 }
 
+pub(crate) struct PreparedAggregateArguments<'a> {
+    pub(crate) function: &'a AggFunc,
+    pub(crate) registers_start: usize,
+    pub(crate) count: usize,
+    pub(crate) collations: &'a [CollationSeq],
+    pub(crate) comparators: &'a [Option<crate::vdbe::insn::SortComparatorType>],
+    pub(crate) custom_types_enabled: bool,
+}
+
 enum AggregationArguments<'a, 'resolver> {
     Legacy {
         source: AggArgumentSource<'a>,
@@ -335,6 +344,7 @@ enum AggregationArguments<'a, 'resolver> {
         func: AggFunc,
         distinct: Option<&'a HirAggregateDistinct>,
     },
+    Prepared(PreparedAggregateArguments<'a>),
 }
 
 impl AggregationArguments<'_, '_> {
@@ -342,6 +352,7 @@ impl AggregationArguments<'_, '_> {
         match self {
             Self::Legacy { source, .. } => source.agg_func(),
             Self::Hir { func, .. } => func,
+            Self::Prepared(arguments) => arguments.function,
         }
     }
 
@@ -353,6 +364,7 @@ impl AggregationArguments<'_, '_> {
                 hir::FunctionArguments::Expressions { values, .. } => values.len(),
                 hir::FunctionArguments::OrderedSet { direct, .. } => direct.len() + 1,
             },
+            Self::Prepared(arguments) => arguments.count,
         }
     }
 
@@ -386,6 +398,15 @@ impl AggregationArguments<'_, '_> {
                 )?;
                 Ok(register)
             }
+            Self::Prepared(arguments) => {
+                if index >= arguments.count {
+                    return Err(LimboError::InternalError(format!(
+                        "prepared aggregate argument {index} is outside {} arguments",
+                        arguments.count
+                    )));
+                }
+                Ok(arguments.registers_start + index)
+            }
         }
     }
 
@@ -407,6 +428,7 @@ impl AggregationArguments<'_, '_> {
                 }),
             }),
             Self::Hir { distinct: None, .. } => {}
+            Self::Prepared(_) => {}
         }
     }
 
@@ -430,6 +452,11 @@ impl AggregationArguments<'_, '_> {
                     .unwrap_or(CollationSeq::Binary),
                 _ => CollationSeq::Binary,
             },
+            Self::Prepared(arguments) => arguments
+                .collations
+                .get(index)
+                .copied()
+                .unwrap_or(CollationSeq::Binary),
         }
     }
 
@@ -455,6 +482,7 @@ impl AggregationArguments<'_, '_> {
                 }
                 _ => None,
             },
+            Self::Prepared(arguments) => arguments.comparators.get(index).copied().flatten(),
         }
     }
 
@@ -469,6 +497,14 @@ impl AggregationArguments<'_, '_> {
                 translate_const_arg(program, referenced_tables, resolver, &expression)
             }
             Self::Hir { .. } => {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: register,
+                });
+                Ok(register)
+            }
+            Self::Prepared(_) => {
                 let register = program.alloc_register();
                 program.emit_insn(Insn::Integer {
                     value: 1,
@@ -497,6 +533,14 @@ impl AggregationArguments<'_, '_> {
                 });
                 Ok(register)
             }
+            Self::Prepared(_) => {
+                let register = program.alloc_register();
+                program.emit_insn(Insn::String8 {
+                    value: ",".to_string(),
+                    dest: register,
+                });
+                Ok(register)
+            }
         }
     }
 
@@ -504,6 +548,14 @@ impl AggregationArguments<'_, '_> {
         match self {
             Self::Legacy { resolver, .. } => resolver.require_custom_types("Array features"),
             Self::Hir { .. } => Ok(()),
+            Self::Prepared(arguments) => {
+                if !arguments.custom_types_enabled {
+                    crate::bail_parse_error!(
+                        "Array features require --experimental-custom-types flag"
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -635,6 +687,19 @@ pub(crate) fn translate_hir_aggregation_step(
         },
         target_register,
         fraction_reg,
+    )
+}
+
+pub(crate) fn translate_prepared_aggregation_step(
+    program: &mut ProgramBuilder,
+    arguments: PreparedAggregateArguments<'_>,
+    target_register: usize,
+) -> Result<usize> {
+    emit_aggregation_step(
+        program,
+        AggregationArguments::Prepared(arguments),
+        target_register,
+        None,
     )
 }
 

@@ -853,6 +853,188 @@ arguments into the `VFilter` argument registers, and advances with `VNext`.
 Column reads already use the shared HIR expression lowering through `VColumn`;
 no parser expression, resolver, or table-reference sidecar is rebuilt.
 
+Window function stepping now consumes a representation-neutral runtime record.
+It owns prepared argument and FILTER value sources, result registers,
+collations, custom comparators, and moving-frame min/max state. The legacy
+adapter preserves direct buffered-column reads and late JSON expression
+recomputation, while aggregate opcode selection is shared with HIR lowering
+through prepared argument registers. Frame movement, peer handling, positional
+lookups, partition buffering, and row output still use the existing legacy
+window plan; adding the HIR adapter and then removing that remaining plan
+dependency are later checkpoints.
+
+Resolved HIR now builds an explicit input layout for one effective window.
+PARTITION BY and ORDER BY values are deduplicated in legacy order; ordinary
+arguments and FILTER predicates receive stable buffer slots. JSON aggregates
+keep their argument expression for late recomputation and buffer only its
+resolved column, rowid, aggregate, and subquery leaves, matching the existing
+subtype-preserving rule without rewriting expressions into subquery-column
+AST nodes. Stable `WindowFunctionId` values select calls for each window and
+missing or mismatched identities fail as HIR invariants. This plan is not yet
+routed into production frame lowering.
+
+HIR window-buffer plans now create the same representation-neutral
+`WindowFunctionRuntime` used by legacy lowering. Resolved argument facts supply
+collations and custom comparators, stable window identities bind result
+registers, and resolved frame facts drive the shared moving min/max setup. The
+HIR adapter needs no resolver, parser expression, or `TableReferences` sidecar.
+Frame movement and row buffering are still not routed to HIR.
+
+HIR window step and inverse emission now read direct arguments and filters from
+their planned buffer columns. Subtype-sensitive arguments load only their
+planned HIR leaves from the buffer and recompute through the existing HIR
+expression walker using scoped node-to-register inputs. The same generic
+step/inverse loops serve legacy and HIR expressions; HIR does not create AST
+nodes or mutate global source bindings. Production partition buffering and
+frame-loop routing remain later checkpoints.
+
+HIR window-buffer columns now retain their original resolved expression even
+for direct source-column slots. A source row can be lowered into one contiguous
+register range in the planned partition, order, argument, and filter order by
+the existing HIR expression walker. Direct columns are not reconstructed as
+new expression nodes, and windows with no buffered values consume no
+registers. The row is not yet inserted into the production window buffer or
+driven through the frame loop.
+
+Window buffer cursor creation is now shared below the legacy/HIR boundary.
+Both paths can open the same ephemeral table roles in the same order: current,
+write, end, and the optional moving-start and positional-lookup cursors. Legacy
+window initialization uses this helper without changing its frame plan or
+opcode flow. HIR window plans now open this same cursor set from their resolved
+frame and function requirements. Their ephemeral table schema carries only the
+planned record width because expression types, collations, and comparison rules
+remain owned by resolved HIR facts. Window input register ranges and buffer
+insertion are now representation-neutral as well. Legacy and HIR rows use the
+same `MakeRecord`, `NewRowid`, and `Insert` sequence without rebuilding HIR
+expressions or consulting table references. The production HIR window frame
+loop does not call this insertion path yet. HIR window plans also retain the
+exact buffer slot for every PARTITION BY and ORDER BY term. Reused expressions
+share one stored value while repeated terms and their original order remain
+explicit for partition and peer comparisons.
+PARTITION BY terms now retain their analyzed type and collation facts in HIR,
+matching ORDER BY terms instead of discarding those facts during window
+construction.
+Window key metadata stays iterator-based until `Insn::Compare` requires its
+owned vector. Legacy and HIR partition/peer comparisons use the same compare
+and branch emitter; HIR keys take collations directly from resolved terms.
+The partition-change sequence is shared too: compare keys, flush the previous
+partition, reset rowid, then save the new keys. The emitted key width drives
+the copy without collecting or walking the key iterator a second time.
+Legacy and HIR window input paths now allocate the rowid, saved partition keys,
+and flush return register through the same input state. HIR partition handling
+passes its resolved key iterator directly into the shared change sequence.
+Legacy and HIR also use one iterator-based gather operation to restore ORDER BY
+term order from deduplicated input slots. Repeated or reordered terms emit
+direct register copies without building an intermediate slot vector.
+Legacy and HIR now allocate current ORDER BY keys plus input and cursor peer
+reference registers through the same frame-gated state. First-row peer seeding
+uses the same copy sequence and preserves the legacy register order.
+Peer-group changes now use one shared emitter too. The no-ORDER case is an
+explicit all-rows state; keyed comparisons accept lazy legacy or resolved HIR
+key metadata, then update the remembered keys with the same copy sequence.
+All buffered-cursor ORDER BY reads now use one iterator-based emitter. Legacy
+extracts rewritten buffer-column indexes in one place; HIR passes its resolved
+slot iterator directly, including repeated and reordered terms.
+First-row partition reset is now shared too. Legacy and HIR clear the
+accumulator block, reset moving min/max state, and zero positional frame
+counters through one runtime emitter without collecting function state.
+Window frame tracking now has explicit `None`, positional-counter, and
+EXCLUDE-rowid states. Legacy and HIR allocate the same state, so partial
+rowid pairs and simultaneous positional/EXCLUDE tracking are unrepresentable.
+Bounded frame offsets now share evaluation timing and runtime checks. HIR
+classifies resolved expressions with the iterative expression fold, lowers
+accepted constants directly, and preserves SQLite's NULL substitution for
+columns, functions, subqueries, and current-time values.
+Frame-offset registers now use one explicit `None`, start, end, or both state.
+Legacy and HIR allocate that state from their own frame bounds, while the
+runtime loop consumes the same accessors and keeps the existing opcode order.
+Window step, per-operation, output, and flush routing now consume an
+expression-free frame shape. Legacy and HIR map their own bounds into the same
+edge enum; runtime routing no longer matches legacy `FrameBoundary` values.
+The crossed-bound check for same-kind bounded frames is shared as well. One
+explicit order-check enum selects the existing `Le`/`Ge` branch, and both HIR
+and legacy frame state can classify that check without carrying expressions.
+First-row frame cursor positioning is shared without allocating a cursor list.
+HIR and legacy lowering rewind the optional start cursor, current cursor, and
+end cursor in the same order.
+The `FOLLOWING` start delay is shared too: bounded `ROWS`/`GROUPS` frames keep
+the existing `end - start` register adjustment, while `RANGE` remains exempt.
+The crossed-bound empty-frame guard now owns the shared branch, cursor rewind,
+rowid reset, and sorter reset sequence. Representation-specific aggregate and
+row output remain callbacks in their original bytecode positions.
+Window aggregate result emission now consumes the shared function runtime and
+an explicit value/finalize mode. HIR and legacy use the same min/max, positional,
+`AggValue`, and `AggFinal` paths without collecting a temporary min/max vector.
+HIR bounded frame offsets now have one partition-entry emitter. It rebuilds the
+start and end countdown registers in legacy order through the existing shared
+offset checks, ready for the HIR first-row frame path.
+First-row buffer insertion, empty-frame handling, following-bound delay, cursor
+rewind, and final jump now share one emitter. It accepts prepared frame state
+and the existing aggregate/row phase callback; HIR tests exercise the sequence
+without a resolver or table references. Production HIR frame-loop wiring remains
+a later checkpoint.
+The HIR first-row adapter now evaluates partition offsets before insertion and
+supplies resolved aggregate results to that sequence. EXCLUDE frames retain
+full-frame result evaluation; row output remains a callback after cursor rewind.
+HIR first-row initialization now composes peer-reference seeding, accumulator
+and frame-counter reset, and that frame adapter in legacy order. Prepared peer,
+tracking, function, and buffer state are reused across partition entries.
+Subsequent rows now share buffer insertion followed by the frame-gated peer
+check. HIR passes resolved ORDER BY metadata directly; ROWS skips comparison,
+and RANGE/GROUPS without ORDER BY jump to the step end after insertion.
+Bounded RANGE comparisons now consume a resolved buffer slot, direction, NULL
+order, and collation through a shared key descriptor. Legacy and HIR adapters
+use the same numeric guards, DESC reversal, NULL branches, and comparison flow.
+Operation offset gates now share countdown emission and RANGE comparison
+selection. Missing offsets emit nothing; ROWS/GROUPS keep their decrementing
+`IfPos`, while HIR and legacy RANGE gates return the same retry-label position
+and preserve operation-specific cursor order and boundary comparisons.
+Window operations now share the complete control flow: unbounded-inverse no-op,
+offset gates, aggregate-result reads, RANGE cursor guards, tracked step/inverse,
+row deletion, cursor advance, EOF exits, peer repeats, and RANGE retry branches.
+Legacy and HIR adapters supply aggregate/output and key emitters. HIR deletion
+uses resolved frame facts and literal offsets with legacy integer truncation;
+its peer checks read planned buffer slots and resolved collations directly.
+Per-row result preparation now shares buffered output reads, first_value /
+nth_value and lag / lead lookups, EXCLUDE frame scans, and the output Gosub.
+HIR supplies planned buffer slots, prepared function result registers, resolved
+peer keys, and HIR aggregate emission for scan rows. The HIR row-result adapter
+can serve as the operation loop's output callback, including EXCLUDE scans.
+Streaming and partition-flush control flow now share the legacy frame-pattern
+branches. HIR adapters compose partition checks, first-row initialization,
+subsequent insertion, operation loops, and row-result callbacks. Flush preserves
+its partition-boundary and end-of-source entries, EOF exits, buffer reset,
+EXCLUDE rowid reset, and jump over the output subroutine. Tests lower these
+pieces together using resolved HIR for ROWS, GROUPS, RANGE, and EXCLUDE frames.
+The HIR SELECT output subroutine now evaluates expressions from supplied buffer
+registers and bound window results, then reuses SELECT DISTINCT, destination,
+sorter, and LIMIT/OFFSET emission. DISTINCT and OFFSET skips return to the window
+loop; direct LIMIT exits through the query's done label. Sorted output applies
+LIMIT/OFFSET when draining. Separate sort-input mappings preserve encoded custom
+keys independently of decoded SELECT values. Row-dependent expressions stay
+inside the subroutine. Outer-input planning now walks SELECT and ORDER BY HIR,
+retaining columns, rowids, aggregates, subqueries, and other-window results in
+buffer slots.
+Current-window calls keep their computed result bindings; scalar expressions
+remain at output time. Equivalent terminals reuse slots while every exact HIR
+node gets a register mapping. Encoded sort terminals use separate slots and
+source emission suppresses custom decoding only for those slots. Prepared
+registers feed shared row-result reads and the HIR output subroutine.
+Planned SELECT blocks with one window now lower end to end. The block's rows
+play the role of the legacy window source subquery: plain, grouped, ungrouped
+aggregate, and FROM-less rows go to a window input target instead of the SELECT
+output. Rows are sorted by PARTITION BY ascending and then ORDER BY, skipping
+terms equal to an earlier key, with resolved collations, NULL order, and
+custom comparators. Keys of custom types that decode values sort by their
+stored value, and grouped rows add a sequence column so equal keys keep group
+order, both as in legacy. A window with no keys streams rows straight into the
+buffer. The sorted rows then run the shared window step, and the flush emits
+the SELECT output subroutine, so DISTINCT, ORDER BY, LIMIT, and OFFSET apply to
+window output rows. Aggregates, grouped rowids, and bare columns used only by a
+window definition are now collected too. Several windows in one block still
+return an internal error; they need one layer per window, as legacy nests one
+source subquery per window.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

@@ -418,12 +418,39 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
     }
 }
 
-struct ExprLowerer<'program, 'document> {
-    program: &'program mut ProgramBuilder,
-    document: &'document hir::HirDocument,
+/// One expression node whose value was already produced in a register.
+///
+/// The node is matched by identity. This keeps temporary runtime inputs scoped
+/// to the exact resolved expression being lowered.
+#[derive(Clone, Copy)]
+pub(crate) struct ExprRegisterInput<'expr> {
+    expression: &'expr hir::Expr,
+    register: usize,
 }
 
-impl<'expr> ExprLowerer<'_, 'expr> {
+impl<'expr> ExprRegisterInput<'expr> {
+    pub(crate) const fn new(expression: &'expr hir::Expr, register: usize) -> Self {
+        Self {
+            expression,
+            register,
+        }
+    }
+}
+
+struct ExprLowerer<'program, 'document, 'inputs> {
+    program: &'program mut ProgramBuilder,
+    document: &'document hir::HirDocument,
+    inputs: &'inputs [ExprRegisterInput<'document>],
+}
+
+impl<'expr> ExprLowerer<'_, 'expr, '_> {
+    fn input_register(&self, expression: &hir::Expr) -> Option<usize> {
+        self.inputs
+            .iter()
+            .find(|input| std::ptr::eq(input.expression, expression))
+            .map(|input| input.register)
+    }
+
     fn schema_call_child(
         &self,
         calls: impl IntoIterator<Item = &'expr hir::BoundSchemaCall>,
@@ -568,12 +595,15 @@ impl<'expr> ExprLowerer<'_, 'expr> {
     }
 }
 
-impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
+impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
     type Context = LoweringContext;
     type Output = usize;
     type Error = LimboError;
 
     fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        if self.input_register(expression).is_some() {
+            return None;
+        }
         match expression {
             hir::Expr::Column(reference) => self
                 .column_child(*reference, index)
@@ -1646,6 +1676,17 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
         children: &[usize],
     ) -> Result<usize> {
         let target = context.target;
+        if let Some(register) = self.input_register(expression) {
+            debug_assert!(children.is_empty());
+            if register != target {
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+            }
+            return Ok(target);
+        }
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
@@ -2692,7 +2733,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
     }
 }
 
-impl ExprLowerer<'_, '_> {
+impl ExprLowerer<'_, '_, '_> {
     fn begin_cast_call(
         &mut self,
         target: &hir::TypeName,
@@ -4216,9 +4257,25 @@ pub(crate) fn translate_expr(
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
+    translate_expr_with_inputs(program, document, expression, target, &[])
+}
+
+/// Lower a resolved expression while taking selected node values from
+/// registers prepared by its caller.
+pub(crate) fn translate_expr_with_inputs<'expr>(
+    program: &mut ProgramBuilder,
+    document: &'expr hir::HirDocument,
+    expression: &'expr hir::Expr,
+    target: usize,
+    inputs: &[ExprRegisterInput<'expr>],
+) -> Result<usize> {
     expression.walk(
         LoweringContext::new(target),
-        &mut ExprLowerer { program, document },
+        &mut ExprLowerer {
+            program,
+            document,
+            inputs,
+        },
     )
 }
 
@@ -4368,10 +4425,21 @@ pub(crate) fn translate_expr_no_constant_opt(
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
+    translate_expr_with_inputs_no_constant_opt(program, document, expression, target, &[])
+}
+
+/// Keep register-dependent expressions inside the row or subroutine using them.
+pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
+    program: &mut ProgramBuilder,
+    document: &'expr hir::HirDocument,
+    expression: &'expr hir::Expr,
+    target: usize,
+    inputs: &[ExprRegisterInput<'expr>],
+) -> Result<usize> {
     let first_new_span = program.constant_spans_next_idx();
-    let result = translate_expr(program, document, expression, target)?;
+    let result = translate_expr_with_inputs(program, document, expression, target, inputs);
     program.constant_spans_invalidate_after(first_new_span);
-    Ok(result)
+    result
 }
 
 /// Apply bound schema calls to a value already stored in `target`.

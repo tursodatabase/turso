@@ -74,9 +74,19 @@ pub struct OrderTerm {
 }
 
 #[derive(Clone, Debug)]
+pub struct WindowPartitionTerm {
+    pub expr: Expr,
+    /// Final type facts of `expr` in the scope where this term was bound.
+    pub type_fact: TypeFact,
+    /// Final SQLite collation after explicit-COLLATE and declared-column
+    /// precedence have been applied during semantic analysis.
+    pub collation: Option<ResolvedCollation>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ResolvedWindow {
     pub id: WindowId,
-    pub partition_by: Vec<Expr>,
+    pub partition_by: Vec<WindowPartitionTerm>,
     pub order_by: Vec<OrderTerm>,
     pub frame: WindowFrame,
 }

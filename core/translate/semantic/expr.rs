@@ -473,7 +473,11 @@ impl FunctionWindow {
             partition_by: self
                 .partition_by
                 .into_iter()
-                .map(|value| value.expr)
+                .map(|value| hir::WindowPartitionTerm {
+                    collation: value.collation.value().cloned(),
+                    type_fact: value.type_fact,
+                    expr: value.expr,
+                })
                 .collect(),
             order_by: self
                 .order_by
@@ -484,13 +488,18 @@ impl FunctionWindow {
         })
     }
 
-    fn nested_function(&self) -> Option<NestedFunction> {
-        nested_function_iter(&self.partition_by)
-            .or_else(|| nested_function_iter(self.order_by.iter().map(|term| &term.value)))
+    fn nested_window(&self) -> Option<NestedFunction> {
+        let nested = NestedSearch::WindowsOnly;
+        nested_function_iter(&self.partition_by, nested)
+            .or_else(|| nested_function_iter(self.order_by.iter().map(|term| &term.value), nested))
             .or_else(|| {
                 let frame = self.frame.as_ref()?;
-                nested_function_in_window_bound(&frame.start)
-                    .or_else(|| frame.end.as_ref().and_then(nested_function_in_window_bound))
+                nested_function_in_window_bound(&frame.start, nested).or_else(|| {
+                    frame
+                        .end
+                        .as_ref()
+                        .and_then(|bound| nested_function_in_window_bound(bound, nested))
+                })
             })
     }
 }
@@ -2725,23 +2734,30 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 None => self.resolve_sequence_operation(&function, &input)?,
             };
         if aggregate || window_evaluation {
-            if let Some(nested) = nested_function_iter(input.facts())
+            // A window call runs over the rows an aggregate query produces, so
+            // its operands may contain aggregates but not other windows.
+            let search = if window_evaluation {
+                NestedSearch::WindowsOnly
+            } else {
+                NestedSearch::AggregatesAndWindows
+            };
+            if let Some(nested) = nested_function_iter(input.facts(), search)
                 .or_else(|| {
-                    nested_function_iter(input.order_terms().iter().map(|term| &term.value))
+                    nested_function_iter(input.order_terms().iter().map(|term| &term.value), search)
                 })
                 .or_else(|| {
                     filter
                         .as_ref()
-                        .and_then(|filter| nested_function_iter([filter]))
+                        .and_then(|filter| nested_function_iter([filter], search))
                 })
-                .or_else(|| window.as_ref().and_then(FunctionWindow::nested_function))
+                .or_else(|| window.as_ref().and_then(FunctionWindow::nested_window))
             {
                 match nested {
                     NestedFunction::Aggregate(name) => {
                         crate::bail_parse_error!("misuse of aggregate function {name}()")
                     }
                     NestedFunction::Window(name) => {
-                        crate::bail_parse_error!("misuse of window function: {name}()")
+                        crate::bail_parse_error!("misuse of window function {name}()")
                     }
                 }
             }
@@ -3974,10 +3990,10 @@ fn bind_function(
     if has_over && !policy.allow_windows {
         match function {
             Func::Agg(_) | Func::Window(_) => {
-                crate::bail_parse_error!("misuse of window function: {}()", function)
+                crate::bail_parse_error!("misuse of window function {}()", function)
             }
             Func::External(external) if external.func.is_aggregate() => {
-                crate::bail_parse_error!("misuse of window function: {}()", function)
+                crate::bail_parse_error!("misuse of window function {}()", function)
             }
             _ => {
                 crate::bail_parse_error!("{} may not be used as a window function", name.as_str())
@@ -3996,7 +4012,7 @@ fn bind_function(
         }
         Func::Window(_) if has_over => bind_window(function, context),
         Func::Window(window) => {
-            crate::bail_parse_error!("misuse of window function: {}()", window)
+            crate::bail_parse_error!("misuse of window function {}()", window)
         }
         _ if has_over => {
             crate::bail_parse_error!("{} may not be used as a window function", name.as_str())
@@ -4009,7 +4025,7 @@ fn bind_function(
 fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
     match context {
         FunctionContext::ScalarOnly => {
-            crate::bail_parse_error!("misuse of window function: {}()", function)
+            crate::bail_parse_error!("misuse of window function {}()", function)
         }
         FunctionContext::Query(state) => Ok(FunctionBinding::Window(WindowBinding {
             id: state.allocate_window(),
@@ -4088,15 +4104,22 @@ fn resolve_ordered_set_function(
     Ok(function)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestedSearch {
+    AggregatesAndWindows,
+    WindowsOnly,
+}
+
 fn nested_function_iter<'a>(
     arguments: impl IntoIterator<Item = &'a ResolvedScopeExpr>,
+    search: NestedSearch,
 ) -> Option<NestedFunction> {
     arguments
         .into_iter()
-        .find_map(|argument| nested_function_in_expr(&argument.expr))
+        .find_map(|argument| nested_function_in_expr(&argument.expr, search))
 }
 
-fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
+fn nested_function_in_expr(expression: &hir::Expr, search: NestedSearch) -> Option<NestedFunction> {
     let mut nested = None;
     expression.for_each(&mut |expression| {
         if nested.is_some() {
@@ -4106,9 +4129,12 @@ fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
             return;
         };
         nested = match call.evaluation {
-            hir::FunctionEvaluation::Aggregate { .. } => {
+            hir::FunctionEvaluation::Aggregate { .. }
+                if search == NestedSearch::AggregatesAndWindows =>
+            {
                 Some(NestedFunction::Aggregate(call.function.value().to_string()))
             }
+            hir::FunctionEvaluation::Aggregate { .. } => None,
             hir::FunctionEvaluation::Window { .. } => {
                 Some(NestedFunction::Window(call.function.value().to_string()))
             }
@@ -4118,10 +4144,15 @@ fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
     nested
 }
 
-fn nested_function_in_window_bound(bound: &hir::WindowFrameBound) -> Option<NestedFunction> {
+fn nested_function_in_window_bound(
+    bound: &hir::WindowFrameBound,
+    search: NestedSearch,
+) -> Option<NestedFunction> {
     match bound {
         hir::WindowFrameBound::Following(expression)
-        | hir::WindowFrameBound::Preceding(expression) => nested_function_in_expr(expression),
+        | hir::WindowFrameBound::Preceding(expression) => {
+            nested_function_in_expr(expression, search)
+        }
         hir::WindowFrameBound::CurrentRow
         | hir::WindowFrameBound::UnboundedFollowing
         | hir::WindowFrameBound::UnboundedPreceding => None,
