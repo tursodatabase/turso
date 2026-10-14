@@ -4335,6 +4335,204 @@ test fk-deferred-null-parent-key-does-not-repay {
 expect error {
 }
 
+# Immediate foreign keys are checked when the statement ends, like SQLite.
+# A later row of the same statement can fix a violation of an earlier row.
+
+# Deletes the parent row 1 first, then its child row 2.
+@cross-check-integrity
+test fk-immediate-delete-parent-then-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# Inserts the child row 2 first, then its parent row 1.
+@cross-check-integrity
+test fk-immediate-insert-child-then-parent-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, p INTEGER REFERENCES s(id));
+    INSERT INTO s VALUES (2, 1), (1, NULL);
+    SELECT id, p FROM s ORDER BY id;
+}
+expect {
+    1|
+    2|1
+}
+
+# Moving the parent key orphans row 2 until row 2 moves too.
+@cross-check-integrity
+test fk-immediate-update-moves-parent-and-child-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, p = p + 10;
+    SELECT id, p FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+@cross-check-integrity
+test fk-immediate-orphan-in-multi-row-insert-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE par(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES par(id));
+    INSERT INTO ch VALUES (5, 9), (6, NULL);
+}
+expect error {
+}
+
+# Children of every action are counted when their parent goes away, and the
+# CASCADE action repays only its own. The NO ACTION child stays an orphan.
+@cross-check-integrity
+test fk-cascade-sibling-does-not-repay-no-action-child-on-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE NO ACTION);
+    CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (22);
+    INSERT INTO c1 VALUES (1, 22);
+    INSERT INTO c2 VALUES (5, 22);
+    UPDATE parent SET id = 11 WHERE id = 22;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-cascade-sibling-does-not-repay-no-action-child-on-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));
+    CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES (22);
+    INSERT INTO c1 VALUES (1, 22);
+    INSERT INTO c2 VALUES (5, 22);
+    DELETE FROM parent WHERE id = 22;
+}
+expect error {
+}
+
+# The parent's index entries are gone before its CASCADE action runs, so the
+# action's child-side check sees the parent as deleted and repays the count.
+@cross-check-integrity
+test fk-cascade-delete-through-parent-index-on-composite-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent_comp(a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY(a, b));
+    CREATE TABLE child_comp(id INTEGER PRIMARY KEY, ca INTEGER, cb INTEGER, FOREIGN KEY(ca, cb) REFERENCES parent_comp(a, b) ON DELETE CASCADE);
+    INSERT INTO parent_comp VALUES (2, 9), (3, 1);
+    INSERT INTO child_comp VALUES (1, 2, 9), (2, 3, 1);
+    DELETE FROM parent_comp WHERE a = 2 AND b = 9;
+    SELECT id FROM child_comp;
+}
+expect {
+    2
+}
+
+# A trigger shares the statement's count: its orphan child is repaired by a
+# later row of the statement that fired it.
+@cross-check-integrity
+test fk-immediate-trigger-violation-repaired-by-later-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE src(x INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES src(x));
+    CREATE TRIGGER tr AFTER INSERT ON src WHEN new.x = 1 BEGIN INSERT INTO child VALUES (10, 2); END;
+    INSERT INTO src VALUES (1), (2);
+    SELECT id, pid FROM child;
+}
+expect {
+    10|2
+}
+
+# RAISE(IGNORE) keeps the rows the trigger already wrote, so their count stays.
+@cross-check-integrity
+test fk-immediate-trigger-raise-ignore-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id));
+    CREATE TABLE src(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO c VALUES (1, 99); SELECT RAISE(IGNORE); END;
+    INSERT INTO src VALUES (1);
+}
+expect error {
+}
+
+# A single-row INSERT into a table with INSERT triggers counts its violation:
+# the trigger can insert the missing parent.
+@cross-check-integrity
+test fk-immediate-single-row-insert-repaired-by-its-trigger {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id));
+    CREATE TRIGGER tr AFTER INSERT ON c BEGIN INSERT INTO p VALUES (new.pid); END;
+    INSERT INTO c VALUES (1, 5);
+    SELECT id FROM p;
+}
+expect {
+    5
+}
+
+# Deleting a self-referencing parent through an index on the child column
+# does not count the deleted row as its own child.
+@cross-check-integrity
+test fk-immediate-self-reference-delete-with-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id));
+    CREATE INDEX t_p ON t(p);
+    INSERT INTO t VALUES (1, 1), (2, 1), (3, 3), (4, NULL);
+    DELETE FROM t WHERE id IN (1, 2);
+    DELETE FROM t WHERE id = 3;
+    SELECT id FROM t;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+test fk-immediate-trigger-violation-not-repaired-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE src(x INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES src(x));
+    CREATE TRIGGER tr AFTER INSERT ON src WHEN new.x = 1 BEGIN INSERT INTO child VALUES (10, 3); END;
+    INSERT INTO src VALUES (1), (2);
+}
+expect error {
+}
+
+# Deleting a parent counts one violation per child row, also when the child
+# column has an index. Deleting one of two children repays only one.
+@cross-check-integrity
+test fk-deferred-indexed-child-counts-each-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_a ON c(a);
+    INSERT INTO p VALUES (40);
+    INSERT INTO c VALUES (9, 40), (13, 40);
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c WHERE id = 13;
+    COMMIT;
+}
+expect error {
+}
+
+# RESTRICT fails at once, even if a later row would fix it.
+@cross-check-integrity
+test fk-restrict-fails-before-the-statement-ends {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE r(id INTEGER PRIMARY KEY, p INTEGER REFERENCES r(id) ON DELETE RESTRICT);
+    INSERT INTO r VALUES (1, NULL), (2, 1);
+    DELETE FROM r;
+}
+expect error {
+}
+
 # UPDATE and UPSERT only emit parent-side foreign-key bytecode when the
 # statement can change the key that the children point at. These snapshots record
 # which statements get the OLD/NEW key probes and which get the CASCADE,
