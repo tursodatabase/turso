@@ -4214,39 +4214,15 @@ fn predicate_loop(
 ) -> Result<Option<usize>> {
     let mut eval_at = None;
     let mut missing = None;
-    let mut missing_query = None;
-    let mut record_source = |source| {
+    // Output references follow the aliased expression, and subqueries
+    // contribute their outer captures.
+    document.visit_expr_sources(expression, &mut |source| {
         if let Some(position) = loops.iter().position(|hir_loop| hir_loop.source == source) {
             eval_at = Some(eval_at.map_or(position, |current: usize| current.max(position)));
         } else if program.source_binding(source).is_none() {
             missing = Some(source);
         }
-    };
-    expression.for_each(&mut |expression| match expression {
-        hir::Expr::Column(reference) => record_source(reference.source),
-        hir::Expr::RowId(source) => record_source(*source),
-        hir::Expr::Subquery(subquery) => {
-            let query = match subquery {
-                SubqueryExpr::Scalar { query, .. }
-                | SubqueryExpr::Row { query }
-                | SubqueryExpr::In { query, .. }
-                | SubqueryExpr::Exists(query) => *query,
-            };
-            if let Some(query) = document.query(query) {
-                for source in &query.captures {
-                    record_source(*source);
-                }
-            } else {
-                missing_query = Some(query);
-            }
-        }
-        _ => {}
     });
-    if let Some(query) = missing_query {
-        return Err(LimboError::InternalError(format!(
-            "HIR predicate references missing subquery {query}"
-        )));
-    }
     if let Some(source) = missing {
         return Err(LimboError::InternalError(format!(
             "HIR predicate references source {source} outside its loop plan"

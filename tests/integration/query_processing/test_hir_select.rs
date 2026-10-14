@@ -65,6 +65,12 @@ fn hir_select_matches_legacy_rows_and_columns() {
         "SELECT count(*), max(value) FROM items",
         "SELECT a.id, b.id FROM items a JOIN items b ON a.value = b.value + 10 ORDER BY 1, 2",
         "SELECT a.id, b.id FROM items a LEFT JOIN items b ON b.value = a.value + 10 ORDER BY 1, 2",
+        // Aliases used before their output is evaluated expand in place.
+        "SELECT value + 1 AS x FROM items WHERE x > 15 ORDER BY x",
+        "SELECT extra AS e, count(*) FROM items GROUP BY e ORDER BY e",
+        "SELECT extra, sum(value) FILTER (WHERE value > 15) AS s FROM items GROUP BY extra HAVING s > 0",
+        "SELECT extra AS e, count(*) FROM items GROUP BY 1 ORDER BY 1",
+        "SELECT json_valid('{a:1}', 6), json_valid('{}')",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),

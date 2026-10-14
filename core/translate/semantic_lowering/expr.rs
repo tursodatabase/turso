@@ -630,6 +630,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 hir::Expr::Row(values) => values.get(index),
                 expression => (index == 0).then_some(expression),
             },
+            // A reference to an output that has not been evaluated yet, as in
+            // WHERE, GROUP BY, or HAVING, evaluates the aliased expression in
+            // place, like SQLite's alias expansion.
+            hir::Expr::Output(output)
+                if index == 0 && self.program.output_binding(*output).is_none() =>
+            {
+                self.document.output(*output).map(|output| &output.expr)
+            }
             _ => expression.child(index),
         }
     }
@@ -761,7 +769,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             hir::Expr::IsNull(_) | hir::Expr::NotNull(_) | hir::Expr::TruthTest { .. } => {
                 self.program.alloc_register()
             }
-            hir::Expr::Collate { .. } => context.target,
+            hir::Expr::Collate { .. } | hir::Expr::Output(_) => context.target,
             hir::Expr::Cast {
                 expr,
                 target: cast_target,
@@ -1721,11 +1729,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             }
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Output(output) => {
-                let binding = self.program.output_binding(*output).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "HIR output {output:?} has no runtime binding"
-                    ))
-                })?;
+                let Some(binding) = self.program.output_binding(*output) else {
+                    if children.len() != 1 {
+                        return Err(LimboError::InternalError(format!(
+                            "HIR output {output:?} has no runtime binding or definition"
+                        )));
+                    }
+                    return Ok(target);
+                };
                 if binding.register != target {
                     self.program.emit_insn(Insn::Copy {
                         src_reg: binding.register,
