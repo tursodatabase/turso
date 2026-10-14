@@ -14,6 +14,29 @@ use turso_parser::ast::RefAct;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
+// These are PostgreSQL's fixed system-catalog OIDs, not generated user-object OIDs.
+// Catalog tableoid values and pg_depend classid/refclassid must match PostgreSQL
+// so clients such as pg_dump can identify the catalog containing each object.
+/// OID of pg_class, which describes tables and indexes.
+const PG_CLASS_OID: i64 = 1259;
+/// OID of pg_namespace, which describes schemas.
+const PG_NAMESPACE_OID: i64 = 2615;
+/// OID of pg_am, which lists table and index access methods.
+const PG_AM_OID: i64 = 2601;
+/// OID of pg_constraint, which describes primary keys, unique constraints, foreign keys and checks.
+const PG_CONSTRAINT_OID: i64 = 2606;
+/// OID of pg_attrdef, which describes column default expressions.
+const PG_ATTRDEF_OID: i64 = 2604;
+/// OID of pg_depend, which records dependencies between database objects.
+const PG_DEPEND_OID: i64 = 2608;
+
+/// PostgreSQL uses OID zero when no object is referenced.
+const PG_INVALID_OID: i64 = 0;
+/// pg_depend uses column zero for a whole object; table columns are numbered from one.
+const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
+/// Catalog BOOLEAN values are stored as integers; one means true.
+const CATALOG_BOOLEAN_TRUE: i64 = 1;
+
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -297,7 +320,7 @@ impl SnapshotRows for PgClassTable {
             relpartbound TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(1259);
+    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -425,7 +448,7 @@ impl SnapshotRows for PgNamespaceTable {
             nspacl TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(2615);
+    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -853,7 +876,7 @@ impl SnapshotRows for PgAmTable {
             amtype TEXT,
             tableoid INTEGER HIDDEN
         )";
-    const TABLE_OID: Option<i64> = Some(2601);
+    const TABLE_OID: Option<i64> = Some(PG_AM_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -1587,7 +1610,7 @@ struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
-    const TABLE_OID: Option<i64> = Some(2606);
+    const TABLE_OID: Option<i64> = Some(PG_CONSTRAINT_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1879,7 +1902,7 @@ struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
-    const TABLE_OID: Option<i64> = Some(2604);
+    const TABLE_OID: Option<i64> = Some(PG_ATTRDEF_OID);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -2234,6 +2257,42 @@ enum DependencyKind {
     Internal,
 }
 
+struct ObjectAddress {
+    catalog_oid: i64,
+    object_oid: i64,
+    column_number: i64,
+}
+
+struct RelationRow<'a> {
+    oid: i64,
+    name: &'a str,
+    namespace_oid: i64,
+    access_method_oid: i64,
+    kind: RelationKind,
+}
+
+struct ConstraintRow<'a> {
+    oid: i64,
+    kind: ConstraintKind,
+    table_oid: i64,
+    referenced_table_oid: i64,
+    column_numbers: Option<&'a str>,
+    referenced_column_numbers: Option<&'a str>,
+}
+
+struct IndexRow<'a> {
+    oid: i64,
+    table_oid: i64,
+    is_unique: bool,
+    column_numbers: Option<&'a str>,
+}
+
+struct ColumnDefaultRow {
+    oid: i64,
+    table_oid: i64,
+    column_number: i64,
+}
+
 #[derive(Debug)]
 struct PgDependTable;
 
@@ -2243,132 +2302,115 @@ impl SnapshotRows for PgDependTable {
         refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT,
         tableoid INTEGER HIDDEN
     )";
-    const TABLE_OID: Option<i64> = Some(2608);
+    const TABLE_OID: Option<i64> = Some(PG_DEPEND_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let constraint_rows = PgConstraintTable::load_rows(conn);
-        let constraints = constraint_rows.iter().map(|row| {
-            let kind = row[3]
-                .to_text()
-                .expect("catalog constraint kinds are text")
-                .parse::<ConstraintKind>()
-                .expect("catalog constraint kinds are valid");
-            (row, kind)
-        });
-        let indexes = PgIndexTable::load_rows(conn);
+        let constraints = constraint_rows
+            .iter()
+            .map(|row| ConstraintRow::from_row(row));
+        let index_rows = PgIndexTable::load_rows(conn);
+        let indexes = index_rows.iter().map(|row| IndexRow::from_row(row));
         let relation_rows = PgClassTable::load_rows(conn);
-        let relations = relation_rows.iter().map(|row| {
-            let kind = row[16]
-                .to_text()
-                .expect("catalog relation kinds are text")
-                .parse::<RelationKind>()
-                .expect("catalog relation kinds are valid");
-            (row, kind)
-        });
+        let relations = relation_rows.iter().map(|row| RelationRow::from_row(row));
 
-        for (relation, kind) in relations.clone() {
-            if !matches!(kind, RelationKind::Table) {
+        for relation in relations.clone() {
+            if !matches!(relation.kind, RelationKind::Table) {
                 continue;
             }
-            let oid = relation[0].as_int().expect("catalog OIDs are integers");
-            let namespace = relation[2].as_int().expect("catalog OIDs are integers");
             rows.push(dependency_row(
-                [1259, oid, 0],
-                [2615, namespace, 0],
+                ObjectAddress::whole::<PgClassTable>(relation.oid),
+                ObjectAddress::whole::<PgNamespaceTable>(relation.namespace_oid),
                 DependencyKind::Normal,
             ));
-            let access_method = relation[6].as_int().expect("catalog OIDs are integers");
-            if access_method != 0 {
+            if relation.access_method_oid != PG_INVALID_OID {
                 rows.push(dependency_row(
-                    [1259, oid, 0],
-                    [2601, access_method, 0],
+                    ObjectAddress::whole::<PgClassTable>(relation.oid),
+                    ObjectAddress::whole::<PgAmTable>(relation.access_method_oid),
                     DependencyKind::Normal,
                 ));
             }
         }
 
-        for index in &indexes {
-            let oid = index[0].as_int().expect("catalog OIDs are integers");
-            let table = index[1].as_int().expect("catalog OIDs are integers");
-            let columns = catalog_column_numbers(&index[14]);
-            let automatic = relations.clone().any(|(relation, _)| {
-                relation[0].as_int() == Some(oid)
-                    && matches!(&relation[1], Value::Text(name) if name.as_str().starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX))
+        for index in indexes.clone() {
+            let columns = catalog_column_numbers(index.column_numbers);
+            let automatic = relations.clone().any(|relation| {
+                relation.oid == index.oid
+                    && relation
+                        .name
+                        .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
             });
             let constraint = if automatic {
-                constraints.clone().find(|(constraint, kind)| {
-                    matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique)
-                        && constraint[7].as_int() == Some(table)
-                        && catalog_column_numbers(&constraint[18]) == columns
+                constraints.clone().find(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                    ) && constraint.table_oid == index.table_oid
+                        && catalog_column_numbers(constraint.column_numbers) == columns
                 })
             } else {
                 None
             };
-            if let Some((constraint, _)) = constraint {
-                let constraint_oid = constraint[0].as_int().expect("catalog OIDs are integers");
+            if let Some(constraint) = constraint {
                 rows.push(dependency_row(
-                    [1259, oid, 0],
-                    [2606, constraint_oid, 0],
+                    ObjectAddress::whole::<PgClassTable>(index.oid),
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
                     DependencyKind::Internal,
                 ));
             } else {
-                for column in columns {
+                for column_number in columns {
                     rows.push(dependency_row(
-                        [1259, oid, 0],
-                        [1259, table, column],
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
+                        ObjectAddress::column(index.table_oid, column_number),
                         DependencyKind::Auto,
                     ));
                 }
             }
         }
 
-        for (constraint, _) in constraints {
-            let oid = constraint[0].as_int().expect("catalog OIDs are integers");
-            let table = constraint[7].as_int().expect("catalog OIDs are integers");
-            for column in catalog_column_numbers(&constraint[18]) {
+        for constraint in constraints {
+            for column_number in catalog_column_numbers(constraint.column_numbers) {
                 rows.push(dependency_row(
-                    [2606, oid, 0],
-                    [1259, table, column],
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                    ObjectAddress::column(constraint.table_oid, column_number),
                     DependencyKind::Auto,
                 ));
             }
-            let referenced_table = constraint[11].as_int().expect("catalog OIDs are integers");
-            if referenced_table != 0 {
-                let referenced_columns = catalog_column_numbers(&constraint[19]);
-                for &column in &referenced_columns {
+            if constraint.referenced_table_oid != PG_INVALID_OID {
+                let referenced_columns =
+                    catalog_column_numbers(constraint.referenced_column_numbers);
+                for &column_number in &referenced_columns {
                     rows.push(dependency_row(
-                        [2606, oid, 0],
-                        [1259, referenced_table, column],
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::column(constraint.referenced_table_oid, column_number),
                         DependencyKind::Normal,
                     ));
                 }
-                if let Some(index) = indexes.iter().find(|index| {
-                    index[1].as_int() == Some(referenced_table)
-                        && index[4].as_int() == Some(1)
-                        && catalog_column_numbers(&index[14]) == referenced_columns
+                if let Some(index) = indexes.clone().find(|index| {
+                    index.table_oid == constraint.referenced_table_oid
+                        && index.is_unique
+                        && catalog_column_numbers(index.column_numbers) == referenced_columns
                 }) {
-                    let index_oid = index[0].as_int().expect("catalog OIDs are integers");
                     rows.push(dependency_row(
-                        [2606, oid, 0],
-                        [1259, index_oid, 0],
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
                         DependencyKind::Normal,
                     ));
                 }
             }
         }
 
-        for default in PgAttrdefTable::load_rows(conn) {
-            let oid = default[0].as_int().expect("catalog OIDs are integers");
-            let table = default[1].as_int().expect("catalog OIDs are integers");
-            let column = default[2]
-                .as_int()
-                .expect("catalog column numbers are integers");
+        let default_rows = PgAttrdefTable::load_rows(conn);
+        let defaults = default_rows
+            .iter()
+            .map(|row| ColumnDefaultRow::from_row(row));
+        for default in defaults {
             rows.push(dependency_row(
-                [2604, oid, 0],
-                [1259, table, column],
+                ObjectAddress::whole::<PgAttrdefTable>(default.oid),
+                ObjectAddress::column(default.table_oid, default.column_number),
                 DependencyKind::Auto,
             ));
         }
@@ -2376,34 +2418,173 @@ impl SnapshotRows for PgDependTable {
     }
 }
 
-fn catalog_column_numbers(value: &Value) -> Vec<i64> {
-    match value {
-        Value::Null => vec![0],
-        Value::Text(text) => {
+fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
+    match text {
+        None => vec![WHOLE_OBJECT_COLUMN_NUMBER],
+        Some(text) => {
             let mut columns: Vec<i64> = text
-                .as_str()
                 .split_ascii_whitespace()
                 .map(|column| column.parse().expect("catalog column numbers are integers"))
                 .collect();
             if columns.is_empty() {
-                columns.push(0);
+                columns.push(WHOLE_OBJECT_COLUMN_NUMBER);
             }
             columns.sort_unstable();
             columns.dedup();
             columns
         }
-        _ => unreachable!("catalog column lists are text or null"),
     }
 }
 
-fn dependency_row(dependent: [i64; 3], referenced: [i64; 3], kind: DependencyKind) -> Vec<Value> {
+fn dependency_row(
+    dependent: ObjectAddress,
+    referenced: ObjectAddress,
+    kind: DependencyKind,
+) -> Vec<Value> {
     let kind: &'static str = kind.into();
-    dependent
-        .into_iter()
-        .chain(referenced)
-        .map(Value::from_i64)
-        .chain(std::iter::once(Value::build_text(kind)))
-        .collect()
+    vec![
+        Value::from_i64(dependent.catalog_oid),
+        Value::from_i64(dependent.object_oid),
+        Value::from_i64(dependent.column_number),
+        Value::from_i64(referenced.catalog_oid),
+        Value::from_i64(referenced.object_oid),
+        Value::from_i64(referenced.column_number),
+        Value::build_text(kind),
+    ]
+}
+
+impl ObjectAddress {
+    const fn whole<T: SnapshotRows>(object_oid: i64) -> Self {
+        Self {
+            catalog_oid: T::TABLE_OID.expect("dependency catalogs have OIDs"),
+            object_oid,
+            column_number: WHOLE_OBJECT_COLUMN_NUMBER,
+        }
+    }
+
+    const fn column(table_oid: i64, column_number: i64) -> Self {
+        Self {
+            column_number,
+            ..Self::whole::<PgClassTable>(table_oid)
+        }
+    }
+}
+
+impl<'a> RelationRow<'a> {
+    // Zero-based positions in PgClassTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const NAME_COLUMN: usize = 1;
+    const NAMESPACE_OID_COLUMN: usize = 2;
+    const ACCESS_METHOD_OID_COLUMN: usize = 6;
+    const KIND_COLUMN: usize = 16;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            name: row[Self::NAME_COLUMN]
+                .to_text()
+                .expect("catalog relation names are text"),
+            namespace_oid: row[Self::NAMESPACE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            access_method_oid: row[Self::ACCESS_METHOD_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog relation kinds are text")
+                .parse()
+                .expect("catalog relation kinds are valid"),
+        }
+    }
+}
+
+impl<'a> ConstraintRow<'a> {
+    // Zero-based positions in PgConstraintTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const KIND_COLUMN: usize = 3;
+    const TABLE_OID_COLUMN: usize = 7;
+    const REFERENCED_TABLE_OID_COLUMN: usize = 11;
+    const COLUMN_NUMBERS_COLUMN: usize = 18;
+    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 19;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog constraint kinds are text")
+                .parse()
+                .expect("catalog constraint kinds are valid"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            referenced_table_oid: row[Self::REFERENCED_TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+            referenced_column_numbers: catalog_column_text(
+                &row[Self::REFERENCED_COLUMN_NUMBERS_COLUMN],
+            ),
+        }
+    }
+}
+
+impl<'a> IndexRow<'a> {
+    // Zero-based positions in PgIndexTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const IS_UNIQUE_COLUMN: usize = 4;
+    const COLUMN_NUMBERS_COLUMN: usize = 14;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            is_unique: row[Self::IS_UNIQUE_COLUMN]
+                .as_int()
+                .expect("catalog index uniqueness is an integer")
+                == CATALOG_BOOLEAN_TRUE,
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+        }
+    }
+}
+
+impl ColumnDefaultRow {
+    // Zero-based positions in PgAttrdefTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const COLUMN_NUMBER_COLUMN: usize = 2;
+
+    fn from_row(row: &[Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_number: row[Self::COLUMN_NUMBER_COLUMN]
+                .as_int()
+                .expect("catalog column numbers are integers"),
+        }
+    }
+}
+
+fn catalog_column_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str()),
+        _ => unreachable!("catalog column lists are text or null"),
+    }
 }
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
