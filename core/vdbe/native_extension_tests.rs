@@ -19,7 +19,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
         FunctionArity::OneOf(&[1, usize::MAX]),
     ] {
         assert!(matches!(
-            ExternalFunc::new_native_scalar("invalid".into(), arity, false, NullToNine),
+            ExternalFunc::new_native_scalar("invalid".into(), arity, false, None, NullToNine),
             Err(LimboError::InvalidArgument(_))
         ));
     }
@@ -29,6 +29,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
                 "null_to_nine".into(),
                 FunctionArity::OneOf(&[1, 3]),
                 false,
+                None,
                 NullToNine,
             )
             .unwrap(),
@@ -66,6 +67,41 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
+fn native_scalar_with_a_declared_return_type_can_be_called_in_a_strict_check_constraint() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    Some(ReturnType::Integer),
+                    NullToNine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "untyped_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    None,
+                    NullToNine,
+                )
+                .unwrap(),
+            ),
+    );
+
+    conn.execute("CREATE TABLE typed (x INTEGER CHECK (x = typed_nine(NULL))) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO typed VALUES (9)").unwrap();
+    assert!(conn.execute("INSERT INTO typed VALUES (8)").is_err());
+    assert!(conn
+        .execute("CREATE TABLE untyped (x INTEGER CHECK (x = untyped_nine(NULL))) STRICT")
+        .is_err());
+}
+
+#[test]
 fn native_scalar_borrows_the_same_registers_across_io() {
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let args = [
@@ -77,6 +113,7 @@ fn native_scalar_borrows_the_same_registers_across_io() {
         "register_probe".into(),
         FunctionArity::Exact(2),
         false,
+        None,
         RegisterProbe {
             args_address: args.as_ptr() as usize,
             queue: queue.clone(),
@@ -99,6 +136,7 @@ fn native_scalar_receives_each_executing_connection() {
                 "connection_changes".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 ConnectionChanges,
             )
             .unwrap(),
@@ -129,6 +167,7 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
                 "connection_context_read".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 ConnectionContextRead {
                     queue: queue.clone(),
                 },
@@ -232,6 +271,7 @@ fn native_scalar_preserves_unmatched_outer_join_rows() {
                 "null_to_nine".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 NullToNine,
             )
             .unwrap(),
@@ -262,6 +302,7 @@ fn native_scalar_helper_queries_resume_with_independent_call_state() {
                 "nested_sum".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 NestedSum {
                     queue: queue.clone(),
                 },
@@ -297,6 +338,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                             "nested_sum".into(),
                             FunctionArity::Exact(1),
                             false,
+                            None,
                             NestedSum {
                                 queue: queue.clone(),
                             },
@@ -519,6 +561,7 @@ fn extension_constructors_validate_argument_counts() {
                     count => FunctionArity::Exact(count as usize),
                 },
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -644,6 +687,7 @@ fn scalar_calls_resume_independently_and_create_once() {
                 "DeLaYeD".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -681,6 +725,7 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -709,6 +754,7 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -738,6 +784,7 @@ fn failed_completion_releases_the_pending_scalar() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -772,6 +819,7 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
                     "delayed".into(),
                     FunctionArity::Exact(2),
                     false,
+                    None,
                     DelayedScalar {
                         queue: queue.clone(),
                         created: Arc::new(AtomicUsize::new(0)),
@@ -1552,6 +1600,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
             "delayed".into(),
             FunctionArity::Exact(2),
             false,
+            None,
             DelayedScalar {
                 queue: queue.clone(),
                 created: created.clone(),
@@ -1591,6 +1640,7 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),

@@ -1,6 +1,6 @@
 use chrono::Utc;
 use std::{fmt, sync::Arc};
-use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
@@ -13,6 +13,7 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
                 function.name().to_string(),
                 function.arity(),
                 function.is_deterministic(),
+                Some(function.return_type()),
                 *function,
             )
             .expect("PostgreSQL function declarations have valid argument counts"),
@@ -22,7 +23,7 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
 }
 
 macro_rules! scalar_functions {
-    ($($($variant:ident)|+($arity:expr, $deterministic:expr)),* $(,)?) => {
+    ($($($variant:ident)|+($arity:expr, $deterministic:expr, $return_type:ident)),* $(,)?) => {
         #[derive(Debug, Clone, Copy, strum::AsRefStr)]
         #[strum(serialize_all = "snake_case")]
         enum PgScalarFunction {
@@ -47,37 +48,44 @@ macro_rules! scalar_functions {
                     $($(Self::$variant)|+ => $deterministic,)*
                 }
             }
+
+            fn return_type(&self) -> ReturnType {
+                match self {
+                    $($(Self::$variant)|+ => ReturnType::$return_type,)*
+                }
+            }
         }
     };
 }
 
 scalar_functions! {
-    Acldefault(FunctionArity::Exact(2), true),
-    PgGetUserbyid(FunctionArity::Exact(1), true),
-    PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true),
-    PgEncodingToChar(FunctionArity::Exact(1), true),
-    PgGetFunctionResult | PgGetFunctionArguments | PgGetStatisticsobjdefColumns | PgRelationIsPublishable(
-        FunctionArity::Exact(1), true
+    Acldefault(FunctionArity::Exact(2), true, Text),
+    PgGetUserbyid(FunctionArity::Exact(1), true, Text),
+    PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true, Integer),
+    PgEncodingToChar(FunctionArity::Exact(1), true, Text),
+    PgGetFunctionResult | PgGetFunctionArguments | PgGetStatisticsobjdefColumns(
+        FunctionArity::Exact(1), true, Text
     ),
-    QuoteIdent(FunctionArity::Exact(1), true),
-    QuoteLiteral(FunctionArity::Exact(1), true),
-    FormatType(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
-    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
-    ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
-    ToChar(FunctionArity::Exact(2), true),
-    PgInputIsValid(FunctionArity::Exact(2), true),
-    Booleq(FunctionArity::Exact(2), true),
-    Boolne(FunctionArity::Exact(2), true),
-    ColDescription(FunctionArity::Exact(2), true),
-    SetConfig(FunctionArity::Exact(3), false),
-    Version(FunctionArity::Exact(0), true),
-    CurrentDatabase(FunctionArity::Exact(0), false),
-    CurrentSchema(FunctionArity::Exact(0), true),
-    PgBackendPid(FunctionArity::Exact(0), true),
-    PgIsInRecovery(FunctionArity::Exact(0), false),
-    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
+    PgRelationIsPublishable(FunctionArity::Exact(1), true, Integer),
+    QuoteIdent(FunctionArity::Exact(1), true, Text),
+    QuoteLiteral(FunctionArity::Exact(1), true, Text),
+    FormatType(FunctionArity::OneOf(&[1, 2]), true, Text),
+    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false, Text),
+    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false, Text),
+    ObjDescription(FunctionArity::OneOf(&[1, 2]), true, Text),
+    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true, Text),
+    ToChar(FunctionArity::Exact(2), true, Text),
+    PgInputIsValid(FunctionArity::Exact(2), true, Integer),
+    Booleq(FunctionArity::Exact(2), true, Integer),
+    Boolne(FunctionArity::Exact(2), true, Integer),
+    ColDescription(FunctionArity::Exact(2), true, Text),
+    SetConfig(FunctionArity::Exact(3), false, Text),
+    Version(FunctionArity::Exact(0), true, Text),
+    CurrentDatabase(FunctionArity::Exact(0), false, Text),
+    CurrentSchema(FunctionArity::Exact(0), true, Text),
+    PgBackendPid(FunctionArity::Exact(0), true, Integer),
+    PgIsInRecovery(FunctionArity::Exact(0), false, Text),
+    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false, Text),
 }
 
 impl ScalarFunction for PgScalarFunction {
