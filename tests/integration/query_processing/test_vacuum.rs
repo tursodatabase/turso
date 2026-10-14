@@ -5863,6 +5863,53 @@ fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Resu
 }
 
 #[test]
+fn test_mvcc_plain_vacuum_after_checkpoint_of_rows_never_written() -> anyhow::Result<()> {
+    let scenarios = [
+        (
+            "drop table with rows never written",
+            "CREATE TABLE u(x); CREATE INDEX u_x ON u(x); INSERT INTO u VALUES (1); DROP TABLE u;",
+            vec![(1, 1)],
+        ),
+        (
+            "drop index with rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (3, 3); DROP INDEX t_a;",
+            vec![(1, 1), (3, 3)],
+        ),
+        (
+            "delete rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (2, 2); DELETE FROM t WHERE id = 2;",
+            vec![(1, 1)],
+        ),
+    ];
+    for passive_checkpoint in [false, true] {
+        for (scenario, sql, expected_rows) in &scenarios {
+            let opts =
+                DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive_checkpoint);
+            let tmp_db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build();
+            let conn = tmp_db.connect_limbo();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT)")?;
+            conn.execute("INSERT INTO t VALUES (1, 1)")?;
+            conn.execute(sql)?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+            conn.execute("VACUUM")?;
+
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM t ORDER BY id");
+            assert_eq!(
+                &rows, expected_rows,
+                "{scenario}, passive_checkpoint={passive_checkpoint}"
+            );
+            assert_eq!(run_integrity_check(&conn), "ok");
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let tmp_db =
         TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_requires_checkpointed_image.db");
