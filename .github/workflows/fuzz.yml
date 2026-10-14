@@ -37,13 +37,12 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
-    # run-fuzz-tests, run-long-fuzz-tests and simple-stress-test build the
-    # same --all-features dependencies, so they share one cache entry. Only
-    # part 1 of this job saves it.
+    # run-fuzz-tests and run-long-fuzz-tests build the same test binaries,
+    # so they share one cache entry. Only part 1 of this job saves it.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        shared-key: "fuzz-all-features"
+        shared-key: "fuzz-nextest"
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
     - name: Install cargo-nextest
@@ -52,8 +51,6 @@ jobs:
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
@@ -72,7 +69,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        shared-key: "fuzz-all-features"
+        shared-key: "fuzz-nextest"
         save-if: false
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
@@ -80,8 +77,6 @@ jobs:
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
     - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
@@ -96,17 +91,16 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
+    # Builds with --cfg shuttle, so it can't reuse the other jobs' cache.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        shared-key: "fuzz-all-features"
-        save-if: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
     - name: Run ignored long tests
       env:
         RUST_BACKTRACE: 1
