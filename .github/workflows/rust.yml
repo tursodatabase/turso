@@ -544,10 +544,12 @@ jobs:
       - name: Test
         run: make test-without-sqltest
 
-  concurrent-simulator:
-    name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
+  # Builds turso_whopper once per toolchain. The concurrent-simulator jobs
+  # below download the binary instead of each compiling it again.
+  concurrent-simulator-build:
+    name: "Concurrent simulator build (${{ matrix.toolchain.label }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 40
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -558,6 +560,73 @@ jobs:
           - label: nightly
             version: "nightly-2025-12-17"
             rustflags: "--cfg nightly"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain.version }}
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build turso_whopper
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+        run: cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
+      - name: Upload turso_whopper
+        uses: actions/upload-artifact@v4
+        with:
+          name: turso_whopper-${{ matrix.toolchain.label }}
+          path: target/release/turso_whopper
+          if-no-files-found: error
+          retention-days: 1
+
+  concurrent-simulator-regression-tests:
+    name: "Concurrent simulator regression tests (${{ matrix.toolchain.label }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - label: stable
+            version: "1.88.0"
+            rustflags: ""
+          - label: nightly
+            version: "nightly-2025-12-17"
+            rustflags: "--cfg nightly"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain.version }}
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run turso_whopper regression tests
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
+        timeout-minutes: 15
+
+  concurrent-simulator:
+    name: "Concurrent simulator (${{ matrix.toolchain }}, ${{ matrix.profile.name }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    needs: concurrent-simulator-build
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
         profile:
           - name: in-process
             iterations: 100
@@ -589,37 +658,33 @@ jobs:
           - name: fts-recovery-mvcc
             iterations: 10
             args: "--mode fts-recovery --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
-          - name: multiprocess
-            iterations: 10
+          # The multiprocess profiles are the slowest, so their iterations
+          # are split across two jobs each.
+          - name: multiprocess (1/2)
+            iterations: 5
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
-          - name: multiprocess-kill
-            iterations: 10
+          - name: multiprocess (2/2)
+            iterations: 5
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess-kill (1/2)
+            iterations: 5
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (2/2)
+            iterations: 5
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Download turso_whopper
+        uses: actions/download-artifact@v4
         with:
-          toolchain: ${{ matrix.toolchain.version }}
-      - name: Setup mold linker
-        uses: "./.github/shared/setup-mold"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run turso_whopper regression tests
-        if: matrix.profile.name == 'in-process'
+          name: turso_whopper-${{ matrix.toolchain }}
+          path: target/release
+      - name: Restore binary permissions
+        run: chmod +x target/release/turso_whopper
+      - name: Run turso_whopper (${{ matrix.toolchain }}, ${{ matrix.profile.name }})
         env:
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
-        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
-        timeout-minutes: 15
-      - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
-        env:
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
           WHOPPER_ARGS: ${{ matrix.profile.args }}
         run: |
-          cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
           # A single whopper run drives its connections serially (one blocking
           # step at a time), so it only keeps about one core busy. Run
           # iterations concurrently to use the whole runner; per-iteration log
