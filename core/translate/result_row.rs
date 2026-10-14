@@ -1,8 +1,9 @@
 use crate::turso_assert_eq;
 use crate::{
+    function::{AccumulatorFunc, AggFunc},
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u32, IdxInsertFlags, InsertFlags, Insn},
+        insn::{to_u32, AggStepData, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -70,6 +71,7 @@ pub fn emit_select_result(
             | QueryDestination::CoroutineYield { .. }
             | QueryDestination::EphemeralTable { .. }
             | QueryDestination::RecursiveCteQueue { .. }
+            | QueryDestination::ArraySubqueryResult { .. }
     );
 
     if !skip_column_eval {
@@ -430,6 +432,19 @@ pub fn emit_columns_to_destination(
             program.emit_insn(Insn::Integer {
                 value: 1,
                 dest: *result_reg,
+            });
+        }
+        QueryDestination::ArraySubqueryResult { result_reg } => {
+            turso_assert_eq!(num_columns, 1, "ARRAY subquery must return one column");
+            program.emit_insn(Insn::AggStep {
+                data: Box::new(AggStepData {
+                    acc_reg: *result_reg,
+                    col: start_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
+                    comparator: None,
+                    collation: None,
+                }),
             });
         }
         QueryDestination::RowValueSubqueryResult {

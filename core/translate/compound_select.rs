@@ -159,6 +159,7 @@ pub fn emit_program_for_compound_select(
         QueryDestination::CoroutineYield { .. }
         | QueryDestination::EphemeralTable { .. }
         | QueryDestination::RecursiveCteQueue { .. }
+        | QueryDestination::ArraySubqueryResult { .. }
         | QueryDestination::EphemeralIndex { .. } => Some(program.alloc_registers(num_result_cols)),
         QueryDestination::ResultRows => None,
         other => {

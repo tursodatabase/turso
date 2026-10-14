@@ -3534,6 +3534,7 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(ast::Expr::ArraySubquery(select)),
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {

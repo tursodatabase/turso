@@ -15,6 +15,7 @@ use crate::translate::expr::comparison_affinity;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
+    function::{AccumulatorFunc, AggFunc},
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
@@ -927,6 +928,63 @@ fn get_subquery_parser<'a>(
                 }
                 Ok(WalkControl::Continue)
             }
+            ast::Expr::ArraySubquery(_) => {
+                resolver.require_custom_types("Array features")?;
+                let subquery_id = program.table_reference_counter.next();
+                let outer_query_refs = get_outer_query_refs(referenced_tables)?;
+                let ast::Expr::ArraySubquery(subselect) = std::mem::take(expr) else {
+                    unreachable!();
+                };
+                let result_reg = program.alloc_register();
+                let mut plan = prepare_select_plan(
+                    *subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs,
+                    QueryDestination::ArraySubqueryResult { result_reg },
+                    connection,
+                )?;
+                let element_type = array_subquery_element_type(&plan)?;
+                let correlated = plan_has_outer_scope_dependency(&plan);
+                handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if !correlated || origin.is_write_statement() {
+                    match &mut plan {
+                        Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver)?,
+                        Plan::CompoundSelect {
+                            left, right_most, ..
+                        } => {
+                            optimize_select_plan(right_most, resolver)?;
+                            for (select_plan, _) in left.iter_mut() {
+                                optimize_select_plan(select_plan, resolver)?;
+                            }
+                        }
+                        _ => unreachable!("prepare_select_plan cannot return DML"),
+                    }
+                }
+                let query_type = SubqueryType::Array {
+                    result_reg,
+                    element_type,
+                };
+                *expr = ast::Expr::SubqueryResult {
+                    subquery_id,
+                    lhs: None,
+                    not_in: false,
+                    query_type: query_type.clone(),
+                };
+                out_subqueries.push(NonFromClauseSubquery {
+                    internal_id: subquery_id,
+                    same_query: None,
+                    query_type,
+                    state: SubqueryState::Unevaluated {
+                        plan: Some(Box::new(plan)),
+                    },
+                    correlated,
+                    origin,
+                    eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
+                });
+                Ok(WalkControl::Continue)
+            }
             ast::Expr::InSelect { .. } => {
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
@@ -1075,6 +1133,60 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+fn array_subquery_element_type(plan: &Plan) -> Result<Option<String>> {
+    let selects = match plan {
+        Plan::Select(select) => either::Left(std::iter::once(select.as_ref())),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => either::Right(
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref())),
+        ),
+        _ => unreachable!("ARRAY subquery must have a SELECT plan"),
+    };
+    let mut element_type = None;
+    for select in selects {
+        if select.result_columns.len() != 1 {
+            crate::bail_parse_error!("ARRAY subquery must return exactly one column");
+        }
+        let expressions = if select.values.is_empty() {
+            either::Left(std::iter::once(&select.result_columns[0].expr))
+        } else {
+            either::Right(select.values.iter().map(|row| &row[0]))
+        };
+        let tables = &select.table_references;
+        for expr in expressions {
+            if super::expr::expr_is_array(expr, Some(tables)) {
+                crate::bail_parse_error!("array-valued ARRAY subqueries are not supported yet");
+            }
+            let ty = match expr {
+                ast::Expr::Column { table, column, .. } => tables
+                    .find_table_by_internal_id(*table)
+                    .and_then(|(_, t)| t.get_column_at(*column))
+                    .map(|c| c.ty_str.clone()),
+                ast::Expr::Cast {
+                    type_name: Some(ty),
+                    ..
+                } => Some(ty.name.clone()),
+                _ => crate::statement::infer_expression_primitive(expr, Some(tables))
+                    .map(str::to_owned),
+            };
+            if let (Some(existing), Some(next)) = (&element_type, &ty) {
+                if existing != next {
+                    crate::bail_parse_error!(
+                        "ARRAY subqueries with differing result types are not supported yet"
+                    );
+                }
+            }
+            if element_type.is_none() {
+                element_type = ty;
+            }
+        }
+    }
+    Ok(element_type)
 }
 
 /// Recollect all aggregates after subquery planning.
@@ -2041,7 +2153,7 @@ pub fn emit_non_from_clause_subquery(
                     }
                 );
             }
-            SubqueryType::RowValue { .. } => {
+            SubqueryType::RowValue { .. } | SubqueryType::Array { .. } => {
                 emit_explain!(
                     program,
                     true,
@@ -2112,6 +2224,28 @@ pub fn emit_non_from_clause_subquery(
                     is_table: false,
                 });
                 emit_plan(program)?;
+            }
+            SubqueryType::Array { result_reg, .. } => {
+                program.emit_insn(Insn::Null {
+                    dest: *result_reg,
+                    dest_end: None,
+                });
+                emit_plan(program)?;
+                program.emit_insn(Insn::AggFinal {
+                    register: *result_reg,
+                    func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
+                });
+                let not_empty = program.allocate_label();
+                program.emit_insn(Insn::NotNull {
+                    reg: *result_reg,
+                    target_pc: not_empty,
+                });
+                program.emit_insn(Insn::MakeArray {
+                    start_reg: *result_reg,
+                    count: 0,
+                    dest: *result_reg,
+                });
+                program.preassign_label_to_next_insn(not_empty);
             }
             SubqueryType::RowValue {
                 result_reg_start,

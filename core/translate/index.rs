@@ -1114,6 +1114,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             Expr::Exists(_)
             | Expr::InSelect { .. }
             | Expr::Subquery(_)
+            | Expr::ArraySubquery(_)
             | Expr::Raise { .. }
             | Expr::Variable(_) => {
                 ok = false;

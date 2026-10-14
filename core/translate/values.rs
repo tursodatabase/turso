@@ -34,7 +34,8 @@ pub fn emit_values(
             });
             result_reg
         }
-        QueryDestination::RowValueSubqueryResult { .. } => {
+        QueryDestination::RowValueSubqueryResult { .. }
+        | QueryDestination::ArraySubqueryResult { .. } => {
             emit_toplevel_values(program, plan, t_ctx)?
         }
         QueryDestination::RowSet { .. } => {
@@ -218,7 +219,8 @@ fn emit_values_to_destination(
                 dest: *result_reg,
             });
         }
-        QueryDestination::RowValueSubqueryResult { .. } => {
+        QueryDestination::RowValueSubqueryResult { .. }
+        | QueryDestination::ArraySubqueryResult { .. } => {
             emit_result_row_and_limit(program, plan, start_reg, t_ctx.limit_ctx, Some(end_label))?;
         }
         QueryDestination::RowSet { .. } => {

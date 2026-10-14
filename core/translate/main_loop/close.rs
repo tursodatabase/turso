@@ -792,6 +792,16 @@ fn assign_new_subquery_output(
                 QueryDestination::ExistsSubqueryResult { result_reg },
             )
         }
+        SubqueryType::Array { element_type, .. } => {
+            let result_reg = program.alloc_register();
+            (
+                SubqueryType::Array {
+                    result_reg,
+                    element_type: element_type.clone(),
+                },
+                QueryDestination::ArraySubqueryResult { result_reg },
+            )
+        }
         SubqueryType::RowValue { num_regs, .. } => {
             let result_reg_start = program.alloc_registers(*num_regs);
             (

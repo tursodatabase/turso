@@ -359,7 +359,10 @@ fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
         let _ = walk_expr(&pred.expr, &mut |e| {
             if matches!(
                 e,
-                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+                Expr::Subquery(_)
+                    | Expr::ArraySubquery(_)
+                    | Expr::InSelect { .. }
+                    | Expr::Exists(_)
             ) {
                 found = true;
             }

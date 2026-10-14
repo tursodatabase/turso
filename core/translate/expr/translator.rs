@@ -240,7 +240,7 @@ fn translate_expr_by_kind(
         ast::Expr::Raise(..) => {
             translate_raise_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::Subquery(_) => {
+        ast::Expr::Subquery(_) | ast::Expr::ArraySubquery(_) => {
             crate::bail_parse_error!("Subquery is not supported in this position")
         }
         ast::Expr::Unary(..) => {
@@ -356,7 +356,7 @@ fn translate_subquery_result_expr(
         unreachable!("translate_subquery_result_expr expects Expr::SubqueryResult");
     };
     match query_type {
-        SubqueryType::Exists { result_reg } => {
+        SubqueryType::Exists { result_reg } | SubqueryType::Array { result_reg, .. } => {
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg,
                 dst_reg: target_register,

@@ -1223,6 +1223,8 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
 const OID_FLOAT8: u32 = 701;
+const OID_INT4_ARRAY: u32 = 1007;
+const OID_TEXT_ARRAY: u32 = 1009;
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
 fn extract_command_tags(data: &[u8]) -> Vec<String> {
@@ -1323,6 +1325,37 @@ fn with_pg_client<F: FnOnce(&mut PgTestClient)>(f: F) {
 fn wire_integer_literal_reports_int4() {
     with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 42"), vec![OID_INT4]);
+    });
+}
+
+#[test]
+fn wire_array_subquery_reports_element_type_for_empty_results() {
+    with_pg_client(|c| {
+        assert_eq!(
+            c.query_column_oids(
+                "SELECT ARRAY(SELECT 17), ARRAY(SELECT 17 WHERE false),
+                        ARRAY(SELECT 'two words' WHERE false),
+                        ARRAY(SELECT 17 UNION ALL SELECT NULL),
+                        ARRAY(VALUES (NULL), ('two words'))"
+            ),
+            vec![
+                OID_INT4_ARRAY,
+                OID_INT4_ARRAY,
+                OID_TEXT_ARRAY,
+                OID_INT4_ARRAY,
+                OID_TEXT_ARRAY
+            ]
+        );
+        assert_eq!(
+            c.query_single_text("SELECT ARRAY(SELECT 17 WHERE false)"),
+            "{}"
+        );
+        assert_eq!(
+            c.query_column_oids(
+                "SELECT vals FROM (SELECT ARRAY(SELECT 17 WHERE false) AS vals) AS q"
+            ),
+            vec![OID_INT4_ARRAY]
+        );
     });
 }
 

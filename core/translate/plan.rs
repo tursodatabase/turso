@@ -688,6 +688,9 @@ pub enum QueryDestination {
         /// The register that holds the result of the EXISTS subquery.
         result_reg: usize,
     },
+    ArraySubqueryResult {
+        result_reg: usize,
+    },
     /// The results of a subquery that is neither 'EXISTS' nor 'IN' are stored in a range of registers.
     RowValueSubqueryResult {
         /// The start register of the range that holds the result of the subquery.
@@ -3082,6 +3085,17 @@ pub(super) fn query_output_columns(
         let result_expr = &result_columns[column_index].expr;
         if super::expr::expr_is_array(result_expr, Some(table_references)) {
             column.set_array_dimensions(1);
+            if let ast::Expr::SubqueryResult {
+                query_type:
+                    ast::SubqueryType::Array {
+                        element_type: Some(element_type),
+                        ..
+                    },
+                ..
+            } = result_expr
+            {
+                column.ty_str.clone_from(element_type);
+            }
         }
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
     }

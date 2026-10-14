@@ -178,7 +178,7 @@ pub enum ColumnTypeKind {
 /// inference) by walking through arithmetic, bitwise, comparison, logical,
 /// and concat operators — letting `SELECT 42 + 1` report INT4 to a
 /// PostgreSQL client the way PG itself does.
-fn infer_expression_primitive(
+pub(crate) fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
 ) -> Option<&'static str> {
@@ -1285,27 +1285,42 @@ impl Statement {
         // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
         // schema. Anything else falls through to the expression-affinity
         // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
-        {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
-            };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
-            let declared_name = table_column.ty_str.clone();
-            let array_dimensions = table_column.array_dimensions();
+        let declared_type = match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let Some((_, table_ref)) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)
+                else {
+                    return Ok(None);
+                };
+                let Some(table_column) = table_ref.get_column_at(*column_idx) else {
+                    return Ok(None);
+                };
+                Some((
+                    table_column.ty_str.clone(),
+                    table_column.array_dimensions(),
+                    table_ref.is_strict(),
+                ))
+            }
+            turso_parser::ast::Expr::SubqueryResult {
+                query_type: turso_parser::ast::SubqueryType::Array { element_type, .. },
+                ..
+            } => Some((
+                element_type.clone().unwrap_or_else(|| "TEXT".to_owned()),
+                1,
+                true,
+            )),
+            _ => None,
+        };
+        if let Some((declared_name, array_dimensions, is_strict)) = declared_type {
             let schema = self.program.connection.schema.read();
             let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
+                .resolve_type(&declared_name, is_strict)
                 .ok()
                 .flatten();
             // `kind` is computed from the leaf TypeDef in the resolution chain:

@@ -1473,7 +1473,10 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut stack = vec![expr];
     while let Some(node) = stack.pop() {
         match node {
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) => return true,
+            Expr::Subquery(_)
+            | Expr::ArraySubquery(_)
+            | Expr::InSelect { .. }
+            | Expr::Exists(_) => return true,
             Expr::Between {
                 lhs, start, end, ..
             } => {

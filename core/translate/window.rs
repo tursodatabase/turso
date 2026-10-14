@@ -361,6 +361,7 @@ fn rewrite_terminal_expr(
                 Expr::SubqueryResult { .. }
                 | Expr::Exists(..)
                 | Expr::InSelect { .. }
+                | Expr::ArraySubquery(..)
                 | Expr::Subquery(..) => {
                     rewrite_expr_as_subquery_column(expr, ctx, false);
                     return Ok(WalkControl::SkipChildren);
@@ -511,6 +512,7 @@ fn rewrite_late_window_arg(
             Expr::SubqueryResult { .. }
             | Expr::Exists(..)
             | Expr::InSelect { .. }
+            | Expr::ArraySubquery(..)
             | Expr::Subquery(..) => {
                 rewrite_expr_as_subquery_column(node, ctx, false);
                 return Ok(WalkControl::SkipChildren);

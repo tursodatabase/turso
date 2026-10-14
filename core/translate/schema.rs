@@ -114,7 +114,10 @@ pub(crate) fn validate_check_expr(
             ast::Expr::Variable(_) => {
                 bail_parse_error!("parameters prohibited in CHECK constraints");
             }
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+            ast::Expr::Subquery(_)
+            | ast::Expr::ArraySubquery(_)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. } => {
                 bail_parse_error!("subqueries prohibited in CHECK constraints");
             }
             _ => {}
@@ -138,6 +141,7 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
             | ast::Expr::InSelect { .. }
             | ast::Expr::InTable { .. }
             | ast::Expr::Subquery(_)
+            | ast::Expr::ArraySubquery(_)
             | ast::Expr::SubqueryResult { .. }
             | ast::Expr::Id(_) => {
                 bail_parse_error!(
@@ -2546,7 +2550,10 @@ pub fn translate_drop_table(
 fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+            ast::Expr::Subquery(_)
+            | ast::Expr::ArraySubquery(_)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. } => {
                 bail_parse_error!("subqueries prohibited in {kind} expressions");
             }
             ast::Expr::FunctionCall {

@@ -3376,7 +3376,7 @@ fn apply_expr_for_column_rename(
                     resolver,
                 )?;
             }
-            ast::Expr::Subquery(select) => {
+            ast::Expr::Subquery(select) | ast::Expr::ArraySubquery(select) => {
                 apply_select_for_column_rename(
                     mode,
                     select,
@@ -4741,7 +4741,9 @@ fn validate_expr_table_refs_after_rename(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     match expr {
-        ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+        ast::Expr::Exists(select)
+        | ast::Expr::Subquery(select)
+        | ast::Expr::ArraySubquery(select) => {
             return validate_select_table_refs_after_rename(
                 select,
                 altered_table_norm,
@@ -4777,7 +4779,9 @@ fn validate_expr_table_refs_after_rename(
             return Ok(WalkControl::SkipChildren);
         }
         match e {
-            ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+            ast::Expr::Exists(select)
+            | ast::Expr::Subquery(select)
+            | ast::Expr::ArraySubquery(select) => {
                 missing_table = validate_select_table_refs_after_rename(
                     select,
                     altered_table_norm,
@@ -5243,7 +5247,9 @@ fn validate_expr_column_refs_after_drop(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     match expr {
-        ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+        ast::Expr::Exists(select)
+        | ast::Expr::Subquery(select)
+        | ast::Expr::ArraySubquery(select) => {
             return validate_select_column_refs_after_drop(
                 select,
                 visible_columns,
@@ -5306,7 +5312,9 @@ fn validate_expr_column_refs_after_drop(
             return Ok(WalkControl::SkipChildren);
         }
         match e {
-            ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+            ast::Expr::Exists(select)
+            | ast::Expr::Subquery(select)
+            | ast::Expr::ArraySubquery(select) => {
                 bad = validate_select_column_refs_after_drop(
                     select,
                     visible_columns,
