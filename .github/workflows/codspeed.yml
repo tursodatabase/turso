@@ -119,15 +119,24 @@ jobs:
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
           cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
 
+          # Every bench binary contains its own copy of turso_core, so the
+          # binaries are mostly the same bytes. A zip compresses each file
+          # on its own (~2 GB); zstd with long-distance matching stores the
+          # shared parts once. Every benchmark job downloads this archive.
+          tar -cf - -C target codspeed | zstd -q -3 -T0 --long=31 -o codspeed-benchmarks.tar.zst
+          ls -lh codspeed-benchmarks.tar.zst
+
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
+          path: codspeed-benchmarks.tar.zst
           if-no-files-found: error
           retention-days: 1
+          # Already compressed.
+          compression-level: 0
 
       - name: Record build status
         id: build_status
@@ -189,15 +198,24 @@ jobs:
           bench_args=$(jq -r '.[] | "--bench " + .' <<< "$BENCHMARKS_JSON" | tr '\n' ' ')
           cargo +${{ env.TOOLCHAIN_VERSION }} codspeed build -m simulation $bench_args --features codspeed
 
+          # Every bench binary contains its own copy of turso_core, so the
+          # binaries are mostly the same bytes. A zip compresses each file
+          # on its own (~2 GB); zstd with long-distance matching stores the
+          # shared parts once. Every benchmark job downloads this archive.
+          tar -cf - -C target codspeed | zstd -q -3 -T0 --long=31 -o codspeed-benchmarks.tar.zst
+          ls -lh codspeed-benchmarks.tar.zst
+
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
+          path: codspeed-benchmarks.tar.zst
           if-no-files-found: error
           retention-days: 1
+          # Already compressed.
+          compression-level: 0
 
       - name: Record build status
         id: build_status
@@ -239,10 +257,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
 
-      - name: Restore binary permissions
-        run: find target/codspeed -type f -exec chmod +x {} +
+      # tar keeps the executable bits, so no chmod is needed.
+      - name: Unpack benchmark binaries
+        run: |
+          mkdir -p target
+          zstd -q -d --long=31 -c codspeed-benchmarks.tar.zst | tar -xf - -C target
+          rm codspeed-benchmarks.tar.zst
 
       - name: Generate graph-queries DBs
         if: matrix.benchmark == 'graph_queries_benchmark'
@@ -294,10 +315,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
-          path: target/codspeed
 
-      - name: Restore binary permissions
-        run: find target/codspeed -type f -exec chmod +x {} +
+      # tar keeps the executable bits, so no chmod is needed.
+      - name: Unpack benchmark binaries
+        run: |
+          mkdir -p target
+          zstd -q -d --long=31 -c codspeed-benchmarks.tar.zst | tar -xf - -C target
+          rm codspeed-benchmarks.tar.zst
 
       - name: Generate graph-queries DBs
         if: matrix.benchmark == 'graph_queries_benchmark'
