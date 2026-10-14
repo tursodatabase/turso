@@ -34,11 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: blacksmith-4vcpu-windows-2025
+          - host: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: db-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
-          - host: blacksmith-4vcpu-windows-2025
+          - host: blacksmith-8vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
@@ -60,11 +60,11 @@ jobs:
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
-          - host: blacksmith-4vcpu-ubuntu-2404-arm
+          - host: blacksmith-8vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
-          - host: blacksmith-4vcpu-ubuntu-2404-arm
+          - host: blacksmith-8vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
