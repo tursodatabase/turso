@@ -141,6 +141,7 @@ jobs:
         with:
           prefix-key: "v1-rust-dotnet-publish"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')

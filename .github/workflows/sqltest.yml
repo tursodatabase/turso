@@ -23,6 +23,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build test runner
         run: make -C sqlite/conformance build-runner
       - name: Check test syntax
@@ -39,6 +40,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
         run: make -C sqlite/conformance build-tursodb
@@ -58,6 +60,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build test runner
         run: make -C sqlite/conformance build-runner
       - name: Run tests
@@ -77,6 +80,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
@@ -108,6 +112,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursopg
         run: make -C postgres/conformance build-tursopg
       - name: Build test runner
@@ -124,6 +129,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
         run: make -C sqlite/conformance build-runner

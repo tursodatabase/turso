@@ -36,6 +36,7 @@ jobs:
         with:
           prefix-key: "v1-rust-ios"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build iOS libraries
         run: make ios-build
@@ -70,6 +71,7 @@ jobs:
         with:
           prefix-key: "v1-rust-android"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up Android NDK
         uses: android-actions/setup-android@v3

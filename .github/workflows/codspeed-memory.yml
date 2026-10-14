@@ -33,6 +33,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-memory"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed

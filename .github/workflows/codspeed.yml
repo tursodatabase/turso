@@ -88,6 +88,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed
@@ -157,6 +158,7 @@ jobs:
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Install cargo-codspeed

@@ -315,6 +315,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked
@@ -371,6 +372,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked
@@ -426,6 +428,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursodb
         working-directory: .
         run: cargo build --bin tursodb --locked

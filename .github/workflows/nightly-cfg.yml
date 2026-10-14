@@ -41,6 +41,7 @@ jobs:
           # otherwise evict/thrash the stable cache entries.
           prefix-key: "v1-rust-nightly-cfg"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check core with the nightly allocator cfg
         env:
           RUSTFLAGS: "--cfg nightly"
