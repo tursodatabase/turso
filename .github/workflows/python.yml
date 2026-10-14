@@ -74,6 +74,16 @@ jobs:
         with:
           enable-cache: true
 
+      # `uv sync` builds the extension with maturin, which defaults to an
+      # optimized release build with LTO. On pull requests, build it in debug
+      # mode instead: much faster, and it reuses what "Build Rust (debug)"
+      # built. main keeps testing the release build, which has code paths
+      # debug builds don't (e.g. panic=abort, release-only branches).
+      - name: Build the extension in debug mode on pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "MATURIN_PEP517_ARGS=--profile dev" >> "$GITHUB_ENV"
+
       - name: Install the project
         working-directory: ${{ env.working-directory }}
         run: uv sync --all-extras --dev --all-packages
@@ -180,7 +190,11 @@ jobs:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        # On pull requests, skip the aarch64 wheel: the macOS test job
+        # already builds the same extension for aarch64 (uv sync builds a
+        # wheel through maturin) and runs the tests against it. x86_64 is
+        # the only PR build for that target, so it stays.
+        target: ${{ github.event_name == 'pull_request' && fromJSON('["x86_64"]') || fromJSON('["x86_64", "aarch64"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

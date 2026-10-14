@@ -14,7 +14,13 @@
 # crates.io. Heavy canon verification (`aristo verify`) is a separate workflow:
 # .github/workflows/aristo-verify.yml (manual + nightly, needs ARETTA_TOKEN).
 name: aristo
-on: [push, pull_request]
+# Pushes to a PR branch are already checked by the pull_request run, so
+# the push trigger only covers main.
+on:
+  push:
+    branches: [main]
+    tags: ["**"]
+  pull_request:
 jobs:
   aristo:
     runs-on: ubuntu-latest
