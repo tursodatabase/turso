@@ -3253,8 +3253,8 @@ mod tests {
             "SELECT id FROM items HAVING id = 1",
             "SELECT id FROM items HAVING id = 1 ORDER BY count(*)",
         ] {
-            let error = analyze_sql_with_schema(&schema, sql)
-                .expect_err("HAVING needs an aggregate query");
+            let error =
+                analyze_sql_with_schema(&schema, sql).expect_err("HAVING needs an aggregate query");
             assert_eq!(
                 error.to_string(),
                 "Parse error: HAVING clause on a non-aggregate query",
