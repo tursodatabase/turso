@@ -907,9 +907,9 @@ set __runner_hang_completed [list]
 # parts are: a file missing from it, or an outdated time, still runs exactly
 # once.
 set __runner_slow_files {
-  view3 86  tkt2686 45  notify2 31  trans2 31  walsetlk_recover 31
-  walsetlk3 31  lock4 31  selectG 21  zeroblob 16  avtrans 14  trans 12
-  sort3 11
+  view3 140  tkt2686 45  selectG 45  notify2 31  trans2 31
+  walsetlk_recover 31  walsetlk3 31  lock4 31  zeroblob 16  avtrans 14
+  trans 12  sort3 11
 }
 set __runner_part 1
 set __runner_parts 1
