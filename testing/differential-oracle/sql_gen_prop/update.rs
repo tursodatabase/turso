@@ -126,7 +126,8 @@ pub fn update_for_table(
         .with_columns(table.columns.clone())
         .with_max_depth(expression_max_depth)
         .with_aggregates(allow_aggregates)
-        .with_profile(expr_profile);
+        .with_profile(expr_profile)
+        .with_values(profile.generation.value.clone());
 
     let col_indices: Vec<usize> = (0..updatable.len()).collect();
     let updatable_clone = updatable.clone();

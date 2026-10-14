@@ -30,6 +30,41 @@ expect {
     C|1
 }
 
+test matview-group-emptied-after-two-inserts-comes-back {
+    CREATE TABLE t(g TEXT, v TEXT);
+    CREATE MATERIALIZED VIEW v AS
+    SELECT g, COUNT(*) AS cnt
+    FROM t
+    GROUP BY g;
+    INSERT INTO t VALUES ('a', 'x');
+    INSERT INTO t VALUES ('a', 'y');
+    DELETE FROM t WHERE g = 'a';
+    SELECT * FROM v;
+    INSERT INTO t VALUES ('a', 'x');
+    SELECT * FROM v;
+}
+expect {
+    a|1
+}
+
+test matview-group-emptied-in-its-first-transaction-comes-back {
+    CREATE TABLE t(g TEXT, v TEXT);
+    CREATE MATERIALIZED VIEW v AS
+    SELECT g, COUNT(*) AS cnt
+    FROM t
+    GROUP BY g;
+    BEGIN;
+    INSERT INTO t VALUES ('a', 'x');
+    DELETE FROM t WHERE g = 'a';
+    COMMIT;
+    SELECT * FROM v;
+    INSERT INTO t VALUES ('a', 'x');
+    SELECT * FROM v;
+}
+expect {
+    a|1
+}
+
 test matview-basic-filter-population {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES
