@@ -19,6 +19,9 @@ env:
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
+  # Keeps file and line numbers in backtraces but drops the rest of the
+  # debug info, which makes the Rust cache entries smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   license-check:
