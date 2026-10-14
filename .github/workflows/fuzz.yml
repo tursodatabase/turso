@@ -19,6 +19,11 @@ env:
   # Keeps file and line numbers in backtraces but drops the rest of the
   # debug info, which makes the Rust cache entries smaller.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # These jobs spend most of their time running tests, not compiling them.
+  # opt-level 2 runs the same tests with the same checks much faster: the
+  # dev profile keeps debug assertions and overflow checks on regardless of
+  # opt-level.
+  CARGO_PROFILE_DEV_OPT_LEVEL: "2"
 
 jobs:
   run-fuzz-tests:
