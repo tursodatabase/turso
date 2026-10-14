@@ -458,6 +458,43 @@ impl SnapshotRows for PgNamespaceTable {
     }
 }
 
+/// Virtual table implementation for information_schema.schemata
+#[derive(Debug)]
+struct SchemataTable;
+
+impl SnapshotRows for SchemataTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_information_schema_schemata (
+            catalog_name TEXT,
+            schema_name TEXT,
+            schema_owner TEXT,
+            default_character_set_catalog TEXT,
+            default_character_set_schema TEXT,
+            default_character_set_name TEXT,
+            sql_path TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 5;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let db_name = db_name_from_path(conn.db_file_path());
+        PgNamespaceTable::load_rows(conn)
+            .into_iter()
+            .map(|namespace| {
+                vec![
+                    Value::build_text(db_name.clone()),
+                    namespace[1].clone(),
+                    Value::build_text("turso"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
 /// Virtual table implementation for pg_catalog.pg_attribute
 /// Maps column information to PostgreSQL's pg_attribute
 #[derive(Debug)]
@@ -1950,6 +1987,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_indexes",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgIndexesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_information_schema_schemata",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<SchemataTable>(PhantomData),
     );
     options = options.native_module(
         "pg_get_tabledef",

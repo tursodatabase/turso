@@ -36,7 +36,15 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = self.map_table_name(&range_var.relname);
+        let is_schemata = range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && range_var.relname.eq_ignore_ascii_case("schemata");
+        let mapped_name = if is_schemata {
+            "pg_information_schema_schemata".to_string()
+        } else {
+            self.map_table_name(&range_var.relname)
+        };
         let name = ast::Name::from_string(mapped_name);
         let alias = range_var
             .alias
@@ -1792,10 +1800,14 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         let qualified_name = self.qualified_name_from_range_var(range_var);
-        let alias = range_var
-            .alias
-            .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        let alias = match &range_var.alias {
+            Some(a) => Some(a.aliasname.clone()),
+            None if qualified_name.name.as_str() != range_var.relname => {
+                Some(range_var.relname.clone())
+            }
+            None => None,
+        }
+        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
