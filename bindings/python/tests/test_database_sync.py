@@ -271,7 +271,7 @@ def test_configuration_persistence():
 
             server.db_sql("INSERT INTO t VALUES (43)")
 
-            assert "http://localhost" in open(f"{path}-info", "r").read()
+            assert server.db_url() in open(f"{path}-info", "r").read()
 
             conn2 = turso.sync.connect(path)
             conn2.pull()
