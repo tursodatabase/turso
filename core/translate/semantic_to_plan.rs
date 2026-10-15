@@ -19,8 +19,9 @@ use super::{
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
 use crate::{
+    incremental::view::IncrementalView,
     schema::{Index, Schema, Table},
-    sync::Arc,
+    sync::{Arc, Mutex},
     LimboError, Result,
 };
 use rustc_hash::FxHashSet as HashSet;
@@ -46,6 +47,9 @@ pub(crate) struct HirPlan {
     pub(crate) document: Arc<HirDocument>,
     pub(crate) root: HirRootPlan,
     pub(crate) queries: Vec<HirPlannedQuery>,
+    /// Table sources that read a materialized view. Their cursor merges the
+    /// current transaction's changes into the stored rows.
+    pub(crate) materialized_views: Vec<(SourceId, Arc<Mutex<IncrementalView>>)>,
 }
 
 /// Planner facts owned by the semantic root. Variants without a source scan
@@ -107,11 +111,22 @@ impl HirPlan {
                 })
         };
         let root = context.plan_root(schema, params, &query_estimate)?;
+        let materialized_views = materialized_view_sources(&document, schema)?;
         Ok(Self {
             document,
             root,
             queries,
+            materialized_views,
         })
+    }
+
+    pub(crate) fn materialized_view(
+        &self,
+        source: SourceId,
+    ) -> Option<&Arc<Mutex<IncrementalView>>> {
+        self.materialized_views
+            .iter()
+            .find_map(|(view_source, view)| (*view_source == source).then_some(view))
     }
 
     pub(crate) fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
@@ -124,6 +139,10 @@ pub(crate) struct HirQueryBlockPlanInput {
     pub(crate) sources: Vec<HirPlanSource>,
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    /// Index of the first predicate from the WHERE clause. Earlier predicates
+    /// come from the FROM clause: join constraints and table-function
+    /// arguments.
+    pub(crate) where_start: usize,
 }
 
 /// Access choices for one resolved HIR query block.
@@ -132,7 +151,13 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    /// Index of the first predicate from the WHERE clause. Earlier predicates
+    /// come from the FROM clause. Planning only marks predicates consumed; it
+    /// never reorders them.
+    pub(crate) where_start: usize,
     pub(crate) group_sort_elided: bool,
+    /// The loops return rows in ORDER BY order, so the query needs no sorter.
+    pub(crate) order_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -143,6 +168,8 @@ pub(crate) struct HirAccessPlan {
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) group_sort_elided: bool,
+    /// The loops return rows in ORDER BY order.
+    pub(crate) order_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -281,10 +308,12 @@ impl<'a> HirPlanContext<'a> {
             sources: vec![self.plan_source(update.target, None, &usage)?],
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
         if let Some(from) = &update.from {
             self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
         }
+        input.where_start = input.predicates.len();
         if let Some(predicate) = &update.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
@@ -307,6 +336,7 @@ impl<'a> HirPlanContext<'a> {
             sources: vec![self.plan_source(delete.target, None, &usage)?],
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
         if let Some(predicate) = &delete.predicate {
             append_predicates(&mut input.predicates, predicate, None);
@@ -712,11 +742,13 @@ impl<'a> HirPlanContext<'a> {
             sources: Vec::new(),
             groups: Vec::new(),
             predicates: Vec::new(),
+            where_start: 0,
         };
 
         if let Some(from) = &block.from {
             self.append_from(from, HirFromContext::default(), &mut input, usage)?;
         }
+        input.where_start = input.predicates.len();
 
         if let hir::QueryBlockBody::Select {
             filter: Some(filter),
@@ -726,6 +758,20 @@ impl<'a> HirPlanContext<'a> {
             append_predicates(&mut input.predicates, filter, None);
         }
 
+        // GROUP BY and window lowering copy every column the block reads into
+        // a sorter or buffer, so an expression index cannot stand in for the
+        // columns its expressions read.
+        let copies_columns = !block.windows.is_empty()
+            || matches!(
+                &block.body,
+                hir::QueryBlockBody::Select {
+                    grouping: Some(grouping),
+                    ..
+                } if !grouping.keys.is_empty()
+            );
+        if copies_columns {
+            return Ok(input);
+        }
         for output in &block.outputs {
             self.register_expression_index_usage(&mut input.sources, &output.expr)?;
         }
@@ -838,7 +884,7 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
-        let usage = query.direct_column_usage(|source| self.document.source(source));
+        let usage = self.document.source_column_usage(query.id);
         if block.from.is_none() {
             let input = self.query_block_input(block, order_by, &usage)?;
             let output_cardinality = match &block.body {
@@ -850,13 +896,16 @@ impl<'a> HirPlanContext<'a> {
                 groups: input.groups,
                 loops: Vec::new(),
                 predicates: input.predicates,
+                where_start: input.where_start,
                 group_sort_elided: false,
+                order_sort_elided: false,
                 output_cardinality,
                 cost: Cost(0.0),
             });
         }
 
         let input = self.query_block_input(block, order_by, &usage)?;
+        let where_start = input.where_start;
         let order_target = if order_by.is_empty() {
             self.grouping_target(block)
         } else {
@@ -884,7 +933,9 @@ impl<'a> HirPlanContext<'a> {
             groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
+            where_start,
             group_sort_elided: access.group_sort_elided,
+            order_sort_elided: access.order_sort_elided,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
@@ -967,23 +1018,25 @@ impl<'a> HirPlanContext<'a> {
         let Some(result) = result else {
             return Ok(None);
         };
-        let group_sort_elided = if order_target.is_some_and(|target| {
-            matches!(
-                &target.purpose,
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group)
-            )
-        }) {
-            hir_plan_satisfies_order_target(
-                &result.best_plan,
-                &access_methods,
-                &input.sources,
-                self.document,
-                order_target.expect("GROUP BY order target exists"),
-                schema,
-            )?
-        } else {
-            false
+        // Whether the chosen loops already return rows in the order the
+        // GROUP BY or ORDER BY target asks for, so its sort can be skipped.
+        let sort_elided = |by: EliminatesSortBy| -> Result<bool> {
+            match order_target {
+                Some(target) if target.purpose == OrderTargetPurpose::EliminatesSort(by) => {
+                    hir_plan_satisfies_order_target(
+                        &result.best_plan,
+                        &access_methods,
+                        &input.sources,
+                        self.document,
+                        target,
+                        schema,
+                    )
+                }
+                _ => Ok(false),
+            }
         };
+        let group_sort_elided = sort_elided(EliminatesSortBy::Group)?;
+        let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
@@ -1091,6 +1144,7 @@ impl<'a> HirPlanContext<'a> {
             loops,
             predicates: input.predicates,
             group_sort_elided,
+            order_sort_elided,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
@@ -1113,10 +1167,7 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
-    fn grouping_target<'term>(
-        &self,
-        block: &'term hir::QueryBlock,
-    ) -> Option<HirOrderTarget<'term>>
+    fn grouping_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
     where
         'a: 'term,
     {
@@ -1240,6 +1291,37 @@ fn selected_btree_index(operation: &HirBtreeOperation) -> Option<&Index> {
         | HirBtreeOperation::InSeek { index, .. } => index.as_deref(),
         HirBtreeOperation::RowidEq { .. } => None,
     }
+}
+
+/// Main-schema table sources that are materialized views, checked the way
+/// legacy checks them before reading.
+fn materialized_view_sources(
+    document: &HirDocument,
+    schema: &Schema,
+) -> Result<Vec<(SourceId, Arc<Mutex<IncrementalView>>)>> {
+    let mut views = Vec::new();
+    for source in &document.sources {
+        let hir::SourceKind::Table(table) = &source.kind else {
+            continue;
+        };
+        if source.database.map(hir::DatabaseId::index) != Some(crate::MAIN_DB_ID) {
+            continue;
+        }
+        let name = table.value().get_name();
+        let Some(view) = schema.get_materialized_view(name) else {
+            continue;
+        };
+        if !schema.has_compatible_dbsp_state_table(name) {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            return Err(LimboError::InternalError(format!(
+                "Materialized view '{name}' has an incompatible version. \n\
+                 The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
+                 Please DROP and recreate the view to use it."
+            )));
+        }
+        views.push((source.id, view));
+    }
+    Ok(views)
 }
 
 fn query_estimate_from_blocks(

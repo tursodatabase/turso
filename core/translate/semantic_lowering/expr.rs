@@ -338,6 +338,7 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
@@ -444,11 +445,21 @@ struct ExprLowerer<'program, 'document, 'inputs> {
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
+    /// Run a subquery before its result is read, when a statement plan is
+    /// being lowered. Without one, the caller has already bound the result.
+    fn emit_subquery(&mut self, subquery: &hir::SubqueryExpr) -> Result<()> {
+        let Some(plan) = self.program.hir_plan() else {
+            return Ok(());
+        };
+        super::query::emit_expression_subquery(self.program, &plan, subquery)
+    }
+
     fn input_register(&self, expression: &hir::Expr) -> Option<usize> {
         self.inputs
             .iter()
             .find(|input| std::ptr::eq(input.expression, expression))
             .map(|input| input.register)
+            .or_else(|| self.program.expression_register(expression))
     }
 
     fn schema_call_child(
@@ -620,6 +631,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 hir::Expr::Row(values) => values.get(index),
                 expression => (index == 0).then_some(expression),
             },
+            // A reference to an output that has not been evaluated yet, as in
+            // WHERE, GROUP BY, or HAVING, evaluates the aliased expression in
+            // place, like SQLite's alias expansion.
+            hir::Expr::Output(output)
+                if index == 0 && self.program.output_binding(*output).is_none() =>
+            {
+                self.document.output(*output).map(|output| &output.expr)
+            }
             _ => expression.child(index),
         }
     }
@@ -751,7 +770,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             hir::Expr::IsNull(_) | hir::Expr::NotNull(_) | hir::Expr::TruthTest { .. } => {
                 self.program.alloc_register()
             }
-            hir::Expr::Collate { .. } => context.target,
+            hir::Expr::Collate { .. } | hir::Expr::Output(_) => context.target,
             hir::Expr::Cast {
                 expr,
                 target: cast_target,
@@ -1711,11 +1730,14 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             }
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Output(output) => {
-                let binding = self.program.output_binding(*output).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "HIR output {output:?} has no runtime binding"
-                    ))
-                })?;
+                let Some(binding) = self.program.output_binding(*output) else {
+                    if children.len() != 1 {
+                        return Err(LimboError::InternalError(format!(
+                            "HIR output {output:?} has no runtime binding or definition"
+                        )));
+                    }
+                    return Ok(target);
+                };
                 if binding.register != target {
                     self.program.emit_insn(Insn::Copy {
                         src_reg: binding.register,
@@ -1725,7 +1747,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 }
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Scalar { query, output }) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::RowValue { start, count }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1745,7 +1768,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Row { query }) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::RowValue { start, count }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1776,7 +1800,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => {
+            hir::Expr::Subquery(subquery @ hir::SubqueryExpr::Exists(query)) => {
+                self.emit_subquery(subquery)?;
                 let Some(SubqueryBinding::Exists { register }) =
                     self.program.subquery_binding(*query)
                 else {
@@ -1791,15 +1816,18 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 });
                 Ok(target)
             }
-            hir::Expr::Subquery(hir::SubqueryExpr::In {
-                query,
-                negated,
-                comparison,
-                ..
-            }) => {
+            hir::Expr::Subquery(
+                subquery @ hir::SubqueryExpr::In {
+                    query,
+                    negated,
+                    comparison,
+                    ..
+                },
+            ) => {
                 let ExprRegisters::InSubquery(registers) = context.registers else {
                     unreachable!("IN-subquery registers were allocated")
                 };
+                self.emit_subquery(subquery)?;
                 if children.len() != registers.width {
                     return Err(LimboError::InternalError(format!(
                         "HIR IN-subquery has {} lowered operands for comparison width {}",
@@ -3168,11 +3196,15 @@ impl ExprLowerer<'_, '_, '_> {
                     self.program
                         .emit_column_or_rowid(read.cursor, read.column, target);
                 }
-                if apply_storage_affinity {
-                    let Some(storage) = column.type_fact.storage else {
-                        return Ok(());
-                    };
-                    expr::maybe_apply_affinity(storage, target, self.program);
+                // A column with REAL affinity gives back integral values as
+                // REAL. A subquery column without affinity, such as one
+                // computed from a literal, gives values back as stored; a
+                // compound subquery column follows its combined affinity.
+                if apply_storage_affinity
+                    && column.has_affinity
+                    && column.affinity == crate::vdbe::affinity::Affinity::Real
+                {
+                    expr::maybe_apply_affinity(crate::schema::Type::Real, target, self.program);
                 }
             }
         }
@@ -3191,10 +3223,12 @@ impl ExprLowerer<'_, '_, '_> {
             )));
         };
         match self.program.get_cursor_type(scan_cursor) {
-            Some(CursorType::BTreeTable(_)) => Ok(CursorColumn {
-                cursor: scan_cursor,
-                column: reference.column,
-            }),
+            Some(CursorType::BTreeTable(_) | CursorType::MaterializedView(..)) => {
+                Ok(CursorColumn {
+                    cursor: scan_cursor,
+                    column: reference.column,
+                })
+            }
             Some(CursorType::BTreeIndex(index)) => {
                 if let Some(column) = index.column_table_pos_to_index_pos(reference.column) {
                     Ok(CursorColumn {
@@ -3271,10 +3305,12 @@ impl ExprLowerer<'_, '_, '_> {
 
     fn emit_btree_rowid(&mut self, cursor: usize, target: usize) -> Result<()> {
         match self.program.get_cursor_type(cursor) {
-            Some(CursorType::BTreeTable(_)) => self.program.emit_insn(Insn::RowId {
-                cursor_id: cursor,
-                dest: target,
-            }),
+            Some(CursorType::BTreeTable(_) | CursorType::MaterializedView(..)) => {
+                self.program.emit_insn(Insn::RowId {
+                    cursor_id: cursor,
+                    dest: target,
+                })
+            }
             Some(CursorType::BTreeIndex(_)) => self.program.emit_insn(Insn::IdxRowId {
                 cursor_id: cursor,
                 dest: target,

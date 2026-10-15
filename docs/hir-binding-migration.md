@@ -116,6 +116,81 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
+### Opt-in production entry point
+
+Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
+calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
+statements through HIR: the owned semantic catalog, `analyze_root`,
+`HirPlan::build`, and HIR lowering. Nested engine statements still use the
+legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
+prepare, so running the test suites with the variable set lists the remaining
+gaps. The variable and the legacy path are removed at cutover.
+
+Result-column names, table names, and declared types come from the HIR outputs
+and the same alias, `full_column_names`, and `short_column_names` rules as
+legacy. Two known differences are legacy artifacts: legacy reports its internal
+window subquery as the table of every output of a window query, and BLOB as
+the declared type of expressions such as `count(*)` there. HIR reports the real
+table and no declared type, like SQLite. `get_column_type_info` and
+`get_column_inferred_type` report the resolved affinity for expression outputs
+instead of legacy's AST-shape rules.
+
+Expression subqueries (scalar, row, EXISTS, IN) run where their expression is
+evaluated, the way SQLite codes subselects: the statement plan is installed in
+`ProgramBuilder`, and expression lowering emits the prepared subquery shell
+right before reading its result. Uncorrelated subqueries run once through
+`Once`; correlated ones run again on every evaluation, with outer values read
+through the source bindings in effect at that point. An IN seek driven by a
+subquery emits the same shell when its loop opens.
+
+`scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
+one process per file, and groups failures by cause. The first run on
+2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-15 a run
+passed 14236 and failed 53, with every file running to the end; legacy
+passes all of them. What is left:
+
+| Gap | Failing tests | Example |
+|---|---|---|
+| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
+| Aggregates of outer columns inside subqueries (`count(outer.x)` belongs to the outer query) | 4 | `aggregate-of-outer-column` |
+| ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
+| Compound ORDER BY expression inside a recursive CTE | 1 | `recursive-cte-order-qualified-expression` |
+| Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
+| A named window whose definition uses an aggregate, with GROUP BY | 1 | `named-window-with-group-by` |
+| `nth_value` with LIMIT stops before an invalid later argument | 1 | `nth-value-limit-stops-before-late-invalid-n` |
+| `cte.y` for a CTE not in FROM, under ORDER BY EXISTS, reports no such table | 1 | `cte-unreferenced-qualified-column-orderby-exists` |
+| Bare column next to several aggregates in HAVING with generated columns | 1 | `gencol_having_multiple_aggregates` |
+| Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
+
+`SELECT a FROM t HAVING max(a) > 0` returns the row's value where legacy
+returns NULL (SQLite rejects it).
+
+RIGHT and FULL joins use SQLite's nested-loop method instead of legacy's hash
+join. The right loop records each matched rowid in an ephemeral table, and
+after the main loops a second pass scans the right table, or the ephemeral
+table of a materialized subquery, for rows not in it,
+with the left tables reading NULL. As in SQLite, WHERE terms run only after the
+match is recorded, and the second pass checks WHERE terms but not ON terms.
+HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
+(chaining, a recursive CTE reference, USING or NATURAL). It accepts correlated
+subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:
+`a, b FULL JOIN c ... WHERE ...` (legacy returns extra rows), RIGHT JOIN
+followed by another join (legacy returns columns in the wrong order), and
+`outer_hash_join: full-outer-with-where-equijoin` (legacy ignores a WHERE term
+that repeats the ON term). Both still reject a RIGHT JOIN after another join,
+during analysis.
+
+EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
+legacy does, so simple plans print the same rows with the same ids. Plans
+still differ where the bytecode differs: legacy runs uncorrelated subqueries
+before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
+joins, which HIR does not.
+
+Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
+as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
+stop an endless recursive CTE. HIR still materializes them in blocks with an
+outer join, where legacy can stream some of them.
+
 ### Non-lowering phase complete
 
 Validated HIR and HIR access planning now cover query roots, INSERT-owned
@@ -1031,9 +1106,16 @@ order, both as in legacy. A window with no keys streams rows straight into the
 buffer. The sorted rows then run the shared window step, and the flush emits
 the SELECT output subroutine, so DISTINCT, ORDER BY, LIMIT, and OFFSET apply to
 window output rows. Aggregates, grouped rowids, and bare columns used only by a
-window definition are now collected too. Several windows in one block still
-return an internal error; they need one layer per window, as legacy nests one
-source subquery per window.
+window definition are now collected too.
+
+Several windows in one block lower as one layer per window, nested like the
+legacy window source subqueries: the first window is the outermost layer. The
+block's rows feed the innermost layer, and each finished row of an inner layer
+feeds the next outer layer instead of the SELECT output. Each layer buffers
+only what its consumer reads: the final SELECT outputs and ORDER BY terms for
+the outermost layer, and the outer layer's buffer columns and stored-value
+sort keys for the others. A layer's own window results stay bound to their
+result registers, and other windows' results are buffered like any value.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

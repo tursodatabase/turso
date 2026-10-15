@@ -335,6 +335,8 @@ pub(super) struct QueryFunctionState {
     window_function_count: usize,
     named_windows: Vec<NamedFunctionWindow>,
     windows: Vec<hir::ResolvedWindow>,
+    /// The `OVER name` of each window in `windows`, if any.
+    window_names: Vec<Option<String>>,
 }
 
 impl QueryFunctionState {
@@ -345,6 +347,7 @@ impl QueryFunctionState {
             window_function_count: 0,
             named_windows: Vec::new(),
             windows: Vec::new(),
+            window_names: Vec::new(),
         }
     }
 
@@ -369,18 +372,84 @@ impl QueryFunctionState {
     }
 
     pub(super) fn take_windows(&mut self) -> Vec<hir::ResolvedWindow> {
+        self.window_names.clear();
         std::mem::take(&mut self.windows)
     }
 
+    /// Return the block window for one call, sharing an earlier window the
+    /// way legacy planning does: a call with an inline OVER clause reuses any
+    /// window with the same frame, PARTITION BY, and ORDER BY; a call naming
+    /// its window reuses the latest window with that name and frame.
     fn allocate_resolved_window(
         &mut self,
         window: FunctionWindow,
         function: &Func,
     ) -> Result<hir::WindowId> {
+        let name = window.name.clone();
         let id = hir::WindowId::new(self.block, self.windows.len());
-        self.windows.push(window.into_hir(id, function)?);
+        let resolved = window.into_hir(id, function)?;
+        let existing = match &name {
+            Some(name) => self.windows.iter().zip(&self.window_names).rposition(
+                |(existing, existing_name)| {
+                    existing_name.as_ref() == Some(name)
+                        && frames_are_equivalent(&existing.frame, &resolved.frame)
+                },
+            ),
+            None => self
+                .windows
+                .iter()
+                .position(|existing| windows_are_equivalent(existing, &resolved)),
+        };
+        if let Some(index) = existing {
+            return Ok(self.windows[index].id);
+        }
+        self.windows.push(resolved);
+        self.window_names.push(name);
         Ok(id)
     }
+}
+
+fn windows_are_equivalent(left: &hir::ResolvedWindow, right: &hir::ResolvedWindow) -> bool {
+    frames_are_equivalent(&left.frame, &right.frame)
+        && left.partition_by.len() == right.partition_by.len()
+        && left
+            .partition_by
+            .iter()
+            .zip(&right.partition_by)
+            .all(|(left, right)| left.expr.equivalent(&right.expr))
+        && left.order_by.len() == right.order_by.len()
+        && left
+            .order_by
+            .iter()
+            .zip(&right.order_by)
+            .all(|(left, right)| {
+                left.expr.equivalent(&right.expr)
+                    && left.order == right.order
+                    && left.nulls == right.nulls
+            })
+}
+
+fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> bool {
+    let bounds_are_equivalent = |left: &hir::WindowFrameBound, right: &hir::WindowFrameBound| {
+        use hir::WindowFrameBound::*;
+        match (left, right) {
+            (CurrentRow, CurrentRow)
+            | (UnboundedPreceding, UnboundedPreceding)
+            | (UnboundedFollowing, UnboundedFollowing) => true,
+            (Preceding(left), Preceding(right)) | (Following(left), Following(right)) => {
+                left.equivalent(right)
+            }
+            _ => false,
+        }
+    };
+    left.mode == right.mode
+        && left.exclude == right.exclude
+        && bounds_are_equivalent(&left.start, &right.start)
+        && match (&left.end, &right.end) {
+            (Some(left), Some(right)) => bounds_are_equivalent(left, right),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 enum FunctionContext<'state> {
@@ -429,6 +498,9 @@ struct FunctionWindow {
     partition_by: ExprChildren,
     order_by: Vec<FunctionOrderTerm>,
     frame: Option<FunctionWindowFrame>,
+    /// Set when the call names its window (`OVER name`). Calls naming a
+    /// window share it only with calls using the same name and frame.
+    name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -717,15 +789,16 @@ fn validate_json_arguments(function: &JsonFunc, count: usize) -> Result<()> {
     };
 
     match function {
-        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonValid | JsonFunc::JsonQuote => {
-            require_exact(1)
-        }
+        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonQuote => require_exact(1),
         JsonFunc::JsonErrorPosition if count != 1 => {
             crate::bail_parse_error!("{} function with not exactly 1 argument", function)
         }
         JsonFunc::JsonErrorPosition => Ok(()),
         JsonFunc::JsonPatch | JsonFunc::JsonbPatch => require_exact(2),
-        JsonFunc::JsonArrayLength | JsonFunc::JsonType | JsonFunc::JsonPretty => require_max(2),
+        JsonFunc::JsonArrayLength
+        | JsonFunc::JsonType
+        | JsonFunc::JsonPretty
+        | JsonFunc::JsonValid => require_max(2),
         JsonFunc::JsonObject | JsonFunc::JsonbObject if count % 2 != 0 => {
             crate::bail_parse_error!("{} function requires an even number of arguments", function)
         }
@@ -1332,6 +1405,7 @@ fn take_function_window(
             partition_by,
             order_by,
             frame,
+            name: None,
         },
     }))
 }
@@ -1768,6 +1842,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             partition_by,
             order_by,
             frame: None,
+            name: None,
         })
     }
 
@@ -1824,6 +1899,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .rfind(|window| window.name == name)
                     .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
                 let mut window = named.window.clone();
+                window.name = Some(name);
                 if !function_ignores_user_frame(function) {
                     window.frame = named
                         .frame
@@ -2097,9 +2173,22 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
                     return self.resolve_atomic_expr(resolved.expr, scope);
                 }
-                if let Some(base) =
-                    scope.resolve_unqualified(table.as_str(), NamePrecedence::SourcesOnly)?
-                {
+                // `data.x` reads field `x` of a struct or union column `data`.
+                let base = scope
+                    .resolve_unqualified(table.as_str(), NamePrecedence::SourcesOnly)
+                    .map_err(|error| match error {
+                        LimboError::ParseError(message)
+                            if message.starts_with("ambiguous column name") =>
+                        {
+                            LimboError::ParseError(format!(
+                                "ambiguous column reference: '{}' — multiple tables have a \
+                                 struct/union column with this name",
+                                table.as_str()
+                            ))
+                        }
+                        error => error,
+                    })?;
+                if let Some(base) = base {
                     if custom_argument_type(&base, |definition| {
                         definition.is_struct() || definition.is_union()
                     })
@@ -2958,23 +3047,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
                 )?;
+                // Legacy reports an unknown type and an unknown field alike.
+                let unresolved = || {
+                    LimboError::ParseError(format!(
+                        "cannot resolve struct field '{field_name}' for struct_extract"
+                    ))
+                };
                 let struct_type =
                     custom_argument_type(&arguments[0], |definition| definition.is_struct())
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "struct_extract() first argument must have a known struct type"
-                                    .to_string(),
-                            )
-                        })?;
+                        .ok_or_else(unresolved)?;
                 let member = self
                     .resolve_custom_member(&arguments[0], &field_name)?
-                    .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "unknown field '{}' in struct type '{}'",
-                            field_name,
-                            struct_type.value().name
-                        ))
-                    })?;
+                    .ok_or_else(unresolved)?;
                 let hir::FieldAccessKind::Struct { field_index } = member.kind else {
                     unreachable!("struct member resolution returns a struct field")
                 };
@@ -4346,11 +4430,21 @@ fn comparison_component(
     lhs: &ResolvedScopeExpr,
     rhs: &ResolvedScopeExpr,
 ) -> hir::ComparisonComponent {
+    // Like legacy and SQLite's sqlite3CompareAffinity, a numeric affinity on
+    // either side compares as NUMERIC, even alone: REAL affinity would turn a
+    // large integer into a float and lose its exact value.
+    let lone = |affinity: Affinity| {
+        if affinity.is_numeric() {
+            Affinity::Numeric
+        } else {
+            affinity
+        }
+    };
     let affinity = match (lhs.has_affinity, rhs.has_affinity) {
         (true, true) if lhs.affinity.is_numeric() || rhs.affinity.is_numeric() => Affinity::Numeric,
         (true, true) => Affinity::Blob,
-        (true, false) => lhs.affinity,
-        (false, true) => rhs.affinity,
+        (true, false) => lone(lhs.affinity),
+        (false, true) => lone(rhs.affinity),
         (false, false) => Affinity::Blob,
     };
     hir::ComparisonComponent {
@@ -5102,6 +5196,7 @@ mod tests {
             "SELECT json_pretty('{}')",
             "SELECT json_pretty('{}', '  ')",
             "SELECT json_array()",
+            "SELECT json_valid('{}', 6)",
         ] {
             let analyzed = analyze_expression(
                 &expression(sql),
@@ -5137,6 +5232,10 @@ mod tests {
             (
                 "SELECT json_object('key')",
                 "json_object function requires an even number of arguments",
+            ),
+            (
+                "SELECT json_valid('{}', 6, 1)",
+                "json_valid function called with more than 2 arguments",
             ),
         ] {
             let error = analyze_expression(

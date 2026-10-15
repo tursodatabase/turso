@@ -33,6 +33,65 @@ impl ColumnUsageCollector {
 }
 
 impl HirDocument {
+    /// Count every column of `query`'s own sources that is read anywhere:
+    /// by the query itself or by a nested query, such as a correlated
+    /// subquery reading an outer column. An index covers a source only if it
+    /// holds all of these.
+    pub(crate) fn source_column_usage(&self, query: QueryId) -> Vec<ColumnUsage> {
+        let Some(owner) = self.query(query) else {
+            return Vec::new();
+        };
+        let owns = |source: SourceId| {
+            self.source(source).is_some_and(|source| {
+                matches!(source.owner, SourceOwner::QueryBlock(block) if block.query == query)
+            })
+        };
+        let mut counts = ColumnUsageCollector::default();
+        for usage in owner.direct_column_usage(|source| self.source(source)) {
+            *counts.counts.entry(usage.reference).or_default() += usage.count;
+        }
+        for nested in self.queries.iter().filter(|nested| nested.id != query) {
+            for usage in nested.direct_column_usage(|source| self.source(source)) {
+                if owns(usage.reference.source) {
+                    *counts.counts.entry(usage.reference).or_default() += usage.count;
+                }
+            }
+        }
+        counts.into_usage()
+    }
+
+    /// Sources of enclosing queries that `query`, or any query it runs
+    /// (subqueries in its expressions, FROM subqueries and CTEs), reads. A
+    /// query that reads any must run again whenever the outer row changes,
+    /// even when its own expressions read no outer column.
+    pub(crate) fn outer_sources(&self, query: QueryId) -> Vec<SourceId> {
+        let mut pending = vec![query];
+        let mut nested = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if nested.insert(id) {
+                pending.extend(self.direct_query_dependencies(id));
+            }
+        }
+        let mut outer = nested
+            .iter()
+            .filter_map(|id| self.query(*id))
+            .flat_map(|query| query.captures.iter().copied())
+            .filter(|source| {
+                !matches!(
+                    self.source(*source).map(|source| source.owner),
+                    Some(SourceOwner::QueryBlock(block)) if nested.contains(&block.query)
+                )
+            })
+            .collect::<Vec<_>>();
+        outer.sort_unstable();
+        outer.dedup();
+        outer
+    }
+
+    pub(crate) fn reads_outer_sources(&self, query: QueryId) -> bool {
+        !self.outer_sources(query).is_empty()
+    }
+
     /// Return every query whose plan is needed directly by this query. This
     /// includes query-backed FROM sources and subqueries in expressions, but
     /// does not descend into those query definitions.
@@ -102,11 +161,8 @@ impl HirDocument {
                     | SubqueryExpr::In { query, .. }
                     | SubqueryExpr::Exists(query) => query,
                 };
-                let query = self
-                    .query(*query)
-                    .expect("validated HIR subquery reference must exist");
-                for source in &query.captures {
-                    visit(*source);
+                for source in self.outer_sources(*query) {
+                    visit(source);
                 }
             }
             _ => {}

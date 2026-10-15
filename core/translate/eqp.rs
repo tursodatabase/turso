@@ -386,7 +386,7 @@ impl Display for EqpDetail {
 
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
-pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<String> {
+pub(crate) fn seek_constraint_parts<E>(index: &Index, seek_def: &SeekDef<E>) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
     for (i, _constraint) in seek_def.prefix.iter().enumerate() {

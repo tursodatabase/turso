@@ -1608,6 +1608,10 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    /// Result columns of a statement prepared from semantic HIR; see
+    /// [crate::vdbe::builder::ProgramBuilder::resolved_result_columns].
+    pub(crate) resolved_result_columns:
+        Vec<crate::translate::semantic_lowering::ResolvedResultColumn>,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.

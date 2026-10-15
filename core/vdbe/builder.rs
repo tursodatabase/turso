@@ -1,6 +1,6 @@
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -13,7 +13,9 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
-        semantic::hir::{AggregateId, CteId, OutputId, QueryId, SourceId, WindowFunctionId},
+        semantic::hir::{
+            AggregateId, CteId, OutputId, QueryBlockId, QueryId, SourceId, WindowFunctionId,
+        },
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -309,6 +311,10 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    /// Result columns of a statement prepared from semantic HIR. When set,
+    /// `result_columns` and `table_references` are empty.
+    pub(crate) resolved_result_columns:
+        Vec<crate::translate::semantic_lowering::ResolvedResultColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by legacy or HIR identity.
@@ -341,6 +347,14 @@ pub struct ProgramBuilder {
     cursor_overrides: HashMap<usize, CursorID>,
     /// Physical value locations for resolved HIR sources.
     source_bindings: HashMap<SourceId, SourceBinding>,
+    /// EXPLAIN QUERY PLAN row of each resolved HIR source's loop.
+    source_explain_rows: HashMap<SourceId, usize>,
+    /// The fixed registers each HIR coroutine yields its row in, by yield
+    /// register.
+    coroutine_rows: HashMap<usize, usize>,
+    /// Resolved HIR query blocks whose loops already have EXPLAIN QUERY
+    /// PLAN rows.
+    explained_blocks: HashSet<QueryBlockId>,
     /// Registers containing already-evaluated resolved HIR outputs.
     output_bindings: HashMap<OutputId, OutputBinding>,
     /// Registers containing finalized aggregate results.
@@ -349,6 +363,12 @@ pub struct ProgramBuilder {
     window_result_registers: HashMap<WindowFunctionId, usize>,
     /// Runtime results for resolved non-FROM subqueries.
     subquery_bindings: HashMap<QueryId, SubqueryBinding>,
+    /// Plan of the HIR statement being lowered. Expression subqueries emit
+    /// their bodies from it where the expression is evaluated.
+    hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
+    /// Registers already holding the value of exact HIR expression nodes,
+    /// keyed by node address, such as GROUP BY keys while a group is output.
+    expression_registers: Vec<(usize, usize)>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -800,6 +820,7 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            resolved_result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -822,10 +843,15 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             source_bindings: HashMap::default(),
+            source_explain_rows: HashMap::default(),
+            coroutine_rows: HashMap::default(),
+            explained_blocks: HashSet::default(),
             output_bindings: HashMap::default(),
             aggregate_result_registers: HashMap::default(),
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
+            hir_plan: None,
+            expression_registers: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -1010,6 +1036,15 @@ impl ProgramBuilder {
         self.source_bindings.get(&source)
     }
 
+    /// Record the registers a HIR coroutine yields its row in.
+    pub(crate) fn bind_coroutine_row(&mut self, yield_reg: usize, row_start: usize) {
+        self.coroutine_rows.insert(yield_reg, row_start);
+    }
+
+    pub(crate) fn coroutine_row(&self, yield_reg: usize) -> Option<usize> {
+        self.coroutine_rows.get(&yield_reg).copied()
+    }
+
     pub(crate) fn bind_output(&mut self, output: OutputId, register: usize) {
         self.output_bindings
             .insert(output, OutputBinding { register });
@@ -1033,6 +1068,40 @@ impl ProgramBuilder {
 
     pub(crate) fn window_result_register(&self, window: WindowFunctionId) -> Option<usize> {
         self.window_result_registers.get(&window).copied()
+    }
+
+    pub(crate) fn set_hir_plan(&mut self, plan: Arc<crate::translate::semantic_to_plan::HirPlan>) {
+        self.hir_plan = Some(plan);
+    }
+
+    pub(crate) fn hir_plan(&self) -> Option<Arc<crate::translate::semantic_to_plan::HirPlan>> {
+        self.hir_plan.clone()
+    }
+
+    /// Read `expression` from `register` instead of evaluating it, until
+    /// [Self::clear_expression_registers].
+    pub(crate) fn bind_expression_register(
+        &mut self,
+        expression: &crate::translate::semantic::hir::Expr,
+        register: usize,
+    ) {
+        self.expression_registers
+            .push((std::ptr::from_ref(expression) as usize, register));
+    }
+
+    pub(crate) fn expression_register(
+        &self,
+        expression: &crate::translate::semantic::hir::Expr,
+    ) -> Option<usize> {
+        let address = std::ptr::from_ref(expression) as usize;
+        self.expression_registers
+            .iter()
+            .find(|(bound, _)| *bound == address)
+            .map(|(_, register)| *register)
+    }
+
+    pub(crate) fn clear_expression_registers(&mut self) {
+        self.expression_registers.clear();
     }
 
     pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {
@@ -1541,6 +1610,41 @@ impl ProgramBuilder {
             }
         }
         Ok(emitted)
+    }
+
+    /// Emit the EXPLAIN QUERY PLAN row of a resolved HIR source's loop,
+    /// once. Rows emitted later for the source, like the body of its
+    /// subquery, go under it through [Self::with_source_explain_parent].
+    pub(crate) fn emit_source_explain(&mut self, source: SourceId, detail: EqpDetail) {
+        if !self.mode.is_explain_query_plan() || self.source_explain_rows.contains_key(&source) {
+            return;
+        }
+        self.emit_explain_should_not_be_called_directly(true, detail);
+        self.source_explain_rows
+            .insert(source, self.insns.len() - 1);
+        self.pop_current_parent_explain();
+    }
+
+    /// In EXPLAIN QUERY PLAN mode, whether this is the first request to
+    /// explain the block's loops.
+    pub(crate) fn start_block_explain(&mut self, block: QueryBlockId) -> bool {
+        self.mode.is_explain_query_plan() && self.explained_blocks.insert(block)
+    }
+
+    /// Run `emit` with the source's EXPLAIN QUERY PLAN row as the parent of
+    /// the rows it emits.
+    pub(crate) fn with_source_explain_parent<T>(
+        &mut self,
+        source: SourceId,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let Some(&row) = self.source_explain_rows.get(&source) else {
+            return emit(self);
+        };
+        let previous = self.current_parent_idx_mut().replace(row);
+        let result = emit(self);
+        *self.current_parent_idx_mut() = previous;
+        result
     }
 
     pub fn pop_current_parent_explain(&mut self) {
@@ -2426,6 +2530,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            resolved_result_columns: self.resolved_result_columns,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

@@ -513,15 +513,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         else {
             return Ok(None);
         };
+        self.resolve_cte_entry(scope, entry, context).map(Some)
+    }
 
+    fn resolve_cte_entry(
+        &mut self,
+        scope: usize,
+        entry: usize,
+        context: CteBindingContext<'_>,
+    ) -> Result<CteResolution> {
+        let name = self.cte_scopes[scope].entries[entry].name.clone();
         match &self.cte_scopes[scope].entries[entry].state {
-            CteState::Bound(id) => return Ok(Some(CteResolution::Cte(*id))),
+            CteState::Bound(id) => return Ok(CteResolution::Cte(*id)),
             CteState::BindingSeed(_) => crate::bail_parse_error!("circular reference: {}", name),
             CteState::BindingRecursive(binding) => {
-                return Ok(Some(CteResolution::RecursiveInput {
+                return Ok(CteResolution::RecursiveInput {
                     cte: binding.id,
                     columns: binding.columns.clone(),
-                }));
+                });
             }
             CteState::Failed(message) => {
                 return Err(LimboError::ParseError(message.clone()));
@@ -529,6 +538,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             CteState::Unbound => {}
         }
 
+        self.bind_sibling_dependencies_first(scope, entry, context);
         let syntax = self.cte_scopes[scope].entries[entry].syntax;
         let first_recursive_arm = match recursive_arm_start(syntax) {
             Ok(first_recursive_arm) => first_recursive_arm,
@@ -543,6 +553,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let recursive_id = first_recursive_arm.map(|_| self.reserve_cte());
         self.cte_scopes[scope].entries[entry].state = CteState::BindingSeed(recursive_id);
+        // A CTE body sees its own WITH clause and the ones around it, never a
+        // WITH clause nested inside the query that happened to reference it.
+        let inner_scopes = self.cte_scopes.split_off(scope + 1);
         let result = self.bind_cte(
             syntax,
             recursive_id,
@@ -551,10 +564,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             first_recursive_arm,
             context,
         );
+        assert_eq!(
+            self.cte_scopes.len(),
+            scope + 1,
+            "CTE binding leaked a CTE scope"
+        );
+        self.cte_scopes.extend(inner_scopes);
         match result {
             Ok(id) => {
                 self.cte_scopes[scope].entries[entry].state = CteState::Bound(id);
-                Ok(Some(CteResolution::Cte(id)))
+                Ok(CteResolution::Cte(id))
             }
             Err(error) => {
                 let message = match error {
@@ -564,6 +583,78 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 self.cte_scopes[scope].entries[entry].state = CteState::Failed(message.clone());
                 Err(LimboError::ParseError(message))
             }
+        }
+    }
+
+    /// Bind the unbound sibling CTEs that `entry` reads, deepest first, so
+    /// binding `entry` finds them already bound. Lazy binding would otherwise
+    /// recurse once per link of a `WITH c1 AS (... c0), c2 AS (... c1), ...`
+    /// chain and overflow the stack on long chains.
+    ///
+    /// This only runs when a dependency would get the same binding context as
+    /// `entry`, which holds when there is no outer scope. A dependency cycle
+    /// stops it, leaving the lazy path to report the circular reference. A
+    /// dependency that fails to bind keeps its error for the reference that
+    /// reaches it while `entry` is analyzed.
+    fn bind_sibling_dependencies_first(
+        &mut self,
+        scope: usize,
+        entry: usize,
+        context: CteBindingContext<'_>,
+    ) {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Visit {
+            New,
+            OnPath,
+            Done,
+        }
+        if context.outer_scope().is_some() {
+            return;
+        }
+        let entries = &self.cte_scopes[scope].entries;
+        let reads = |reader: usize| -> Vec<usize> {
+            let mut names = Vec::new();
+            for (sibling, pending) in entries.iter().enumerate() {
+                if sibling == reader || !matches!(pending.state, CteState::Unbound) {
+                    continue;
+                }
+                let counter = RecursiveRefCounter {
+                    cte_name: &pending.name,
+                };
+                if counter.count_select(&entries[reader].syntax.select, &mut Vec::new()) > 0 {
+                    names.push(sibling);
+                }
+            }
+            names
+        };
+        let mut visits = vec![Visit::New; entries.len()];
+        visits[entry] = Visit::OnPath;
+        let mut path = vec![(entry, reads(entry), 0)];
+        let mut order = Vec::new();
+        while let Some((node, node_reads, next)) = path.last_mut() {
+            let Some(&dependency) = node_reads.get(*next) else {
+                let node = *node;
+                path.pop();
+                visits[node] = Visit::Done;
+                if node != entry {
+                    order.push(node);
+                }
+                continue;
+            };
+            *next += 1;
+            match visits[dependency] {
+                Visit::OnPath => return,
+                Visit::Done => {}
+                Visit::New => {
+                    visits[dependency] = Visit::OnPath;
+                    path.push((dependency, reads(dependency), 0));
+                }
+            }
+        }
+        for dependency in order {
+            // An error stays recorded on the dependency; `entry` reports it
+            // when its analysis reaches that reference.
+            let _ = self.resolve_cte_entry(scope, dependency, context);
         }
     }
 
@@ -761,7 +852,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .iter()
                 .enumerate()
                 .map(|(index, term)| {
-                    super::analyze::compound_order_by_position(&term.expr, &output_arms, index + 1)
+                    super::analyze::compound_order_by_position(
+                        &term.expr,
+                        &output_arms,
+                        &mut |_, _| Ok(None),
+                        index + 1,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?
         };

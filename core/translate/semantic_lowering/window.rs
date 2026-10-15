@@ -16,7 +16,7 @@ use crate::{
         semantic::hir::{self, ExprVisitor},
         semantic_lowering::expr::{
             translate_expr, translate_expr_no_constant_opt, translate_expr_with_inputs,
-            ExprRegisterInput,
+            translate_expr_with_inputs_no_constant_opt, ExprRegisterInput,
         },
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
@@ -549,18 +549,20 @@ pub(super) fn emit_hir_window_input_row(
         count: plan.columns.len(),
     };
     for column in 0..plan.columns.len() {
-        emit_hir_window_input_column(program, document, plan, column, row.start + column)?;
+        emit_hir_window_input_column(program, document, plan, column, row.start + column, &[])?;
     }
     Ok(row)
 }
 
-/// Lower one buffer column of the current source row into `target`.
-pub(super) fn emit_hir_window_input_column(
+/// Lower one buffer column of the current source row into `target`. A row
+/// coming from an inner window layer supplies its values through `inputs`.
+pub(super) fn emit_hir_window_input_column<'a>(
     program: &mut ProgramBuilder,
-    document: &hir::HirDocument,
-    plan: &HirWindowBufferPlan<'_>,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
     column: usize,
     target: usize,
+    inputs: &[ExprRegisterInput<'a>],
 ) -> Result<()> {
     let column = &plan.columns[column];
     emit_hir_window_value(
@@ -569,21 +571,27 @@ pub(super) fn emit_hir_window_input_column(
         column.expression(),
         matches!(column, HirWindowBufferColumn::Encoded(_)),
         target,
+        inputs,
     )
 }
 
-fn emit_hir_window_value(
+fn emit_hir_window_value<'a>(
     program: &mut ProgramBuilder,
-    document: &hir::HirDocument,
-    expression: &hir::Expr,
+    document: &'a hir::HirDocument,
+    expression: &'a hir::Expr,
     encoded: bool,
     target: usize,
+    inputs: &[ExprRegisterInput<'a>],
 ) -> Result<()> {
     let previous = program.flags.suppress_custom_type_decode();
     if encoded {
         program.flags.set_suppress_custom_type_decode(true);
     }
-    let result = translate_expr(program, document, expression, target);
+    let result = if inputs.is_empty() {
+        translate_expr(program, document, expression, target)
+    } else {
+        translate_expr_with_inputs_no_constant_opt(program, document, expression, target, inputs)
+    };
     program.flags.set_suppress_custom_type_decode(previous);
     result.map(|_| ())
 }
@@ -600,7 +608,7 @@ pub(super) struct HirWindowInputKey<'a> {
     pub(super) type_fact: &'a hir::TypeFact,
 }
 
-impl HirWindowInputKey<'_> {
+impl<'a> HirWindowInputKey<'a> {
     /// Custom types with a decode program sort by their stored value, like
     /// legacy ORDER BY keys, so the key cannot reuse the decoded buffer value.
     pub(super) fn is_encoded(&self) -> bool {
@@ -614,14 +622,30 @@ impl HirWindowInputKey<'_> {
     pub(super) fn emit(
         &self,
         program: &mut ProgramBuilder,
-        document: &hir::HirDocument,
+        document: &'a hir::HirDocument,
         target: usize,
+        inputs: &[ExprRegisterInput<'a>],
     ) -> Result<()> {
-        emit_hir_window_value(program, document, self.expression, true, target)
+        emit_hir_window_value(program, document, self.expression, true, target, inputs)
     }
 }
 
 impl<'a> HirWindowBufferPlan<'a> {
+    /// Values this layer stores per row, with whether each is a stored
+    /// (encoded) custom-type value.
+    pub(super) fn column_expressions(&self) -> impl Iterator<Item = (&'a hir::Expr, bool)> + '_ {
+        self.columns.iter().map(|column| {
+            (
+                column.expression(),
+                matches!(column, HirWindowBufferColumn::Encoded(_)),
+            )
+        })
+    }
+
+    pub(super) fn column_is_encoded(&self, column: usize) -> bool {
+        matches!(self.columns[column], HirWindowBufferColumn::Encoded(_))
+    }
+
     /// Source-row ordering for this window: PARTITION BY terms ascending, then
     /// ORDER BY terms, skipping any term equivalent to an earlier key. This is
     /// the ORDER BY of the legacy window source subquery.
@@ -2463,19 +2487,21 @@ mod tests {
         );
         let (query, block) = root_query(&document);
         let mut program = program();
-        assert_eq!(block.windows.len(), 2);
-        for window in &block.windows {
-            let plan =
-                plan_hir_window_buffer(query, block, window.id).expect("window buffer plans");
-            let runtimes =
-                prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
-            let [runtime] = runtimes.as_slice() else {
-                panic!("one function belongs to each effective window");
-            };
+        assert_eq!(
+            block.windows.len(),
+            1,
+            "calls naming the same window and frame share it"
+        );
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let runtimes =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        assert_eq!(runtimes.len(), 2);
+        for (function, runtime) in plan.functions.iter().zip(&runtimes) {
             assert_eq!(runtime.argument_collations(), &[CollationSeq::NoCase]);
             assert!(runtime.has_minmax_state());
             assert_eq!(
-                program.window_result_register(plan.functions[0].id),
+                program.window_result_register(function.id),
                 Some(runtime.result_register())
             );
         }
@@ -2485,7 +2511,8 @@ mod tests {
                 .iter()
                 .filter(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. }))
                 .count(),
-            2
+            2,
+            "each moving min/max function keeps its own ordered state"
         );
     }
 
@@ -3419,8 +3446,8 @@ mod tests {
             "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-            .expect("window buffer plans");
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let check = window_frame_order_check(hir_window_frame_shape(&plan.window.frame), offsets)
@@ -3491,9 +3518,8 @@ mod tests {
             (offsets, program)
         }
 
-        let (offsets, program) = delay(
-            "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
-        );
+        let (offsets, program) =
+            delay("SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items");
         let WindowFrameOffsets::Both { start, end } = offsets else {
             panic!("bounded following frame has both offsets");
         };
@@ -3512,9 +3538,8 @@ mod tests {
         );
         assert!(range.insns.is_empty());
 
-        let (_, preceding) = delay(
-            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM items",
-        );
+        let (_, preceding) =
+            delay("SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM items");
         assert!(preceding.insns.is_empty());
     }
 
@@ -3620,8 +3645,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-            .expect("window buffer plans");
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let WindowFrameOffsets::Both { start, end } = offsets else {

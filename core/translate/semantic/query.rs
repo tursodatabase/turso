@@ -10,7 +10,10 @@ use super::{
     schema_program::TypeTransform,
     scope::{resolve_source_column, ResolvedScopeExpr, Scope},
 };
-use crate::{schema::Table, sync::Arc, LimboError, Result};
+use crate::{
+    schema::Table, sync::Arc, translate::expr::StorageClassMask, vdbe::affinity::Affinity,
+    LimboError, Result,
+};
 
 struct AnalyzedTableSource<'ast> {
     id: hir::SourceId,
@@ -317,8 +320,22 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         });
                     }
                 }
-                let id =
-                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?;
+                let id = if self.context().table_exists(name)? {
+                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?
+                } else if let Some(view) = self.context().resolve_view(name)? {
+                    if let Some(ast::Indexed::IndexedBy(index)) = indexed {
+                        crate::bail_parse_error!("no such index: {}", index.as_str());
+                    }
+                    self.analyze_view_source(view, alias.as_ref(), context)?
+                } else if self.context().is_broken_view(name) {
+                    crate::bail_parse_error!(
+                        "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
+                         Use DROP VIEW to remove it, then recreate it.",
+                        crate::util::normalize_ident(name.name.as_str())
+                    );
+                } else {
+                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?
+                };
                 Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
@@ -585,13 +602,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             CteResolution::RecursiveInput { cte, columns } => (cte, true, columns),
         };
+        // Like SQLite, a recursive CTE's reference to itself has no
+        // affinity; a read from outside keeps the anchor query's.
         let columns = cte_columns
             .iter()
             .map(|column| hir::SourceColumn {
                 name: column.name.clone(),
                 type_fact: column.type_fact.clone(),
-                affinity: column.affinity,
-                has_affinity: column.has_affinity,
+                affinity: if recursive {
+                    Affinity::Blob
+                } else {
+                    column.affinity
+                },
+                has_affinity: column.has_affinity && !recursive,
                 collation: column.collation.clone(),
                 hidden: false,
                 rowid_alias: false,
@@ -684,6 +707,84 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(source)
     }
 
+    /// Expand a view like legacy planning: its stored SELECT becomes a
+    /// derived source named after the view, with the view's column names.
+    /// The SELECT resolves against the catalog only, so the statement's CTEs
+    /// are hidden while it is analyzed, and it cannot read outer columns.
+    fn analyze_view_source(
+        &mut self,
+        view: &'ast crate::schema::View,
+        alias: Option<&ast::As>,
+        context: FromContext<'_>,
+    ) -> Result<hir::SourceId> {
+        let name = crate::util::normalize_ident(&view.name);
+        if self.views_in_progress.contains(&name) {
+            crate::bail_parse_error!("view {} is circularly defined", view.name);
+        }
+        let owner = context.source_owner();
+        self.views_in_progress.push(name.clone());
+        let statement_ctes = std::mem::take(&mut self.cte_scopes);
+        let query = self.analyze_select_with_scope(
+            &view.select_stmt,
+            context.query_parent(),
+            None,
+            None,
+            context.expr_policies(self.context().dqs_dml()),
+        );
+        assert!(
+            self.cte_scopes.is_empty(),
+            "view analysis leaked a CTE scope"
+        );
+        self.cte_scopes = statement_ctes;
+        self.views_in_progress.pop();
+        let query = query?;
+
+        let mut columns = self.query_source_columns(query)?;
+        if columns.len() != view.columns.len() {
+            return Err(crate::LimboError::InternalError(format!(
+                "view {} has {} columns but its SELECT returns {}",
+                view.name,
+                view.columns.len(),
+                columns.len()
+            )));
+        }
+        for (column, view_column) in columns.iter_mut().zip(&view.columns) {
+            if let Some(view_name) = &view_column.name {
+                column.name.clone_from(view_name);
+            }
+        }
+        let width = columns.len();
+        let source = self.reserve_source();
+        self.insert_source(
+            source,
+            hir::Source {
+                id: source,
+                owner,
+                database: None,
+                name: name.clone(),
+                alias: Some(
+                    alias
+                        .map(ast::As::name)
+                        .map(ast::Name::as_str)
+                        .map(crate::util::normalize_ident)
+                        .unwrap_or(name),
+                ),
+                kind: hir::SourceKind::Derived(query),
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available: false,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(source)
+    }
+
     pub(super) fn query_source_columns(
         &self,
         query: hir::QueryId,
@@ -697,16 +798,155 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(first
             .outputs
             .iter()
-            .map(|output| hir::SourceColumn {
-                name: output.name.clone(),
-                type_fact: output.type_fact.clone(),
-                affinity: output.schema_affinity,
-                has_affinity: output.has_affinity,
-                collation: output.collation.clone(),
-                hidden: false,
-                rowid_alias: false,
+            .enumerate()
+            .map(|(position, output)| {
+                let (affinity, has_affinity) = if query.blocks.len() > 1 {
+                    self.compound_column_affinity(query, position)
+                } else {
+                    (output.schema_affinity, output.has_affinity)
+                };
+                hir::SourceColumn {
+                    name: self.subquery_column_name(output),
+                    type_fact: output.type_fact.clone(),
+                    affinity,
+                    has_affinity,
+                    collation: output.collation.clone(),
+                    hidden: false,
+                    rowid_alias: false,
+                }
             })
             .collect())
+    }
+
+    /// The affinity of column `position` of a compound subquery, combined
+    /// across its arms like legacy and SQLite's `sqlite3SubqueryColumnTypes`:
+    /// the first arm with an affinity sets it, and a later arm that can give
+    /// a value of the other class (text against numeric) removes it, so the
+    /// column compares by storage class.
+    fn compound_column_affinity(&self, query: &hir::Query, position: usize) -> (Affinity, bool) {
+        let outputs = query
+            .blocks
+            .iter()
+            .filter_map(|block| block.outputs.get(position))
+            .collect::<Vec<_>>();
+        let affinity_of = |output: &hir::Output| {
+            if output.has_affinity {
+                output.schema_affinity
+            } else {
+                Affinity::None
+            }
+        };
+        let mut data_types = StorageClassMask::from_null();
+        let mut arms = outputs.iter();
+        let mut affinity = Affinity::None;
+        for output in arms.by_ref() {
+            affinity = affinity_of(output);
+            if affinity != Affinity::None {
+                break;
+            }
+            data_types |= self.expr_data_type(&output.expr);
+        }
+        if affinity == Affinity::None {
+            return (Affinity::Blob, false);
+        }
+        for output in arms {
+            data_types |= self.expr_data_type(&output.expr);
+        }
+        let conflicts = match affinity {
+            Affinity::Text => data_types.has_numeric(),
+            affinity => affinity.is_numeric() && data_types.has_text(),
+        };
+        if conflicts {
+            (Affinity::Blob, false)
+        } else {
+            (affinity, true)
+        }
+    }
+
+    /// The storage classes an expression can give, like SQLite's
+    /// `sqlite3ExprDataType`.
+    fn expr_data_type(&self, expression: &hir::Expr) -> StorageClassMask {
+        let from_affinity = |affinity: Affinity| {
+            if affinity.is_numeric() {
+                StorageClassMask::NUMERIC | StorageClassMask::BLOB
+            } else if affinity == Affinity::Text {
+                StorageClassMask::TEXT | StorageClassMask::BLOB
+            } else {
+                StorageClassMask::all()
+            }
+        };
+        match expression {
+            hir::Expr::Collate { expr, .. }
+            | hir::Expr::Unary {
+                operator: ast::UnaryOperator::Positive,
+                expr,
+            } => self.expr_data_type(expr),
+            hir::Expr::Literal(literal) => {
+                match crate::translate::alter::literal_default_value(literal)
+                    .map(|value| value.value_type())
+                {
+                    Ok(crate::types::ValueType::Null) => StorageClassMask::from_null(),
+                    Ok(crate::types::ValueType::Text) => StorageClassMask::from_text(),
+                    Ok(crate::types::ValueType::Blob) => StorageClassMask::from_blob(),
+                    _ => StorageClassMask::from_numeric(),
+                }
+            }
+            hir::Expr::Binary {
+                operator: ast::Operator::Concat,
+                ..
+            } => StorageClassMask::TEXT | StorageClassMask::BLOB,
+            hir::Expr::Function(_) | hir::Expr::Parameter(_) => StorageClassMask::all(),
+            hir::Expr::Column(reference) => self
+                .source(reference.source)
+                .and_then(|source| source.columns.get(reference.column))
+                .filter(|column| column.has_affinity)
+                .map_or(StorageClassMask::all(), |column| {
+                    from_affinity(column.affinity)
+                }),
+            hir::Expr::RowId(_) => from_affinity(Affinity::Integer),
+            hir::Expr::Cast { target, .. } => from_affinity(target.affinity),
+            hir::Expr::Subquery(_) => StorageClassMask::all(),
+            hir::Expr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => {
+                let mut types = StorageClassMask::from_null();
+                for (_, then) in when_then {
+                    types |= self.expr_data_type(then);
+                }
+                if let Some(else_expr) = else_expr {
+                    types |= self.expr_data_type(else_expr);
+                }
+                types
+            }
+            _ => StorageClassMask::from_numeric(),
+        }
+    }
+
+    /// Like legacy and SQLite, a subquery column without an alias is named
+    /// after the column it reads: `(SELECT b.k FROM l AS b)` has a column
+    /// `k`, not `b.k`. A rowid read takes the name of the rowid alias column,
+    /// or `rowid`. Other expressions keep their SQL text.
+    fn subquery_column_name(&self, output: &hir::Output) -> String {
+        if output.name_kind != hir::OutputNameKind::Inferred {
+            return output.name.clone();
+        }
+        let column_name = match &output.expr {
+            hir::Expr::Column(reference) => self
+                .source(reference.source)
+                .and_then(|source| source.columns.get(reference.column))
+                .map(|column| column.name.clone()),
+            hir::Expr::RowId(source) => self.source(*source).map(|source| {
+                source
+                    .columns
+                    .iter()
+                    .find(|column| column.rowid_alias)
+                    .map_or_else(|| "rowid".to_string(), |column| column.name.clone())
+            }),
+            _ => None,
+        };
+        column_name.unwrap_or_else(|| output.name.clone())
     }
 
     pub(super) fn analyze_base_table_source(
