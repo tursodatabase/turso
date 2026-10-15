@@ -656,24 +656,66 @@ fn prepare_one_select_plan(
                 .as_ref()
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
+            for mut o in order_by {
+                replace_column_number_with_copy_of_column_expr(
+                    &mut o.expr,
+                    &plan.result_columns,
+                    "ORDER BY",
+                )?;
+
+                bind_and_rewrite_expr(
+                    &mut o.expr,
+                    Some(&mut plan.table_references),
+                    Some(&plan.result_columns),
+                    resolver,
+                    BindingBehavior::TryResultColumnsFirst,
+                )?;
+                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+            }
+            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
+            // Duplicates are semantically redundant.
+            let mut i = 0;
+            while i < key.len() {
+                if key[..i]
+                    .iter()
+                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
+                {
+                    key.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
+            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
+            // This means we truncate the ORDER BY to just the rowid column.
+            // We do this for SQLite compatibility - SQLite truncates before validating, so
+            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+            let mut terms_cut_after_rowid = Vec::new();
+            if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
+                let joined = &plan.table_references.joined_tables()[0];
+                let table_id = joined.internal_id;
+                let rowid_alias_col = joined
+                    .btree()
+                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                let first_is_rowid = match key[0].0.as_ref() {
+                    ast::Expr::Column { table, column, .. } => {
+                        *table == table_id && rowid_alias_col == Some(*column)
+                    }
+                    ast::Expr::RowId { table, .. } => *table == table_id,
+                    _ => false,
+                };
+                if first_is_rowid {
+                    terms_cut_after_rowid = key.split_off(1);
+                }
+            }
+
             {
                 trace_stack!("process_order_by");
-                for mut o in order_by {
-                    replace_column_number_with_copy_of_column_expr(
-                        &mut o.expr,
-                        &plan.result_columns,
-                        "ORDER BY",
-                    )?;
-
-                    bind_and_rewrite_expr(
-                        &mut o.expr,
-                        Some(&mut plan.table_references),
-                        Some(&plan.result_columns),
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
-                        &o.expr,
+                        expr,
                         resolver,
                         &mut plan.aggregates,
                         Some(&mut windows),
@@ -690,21 +732,26 @@ fn prepare_one_select_plan(
                         let agg = &plan.aggregates[agg_count_before_order_by];
                         crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                     }
-
-                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
                 }
-            }
-            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
-            // Duplicates are semantically redundant.
-            let mut i = 0;
-            while i < key.len() {
-                if key[..i]
-                    .iter()
-                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
-                {
-                    key.remove(i);
-                } else {
-                    i += 1;
+                let mut cut_aggregates = plan.aggregates.clone();
+                let mut cut_windows = windows.clone();
+                let mut cut_named_windows = named_windows.clone();
+                for (expr, _, _) in terms_cut_after_rowid.iter() {
+                    resolve_window_and_aggregate_functions(
+                        expr,
+                        resolver,
+                        &mut cut_aggregates,
+                        Some(&mut cut_windows),
+                        &mut cut_named_windows,
+                    )?;
+                }
+                let is_aggregate_query = has_group_by || agg_count_before_order_by > 0;
+                if !cut_windows.is_empty() && !is_aggregate_query {
+                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                        if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
+                            crate::bail_parse_error!("misuse of aggregate: {}()", name);
+                        }
+                    }
                 }
             }
             plan.order_by = key;
@@ -718,30 +765,6 @@ fn prepare_one_select_plan(
                 && windows.is_empty();
             if is_single_row_aggregate {
                 plan.order_by.clear();
-            }
-
-            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
-            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
-            // This means we truncate the ORDER BY to just the rowid column.
-            // We do this for SQLite compatibility - SQLite truncates before validating, so
-            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
-            if plan.order_by.len() > 1 && plan.table_references.joined_tables().len() == 1 {
-                let joined = &plan.table_references.joined_tables()[0];
-                let table_id = joined.internal_id;
-                let rowid_alias_col = joined
-                    .btree()
-                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
-
-                let first_is_rowid = match plan.order_by[0].0.as_ref() {
-                    ast::Expr::Column { table, column, .. } => {
-                        *table == table_id && rowid_alias_col == Some(*column)
-                    }
-                    ast::Expr::RowId { table, .. } => *table == table_id,
-                    _ => false,
-                };
-                if first_is_rowid {
-                    plan.order_by.truncate(1);
-                }
             }
 
             if let Some(group_by) = &mut plan.group_by {
@@ -872,6 +895,41 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+fn first_aggregate_without_over_clause<'a>(
+    expr: &'a ast::Expr,
+    resolver: &Resolver,
+) -> Result<Option<&'a str>> {
+    let mut found = None;
+    walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
+        let (name, args_count, filter_over) = match e {
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => (name, args.len(), filter_over),
+            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+            _ => return Ok(WalkControl::Continue),
+        };
+        if found.is_some() || filter_over.over_clause.is_some() {
+            return Ok(WalkControl::Continue);
+        }
+        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
+        {
+            Ok(Some(crate::function::Func::Agg(_))) => true,
+            _ => resolver
+                .symbol_table
+                .resolve_function(name.as_str(), args_count)
+                .is_some_and(|f| f.func.is_aggregate()),
+        };
+        if is_aggregate {
+            found = Some(name.as_str());
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 /// Validate that all expressions in the plan return the correct number of values;
