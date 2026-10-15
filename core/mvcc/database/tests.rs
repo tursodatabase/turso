@@ -2636,19 +2636,8 @@ fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
         ])));
 
         let mut commit_stmt = conn_a.prepare("COMMIT").unwrap();
-        let mut yielded = false;
-        for _ in 0..100 {
-            match commit_stmt.step().unwrap() {
-                StepResult::Yield => {
-                    yielded = true;
-                    break;
-                }
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
         assert!(
-            yielded,
+            step_until_yield(&mut commit_stmt, 100),
             "tx_a's COMMIT should yield at CommitYieldPoint::CommitValidation"
         );
 
@@ -3670,36 +3659,35 @@ fn test_header_only_mutation_is_replayed_and_checkpointed() {
     }
 }
 
-/// What this test checks: Header PRAGMAs in MVCC require an exclusive transaction and reject
-/// BEGIN CONCURRENT writes.
-/// Why this matters: Header updates have no row-level conflict keys, so they must not run under
-/// optimistic concurrent write mode.
+/// Header PRAGMAs inside BEGIN CONCURRENT record their change on the
+/// transaction's header copy; the real header write happens at commit, where
+/// the change is re-applied on top of the then-current global header. An
+/// unrelated commit in between does not invalidate the transaction.
 #[test]
-fn test_mvcc_header_updates_require_exclusive_transaction() {
+fn test_mvcc_header_updates_work_in_concurrent_transactions() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
-    let err = conn.execute("PRAGMA user_version = 42").unwrap_err();
-    assert!(
-        err.to_string().contains("exclusive transaction"),
-        "expected exclusive-transaction error, got: {err:?}"
-    );
-    conn.execute("ROLLBACK").unwrap();
+    conn.execute("PRAGMA user_version = 42").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
 
-    conn.execute("BEGIN").unwrap();
-    conn.execute("PRAGMA user_version = 7").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let other = db.connect();
+    other.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.execute("PRAGMA user_version = 43").unwrap();
     conn.execute("COMMIT").unwrap();
 
     let rows = get_rows(&conn, "PRAGMA user_version");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+    assert_eq!(rows[0][0].as_int().unwrap(), 43);
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
 }
-
-/// What this test checks: Header PRAGMAs in MVCC succeed in autocommit mode, where the VM
-/// opens an implicit single-statement write transaction.
-/// Why this matters: The exclusive-transaction gate must block BEGIN CONCURRENT, but not reject
-/// valid autocommit writes that are internally upgraded to exclusive write mode.
 #[test]
 fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -7543,6 +7531,10 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        snapshot_header: DatabaseHeader::default(),
+        used_tables: Mutex::new(HashSet::default()),
+        ddl_target_tables: Mutex::new(Vec::new()),
+        ddl_lock_names: Mutex::new(Vec::new()),
     }
 }
 
@@ -9053,6 +9045,20 @@ fn test_commit_without_tx() {
     }
 }
 
+/// Drive a statement until an injected yield point fires. Returns true if
+/// it yielded, false if it ran to Done (or the step budget) without
+/// yielding.
+fn step_until_yield(stmt: &mut crate::Statement, max_steps: usize) -> bool {
+    for _ in 0..max_steps {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield => return true,
+            crate::StepResult::Done => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
@@ -9093,53 +9099,51 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
         CommitYieldPoint::LogRecordPrepared.point(),
     ])));
     let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
-    let mut yielded = false;
-    for _ in 0..200 {
-        match create_idx.step().unwrap() {
-            StepResult::Yield => {
-                yielded = true;
-                break;
-            }
-            StepResult::Done => break,
-            _ => {}
-        }
-    }
     assert!(
-        yielded,
+        step_until_yield(&mut create_idx, 200),
         "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
     );
 
     // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
     // but the global schema view still doesn't know about the new index `i`.
-    // The INSERT compiles its bytecode against the stale schema and emits
-    // IdxInsert ops only for the indexes the stale schema knows about.
+    // The INSERT compiles its bytecode against the stale schema and would
+    // emit IdxInsert ops only for the indexes the stale schema knows about.
+    // The DDL table block is held until T1's commit fully finalizes, so the
+    // dangerous write is refused outright instead of being allowed and
+    // aborted at T2's commit (which the old global cookie check did).
     conn_b.execute("BEGIN CONCURRENT").unwrap();
-    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let insert_result = conn_b.execute("INSERT INTO t VALUES (2, 20)");
+    assert!(
+        matches!(insert_result, Err(LimboError::TableLocked)),
+        "a write to the table must be blocked while the index build commit \
+         is still in flight, got {insert_result:?}"
+    );
 
-    // T1 finishes finalizing the CREATE INDEX. After this point, the global
-    // header carries the new schema_cookie and `last_committed_schema_change_ts`
-    // is bumped to T1's `end_ts`.
+    // T1 finishes finalizing the CREATE INDEX, releasing its DDL locks.
     create_idx.run_ignore_rows().unwrap();
     drop(create_idx);
 
-    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
-    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
-    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
-    // though its writes never touched the new index.
+    // The retried INSERT runs (compiled against the published schema), but
+    // the transaction used a table whose schema changed after it began, so
+    // scoped validation aborts it at COMMIT. Postgres would have blocked the
+    // INSERT and then committed; aborting where postgres serializes is the
+    // accepted trade, and issue #6338's transaction restart makes it
+    // transparent.
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let commit_err = conn_b
+        .execute("COMMIT")
+        .expect_err("transaction used t, whose schema changed after it began");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
 
-    let commit_result = conn_b.execute("COMMIT");
+    // A fresh transaction sees the new index and commits cleanly.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn_b.execute("COMMIT").unwrap();
 
-    assert!(
-        matches!(
-            commit_result,
-            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
-        ),
-        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
-         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
-         schema (missing index `i`), so its INSERT silently skipped writing \
-         to that index. Allowing the commit leaves `i` permanently short the \
-         row tx_b wrote."
-    );
+    let rows = get_rows(&conn_a, "SELECT c FROM t WHERE c = 20");
+    assert_eq!(rows.len(), 1);
+    let rows = get_rows(&conn_a, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
 }
 
 #[test]
@@ -9271,6 +9275,10 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        snapshot_header: DatabaseHeader::default(),
+        used_tables: Mutex::new(HashSet::default()),
+        ddl_target_tables: Mutex::new(Vec::new()),
+        ddl_lock_names: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -19406,7 +19414,7 @@ fn test_read_lock_leak_deferred_then_concurrent() {
 }
 
 #[test]
-fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
+fn test_ddl_busy_while_writer_in_flight_then_succeeds() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19415,24 +19423,25 @@ fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
     setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
     setup.close().unwrap();
 
-    let ddl = db.connect();
     let writer = db.connect();
     writer.execute("BEGIN CONCURRENT").unwrap();
     writer
         .execute("UPDATE t SET c = 'writer' WHERE id = 1")
         .unwrap();
 
+    // An ALTER must observe a stable table: with an uncommitted writer on t
+    // it returns Busy (postgres queues behind the writer instead). The
+    // writer is left untouched and commits.
+    let ddl = db.connect();
+    let err = ddl
+        .execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .expect_err("DDL must not run under an in-flight writer of the table");
+    assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+
+    writer.execute("COMMIT").unwrap();
+
     ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
         .unwrap();
-
-    let commit_err = writer
-        .execute("COMMIT")
-        .expect_err("writer snapshot predates committed schema change");
-    assert!(matches!(commit_err, LimboError::SchemaConflict));
-    assert!(
-        writer.get_auto_commit(),
-        "SchemaConflict should roll back the stale writer transaction"
-    );
 
     let verify = db.connect();
     let columns = get_rows(&verify, "PRAGMA table_info(t)");
@@ -19440,12 +19449,11 @@ fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
     assert_eq!(column_names, vec!["id", "c", "extra"]);
     let rows = get_rows(&verify, "SELECT id, c, extra FROM t");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[0][1].to_string(), "writer");
     assert!(matches!(&rows[0][2], crate::types::Value::Null));
 }
-
 #[test]
-fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
+fn test_create_index_busy_while_writer_in_flight_then_succeeds() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19459,18 +19467,20 @@ fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
     writer.execute("BEGIN CONCURRENT").unwrap();
     writer.execute("INSERT INTO t VALUES(3, 'c', 30)").unwrap();
 
+    // The index build would miss the writer's uncommitted row: Busy until
+    // the writer finishes (postgres queues behind it instead).
     let ddl = db.connect();
-    ddl.execute("CREATE INDEX idx_t_c ON t(c)").unwrap();
+    let err = ddl
+        .execute("CREATE INDEX idx_t_c ON t(c)")
+        .expect_err("index build must not run under an in-flight writer");
+    assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
 
-    let commit_err = writer
-        .execute("COMMIT")
-        .expect_err("writer snapshot predates committed schema change");
-    assert!(matches!(commit_err, LimboError::SchemaConflict));
-    assert!(writer.get_auto_commit());
+    writer.execute("COMMIT").unwrap();
+    ddl.execute("CREATE INDEX idx_t_c ON t(c)").unwrap();
 
     let verify = db.connect();
     let rows = get_rows(&verify, "SELECT id, c, keep FROM t ORDER BY id");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     let indexes = get_rows(
         &verify,
         "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_c'",
@@ -19478,6 +19488,1186 @@ fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
     assert_eq!(indexes.len(), 1);
     let rows = get_rows(&verify, "PRAGMA integrity_check");
     assert_eq!(rows[0][0].to_string(), "ok");
+}
+#[test]
+fn test_ddl_inside_concurrent_tx_upgrades_and_commits() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES(1, 'x')").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id, c FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let rows = get_rows(&verify, "SELECT id, c FROM u");
+    assert_eq!(rows.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_ddl_succeeds_after_unrelated_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+
+    // A commit elsewhere does not invalidate the DDL: the DDL locks protect
+    // its objects, nothing requires a globally quiescent database.
+    let other = db.connect();
+    other.execute("INSERT INTO t VALUES(3, 'c')").unwrap();
+
+    writer
+        .execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    writer.execute("INSERT INTO u VALUES (1)").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    let rows = get_rows(&verify, "SELECT id FROM u");
+    assert_eq!(rows.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+#[test]
+fn test_ddl_inside_concurrent_tx_rollback_undoes_ddl() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES(1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let verify = db.connect();
+    let tables = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'u'",
+    );
+    assert_eq!(tables.len(), 0);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&verify, "SELECT id, c FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_unrelated_writer_survives_ddl_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE t SET c = 'writer' WHERE id = 1")
+        .unwrap();
+
+    // Another transaction creates an unrelated table and commits first.
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    // The writer never used `u`, so it must not abort (postgres does not
+    // even notice; the old global check aborted every overlapping writer).
+    writer.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT c FROM t WHERE id = 1");
+    assert_eq!(rows[0][0].to_string(), "writer");
+    let tables = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'u'",
+    );
+    assert_eq!(tables.len(), 1);
+}
+
+#[test]
+fn test_writer_of_changed_table_aborts_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup
+        .execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    // The writer transaction uses `t` (reads it) before the DDL, writes only
+    // `other`, then the DDL on `t` commits. Scoped validation aborts the
+    // writer because a table it used changed under it. Postgres would have
+    // blocked the DDL instead; failing where postgres serializes is the
+    // accepted trade.
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO other VALUES (1)").unwrap();
+    let rows = get_rows(&writer, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+
+    let ddl = db.connect();
+    ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .unwrap();
+
+    let commit_err = writer
+        .execute("COMMIT")
+        .expect_err("writer used a table whose schema changed after it began");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
+    assert!(writer.get_auto_commit());
+}
+// --- DDL concurrency matrix. Validated against live PostgreSQL 18; where
+// postgres blocks (queues) we return Busy for the caller to retry, and
+// readers are never blocked at all (postgres's ACCESS EXCLUSIVE blocks even
+// SELECTs). See the per-test comments for the postgres behavior.
+
+#[test]
+fn test_matrix_multi_ddl_in_one_concurrent_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO a VALUES (1)").unwrap();
+    conn.execute("ALTER TABLE a ADD COLUMN label TEXT").unwrap();
+    conn.execute("CREATE INDEX idx_a ON a(id)").unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("DROP TABLE b").unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'x')").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id, label FROM a");
+    assert_eq!(rows.len(), 1);
+    let rows = get_rows(&verify, "SELECT v FROM b");
+    assert_eq!(rows[0][0].to_string(), "x");
+    let indexes = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_a'",
+    );
+    assert_eq!(indexes.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_rename_and_use_new_name_in_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+    conn.execute("INSERT INTO u VALUES (7)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id FROM u");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_matrix_ddl_vs_ddl_same_table_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let a = db.connect();
+    a.execute("BEGIN CONCURRENT").unwrap();
+    a.execute("ALTER TABLE t ADD COLUMN x1 INTEGER").unwrap();
+
+    // Postgres blocks each of these behind A's lock and proceeds after A
+    // commits; we return Busy and the retry succeeds.
+    let b = db.connect();
+    for stmt in [
+        "ALTER TABLE t ADD COLUMN x2 INTEGER",
+        "DROP TABLE t",
+        "CREATE INDEX i1 ON t(c)",
+    ] {
+        let err = b.execute(stmt).expect_err("same-table DDL must contend");
+        assert!(
+            matches!(err, LimboError::TableLocked),
+            "{stmt}: got {err:?}"
+        );
+    }
+
+    a.execute("COMMIT").unwrap();
+    b.execute("ALTER TABLE t ADD COLUMN x2 INTEGER").unwrap();
+
+    let verify = db.connect();
+    let columns = get_rows(&verify, "PRAGMA table_info(t)");
+    let names: Vec<String> = columns.iter().map(|row| row[1].to_string()).collect();
+    assert_eq!(names, vec!["id", "c", "x1", "x2"]);
+}
+
+#[test]
+fn test_matrix_create_vs_create_same_name() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let a = db.connect();
+    let b = db.connect();
+
+    // Postgres blocks the second creator on the catalog unique index; after
+    // a rollback of the first it succeeds, after a commit it fails with
+    // "already exists". The name lock gives the same outcomes via Busy.
+    a.execute("BEGIN CONCURRENT").unwrap();
+    a.execute("CREATE TABLE newt(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = b
+        .execute("CREATE TABLE newt(id INTEGER PRIMARY KEY)")
+        .expect_err("pending CREATE must hold the name");
+    assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+
+    a.execute("ROLLBACK").unwrap();
+    b.execute("CREATE TABLE newt(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let err = b
+        .execute("CREATE TABLE newt(id INTEGER PRIMARY KEY)")
+        .expect_err("table exists now");
+    assert!(err.to_string().contains("already exists"), "got {err:?}");
+}
+
+#[test]
+fn test_matrix_pending_drop_blocks_recreate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let a = db.connect();
+    a.execute("BEGIN CONCURRENT").unwrap();
+    a.execute("DROP TABLE t").unwrap();
+
+    // The uncommitted drop is invisible to B, so name resolution fails at
+    // prepare time with "already exists" — the same outcome live postgres
+    // produces for this interleaving. After the drop commits, the recreate
+    // succeeds.
+    let b = db.connect();
+    let err = b
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .expect_err("t still visible while the drop is uncommitted");
+    assert!(err.to_string().contains("already exists"), "got {err:?}");
+
+    a.execute("COMMIT").unwrap();
+    b.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+}
+
+#[test]
+fn test_matrix_name_lock_lifecycle_churn() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    // Create/drop/recreate the same name across transactions: locks must be
+    // fully released at every commit and rollback, never leaking an entry
+    // that would make the name permanently Busy.
+    let conn = db.connect();
+    for _ in 0..3 {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("CREATE TABLE churn(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("DROP TABLE churn").unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("CREATE TABLE churn(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // After the rollback another connection can take the name immediately.
+    let other = db.connect();
+    other
+        .execute("CREATE TABLE churn(id INTEGER PRIMARY KEY)")
+        .unwrap();
+}
+
+#[test]
+fn test_matrix_rename_abba_busy_without_deadlock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE a1(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE b1(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let t1 = db.connect();
+    t1.execute("BEGIN CONCURRENT").unwrap();
+    t1.execute("ALTER TABLE a1 RENAME TO c1").unwrap();
+
+    // T1's rename is uncommitted, so T2 still sees a1 and fails at prepare
+    // time with "already exists" — live postgres resolves the ABBA shape the
+    // same way. Nothing waits, so no deadlock.
+    let t2 = db.connect();
+    let err = t2
+        .execute("ALTER TABLE b1 RENAME TO a1")
+        .expect_err("a1 is still visible while T1's rename is uncommitted");
+    assert!(err.to_string().contains("already"), "got {err:?}");
+
+    // TODO: the rename sweep rewrites every sqlite_schema row even when the
+    // row is unchanged (the sqlite_rename_table UPDATE), so any concurrent
+    // DDL write-write conflicts with an in-flight rename. Eliding the no-op
+    // row writes would let disjoint renames run concurrently like postgres.
+    let err = t2
+        .execute("ALTER TABLE b1 RENAME TO d1")
+        .expect_err("concurrent rename currently conflicts on the schema sweep");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "got {err:?}");
+
+    t1.execute("COMMIT").unwrap();
+    t2.execute("ALTER TABLE b1 RENAME TO d1").unwrap();
+    let verify = db.connect();
+    let tables = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+    );
+    let names: Vec<String> = tables.iter().map(|r| r[0].to_string()).collect();
+    assert!(names.contains(&"c1".to_string()) && names.contains(&"d1".to_string()));
+}
+
+#[test]
+fn test_matrix_index_and_table_names_share_namespace() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let a = db.connect();
+    a.execute("BEGIN CONCURRENT").unwrap();
+    a.execute("CREATE INDEX iname ON t(c)").unwrap();
+
+    // Postgres blocks this on pg_class's unique name index and fails it
+    // after the commit; the shared-namespace name lock returns Busy.
+    let b = db.connect();
+    let err = b
+        .execute("CREATE TABLE iname(id INTEGER PRIMARY KEY)")
+        .expect_err("index and table names share one namespace");
+    assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+    a.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn test_matrix_reader_never_blocked_by_ddl() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    // Postgres blocks the ALTER behind the open reader (and new readers
+    // behind the ALTER). Our readers are snapshot-isolated: neither side
+    // blocks, and the reader keeps its pre-DDL view.
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&reader, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+
+    let ddl = db.connect();
+    ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .unwrap();
+
+    let rows = get_rows(&reader, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn test_matrix_concurrent_ddl_on_different_tables() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE a(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE b(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let cookie_before = {
+        let conn = db.connect();
+        get_rows(&conn, "PRAGMA schema_version")[0][0]
+            .as_int()
+            .unwrap()
+    };
+
+    // Both transactions hold DDL locks on disjoint names: fully concurrent,
+    // like postgres. The deferred cookie bump assigns each commit its own
+    // increment, keeping the cookie strictly monotonic.
+    let t1 = db.connect();
+    let t2 = db.connect();
+    t1.execute("BEGIN CONCURRENT").unwrap();
+    t1.execute("CREATE TABLE aa(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    t2.execute("BEGIN CONCURRENT").unwrap();
+    t2.execute("ALTER TABLE b ADD COLUMN v TEXT").unwrap();
+    t1.execute("INSERT INTO aa VALUES (1)").unwrap();
+    t1.execute("COMMIT").unwrap();
+    t2.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id FROM aa");
+    assert_eq!(rows.len(), 1);
+    let columns = get_rows(&verify, "PRAGMA table_info(b)");
+    assert_eq!(columns.len(), 2);
+    let cookie_after = get_rows(&verify, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        cookie_after >= cookie_before + 2,
+        "each DDL commit must advance the schema cookie: before={cookie_before} after={cookie_after}"
+    );
+}
+
+#[test]
+fn test_matrix_ddl_in_concurrent_tx_persists_across_reopen() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'kept')").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT c FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "kept");
+}
+
+#[test]
+fn test_matrix_autoincrement_table_in_concurrent_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("CREATE TABLE seq_t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // Inserting into the AUTOINCREMENT table within the same concurrent
+    // transaction that created it conflicts with the sequence machinery's
+    // inner transaction (issue #9505 / #9509); exercise the committed table
+    // instead.
+    conn.execute("INSERT INTO seq_t(v) VALUES ('a')").unwrap();
+    conn.execute("INSERT INTO seq_t(v) VALUES ('b')").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id, v FROM seq_t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_matrix_ddl_refused_when_table_changed_since_snapshot() {
+    // Deterministic regression for the fuzzer-found corruption: a DDL that
+    // rewrites or scans the whole table (drop column, index build) under a
+    // snapshot that predates a committed write would silently miss that row.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    // Pin the snapshot before the other connection's write commits.
+    let rows = get_rows(&ddl, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let err = ddl
+        .execute("ALTER TABLE t DROP COLUMN c")
+        .expect_err("rewrite under a snapshot missing a committed row must be refused");
+    assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+    ddl.execute("ROLLBACK").unwrap();
+
+    // A fresh transaction sees the row and the rewrite succeeds.
+    ddl.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_exclusive_upgrade_blocked_by_ddl_locks() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE INDEX i ON t(c)").unwrap();
+
+    // A deferred BEGIN's first write upgrades to the exclusive transaction,
+    // which is mutually exclusive with in-flight DDL locks.
+    let writer = db.connect();
+    writer.execute("BEGIN").unwrap();
+    let err = writer
+        .execute("INSERT INTO other VALUES (1)")
+        .expect_err("exclusive upgrade must not overtake in-flight DDL locks");
+    assert!(matches!(err, LimboError::Busy), "got {err:?}");
+
+    ddl.execute("COMMIT").unwrap();
+    writer.execute("INSERT INTO other VALUES (1)").unwrap();
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn test_matrix_name_only_ddl_aborts_overlapping_writer() {
+    // Views carry no target tables, so their commits fall back to the global
+    // schema-change marker: every overlapping writer aborts, like the old
+    // whole-database check. Registering targets for name-only DDL would
+    // scope this.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("CREATE VIEW v1 AS SELECT id FROM t").unwrap();
+
+    let err = writer
+        .execute("COMMIT")
+        .expect_err("name-only DDL aborts every overlapping writer via the global marker");
+    assert!(matches!(err, LimboError::SchemaConflict), "got {err:?}");
+}
+
+#[test]
+fn test_matrix_overlapping_header_commits_do_not_lose_updates() {
+    // Two header-dirty commits overlapping in the commit pipeline: the first
+    // (header-only, so no schema rows that would hand the second a commit
+    // dependency) is suspended right after reserving its commit timestamp,
+    // the second runs to completion, then the first finishes. Both header
+    // changes must survive, and the schema cookie must advance for the DDL.
+    // Two cookie-bumping DDLs cannot be overlapped this way: the second's
+    // schema scan takes a commit dependency on the first's Preparing commit,
+    // which serializes them; the cookie reservation counter covers the
+    // orderings dependencies do not (group-commit reordering).
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let cookie_before = get_rows(&conn_a, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("PRAGMA user_version = 42").unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::CommitValidation.point(),
+    ])));
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        step_until_yield(&mut commit_a, 100),
+        "COMMIT should yield at CommitValidation"
+    );
+
+    // conn_b's DDL commits fully while conn_a's commit is parked.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b
+        .execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    commit_a.run_collect_rows().unwrap();
+    drop(commit_a);
+    conn_a.set_yield_injector(None);
+
+    // conn_a's user_version must not be lost to conn_b's whole-header
+    // publish, and conn_b's cookie bump must not be reverted by conn_a's.
+    let verify = db.connect();
+    let rows = get_rows(&verify, "PRAGMA user_version");
+    assert_eq!(rows[0][0].as_int().unwrap(), 42);
+    let cookie_after = get_rows(&verify, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        cookie_after > cookie_before,
+        "conn_b's DDL cookie bump must survive: before={cookie_before} after={cookie_after}"
+    );
+    let rows = get_rows(&verify, "SELECT count(*) FROM u");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
+#[test]
+fn test_matrix_concurrent_autoincrement_creates_serialize_on_sqlite_sequence() {
+    // Both creators see sqlite_sequence as absent at prepare time; without a
+    // lock on the name, both would commit a definition for it, bricking the
+    // database with a duplicate schema row ("table sqlite_sequence already
+    // exists" on every later statement, reopen fails).
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let a = db.connect();
+        a.execute("BEGIN CONCURRENT").unwrap();
+        a.execute("CREATE TABLE sa(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let b = db.connect();
+        let err = b
+            .execute("CREATE TABLE sb(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .expect_err("second AUTOINCREMENT create must contend on sqlite_sequence");
+        assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+
+        a.execute("COMMIT").unwrap();
+        b.execute("CREATE TABLE sb(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        b.execute("INSERT INTO sa(v) VALUES ('a')").unwrap();
+        b.execute("INSERT INTO sb(v) VALUES ('b')").unwrap();
+        let rows = get_rows(
+            &b,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_sequence'",
+        );
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        a.close().unwrap();
+        b.close().unwrap();
+    }
+    db.restart();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT v FROM sa");
+    assert_eq!(rows.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_savepoint_rolled_back_ddl_does_not_abort_others() {
+    // A DDL undone by ROLLBACK TO must not publish its target tables at
+    // commit: no schema change committed, so a transaction that used the
+    // table has nothing to conflict with.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT sp").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .unwrap();
+    ddl.execute("ROLLBACK TO sp").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    reader.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    reader
+        .execute("COMMIT")
+        .expect("no schema change committed, so the overlapping writer must not abort");
+
+    let verify = db.connect();
+    let columns = get_rows(&verify, "PRAGMA table_info(t)");
+    let names: Vec<String> = columns.iter().map(|row| row[1].to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["id", "c"],
+        "the rolled-back column must not exist"
+    );
+}
+
+#[test]
+fn test_matrix_nested_savepoint_inner_ddl_rollback_keeps_outer_ddl() {
+    // Two DDLs at different savepoint depths; only the inner one is rolled
+    // back. The outer DDL must commit AND publish (a transaction that used
+    // its table aborts), while the inner one must do neither: the savepoint
+    // watermarks have to restore to the inner savepoint's mark, not further.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t2(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader_t1 = db.connect();
+    reader_t1.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&reader_t1, "SELECT count(*) FROM t1");
+    let reader_t2 = db.connect();
+    reader_t2.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&reader_t2, "SELECT count(*) FROM t2");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT s1").unwrap();
+    ddl.execute("ALTER TABLE t1 ADD COLUMN a INTEGER").unwrap();
+    ddl.execute("SAVEPOINT s2").unwrap();
+    ddl.execute("ALTER TABLE t2 ADD COLUMN b INTEGER").unwrap();
+    ddl.execute("ROLLBACK TO s2").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    reader_t1.execute("INSERT INTO t1(id) VALUES (1)").unwrap();
+    let err = reader_t1
+        .execute("COMMIT")
+        .expect_err("t1's schema change committed, so its user must abort");
+    assert!(matches!(err, LimboError::SchemaConflict), "got {err:?}");
+
+    reader_t2.execute("INSERT INTO t2(id) VALUES (1)").unwrap();
+    reader_t2
+        .execute("COMMIT")
+        .expect("t2's schema change rolled back, so its user must not abort");
+
+    let verify = db.connect();
+    let names: Vec<String> = get_rows(&verify, "PRAGMA table_info(t1)")
+        .iter()
+        .map(|row| row[1].to_string())
+        .collect();
+    assert_eq!(names, vec!["id", "a"]);
+    let names: Vec<String> = get_rows(&verify, "PRAGMA table_info(t2)")
+        .iter()
+        .map(|row| row[1].to_string())
+        .collect();
+    assert_eq!(names, vec!["id"], "the rolled-back column must not exist");
+}
+
+#[test]
+fn test_matrix_ddl_after_savepoint_rollback_publishes() {
+    // Rollback truncates the recorded targets; a NEW DDL on the same table
+    // after the rollback must re-record and publish them (the dedup in
+    // record_ddl_targets must not treat the truncated entry as present).
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&reader, "SELECT count(*) FROM t");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT s").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN a INTEGER").unwrap();
+    ddl.execute("ROLLBACK TO s").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    reader.execute("INSERT INTO t(id) VALUES (1)").unwrap();
+    let err = reader
+        .execute("COMMIT")
+        .expect_err("the post-rollback schema change committed, so t's user must abort");
+    assert!(matches!(err, LimboError::SchemaConflict), "got {err:?}");
+
+    let verify = db.connect();
+    let names: Vec<String> = get_rows(&verify, "PRAGMA table_info(t)")
+        .iter()
+        .map(|row| row[1].to_string())
+        .collect();
+    assert_eq!(names, vec!["id", "b"]);
+}
+
+#[test]
+fn test_matrix_released_savepoint_ddl_undone_by_outer_rollback() {
+    // RELEASE merges the inner savepoint's undo records into its parent;
+    // rolling back the parent must still undo the released DDL and must not
+    // publish anything at commit.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&reader, "SELECT count(*) FROM t");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT s1").unwrap();
+    ddl.execute("SAVEPOINT s2").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN a INTEGER").unwrap();
+    ddl.execute("RELEASE s2").unwrap();
+    ddl.execute("ROLLBACK TO s1").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    reader.execute("INSERT INTO t(id) VALUES (1)").unwrap();
+    reader
+        .execute("COMMIT")
+        .expect("no schema change committed, so the overlapping writer must not abort");
+
+    let verify = db.connect();
+    let names: Vec<String> = get_rows(&verify, "PRAGMA table_info(t)")
+        .iter()
+        .map(|row| row[1].to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["id"],
+        "the released-then-rolled-back column must not exist"
+    );
+}
+
+#[test]
+fn test_matrix_nested_savepoint_created_tables_partial_rollback() {
+    // Tables created at two savepoint depths; the inner rollback must make
+    // its table vanish for everyone (including the creating transaction:
+    // prepare says "no such table") and drop its slots, while the outer
+    // table commits, persists across reopen, and publishes.
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let ddl = db.connect();
+        ddl.execute("BEGIN CONCURRENT").unwrap();
+        ddl.execute("SAVEPOINT s1").unwrap();
+        ddl.execute("CREATE TABLE x(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        ddl.execute("SAVEPOINT s2").unwrap();
+        ddl.execute("CREATE TABLE y(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        ddl.execute("ROLLBACK TO s2").unwrap();
+        let err = ddl
+            .execute("INSERT INTO y VALUES (1)")
+            .expect_err("the rolled-back table must not resolve, even for its creator");
+        assert!(err.to_string().contains("no such table"), "got {err:?}");
+        ddl.execute("INSERT INTO x VALUES (1)").unwrap();
+        ddl.execute("COMMIT").unwrap();
+
+        let verify = db.connect();
+        let rows = get_rows(&verify, "SELECT count(*) FROM x");
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        let rows = get_rows(
+            &verify,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'y'",
+        );
+        assert_eq!(rows[0][0].as_int().unwrap(), 0);
+        ddl.close().unwrap();
+        verify.close().unwrap();
+    }
+    db.restart();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT count(*) FROM x");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_rolled_back_create_does_not_poison_name_for_others() {
+    // A CREATE undone by ROLLBACK TO must not publish its name timestamp:
+    // another transaction whose snapshot predates this commit must still be
+    // able to create the same name (a published entry would refuse it with
+    // TableLocked as a supposed stale-snapshot recreate).
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let other = db.connect();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    // Pin a snapshot that predates the rolled-back CREATE's commit.
+    let _ = get_rows(&other, "SELECT count(*) FROM sqlite_schema");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT s").unwrap();
+    ddl.execute("CREATE TABLE n(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    ddl.execute("ROLLBACK TO s").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    other
+        .execute("CREATE TABLE n(id INTEGER PRIMARY KEY)")
+        .expect("the name was never committed, so creating it must not be refused");
+    other.execute("INSERT INTO n VALUES (1)").unwrap();
+    other.execute("COMMIT").unwrap();
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT count(*) FROM n");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+}
+
+#[test]
+fn test_matrix_repeated_rollback_to_same_savepoint_with_ddl() {
+    // ROLLBACK TO re-pushes the target savepoint with its ORIGINAL
+    // watermarks; a second DDL + rollback cycle must truncate back to the
+    // same marks, leaving nothing to publish.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&reader, "SELECT count(*) FROM t");
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("SAVEPOINT s").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN a INTEGER").unwrap();
+    ddl.execute("ROLLBACK TO s").unwrap();
+    ddl.execute("ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+    ddl.execute("ROLLBACK TO s").unwrap();
+    ddl.execute("COMMIT").unwrap();
+
+    reader.execute("INSERT INTO t(id) VALUES (1)").unwrap();
+    reader
+        .execute("COMMIT")
+        .expect("both schema changes rolled back, so the overlapping writer must not abort");
+
+    let verify = db.connect();
+    let names: Vec<String> = get_rows(&verify, "PRAGMA table_info(t)")
+        .iter()
+        .map(|row| row[1].to_string())
+        .collect();
+    assert_eq!(names, vec!["id"]);
+}
+
+#[test]
+fn test_matrix_overlapping_header_commits_survive_reopen() {
+    // Same overlap as test_matrix_overlapping_header_commits_do_not_lose_updates,
+    // but parked after the commit timestamp is assigned and the log record is
+    // prepared: the pragma commit (older end_ts) then reaches the log AFTER
+    // the DDL commit (newer end_ts). Recovery applies header entries
+    // last-record-wins, so the log writer must have merged the pragma
+    // record's header onto the DDL's; otherwise the reopen loses the DDL's
+    // cookie bump (and in the reverse interleaving, the pragma value).
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let cookie_running;
+    {
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("PRAGMA user_version = 42").unwrap();
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::LogRecordPrepared.point(),
+        ])));
+        let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+        assert!(
+            step_until_yield(&mut commit_a, 100),
+            "COMMIT should yield at LogRecordPrepared"
+        );
+
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b
+            .execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn_b.execute("COMMIT").unwrap();
+
+        commit_a.run_collect_rows().unwrap();
+        drop(commit_a);
+        conn_a.set_yield_injector(None);
+
+        cookie_running = get_rows(&conn_a, "PRAGMA schema_version")[0][0]
+            .as_int()
+            .unwrap();
+        conn_a.close().unwrap();
+        conn_b.close().unwrap();
+    }
+    db.restart();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "PRAGMA user_version");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        42,
+        "pragma value lost across reopen"
+    );
+    let rows = get_rows(&verify, "SELECT count(*) FROM u");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+    let cookie_reopened = get_rows(&verify, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        cookie_reopened >= cookie_running,
+        "schema cookie regressed across reopen: running={cookie_running} reopened={cookie_reopened}"
+    );
+}
+
+#[test]
+fn test_matrix_stale_snapshot_create_same_name_refused() {
+    // The DDL name locks only exclude in-flight holders. A transaction whose
+    // snapshot predates a committed CREATE still resolves the name as free at
+    // prepare time (its connection schema is pinned inside the open
+    // transaction); without the committed-name timestamp check it would
+    // commit a second schema row for the same name, making the database
+    // unopenable.
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let stale = db.connect();
+        stale.execute("BEGIN CONCURRENT").unwrap();
+        // Pin the snapshot before the other connection's CREATE commits.
+        let _ = get_rows(&stale, "SELECT count(*) FROM sqlite_schema");
+
+        let creator = db.connect();
+        creator
+            .execute("CREATE TABLE b(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let err = stale
+            .execute("CREATE TABLE b(id INTEGER PRIMARY KEY)")
+            .expect_err("a stale snapshot must not recreate a committed name");
+        assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+        stale.execute("COMMIT").unwrap();
+
+        let rows = get_rows(
+            &creator,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'b'",
+        );
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        stale.close().unwrap();
+        creator.close().unwrap();
+    }
+    db.restart();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_stale_snapshot_autoincrement_create_refused() {
+    // Same stale-snapshot hole through the inline sqlite_sequence creation:
+    // the second creator targets a different table name, but both would
+    // define sqlite_sequence.
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let stale = db.connect();
+        stale.execute("BEGIN CONCURRENT").unwrap();
+        // Pin the snapshot before the other connection's CREATE commits.
+        let _ = get_rows(&stale, "SELECT count(*) FROM sqlite_schema");
+
+        let creator = db.connect();
+        creator
+            .execute("CREATE TABLE sa(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let err = stale
+            .execute("CREATE TABLE sb(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .expect_err("a stale snapshot must not recreate sqlite_sequence");
+        assert!(matches!(err, LimboError::TableLocked), "got {err:?}");
+        stale.execute("COMMIT").unwrap();
+
+        // A fresh statement sees sqlite_sequence and succeeds.
+        stale
+            .execute("CREATE TABLE sb(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+        let rows = get_rows(
+            &creator,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_sequence'",
+        );
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        stale.close().unwrap();
+        creator.close().unwrap();
+    }
+    db.restart();
+    let verify = db.connect();
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_matrix_failed_ddl_statement_does_not_abort_others() {
+    // A DDL statement that fails mid-execution rolls back through the
+    // statement savepoint, which must undo its recorded target tables: the
+    // transaction's later COMMIT (of nothing) must not publish a schema
+    // change for t and abort every transaction that used it.
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, 7), (2, 7)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE UNIQUE INDEX i ON t(a)")
+        .expect_err("duplicate values must fail the unique index build");
+    ddl.execute("COMMIT").unwrap();
+
+    reader.execute("INSERT INTO t VALUES (3, 8)").unwrap();
+    reader
+        .execute("COMMIT")
+        .expect("the failed index build committed nothing, so the reader must not abort");
 }
 
 #[test]
@@ -20113,7 +21303,6 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
     use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{CheckpointResult, File, Result, IO};
     use std::time::Duration;
 
@@ -20143,13 +21332,6 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         ) -> Result<()> {
             self.inner
                 .serialize_row_version(log_record, row_version, portable_extension)
-        }
-        fn serialize_database_header(
-            &self,
-            log_record: &mut LogRecord,
-            header: &DatabaseHeader,
-        ) -> Result<()> {
-            self.inner.serialize_database_header(log_record, header)
         }
         fn log_tx(
             &self,
@@ -20326,7 +21508,6 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
     use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
     use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{CheckpointResult, File, Result, IO};
 
     #[derive(Debug)]
@@ -20364,13 +21545,6 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         ) -> Result<()> {
             self.inner
                 .serialize_row_version(log_record, row_version, portable_extension)
-        }
-        fn serialize_database_header(
-            &self,
-            log_record: &mut LogRecord,
-            header: &DatabaseHeader,
-        ) -> Result<()> {
-            self.inner.serialize_database_header(log_record, header)
         }
         fn log_tx(
             &self,
@@ -21640,19 +22814,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
         CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
     ])));
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
-    let mut yielded = false;
-    for _ in 0..200 {
-        match commit_a.step().unwrap() {
-            StepResult::Yield => {
-                yielded = true;
-                break;
-            }
-            StepResult::Done => break,
-            _ => {}
-        }
-    }
     assert!(
-        yielded,
+        step_until_yield(&mut commit_a, 200),
         "tx_a's COMMIT should yield before publishing global_header"
     );
     assert!(
@@ -22608,7 +23771,6 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
     use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::{CheckpointMode, TursoRwLock};
     use crate::{CheckpointResult, File, Result, IO};
 
@@ -22645,13 +23807,6 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         ) -> Result<()> {
             self.inner
                 .serialize_row_version(log_record, row_version, portable_extension)
-        }
-        fn serialize_database_header(
-            &self,
-            log_record: &mut LogRecord,
-            header: &DatabaseHeader,
-        ) -> Result<()> {
-            self.inner.serialize_database_header(log_record, header)
         }
         fn log_tx(
             &self,

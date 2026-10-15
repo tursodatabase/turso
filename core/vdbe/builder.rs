@@ -269,6 +269,16 @@ pub struct ProgramBuilder {
     mvcc_enabled: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
+    /// Normalized schema-object names this statement changes (tables, indexes,
+    /// views and triggers share one namespace per database). Under MVCC,
+    /// op_transaction acquires the DDL locks for them on the owning
+    /// database's store before the statement runs.
+    ddl_lock_names: Vec<(usize, String)>,
+    /// Root pages (MVCC table ids) of existing tables whose data writes must
+    /// be excluded while this DDL is in flight (index builds, drops, alters),
+    /// paired with the owning database id: a TEMP table's root must not be
+    /// resolved against the main database's store.
+    ddl_target_tables: Vec<(usize, i64)>,
     /// Set of database IDs that need write transactions (for attached databases).
     write_databases: BitSet,
     /// Set of attached database IDs that need read transactions.
@@ -724,6 +734,8 @@ impl ProgramBuilder {
             capture_data_changes_info,
             mvcc_enabled: false,
             txn_mode: TransactionMode::None,
+            ddl_lock_names: Vec::new(),
+            ddl_target_tables: Vec::new(),
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
@@ -2073,6 +2085,27 @@ impl ProgramBuilder {
         self.txn_mode = TransactionMode::Concurrent;
     }
 
+    /// Register a schema-object name this statement creates, drops or alters.
+    /// Pass the normalized name; under MVCC the statement acquires the DDL
+    /// lock for it before running.
+    pub fn ddl_lock_name(&mut self, database_id: usize, name: &str) {
+        if !self
+            .ddl_lock_names
+            .iter()
+            .any(|(db, n)| *db == database_id && n == name)
+        {
+            self.ddl_lock_names.push((database_id, name.to_string()));
+        }
+    }
+
+    /// Register an existing table (by root page / MVCC table id) whose data
+    /// writes must be excluded while this DDL is in flight.
+    pub fn ddl_target_table(&mut self, database_id: usize, root_page: i64) {
+        if !self.ddl_target_tables.contains(&(database_id, root_page)) {
+            self.ddl_target_tables.push((database_id, root_page));
+        }
+    }
+
     /// Indicates the rollback behvaiour for the halt instruction in epilogue
     pub const fn rollback(&mut self) {
         self.flags.set_rollback(true);
@@ -2408,6 +2441,8 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            ddl_lock_names: self.ddl_lock_names,
+            ddl_target_tables: self.ddl_target_tables,
         };
         Ok(prepared)
     }

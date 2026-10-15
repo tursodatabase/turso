@@ -25,11 +25,7 @@ fn discard_pending_log_write_clears_staged_pending_crc() {
     // Stage a deferred write: `Storage::log_tx` routes to
     // `log_tx_deferred_offset`, which stages the pending running CRC and does
     // NOT advance the writer offset.
-    let mut tx =
-        crate::mvcc::database::LogRecord::new(1, crate::alloc::DynAllocator::default()).unwrap();
-    storage
-        .serialize_database_header(&mut tx, &DatabaseHeader::default())
-        .unwrap();
+    let tx = crate::mvcc::database::LogRecord::for_test(1, &[], Some(DatabaseHeader::default()));
     let (completion, bytes) = storage.log_tx(tx, None).unwrap();
     io.wait_for_completion(completion).unwrap();
     assert!(bytes > 0, "deferred write should have framed bytes");

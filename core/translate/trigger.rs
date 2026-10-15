@@ -138,6 +138,12 @@ pub fn translate_create_trigger(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
 
+    // A new trigger changes what writers of the table must execute: lock the
+    // trigger name and block concurrent data writes to the table (the target
+    // is registered below once the table is resolved).
+    program.ddl_lock_name(database_id, &normalized_trigger_name);
+    program.ddl_lock_name(target_table_database_id, &normalized_table_name);
+
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
     if database_id != crate::TEMP_DB_ID {
@@ -193,6 +199,9 @@ pub fn translate_create_trigger(
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
     };
+    if let Some(btree) = table.btree() {
+        program.ddl_target_table(target_table_database_id, btree.root_page);
+    }
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
     }
@@ -505,6 +514,7 @@ pub fn translate_drop_trigger(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_trigger_name);
 
     // Check if trigger exists
     if resolver.with_schema(database_id, |s| {

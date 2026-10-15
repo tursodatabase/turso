@@ -1884,6 +1884,12 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Normalized schema-object names this statement changes; under MVCC the
+    /// DDL locks for them are acquired before the statement runs.
+    pub ddl_lock_names: Vec<(usize, String)>,
+    /// Root pages (MVCC table ids) of tables whose data writes are excluded
+    /// while this DDL is in flight.
+    pub ddl_target_tables: Vec<(usize, i64)>,
 }
 
 #[derive(Clone)]

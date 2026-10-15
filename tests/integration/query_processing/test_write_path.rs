@@ -1657,9 +1657,11 @@ pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
         .unwrap();
     // conn2: Modify schema while conn1's CONCURRENT transaction is active.
     conn2.execute("CREATE TABLE t2 (x)").unwrap();
-    // conn1: COMMIT should fail because its writer snapshot predates the schema change.
-    let commit_result = conn1.execute("COMMIT");
-    assert!(matches!(commit_result, Err(LimboError::SchemaConflict)));
+    // conn1 never used t2, so the unrelated schema change does not abort it:
+    // commit-time schema validation is scoped to the objects a transaction
+    // actually used (postgres-like). The same-table variants are covered by
+    // the DDL lock tests in core.
+    conn1.execute("COMMIT").unwrap();
 
     // conn2: Insert a row and commit (this happens AFTER conn1's original snapshot)
     conn2

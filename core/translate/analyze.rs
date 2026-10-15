@@ -167,6 +167,11 @@ pub fn translate_analyze(
 
     let stat1_table: Option<Arc<BTreeTable>> =
         resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+    if stat1_table.is_none() {
+        // ANALYZE creates sqlite_stat1 on first use: that is DDL, take the
+        // lock on its name.
+        program.ddl_lock_name(database_id, "sqlite_stat1");
+    }
     if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);

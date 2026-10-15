@@ -69,6 +69,7 @@ pub fn translate_create_materialized_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_view_name);
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -332,6 +333,7 @@ pub fn translate_create_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_view_name);
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -451,6 +453,7 @@ pub fn translate_drop_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_view_name);
 
     // Check if view exists: regular, materialized, or a broken sqlite_schema
     // row whose stored SQL failed to parse at load time. Broken views have no

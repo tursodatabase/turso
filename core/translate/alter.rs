@@ -899,6 +899,13 @@ pub fn translate_alter_table(
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
+    program.ddl_lock_name(database_id, &normalize_ident(table_name));
+    program.ddl_target_table(database_id, original_btree.root_page);
+    if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
+        // A rename holds both names, all or nothing, so crossing renames
+        // cannot deadlock (acquisition never waits) and cannot interleave.
+        program.ddl_lock_name(database_id, &normalize_ident(new_name.as_str()));
+    }
 
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {

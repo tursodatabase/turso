@@ -1175,6 +1175,7 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_tbl_name);
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
@@ -1313,6 +1314,10 @@ pub fn translate_create_table(
         && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
         }) {
+        // Two concurrent AUTOINCREMENT creates would otherwise both see
+        // sqlite_sequence as absent and both commit a definition for it,
+        // leaving a duplicate schema row that breaks every later statement.
+        program.ddl_lock_name(database_id, SQLITE_SEQUENCE_TABLE_NAME);
         let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
         let sqlite_schema_cursor_id =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
@@ -1885,6 +1890,18 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
+    let normalized_for_lock = normalize_ident(name);
+    program.ddl_lock_name(database_id, &normalized_for_lock);
+    if let Some(btree) = table.btree() {
+        program.ddl_target_table(database_id, btree.root_page);
+    }
+    // Dropping the table also drops its indexes; lock their names so a
+    // concurrent CREATE cannot reuse one while this drop is pending.
+    resolver.with_schema(database_id, |s| {
+        for index in s.get_indices(name) {
+            program.ddl_lock_name(database_id, &index.name);
+        }
+    });
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)

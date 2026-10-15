@@ -917,6 +917,8 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
+    // Sequences are schema objects: take the DDL lock on the name.
+    program.ddl_lock_name(database_id, &normalized_name);
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
         data: Box::new(AddSequenceData {
@@ -1057,6 +1059,7 @@ pub fn translate_drop_sequence(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
+    program.ddl_lock_name(database_id, &normalized_name);
     let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
     if !dropped {
         if if_exists {
