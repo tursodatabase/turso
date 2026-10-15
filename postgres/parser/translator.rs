@@ -51,11 +51,10 @@ impl PostgreSQLTranslator {
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let schema = match range_var.schemaname.to_ascii_lowercase().as_str() {
-            "pg_catalog" | "public" | "information_schema" => Some("main"),
-            "" if is_catalog_table_name(name.as_str()) => Some("main"),
-            "" => None,
-            _ => Some(range_var.schemaname.as_str()),
+        let schema = if range_var.schemaname.is_empty() {
+            is_catalog_table_name(name.as_str()).then_some("main")
+        } else {
+            Some(map_schema_name(&range_var.schemaname))
         };
         let mut qn = match schema {
             Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
@@ -2168,9 +2167,10 @@ impl PostgreSQLTranslator {
                                 }
                                 match parts.len() {
                                     3 => {
-                                        // schema.table.column
+                                        // schema.table.column. The table name is not mapped:
+                                        // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(parts[0].clone()),
+                                            ast::Name::from_string(map_schema_name(&parts[0])),
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
@@ -4047,6 +4047,14 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
         join.operator,
         ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
     )
+}
+
+/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+fn map_schema_name(schema: &str) -> &str {
+    match schema.to_ascii_lowercase().as_str() {
+        "pg_catalog" | "public" | "information_schema" => "main",
+        _ => schema,
+    }
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {
