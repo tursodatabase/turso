@@ -809,3 +809,42 @@ test affinity-sum-of-text-i64-min {
 expect {
     integer|-9223372036854775808
 }
+
+@cross-check-integrity
+test affinity-real-text-large-exponent-matches-cast {
+    CREATE TABLE r(x REAL);
+    INSERT INTO r VALUES ('2e218'), (2e218);
+    SELECT x = 2e218, x = CAST('2e218' AS REAL) FROM r;
+    SELECT count(DISTINCT x) FROM r;
+}
+expect {
+    1|1
+    1|1
+    1
+}
+
+@cross-check-integrity
+test affinity-real-numeric-text-matches-cast {
+    CREATE TABLE s(v TEXT, x REAL, n NUMERIC);
+    INSERT INTO s VALUES ('43833.5411857880e249', '43833.5411857880e249', '43833.5411857880e249');
+    INSERT INTO s VALUES ('3.158929622800560e-100', '3.158929622800560e-100', '3.158929622800560e-100');
+    SELECT x = CAST(v AS REAL), n = CAST(v AS REAL) FROM s ORDER BY rowid;
+}
+expect {
+    1|1
+    1|1
+}
+
+@cross-check-integrity
+test affinity-sum-total-avg-of-text-matches-cast {
+    SELECT sum('2e218') = 2e218, total('2e218') = 2e218, avg('2e218') = 2e218;
+    SELECT sum('1.0e-300') = CAST('1.0e-300' AS REAL);
+    SELECT sum(v) = CAST(v AS REAL) FROM (SELECT '43833.5411857880e249' AS v);
+    SELECT sum(v) = CAST(v AS REAL) FROM (SELECT '3.158929622800560e-100' AS v);
+}
+expect {
+    1|1|1
+    1
+    1
+    1
+}

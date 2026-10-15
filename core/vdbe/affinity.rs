@@ -2,7 +2,7 @@ use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
 use crate::{
-    numeric::{format_float, DoubleDouble, Numeric},
+    numeric::{decimal_to_f64, format_float, Numeric},
     types::AsValueRef,
     Value, ValueRef,
 };
@@ -567,44 +567,7 @@ fn create_result_from_significand(
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
 
-    // Convert to float using Dekker double-double arithmetic for precision
-    // This matches SQLite's sqlite3AtoF implementation
-    let mut result = DoubleDouble::from(significand);
-
-    let mut exp = exponent;
-    match exp.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            while exp >= 100 {
-                result *= DoubleDouble::E100;
-                exp -= 100;
-            }
-            while exp >= 10 {
-                result *= DoubleDouble::E10;
-                exp -= 10;
-            }
-            while exp >= 1 {
-                result *= DoubleDouble::E1;
-                exp -= 1;
-            }
-        }
-        std::cmp::Ordering::Less => {
-            while exp <= -100 {
-                result *= DoubleDouble::NEG_E100;
-                exp += 100;
-            }
-            while exp <= -10 {
-                result *= DoubleDouble::NEG_E10;
-                exp += 10;
-            }
-            while exp <= -1 {
-                result *= DoubleDouble::NEG_E1;
-                exp += 1;
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-
-    let mut final_result: f64 = result.into();
+    let mut final_result = decimal_to_f64(significand, exponent);
     if final_result.is_nan() {
         final_result = f64::INFINITY;
     }
