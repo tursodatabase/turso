@@ -870,22 +870,30 @@ fn get_subquery_parser<'a>(
                     num_regs: reg_count,
                 };
 
-                // Only inject LIMIT 1 if there's no existing limit, or the existing limit is > 1,
-                // If LIMIT 0, subquery should return no rows (NULL).
-                let limit = match &plan.limit {
-                    Some(expr) => match parse_signed_number(expr) {
-                        Ok(Value::Numeric(Numeric::Integer(v))) => !(0..=1).contains(&v),
-                        _ => true,
+                // RowValue subqueries are satisfied after at most 1 row has been returned,
+                // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
+                // Like SQLite, an existing LIMIT X becomes X != 0, with the 0 given NUMERIC
+                // affinity so that a text '0' also means no rows. Integer literals are folded here.
+                plan.limit = Some(match plan.limit.take() {
+                    None => Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                    Some(expr) => match parse_signed_number(&expr) {
+                        Ok(Value::Numeric(Numeric::Integer(v))) => Box::new(ast::Expr::Literal(
+                            ast::Literal::Numeric(((v != 0) as i64).to_string()),
+                        )),
+                        _ => Box::new(ast::Expr::Binary(
+                            expr,
+                            ast::Operator::NotEquals,
+                            Box::new(ast::Expr::cast(
+                                ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                                Some(ast::Type {
+                                    name: "NUMERIC".to_string(),
+                                    size: None,
+                                    array_dimensions: 0,
+                                }),
+                            )),
+                        )),
                     },
-                    None => true,
-                };
-                if limit {
-                    // RowValue subqueries are satisfied after at most 1 row has been returned,
-                    // as they are used in comparisons with a scalar or a tuple of scalars like (x,y) = (SELECT ...) or x = (SELECT ...).
-                    plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
-                }
+                });
 
                 let ast::Expr::SubqueryResult {
                     subquery_id,
