@@ -158,7 +158,7 @@ impl From<SeekOp> for ComparisonOp {
 }
 
 #[inline]
-fn sqlite_text_prefix(s: &str) -> &str {
+pub(crate) fn sqlite_text_prefix(s: &str) -> &str {
     match first_nul(s.as_bytes()) {
         // A NUL is ASCII, so the cut is always on a character boundary.
         Some(idx) => &s[..idx],
@@ -170,7 +170,7 @@ fn sqlite_text_prefix(s: &str) -> &str {
 /// ask this of their pattern and their text on every row, and a byte-at-a-time
 /// scan of a short value costs more than the match that follows it.
 #[inline(always)]
-fn first_nul(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn first_nul(bytes: &[u8]) -> Option<usize> {
     const WORD_BYTES: usize = size_of::<usize>();
     const LOW_BITS: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
     const HIGH_BITS: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
