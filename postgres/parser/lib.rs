@@ -78,6 +78,37 @@ fn keyword_requires_quoting(ident: &str) -> bool {
     }
 }
 
+pub fn declare_real_columns_as_double_precision(sql: &str) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let mut parse_result = parse(sql)?;
+    let stmt = parse_result
+        .protobuf
+        .stmts
+        .first_mut()
+        .and_then(|raw_stmt| raw_stmt.stmt.as_mut())
+        .and_then(|stmt| stmt.node.as_mut());
+    let Some(Node::CreateStmt(create)) = stmt else {
+        return Err(ParseError::ParseError(format!(
+            "expected CREATE TABLE statement: {sql}"
+        )));
+    };
+    for element in &mut create.table_elts {
+        let Some(Node::ColumnDef(column)) = element.node.as_mut() else {
+            continue;
+        };
+        let Some(type_name) = column.type_name.as_mut() else {
+            continue;
+        };
+        if let Some(Node::String(name)) = type_name.names.last_mut().and_then(|n| n.node.as_mut()) {
+            if name.sval.eq_ignore_ascii_case("float4") {
+                name.sval = "float8".to_string();
+            }
+        }
+    }
+    pg_query::deparse(&parse_result.protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

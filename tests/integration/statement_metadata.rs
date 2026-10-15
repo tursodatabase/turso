@@ -122,6 +122,31 @@ mod tests {
         assert_eq!(amount_info.kind, ColumnTypeKind::Custom);
     }
 
+    #[test]
+    fn type_info_for_compound_select_of_custom_type_and_other_type_is_primitive() {
+        let db = fresh_db_with_custom_types("type_info_compound.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE accounts(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+
+        let same_type = conn
+            .prepare("SELECT amount FROM accounts UNION ALL SELECT amount FROM accounts UNION ALL SELECT NULL")
+            .unwrap();
+        let info = expect_info(&same_type, 0);
+        assert_eq!(info.declared_name, "cents");
+        assert_eq!(info.kind, ColumnTypeKind::Custom);
+
+        let other_type = conn
+            .prepare("SELECT amount FROM accounts UNION ALL SELECT id FROM accounts")
+            .unwrap();
+        let info = expect_info(&other_type, 0);
+        assert_eq!(info.declared_name, "INTEGER");
+        assert_eq!(info.base_type, None);
+        assert_eq!(info.kind, ColumnTypeKind::Builtin);
+    }
+
     /// `CREATE DOMAIN` columns share the same underlying primitive as their
     /// base type but report `kind == Domain` — letting consumers know there
     /// are CHECK constraints attached even though the on-disk representation
