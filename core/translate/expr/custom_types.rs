@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::aggregation::aggregate_arg_with_column_type;
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -124,12 +125,16 @@ pub(super) struct ExprCustomTypeInfo {
     type_def: Arc<TypeDef>,
 }
 
-/// If the expression is a column reference to a custom type, return the type info.
+/// If the expression is a column reference to a custom type, or an aggregate
+/// that returns its column's custom type, return the type info.
 pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Option<ExprCustomTypeInfo> {
+    if let Some(arg) = aggregate_arg_with_column_type(expr, referenced_tables?, resolver.schema()) {
+        return expr_custom_type_info(arg, referenced_tables, resolver);
+    }
     if let ast::Expr::Column {
         table: table_ref_id,
         column,

@@ -357,6 +357,9 @@ pub struct AggStepData {
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
+    /// SUM/AVG over a `numeric` column: add the values as exact decimals
+    /// instead of integers and floats.
+    pub exact_numeric: bool,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).

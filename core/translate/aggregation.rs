@@ -1,8 +1,8 @@
 use turso_parser::ast;
 
 use crate::{
-    function::{AccumulatorFunc, AggFunc},
-    schema::Table,
+    function::{AccumulatorFunc, AggFunc, Func},
+    schema::{Schema, Table},
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::{
@@ -386,6 +386,11 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
                     comparator: None,
                     collation: None,
+                    exact_numeric: is_numeric_column(
+                        agg_arg_source.arg_at(0),
+                        referenced_tables,
+                        resolver.schema(),
+                    ),
                 }),
             });
             target_register
@@ -402,6 +407,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -420,6 +426,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Count),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -448,6 +455,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
 
@@ -471,6 +479,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Max),
                     comparator,
                     collation: Some(arg_collation),
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -493,6 +502,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Min),
                     comparator,
                     collation: Some(arg_collation),
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -514,6 +524,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -533,6 +544,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -554,6 +566,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
 
@@ -573,6 +586,11 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
                     comparator: None,
                     collation: None,
+                    exact_numeric: is_numeric_column(
+                        agg_arg_source.arg_at(0),
+                        referenced_tables,
+                        resolver.schema(),
+                    ),
                 }),
             });
             target_register
@@ -591,6 +609,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Total),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -610,6 +629,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -631,6 +651,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
                     comparator: None,
                     collation: Some(arg_collation),
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -656,6 +677,7 @@ pub fn translate_aggregation_step(
                     func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
                     collation: Some(arg_collation),
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -698,6 +720,7 @@ pub fn translate_aggregation_step(
                     })),
                     comparator: None,
                     collation: None,
+                    exact_numeric: false,
                 }),
             });
             target_register
@@ -708,6 +731,56 @@ pub fn translate_aggregation_step(
     // surrounding expression that consumes the aggregate result.
     program.reset_collation();
     Ok(dest)
+}
+
+/// Returns the argument of an aggregate whose result has the argument's custom
+/// type: MIN/MAX of any column, and SUM/AVG of a `numeric` column.
+pub(crate) fn aggregate_arg_with_column_type<'a>(
+    expr: &'a ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<&'a ast::Expr> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    match Func::resolve_function(name.as_str(), 1) {
+        Ok(Some(Func::Agg(AggFunc::Min | AggFunc::Max))) => Some(arg),
+        Ok(Some(Func::Agg(AggFunc::Sum | AggFunc::Avg)))
+            if is_numeric_column(arg, referenced_tables, schema) =>
+        {
+            Some(arg)
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if `expr` is a column whose type adds values with
+/// `numeric_add`, so SUM and AVG must add them as exact decimals.
+pub(crate) fn is_numeric_column(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> bool {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return false;
+    };
+    let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table) else {
+        return false;
+    };
+    let Some(col) = table.get_column_at(*column) else {
+        return false;
+    };
+    schema
+        .get_type_def(&col.ty_str, table.is_strict())
+        .is_some_and(|type_def| {
+            type_def
+                .operators()
+                .iter()
+                .any(|op| op.op == "+" && op.func_name.as_deref() == Some("numeric_add"))
+        })
 }
 
 fn translate_const_arg(
