@@ -117,6 +117,31 @@ impl HirDocument {
     /// Return every query whose plan is needed directly by this query. This
     /// includes query-backed FROM sources and subqueries in expressions, but
     /// does not descend into those query definitions.
+    /// Whether `query`, or any query it runs, reads `table`.
+    pub(crate) fn query_reads_table(&self, query: QueryId, table: &ResolvedTable) -> bool {
+        let mut pending = vec![query];
+        let mut seen = HashSet::default();
+        while let Some(query) = pending.pop() {
+            if !seen.insert(query) {
+                continue;
+            }
+            let definition = self.query(query).expect("validated HIR query must exist");
+            let mut reads = false;
+            visit_query_parts(self, definition, &mut |part| {
+                if let QueryPart::Source(source) = part {
+                    if let SourceKind::Table(source_table) = &source.kind {
+                        reads |= source_table == table;
+                    }
+                }
+            });
+            if reads {
+                return true;
+            }
+            pending.extend(self.direct_query_dependencies(query));
+        }
+        false
+    }
+
     pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
         let Some(query) = self.query(id) else {
             return Vec::new();

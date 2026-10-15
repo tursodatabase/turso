@@ -76,6 +76,17 @@ impl<'a> DmlTarget<'a> {
         })
     }
 
+    /// The catalog table the target writes.
+    pub(super) fn resolved_table(&self) -> Result<&'a hir::ResolvedTable> {
+        match &self.source.kind {
+            hir::SourceKind::Table(table) => Ok(table),
+            _ => Err(LimboError::InternalError(format!(
+                "HIR DML target {} is not a table",
+                self.source.id
+            ))),
+        }
+    }
+
     pub(super) fn open_table_for_write(&self, program: &mut ProgramBuilder) -> CursorID {
         let cursor = program.alloc_cursor_id(CursorType::BTreeTable(self.table.clone()));
         program.emit_insn(Insn::OpenWrite {

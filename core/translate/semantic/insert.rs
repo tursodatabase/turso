@@ -174,8 +174,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     table.value(),
                                     target_column.column,
                                     expressions,
-                                    whole_values_only
-                                        && !matches!(syntax.as_ref(), ast::Expr::Id(_)),
+                                    InsertValueRules {
+                                        without_dqs_fallback: whole_values_only
+                                            && !matches!(syntax.as_ref(), ast::Expr::Id(_)),
+                                        unknown_table_as_column: whole_values_only,
+                                    },
                                 )?);
                             }
                             bound_rows.push(bound);
@@ -515,14 +518,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &Table,
         column: hir::TargetColumn,
         expressions: InsertExprContext<'_>,
-        without_dqs_fallback: bool,
+        rules: InsertValueRules,
     ) -> Result<hir::Expr> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_write_default(target, table, column);
         }
         let mut policy = expressions.policies.insert_values();
-        if without_dqs_fallback {
+        if rules.without_dqs_fallback {
             policy = policy.without_dqs_fallback();
+        }
+        if rules.unknown_table_as_column {
+            policy = policy.with_unknown_table_as_column();
         }
         Ok(self
             .analyze_root_expr_with_expected_type(
@@ -918,6 +924,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         )?;
         Ok(excluded)
     }
+}
+
+/// Legacy quirks of the values of a single VALUES row without a subquery.
+#[derive(Clone, Copy)]
+struct InsertValueRules {
+    /// A double-quoted name falls back to a string only when it is the
+    /// whole value.
+    without_dqs_fallback: bool,
+    /// `x.y` with no table `x` is reported as "no such column: x.y".
+    unknown_table_as_column: bool,
 }
 
 fn is_simple_values(select: &ast::Select) -> bool {

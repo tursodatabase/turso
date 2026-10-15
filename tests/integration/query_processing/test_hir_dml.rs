@@ -354,6 +354,27 @@ fn hir_insert_matches_legacy() {
         &["INSERT OR FAIL INTO u(b) VALUES (43), (1), (44)"],
         &["INSERT OR ROLLBACK INTO u(b) VALUES (45), (1)"],
         &["INSERT OR ABORT INTO u(b) VALUES (46), (1)"],
+        // INSERT ... SELECT runs the query as a coroutine; a query that
+        // reads the target first fills a temp table.
+        &["INSERT INTO u(b, c) SELECT b + 100, c FROM t WHERE b IS NOT NULL RETURNING a, b"],
+        &["INSERT INTO u(b, c, d) SELECT b + 10, c, d FROM u", "SELECT last_insert_rowid()"],
+        &["INSERT INTO u SELECT a + 100, b + 100, c, d FROM u ORDER BY a DESC LIMIT 2 RETURNING *"],
+        &["INSERT INTO log SELECT count(*) FROM t"],
+        &["INSERT INTO u(b) SELECT 1"],
+        &["INSERT OR IGNORE INTO u(b, c) SELECT b, 'dup' FROM t"],
+        &["INSERT INTO u(b) SELECT 200 UNION ALL SELECT 201 UNION SELECT 200"],
+        &["WITH x AS (SELECT 300 AS v) INSERT INTO u(b) SELECT v FROM x"],
+        &["INSERT INTO u(b, c) SELECT g, 'g' FROM t WHERE g > 4 AND EXISTS (SELECT 1 FROM u WHERE u.b = 1)"],
+        &[
+            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b) SELECT a + 50 FROM t",
+        ],
+        &[
+            "INSERT INTO u(a, b) SELECT a, b + 1000 FROM t WHERE true \
+             ON CONFLICT(a) DO UPDATE SET c = 'from t'",
+        ],
+        &["INSERT OR REPLACE INTO u(a, b, c) SELECT a, a, 'r' FROM t"],
+        &["PRAGMA count_changes = 1", "INSERT INTO u(b) SELECT a + 60 FROM t"],
         // UPSERT: the clause naming a conflict decides what happens.
         &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT(a) DO UPDATE SET c = excluded.c || c, d = d + 1"],

@@ -16,13 +16,14 @@ use crate::{
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
         insert::{format_unique_violation_desc, halt_desc_and_on_error},
+        plan::QueryDestination,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::HirPlan,
         stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,
-        builder::{ProgramBuilder, SourceBinding},
+        builder::{CursorType, ProgramBuilder, SourceBinding},
         insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -41,9 +42,10 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    // INSERT ... SELECT and subqueries.
+    // Subqueries in VALUES and RETURNING. The query of INSERT ... SELECT
+    // is lowered like any SELECT.
     let values_have_subquery = match &insert.source {
-        hir::InsertSource::Query(_) => true,
+        hir::InsertSource::Query(_) => false,
         hir::InsertSource::DefaultValues => false,
         hir::InsertSource::Values(rows) => rows.iter().flatten().any(has_subquery),
     };
@@ -170,14 +172,10 @@ pub(super) fn emit_insert(
             "HIR INSERT target is not a B-tree table".into(),
         ));
     };
-    let rows: &[Vec<hir::Expr>] = match &insert.source {
-        hir::InsertSource::DefaultValues => &[Vec::new()],
-        hir::InsertSource::Values(rows) => rows,
-        hir::InsertSource::Query(_) => {
-            return Err(LimboError::InternalError(
-                "HIR INSERT ... SELECT is not lowered".into(),
-            ));
-        }
+    let (rows, query): (&[Vec<hir::Expr>], _) = match &insert.source {
+        hir::InsertSource::DefaultValues => (&[Vec::new()], None),
+        hir::InsertSource::Values(rows) => (rows, None),
+        hir::InsertSource::Query(query) => (&[], Some(*query)),
     };
     let target = DmlTarget::new(program, document, insert.target, "INSERT")?;
     let table = target.table;
@@ -212,7 +210,7 @@ pub(super) fn emit_insert(
     }
 
     // Same statement-journal facts as legacy.
-    let several_rows = rows.len() > 1;
+    let several_rows = rows.len() > 1 || query.is_some();
     let indexes = &target.source.index_expressions;
     let any_replace = any_effective_replace(
         has_statement_conflict,
@@ -272,6 +270,23 @@ pub(super) fn emit_insert(
     };
     let done = program.allocate_label();
     match rows {
+        _ if query.is_some() => {
+            let query = query.expect("query was checked");
+            emit_select_rows(
+                program,
+                plan,
+                insert,
+                query,
+                &row,
+                RowSink {
+                    column_values: &column_values,
+                    rowid_value,
+                    index_cursors: &index_cursors,
+                    returning,
+                },
+                done,
+            )?;
+        }
         [values] => {
             let row_done = program.allocate_label();
             row.emit(
@@ -359,6 +374,164 @@ enum ColumnValue<'a> {
     /// The value at this position of each VALUES row.
     Row(usize),
     Default(&'a hir::Expr),
+}
+
+/// What every inserted row needs besides its values.
+struct RowSink<'a, 'b> {
+    column_values: &'a [ColumnValue<'b>],
+    rowid_value: Option<usize>,
+    index_cursors: &'a [(&'b hir::IndexExpressions, CursorID)],
+    returning: Option<ReturningBuffer<'b>>,
+}
+
+/// INSERT ... SELECT: the query runs as a coroutine that yields one row at
+/// a time. Like legacy and SQLite, when the query reads the target table, or
+/// the INSERT fires triggers, every row is first copied into an ephemeral
+/// table, so inserting never changes what the query reads.
+fn emit_select_rows(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+    query: hir::QueryId,
+    row: &InsertRow<'_>,
+    sink: RowSink<'_, '_>,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = &plan.document;
+    let width = insert.columns.len();
+    let yield_reg = program.alloc_register();
+    let values = program.alloc_registers(width.max(1));
+    let start = program.allocate_label();
+    let defined = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: defined,
+        start_offset: start,
+    });
+    program.preassign_label_to_next_insn(start);
+    program.bind_coroutine_row(yield_reg, values);
+    super::query::emit_planned_query_body(
+        program,
+        plan,
+        query,
+        &QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: start,
+        },
+    )?;
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(defined);
+
+    let table = row.target.table;
+    let reads_target = document.query_reads_table(query, row.target.resolved_table()?);
+    if !reads_target && row.triggers.is_empty() {
+        let next = program.allocate_label();
+        program.preassign_label_to_next_insn(next);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: done,
+            subtype_clear_start_reg: 0,
+            subtype_clear_count: 0,
+        });
+        row.emit(
+            program,
+            sink.column_values,
+            sink.rowid_value,
+            RowValues::Registers(values),
+            sink.index_cursors,
+            sink.returning,
+            next,
+        )?;
+        program.emit_insn(Insn::Goto { target_pc: next });
+        return Ok(());
+    }
+
+    let temp = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: temp,
+        is_table: true,
+    });
+    let fill = program.allocate_label();
+    let filled = program.allocate_label();
+    program.preassign_label_to_next_insn(fill);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: filled,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(values),
+        count: to_u32(width),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: Some(
+            insert
+                .columns
+                .iter()
+                .map(|target| match target.column {
+                    hir::TargetColumn::RowId => Affinity::Integer.aff_mask(),
+                    hir::TargetColumn::Column(column) => table.columns()[column]
+                        .affinity_with_strict(table.is_strict)
+                        .aff_mask(),
+                })
+                .collect(),
+        ),
+    });
+    let temp_rowid = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: temp,
+        rowid_reg: temp_rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: temp,
+        key_reg: temp_rowid,
+        record_reg: record,
+        flag: InsertFlags::new()
+            .require_seek()
+            .is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Goto { target_pc: fill });
+    program.preassign_label_to_next_insn(filled);
+
+    let empty = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: temp,
+        pc_if_empty: empty,
+    });
+    let top = program.allocate_label();
+    let next = program.allocate_label();
+    program.preassign_label_to_next_insn(top);
+    for position in 0..width {
+        program.emit_insn(Insn::Column {
+            cursor_id: temp,
+            column: position,
+            dest: values + position,
+            default: None,
+        });
+    }
+    row.emit(
+        program,
+        sink.column_values,
+        sink.rowid_value,
+        RowValues::Registers(values),
+        sink.index_cursors,
+        sink.returning,
+        next,
+    )?;
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: temp,
+        pc_if_next: top,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(empty);
+    program.emit_insn(Insn::Close { cursor_id: temp });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    Ok(())
 }
 
 /// Where the values of the row being inserted are.
@@ -1600,9 +1773,42 @@ mod tests {
     }
 
     #[test]
+    fn insert_select_reading_its_own_table_goes_through_a_temp_table() {
+        let program = emit("INSERT INTO items SELECT value + 1, extra FROM items");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::OpenEphemeral { .. })),
+            1
+        );
+        let program = emit("INSERT INTO items SELECT 1, 'x'");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::OpenEphemeral { .. })),
+            0
+        );
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::InitCoroutine { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn upsert_goes_through_hir() {
+        for sql in [
+            "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
+            "INSERT INTO items(rowid, value) VALUES (1, 2) \
+             ON CONFLICT DO UPDATE SET extra = excluded.extra || extra",
+        ] {
+            let program = emit(sql);
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::Insert { .. })),
+                if sql.contains("DO UPDATE") { 2 } else { 1 },
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn insert_that_needs_legacy_is_left_to_it() {
         for sql in [
-            "INSERT INTO items SELECT value, extra FROM items",
             "INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
             "INSERT INTO items VALUES ((SELECT 1), 'x')",
         ] {
