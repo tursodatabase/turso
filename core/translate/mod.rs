@@ -304,6 +304,22 @@ fn translate_statement(
                     &stmt, schema, resolver, program, connection,
                 )?
         }
+        (Some(schema), ast::Stmt::Insert { tbl_name, body, .. }) => {
+            // Legacy checks these by name before it looks the table up.
+            // UPSERT is not lowered from HIR yet, and legacy reports its
+            // name errors its own way.
+            let table_name = crate::util::normalize_ident(tbl_name.name.as_str());
+            !matches!(body, ast::InsertBody::Select(_, Some(_)))
+                && crate::schema::allow_user_dml(&table_name)
+                && !resolver.schema().is_materialized_view(&table_name)
+                && resolver
+                    .schema()
+                    .get_dependent_materialized_views(&table_name)
+                    .is_empty()
+                && semantic_lowering::translate_insert(
+                    &stmt, schema, resolver, program, connection,
+                )?
+        }
         _ => false,
     };
 

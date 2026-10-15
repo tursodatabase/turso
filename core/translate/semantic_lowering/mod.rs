@@ -3,6 +3,7 @@
 mod delete;
 mod dml;
 pub(super) mod expr;
+mod insert;
 pub(super) mod query;
 mod update;
 mod window;
@@ -104,6 +105,33 @@ pub(crate) fn translate_update(
     program.set_hir_plan(plan.clone());
     update::emit_update(program, &plan, mvcc)?;
     if let Some(returning) = &update.returning {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
+    Ok(true)
+}
+
+/// Prepare a top-level INSERT through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_insert(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    if insert::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+        return Ok(false);
+    }
+    program.set_hir_plan(plan.clone());
+    insert::emit_insert(program, &plan)?;
+    if let HirRoot::Insert(hir::Insert {
+        returning: Some(returning),
+        ..
+    }) = &plan.document.root
+    {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }

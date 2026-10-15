@@ -159,7 +159,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect::<Vec<_>>();
         let target = table.value();
         self.table_triggers(table, |trigger| {
-            trigger_matches_update(trigger, &target, &updated_columns)
+            trigger_matches_update(trigger, target, &updated_columns)
         })
     }
 

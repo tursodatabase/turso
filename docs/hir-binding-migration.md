@@ -124,8 +124,8 @@ statements through HIR: the owned semantic catalog, `analyze_root`,
 `HirPlan::build`, and HIR lowering. Nested engine statements still use the
 legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
 prepare, so running the test suites with the variable set lists the remaining
-gaps. Top-level DELETE and UPDATE also go through HIR, except the cases
-listed under "DML through HIR", which still go to legacy. The variable and the legacy path
+gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
+cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
 are removed at cutover.
 
 Result-column names, table names, and declared types come from the HIR outputs
@@ -233,7 +233,22 @@ new values. These still go to legacy:
 | REPLACE (statement, NOT NULL, or index) | Deleting the conflicting row |
 | STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
 
-INSERT still uses legacy.
+INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
+from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
+coroutine, as in legacy, so the row code is emitted once. The rowid comes
+from the statement (checked against existing rows) or NewRowid; NOT NULL,
+PRIMARY KEY and UNIQUE are checked with ABORT, FAIL, ROLLBACK or IGNORE before
+anything is written, then every index entry and the row are written. The
+target source is bound to the new row's registers for index expressions,
+partial-index WHERE terms and RETURNING. These still go to legacy:
+
+| INSERT feature | What HIR needs first |
+|---|---|
+| Triggers, enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
+| UPSERT and REPLACE (statement, column, index or INTEGER PRIMARY KEY) | Conflict actions |
+| AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
+| WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
 
 ### Non-lowering phase complete
 

@@ -196,6 +196,71 @@ fn hir_update_matches_legacy() {
 }
 
 #[test]
+fn hir_insert_matches_legacy() {
+    for statements in [
+        &["INSERT INTO u VALUES (10, 10, 'n', 1.5)"][..],
+        &["INSERT INTO u(b, d) VALUES (20, 2), (21, -1), (22, '4')"],
+        &["INSERT INTO u(rowid, b) VALUES (30, 30)"],
+        &["INSERT INTO u(a, b) VALUES (NULL, 31)"],
+        &["INSERT INTO u(b, c) VALUES (32, 'r') RETURNING *, rowid, c || '!'"],
+        &["INSERT INTO u(b, c) VALUES ('33', 5), (x'01', NULL)"],
+        &["INSERT INTO u(c, b, c) VALUES ('first', 34, 'second')"],
+        &[
+            "INSERT INTO log DEFAULT VALUES",
+            "INSERT INTO log VALUES (1), (2), (3)",
+        ],
+        // Constraint failures and their conflict modes.
+        &["INSERT INTO u VALUES (1, 99, 'y', 1)"],
+        &["INSERT INTO u(b) VALUES (1)"],
+        &["INSERT INTO u(b) VALUES (NULL)"],
+        &["INSERT INTO u(b, c, d) VALUES (40, 'p', 5)"],
+        &["INSERT OR IGNORE INTO u VALUES (1, 99, 'y', 1), (40, 1, 'z', 1), (41, 41, 'q', 0)"],
+        &["INSERT OR IGNORE INTO u(b) VALUES (NULL), (42)"],
+        &["INSERT OR FAIL INTO u(b) VALUES (43), (1), (44)"],
+        &["INSERT OR ROLLBACK INTO u(b) VALUES (45), (1)"],
+        &["INSERT OR ABORT INTO u(b) VALUES (46), (1)"],
+        &[
+            "PRAGMA count_changes = 1",
+            "INSERT INTO u(b) VALUES (47), (48)",
+        ],
+        &["INSERT INTO u(b) VALUES (49)", "SELECT last_insert_rowid()"],
+        &["INSERT INTO u(rowid, b) VALUES ('x', 50)"],
+        // Like legacy, a double-quoted name is a string only as a whole
+        // value of a single VALUES row.
+        &["INSERT INTO u(b, c) VALUES (51, \"s\")"],
+        &["INSERT INTO u(b, c) VALUES (52, upper(\"s\"))"],
+        &["INSERT INTO u(b, c) VALUES (53, upper(\"s\")), (54, \"t\")"],
+        // Statements that still go through legacy.
+        &["INSERT INTO u(b) SELECT b + 100 FROM u"],
+        &["INSERT OR REPLACE INTO u VALUES (1, 60, 'v', 1)"],
+        &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
+        &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
+        &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
+        &["INSERT INTO t(b) VALUES (62)"],
+        &[
+            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b) VALUES (63)",
+        ],
+        &[
+            "CREATE TEMP TRIGGER tr AFTER INSERT ON main.u BEGIN \
+             INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b) VALUES (64)",
+        ],
+        &[
+            "CREATE TABLE auto(a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
+            "INSERT INTO auto(b) VALUES (1), (2)",
+            "SELECT * FROM auto",
+        ],
+    ] {
+        assert_eq!(
+            run(true, statements),
+            run(false, statements),
+            "results differ for {statements:?}"
+        );
+    }
+}
+
+#[test]
 fn hir_delete_returning_names_columns_like_legacy() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
