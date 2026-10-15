@@ -19485,6 +19485,38 @@ fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
 }
 
 #[test]
+fn test_schema_row_insert_does_not_count_as_statement_change() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1),(2),(3)").unwrap();
+
+    // The sqlite_schema row insert must count neither in the statement change
+    // count nor in last_insert_rowid. Under MVCC the schema cursor reports
+    // the schema table id as its root page, not page 1.
+    let mut stmt = conn
+        .prepare("CREATE TABLE dst AS SELECT * FROM src WHERE id > 1")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(
+        stmt.n_change(),
+        2,
+        "CTAS must count only the copied data rows"
+    );
+
+    let last_rowid_before = conn.last_insert_rowid();
+    let mut stmt = conn.prepare("CREATE TABLE empty_t(x)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(stmt.n_change(), 0, "plain CREATE TABLE changes no rows");
+    assert_eq!(
+        conn.last_insert_rowid(),
+        last_rowid_before,
+        "the schema row insert must not update last_insert_rowid"
+    );
+}
+
+#[test]
 fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
