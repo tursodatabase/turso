@@ -3,6 +3,7 @@ use turso_core::functions::datetime::{
     exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_timediff,
     exec_unixepoch,
 };
+use turso_core::io::clock::DefaultClock;
 use turso_core::types::Value;
 
 // =============================================================================
@@ -14,56 +15,56 @@ use turso_core::types::Value;
 fn fast_path_date_only(bencher: Bencher) {
     // YYYY-MM-DD (10 chars) - fast path
     let args = [Value::build_text("2024-07-21")];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_datetime_hhmm(bencher: Bencher) {
     // YYYY-MM-DD HH:MM (16 chars) - fast path
     let args = [Value::build_text("2024-07-21 14:30")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_datetime_hhmmss(bencher: Bencher) {
     // YYYY-MM-DD HH:MM:SS (19 chars) - fast path
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_datetime_with_frac(bencher: Bencher) {
     // YYYY-MM-DD HH:MM:SS.fff (23 chars) - fast path
     let args = [Value::build_text("2024-07-21 14:30:45.123")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_datetime_t_separator(bencher: Bencher) {
     // YYYY-MM-DDTHH:MM:SS - fast path with T separator
     let args = [Value::build_text("2024-07-21T14:30:45")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_time_hhmm(bencher: Bencher) {
     // HH:MM (5 chars) - fast path
     let args = [Value::build_text("14:30")];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_time_hhmmss(bencher: Bencher) {
     // HH:MM:SS (8 chars) - fast path
     let args = [Value::build_text("14:30:45")];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn fast_path_time_with_frac(bencher: Bencher) {
     // HH:MM:SS.fff - fast path
     let args = [Value::build_text("14:30:45.123")];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -75,28 +76,28 @@ fn fast_path_time_with_frac(bencher: Bencher) {
 fn slow_path_datetime_utc_z(bencher: Bencher) {
     // Ends with Z - triggers slow path for timezone
     let args = [Value::build_text("2024-07-21 14:30:45Z")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn slow_path_datetime_tz_offset(bencher: Bencher) {
     // Has timezone offset - slow path
     let args = [Value::build_text("2024-07-21 14:30:45+02:00")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn slow_path_datetime_negative_tz(bencher: Bencher) {
     // Negative timezone offset - slow path
     let args = [Value::build_text("2024-07-21 14:30:45-05:00")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn slow_path_time_with_tz(bencher: Bencher) {
     // Time with timezone - slow path
     let args = [Value::build_text("14:30:45+02:00")];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -107,21 +108,21 @@ fn slow_path_time_with_tz(bencher: Bencher) {
 fn julian_day_float_input(bencher: Bencher) {
     // Float julian day value
     let args = [Value::from_f64(2460512.5)];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn julian_day_integer_input(bencher: Bencher) {
     // Integer julian day value
     let args = [Value::from_i64(2460513)];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn julian_day_string_numeric(bencher: Bencher) {
     // Numeric string that parses as julian day
     let args = [Value::build_text("2460512.5")];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -131,31 +132,31 @@ fn julian_day_string_numeric(bencher: Bencher) {
 #[turso_macros::divan_bench]
 fn output_date(bencher: Bencher) {
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn output_time(bencher: Bencher) {
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn output_datetime(bencher: Bencher) {
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn output_julianday(bencher: Bencher) {
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_julianday(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_julianday(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn output_unixepoch(bencher: Bencher) {
     let args = [Value::build_text("2024-07-21 14:30:45")];
-    bencher.bench_local(|| black_box(exec_unixepoch(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_unixepoch(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -168,7 +169,7 @@ fn strftime_simple_format(bencher: Bencher) {
         Value::build_text("%Y-%m-%d"),
         Value::build_text("2024-07-21 14:30:45"),
     ];
-    bencher.bench_local(|| black_box(exec_strftime(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_strftime(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -177,7 +178,7 @@ fn strftime_complex_format(bencher: Bencher) {
         Value::build_text("%Y-%m-%d %H:%M:%S"),
         Value::build_text("2024-07-21 14:30:45"),
     ];
-    bencher.bench_local(|| black_box(exec_strftime(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_strftime(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -187,7 +188,7 @@ fn strftime_with_julian(bencher: Bencher) {
         Value::build_text("%J"),
         Value::build_text("2024-07-21 14:30:45"),
     ];
-    bencher.bench_local(|| black_box(exec_strftime(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_strftime(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -196,7 +197,7 @@ fn strftime_weekday_format(bencher: Bencher) {
         Value::build_text("%w %W"),
         Value::build_text("2024-07-21 14:30:45"),
     ];
-    bencher.bench_local(|| black_box(exec_strftime(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_strftime(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -209,7 +210,7 @@ fn modifier_add_days(bencher: Bencher) {
         Value::build_text("2024-07-21"),
         Value::build_text("+5 days"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -219,7 +220,7 @@ fn modifier_add_fractional_days(bencher: Bencher) {
         Value::build_text("2024-07-21 12:00:00"),
         Value::build_text("+1.5 days"),
     ];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -228,7 +229,7 @@ fn modifier_add_months(bencher: Bencher) {
         Value::build_text("2024-07-21"),
         Value::build_text("+3 months"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -237,7 +238,7 @@ fn modifier_start_of_month(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45"),
         Value::build_text("start of month"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -246,7 +247,7 @@ fn modifier_start_of_year(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45"),
         Value::build_text("start of year"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -255,28 +256,28 @@ fn modifier_weekday(bencher: Bencher) {
         Value::build_text("2024-07-21"),
         Value::build_text("weekday 0"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn modifier_unixepoch(bencher: Bencher) {
     // unixepoch modifier for numeric input
     let args = [Value::from_i64(1721577045), Value::build_text("unixepoch")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn modifier_auto_unixepoch(bencher: Bencher) {
     // auto modifier detecting unix epoch
     let args = [Value::from_i64(1721577045), Value::build_text("auto")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn modifier_auto_julianday(bencher: Bencher) {
     // auto modifier detecting julian day
     let args = [Value::from_f64(2460512.5), Value::build_text("auto")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -285,7 +286,7 @@ fn modifier_localtime(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45"),
         Value::build_text("localtime"),
     ];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -297,7 +298,7 @@ fn modifier_chain_multiple(bencher: Bencher) {
         Value::build_text("start of month"),
         Value::build_text("+7 days"),
     ];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -310,7 +311,7 @@ fn timediff_same_day(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45"),
         Value::build_text("2024-07-21 10:15:30"),
     ];
-    bencher.bench_local(|| black_box(exec_timediff(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_timediff(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -319,7 +320,7 @@ fn timediff_different_days(bencher: Bencher) {
         Value::build_text("2024-07-25 14:30:45"),
         Value::build_text("2024-07-21 10:15:30"),
     ];
-    bencher.bench_local(|| black_box(exec_timediff(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_timediff(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -328,7 +329,7 @@ fn timediff_different_years(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45"),
         Value::build_text("2020-01-15 10:15:30"),
     ];
-    bencher.bench_local(|| black_box(exec_timediff(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_timediff(&DefaultClock, black_box(&args))));
 }
 
 // =============================================================================
@@ -338,14 +339,14 @@ fn timediff_different_years(bencher: Bencher) {
 #[turso_macros::divan_bench]
 fn special_now(bencher: Bencher) {
     let args = [Value::build_text("now")];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn special_no_args_current_time(bencher: Bencher) {
     // No arguments - returns current time
     let args: [Value; 0] = [];
-    bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_datetime_full(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
@@ -354,19 +355,19 @@ fn special_subsec_modifier(bencher: Bencher) {
         Value::build_text("2024-07-21 14:30:45.123456"),
         Value::build_text("subsec"),
     ];
-    bencher.bench_local(|| black_box(exec_time(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_time(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn special_date_overflow(bencher: Bencher) {
     // Invalid date that overflows (Feb 30 -> Mar 2)
     let args = [Value::build_text("2024-02-30")];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }
 
 #[turso_macros::divan_bench]
 fn special_negative_year(bencher: Bencher) {
     // Negative year (BCE dates)
     let args = [Value::build_text("-0044-03-15")];
-    bencher.bench_local(|| black_box(exec_date(black_box(&args))));
+    bencher.bench_local(|| black_box(exec_date(&DefaultClock, black_box(&args))));
 }

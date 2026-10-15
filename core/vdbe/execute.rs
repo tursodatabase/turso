@@ -10443,13 +10443,13 @@ pub fn op_function(
             ScalarFunc::Date => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_date(values);
+                let result = exec_date(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_time(values);
+                let result = exec_time(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
@@ -10459,7 +10459,8 @@ pub fn op_function(
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff([start, end]);
+                    let result =
+                        crate::functions::datetime::exec_timediff(pager.io.as_ref(), [start, end]);
 
                     state.registers[*dest].set_value(result);
                 }
@@ -10472,19 +10473,19 @@ pub fn op_function(
             ScalarFunc::DateTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_datetime_full(values);
+                let result = exec_datetime_full(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_julianday(values);
+                let result = exec_julianday(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_unixepoch(values);
+                let result = exec_unixepoch(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
@@ -10534,7 +10535,7 @@ pub fn op_function(
             ScalarFunc::StrfTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_strftime(values);
+                let result = exec_strftime(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
@@ -11207,8 +11208,8 @@ pub fn op_function(
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
                 let result = match scalar_func {
-                    ScalarFunc::DatePlus => exec_date_plus(lhs, rhs)?,
-                    ScalarFunc::DateMinus => exec_date_minus(lhs, rhs)?,
+                    ScalarFunc::DatePlus => exec_date_plus(pager.io.as_ref(), lhs, rhs)?,
+                    ScalarFunc::DateMinus => exec_date_minus(pager.io.as_ref(), lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
