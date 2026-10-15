@@ -242,13 +242,16 @@ from the statement (checked against existing rows) or NewRowid; NOT NULL,
 PRIMARY KEY and UNIQUE are checked with ABORT, FAIL, ROLLBACK or IGNORE before
 anything is written, then every index entry and the row are written. The
 target source is bound to the new row's registers for index expressions,
-partial-index WHERE terms and RETURNING. These still go to legacy:
+partial-index WHERE terms and RETURNING. As in legacy and SQLite, when
+several VALUES rows read the target table (through a subquery) or the INSERT
+fires triggers, every row is computed into an ephemeral table before any is
+inserted. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
-| A subquery in VALUES or RETURNING | Reading it at the points legacy does |
+| A subquery in RETURNING (SQLite runs it again for each row) | Running it for each row |
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |

@@ -528,7 +528,21 @@ fn hir_insert_matches_legacy() {
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
         &["INSERT INTO t(b) VALUES (62)"],
+        &["INSERT INTO u(b) VALUES (69) RETURNING (SELECT count(*) FROM u)"],
+        // Subqueries in VALUES. Rows that read the target are all computed
+        // before any is inserted.
         &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(b) FROM u) + 1, 'r1'), \
+           ((SELECT max(b) FROM u) + 1, 'r2')"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(b) FROM u) + 1, 'r1'), \
+           ((SELECT max(b) FROM u) + 2, (SELECT count(*) FROM u))"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(a) FROM log) + 70, 'l'), (71, 'm')"],
+        // With triggers, the rows are computed before any is inserted too.
+        &[
+            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b, c) VALUES (72, last_insert_rowid()), (73, last_insert_rowid()), \
+             (74, (SELECT count(*) FROM log))",
+        ],
         // Triggers run from HIR-compiled subprograms. NEW.rowid reads -1 in
         // a BEFORE trigger until the rowid is known.
         &[
@@ -866,6 +880,49 @@ fn hir_update_subqueries_match_sqlite() {
         conn.execute(sql).unwrap();
         sqlite.execute(sql, ()).unwrap();
         let select = "SELECT * FROM u ORDER BY a";
+        assert_eq!(
+            limbo_exec_rows(&conn, select),
+            sqlite_exec_rows(&sqlite, select),
+            "{sql}"
+        );
+    }
+}
+
+/// Subqueries in INSERT VALUES see the table as SQLite's do: each VALUES
+/// row is computed after the rows before it are written.
+#[test]
+fn hir_insert_values_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE v(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "INSERT INTO v VALUES (1, 1, 'x'), (2, 2, 'y')",
+        "CREATE TABLE w(x)",
+        "INSERT INTO w VALUES (10), (20)",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "INSERT INTO v(b, c) VALUES ((SELECT max(b) FROM v) + 1, 'one')",
+        "INSERT INTO v(b, c) VALUES ((SELECT max(b) FROM v) + 1, 'r1'), \
+         ((SELECT max(b) FROM v) + 1, 'r2'), ((SELECT count(*) FROM v) * 10, 'r3')",
+        "INSERT INTO v(b, c) VALUES ((SELECT max(x) FROM w), (SELECT group_concat(c) FROM v))",
+        "INSERT INTO v(b, c) VALUES (100, 'p'), ((SELECT b FROM v WHERE c = 'p') + 1, 'q')",
+        "INSERT INTO v(b, c) VALUES ((SELECT 1 WHERE 0), (SELECT c FROM v WHERE a = 1))",
+        "INSERT INTO v(b) VALUES ((SELECT b FROM v WHERE a = 1))",
+    ] {
+        let turso = conn.execute(sql).map_err(|e| e.to_string());
+        let reference = sqlite.execute(sql, ()).map_err(|e| e.to_string());
+        assert_eq!(
+            turso.is_ok(),
+            reference.is_ok(),
+            "{sql}: {turso:?} {reference:?}"
+        );
+        let select = "SELECT * FROM v ORDER BY a";
         assert_eq!(
             limbo_exec_rows(&conn, select),
             sqlite_exec_rows(&sqlite, select),

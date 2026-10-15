@@ -44,21 +44,14 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    // Subqueries in VALUES and RETURNING. The query of INSERT ... SELECT
-    // is lowered like any SELECT.
-    let values_have_subquery = match &insert.source {
-        hir::InsertSource::Query(_) => false,
-        hir::InsertSource::DefaultValues => false,
-        hir::InsertSource::Values(rows) => rows.iter().flatten().any(has_subquery),
-    };
-    if values_have_subquery
-        || insert.returning.as_ref().is_some_and(|returning| {
-            returning
-                .outputs
-                .iter()
-                .any(|output| has_subquery(&output.expr))
-        })
-    {
+    // Like SQLite, legacy runs a RETURNING subquery again for each row;
+    // HIR runs an uncorrelated one only once.
+    if insert.returning.as_ref().is_some_and(|returning| {
+        returning
+            .outputs
+            .iter()
+            .any(|output| has_subquery(&output.expr))
+    }) {
         return Ok(true);
     }
     // Like legacy, OR IGNORE drops the UPSERT clauses.
@@ -336,24 +329,28 @@ pub(super) fn emit_insert(
             }
             program.emit_insn(Insn::EndCoroutine { yield_reg });
             program.preassign_label_to_next_insn(defined);
-            let next = program.allocate_label();
-            program.preassign_label_to_next_insn(next);
-            program.emit_insn(Insn::Yield {
-                yield_reg,
-                end_offset: done,
-                subtype_clear_start_reg: 0,
-                subtype_clear_count: 0,
-            });
-            row.emit(
+            // Like legacy and SQLite, the rows are computed before any is
+            // inserted when they read the target table or the INSERT fires
+            // triggers.
+            let target_table = target.resolved_table()?;
+            let reads_target = rows
+                .iter()
+                .flatten()
+                .any(|value| subquery_reads_table(document, value, target_table));
+            emit_coroutine_rows(
                 program,
-                &column_values,
-                rowid_value,
-                RowValues::Registers(values),
-                &index_cursors,
-                returning,
-                next,
+                insert,
+                &row,
+                RowSink {
+                    column_values: &column_values,
+                    rowid_value,
+                    index_cursors: &index_cursors,
+                    returning,
+                },
+                (yield_reg, values),
+                reads_target || !triggers.is_empty(),
+                done,
             )?;
-            program.emit_insn(Insn::Goto { target_pc: next });
         }
     }
     program.preassign_label_to_next_insn(done);
@@ -361,6 +358,27 @@ pub(super) fn emit_insert(
         returning.emit_rows(program);
     }
     Ok(())
+}
+
+/// Whether `expression` has a subquery that reads `table`.
+fn subquery_reads_table(
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    table: &hir::ResolvedTable,
+) -> bool {
+    let mut reads = false;
+    expression.for_each(&mut |expression| {
+        if let hir::Expr::Subquery(subquery) = expression {
+            let query = match subquery {
+                hir::SubqueryExpr::Scalar { query, .. }
+                | hir::SubqueryExpr::Row { query }
+                | hir::SubqueryExpr::Exists(query)
+                | hir::SubqueryExpr::In { query, .. } => *query,
+            };
+            reads |= document.query_reads_table(query, table);
+        }
+    });
+    reads
 }
 
 pub(super) fn insert_root(plan: &HirPlan) -> Result<&hir::Insert> {
@@ -425,10 +443,33 @@ fn emit_select_rows(
     )?;
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(defined);
-
-    let table = row.target.table;
     let reads_target = document.query_reads_table(query, row.target.resolved_table()?);
-    if !reads_target && row.triggers.is_empty() {
+    emit_coroutine_rows(
+        program,
+        insert,
+        row,
+        sink,
+        (yield_reg, values),
+        reads_target || !row.triggers.is_empty(),
+        done,
+    )
+}
+
+/// Insert each row a coroutine yields into `values`. With `use_temp`, every
+/// row is first copied into an ephemeral table, so that inserting cannot
+/// change the rows still to come.
+fn emit_coroutine_rows(
+    program: &mut ProgramBuilder,
+    insert: &hir::Insert,
+    row: &InsertRow<'_>,
+    sink: RowSink<'_, '_>,
+    (yield_reg, values): (usize, usize),
+    use_temp: bool,
+    done: BranchOffset,
+) -> Result<()> {
+    let width = insert.columns.len();
+    let table = row.target.table;
+    if !use_temp {
         let next = program.allocate_label();
         program.preassign_label_to_next_insn(next);
         program.emit_insn(Insn::Yield {
@@ -1859,6 +1900,21 @@ mod tests {
     }
 
     #[test]
+    fn values_reading_their_own_table_go_through_a_temp_table() {
+        let program =
+            emit("INSERT INTO items VALUES ((SELECT max(value) FROM items), 'x'), (2, 'y')");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::OpenEphemeral { .. })),
+            1
+        );
+        let program = emit("INSERT INTO items VALUES ((SELECT 1), 'x'), (2, 'y')");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::OpenEphemeral { .. })),
+            0
+        );
+    }
+
+    #[test]
     fn upsert_goes_through_hir() {
         for sql in [
             "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
@@ -1878,7 +1934,7 @@ mod tests {
     fn insert_that_needs_legacy_is_left_to_it() {
         for sql in [
             "INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
-            "INSERT INTO items VALUES ((SELECT 1), 'x')",
+            "INSERT INTO items VALUES (1, 'x') RETURNING (SELECT 1)",
         ] {
             let plan = analyze_plan(indexed_items_schema(), sql);
             let insert = insert_root(&plan).unwrap();
