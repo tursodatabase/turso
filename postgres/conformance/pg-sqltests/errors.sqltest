@@ -28,11 +28,8 @@ test error-aborts-rest-of-batch {
 }
 expect error {}
 
-# Schema databases are file-backed, so the schema table is dropped before each
-# create to keep repeated test runs independent of old sidecar files.
 test error-drop-type-used-by-table-in-other-schema {
     CREATE SCHEMA IF NOT EXISTS err_drop_type;
-    DROP TABLE IF EXISTS err_drop_type.t;
     CREATE TYPE mood AS ENUM ('happy', 'sad');
     CREATE TABLE err_drop_type.t (m mood);
     DROP TYPE mood;
@@ -41,7 +38,6 @@ expect error {}
 
 test error-drop-domain-used-by-table-in-other-schema {
     CREATE SCHEMA IF NOT EXISTS err_drop_domain;
-    DROP TABLE IF EXISTS err_drop_domain.t;
     CREATE DOMAIN pos AS integer CHECK (VALUE > 0);
     CREATE TABLE err_drop_domain.t (v pos);
     DROP DOMAIN pos;

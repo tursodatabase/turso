@@ -1,0 +1,319 @@
+# Schemas created with CREATE SCHEMA and the objects in them.
+
+@database :memory:
+
+test schema-qualified-table {
+    CREATE SCHEMA app;
+    CREATE TABLE app.items (id int, label text);
+    INSERT INTO app.items VALUES (1, 'a'), (2, 'b');
+    SELECT app.items.label, items.id FROM app.items ORDER BY id;
+}
+expect {
+    a|1
+    b|2
+}
+
+test schema-qualified-star {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (7);
+    SELECT app.t.* FROM app.t;
+}
+expect {
+    7
+}
+
+test same-table-name-in-two-schemas {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v text);
+    CREATE TABLE b.t (v text);
+    CREATE TABLE t (v text);
+    INSERT INTO a.t VALUES ('a');
+    INSERT INTO b.t VALUES ('b');
+    INSERT INTO t VALUES ('public');
+    SELECT v FROM a.t UNION ALL SELECT v FROM b.t UNION ALL SELECT v FROM public.t;
+}
+expect {
+    a
+    b
+    public
+}
+
+test update-and-delete-with-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1), (2);
+    UPDATE app.t SET x = t.x * 10 WHERE t.x = 1;
+    DELETE FROM app.t WHERE t.x = 2;
+    SELECT x FROM app.t;
+}
+expect {
+    10
+}
+
+test insert-select-between-schemas {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (x int);
+    CREATE TABLE b.t (x int);
+    INSERT INTO a.t VALUES (1), (2);
+    INSERT INTO b.t SELECT x * 10 FROM a.t;
+    SELECT x FROM b.t ORDER BY x;
+}
+expect {
+    10
+    20
+}
+
+test truncate-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    TRUNCATE app.t;
+    SELECT count(*) FROM app.t;
+}
+expect {
+    0
+}
+
+test rename-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    ALTER TABLE app.t RENAME TO u;
+    SELECT x FROM app.u;
+}
+expect {
+    1
+}
+
+test renamed-table-leaves-old-name {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    ALTER TABLE app.t RENAME TO u;
+    SELECT x FROM app.t;
+}
+expect error {}
+
+test create-table-in-missing-schema-errors {
+    CREATE TABLE missing_schema.t (x int);
+}
+expect error {}
+
+test index-names-are-per-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    CREATE INDEX t_x ON t (x);
+    DROP INDEX app.t_x;
+    DROP INDEX t_x;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test serial-columns-in-schema-and-public {
+    CREATE SCHEMA app;
+    CREATE TABLE t (id serial, v text);
+    CREATE TABLE app.t (id serial, v text);
+    INSERT INTO t (v) VALUES ('p1'), ('p2');
+    INSERT INTO app.t (v) VALUES ('a1');
+    SELECT id, v FROM t UNION ALL SELECT id, v FROM app.t ORDER BY v;
+}
+expect {
+    1|a1
+    1|p1
+    2|p2
+}
+
+test sequence-in-schema {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s START 5;
+    SELECT nextval('app.s');
+}
+expect {
+    5
+}
+
+test sequence-functions-in-schema {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s;
+    SELECT nextval('app.s');
+    SELECT setval('app.s', 10);
+    SELECT nextval('app.s');
+    SELECT currval('app.s');
+}
+expect {
+    1
+    10
+    11
+    11
+}
+
+test create-follows-search-path {
+    CREATE SCHEMA app;
+    SET search_path TO app, public;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    SET search_path TO public;
+    SELECT x FROM app.t;
+}
+expect {
+    1
+}
+
+test table-created-through-search-path-is-not-in-public {
+    CREATE SCHEMA app;
+    SET search_path TO app;
+    CREATE TABLE t (x int);
+    SET search_path TO public;
+    SELECT x FROM t;
+}
+expect error {}
+
+test create-skips-missing-schemas-in-search-path {
+    SET search_path TO missing_schema, public;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (3);
+    SELECT x FROM public.t;
+}
+expect {
+    3
+}
+
+test create-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO missing_schema;
+    CREATE TABLE t (x int);
+}
+expect error {}
+
+test cte-hides-table-of-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE app.demo (id int);
+    INSERT INTO app.demo VALUES (1);
+    SET search_path TO app;
+    WITH demo AS (SELECT 42 AS id) SELECT id FROM demo;
+}
+expect {
+    42
+}
+
+test cte-does-not-hide-table-that-dml-writes-to {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (v int);
+    CREATE TABLE t (v int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (1);
+    SET search_path TO app, public;
+    WITH t AS (SELECT 7 AS v) UPDATE t SET v = 2;
+    WITH t AS (SELECT 7 AS v) INSERT INTO t SELECT v FROM t;
+    WITH t AS (SELECT 1 AS v) DELETE FROM t WHERE v = 2;
+    SELECT 'app', v FROM app.t ORDER BY v;
+    SELECT 'public', v FROM public.t;
+}
+expect {
+    app|7
+    public|1
+}
+
+test view-keeps-the-table-it-was-created-with {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (v text);
+    INSERT INTO app.t VALUES ('app');
+    CREATE TABLE t (v text);
+    INSERT INTO t VALUES ('public');
+    SET search_path TO app, public;
+    CREATE VIEW v AS SELECT v FROM t;
+    SET search_path TO public;
+    SELECT v FROM app.v;
+}
+expect {
+    app
+}
+
+test foreign-key-to-table-found-through-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE app.parents (id int PRIMARY KEY, name text);
+    SET search_path TO app;
+    CREATE TABLE children (parent_id int REFERENCES parents (id));
+    INSERT INTO parents VALUES (1, 'p');
+    INSERT INTO children VALUES (1);
+    SET search_path TO public;
+    SELECT p.name FROM app.children c JOIN app.parents p ON p.id = c.parent_id;
+}
+expect {
+    p
+}
+
+test drop-table-if-exists-ignores-tables-outside-search-path {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE SCHEMA app;
+    SET search_path TO app;
+    DROP TABLE IF EXISTS t;
+    SET search_path TO public;
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test drop-schema-with-objects-errors {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    DROP SCHEMA app;
+}
+expect error {}
+
+test drop-schema-cascade-drops-its-objects {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id serial, x int);
+    CREATE VIEW app.v AS SELECT x FROM app.t;
+    CREATE SEQUENCE app.s;
+    CREATE INDEX t_x ON app.t (x);
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (5);
+    DROP SCHEMA app CASCADE;
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id serial, x int);
+    CREATE VIEW app.v AS SELECT x FROM app.t;
+    CREATE SEQUENCE app.s;
+    CREATE INDEX t_x ON app.t (x);
+    SELECT x FROM t;
+}
+expect {
+    5
+}
+
+test drop-schema-if-exists-of-missing-schema {
+    DROP SCHEMA IF EXISTS missing_schema;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test create-schema-rolls-back {
+    BEGIN;
+    CREATE SCHEMA app;
+    ROLLBACK;
+    CREATE TABLE app.t (x int);
+}
+expect error {}
+
+test drop-schema-rolls-back {
+    BEGIN;
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    SAVEPOINT before_drop;
+    DROP SCHEMA app CASCADE;
+    ROLLBACK TO SAVEPOINT before_drop;
+    SELECT x FROM app.t;
+}
+expect {
+    1
+}

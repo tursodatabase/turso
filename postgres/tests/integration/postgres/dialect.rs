@@ -487,6 +487,99 @@ fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
     };
 }
 
+/// The stored text of a table created through `search_path` names its
+/// schema and the schema of the table that its foreign key references, so
+/// that the database reads them back the same way when it is opened again.
+#[test]
+fn table_created_through_search_path_keeps_its_schemas_after_reopen() {
+    let db = TempDatabase::builder().build();
+    let path = db.path.to_str().unwrap().to_string();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.parents (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("SET search_path TO app").unwrap();
+    conn.execute("CREATE TABLE children (parent_id int REFERENCES parents (id))")
+        .unwrap();
+    conn.execute("INSERT INTO children VALUES (1)").unwrap();
+    drop(conn);
+    drop(db);
+
+    let (_io, db) = turso_pg::open_database(
+        &path,
+        None,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+
+    assert_eq!(
+        query_strings(&conn, "SELECT parent_id::text FROM app.children"),
+        ["1"]
+    );
+    assert!(conn.query("SELECT * FROM children").is_err());
+    let mut foreign_keys = conn
+        .inner()
+        .prepare("PRAGMA foreign_key_list('app.children')")
+        .unwrap();
+    let rows = foreign_keys.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][2].to_string(), "app.parents");
+}
+
+#[turso_macros::test]
+fn search_path_finds_table_created_by_another_connection(db: TempDatabase) {
+    let conn1 = db.connect_postgres();
+    let conn2 = db.connect_postgres();
+    conn1.execute("CREATE TABLE t (x text)").unwrap();
+    conn1.execute("INSERT INTO t VALUES ('public')").unwrap();
+    conn1.execute("CREATE SCHEMA app").unwrap();
+    conn2.execute("SET search_path TO app, public").unwrap();
+    let before_create = query_strings(&conn2, "SELECT x FROM t");
+
+    conn1.execute("CREATE TABLE app.t (x text)").unwrap();
+    conn1.execute("INSERT INTO app.t VALUES ('app')").unwrap();
+    let after_create = query_strings(&conn2, "SELECT x FROM t");
+
+    assert_eq!(
+        (before_create, after_create),
+        (vec!["public".to_string()], vec!["app".to_string()])
+    );
+}
+
+#[turso_macros::test]
+fn test_postgres_copy_from_file_into_table_of_schema(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let data = db.path.with_file_name("copy_into_schema.tsv");
+    std::fs::write(&data, "1\ta\n2\tb\n").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t (id int, v text)").unwrap();
+
+    conn.execute(format!("COPY app.t FROM '{}'", data.display()))
+        .unwrap();
+    conn.execute("SET search_path TO app").unwrap();
+    conn.execute(format!("COPY t FROM '{}'", data.display()))
+        .unwrap();
+
+    assert_eq!(
+        query_strings(&conn, "SELECT v FROM app.t ORDER BY v"),
+        ["a", "a", "b", "b"]
+    );
+}
+
+/// Runs `sql` and returns the first column of each row as text.
+fn query_strings(conn: &turso_pg::Connection, sql: &str) -> Vec<String> {
+    conn.query(sql)
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].to_string())
+        .collect()
+}
+
 #[turso_macros::test]
 fn test_postgres_drop_schema_public_no_cascade_error(db: TempDatabase) {
     let conn = db.connect_postgres();
