@@ -722,6 +722,108 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(mvcc)]
+fn test_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    for (limit, expected) in [
+        (Value::from_i64(0), Value::Null),
+        (Value::build_text("0"), Value::Null),
+        (Value::from_i64(1), Value::from_i64(5)),
+        (Value::from_i64(2), Value::from_i64(5)),
+        (Value::from_i64(-1), Value::from_i64(5)),
+    ] {
+        let mut stmt = conn.prepare("SELECT (SELECT 5 LIMIT ?)")?;
+        assert_eq!(stmt.parameters().count(), 1);
+        stmt.bind_at(1.try_into()?, limit)?;
+
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            Ok(())
+        })?;
+
+        assert_eq!(rows, vec![vec![expected]]);
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_correlated_scalar_subquery_limit_offset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT o.a, (SELECT i.a FROM t i WHERE i.a >= o.a ORDER BY i.a LIMIT ? OFFSET ?) FROM t o ORDER BY o.a",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(2), Value::from_i64(3)],
+            vec![Value::from_i64(3), Value::Null],
+        ]
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE pf_job_queue (id INTEGER PRIMARY KEY, queue TEXT, available_at INTEGER, locked_until INTEGER, claim_receipt TEXT, job_attempts INTEGER, job_retry_limit INTEGER, _deleted INTEGER);"
+)]
+fn test_update_where_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "INSERT INTO pf_job_queue VALUES (1, 'q', 10, NULL, NULL, 0, 3, 0), (2, 'q', 5, NULL, NULL, 0, 3, 0)",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "UPDATE \"pf_job_queue\"
+         SET \"job_attempts\" = \"job_attempts\" + 1,
+             \"locked_until\" = ?,
+             \"claim_receipt\" = ?
+         WHERE \"id\" = (
+           SELECT \"id\"
+           FROM \"pf_job_queue\"
+           WHERE \"queue\" = ?
+             AND \"available_at\" <= ?
+             AND (\"locked_until\" IS NULL OR \"locked_until\" <= ?)
+             AND \"job_attempts\" < \"job_retry_limit\"
+             AND \"_deleted\" = 0
+           ORDER BY \"job_attempts\", \"available_at\", \"id\"
+           LIMIT ?
+         )
+         RETURNING \"id\"",
+    )?;
+    assert_eq!(stmt.parameters().count(), 6);
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.bind_at(2.try_into()?, Value::build_text("receipt"))?;
+    stmt.bind_at(3.try_into()?, Value::build_text("q"))?;
+    stmt.bind_at(4.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(5.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(6.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+    assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
+
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"

@@ -8,8 +8,8 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_table_column, translate_expr_no_constant_opt, walk_expr,
+        BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -1908,7 +1908,14 @@ pub(crate) fn init_limit(
                 _ => {
                     let r = limit_ctx.reg_limit;
 
-                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        r,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                     program.emit_insn(Insn::MustBeInt {
                         reg: r,
                         target_pc: None,
@@ -1943,7 +1950,14 @@ pub(crate) fn init_limit(
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        offset_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
