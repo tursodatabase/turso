@@ -223,6 +223,12 @@ fn hir_expression_subqueries_match_legacy_rows() {
          LEFT JOIN c ON items.id = 1 WHERE c.x < 3) SELECT * FROM c",
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT tags.item_id FROM c \
          RIGHT JOIN tags ON tags.item_id = c.x + 2 WHERE c.x < 3 LIMIT 4) SELECT x FROM c",
+        // FROM subqueries and CTEs stream rows, so an outer LIMIT stops an
+        // endless recursive CTE.
+        "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq) \
+         SELECT x FROM seq LIMIT 5",
+        "SELECT a.id, b.v FROM items a JOIN (SELECT id + 1 AS k, value AS v FROM items) b \
+         ON b.k = a.id ORDER BY 1",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \

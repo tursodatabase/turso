@@ -349,6 +349,9 @@ pub struct ProgramBuilder {
     source_bindings: HashMap<SourceId, SourceBinding>,
     /// EXPLAIN QUERY PLAN row of each resolved HIR source's loop.
     source_explain_rows: HashMap<SourceId, usize>,
+    /// The fixed registers each HIR coroutine yields its row in, by yield
+    /// register.
+    coroutine_rows: HashMap<usize, usize>,
     /// Resolved HIR query blocks whose loops already have EXPLAIN QUERY
     /// PLAN rows.
     explained_blocks: HashSet<QueryBlockId>,
@@ -841,6 +844,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::default(),
             source_bindings: HashMap::default(),
             source_explain_rows: HashMap::default(),
+            coroutine_rows: HashMap::default(),
             explained_blocks: HashSet::default(),
             output_bindings: HashMap::default(),
             aggregate_result_registers: HashMap::default(),
@@ -1030,6 +1034,15 @@ impl ProgramBuilder {
 
     pub(crate) fn source_binding(&self, source: SourceId) -> Option<&SourceBinding> {
         self.source_bindings.get(&source)
+    }
+
+    /// Record the registers a HIR coroutine yields its row in.
+    pub(crate) fn bind_coroutine_row(&mut self, yield_reg: usize, row_start: usize) {
+        self.coroutine_rows.insert(yield_reg, row_start);
+    }
+
+    pub(crate) fn coroutine_row(&self, yield_reg: usize) -> Option<usize> {
+        self.coroutine_rows.get(&yield_reg).copied()
     }
 
     pub(crate) fn bind_output(&mut self, output: OutputId, register: usize) {

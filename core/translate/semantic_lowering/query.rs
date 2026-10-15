@@ -2158,7 +2158,7 @@ fn emit_hir_deduplicated_rows(
             default: None,
         });
     }
-    emit_columns_to_destination(program, destination, columns, index.columns.len())?;
+    emit_hir_row_to_destination(program, destination, columns, index.columns.len())?;
     emit_after_row(
         program,
         limit,
@@ -2215,7 +2215,7 @@ fn emit_hir_intersect_rows(
             default: None,
         });
     }
-    emit_columns_to_destination(program, destination, columns, index.columns.len())?;
+    emit_hir_row_to_destination(program, destination, columns, index.columns.len())?;
     emit_after_row(
         program,
         limit,
@@ -2399,6 +2399,8 @@ fn hir_compound_order_position(query: &hir::Query, expression: &hir::Expr) -> Re
 
 enum HirLoopAdvance {
     None,
+    /// Resume the coroutine for its next row.
+    Coroutine,
     Cursor {
         direction: IterationDirection,
         fullscan: bool,
@@ -2436,6 +2438,15 @@ struct PreparedHirRegistersLoop<'a> {
     source: &'a hir::Source,
 }
 
+/// A FROM subquery or CTE that runs as a coroutine: the loop resumes it for
+/// each row instead of reading a materialized table, so an outer LIMIT can
+/// stop it early, as in legacy.
+struct PreparedHirCoroutineLoop<'a> {
+    source: &'a hir::Source,
+    yield_reg: usize,
+    start: BranchOffset,
+}
+
 #[derive(Clone, Copy)]
 enum HirMaterializedQuery {
     Derived(QueryId),
@@ -2455,6 +2466,7 @@ enum PreparedHirLoop<'a> {
     Virtual(PreparedHirVirtualLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
+    Coroutine(PreparedHirCoroutineLoop<'a>),
 }
 
 impl PreparedHirLoop<'_> {
@@ -2463,7 +2475,7 @@ impl PreparedHirLoop<'_> {
             Self::BTree(prepared) => Some(prepared.cursor),
             Self::Virtual(prepared) => Some(prepared.cursor),
             Self::Materialized(prepared) => Some(prepared.cursor),
-            Self::Registers(_) => None,
+            Self::Registers(_) | Self::Coroutine(_) => None,
         }
     }
 
@@ -2472,7 +2484,7 @@ impl PreparedHirLoop<'_> {
             Self::BTree(prepared) => prepared.table_cursor,
             Self::Virtual(_) => None,
             Self::Materialized(_) => None,
-            Self::Registers(_) => None,
+            Self::Registers(_) | Self::Coroutine(_) => None,
         }
     }
 }
@@ -3174,7 +3186,13 @@ fn emit_btree_loops(
     let prepared_loops = block_plan
         .loops
         .iter()
-        .map(|planned_loop| prepare_hir_loop(program, plan, planned_loop))
+        .map(|planned_loop| {
+            let streams = block
+                .from
+                .as_ref()
+                .is_some_and(|from| hir_loop_streams(document, from, planned_loop));
+            prepare_hir_loop(program, plan, planned_loop, streams)
+        })
         .collect::<Result<Vec<_>>>()?;
     let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(_))
         .then(|| {
@@ -3407,7 +3425,7 @@ impl HirLoopNest<'_, '_> {
                     );
                     register_bindings.push((registers.source.id, original));
                 }
-                PreparedHirLoop::Virtual(_) => {
+                PreparedHirLoop::Virtual(_) | PreparedHirLoop::Coroutine(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -3563,7 +3581,9 @@ fn prepare_hir_right_outer_join(
             (table, None)
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
-        PreparedHirLoop::Virtual(_) | PreparedHirLoop::Registers(_) => {
+        PreparedHirLoop::Virtual(_)
+        | PreparedHirLoop::Registers(_)
+        | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
                 "HIR RIGHT or FULL JOIN source {source} has no rowids"
             )));
@@ -3892,6 +3912,11 @@ fn hir_loop_explain(
         }
     };
     let join = hir_loop_explain_join(document, from, source.id);
+    let exec = if hir_loop_streams(document, from, planned_loop) {
+        EqpSubqueryExec::Coroutine
+    } else {
+        EqpSubqueryExec::Materialized
+    };
     let subquery = |cte: Option<hir::CteId>, recursive| EqpDetail::Scan {
         table: table.clone(),
         index: None,
@@ -3899,7 +3924,7 @@ fn hir_loop_explain(
         backwards: false,
         join,
         subquery: Some(EqpSubquery {
-            exec: EqpSubqueryExec::Materialized,
+            exec,
             cte_id: cte.map(hir::CteId::index),
             recursive,
         }),
@@ -4014,11 +4039,136 @@ fn prepare_hir_loop<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,
+    streams: bool,
 ) -> Result<PreparedHirLoop<'a>> {
     // A subquery's own rows go under its loop's row.
     program.with_source_explain_parent(planned_loop.source, |program| {
-        prepare_hir_loop_unexplained(program, plan, planned_loop)
+        if streams {
+            prepare_hir_coroutine_loop(program, plan, planned_loop)
+        } else {
+            prepare_hir_loop_unexplained(program, plan, planned_loop)
+        }
     })
+}
+
+/// Whether a FROM subquery or CTE runs as a coroutine, as in legacy, so the
+/// outer loop pulls its rows on demand. It is materialized instead when
+/// several references share it, when it is hinted MATERIALIZED, and in a
+/// block with an outer join, whose NULL rows and unmatched-row pass need a
+/// table.
+fn hir_loop_streams(
+    document: &HirDocument,
+    from: &hir::From,
+    planned_loop: &HirPlannedLoop,
+) -> bool {
+    if hir_from_has_outer_join(document, from) {
+        return false;
+    }
+    match &planned_loop.access {
+        HirSourceAccess::Derived { .. }
+        | HirSourceAccess::Cte {
+            materialization: HirCteMaterialization::PerReference,
+            ..
+        } => true,
+        HirSourceAccess::RecursiveCte { cte } => {
+            let references = document
+                .sources
+                .iter()
+                .filter(|source| matches!(source.kind, hir::SourceKind::Cte(id) if id == *cte))
+                .count();
+            references == 1
+                && document
+                    .cte(*cte)
+                    .is_some_and(|cte| cte.materialized != turso_parser::ast::Materialized::Yes)
+        }
+        _ => false,
+    }
+}
+
+fn hir_from_has_outer_join(document: &HirDocument, from: &hir::From) -> bool {
+    std::iter::once(from.first)
+        .chain(from.joins.iter().map(|join| join.right))
+        .any(|source| {
+            matches!(
+                document.source(source).map(|source| &source.kind),
+                Some(hir::SourceKind::FromGroup(group)) if hir_from_has_outer_join(document, &group.from)
+            )
+        })
+        || from.joins.iter().any(|join| {
+            matches!(
+                join.kind,
+                hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+            )
+        })
+}
+
+/// Define the coroutine of a FROM subquery or recursive CTE. Its body is
+/// skipped here and runs each time the loop resumes it; the loop reads the
+/// yielded row from registers.
+fn prepare_hir_coroutine_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    planned_loop: &'a HirPlannedLoop,
+) -> Result<PreparedHirLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(planned_loop.source).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR coroutine loop references missing source {}",
+            planned_loop.source
+        ))
+    })?;
+    let yield_reg = program.alloc_register();
+    let start = program.allocate_label();
+    let body_end = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: body_end,
+        start_offset: start,
+    });
+    program.preassign_label_to_next_insn(start);
+    let destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: start,
+    };
+    let row = match &planned_loop.access {
+        HirSourceAccess::Derived { query } | HirSourceAccess::Cte { query, .. } => {
+            let row = program.alloc_registers(source.columns.len().max(1));
+            program.bind_coroutine_row(yield_reg, row);
+            emit_planned_query_body(program, plan, *query, &destination)?;
+            row
+        }
+        HirSourceAccess::RecursiveCte { cte } => {
+            let definition = document.cte(*cte).ok_or_else(|| {
+                LimboError::InternalError(format!("HIR references missing recursive CTE {cte}"))
+            })?;
+            let hir::CteBody::Recursive(recursive) = &definition.body else {
+                return Err(LimboError::InternalError(format!(
+                    "HIR CTE {cte} is not recursive"
+                )));
+            };
+            emit_hir_recursive_cte(program, plan, definition, recursive, &destination)?
+        }
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "HIR source {} cannot run as a coroutine",
+                planned_loop.source
+            )))
+        }
+    };
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(body_end);
+    program.bind_source(
+        source.id,
+        SourceBinding::Registers {
+            start: row,
+            rowid: None,
+        },
+    );
+    Ok(PreparedHirLoop::Coroutine(PreparedHirCoroutineLoop {
+        source,
+        yield_reg,
+        start,
+    }))
 }
 
 fn prepare_hir_loop_unexplained<'a>(
@@ -4742,6 +4892,32 @@ fn start_hir_loop(
         PreparedHirLoop::BTree(prepared) => {
             start_hir_btree_loop(program, document, prepared, left_join)
         }
+        PreparedHirLoop::Coroutine(prepared) => {
+            let loop_start = program.allocate_label();
+            let next = program.allocate_label();
+            let exhausted = program.allocate_label();
+            // An inner loop runs the coroutine again for each outer row.
+            program.emit_insn(Insn::InitCoroutine {
+                yield_reg: prepared.yield_reg,
+                jump_on_definition: BranchOffset::Offset(0),
+                start_offset: prepared.start,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::Yield {
+                yield_reg: prepared.yield_reg,
+                end_offset: exhausted,
+                subtype_clear_start_reg: 0,
+                subtype_clear_count: 0,
+            });
+            Ok(HirBtreeLoop {
+                cursor: None,
+                loop_start,
+                next,
+                exhausted,
+                advance: HirLoopAdvance::Coroutine,
+                left_join,
+            })
+        }
         PreparedHirLoop::Virtual(prepared) => {
             start_hir_virtual_loop(program, document, prepared, left_join)
         }
@@ -5057,6 +5233,9 @@ fn close_hir_btree_loop(
     program.preassign_label_to_next_insn(hir_loop.next);
     match &hir_loop.advance {
         HirLoopAdvance::None => {}
+        HirLoopAdvance::Coroutine => program.emit_insn(Insn::Goto {
+            target_pc: hir_loop.loop_start,
+        }),
         HirLoopAdvance::Cursor {
             direction,
             fullscan,
@@ -5416,7 +5595,7 @@ fn emit_hir_sorter_rows(
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
     emit_array_results(program, document, output_definitions, outputs);
-    emit_columns_to_destination(program, destination, outputs, output_definitions.len())?;
+    emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
         limit,
@@ -5685,7 +5864,7 @@ fn emit_query_row_with_inputs<'expr>(
             done,
         } => {
             emit_before_row(program, limit, skip_row);
-            emit_columns_to_destination(program, destination, start, outputs.len())?;
+            emit_hir_row_to_destination(program, destination, start, outputs.len())?;
             emit_after_row(
                 program,
                 limit,
@@ -6256,6 +6435,29 @@ fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool
         }
         _ => false,
     }
+}
+
+/// Send one row to `destination`. The reader of a coroutine reads its row
+/// from fixed registers, so the row is copied there first.
+fn emit_hir_row_to_destination(
+    program: &mut ProgramBuilder,
+    destination: &QueryDestination,
+    start: usize,
+    count: usize,
+) -> Result<()> {
+    if let QueryDestination::CoroutineYield { yield_reg, .. } = destination {
+        if let Some(row) = program.coroutine_row(*yield_reg) {
+            if row != start && count > 0 {
+                program.emit_insn(Insn::Copy {
+                    src_reg: start,
+                    dst_reg: row,
+                    extra_amount: count - 1,
+                });
+            }
+            return emit_columns_to_destination(program, destination, row, count);
+        }
+    }
+    emit_columns_to_destination(program, destination, start, count)
 }
 
 fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> DestinationBinding {
@@ -8549,7 +8751,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_derived_table_materializes_once_and_scans_its_hir_query() {
+    fn planned_derived_table_streams_its_hir_query_as_a_coroutine() {
         let plan = analyze_plan(
             indexed_items_schema(),
             "SELECT d.value \
@@ -8575,51 +8777,71 @@ mod tests {
         emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
             .expect("derived-table query emits");
 
-        let SourceBinding::BTree {
-            scan_cursor,
-            table_cursor: None,
-        } = program
-            .source_binding(planned_loop.source)
-            .copied()
-            .expect("derived source is bound")
-        else {
-            panic!("materialized derived source uses one table cursor");
-        };
-        let position = |matches: &dyn Fn(&Insn) -> bool| {
+        assert_ne!(derived_query, query);
+        assert_streams_as_coroutine(&program, planned_loop.source);
+    }
+
+    /// The source reads the row its coroutine yields: the coroutine is
+    /// defined, then started and resumed by the loop, which emits the result.
+    fn assert_streams_as_coroutine(program: &ProgramBuilder, source: SourceId) {
+        assert!(matches!(
+            program.source_binding(source),
+            Some(SourceBinding::Registers { rowid: None, .. })
+        ));
+        let positions = |matches: &dyn Fn(&Insn) -> bool| {
             program
                 .insns
                 .iter()
-                .position(|(insn, _)| matches(insn))
-                .expect("expected instruction is emitted")
+                .enumerate()
+                .filter_map(|(position, (insn, _))| matches(insn).then_some(position))
+                .collect::<Vec<_>>()
         };
-        let once = position(&|insn| matches!(insn, Insn::Once { .. }));
-        let open = position(
-            &|insn| matches!(insn, Insn::OpenEphemeral { cursor_id, is_table: true } if *cursor_id == scan_cursor),
-        );
-        let insert =
-            position(&|insn| matches!(insn, Insn::Insert { cursor, .. } if *cursor == scan_cursor));
-        let rewind = program
+        let init = positions(&|insn| matches!(insn, Insn::InitCoroutine { .. }));
+        let end = positions(&|insn| matches!(insn, Insn::EndCoroutine { .. }));
+        let yields = positions(&|insn| matches!(insn, Insn::Yield { .. }));
+        let result = positions(&|insn| matches!(insn, Insn::ResultRow { .. }));
+        let [define, start] = init.as_slice() else {
+            panic!("the coroutine is defined and started once each: {init:?}");
+        };
+        let [end] = end.as_slice() else {
+            panic!("the coroutine has one end");
+        };
+        assert!(define < end && end < start);
+        assert!(yields
+            .iter()
+            .any(|position| define < position && position < end));
+        assert!(yields.iter().any(|position| start < position));
+        assert!(result.iter().all(|position| start < position));
+        assert!(!program
             .insns
             .iter()
-            .enumerate()
-            .filter_map(|(position, (insn, _))| {
-                matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == scan_cursor)
-                    .then_some(position)
-            })
-            .last()
-            .expect("materialized table is scanned");
-        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 1, .. }));
-        let next = position(
-            &|insn| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == scan_cursor),
-        );
-
-        assert_ne!(derived_query, query);
-        assert!(once < open && open < insert && insert < rewind);
-        assert!(rewind < result && result < next);
+            .any(|(insn, _)| matches!(insn, Insn::OpenEphemeral { is_table: true, .. })));
     }
 
     #[test]
-    fn planned_single_reference_cte_materializes_its_hir_query() {
+    fn planned_derived_table_in_an_outer_join_is_materialized() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT d.value FROM items AS o \
+             LEFT JOIN (SELECT value FROM items NOT INDEXED WHERE value > 1) AS d \
+             ON d.value = o.value",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("outer-join derived-table query emits");
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenEphemeral { is_table: true, .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::InitCoroutine { .. })));
+    }
+
+    #[test]
+    fn planned_single_reference_cte_streams_its_hir_query() {
         let plan = analyze_plan(
             indexed_items_schema(),
             "WITH chosen AS (\
@@ -8649,36 +8871,8 @@ mod tests {
         emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
             .expect("single-reference CTE query emits");
 
-        let SourceBinding::BTree {
-            scan_cursor,
-            table_cursor: None,
-        } = program
-            .source_binding(planned_loop.source)
-            .copied()
-            .expect("CTE source is bound")
-        else {
-            panic!("materialized CTE source uses one table cursor");
-        };
-        let position = |matches: &dyn Fn(&Insn) -> bool| {
-            program
-                .insns
-                .iter()
-                .position(|(insn, _)| matches(insn))
-                .expect("expected instruction is emitted")
-        };
-        let once = position(&|insn| matches!(insn, Insn::Once { .. }));
-        let open = position(
-            &|insn| matches!(insn, Insn::OpenEphemeral { cursor_id, is_table: true } if *cursor_id == scan_cursor),
-        );
-        let insert =
-            position(&|insn| matches!(insn, Insn::Insert { cursor, .. } if *cursor == scan_cursor));
-        let rewind = position(
-            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == scan_cursor),
-        );
-        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 1, .. }));
-
         assert_ne!(*cte_query, query);
-        assert!(once < open && open < insert && insert < rewind && rewind < result);
+        assert_streams_as_coroutine(&program, planned_loop.source);
     }
 
     #[test]
@@ -8844,7 +9038,12 @@ mod tests {
             program.source_binding(*source),
             Some(SourceBinding::Registers { .. })
         )));
-        assert!(program.hir_materialized_cte(cte).is_some());
+        // A single reference streams the recursion instead of sharing a table.
+        assert!(program.hir_materialized_cte(cte).is_none());
+        assert!(matches!(
+            program.source_binding(planned_loop.source),
+            Some(SourceBinding::Registers { .. })
+        ));
         assert_eq!(
             program
                 .insns
