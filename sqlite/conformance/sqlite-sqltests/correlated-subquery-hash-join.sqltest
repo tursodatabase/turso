@@ -248,3 +248,40 @@ expect {
     9|7|0|SEARCH q USING INDEX q_x (x=?)
     10|7|0|SEARCH p USING COVERING INDEX ephemeral_p_t3 (y=?)
 }
+
+# The materialized hash build input has a hash join of its own. Its build
+# filter must not read the EXISTS term, because the subquery of that term
+# reads a table outside the input. ANALYZE runs before most of the inserts,
+# so the planner sees almost empty tables and picks this plan.
+setup nested-hash-join-in-build-input-schema {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t5_c ON t5(c);
+    INSERT INTO t5 VALUES (NULL, NULL, 1), (1, 1, 1), (NULL, 3, 3);
+    INSERT INTO t0 VALUES (2, NULL, 3), (NULL, 1, 2), (1, NULL, 3), (3, NULL, 3);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    INSERT INTO t1 VALUES (2, 0, 0), (2, 5, 5);
+    INSERT INTO t3 VALUES (0, 0, 2), (0, 0, 1);
+    INSERT INTO t4 VALUES (2, 0, 0);
+}
+
+@setup nested-hash-join-in-build-input-schema
+test correlated-exists-reads-table-outside-build-input-with-nested-hash-join {
+    SELECT t0.a, t1.b, t3.c, t5.c
+    FROM t0
+    LEFT JOIN t1 ON t1.a = 2
+    JOIN t3 ON t3.c = t0.a
+    JOIN t5 ON t5.c = t0.c
+    WHERE EXISTS (SELECT 1 FROM t4 WHERE t4.a = t1.a)
+    ORDER BY 1, 2;
+}
+expect {
+    1|0|1|3
+    1|5|1|3
+    2|0|2|3
+    2|5|2|3
+}
