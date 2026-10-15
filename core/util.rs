@@ -323,8 +323,11 @@ pub fn parse_schema_rows(
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
-    fn parse(s: &str) -> Option<Either<i64, f64>> {
-        if let Ok(i) = s.parse::<i64>() {
+    // i128 rather than i64: an integer literal such as 9223372036854775808 does not
+    // fit in i64 but becomes the integer i64::MIN under unary minus, so it must not
+    // compare equal to the float 9.223372036854776e18.
+    fn parse(s: &str) -> Option<Either<i128, f64>> {
+        if let Ok(i) = s.parse::<i128>() {
             Some(Either::Left(i))
         } else if let Ok(f) = s.parse::<f64>() {
             Some(Either::Right(f))
