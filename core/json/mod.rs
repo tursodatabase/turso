@@ -775,44 +775,54 @@ fn json_path_from_db_value<'a>(
     strict: bool,
 ) -> crate::Result<Option<JsonPath<'a>>> {
     let path = path.as_value_ref();
-    let json_path = if strict {
-        match path {
-            ValueRef::Text(t) => json_path(t.as_str())?,
-            ValueRef::Null => return Ok(None),
-            _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
+    let text = match json_path_text(path) {
+        Some(Cow::Borrowed(text)) => text,
+        Some(Cow::Owned(text)) => {
+            return Ok(Some(json_path_from_text(&text, strict)?.into_owned()));
         }
-    } else {
-        match path {
-            ValueRef::Text(t) => {
-                if t.as_str().starts_with("$") {
-                    json_path(t.as_str())?
-                } else {
-                    JsonPath {
-                        elements: vec![
-                            PathElement::Root(),
-                            PathElement::Key(Cow::Borrowed(t.as_str()), true),
-                        ],
-                    }
-                }
+        None => match path {
+            ValueRef::Null => return Ok(None),
+            ValueRef::Numeric(Numeric::Integer(i)) if !strict => {
+                return Ok(Some(JsonPath {
+                    elements: vec![
+                        PathElement::Root(),
+                        PathElement::ArrayLocator(Some(i as i32)),
+                    ],
+                }));
             }
-            ValueRef::Null => return Ok(None),
-            ValueRef::Numeric(Numeric::Integer(i)) => JsonPath {
-                elements: vec![
-                    PathElement::Root(),
-                    PathElement::ArrayLocator(Some(i as i32)),
-                ],
-            },
-            ValueRef::Numeric(Numeric::Float(f)) => JsonPath {
-                elements: vec![
-                    PathElement::Root(),
-                    PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
-                ],
-            },
+            ValueRef::Numeric(Numeric::Float(f)) if !strict => {
+                return Ok(Some(JsonPath {
+                    elements: vec![
+                        PathElement::Root(),
+                        PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
+                    ],
+                }));
+            }
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
-        }
+        },
     };
+    Ok(Some(json_path_from_text(text, strict)?))
+}
 
-    Ok(Some(json_path))
+/// Like SQLite, a BLOB path is read as text.
+pub(crate) fn json_path_text(path: ValueRef<'_>) -> Option<Cow<'_, str>> {
+    match path {
+        ValueRef::Text(t) => Some(Cow::Borrowed(t.as_str())),
+        ValueRef::Blob(b) => Some(String::from_utf8_lossy(b)),
+        _ => None,
+    }
+}
+
+fn json_path_from_text(text: &str, strict: bool) -> crate::Result<JsonPath<'_>> {
+    if strict || text.starts_with('$') {
+        return json_path(text);
+    }
+    Ok(JsonPath {
+        elements: vec![
+            PathElement::Root(),
+            PathElement::Key(Cow::Borrowed(text), true),
+        ],
+    })
 }
 
 /// Parses the path of a json_set, json_insert or json_replace path/value pair.
@@ -823,10 +833,8 @@ fn json_edit_path<'a>(
     path: &'a (impl AsValueRef + 'a),
     value: &impl AsValueRef,
 ) -> crate::Result<Option<JsonPath<'a>>> {
-    if let ValueRef::Text(text) = path.as_value_ref() {
-        if text.as_str().starts_with('$') {
-            ensure_blob_arg_is_jsonb(value.as_value_ref())?;
-        }
+    if json_path_text(path.as_value_ref()).is_some_and(|text| text.starts_with('$')) {
+        ensure_blob_arg_is_jsonb(value.as_value_ref())?;
     }
     json_path_from_db_value(path, true)
 }

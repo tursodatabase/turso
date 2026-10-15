@@ -1784,6 +1784,85 @@ expect error {
     .*JSON cannot hold BLOB values.*
 }
 
+# x'245b305d' = '$[0]', x'245b315d' = '$[1]', x'61' = 'a', x'2461' = '$a'
+test json_set_blob_path {
+    SELECT json_set('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_insert_blob_path {
+    SELECT json_insert('[1]', x'245b315d', 5);
+}
+expect {
+    [1,5]
+}
+
+test json_replace_blob_path {
+    SELECT json_replace('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_set_blob_path_blob_value {
+    SELECT json_set('[1]', x'245b305d', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_remove_blob_path {
+    SELECT json_remove('[1,2]', x'245b305d');
+}
+expect {
+    [2]
+}
+
+test json_extract_blob_path {
+    SELECT json_extract('[1]', x'245b305d');
+}
+expect {
+    1
+}
+
+test json_extract_bad_blob_path {
+    SELECT json_extract('{"a":1}', x'2461');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test json_type_blob_path {
+    SELECT json_type('[1]', x'245b305d');
+}
+expect {
+    integer
+}
+
+test json_arrow_blob_path {
+    SELECT '[1]' -> x'245b305d', '{"a":1}' ->> x'61';
+}
+expect {
+    1|1
+}
+
+test json_each_blob_path {
+    SELECT key, value FROM json_each('[1,[2]]', x'245b315d');
+}
+expect {
+    0|2
+}
+
+test json_tree_blob_path {
+    SELECT key, value FROM json_tree('[1,[2]]', x'245b315d');
+}
+expect {
+    1|[2]
+    0|2
+}
+
 test json_set_field_empty_object {
     SELECT json_set('{}', '$.field', 'value');
 }
