@@ -713,12 +713,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
 
                 // Apply time offset if present
                 if let Some(t_val) = time_str {
-                    let mut tx = DateTime::default();
-                    if parse_hh_mm_ss(t_val, &mut tx) {
-                        tx.compute_jd();
-                        let ms = (tx.h as i64 * 3600000)
-                            + (tx.min as i64 * 60000)
-                            + (tx.s * 1000.0) as i64;
+                    if let Some(ms) = parse_time_of_day_ms(t_val) {
                         p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
                     } else {
                         // If time parsing failed, the whole modifier is invalid
@@ -736,15 +731,12 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
 
     // Case 2: HH:MM:SS Arithmetic
     if z.contains(':') {
-        let mut tx = DateTime::default();
         let time_str = if z.starts_with('+') || z.starts_with('-') {
             &z[1..]
         } else {
             z
         };
-        if parse_hh_mm_ss(time_str, &mut tx) {
-            tx.compute_jd();
-            let ms = (tx.h as i64 * 3600000) + (tx.min as i64 * 60000) + (tx.s * 1000.0) as i64;
+        if let Some(ms) = parse_time_of_day_ms(time_str) {
             p.compute_jd();
             p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
             p.clear_ymd_hms_tz();
@@ -862,6 +854,17 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     }
 
     Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
+}
+
+/// Parses `HH:MM[:SS[.SSS]]` and returns it as milliseconds since midnight.
+/// Like SQLite, whole days are dropped, so `24:00` is 0 rather than a full day.
+fn parse_time_of_day_ms(z: &str) -> Option<i64> {
+    let mut tx = DateTime::default();
+    if !parse_hh_mm_ss(z, &mut tx) {
+        return None;
+    }
+    tx.compute_jd();
+    Some((tx.i_jd - 43_200_000) % JD_TO_MS)
 }
 
 pub fn exec_datetime_general<I, E, V>(clock: &dyn Clock, values: I, func_type: &str) -> Value
