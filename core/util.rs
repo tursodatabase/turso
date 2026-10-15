@@ -4054,14 +4054,6 @@ fn rewrite_one_select_column_refs_scoped(
             window_clause,
             ..
         } => {
-            // Check if FROM clause references the target table to determine
-            // whether unqualified Expr::Id should be renamed in this scope
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
                     from,
@@ -4072,6 +4064,14 @@ fn rewrite_one_select_column_refs_scoped(
                     target_qualifiers,
                 );
             }
+
+            // Check if FROM clause references the target table to determine
+            // whether unqualified Expr::Id should be renamed in this scope
+            let local = from_clause_target_qualifiers(from, target_table);
+            let added = extend_qualifiers_scoped(target_qualifiers, &local);
+
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
             if let Some(ref mut wc) = where_clause {
                 rename_identifiers_scoped_inner(
                     wc,
@@ -4250,30 +4250,27 @@ fn rewrite_from_clause_column_refs_scoped(
     new_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
+    let outer_len = target_qualifiers.len();
+    let target_table_norm = normalize_ident(target_table);
 
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    rewrite_select_table_entry_column_refs_scoped(
-        &mut from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        new_col,
-        target_qualifiers,
-    );
-    for join in &mut from.joins {
+    for (table, constraint) in std::iter::once((&mut *from.select, None)).chain(
+        from.joins
+            .iter_mut()
+            .map(|join| (&mut *join.table, join.constraint.as_mut())),
+    ) {
         rewrite_select_table_entry_column_refs_scoped(
-            &mut join.table,
+            table,
             target_table,
             trigger_table,
             old_col,
             new_col,
-            target_qualifiers,
+            &mut from_entry_visible_qualifiers(table, target_qualifiers, outer_len),
         );
-        if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
+        push_from_entry_target_qualifiers(table, &target_table_norm, target_qualifiers);
+
+        if let Some(ast::JoinConstraint::On(expr)) = constraint {
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
             rename_identifiers_scoped_inner(
                 expr,
                 target_table,
@@ -4285,7 +4282,37 @@ fn rewrite_from_clause_column_refs_scoped(
             );
         }
     }
-    target_qualifiers.truncate(target_qualifiers.len() - added);
+    target_qualifiers.truncate(outer_len);
+}
+
+/// A plain FROM subquery only sees the outer query; LATERAL subqueries and
+/// table-valued function arguments also see the FROM entries to their left.
+fn from_entry_visible_qualifiers(
+    table: &ast::SelectTable,
+    target_qualifiers: &[String],
+    outer_len: usize,
+) -> Vec<String> {
+    match table {
+        ast::SelectTable::Select { lateral: false, .. } | ast::SelectTable::Sub(..) => {
+            target_qualifiers[..outer_len].to_vec()
+        }
+        _ => target_qualifiers.to_vec(),
+    }
+}
+
+fn push_from_entry_target_qualifiers(
+    table: &ast::SelectTable,
+    target_table_norm: &str,
+    target_qualifiers: &mut Vec<String>,
+) {
+    let mut table_qualifiers = Vec::new();
+    collect_target_qualifiers(
+        table,
+        target_table_norm,
+        &mut table_qualifiers,
+        &mut HashSet::default(),
+    );
+    extend_qualifiers_scoped(target_qualifiers, &table_qualifiers);
 }
 
 fn rewrite_select_table_entry_column_refs_scoped(
@@ -4423,12 +4450,6 @@ fn one_select_still_references_renamed_column(
             group_by,
             ..
         } => {
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
             let mut found = false;
             if let Some(from_clause) = from {
                 if from_clause_still_references_renamed_column(
@@ -4441,6 +4462,12 @@ fn one_select_still_references_renamed_column(
                     found = true;
                 }
             }
+
+            let local = from_clause_target_qualifiers(from, target_table);
+            let added = extend_qualifiers_scoped(target_qualifiers, &local);
+
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
             if !found {
                 if let Some(where_expr) = where_clause {
@@ -4683,52 +4710,43 @@ fn from_clause_still_references_renamed_column(
     old_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) -> bool {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
+    let outer_len = target_qualifiers.len();
+    let target_table_norm = normalize_ident(target_table);
 
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    let mut found = false;
-    if select_table_still_references_renamed_column(
-        &from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        target_qualifiers,
-    ) {
-        found = true;
-    }
-
-    if !found {
-        for join in &from.joins {
+    let found = std::iter::once((&*from.select, None))
+        .chain(
+            from.joins
+                .iter()
+                .map(|join| (&*join.table, join.constraint.as_ref())),
+        )
+        .any(|(table, constraint)| {
             if select_table_still_references_renamed_column(
-                &join.table,
+                table,
                 target_table,
                 trigger_table,
                 old_col,
-                target_qualifiers,
+                &mut from_entry_visible_qualifiers(table, target_qualifiers, outer_len),
             ) {
-                found = true;
-                break;
+                return true;
             }
-            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                if expr_still_references_renamed_column(
-                    expr,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    rename_unqualified,
-                    target_qualifiers,
-                ) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
+            push_from_entry_target_qualifiers(table, &target_table_norm, target_qualifiers);
 
-    target_qualifiers.truncate(target_qualifiers.len() - added);
+            let Some(ast::JoinConstraint::On(expr)) = constraint else {
+                return false;
+            };
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
+            expr_still_references_renamed_column(
+                expr,
+                target_table,
+                trigger_table,
+                old_col,
+                rename_unqualified,
+                target_qualifiers,
+            )
+        });
+
+    target_qualifiers.truncate(outer_len);
     found
 }
 
