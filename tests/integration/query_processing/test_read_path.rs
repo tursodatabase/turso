@@ -1158,3 +1158,41 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     assert_eq!(rows, expected);
     Ok(())
 }
+
+#[turso_macros::test(init_sql = "CREATE TABLE t (x INTEGER);")]
+fn test_inner_loop_subquery_is_filled_again_on_each_run(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u (y INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2)")?;
+    conn.execute("INSERT INTO u VALUES (10)")?;
+    let mut stmt = conn.prepare(
+        "SELECT t.x, b.m FROM t CROSS JOIN (SELECT max(y) + ?1 AS m FROM u) AS b ORDER BY t.x",
+    )?;
+
+    let mut runs = Vec::new();
+    for (added_row, offset) in [(None, 0), (Some(20), 5)] {
+        if let Some(y) = added_row {
+            conn.execute(format!("INSERT INTO u VALUES ({y})"))?;
+        }
+        stmt.reset()?;
+        stmt.bind_at(1.try_into()?, Value::from_i64(offset))?;
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((
+                row.get::<&Value>(0).unwrap().clone(),
+                row.get::<&Value>(1).unwrap().clone(),
+            ));
+            Ok(())
+        })?;
+        runs.push(rows);
+    }
+
+    let row = |x: i64, m: i64| (Value::from_i64(x), Value::from_i64(m));
+    assert_eq!(
+        runs,
+        vec![vec![row(1, 10), row(2, 10)], vec![row(1, 25), row(2, 25)],]
+    );
+    Ok(())
+}

@@ -51,6 +51,7 @@ fn bench_graph_queries(criterion: &mut Criterion) {
         gq_query!("f1_streak_current"),
         gq_query!("f2_streak_longest"),
         gq_query!("3_aggregate_or_in"),
+        gq_query!("g_cross_join_aggregate"),
     ];
 
     for (name, query) in queries.iter() {

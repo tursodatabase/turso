@@ -430,6 +430,19 @@ pub(super) fn emit_table_read_start(
                             });
                         }
                         Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
+                            if let Some(fill) =
+                                program.get_subquery_fill_subroutine(table.internal_id)
+                            {
+                                let after_fill = program.allocate_label();
+                                program.emit_insn(Insn::Once {
+                                    target_pc_when_reentered: after_fill,
+                                });
+                                program.emit_insn(Insn::Gosub {
+                                    target_pc: fill.start,
+                                    return_reg: fill.return_reg,
+                                });
+                                program.preassign_label_to_next_insn(after_fill);
+                            }
                             // Materialized CTE - scan the ephemeral table with Rewind/Next
                             if *iter_dir == IterationDirection::Backwards {
                                 program.emit_insn(Insn::Last {

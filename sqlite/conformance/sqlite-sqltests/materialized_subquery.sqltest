@@ -18,3 +18,274 @@ expect {
     2|1
     2|1
 }
+
+test inner-loop-subquery-runs-once {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    SELECT count(*), count(DISTINCT b.r)
+        FROM t1
+        CROSS JOIN (SELECT max(y) + random() AS r FROM t2) AS b;
+}
+expect {
+    3|1
+}
+
+test inner-loop-subquery-runs-once-left-join {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    SELECT count(*), count(DISTINCT b.r)
+        FROM t1
+        LEFT JOIN (SELECT max(y) + random() AS r FROM t2) AS b ON 1;
+}
+expect {
+    3|1
+}
+
+test inner-loop-not-materialized-cte-runs-once {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    WITH c AS NOT MATERIALIZED (SELECT max(y) + random() AS r FROM t2)
+    SELECT count(*), count(DISTINCT c.r) FROM t1 CROSS JOIN c;
+}
+expect {
+    3|1
+}
+
+test inner-loop-subquery-with-outer-reference-runs-per-row {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT t1.x,
+           (SELECT count(*)
+              FROM t2
+              CROSS JOIN (SELECT y FROM t2 AS t3 WHERE t3.y > t1.x) AS b)
+        FROM t1
+        ORDER BY t1.x;
+}
+expect {
+    1|6
+    2|3
+    3|3
+}
+
+test inner-loop-grouped-subquery-cross-join-aggregate {
+    CREATE TABLE t(d TEXT, kind TEXT, amount INT);
+    INSERT INTO t VALUES
+        ('2024-01-05', 'in', 10), ('2024-01-20', 'out', 5),
+        ('2024-02-03', 'in', 7), ('2024-03-11', 'in', 4),
+        ('2024-03-12', 'fee', 100);
+    SELECT avg(m.net), count(*)
+        FROM (SELECT strftime('%Y-%m', d) AS ym, sum(amount) AS net
+                FROM t WHERE kind IN ('in', 'out') GROUP BY ym) AS m
+        CROSS JOIN (SELECT min(d) AS first_day FROM t WHERE kind IN ('in', 'out')) AS b
+        WHERE m.ym > strftime('%Y-%m', b.first_day);
+}
+expect {
+    5.5|2
+}
+
+test inner-loop-cte-in-two-sibling-subqueries {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    WITH c AS (SELECT y FROM t2)
+    SELECT a.x, a.y, b.n
+        FROM (SELECT t1.x, c.y FROM t1 CROSS JOIN c) AS a
+        CROSS JOIN (SELECT count(*) AS n FROM t1 CROSS JOIN c) AS b
+        ORDER BY a.x, a.y;
+}
+expect {
+    1|10|4
+    1|20|4
+    2|10|4
+    2|20|4
+}
+
+test inner-loop-subquery-not-run-when-outer-loop-is-empty {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t2 VALUES (1);
+    SELECT * FROM t1 CROSS JOIN (SELECT abs(-9223372036854775807 - 1) AS v FROM t2) AS b;
+}
+expect {
+}
+
+test inner-loop-subquery-not-run-when-outer-rows-are-filtered {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (1);
+    SELECT t1.x FROM t1 CROSS JOIN (SELECT abs(-9223372036854775807 - y) AS v FROM t2) AS b
+        WHERE t1.x > 100;
+}
+expect {
+}
+
+test inner-loop-subquery-not-run-with-limit-zero {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (1);
+    SELECT * FROM t1 CROSS JOIN (SELECT json('[1,') AS j FROM t2) AS b LIMIT 0;
+}
+expect {
+}
+
+test inner-loop-subquery-left-join-reached-by-some-rows {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT t1.x, b.v FROM t1 LEFT JOIN (SELECT max(y) AS v FROM t2) AS b ON t1.x > 1
+        ORDER BY t1.x;
+}
+expect {
+    1|
+    2|10
+    3|10
+}
+
+test inner-loop-subquery-keeps-row-order {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT t1.x, group_concat(b.y)
+        FROM t1 CROSS JOIN (SELECT y FROM t2 ORDER BY y DESC) AS b
+        GROUP BY t1.x
+        ORDER BY t1.x;
+}
+expect {
+    1|10,2,1
+    2|10,2,1
+}
+
+test inner-loop-subquery-in-correlated-subquery {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT t1.x,
+           (SELECT count(*)
+              FROM t2
+              CROSS JOIN (SELECT v.y, (SELECT max(w.y) FROM t2 AS w WHERE w.y <= v.y) AS m
+                            FROM t2 AS v) AS b
+             WHERE t2.y > t1.x AND b.m > t1.x)
+        FROM t1
+        ORDER BY t1.x;
+}
+expect {
+    1|4
+    2|1
+    3|1
+}
+
+test inner-loop-subquery-in-exists-and-in {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT
+        (SELECT group_concat(x) FROM t1 WHERE EXISTS (
+            SELECT 1 FROM t2 CROSS JOIN (SELECT y AS z FROM t2) AS b
+             WHERE b.z = t1.x AND t2.y = 1)),
+        (SELECT group_concat(x) FROM t1 WHERE NOT EXISTS (
+            SELECT 1 FROM t2 CROSS JOIN (SELECT y AS z FROM t2 WHERE y > 1) AS b
+             WHERE b.z = t1.x)),
+        (SELECT group_concat(x) FROM t1 WHERE x IN (
+            SELECT b.z FROM t2 CROSS JOIN (SELECT y AS z FROM t2) AS b));
+}
+expect {
+    1,2|1,3|1,2
+}
+
+test inner-loop-subquery-right-join {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT a.x, b.y FROM t1 AS a RIGHT JOIN (SELECT y FROM t2) AS b ON a.x = b.y
+        ORDER BY 1, 2;
+}
+expect {
+    |10
+    1|1
+    2|2
+}
+
+test inner-loop-subquery-in-recursive-cte {
+    CREATE TABLE t2(y INT);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    WITH RECURSIVE r(n) AS (
+        SELECT 1
+        UNION ALL
+        SELECT n + b.s FROM r CROSS JOIN (SELECT count(*) AS s FROM t2) AS b WHERE n < 10
+    )
+    SELECT group_concat(n) FROM r;
+}
+expect {
+    1,4,7,10
+}
+
+test inner-loop-subquery-reads-table-written-by-insert {
+    CREATE TABLE t1(x INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t1 SELECT b.m + a.x FROM t1 AS a CROSS JOIN (SELECT max(x) AS m FROM t1) AS b;
+    SELECT group_concat(x) FROM (SELECT x FROM t1 ORDER BY x);
+}
+expect {
+    1,2,3,4,5,6
+}
+
+test inner-loop-subquery-reads-table-written-by-update {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    UPDATE t1 SET x = x + (SELECT b.m FROM t2 CROSS JOIN (SELECT max(x) AS m FROM t1) AS b
+                            WHERE t2.y = 1);
+    UPDATE t1 SET x = b.m + t1.x FROM t2 CROSS JOIN (SELECT max(x) AS m FROM t1) AS b
+        WHERE t2.y = t1.x - 3;
+    SELECT group_concat(x) FROM (SELECT x FROM t1 ORDER BY x);
+}
+expect {
+    6,10,11
+}
+
+test inner-loop-subquery-reads-table-written-by-delete {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    DELETE FROM t1 WHERE x < (SELECT avg(b.m) FROM t2 CROSS JOIN (SELECT max(x) AS m FROM t1) AS b);
+    SELECT group_concat(x) FROM t1;
+}
+expect {
+    3
+}
+
+test inner-loop-subquery-in-trigger-sees-each-firing {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    CREATE TABLE log(v INT);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN
+        INSERT INTO log
+            SELECT b.c FROM t2 CROSS JOIN (SELECT count(*) AS c FROM t1) AS b WHERE t2.y = 1;
+    END;
+    INSERT INTO t1 VALUES (7);
+    INSERT INTO t1 VALUES (8);
+    INSERT INTO t1 VALUES (9), (10);
+    SELECT group_concat(v) FROM log;
+}
+expect {
+    1,2,3,4
+}
