@@ -24,11 +24,64 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
+    /// The triggers on `table` that `selected` accepts, frozen. Like legacy,
+    /// these are the table's own database's triggers, then temp triggers for
+    /// it: those that name the table's database, or name no database while
+    /// temp has no table of that name.
+    pub(super) fn table_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+        selected: impl Fn(&crate::schema::Trigger) -> bool,
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
+        let database = table
+            .database()
+            .expect("a DML target table must have an owning database");
+        let name = table.value().get_name();
+        let mut triggers = self
+            .context()
+            .schema(database)?
+            .get_triggers_for_table(name)
+            .filter(|trigger| trigger_targets_database(trigger, database) && selected(trigger))
+            .cloned()
+            .map(|trigger| (database, trigger))
+            .collect::<Vec<_>>();
+        let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
+        if database != temp {
+            if let Ok(temp_schema) = self.context().schema(temp) {
+                // Like legacy and SQLite, temp triggers fire first. Each one
+                // found is put in front, so they end up in the reverse of
+                // the order the temp schema lists them.
+                let mut temp_triggers = temp_schema
+                    .get_triggers_for_table(name)
+                    .filter(|trigger| {
+                        selected(trigger)
+                            && match trigger.target_database_id {
+                                Some(target) => target == database.index(),
+                                None => temp_schema.get_table(&trigger.table_name).is_none(),
+                            }
+                    })
+                    .cloned()
+                    .map(|trigger| (temp, trigger))
+                    .collect::<Vec<_>>();
+                temp_triggers.reverse();
+                temp_triggers.append(&mut triggers);
+                triggers = temp_triggers;
+            }
+        }
+        Ok(triggers
+            .into_iter()
+            .map(|(database, trigger)| self.freeze_trigger(database, trigger))
+            .collect())
+    }
+
     pub(super) fn analyze_dml_foreign_keys(
         &mut self,
         target: &hir::ResolvedTable,
         outgoing_child_source: hir::SourceId,
     ) -> Result<hir::DmlForeignKeys> {
+        if !self.context().foreign_keys_enabled() {
+            return Ok(hir::DmlForeignKeys::default());
+        }
         let database = target.database().ok_or_else(|| {
             LimboError::InternalError("DML target has no owning database".to_string())
         })?;
@@ -50,20 +103,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 target.clone(),
                 parent_table,
                 foreign_key,
-            ));
+            )?);
         }
 
         let mut resolved_incoming = Vec::with_capacity(incoming.len());
         for foreign_key in incoming {
             let child_name = foreign_key.child_table.name.clone();
-            let child_source = self.analyze_base_table_source(
-                &ast::QualifiedName {
-                    db_name: None,
-                    name: ast::Name::exact(child_name.clone()),
-                    alias: None,
-                },
-                None,
-                None,
+            // The child table is always in the parent's database.
+            let child_source = self.analyze_base_table_source_in_database(
+                &ast::Name::exact(child_name.clone()),
+                database,
                 hir::SourceOwner::Root,
             )?;
             let child_table = match &self
@@ -88,7 +137,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 child_table,
                 target.clone(),
                 foreign_key,
-            ));
+            )?);
         }
 
         Ok(hir::DmlForeignKeys {
@@ -152,9 +201,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     let expanded = scope.expand_star()?;
                     self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
                 }
-                ast::ResultColumn::TableStar(table) => {
-                    let expanded = scope.expand_table_star(table.as_str())?;
-                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                // Like SQLite and legacy, only a bare `*` expands here.
+                ast::ResultColumn::TableStar(_) => {
+                    crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
                 }
             }
         }
@@ -211,16 +260,27 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         child_table: hir::ResolvedTable,
         parent_table: hir::ResolvedTable,
         foreign_key: crate::schema::ResolvedFkRef,
-    ) -> hir::ResolvedForeignKey {
-        let parent_unique_index = foreign_key.parent_unique_index.map(|index| {
-            let id = self.catalog_object_id(
-                Some(database),
-                CatalogObjectKind::Index,
-                normalize_ident(&index.name),
-            );
-            hir::CatalogObject::new(id, self.context().snapshot(), Some(database), index)
-        });
-        hir::ResolvedForeignKey {
+    ) -> Result<hir::ResolvedForeignKey> {
+        let parent_unique_index = foreign_key
+            .parent_unique_index
+            .map(|index| self.freeze_foreign_key_index(database, index));
+        // Like legacy, the child index must list exactly the child columns,
+        // in the same order.
+        let child_index = self
+            .context()
+            .schema(database)?
+            .get_indices(child_table.value().get_name())
+            .find(|index| {
+                index.columns.len() == foreign_key.fk.child_columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(foreign_key.fk.child_columns.iter())
+                        .all(|(column, child)| column.name.eq_ignore_ascii_case(child))
+            })
+            .cloned();
+        let child_index = child_index.map(|index| self.freeze_foreign_key_index(database, index));
+        Ok(hir::ResolvedForeignKey {
             child_table,
             child_source,
             parent_table,
@@ -230,8 +290,22 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             parent_positions: foreign_key.parent_pos,
             parent_uses_rowid: foreign_key.parent_uses_rowid,
             parent_unique_index,
+            child_index,
             parent_action_guarantees_new_parent: false,
-        }
+        })
+    }
+
+    fn freeze_foreign_key_index(
+        &mut self,
+        database: hir::DatabaseId,
+        index: Arc<crate::schema::Index>,
+    ) -> hir::ResolvedIndex {
+        let id = self.catalog_object_id(
+            Some(database),
+            CatalogObjectKind::Index,
+            normalize_ident(&index.name),
+        );
+        hir::CatalogObject::new(id, self.context().snapshot(), Some(database), index)
     }
 }
 

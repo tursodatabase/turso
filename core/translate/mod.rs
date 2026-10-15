@@ -154,7 +154,21 @@ pub fn translate(
                 &connection,
             )?
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => {
+            // DML that HIR lowers today goes through it; everything else,
+            // and DML it does not lower yet, stays on legacy.
+            let hir_schema = (connection.experimental_hir_enabled()
+                && !connection.is_nested_stmt())
+            .then_some(schema);
+            translate_statement(
+                stmt,
+                &mut resolver,
+                &mut program,
+                &connection,
+                input,
+                hir_schema,
+            )?
+        }
     };
 
     program.epilogue(schema);
@@ -165,13 +179,26 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
-#[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+) -> Result<()> {
+    translate_statement(stmt, resolver, program, connection, input, None)
+}
+
+/// Translate one statement. With `hir_schema`, a statement that HIR can lower
+/// goes through semantic HIR instead of legacy.
+#[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+fn translate_statement(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+    hir_schema: Option<&Arc<Schema>>,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -230,7 +257,68 @@ pub fn translate_inner(
         None
     };
 
+    let lowered_by_hir = match (hir_schema, &stmt) {
+        (
+            Some(schema),
+            ast::Stmt::Delete {
+                tbl_name,
+                where_clause,
+                ..
+            },
+        ) => {
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            // Legacy checks these by name before it looks the table up.
+            let table_name = crate::util::normalize_ident(tbl_name.name.as_str());
+            crate::schema::allow_user_dml(&table_name)
+                && !resolver.schema().is_materialized_view(&table_name)
+                && resolver
+                    .schema()
+                    .get_dependent_materialized_views(&table_name)
+                    .is_empty()
+                && semantic_lowering::translate_delete(
+                    &stmt, schema, resolver, program, connection,
+                )?
+        }
+        (Some(schema), ast::Stmt::Update(update)) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            // Legacy checks these by name before it looks the table up.
+            let table_name = crate::util::normalize_ident(update.tbl_name.name.as_str());
+            crate::schema::allow_user_dml(&table_name)
+                && !resolver.schema().is_materialized_view(&table_name)
+                && resolver
+                    .schema()
+                    .get_dependent_materialized_views(&table_name)
+                    .is_empty()
+                && semantic_lowering::translate_update(
+                    &stmt, schema, resolver, program, connection,
+                )?
+        }
+        (Some(schema), ast::Stmt::Insert { tbl_name, .. }) => {
+            // Legacy checks these by name before it looks the table up.
+            let table_name = crate::util::normalize_ident(tbl_name.name.as_str());
+            crate::schema::allow_user_dml(&table_name)
+                && !resolver.schema().is_materialized_view(&table_name)
+                && resolver
+                    .schema()
+                    .get_dependent_materialized_views(&table_name)
+                    .is_empty()
+                && semantic_lowering::translate_insert(
+                    &stmt, schema, resolver, program, connection,
+                )?
+        }
+        _ => false,
+    };
+
     match stmt {
+        _ if lowered_by_hir => {}
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
         }
@@ -519,7 +607,7 @@ pub fn translate_inner(
     // A statement with RETURNING already produces rows, so it never also returns
     // a count row (same as SQLite).
     if let Some(column_name) = count_changes_column {
-        if program.result_columns.is_empty() {
+        if program.result_columns.is_empty() && program.resolved_result_columns.is_empty() {
             let reg = program.alloc_register();
             program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
             program.emit_result_row(reg, 1);

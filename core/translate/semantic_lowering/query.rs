@@ -350,9 +350,44 @@ struct HirAggregateState<'a> {
 }
 
 enum HirLoopBody<'a> {
-    Rows(&'a HirRowOutput<'a>),
+    /// Send the block's outputs to a query output.
+    Rows(&'a HirRowOutput<'a>, &'a [hir::Output]),
     UngroupedAggregate(&'a HirAggregateState<'a>),
     Group(&'a HirGroupRuntime<'a>),
+    /// Run DML code for each joined row; it continues at the given label to
+    /// reject the row. It may be emitted more than once.
+    Dml(&'a dyn Fn(&mut ProgramBuilder, BranchOffset) -> Result<()>),
+}
+
+/// The loops of one FROM clause and the terms they check: a query block's,
+/// or an UPDATE ... FROM's.
+#[derive(Clone, Copy)]
+pub(super) struct HirLoopsPlan<'a> {
+    groups: &'a [crate::translate::plan::HirFromGroupBoundary],
+    loops: &'a [HirPlannedLoop],
+    predicates: &'a [crate::translate::plan::HirWhereTerm],
+    /// Index of the first WHERE term; earlier terms come from the FROM clause.
+    where_start: usize,
+}
+
+impl<'a> HirLoopsPlan<'a> {
+    fn of_block(plan: &'a HirQueryBlockPlan) -> Self {
+        Self {
+            groups: &plan.groups,
+            loops: &plan.loops,
+            predicates: &plan.predicates,
+            where_start: plan.where_start,
+        }
+    }
+
+    pub(super) fn of_access(plan: &'a crate::translate::semantic_to_plan::HirAccessPlan) -> Self {
+        Self {
+            groups: &plan.groups,
+            loops: &plan.loops,
+            predicates: &plan.predicates,
+            where_start: plan.where_start,
+        }
+    }
 }
 
 struct HirAggregateCapture {
@@ -1111,7 +1146,13 @@ fn emit_planned_block_rows(
     } else if hir_grouping(block).is_some() {
         emit_hir_grouped_aggregate(program, plan, query, block, block_plan, output)
     } else {
-        emit_btree_loops(program, plan, block, block_plan, HirLoopBody::Rows(output))
+        emit_btree_loops(
+            program,
+            plan,
+            block,
+            block_plan,
+            HirLoopBody::Rows(output, &block.outputs),
+        )
     }
 }
 
@@ -1521,12 +1562,7 @@ fn emit_hir_group_input(
                 continue;
             }
             HirGroupInput::RowId { source, .. } => {
-                super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::RowId(*source),
-                    target,
-                )?;
+                super::expr::translate_expr(program, document, &hir::Expr::RowId(*source), target)?;
                 continue;
             }
         };
@@ -2412,14 +2448,14 @@ enum HirLoopAdvance {
     Virtual,
 }
 
-struct PreparedHirBtreeLoop<'a> {
-    source: &'a hir::Source,
-    operation: &'a HirBtreeOperation,
-    index: Option<&'a Arc<Index>>,
-    cursor: CursorID,
-    table_cursor: Option<CursorID>,
-    autoindex_source_cursor: Option<CursorID>,
-    table_has_rowid: bool,
+pub(super) struct PreparedHirBtreeLoop<'a> {
+    pub(super) source: &'a hir::Source,
+    pub(super) operation: &'a HirBtreeOperation,
+    pub(super) index: Option<&'a Arc<Index>>,
+    pub(super) cursor: CursorID,
+    pub(super) table_cursor: Option<CursorID>,
+    pub(super) autoindex_source_cursor: Option<CursorID>,
+    pub(super) table_has_rowid: bool,
 }
 
 struct PreparedHirMaterializedLoop<'a> {
@@ -2489,11 +2525,11 @@ impl PreparedHirLoop<'_> {
     }
 }
 
-struct HirBtreeLoop {
+pub(super) struct HirBtreeLoop {
     cursor: Option<CursorID>,
     loop_start: BranchOffset,
     /// Reject the current row, then run this loop's advance operation.
-    next: BranchOffset,
+    pub(super) next: BranchOffset,
     /// This access produced no row, so skip its advance operation.
     exhausted: BranchOffset,
     advance: HirLoopAdvance,
@@ -2502,7 +2538,7 @@ struct HirBtreeLoop {
 
 /// An outer join's ON predicates, evaluated once its right side is positioned.
 /// LEFT and FULL joins also NULL-extend that side when no row matched.
-struct HirLeftJoin {
+pub(super) struct HirLeftJoin {
     owner: SourceId,
     first_loop: usize,
     last_loop: usize,
@@ -3011,7 +3047,7 @@ fn finalize_hir_aggregates(
 fn initialize_hir_aggregate_captures(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    block_plan: &HirQueryBlockPlan,
+    loops: &[HirPlannedLoop],
     state: &HirAggregateState<'_>,
 ) -> Result<(usize, Vec<HirAggregateCapture>)> {
     let first_row = program.alloc_register();
@@ -3019,8 +3055,8 @@ fn initialize_hir_aggregate_captures(
         value: 0,
         dest: first_row,
     });
-    let mut captures = Vec::with_capacity(block_plan.loops.len());
-    for planned_loop in &block_plan.loops {
+    let mut captures = Vec::with_capacity(loops.len());
+    for planned_loop in loops {
         let mut columns = state
             .bare_columns
             .iter()
@@ -3134,7 +3170,6 @@ fn emit_btree_loops(
     block_plan: &HirQueryBlockPlan,
     body: HirLoopBody<'_>,
 ) -> Result<()> {
-    let document = &plan.document;
     let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} has unsupported B-tree loop clauses",
@@ -3142,7 +3177,7 @@ fn emit_btree_loops(
         )));
     };
     match (&body, grouping) {
-        (HirLoopBody::Rows(_), None) if block.aggregate_count == 0 => {}
+        (HirLoopBody::Rows(..), None) if block.aggregate_count == 0 => {}
         (HirLoopBody::UngroupedAggregate(_), None) if block.aggregate_count != 0 => {}
         (HirLoopBody::UngroupedAggregate(_), Some(grouping)) if grouping.keys.is_empty() => {}
         (HirLoopBody::Group(_), Some(grouping)) if !grouping.keys.is_empty() => {}
@@ -3160,37 +3195,63 @@ fn emit_btree_loops(
             block_plan.loops.len()
         )));
     }
-    // A block without FROM runs its body once, with no loops.
+    emit_join_loops(
+        program,
+        plan,
+        block.from.as_ref(),
+        HirLoopsPlan::of_block(block_plan),
+        body,
+    )
+}
+
+/// Emit the nested loops of a DML target joined with a FROM clause around
+/// `body`, which runs for every joined row and continues at its label to
+/// reject the row.
+pub(super) fn emit_dml_join_loops(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    from: Option<&hir::From>,
+    loops_plan: HirLoopsPlan<'_>,
+    body: &dyn Fn(&mut ProgramBuilder, BranchOffset) -> Result<()>,
+) -> Result<()> {
+    emit_join_loops(program, plan, from, loops_plan, HirLoopBody::Dml(body))
+}
+
+/// Emit the nested loops of a FROM clause, or of a DML target joined with
+/// one, around `body`. A plan without loops runs the body once.
+fn emit_join_loops(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    from: Option<&hir::From>,
+    loops_plan: HirLoopsPlan<'_>,
+    body: HirLoopBody<'_>,
+) -> Result<()> {
+    let document = &plan.document;
     let mut joins = HirOuterJoins::default();
-    if let Some(from) = &block.from {
+    if let Some(from) = from {
         if !supported_btree_from(document, from, &mut joins) {
-            return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} contains an unsupported join",
-                block.id
-            )));
+            return Err(LimboError::InternalError(
+                "HIR FROM clause contains an unsupported join".into(),
+            ));
         }
         check_hir_full_join_shape(document, from, &joins)?;
     }
-    if block_plan.predicates.iter().any(|predicate| {
+    if loops_plan.predicates.iter().any(|predicate| {
         predicate
             .from_outer_join
             .is_some_and(|source| !joins.owners.iter().any(|(owner, _)| *owner == source))
     }) {
-        return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} contains an unsupported outer-join predicate owner",
-            block.id
-        )));
+        return Err(LimboError::InternalError(
+            "HIR FROM clause contains an unsupported outer-join predicate owner".into(),
+        ));
     }
 
     let block_done = program.allocate_label();
-    let prepared_loops = block_plan
+    let prepared_loops = loops_plan
         .loops
         .iter()
         .map(|planned_loop| {
-            let streams = block
-                .from
-                .as_ref()
-                .is_some_and(|from| hir_loop_streams(document, from, planned_loop));
+            let streams = from.is_some_and(|from| hir_loop_streams(document, from, planned_loop));
             prepare_hir_loop(program, plan, planned_loop, streams)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3199,16 +3260,15 @@ fn emit_btree_loops(
             let HirLoopBody::UngroupedAggregate(state) = &body else {
                 unreachable!()
             };
-            initialize_hir_aggregate_captures(program, document, block_plan, state)
+            initialize_hir_aggregate_captures(program, document, loops_plan.loops, state)
         })
         .transpose()?;
-    let left_joins = prepare_hir_left_joins(program, block_plan, &prepared_loops, &joins.owners)?;
-    let right_outer = prepare_hir_right_outer_join(program, block_plan, &prepared_loops, &joins)?;
+    let left_joins = prepare_hir_left_joins(program, loops_plan, &prepared_loops, &joins.owners)?;
+    let right_outer = prepare_hir_right_outer_join(program, loops_plan, &prepared_loops, &joins)?;
 
     let nest = HirLoopNest {
         document,
-        block,
-        block_plan,
+        loops_plan,
         prepared_loops: &prepared_loops,
         left_joins: &left_joins,
         right_outer: right_outer.as_ref(),
@@ -3218,7 +3278,7 @@ fn emit_btree_loops(
     emit_ready_predicates(
         program,
         document,
-        block_plan,
+        loops_plan,
         None,
         block_done,
         HirPredicateKind::Where {
@@ -3241,8 +3301,7 @@ fn emit_btree_loops(
 /// them, followed by the block's row body.
 struct HirLoopNest<'n, 'a> {
     document: &'n HirDocument,
-    block: &'n hir::QueryBlock,
-    block_plan: &'n HirQueryBlockPlan,
+    loops_plan: HirLoopsPlan<'n>,
     prepared_loops: &'n [PreparedHirLoop<'a>],
     left_joins: &'n [HirLeftJoin],
     right_outer: Option<&'n HirRightOuterJoin>,
@@ -3320,7 +3379,7 @@ impl HirLoopNest<'_, '_> {
                 emit_ready_predicates(
                     program,
                     self.document,
-                    self.block_plan,
+                    self.loops_plan,
                     Some(loop_index),
                     hir_loop.next,
                     HirPredicateKind::Join(left_join.owner),
@@ -3344,7 +3403,7 @@ impl HirLoopNest<'_, '_> {
             emit_ready_predicates(
                 program,
                 self.document,
-                self.block_plan,
+                self.loops_plan,
                 Some(loop_index),
                 hir_loop.next,
                 HirPredicateKind::Where {
@@ -3360,19 +3419,19 @@ impl HirLoopNest<'_, '_> {
 
         let innermost_next = loops.last().map_or(outer_next, |hir_loop| hir_loop.next);
         match self.body {
-            HirLoopBody::Rows(output) => {
-                let start =
-                    query_output_registers(program, &self.block.outputs, output.needs_values())?;
+            HirLoopBody::Rows(output, outputs) => {
+                let start = query_output_registers(program, outputs, output.needs_values())?;
                 emit_query_row(
                     program,
                     self.document,
                     output,
-                    &self.block.outputs,
-                    self.block.outputs.iter().map(|output| &output.expr),
+                    outputs,
+                    outputs.iter().map(|output| &output.expr),
                     start,
                     innermost_next,
                 )?;
             }
+            HirLoopBody::Dml(body) => body(program, innermost_next)?,
             HirLoopBody::UngroupedAggregate(state) => {
                 let (first_row, captures) = self
                     .aggregate_captures
@@ -3497,12 +3556,12 @@ impl HirLoopNest<'_, '_> {
         // Like SQLite, the unmatched pass checks WHERE terms only. ON terms,
         // including those of inner joins left of the RIGHT JOIN, would reject
         // every row whose left side is NULL.
-        for predicate in &self.block_plan.predicates[self.block_plan.where_start..] {
+        for predicate in &self.loops_plan.predicates[self.loops_plan.where_start..] {
             let ready_at = predicate_loop(
                 program,
                 self.document,
                 &predicate.expr,
-                &self.block_plan.loops,
+                self.loops_plan.loops,
             )?;
             if ready_at.is_some_and(|ready_at| ready_at > right) {
                 continue;
@@ -3544,7 +3603,7 @@ impl HirLoopNest<'_, '_> {
 /// Open the matched-row set of the block's RIGHT or FULL join, if any.
 fn prepare_hir_right_outer_join(
     program: &mut ProgramBuilder,
-    block_plan: &HirQueryBlockPlan,
+    block_plan: HirLoopsPlan<'_>,
     prepared_loops: &[PreparedHirLoop<'_>],
     joins: &HirOuterJoins,
 ) -> Result<Option<HirRightOuterJoin>> {
@@ -3763,7 +3822,7 @@ fn ordinary_btree_from(document: &HirDocument, from: &hir::From) -> bool {
 
 fn prepare_hir_left_joins(
     program: &mut ProgramBuilder,
-    block_plan: &HirQueryBlockPlan,
+    block_plan: HirLoopsPlan<'_>,
     prepared_loops: &[PreparedHirLoop<'_>],
     owners: &[(SourceId, bool)],
 ) -> Result<Vec<HirLeftJoin>> {
@@ -3876,16 +3935,17 @@ fn emit_hir_block_explain(
         return Ok(());
     };
     for planned_loop in &block_plan.loops {
-        let detail = hir_loop_explain(document, from, planned_loop)?;
+        let detail = hir_loop_explain(document, Some(from), planned_loop)?;
         program.emit_source_explain(planned_loop.source, detail);
     }
     Ok(())
 }
 
 /// The EXPLAIN QUERY PLAN row of one planned loop, worded like legacy's.
-fn hir_loop_explain(
+/// A DML target loop has no FROM clause.
+pub(super) fn hir_loop_explain(
     document: &HirDocument,
-    from: &hir::From,
+    from: Option<&hir::From>,
     planned_loop: &HirPlannedLoop,
 ) -> Result<EqpDetail> {
     let source = document.source(planned_loop.source).ok_or_else(|| {
@@ -3911,8 +3971,8 @@ fn hir_loop_explain(
             EqpTable { name, alias }
         }
     };
-    let join = hir_loop_explain_join(document, from, source.id);
-    let exec = if hir_loop_streams(document, from, planned_loop) {
+    let join = from.and_then(|from| hir_loop_explain_join(document, from, source.id));
+    let exec = if from.is_some_and(|from| hir_loop_streams(document, from, planned_loop)) {
         EqpSubqueryExec::Coroutine
     } else {
         EqpSubqueryExec::Materialized
@@ -4676,7 +4736,7 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
     ))
 }
 
-fn prepare_hir_btree_loop<'a>(
+pub(super) fn prepare_hir_btree_loop<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,
@@ -5029,7 +5089,7 @@ fn start_hir_virtual_loop(
     })
 }
 
-fn start_hir_btree_loop(
+pub(super) fn start_hir_btree_loop(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     prepared: &PreparedHirBtreeLoop<'_>,
@@ -5129,7 +5189,7 @@ fn start_hir_btree_loop(
 fn emit_ready_predicates(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    block_plan: &HirQueryBlockPlan,
+    block_plan: HirLoopsPlan<'_>,
     loop_index: Option<usize>,
     fail: BranchOffset,
     kind: HirPredicateKind,
@@ -5200,7 +5260,7 @@ fn emit_ready_predicates(
     Ok(())
 }
 
-fn predicate_loop(
+pub(super) fn predicate_loop(
     program: &ProgramBuilder,
     document: &HirDocument,
     expression: &hir::Expr,
@@ -5225,7 +5285,7 @@ fn predicate_loop(
     Ok(eval_at)
 }
 
-fn close_hir_btree_loop(
+pub(super) fn close_hir_btree_loop(
     program: &mut ProgramBuilder,
     hir_loop: &HirBtreeLoop,
     left_joins: &[HirLeftJoin],
@@ -6371,7 +6431,7 @@ fn emit_hir_window_output_subroutine(
     Ok(())
 }
 
-fn emit_array_results(
+pub(super) fn emit_array_results(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     outputs: &[hir::Output],
@@ -6475,7 +6535,7 @@ fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> Destinat
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         dialect::SqliteDialect,
@@ -6495,7 +6555,7 @@ mod tests {
     };
     use turso_parser::parser::Parser;
 
-    fn program() -> ProgramBuilder {
+    pub(in crate::translate::semantic_lowering) fn program() -> ProgramBuilder {
         program_with_mode(QueryMode::Normal)
     }
 
@@ -6530,6 +6590,7 @@ mod tests {
                 dialect: Arc::new(SqliteDialect),
                 custom_types_enabled: true,
                 dqs_dml: DoubleQuotedDml::Enabled,
+                foreign_keys_enabled: true,
             },
             SemanticRootInput::Statement(&statement),
         )
@@ -6545,13 +6606,16 @@ mod tests {
         analyze_sql_with_schema(schema, sql).0
     }
 
-    fn analyze_plan(schema: Schema, sql: &str) -> HirPlan {
+    pub(in crate::translate::semantic_lowering) fn analyze_plan(
+        schema: Schema,
+        sql: &str,
+    ) -> HirPlan {
         let (document, schema) = analyze_sql_with_schema(schema, sql);
         HirPlan::build(Arc::new(document), &schema, &CostModelParams::default())
             .expect("HIR query plans")
     }
 
-    fn indexed_items_schema() -> Schema {
+    pub(in crate::translate::semantic_lowering) fn indexed_items_schema() -> Schema {
         let mut schema = Schema::new();
         schema
             .add_btree_table(Arc::new(
@@ -6889,10 +6953,7 @@ mod tests {
             .enumerate()
             .find_map(|(index, (insn, _))| match insn {
                 Insn::AggStep { data }
-                    if matches!(
-                        &data.func,
-                        AccumulatorFunc::Agg(AggFunc::PercentileCont)
-                    ) =>
+                    if matches!(&data.func, AccumulatorFunc::Agg(AggFunc::PercentileCont)) =>
                 {
                     Some((index, data.delimiter))
                 }
@@ -7082,7 +7143,10 @@ mod tests {
 
     #[test]
     fn planned_group_by_without_aggregates_still_emits_one_row_per_group() {
-        let plan = analyze_plan(indexed_items_schema(), "SELECT extra FROM items GROUP BY extra");
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT extra FROM items GROUP BY extra",
+        );
         let query = root_query(&plan.document);
         let mut program = program();
         emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
@@ -7149,12 +7213,14 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::HashDistinct { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .filter(|(insn, _)| matches!(insn, Insn::HashClear { .. }))
-            .count()
-            >= 2);
+        assert!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::HashClear { .. }))
+                .count()
+                >= 2
+        );
     }
 
     #[test]

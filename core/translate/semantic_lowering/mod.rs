@@ -1,7 +1,13 @@
 //! Bytecode lowering from resolved semantic HIR.
 
+mod delete;
+mod dml;
 pub(super) mod expr;
+mod fkey;
+mod insert;
 pub(super) mod query;
+mod trigger;
+mod update;
 mod window;
 
 use turso_parser::ast;
@@ -20,7 +26,7 @@ use crate::{
             hir::{self, HirDocument, HirRoot, OutputNameKind},
             SemanticOptions, SemanticRootInput,
         },
-        semantic_to_plan::HirPlan,
+        semantic_to_plan::{HirPlan, HirRootPlan},
     },
     vdbe::{affinity::Affinity, builder::ProgramBuilder},
     Connection, LimboError, Result,
@@ -35,34 +41,7 @@ pub(crate) fn translate_select(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let catalog = SemanticCatalog::capture(
-        schema.clone(),
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        resolver.custom_types_enabled(),
-        resolver.dialect.as_ref(),
-        resolver.unqualified_database_search_path().as_deref(),
-    )?;
-    let document = analyze_root(
-        &catalog,
-        resolver.symbol_table,
-        SemanticOptions {
-            dialect: resolver.dialect.clone(),
-            custom_types_enabled: resolver.custom_types_enabled(),
-            dqs_dml: if resolver.dqs_dml.is_enabled() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
-        },
-        SemanticRootInput::Statement(statement),
-    )?;
-    let plan = Arc::new(HirPlan::build(
-        Arc::new(document),
-        schema,
-        cost_model_params(),
-    )?);
+    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
@@ -72,6 +51,175 @@ pub(crate) fn translate_select(
     query::emit_planned_query_body(program, &plan, root.query, &QueryDestination::ResultRows)?;
     program.resolved_result_columns = resolved_result_columns(&plan.document, root.query)?;
     Ok(())
+}
+
+/// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_delete(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
+    let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
+    else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE analysis did not produce a DELETE root".into(),
+        ));
+    };
+    if delete::needs_legacy(delete, access, program)? {
+        return Ok(false);
+    }
+    // Triggers are compiled before anything is emitted, so one that needs
+    // legacy still leaves the whole statement to legacy.
+    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete)? else {
+        return Ok(false);
+    };
+    program.set_hir_plan(plan.clone());
+    delete::emit_delete(program, &plan, delete, access, &triggers)?;
+    if let Some(returning) = &delete.returning {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
+    Ok(true)
+}
+
+/// Prepare a top-level UPDATE through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_update(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
+    let (update, access) = update::update_root(&plan)?;
+    if update::needs_legacy(&plan, update, access, program)? {
+        return Ok(false);
+    }
+    let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
+        return Ok(false);
+    };
+    let mvcc = plan
+        .document
+        .source(update.target)
+        .and_then(|source| source.database)
+        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
+    program.set_hir_plan(plan.clone());
+    update::emit_update(program, &plan, update, access, &triggers, mvcc)?;
+    if let Some(returning) = &update.returning {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
+    Ok(true)
+}
+
+/// Prepare a top-level INSERT through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_insert(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
+    let insert = insert::insert_root(&plan)?;
+    if insert::needs_legacy(&plan, insert, program)? {
+        return Ok(false);
+    }
+    let Some(triggers) = trigger::insert_triggers(&session, program, &plan, insert)? else {
+        return Ok(false);
+    };
+    program.set_hir_plan(plan.clone());
+    insert::emit_insert(program, &plan, insert, &triggers)?;
+    if let Some(returning) = &insert.returning {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
+    Ok(true)
+}
+
+/// What every HIR document of one statement is analyzed and planned with:
+/// the statement itself and each trigger it fires.
+pub(super) struct HirSession<'a> {
+    pub(super) schema: &'a Arc<Schema>,
+    pub(super) connection: &'a Arc<Connection>,
+    catalog: SemanticCatalog,
+    symbols: &'a crate::SymbolTable,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+    custom_types_enabled: bool,
+    dqs_dml: DoubleQuotedDml,
+}
+
+impl<'a> HirSession<'a> {
+    fn new(
+        schema: &'a Arc<Schema>,
+        resolver: &'a Resolver,
+        connection: &'a Arc<Connection>,
+    ) -> Result<Self> {
+        let catalog = SemanticCatalog::capture(
+            schema.clone(),
+            connection.database_schemas(),
+            &connection.temp.database,
+            connection.attached_databases(),
+            resolver.custom_types_enabled(),
+            resolver.dialect.as_ref(),
+            resolver.unqualified_database_search_path().as_deref(),
+        )?;
+        Ok(Self {
+            schema,
+            connection,
+            catalog,
+            symbols: resolver.symbol_table,
+            dialect: resolver.dialect.clone(),
+            custom_types_enabled: resolver.custom_types_enabled(),
+            dqs_dml: if resolver.dqs_dml.is_enabled() {
+                DoubleQuotedDml::Enabled
+            } else {
+                DoubleQuotedDml::Disabled
+            },
+        })
+    }
+
+    /// Analyze `input` into HIR and choose its access paths.
+    pub(super) fn plan(&self, input: SemanticRootInput<'_>) -> Result<Arc<HirPlan>> {
+        let document = analyze_root(
+            &self.catalog,
+            self.symbols,
+            SemanticOptions {
+                dialect: self.dialect.clone(),
+                custom_types_enabled: self.custom_types_enabled,
+                dqs_dml: self.dqs_dml,
+                foreign_keys_enabled: self.connection.foreign_keys_enabled(),
+            },
+            input,
+        )?;
+        Ok(Arc::new(HirPlan::build(
+            Arc::new(document),
+            self.schema,
+            cost_model_params(),
+        )?))
+    }
+}
+
+/// Analyze one statement into HIR and choose its access paths.
+fn analyze_and_plan(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<Arc<HirPlan>> {
+    HirSession::new(schema, resolver, connection)?.plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It
@@ -117,8 +265,16 @@ fn resolved_result_columns(
     let block = query.blocks.first().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query {} has no blocks", query.id))
     })?;
-    block
-        .outputs
+    resolved_output_columns(document, &block.outputs)
+}
+
+/// Result-column metadata for a list of outputs, such as a SELECT block's
+/// or a RETURNING clause's.
+fn resolved_output_columns(
+    document: &HirDocument,
+    outputs: &[hir::Output],
+) -> Result<Vec<ResolvedResultColumn>> {
+    outputs
         .iter()
         .map(|output| {
             Ok(ResolvedResultColumn {

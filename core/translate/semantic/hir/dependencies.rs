@@ -60,6 +60,28 @@ impl HirDocument {
         counts.into_usage()
     }
 
+    /// Column reads of a DML statement: `direct`, its own reads, plus the
+    /// reads of every subquery that reads a source the statement owns, such
+    /// as `t.c` in `DELETE FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.x = t.c)`.
+    pub(crate) fn root_column_usage(&self, direct: Vec<ColumnUsage>) -> Vec<ColumnUsage> {
+        let owns = |source: SourceId| {
+            self.source(source)
+                .is_some_and(|source| matches!(source.owner, SourceOwner::Root))
+        };
+        let mut counts = ColumnUsageCollector::default();
+        for usage in direct {
+            *counts.counts.entry(usage.reference).or_default() += usage.count;
+        }
+        for query in &self.queries {
+            for usage in query.direct_column_usage(|source| self.source(source)) {
+                if owns(usage.reference.source) {
+                    *counts.counts.entry(usage.reference).or_default() += usage.count;
+                }
+            }
+        }
+        counts.into_usage()
+    }
+
     /// Sources of enclosing queries that `query`, or any query it runs
     /// (subqueries in its expressions, FROM subqueries and CTEs), reads. A
     /// query that reads any must run again whenever the outer row changes,
@@ -95,6 +117,31 @@ impl HirDocument {
     /// Return every query whose plan is needed directly by this query. This
     /// includes query-backed FROM sources and subqueries in expressions, but
     /// does not descend into those query definitions.
+    /// Whether `query`, or any query it runs, reads `table`.
+    pub(crate) fn query_reads_table(&self, query: QueryId, table: &ResolvedTable) -> bool {
+        let mut pending = vec![query];
+        let mut seen = HashSet::default();
+        while let Some(query) = pending.pop() {
+            if !seen.insert(query) {
+                continue;
+            }
+            let definition = self.query(query).expect("validated HIR query must exist");
+            let mut reads = false;
+            visit_query_parts(self, definition, &mut |part| {
+                if let QueryPart::Source(source) = part {
+                    if let SourceKind::Table(source_table) = &source.kind {
+                        reads |= source_table == table;
+                    }
+                }
+            });
+            if reads {
+                return true;
+            }
+            pending.extend(self.direct_query_dependencies(query));
+        }
+        false
+    }
+
     pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
         let Some(query) = self.query(id) else {
             return Vec::new();

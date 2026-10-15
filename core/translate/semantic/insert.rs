@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
-    dml::{trigger_matches_update, trigger_targets_database},
+    dml::trigger_matches_update,
     expr::{ExprPolicies, ExprPolicy},
     hir::{self, HirRoot, SourceOwner},
     scope::{ExprCollation, Scope},
@@ -161,6 +161,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     row.len()
                                 );
                             }
+                            // Like legacy, in a single VALUES row without a
+                            // subquery a double-quoted name falls back to a
+                            // string only when it is the whole value.
+                            let whole_values_only = rows.len() == 1
+                                && !row.iter().any(|syntax| contains_subquery(syntax));
                             let mut bound = Vec::with_capacity(row.len());
                             for (syntax, target_column) in row.iter().zip(&columns) {
                                 bound.push(self.analyze_insert_value(
@@ -169,6 +174,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     table.value(),
                                     target_column.column,
                                     expressions,
+                                    InsertValueRules {
+                                        without_dqs_fallback: whole_values_only
+                                            && !matches!(syntax.as_ref(), ast::Expr::Id(_)),
+                                        unknown_table_as_column: whole_values_only,
+                                    },
                                 )?);
                             }
                             bound_rows.push(bound);
@@ -209,12 +219,24 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let returning =
             self.analyze_dml_returning_with_policies(returning, target, expressions.policies)?;
+        let upsert_new_source = if !virtual_target
+            && upserts
+                .iter()
+                .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }))
+        {
+            let new_source = self.create_update_new_source(target, table)?;
+            self.analyze_btree_write_metadata(new_source, table)?;
+            Some(new_source)
+        } else {
+            None
+        };
         let target_kind = if virtual_target {
             hir::InsertTargetKind::Virtual
         } else {
             hir::InsertTargetKind::BTree {
                 autoincrement,
                 defaults: self.analyze_insert_defaults(target, table.value(), &columns)?,
+                replace_defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_insert_triggers(table, &upserts)?,
                 foreign_keys: self.analyze_dml_foreign_keys(table, target)?,
             }
@@ -228,6 +250,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             conflict,
             upserts,
             excluded_source,
+            upsert_new_source,
             returning,
         }))
     }
@@ -330,9 +353,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         upserts: &[hir::Upsert],
     ) -> Result<hir::InsertTriggers> {
-        let database = table
-            .database()
-            .expect("an INSERT target table must have an owning database");
         let mut has_upsert_update = false;
         let mut updated_columns = Vec::new();
         for upsert in upserts {
@@ -346,39 +366,20 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }));
             }
         }
-        let (insert, upsert_update) = {
-            let schema = self.context().schema(database)?;
-            let triggers = schema.get_triggers_for_table(table.value().get_name());
-            let insert = triggers
-                .clone()
-                .filter(|trigger| {
-                    trigger_targets_database(trigger, database)
-                        && matches!(trigger.event, ast::TriggerEvent::Insert)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let upsert_update = if has_upsert_update {
-                triggers
-                    .filter(|trigger| {
-                        trigger_targets_database(trigger, database)
-                            && trigger_matches_update(trigger, table.value(), &updated_columns)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            (insert, upsert_update)
+        let insert = self.table_triggers(table, |trigger| {
+            matches!(trigger.event, ast::TriggerEvent::Insert)
+        })?;
+        let upsert_update = if has_upsert_update {
+            let target = table.value();
+            self.table_triggers(table, |trigger| {
+                trigger_matches_update(trigger, target, &updated_columns)
+            })?
+        } else {
+            Vec::new()
         };
         Ok(hir::InsertTriggers {
-            insert: insert
-                .into_iter()
-                .map(|trigger| self.freeze_trigger(database, trigger))
-                .collect(),
-            upsert_update: upsert_update
-                .into_iter()
-                .map(|trigger| self.freeze_trigger(database, trigger))
-                .collect(),
+            insert,
+            upsert_update,
         })
     }
 
@@ -398,7 +399,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 LimboError::InternalError(format!("missing write target source {target}"))
             })?;
             let mut scope = Scope::default();
-            scope.add_source(source, true);
+            scope.add_schema_source(source);
             scope
         };
         let policy = ExprPolicy::schema_expression().with_self_source(target);
@@ -439,7 +440,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 LimboError::InternalError(format!("missing DELETE target source {target}"))
             })?;
             let mut scope = Scope::default();
-            scope.add_source(source, true);
+            scope.add_schema_source(source);
             scope
         };
         let policy = ExprPolicy::schema_expression().with_self_source(target);
@@ -517,15 +518,23 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &Table,
         column: hir::TargetColumn,
         expressions: InsertExprContext<'_>,
+        rules: InsertValueRules,
     ) -> Result<hir::Expr> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_write_default(target, table, column);
+        }
+        let mut policy = expressions.policies.insert_values();
+        if rules.without_dqs_fallback {
+            policy = policy.without_dqs_fallback();
+        }
+        if rules.unknown_table_as_column {
+            policy = policy.with_unknown_table_as_column();
         }
         Ok(self
             .analyze_root_expr_with_expected_type(
                 syntax,
                 expressions.outer_scope,
-                expressions.policies.insert_values(),
+                policy,
                 self.write_target_type(target, table, column)?,
             )?
             .expr)
@@ -554,6 +563,36 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect::<Vec<_>>();
         let mut defaults = Vec::with_capacity(missing.len());
         for column in missing {
+            defaults.push(hir::ResolvedDefault {
+                column,
+                value: self.analyze_write_default(
+                    target,
+                    table,
+                    hir::TargetColumn::Column(column),
+                )?,
+            });
+        }
+        Ok(defaults)
+    }
+
+    /// The DEFAULT of each NOT NULL column that declares one, for NOT NULL
+    /// ON CONFLICT REPLACE.
+    pub(super) fn analyze_replace_defaults(
+        &mut self,
+        target: hir::SourceId,
+        table: &Table,
+    ) -> Result<Vec<hir::ResolvedDefault>> {
+        let columns = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                column.notnull() && !column.is_rowid_alias() && column.default.is_some()
+            })
+            .map(|(column, _)| column)
+            .collect::<Vec<_>>();
+        let mut defaults = Vec::with_capacity(columns.len());
+        for column in columns {
             defaults.push(hir::ResolvedDefault {
                 column,
                 value: self.analyze_write_default(
@@ -606,7 +645,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             LimboError::InternalError(format!("missing write target source {target}"))
         })?;
         let mut scope = Scope::default();
-        scope.add_source(source, true);
+        scope.add_schema_source(source);
         self.analyze_expr_with_expected_type(
             &syntax,
             &scope,
@@ -887,6 +926,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 }
 
+/// Legacy quirks of the values of a single VALUES row without a subquery.
+#[derive(Clone, Copy)]
+struct InsertValueRules {
+    /// A double-quoted name falls back to a string only when it is the
+    /// whole value.
+    without_dqs_fallback: bool,
+    /// `x.y` with no table `x` is reported as "no such column: x.y".
+    unknown_table_as_column: bool,
+}
+
 fn is_simple_values(select: &ast::Select) -> bool {
     select.with.is_none()
         && select.body.compounds.is_empty()
@@ -987,4 +1036,22 @@ fn unsupported_insert<T>(feature: &str) -> Result<T> {
     Err(LimboError::ParseError(format!(
         "semantic INSERT does not yet accept {feature}"
     )))
+}
+
+/// Whether a VALUES expression contains a subquery.
+fn contains_subquery(syntax: &ast::Expr) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let mut found = false;
+    let _ = walk_expr(syntax, &mut |expression| {
+        found |= matches!(
+            expression,
+            ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_)
+        );
+        Ok(if found {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    });
+    found
 }

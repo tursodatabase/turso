@@ -283,6 +283,7 @@ impl<'document> HirValidator<'document> {
             InsertTargetKind::BTree {
                 autoincrement,
                 defaults,
+                replace_defaults,
                 triggers,
                 foreign_keys,
             } => {
@@ -349,7 +350,7 @@ impl<'document> HirValidator<'document> {
                         )?;
                     }
                 }
-                for default in defaults {
+                for default in defaults.iter().chain(replace_defaults) {
                     self.validate_column_position(insert.target, default.column)?;
                     self.visit_expr(&default.value)?;
                 }
@@ -435,6 +436,19 @@ impl<'document> HirValidator<'document> {
         if let Some(excluded) = insert.excluded_source {
             self.visit_source(excluded, Some(SourceOwner::Root))?;
             self.require_pseudo_source(excluded, PseudoSource::Excluded)?;
+        }
+        if let Some(new_source) = insert.upsert_new_source {
+            self.visit_source(new_source, Some(SourceOwner::Root))?;
+            self.require_pseudo_source(new_source, PseudoSource::New)?;
+            self.require_complete_row_image(new_source)?;
+            self.require_complete_index_metadata(new_source)?;
+            self.require(
+                insert
+                    .upserts
+                    .iter()
+                    .any(|upsert| matches!(upsert.action, UpsertAction::Update { .. })),
+                "INSERT has an UPSERT NEW row without a DO UPDATE",
+            )?;
         }
         self.visit_optional_returning(insert.returning.as_ref())
     }
@@ -879,6 +893,25 @@ impl<'document> HirValidator<'document> {
             "only an UPDATE CASCADE action can guarantee the new parent",
         )?;
 
+        if let Some(index) = &foreign_key.child_index {
+            self.visit_catalog_object(index, "foreign-key child index")?;
+            self.require(
+                index
+                    .value()
+                    .table_name
+                    .eq_ignore_ascii_case(&child_table.name)
+                    && index.database() == foreign_key.child_table.database()
+                    && index.value().columns.len() == width
+                    && index
+                        .value()
+                        .columns
+                        .iter()
+                        .zip(foreign_key.child_positions.iter())
+                        .all(|(column, position)| column.pos_in_table == *position),
+                "foreign-key child index does not list exactly the child key",
+            )?;
+        }
+
         match &foreign_key.parent_unique_index {
             Some(index) => {
                 self.visit_catalog_object(index, "foreign-key parent index")?;
@@ -1286,8 +1319,12 @@ impl<'document> HirValidator<'document> {
                 self.visit_expr(&constraint.expression)?;
             }
         }
+        // An UPDATE's NEW row is a pseudo source with its own index
+        // expressions: new index keys read the new values.
         let source_table = match &source.kind {
-            SourceKind::Table(table) | SourceKind::TableFunction { table, .. } => Some(table),
+            SourceKind::Table(table)
+            | SourceKind::TableFunction { table, .. }
+            | SourceKind::Pseudo { table, .. } => Some(table),
             _ => None,
         };
         let mut index_ids = HashSet::with_capacity(source.index_expressions.len());
@@ -2515,13 +2552,22 @@ impl<'document> HirValidator<'document> {
             &source_definition.kind,
             SourceKind::Table(_) | SourceKind::TableFunction { .. }
         );
-        let needs_type_programs = reads_catalog_storage
-            && type_fact
+        let has_custom_type = |type_fact: &super::TypeFact| {
+            type_fact
                 .declared
                 .as_ref()
-                .is_some_and(|declared| !declared.custom_chain.is_empty());
+                .is_some_and(|declared| !declared.custom_chain.is_empty())
+        };
+        let needs_type_programs = reads_catalog_storage && has_custom_type(type_fact);
+        // An UPDATE's NEW row is a pseudo source that keeps the target's
+        // type programs, since it holds the values being written.
+        let has_type_programs = source_definition.column_type_programs[column].is_some();
+        let complete = match &source_definition.kind {
+            SourceKind::Pseudo { .. } => !has_type_programs || has_custom_type(type_fact),
+            _ => has_type_programs == needs_type_programs,
+        };
         self.require(
-            source_definition.column_type_programs[column].is_some() == needs_type_programs,
+            complete,
             format!("source {source} column {column} has incomplete type programs"),
         )?;
         if let Some(programs) = &source_definition.column_type_programs[column] {

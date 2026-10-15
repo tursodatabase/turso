@@ -4,7 +4,6 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
-    dml::trigger_targets_database,
     expr::ExprPolicies,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
@@ -114,22 +113,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         table: &hir::ResolvedTable,
     ) -> Result<Vec<hir::ResolvedTrigger>> {
-        let database = table
-            .database()
-            .expect("a DELETE target table must have an owning database");
-        let triggers = self
-            .context()
-            .schema(database)?
-            .get_triggers_for_table(table.value().get_name())
-            .filter(|trigger| {
-                trigger_targets_database(trigger, database)
-                    && matches!(trigger.event, ast::TriggerEvent::Delete)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(triggers
-            .into_iter()
-            .map(|trigger| self.freeze_trigger(database, trigger))
-            .collect())
+        self.table_triggers(table, |trigger| {
+            matches!(trigger.event, ast::TriggerEvent::Delete)
+        })
     }
 }

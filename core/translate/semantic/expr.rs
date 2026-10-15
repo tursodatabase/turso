@@ -32,6 +32,9 @@ pub(crate) struct ExprPolicy {
     raise: RaisePolicy,
     self_source: Option<hir::SourceId>,
     policies: ExprPolicies,
+    /// Report `x.y` with no table `x` as "no such column: x.y", as legacy
+    /// does in a single VALUES row and in UPSERT.
+    unknown_table_as_column: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +90,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -99,6 +103,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -111,6 +116,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -123,6 +129,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -139,6 +146,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -151,6 +159,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -163,6 +172,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -175,6 +185,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
+            unknown_table_as_column: false,
         }
     }
 
@@ -183,7 +194,12 @@ impl ExprPolicy {
     }
 
     pub(super) const fn upsert_update(dqs_dml: DoubleQuotedDml) -> Self {
-        Self::insert_values(dqs_dml)
+        Self::insert_values(dqs_dml).with_unknown_table_as_column()
+    }
+
+    pub(crate) const fn with_unknown_table_as_column(mut self) -> Self {
+        self.unknown_table_as_column = true;
+        self
     }
 
     pub(super) const fn update(dqs_dml: DoubleQuotedDml) -> Self {
@@ -204,6 +220,7 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(DoubleQuotedDml::Disabled),
+            unknown_table_as_column: false,
         }
     }
 
@@ -2196,6 +2213,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     {
                         return self.build_field_access(base, column.as_str());
                     }
+                }
+                if policy.unknown_table_as_column {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}",
+                        table.as_str(),
+                        column.as_str()
+                    );
                 }
                 crate::bail_parse_error!("no such table: {}", table.as_str());
             }

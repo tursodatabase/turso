@@ -19,12 +19,17 @@ pub(crate) struct SemanticOptions {
     pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
     pub(crate) custom_types_enabled: bool,
     pub(crate) dqs_dml: context::DoubleQuotedDml,
+    pub(crate) foreign_keys_enabled: bool,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
     Statement(&'ast turso_parser::ast::Stmt),
     TriggerProgram {
+        /// The database of the table the trigger is on.
         database: hir::DatabaseId,
+        /// The database the trigger's commands write, or `None` for TEMP
+        /// triggers, which look tables up by the normal rules.
+        command_database: Option<hir::DatabaseId>,
         table_name: &'ast str,
         event: turso_parser::ast::TriggerEvent,
         predicate: Option<&'ast turso_parser::ast::Expr>,
@@ -45,11 +50,13 @@ pub(crate) fn analyze_root(
         options.custom_types_enabled,
         options.dialect,
         options.dqs_dml,
+        options.foreign_keys_enabled,
     )?;
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
         SemanticRootInput::TriggerProgram {
             database,
+            command_database,
             table_name,
             event,
             predicate,
@@ -69,6 +76,7 @@ pub(crate) fn analyze_root(
                     table,
                     event,
                 },
+                command_database,
                 predicate,
                 commands,
                 conflict_override,
@@ -105,6 +113,9 @@ pub(crate) enum AnalyzeInput<'ast> {
 
 pub(crate) struct TriggerProgramInput<'ast> {
     pub(crate) context: TriggerAnalysis,
+    /// The database the trigger's INSERT, UPDATE and DELETE commands write.
+    /// `None` for TEMP triggers, which look tables up by the normal rules.
+    pub(crate) command_database: Option<hir::DatabaseId>,
     pub(crate) predicate: Option<&'ast turso_parser::ast::Expr>,
     pub(crate) commands: &'ast [turso_parser::ast::TriggerCmd],
     pub(crate) conflict_override: Option<turso_parser::ast::ResolveType>,
@@ -191,6 +202,7 @@ mod tests {
             dialect: Arc::new(SqliteDialect),
             custom_types_enabled: true,
             dqs_dml: DoubleQuotedDml::Disabled,
+            foreign_keys_enabled: true,
         };
         let document = analyze_root(
             &catalog,
@@ -230,6 +242,7 @@ mod tests {
             options(),
             SemanticRootInput::TriggerProgram {
                 database: hir::DatabaseId::new(MAIN_DB_ID),
+                command_database: Some(hir::DatabaseId::new(MAIN_DB_ID)),
                 table_name: "items",
                 event: event.clone(),
                 predicate: when_clause.as_deref(),
@@ -253,6 +266,7 @@ mod tests {
             options(),
             SemanticRootInput::TriggerProgram {
                 database: hir::DatabaseId::new(MAIN_DB_ID),
+                command_database: Some(hir::DatabaseId::new(MAIN_DB_ID)),
                 table_name: "missing",
                 event,
                 predicate: None,

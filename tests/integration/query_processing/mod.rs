@@ -4,6 +4,7 @@ mod test_ddl;
 mod test_ephemeral_cleanup;
 mod test_eqp_json;
 mod test_hash_join_materialization;
+mod test_hir_dml;
 mod test_hir_select;
 mod test_in_seek;
 mod test_is_seek;

@@ -394,6 +394,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     source: insert.target,
                     column,
                 }));
+                // The row an UPSERT DO UPDATE writes is a full row image too.
+                if let Some(source) = insert.upsert_new_source {
+                    pending.extend((0..width).map(|column| ColumnRef { source, column }));
+                }
                 pending.extend(foreign_keys.incoming.iter().flat_map(|foreign_key| {
                     foreign_key
                         .child_positions
@@ -525,7 +529,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
                 };
                 let mut scope = Scope::default();
-                scope.add_source(source, true);
+                scope.add_schema_source(source);
                 (scope, generated_syntax, default_syntax)
             };
 
@@ -2027,6 +2031,7 @@ mod tests {
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
                 },
+                command_database: Some(DatabaseId::new(MAIN_DB_ID)),
                 predicate: when_clause.as_deref(),
                 commands: &commands,
                 conflict_override,
@@ -8075,18 +8080,11 @@ mod tests {
             &schema,
             "INSERT INTO writable(id) VALUES (4) RETURNING writable.*",
         )
-        .expect("qualified RETURNING star binds");
-        let HirRoot::Insert(insert) = &qualified.root else {
-            panic!("INSERT produces INSERT root");
-        };
+        .err()
+        .expect("qualified RETURNING star is rejected");
         assert_eq!(
-            insert
-                .returning
-                .as_ref()
-                .expect("qualified star is preserved")
-                .outputs
-                .len(),
-            3
+            qualified.to_string(),
+            "Parse error: RETURNING may not use \"TABLE.*\" wildcards"
         );
     }
 
@@ -11010,7 +11008,7 @@ mod tests {
         let document = analyze_sql_with_schema(
             &schema,
             "UPDATE writable AS old SET value = 'changed' \
-             RETURNING writable.*, value COLLATE nocase AS folded",
+             RETURNING *, value COLLATE nocase AS folded",
         )
         .expect("UPDATE RETURNING binds");
         document
@@ -11603,7 +11601,7 @@ mod tests {
         let document = analyze_sql_with_schema(
             &schema,
             "DELETE FROM writable AS deleted WHERE id = 1 \
-             RETURNING deleted.*, deleted.rowid, value COLLATE nocase AS folded",
+             RETURNING *, deleted.rowid, value COLLATE nocase AS folded",
         )
         .expect("DELETE RETURNING binds");
         document

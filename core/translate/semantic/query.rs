@@ -1094,7 +1094,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ))
                 })?;
                 let mut scope = Scope::default();
-                scope.add_source(definition, true);
+                scope.add_schema_source(definition);
                 scope
             };
             self.analyze_btree_index_metadata(

@@ -124,7 +124,9 @@ statements through HIR: the owned semantic catalog, `analyze_root`,
 `HirPlan::build`, and HIR lowering. Nested engine statements still use the
 legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
 prepare, so running the test suites with the variable set lists the remaining
-gaps. The variable and the legacy path are removed at cutover.
+gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
+cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
+are removed at cutover.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as
@@ -190,6 +192,131 @@ Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
 stop an endless recursive CTE. HIR still materializes them in blocks with an
 outer join, where legacy can stream some of them.
+
+### DML through HIR
+
+DELETE from a B-tree table is lowered from HIR
+(`semantic_lowering/delete.rs`). It follows legacy's bytecode: every index is
+opened for writing, index keys are read from the table row, the entry of the
+index the loop reads is removed after the row, and RETURNING rows wait in an
+ephemeral table until every row is deleted. A WHERE clause with a subquery
+first collects the rowids into a RowSet, then deletes them. HIR reads
+RETURNING values before the row is deleted; legacy reads a copy of the row
+after, which gives the same values when RETURNING has no subquery.
+
+Whether a DELETE needs legacy is decided before any bytecode is emitted. These
+still go to legacy:
+
+| DELETE feature | What HIR needs first |
+|---|---|
+| ON DELETE CASCADE, SET NULL or SET DEFAULT on a table that references the target | Running the action on the child rows |
+| A subquery in RETURNING | RETURNING read from a copy of the deleted row |
+| CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
+| Automatic indexes chosen by the planner | Building them before the delete loop |
+
+UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`)
+when it changes neither the rowid nor the index its loop reads. The new row
+is built in registers, NOT NULL and UNIQUE are checked with the statement's
+or the constraint's conflict mode (ABORT, FAIL, ROLLBACK, IGNORE), and only
+indexes whose key or WHERE term reads a changed column are rewritten: every
+new key is checked before any index changes, then old entries are deleted and
+new ones inserted, as in legacy. HIR's NEW-row source is bound to those
+registers, so new index keys, partial-index WHERE terms and RETURNING read the
+new values. These still go to legacy:
+
+| UPDATE feature | What HIR needs first |
+|---|---|
+| Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| A subquery in SET, WHERE or RETURNING | Reading it at the points legacy does |
+| A changed rowid, or a changed key of the index the loop reads | The same |
+| ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
+| STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
+
+INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
+from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
+coroutine, as in legacy, so the row code is emitted once. The rowid comes
+from the statement (checked against existing rows) or NewRowid; NOT NULL,
+PRIMARY KEY and UNIQUE are checked with ABORT, FAIL, ROLLBACK or IGNORE before
+anything is written, then every index entry and the row are written. The
+target source is bound to the new row's registers for index expressions,
+partial-index WHERE terms and RETURNING. These still go to legacy:
+
+| INSERT feature | What HIR needs first |
+|---|---|
+| CDC, virtual tables, materialized views | As for DELETE |
+| Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
+| A subquery in VALUES or RETURNING | Reading it at the points legacy does |
+| UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
+| OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
+| AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
+| WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
+
+Triggers fired by these statements are compiled from HIR too
+(`semantic_lowering/trigger.rs`). Each trigger is analyzed as its own HIR
+document whose OLD and NEW sources are bound to registers, and is emitted as a
+subprogram that the statement runs with `Program`, as in legacy. The
+subprogram loads OLD and NEW from its parameters, tests WHEN, and lowers each
+command with the same DELETE, UPDATE and INSERT code; a command's own
+triggers are compiled the same way, and a trigger already being compiled is
+not fired again. TEMP triggers fire first. Every command of every trigger is
+checked before anything is emitted, so if one needs legacy the whole
+statement goes to legacy. As in SQLite, OLD.x and NEW.x compare without the
+column's affinity (a rowid alias keeps INTEGER), and triggers stored in the
+temp schema find unqualified tables by the normal temp-then-main lookup.
+
+With triggers, DELETE and UPDATE collect the rowids first, then for each row
+read the OLD row, run BEFORE triggers, check that the row still exists, write,
+and run AFTER triggers. UPDATE reads the columns it does not set again after
+BEFORE triggers and checks NOT NULL only then. INSERT runs BEFORE triggers
+with NEW.rowid -1 when the rowid is not given yet.
+
+With `PRAGMA foreign_keys = ON`, DELETE and INSERT check foreign keys the
+way legacy does (`semantic_lowering/fkey.rs`), reading key values through the
+HIR target source. Before a row is deleted, child rows that still point at
+it are counted as violations (RESTRICT stops at once), found through a child
+index that lists exactly the child key, or by scanning the child table; a
+deleted child of a deferred constraint whose parent was missing takes back
+its violation. Before a new row is written, its parent must exist: an
+immediate constraint stops the statement, a deferred one adds a violation. A
+row may be its own parent. After a new row is written, children of a
+deferred or self-referencing constraint that point at its key take back
+their violations. With foreign keys off, DML carries no foreign-key metadata,
+so a child of a missing parent table can still be written.
+
+REPLACE is lowered for INSERT and UPDATE as legacy does it. The row the new
+row conflicts with is deleted inline, with its index entries and the
+foreign-key checks of deleting it (no DELETE trigger fires); an INSERT writes
+an index whose conflict resolves to REPLACE as soon as it is checked, and an
+INTEGER PRIMARY KEY with its own ON CONFLICT REPLACE after the indexes. NOT
+NULL ON CONFLICT REPLACE stores the column's DEFAULT, resolved in semantic
+analysis. UPDATE OR REPLACE first collects its rowids; after deleting the
+other row an UPDATE seeks back to its own. A REPLACE that would fire an ON
+DELETE action still goes to legacy.
+
+UPSERT is lowered as legacy does it. The constraints an ON CONFLICT clause
+names are checked first, in clause order; a conflict on one goes to the first
+clause naming it, or to a final catch-all clause, and any other conflict stops
+the statement (an UPSERT also turns REPLACE off). DO NOTHING skips the row. DO
+UPDATE seeks to the conflicting row, reads it through the target and the new
+values through `excluded`, builds the new row in registers bound to the
+UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index
+(with ABORT) before rewriting the indexes and the row, and returns the
+updated row to RETURNING. INSERT triggers do not fire for it.
+
+INSERT ... SELECT runs the query as a coroutine that yields one row at a
+time into the same row code as VALUES. When the query reads the target table,
+or the INSERT fires triggers, the rows are first copied into an ephemeral
+table, as legacy and SQLite do.
+
+UPDATE ... FROM first runs the join of the target and the FROM clause (the
+same loop emission as SELECT, `emit_dml_join_loops`), writing the assigned
+values of each target row into a scratch table keyed by its rowid, then
+updates each row of the scratch table. A target row joined more than once
+keeps the values of the last joined row, so the join order decides it: the
+target is planned first, as legacy ends up ordering it, except when the FROM
+clause has a RIGHT or FULL JOIN, which must not NULL-extend the target. Like
+legacy, a FROM clause that names a table twice, or whose NATURAL/USING column
+is also exposed by two other tables, is rejected up front.
 
 ### Non-lowering phase complete
 

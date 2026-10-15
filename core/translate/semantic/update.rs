@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
-    dml::{trigger_matches_update, trigger_targets_database},
+    dml::trigger_matches_update,
     expr::ExprPolicies,
     hir::{self, HirRoot, SourceOwner},
     query::FromContext,
@@ -91,6 +91,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         policies: expressions.policies,
                     },
                 )?;
+                self.check_update_from_ambiguity(&from)?;
                 (Some(from), Some(scope))
             }
             None => (None, None),
@@ -111,7 +112,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::UpdateTargetKind::Virtual
         } else {
             hir::UpdateTargetKind::BTree {
-                defaults: Vec::new(),
+                defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_update_triggers(&table, &assignments)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
             }
@@ -149,9 +150,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         assignments: &[hir::Assignment],
     ) -> Result<Vec<hir::ResolvedTrigger>> {
-        let database = table
-            .database()
-            .expect("an UPDATE target table must have an owning database");
         let updated_columns = assignments
             .iter()
             .flat_map(|assignment| assignment.columns.iter())
@@ -160,23 +158,80 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 hir::TargetColumn::RowId => None,
             })
             .collect::<Vec<_>>();
-        let triggers = self
-            .context()
-            .schema(database)?
-            .get_triggers_for_table(table.value().get_name())
-            .filter(|trigger| {
-                trigger_targets_database(trigger, database)
-                    && trigger_matches_update(trigger, table.value(), &updated_columns)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(triggers
-            .into_iter()
-            .map(|trigger| self.freeze_trigger(database, trigger))
-            .collect())
+        let target = table.value();
+        self.table_triggers(table, |trigger| {
+            trigger_matches_update(trigger, target, &updated_columns)
+        })
     }
 
-    fn create_update_new_source(
+    /// Like legacy and SQLite, UPDATE ... FROM rejects up front a FROM
+    /// clause that names a table twice, or where a column that NATURAL or
+    /// USING merges is also exposed, unmerged, by two other tables, even if
+    /// no expression reads it.
+    fn check_update_from_ambiguity(&self, from: &hir::From) -> Result<()> {
+        let entries = std::iter::once((from.first, None))
+            .chain(from.joins.iter().map(|join| {
+                let merged = match &join.constraint {
+                    hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                        Some(columns.as_slice())
+                    }
+                    hir::JoinConstraint::None | hir::JoinConstraint::On(_) => None,
+                };
+                (join.right, merged)
+            }))
+            .map(|(source, merged)| {
+                self.source(source)
+                    .map(|source| (source, merged))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("missing UPDATE FROM source {source}"))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let identifier =
+            |source: &hir::Source| normalize_ident(source.alias.as_deref().unwrap_or(&source.name));
+        for (position, (source, _)) in entries.iter().enumerate() {
+            let name = identifier(source);
+            if entries[..position]
+                .iter()
+                .any(|(earlier, _)| identifier(earlier) == name)
+            {
+                let database = source
+                    .database
+                    .and_then(|database| self.context().database_name(database))
+                    .unwrap_or("main");
+                crate::bail_parse_error!("ambiguous column name: {database}.{name}._ROWID_");
+            }
+        }
+        let merges = |merged: Option<&[hir::UsingColumn]>, column: &str| {
+            merged.is_some_and(|merged| {
+                merged
+                    .iter()
+                    .any(|merged| merged.name.eq_ignore_ascii_case(column))
+            })
+        };
+        for (position, (_, merged)) in entries.iter().enumerate() {
+            for column in merged.iter().flat_map(|merged| merged.iter()) {
+                let exposing = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, (source, other_merged))| {
+                        *other != position
+                            && source
+                                .columns
+                                .iter()
+                                .any(|candidate| candidate.name.eq_ignore_ascii_case(&column.name))
+                            && !merges(*other_merged, &column.name)
+                    })
+                    .count();
+                if exposing > 1 {
+                    crate::bail_parse_error!("ambiguous column name: {}", column.name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_update_new_source(
         &mut self,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
@@ -275,7 +330,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
             }
 
-            let values: Vec<&ast::Expr> = match set.expr.as_ref() {
+            // Like legacy, `((x, y))` assigns the same values as `(x, y)`.
+            let mut expression = set.expr.as_ref();
+            while let ast::Expr::Parenthesized(expressions) = expression {
+                let [inner] = expressions.as_slice() else {
+                    break;
+                };
+                expression = inner;
+            }
+            let values: Vec<&ast::Expr> = match expression {
                 ast::Expr::Parenthesized(values) => {
                     if set.col_names.len() != values.len() {
                         crate::bail_parse_error!(

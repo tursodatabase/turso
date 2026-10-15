@@ -525,6 +525,30 @@ fn hir_real_column_comparisons_keep_large_integers_exact() {
 }
 
 #[test]
+fn hir_reads_an_aliased_table_whose_partial_index_names_the_table() {
+    let db = TempDatabase::new_empty();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, amount INTEGER, active INTEGER)",
+        // The index WHERE names the table itself, not the statement's alias.
+        "CREATE INDEX orders_active ON orders(amount) WHERE orders.active = 1",
+        "INSERT INTO orders VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT * FROM orders AS o WHERE o.amount > 5 ORDER BY o.id",
+        "SELECT o.amount FROM orders o WHERE o.active = 1 AND o.amount > 0",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);

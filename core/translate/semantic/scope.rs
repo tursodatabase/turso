@@ -199,6 +199,16 @@ impl Scope {
         });
     }
 
+    /// Add a table the way its schema text sees it: under the table's own
+    /// name, whatever alias the statement gave it. Index, generated-column,
+    /// default, and CHECK expressions name their table this way.
+    pub(crate) fn add_schema_source(&mut self, source: &hir::Source) {
+        self.add_source(source, true);
+        let added = self.sources.last_mut().expect("source was just added");
+        added.qualifier = added.table_name.clone();
+        added.database_qualified = true;
+    }
+
     /// Add another root-level source namespace at the same resolution level.
     pub(crate) fn append_local(&mut self, other: Self) {
         assert!(self.outer.is_none(), "destination scope must be root-level");
