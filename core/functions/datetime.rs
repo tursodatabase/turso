@@ -2,6 +2,7 @@ use crate::io::clock::Clock;
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
+use crate::vdbe::affinity::is_space;
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::LimboError::InvalidModifier;
 use crate::{Result, ValueRef};
@@ -224,7 +225,7 @@ fn parse_date_or_time(value: &str, p: &mut DateTime, clock: &dyn Clock) -> Resul
         set_to_current(p, clock);
         return Ok(());
     }
-    let numeric_value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    let numeric_value = value.trim_matches(|c: char| u8::try_from(c).is_ok_and(is_space));
     if let Ok(val) = numeric_value.parse::<f64>() {
         p.s = val;
         p.raw_s = true;
@@ -287,8 +288,8 @@ fn parse_yyyy_mm_dd(mut z: &str, p: &mut DateTime) -> bool {
     }
 
     while !z.is_empty() {
-        let c = z.as_bytes()[0] as char;
-        if c.is_ascii_whitespace() || c == 'T' {
+        let c = z.as_bytes()[0];
+        if is_space(c) || c == b'T' {
             z = &z[1..];
         } else {
             break;
@@ -386,8 +387,7 @@ fn parse_hh_mm_ss(mut z: &str, p: &mut DateTime) -> bool {
 
 fn parse_timezone(mut z: &str, p: &mut DateTime) -> bool {
     while !z.is_empty() {
-        let c = z.as_bytes()[0] as char;
-        if c.is_ascii_whitespace() {
+        if is_space(z.as_bytes()[0]) {
             z = &z[1..];
         } else {
             break;
@@ -454,8 +454,7 @@ fn parse_timezone(mut z: &str, p: &mut DateTime) -> bool {
 // return *zDate!=0;
 fn check_trailing_garbage(mut z: &str) -> bool {
     while !z.is_empty() {
-        let c = z.as_bytes()[0] as char;
-        if c.is_ascii_whitespace() {
+        if is_space(z.as_bytes()[0]) {
             z = &z[1..];
         } else {
             break;

@@ -2752,3 +2752,10 @@ test where-time-of-blob-with-nul {
 expect {
     1
 }
+
+test datetime-accepts-vertical-tab-whitespace {
+    SELECT quote(date('2024-01-01' || char(11))), quote(datetime('12:00' || char(11))), quote(date('2460000.5' || char(11))), quote(datetime('0' || char(11))), quote(date('2024-01-01' || char(12))), quote(datetime('2024-01-01' || char(11) || '12:00')), quote(datetime('2024-01-01 12:00' || char(11) || '+01:00'));
+}
+expect {
+    '2024-01-01'|'2000-01-01 12:00:00'|'2023-02-25'|'-4713-11-24 12:00:00'|'2024-01-01'|'2024-01-01 12:00:00'|'2024-01-01 11:00:00'
+}
