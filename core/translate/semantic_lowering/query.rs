@@ -1074,7 +1074,7 @@ fn emit_planned_block_rows(
             block.id
         )));
     }
-    if block.from.is_none() {
+    if block.from.is_none() && hir_grouping(block).is_none() {
         if is_hir_ungrouped_aggregate(block) {
             return emit_hir_ungrouped_without_from(
                 program,
@@ -3036,21 +3036,24 @@ fn emit_btree_loops(
             )));
         }
     }
-    if block_plan.loops.is_empty() {
+    if block.from.is_some() == block_plan.loops.is_empty() {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} does not have a source loop",
-            block.id
+            "HIR query block {:?} has {} loops for its FROM clause",
+            block.id,
+            block_plan.loops.len()
         )));
     }
-    let from = block.from.as_ref().expect("FROM query block has a source");
+    // A block without FROM runs its body once, with no loops.
     let mut joins = HirOuterJoins::default();
-    if !supported_btree_from(document, from, &mut joins) {
-        return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} contains an unsupported join",
-            block.id
-        )));
+    if let Some(from) = &block.from {
+        if !supported_btree_from(document, from, &mut joins) {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} contains an unsupported join",
+                block.id
+            )));
+        }
+        check_hir_full_join_shape(document, from, &joins)?;
     }
-    check_hir_full_join_shape(document, from, &joins)?;
     if block_plan.predicates.iter().any(|predicate| {
         predicate
             .from_outer_join
