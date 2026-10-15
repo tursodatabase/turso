@@ -624,11 +624,11 @@ fn tagged_dollar_quoted_string() {
 
 #[test]
 fn escape_string_backslash_n() {
-    let output = run_tursopg(b"SELECT E'line1\\nline2';\n");
+    let output = run_tursopg(b"\\x\nSELECT E'line1\\nline2';\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("line1") && out.contains("line2"),
+        out.contains("line1\nline2"),
         "expected two lines, got: {out}"
     );
 }
@@ -1286,6 +1286,41 @@ fn wire_copy_from_returns_copy_n() {
     std::fs::remove_file(&path).ok();
     server.kill().ok();
     server.wait().ok();
+}
+
+#[test]
+fn repl_load_extension_still_attempts_to_open_the_file() {
+    let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
+    let combined = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Extension file not found"),
+        "interactive CLI should still try to load the library: {combined}"
+    );
+    assert!(
+        !combined.contains("runtime extension loading is disabled"),
+        "interactive CLI must keep load_extension enabled: {combined}"
+    );
+}
+
+#[test]
+fn wire_load_extension_is_disabled() {
+    with_pg_client(|client| {
+        client.send_query("SELECT load_extension('/nonexistent/turso-audit-ext')");
+        let response = client.read_until_ready();
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("runtime extension loading is disabled"),
+            "wire listener must refuse load_extension, got: {text}"
+        );
+        assert!(
+            !text.contains("Extension file not found"),
+            "wire listener must not reach the filesystem open: {text}"
+        );
+    });
 }
 
 #[test]

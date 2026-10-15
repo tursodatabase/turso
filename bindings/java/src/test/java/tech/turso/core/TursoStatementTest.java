@@ -2,6 +2,7 @@ package tech.turso.core;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.sql.SQLException;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,6 +28,28 @@ class TursoStatementTest {
     stmt.close();
     assertTrue(stmt.isClosed());
     assertFalse(stmt.getResultSet().isOpen());
+  }
+
+  @Test
+  void closing_statement_twice_frees_it_only_once() throws Exception {
+    TursoStatement stmt = connection.prepare("SELECT 1;");
+
+    stmt.close();
+    stmt.close();
+
+    assertTrue(stmt.isClosed());
+  }
+
+  @Test
+  void using_statement_after_close_throws_instead_of_touching_freed_memory() throws Exception {
+    TursoStatement stmt = connection.prepare("SELECT ?;");
+    stmt.close();
+
+    assertThrows(SQLException.class, stmt::step);
+    assertThrows(SQLException.class, () -> stmt.bindLong(1, 1));
+    assertThrows(SQLException.class, stmt::initializeColumnMetadata);
+    assertThrows(SQLException.class, stmt::parameterCount);
+    assertThrows(SQLException.class, stmt::reset);
   }
 
   @Test

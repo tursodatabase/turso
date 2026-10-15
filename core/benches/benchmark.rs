@@ -1,7 +1,5 @@
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -14,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use turso_core::{Database, LimboError, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, LimboError, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -90,7 +88,7 @@ fn bench_open(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         for i in 0..5000 {
             conn.execute(
@@ -111,7 +109,7 @@ fn bench_open(criterion: &mut Criterion) {
                 Arc::new(SqliteDialect),
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.execute("SELECT * FROM table_0").unwrap();
         });
     });
@@ -143,7 +141,7 @@ fn bench_alter(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         for i in 0..5000 {
             conn.execute(
@@ -163,7 +161,7 @@ fn bench_alter(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
@@ -213,7 +211,7 @@ fn bench_alter(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
@@ -264,7 +262,7 @@ fn bench_alter(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
@@ -314,7 +312,7 @@ fn bench_alter(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         iter_custom_or_iter!(b, |iters| {
             (0..iters)
                 .map(|_| {
@@ -364,7 +362,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let queries = [
         "SELECT 1",
@@ -448,7 +446,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
 
@@ -520,7 +518,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
 
@@ -576,7 +574,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");
 
@@ -641,7 +639,7 @@ fn bench_execute_group_by(criterion: &mut Criterion) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let db =
         Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let mut group = criterion.benchmark_group(
         "Execute `SELECT state, COUNT(*), MAX(last_name), SUM(age) GROUP BY state`",
@@ -712,7 +710,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let limbo_conn = db.connect().unwrap();
+        let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
         if disable_checkpoint {
             limbo_conn.wal_auto_actions_disable();
         }
@@ -785,7 +783,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let mvcc_conn = mvcc_db.connect().unwrap();
+        let mvcc_conn = mvcc_db.connect(ConnectOpts::new()).unwrap();
         mvcc_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         if disable_checkpoint {
             mvcc_conn
@@ -926,7 +924,7 @@ fn bench_limbo(
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let mut connecitons = Vec::new();
     {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         if mvcc {
             conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         }
@@ -936,7 +934,7 @@ fn bench_limbo(
     let inserts =
         generate_inserts_per_connection(num_connections, num_batch_inserts, num_inserts_per_batch);
     for i in 0..num_connections {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let inserts = inserts[i as usize].clone();
         connecitons.push(ConnectionState {
             conn,
@@ -1011,7 +1009,7 @@ fn bench_limbo_mvcc(
     let path = temp_dir.path().join("bench.db");
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let mut connecitons = Vec::new();
-    let conn0 = db.connect().unwrap();
+    let conn0 = db.connect(ConnectOpts::new()).unwrap();
     if mvcc {
         conn0.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
@@ -1020,7 +1018,7 @@ fn bench_limbo_mvcc(
     let inserts =
         generate_inserts_per_connection(num_connections, num_batch_inserts, num_inserts_per_batch);
     for i in 0..num_connections {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let inserts = inserts[i as usize].clone();
         connecitons.push(ConnectionState {
             conn,
@@ -1201,7 +1199,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let limbo_conn = db.connect().unwrap();
+        let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
         let mut stmt = limbo_conn.query("CREATE TABLE test(x)").unwrap().unwrap();
 
@@ -1272,14 +1270,6 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_execute_group_by, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

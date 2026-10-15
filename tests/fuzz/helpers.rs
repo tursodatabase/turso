@@ -167,9 +167,16 @@ pub fn generate_random_text(rng: &mut ChaCha8Rng, max_len: usize) -> String {
         .collect()
 }
 
-/// Create a `TempDatabaseBuilder` pre-configured with the flags and opts from an
-/// existing `TempDatabase`.
+/// Create a `TempDatabaseBuilder` with the flags, opts and MVCC mode of an
+/// existing `TempDatabase`. Use it for databases that Turso opens, so that the
+/// `_mvcc` variant of a fuzz test really runs in MVCC mode.
 pub fn builder_from_db(db: &TempDatabase) -> TempDatabaseBuilder {
+    sqlite_builder_from_db(db).with_mvcc(db.enable_mvcc)
+}
+
+/// Like `builder_from_db`, but the database never uses MVCC. Use it for
+/// databases that rusqlite opens: SQLite cannot read a file in MVCC mode.
+pub fn sqlite_builder_from_db(db: &TempDatabase) -> TempDatabaseBuilder {
     TempDatabase::builder()
         .with_flags(db.db_flags)
         .with_opts(db.db_opts)

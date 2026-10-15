@@ -80,6 +80,16 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
+        Expr::MergedColumn(columns) => {
+            // A merged USING column holds plain table columns, so it is never a row value.
+            for column in columns {
+                turso_assert!(
+                    expr_vector_size(column)? == 1,
+                    "a merged column must hold single values"
+                );
+            }
+            1
+        }
         Expr::FunctionCallStar { .. } => 1,
         Expr::Id(_) => 1,
         Expr::Column { .. } => 1,

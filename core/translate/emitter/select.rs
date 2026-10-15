@@ -12,15 +12,19 @@ use crate::{
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
+        optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
+            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
-        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
+        subquery::{
+            emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at,
+            emit_non_from_clause_subqueries_for_phase,
+        },
         values::emit_values,
         window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
@@ -232,6 +236,10 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
+        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+            let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+            program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+        }
         // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
         // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
         // Without resolving this label before the early return, bytecode assembly fails
@@ -250,6 +258,18 @@ pub fn emit_query<'a>(
         None,
         OperationMode::SELECT,
         &mut plan.non_from_clause_subqueries,
+    )?;
+
+    // A RIGHT or FULL JOIN can call this row body after the main loops finish.
+    // Output subqueries must read the NULL-row state set by that later call.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &mut plan.non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::RowOutput,
+        |_| true,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -308,19 +328,17 @@ struct MaterializationSpec {
     payload_columns: Vec<MaterializedColumnRef>,
 }
 
-/// Build materialized hash-build inputs for hash joins that depend on prior joins.
+/// Store filtered hash-build inputs before the hash table is built.
 ///
 /// A materialized build input is an ephemeral table that captures the rows
-/// a hash join is allowed to build from after earlier joins and filters have
-/// been applied. This prevents the build side from being re-scanned in its
-/// full, unfiltered form when prior join constraints must be respected.
+/// a hash join can use after earlier reads and filters have run. This prevents
+/// a second, unfiltered scan of the build table.
 ///
 /// The materialization uses a join-prefix: all tables that appear before the
 /// probe table in the join order, plus the build table itself. This prefix
 /// represents the minimal context needed to evaluate build-side constraints.
-/// For probe->build chaining we store join keys and payload columns directly
-/// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
-/// during probing when needed.
+/// The table stores keys and payload for a filtered read or a multi-table
+/// prefix. It can store rowids for a single unfiltered table.
 pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -352,6 +370,7 @@ pub(crate) fn emit_materialized_build_inputs(
                 continue;
             }
             seen_build_tables.set(hash_join_op.build_table_idx)?;
+            let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -402,10 +421,14 @@ pub(crate) fn emit_materialized_build_inputs(
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
+            let build_read_is_in_seek =
+                matches!(build_table.op, Operation::Search(Search::InSeek { .. }));
 
-            if build_table_was_prior_probe || prefix_has_other_tables {
-                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
-                // so we do not lose multiplicity or correlation.
+            if build_table_was_prior_probe
+                || prefix_has_other_tables
+                || build_read_is_in_seek
+                || build_table.selected_index_stores_used_columns()
+            {
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -485,6 +508,7 @@ pub(crate) fn emit_materialized_build_inputs(
             true,
             crate::translate::eqp::EqpDetail::HashBuild {
                 table: crate::translate::eqp::EqpTable::from_joined(build_table),
+                estimate: build_table.plan_estimate,
             }
         );
         program.emit_insn(Insn::OpenEphemeral {
@@ -521,6 +545,10 @@ pub(crate) fn emit_materialized_build_inputs(
                 prefix_tables: spec.prefix_tables.clone(),
             },
         );
+    }
+
+    for build_table_idx in build_inputs.keys() {
+        plan.table_references.joined_tables_mut()[*build_table_idx].clear_expression_index_usages();
     }
 
     // Drop any join-prefix tables already captured by key+payload materializations.
@@ -603,9 +631,9 @@ fn prune_join_order_for_materialized_inputs(
         if term.consumed {
             continue;
         }
-        if term.from_outer_join.is_some() {
+        if term.origin.is_outer_join() {
             // OUTER JOIN terms still belong to the right-table loop recorded in
-            // `from_outer_join`. Materializing and pruning the build-side prefix
+            // `origin`. Materializing and pruning the build-side prefix
             // does not make those terms safe to consume here, because the
             // materialization subplan does not include the probe table that
             // determines the null-extension boundary.
@@ -785,6 +813,8 @@ fn build_materialized_build_input_plan(
     // terms for access methods (e.g. ephemeral autoindex seeks) that get
     // overwritten to scans inside the subplan. Reset each term's consumed
     // flag: only terms referencing tables outside the prefix are consumed.
+    // Terms implied by a partial index that the subplan still reads are
+    // consumed again below, after the access methods are checked.
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -802,6 +832,14 @@ fn build_materialized_build_input_plan(
     // the materialization subplan does not try to use an access path that
     // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
+    if matches!(mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+        for table_idx in included_tables.iter() {
+            let table = &mut table_references.joined_tables_mut()[table_idx];
+            if !table.selected_index_stores_used_columns() {
+                table.clear_expression_index_usages();
+            }
+        }
+    }
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
             if hash_join_op.build_table_idx == build_table_idx {
@@ -903,6 +941,19 @@ fn build_materialized_build_input_plan(
             // access paths that are valid within the prefix join order.
             joined_table.op = Operation::default_scan_for(&joined_table.table);
         }
+
+        if let Some(index) = partial_index(joined_table.op.index()) {
+            let is_outer_join = joined_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer());
+            mark_partial_index_predicate_terms_consumed(
+                index,
+                joined_table,
+                &mut where_clause,
+                is_outer_join,
+            );
+        }
     }
 
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
@@ -958,6 +1009,17 @@ fn build_materialized_build_input_plan(
         }
     };
 
+    // The WHERE terms that use a subquery reading tables outside the prefix are
+    // consumed above, so the subquery must not be emitted in this subplan either.
+    let non_from_clause_subqueries = plan
+        .non_from_clause_subqueries
+        .iter()
+        .filter(|subquery| {
+            subquery_reads_only_tables_in(subquery, &plan.table_references, &included_tables)
+        })
+        .cloned()
+        .collect();
+
     let mut materialize_plan = SelectPlan {
         table_references,
         join_order,
@@ -980,7 +1042,7 @@ fn build_materialized_build_input_plan(
         distinctness: Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+        non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         estimated_cost: None,
@@ -991,4 +1053,27 @@ fn build_materialized_build_input_plan(
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
 
     Ok(materialize_plan)
+}
+
+fn subquery_reads_only_tables_in(
+    subquery: &NonFromClauseSubquery,
+    table_references: &TableReferences,
+    tables: &TableMask,
+) -> bool {
+    let SubqueryState::Unevaluated {
+        plan: Some(subquery_plan),
+    } = &subquery.state
+    else {
+        return true;
+    };
+    subquery_plan
+        .used_outer_query_ref_ids()
+        .iter()
+        .all(|outer_ref_id| {
+            table_references
+                .joined_tables()
+                .iter()
+                .position(|table| table.internal_id == *outer_ref_id)
+                .is_none_or(|table_idx| tables.get(table_idx))
+        })
 }

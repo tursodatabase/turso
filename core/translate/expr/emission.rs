@@ -34,16 +34,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Blob(s) => {
-            let bytes = ast::blob_literal_hex(s)
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    // We assume that sqlite3-parser has already validated that
-                    // the input is valid hex string, thus unwrap is safe.
-                    let hex_byte = std::str::from_utf8(pair).unwrap();
-                    u8::from_str_radix(hex_byte, 16).unwrap()
-                })
-                .try_collect()?;
+            let bytes = ast::blob_literal_bytes(s).try_collect()?;
             program.emit_insn(Insn::Blob {
                 value: bytes,
                 dest: target_register,
@@ -75,36 +66,32 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::CurrentDate => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_date::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
+            emit_current_time_function(program, ScalarFunc::Date, target_register)
         }
         ast::Literal::CurrentTime => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_time::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
+            emit_current_time_function(program, ScalarFunc::Time, target_register)
         }
         ast::Literal::CurrentTimestamp => {
-            program.emit_insn(
-                Insn::String8 {
-                    value: datetime::exec_datetime_full::<
-                        &[_; 0],
-                        std::slice::Iter<'_, Value>,
-                        &Value,
-                    >(&[])
-                    .to_string(),
-                    dest: target_register,
-                },
-            );
-            Ok(target_register)
+            emit_current_time_function(program, ScalarFunc::DateTime, target_register)
         }
     }
+}
+
+fn emit_current_time_function(
+    program: &mut ProgramBuilder,
+    func: ScalarFunc,
+    target_register: usize,
+) -> Result<usize> {
+    emit_function_call(
+        program,
+        FuncCtx {
+            func: Func::Scalar(func),
+            arg_count: 0,
+        },
+        &[],
+        target_register,
+    )?;
+    Ok(target_register)
 }
 
 /// Emit a function call instruction with pre-allocated argument registers
@@ -254,6 +241,7 @@ pub(crate) fn emit_returning_scan_back(program: &mut ProgramBuilder, buf: &Retur
         cursor_id: buf.cursor_id,
         pc_if_next: scan_start,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_label);
 }

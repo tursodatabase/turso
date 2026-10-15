@@ -58,7 +58,7 @@ addr  opcode                           p1   p2   p3  p4                     p5  
   18                    Yield           4    0    0                          0
   19                  Next              2    9    0                          1
   20                  EndCoroutine      4    0    0                          0
-  21                  SorterOpen        3    1    0  k(1,B)                  0  cursor=3
+  21                  SorterOpen        3    1    0  k(1,Binary)             0  cursor=3
   22                  OpenEphemeral     4    1    0                          0  cursor=4 is_table=true
   23                  OpenDup           5    4    0                          0  new_cursor=5, original_cursor=4
   24                  OpenDup           6    4    0                          0  new_cursor=6, original_cursor=4
@@ -135,7 +135,7 @@ addr  opcode                           p1   p2   p3  p4                     p5  
   95                Yield               3    0    0                          0
   96              SorterNext            3   93    0                          0
   97              EndCoroutine          3    0    0                          0
-  98              SorterOpen            8    2    0  k(2,B,-B)               0  cursor=8
+  98              SorterOpen            8    2    0  k(2,Binary,-Binary)     0  cursor=8
   99              OpenEphemeral         9    1    0                          0  cursor=9 is_table=true
  100              OpenDup              10    9    0                          0  new_cursor=10, original_cursor=9
  101              OpenDup              11    9    0                          0  new_cursor=11, original_cursor=9
@@ -213,7 +213,7 @@ addr  opcode                           p1   p2   p3  p4                     p5  
  173            Yield                   2    0    0                          0
  174          SorterNext                8  171    0                          0
  175          EndCoroutine              2    0    0                          0
- 176          SorterOpen               13    2    0  k(2,B,-B)               0  cursor=13
+ 176          SorterOpen               13    2    0  k(2,Binary,-Binary)     0  cursor=13
  177          OpenEphemeral            14    1    0                          0  cursor=14 is_table=true
  178          OpenDup                  15   14    0                          0  new_cursor=15, original_cursor=14
  179          OpenDup                  16   14    0                          0  new_cursor=16, original_cursor=14

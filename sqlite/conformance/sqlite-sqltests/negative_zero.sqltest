@@ -147,3 +147,39 @@ expect {
 expect @js {
     0|6
 }
+
+@cross-check-integrity
+test negative-zero-loses-sign-in-real-column {
+    CREATE TABLE t7(x REAL);
+    CREATE TABLE t8(x);
+    INSERT INTO t7 VALUES (-0.0);
+    INSERT INTO t8 VALUES (-0.0);
+    SELECT 'real', atan2(0, x) > 0 FROM t7;
+    SELECT 'no affinity', atan2(0, x) > 0 FROM t8;
+}
+expect {
+    real|0
+    no affinity|1
+}
+
+@cross-check-integrity
+test negative-zero-loses-sign-in-real-column-update {
+    CREATE TABLE t9(x REAL);
+    INSERT INTO t9 VALUES (1.0);
+    UPDATE t9 SET x = -0.0;
+    SELECT atan2(0, x) > 0 FROM t9;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test negative-zero-loses-sign-in-real-column-default {
+    CREATE TABLE t10(id INTEGER, x REAL DEFAULT -0.0);
+    INSERT INTO t10(id) VALUES (1);
+    ALTER TABLE t10 ADD COLUMN y REAL DEFAULT -0.0;
+    SELECT atan2(0, x) > 0, atan2(0, y) > 0 FROM t10;
+}
+expect {
+    0|0
+}

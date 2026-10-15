@@ -43,7 +43,7 @@ addr  opcode                    p1  p2  p3  p4                                  
    8            Integer          0  16   0                                          0  r[16]=0
    9            Once            21   0   0                                          0  goto 21
   10            OpenAutoindex    2   0   0                                          0  cursor=2
-  11            Rewind           1  12   0                                          0  Rewind table lineitem
+  11            Rewind           1  21   0                                          0  Rewind table lineitem
   12              Column         1  10  18                                          0  r[18]=lineitem.L_SHIPDATE
   13              Ge            18  19  20  Binary                                  0  if r[18]>=r[19] goto 20
   14              ColumnRange    1   1  20  2                                       0  r[20..21]=lineitem.L_PARTKEY..L_SUPPKEY

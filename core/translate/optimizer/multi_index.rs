@@ -26,14 +26,14 @@ use crate::translate::optimizer::cost::{
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
-    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
-    UnionBranchPrePostFilters, WhereTerm,
+    BitSet, InSeekSource, JoinOrigin, JoinedTable, NonFromClauseSubquery, SetOperation,
+    TableReferences, UnionBranchPrePostFilters, WhereTerm, WhereTermOrigin,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
@@ -101,10 +101,12 @@ enum MultiIdxBranchAccess {
     },
 }
 
-/// Flattens nested OR expressions into a list of disjuncts.
+/// Flattens nested OR expressions into a list of disjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
+/// For example, `(a OR (b OR c)) OR d` becomes `[a, b, c, d]`.
 fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
             let mut result = flatten_or_expr(lhs);
@@ -115,10 +117,15 @@ fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
     }
 }
 
-/// Flattens nested AND expressions into a list of conjuncts.
+/// Flattens nested AND expressions into a list of conjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
+/// For example, `((a AND b)) AND c` becomes `[a, b, c]`. A BETWEEN that the
+/// planner has already rewritten into `x >= lo AND x <= hi` keeps the
+/// parentheses it was written with, so `(x BETWEEN lo AND hi) AND y = 1`
+/// arrives here as `(x >= lo AND x <= hi) AND y = 1`.
 fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             let mut result = flatten_and_expr(lhs);
@@ -146,7 +153,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 #[expect(clippy::too_many_arguments)]
 fn get_table_local_constraints_for_branch(
     exprs: &[ast::Expr],
-    from_outer_join: Option<TableInternalId>,
+    join_origin: Option<JoinOrigin>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
@@ -159,7 +166,7 @@ fn get_table_local_constraints_for_branch(
         .cloned()
         .map(|expr| WhereTerm {
             expr,
-            from_outer_join,
+            origin: join_origin.map_or(WhereTermOrigin::Where, WhereTermOrigin::Join),
             consumed: false,
         })
         .collect::<Vec<_>>();
@@ -336,6 +343,7 @@ fn choose_multi_index_branch_access(
     rhs_idx: usize,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
+    table_references: &TableReferences,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -406,6 +414,8 @@ fn choose_multi_index_branch_access(
         rhs_table,
         table_constraints,
         lhs_mask,
+        branch_terms,
+        table_references,
         1.0,
         base_row_count,
         params,
@@ -777,8 +787,8 @@ fn evaluate_multi_index_branches(
 ///
 /// The scan *is* the term's evaluation: rows failing it are never visited, and
 /// the term is marked consumed so nothing checks it again. For a table that an
-/// outer join can null-extend (the right-hand table of a LEFT/FULL JOIN, or
-/// any table on the left side of a FULL JOIN) that only holds for the join's
+/// outer join can null-extend (the right table of a LEFT/FULL JOIN, or any table
+/// on the left side of a RIGHT/FULL JOIN) that only holds for the join's
 /// own ON clause, which defines what counts as a match. Any other term must
 /// also reject the null-extended row the join emits when nothing matched, and
 /// that row is produced by jumping straight past the scan — so consuming such
@@ -789,7 +799,10 @@ fn multi_index_can_consume_term(
     table_references: &TableReferences,
 ) -> bool {
     !table_references.outer_join_may_null_extend(table.internal_id)
-        || term.from_outer_join == Some(table.internal_id)
+        || term
+            .origin
+            .join_origin()
+            .is_some_and(|origin| origin.right_table() == table.internal_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -977,13 +990,12 @@ pub fn consider_multi_index_union(
         if term.consumed {
             continue;
         }
-        if !multi_index_can_consume_term(rhs_table, term, table_references) {
-            continue;
-        }
-
         let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
             continue;
         };
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
+            continue;
+        }
 
         let disjuncts = flatten_or_expr(&term.expr);
         if disjuncts.len() < 2 {
@@ -1016,7 +1028,7 @@ pub fn consider_multi_index_union(
                 let Some((synthetic_where_terms, table_constraints)) =
                     get_table_local_constraints_for_branch(
                         &conjuncts,
-                        term.from_outer_join,
+                        term.origin.join_origin(),
                         rhs_table,
                         table_references,
                         available_indexes,
@@ -1036,6 +1048,7 @@ pub fn consider_multi_index_union(
                     rhs_idx,
                     schema,
                     available_indexes,
+                    table_references,
                     base_row_count,
                     analyze_stats,
                     params,
@@ -1221,8 +1234,8 @@ mod tests {
     use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
-            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
-            Type,
+            BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+            Schema, Table, Type,
         },
         translate::{
             optimizer::{
@@ -1233,7 +1246,7 @@ mod tests {
             },
             plan::{
                 ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
-                WhereTerm,
+                WhereTerm, WhereTermOrigin,
             },
             planner::TableMask,
         },
@@ -1262,8 +1275,7 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                primary_key: false,
-                rowid_alias: c.is_rowid_alias,
+                flags: ColDefFlags::empty().with(ColDefFlags::RowIdAlias, c.is_rowid_alias),
                 ..Default::default()
             },
         )
@@ -1300,6 +1312,7 @@ mod tests {
         let table = Table::BTree(table);
         JoinedTable {
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             table,
             identifier: name,
             internal_id,
@@ -1308,6 +1321,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         }
     }
@@ -1485,7 +1499,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -1558,7 +1572,7 @@ mod tests {
                     Operator::Greater,
                     Box::new(create_numeric_literal("10")),
                 ),
-                from_outer_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
             WhereTerm {
@@ -1567,7 +1581,7 @@ mod tests {
                     Operator::Equals,
                     Box::new(create_numeric_literal("7")),
                 ),
-                from_outer_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             },
         ];
@@ -1740,7 +1754,7 @@ mod tests {
                 Operator::Or,
                 Box::new(right_disjunct),
             ),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -1876,7 +1890,7 @@ mod tests {
                     Operator::Or,
                     Box::new(make_branch(1, 0, item_kind)),
                 ),
-                from_outer_join: None,
+                origin: WhereTermOrigin::Where,
                 consumed: false,
             }]
         };

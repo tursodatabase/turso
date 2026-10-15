@@ -81,6 +81,7 @@ impl Table {
                 dependencies.insert(i, refs);
 
                 columns[i].constraints.push(ColumnConstraint::Generated {
+                    generated_always: false,
                     expr: Box::new(expr),
                     typ: Some(GeneratedColumnType::Virtual),
                 });

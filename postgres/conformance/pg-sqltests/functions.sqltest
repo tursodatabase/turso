@@ -203,10 +203,177 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 }
 expect error {}
 
+@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
     SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
 }
 expect {
     val > 0
+}
+
+test percentile-cont-within-group {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo (value) VALUES (1), (2);
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect {
+    1.5
+}
+
+test mode-within-group {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (2), (2), (1), (1);
+    SELECT mode() WITHIN GROUP (ORDER BY value) FROM demo;
+}
+expect {
+    1
+}
+
+@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
+test acldefault-object-kinds {
+    SELECT pg_catalog.acldefault('c', 4294967294);
+    SELECT acldefault('r', 4294967294);
+    SELECT acldefault('s', 4294967294);
+    SELECT acldefault('d', 4294967294);
+    SELECT acldefault('f', 4294967294);
+    SELECT acldefault('l', 4294967294);
+    SELECT acldefault('L', 4294967294);
+    SELECT acldefault('n', 4294967294);
+    SELECT acldefault('p', 4294967294);
+    SELECT acldefault('t', 4294967294);
+    SELECT acldefault('F', 4294967294);
+    SELECT acldefault('S', 4294967294);
+    SELECT acldefault('T', 4294967294);
+}
+expect {
+    {}
+    {4294967294=arwdDxt/4294967294}
+    {4294967294=rwU/4294967294}
+    {=Tc/4294967294,4294967294=CTc/4294967294}
+    {=X/4294967294,4294967294=X/4294967294}
+    {=U/4294967294,4294967294=U/4294967294}
+    {4294967294=rw/4294967294}
+    {4294967294=UC/4294967294}
+    {4294967294=sA/4294967294}
+    {4294967294=C/4294967294}
+    {4294967294=U/4294967294}
+    {4294967294=U/4294967294}
+    {=U/4294967294,4294967294=U/4294967294}
+}
+
+test acldefault-catalog-owner {
+    SET search_path TO '';
+    SELECT n.tableoid, n.oid, n.nspname,
+           replace(acldefault('n', n.nspowner)::text,
+                   pg_get_userbyid(n.nspowner), 'owner')
+    FROM pg_namespace n WHERE n.nspname = 'public';
+}
+expect {
+    2615|2200|public|{owner=UC/owner}
+}
+
+@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
+test acldefault-first-byte-selects-object-kind {
+    SELECT acldefault('rr', 4294967294);
+    SELECT acldefault('r ', 4294967294);
+    SELECT acldefault('Table', 4294967294);
+    SELECT acldefault('ré', 4294967294);
+}
+expect {
+    {4294967294=arwdDxt/4294967294}
+    {4294967294=arwdDxt/4294967294}
+    {=U/4294967294,4294967294=U/4294967294}
+    {4294967294=arwdDxt/4294967294}
+}
+
+test acldefault-null-arguments {
+    SELECT acldefault(NULL, 4294967294), acldefault('r', NULL);
+}
+expect {
+    |
+}
+
+test acldefault-unknown-object-kind-errors {
+    SELECT acldefault('?', 4294967294);
+}
+expect error {}
+
+test acldefault-empty-object-kind-errors {
+    SELECT acldefault('', 4294967294);
+}
+expect error {}
+
+test acldefault-leading-space-object-kind-errors {
+    SELECT acldefault(' r', 4294967294);
+}
+expect error {}
+
+test acldefault-uppercase-object-kind-errors {
+    SELECT acldefault('R', 4294967294);
+}
+expect error {}
+
+test acldefault-non-ascii-object-kind-errors {
+    SELECT acldefault('é', 4294967294);
+}
+expect error {}
+
+test format-type-expanded {
+    SELECT format_type(16, -1);
+    SELECT format_type(23, -1);
+    SELECT format_type(25, -1);
+    SELECT format_type(114, -1);
+    SELECT format_type(3802, -1);
+    SELECT format_type(2950, -1);
+    SELECT format_type(1082, -1);
+    SELECT format_type(1114, -1);
+    SELECT format_type(1184, -1);
+    SELECT format_type(1186, -1);
+    SELECT format_type(2278, -1);
+    SELECT format_type(2205, -1);
+    SELECT format_type(2206, -1);
+    SELECT format_type(1000, -1);
+    SELECT format_type(1007, -1);
+    SELECT format_type(1009, -1);
+    SELECT format_type(1043, 54);
+}
+expect {
+    boolean
+    integer
+    text
+    json
+    jsonb
+    uuid
+    date
+    timestamp without time zone
+    timestamp with time zone
+    interval
+    void
+    regclass
+    regtype
+    boolean[]
+    integer[]
+    text[]
+    character varying(50)
+}
+
+test pg-type-is-visible {
+    SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test lpad-rpad {
+    SELECT quote_literal(lpad('hi', 5, '*'));
+    SELECT quote_literal(rpad('hi', 5, '-'));
+    SELECT quote_literal(lpad('hi', 5));
+    SELECT quote_literal(lpad('hello world', 5));
+}
+expect {
+    '***hi'
+    'hi---'
+    '   hi'
+    'hello'
 }

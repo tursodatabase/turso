@@ -48,9 +48,8 @@ use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
-/// A key that uniquely identifies a cursor.
-/// The key is a pair of table reference id and index.
-/// The index is only provided when the cursor is an index cursor.
+/// Identifies the table source that a cursor reads.
+/// A temporary cursor can share this key. A cursor override selects that cursor.
 #[derive(Debug, Clone)]
 pub struct CursorKey {
     /// The table reference that the cursor is associated with.
@@ -60,7 +59,7 @@ pub struct CursorKey {
     ///  TableInternalIds are unique within a program, since there is one id per table reference.
     pub table_reference_id: TableInternalId,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The table reference and index identify one logical index read.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
@@ -256,6 +255,10 @@ pub struct ProgramBuilder {
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
     ctes_being_defined: Vec<String>,
+    /// Stack of views currently being expanded, keyed by `(database_id, name)`
+    /// so a view is distinguished from a same-named view in another attached or
+    /// temp schema. Used to detect self-referential views.
+    views_being_expanded: Vec<(usize, String)>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -274,9 +277,9 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
-    /// This allows for things like hash build to use a separate cursor for iterating the same table.
-    cursor_overrides: HashMap<usize, CursorID>,
+    /// Temporary cursor mappings for code that reads a source through a second cursor.
+    /// A later mapping takes priority, which permits nested translation scopes.
+    cursor_overrides: Vec<(CursorKey, CursorID)>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -333,17 +336,18 @@ pub struct ProgramBuilder {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct ProgramBuilderFlags(u8);
+pub struct ProgramBuilderFlags(u16);
 
 impl ProgramBuilderFlags {
-    const ROLLBACK: u8 = 1 << 0;
-    const IS_MULTI_WRITE: u8 = 1 << 1;
-    const MAY_ABORT: u8 = 1 << 2;
-    const READONLY: u8 = 1 << 3;
-    const IS_SUBPROGRAM: u8 = 1 << 4;
-    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
-    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+    const ROLLBACK: u16 = 1 << 0;
+    const IS_MULTI_WRITE: u16 = 1 << 1;
+    const MAY_ABORT: u16 = 1 << 2;
+    const READONLY: u16 = 1 << 3;
+    const IS_SUBPROGRAM: u16 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
+    const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -357,12 +361,12 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    const fn get(self, bit: u8) -> bool {
+    const fn get(self, bit: u16) -> bool {
         (self.0 & bit) != 0
     }
 
     #[inline]
-    const fn set(&mut self, bit: u8, value: bool) {
+    const fn set(&mut self, bit: u16, value: bool) {
         if value {
             self.0 |= bit;
         } else {
@@ -461,12 +465,17 @@ impl ProgramBuilderFlags {
     pub const fn set_suppress_column_default(&mut self, v: bool) {
         self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
     }
-}
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
+    /// Whether expression translation must ignore selected expression indexes.
+    pub const fn skip_expression_index_values(self) -> bool {
+        self.get(Self::SKIP_EXPRESSION_INDEX_VALUES)
+    }
+
+    /// Set this while an `IfNullRow` fallback computes the original expression,
+    /// as SQLite clears `pIdxEpr`, so the same index match does not recur.
+    pub const fn set_skip_expression_index_values(&mut self, value: bool) {
+        self.set(Self::SKIP_EXPRESSION_INDEX_VALUES, value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,8 +492,6 @@ pub struct HashBuildSignature {
     pub use_bloom_filter: bool,
     /// Rowid input cursor when the build side is materialized.
     pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
@@ -615,7 +622,7 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
+/// because we want to avoid building the `EqpDetail` if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
@@ -728,7 +735,7 @@ impl ProgramBuilder {
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::default(),
+            cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -736,6 +743,7 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
+            views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
         }
@@ -816,15 +824,36 @@ impl ProgramBuilder {
         self.ctes_being_defined.extend(masked);
     }
 
-    /// Temporarily take the CTE-being-defined stack (e.g. during view
-    /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ctes_being_defined)
-    }
+    /// Expand a view with circular-reference tracking and without the caller's
+    /// CTE context. Restore both stacks even when expansion returns an error.
+    pub fn with_view_expansion<T>(
+        &mut self,
+        database_id: usize,
+        name: &str,
+        expand: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        // check
+        if self
+            .views_being_expanded
+            .iter()
+            .any(|(db, n)| *db == database_id && n == name)
+        {
+            crate::bail_parse_error!("view {} is circularly defined", name);
+        }
 
-    /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
-        self.ctes_being_defined = saved;
+        // push
+        self.views_being_expanded
+            .push((database_id, name.to_owned()));
+        let saved_ctes = std::mem::take(&mut self.ctes_being_defined);
+
+        // expand
+        let result = expand(self);
+
+        // pop
+        self.ctes_being_defined = saved_ctes;
+        self.views_being_expanded.pop();
+
+        result
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -919,7 +948,7 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
-    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
@@ -972,7 +1001,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -980,7 +1009,7 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }
@@ -1190,6 +1219,27 @@ impl ProgramBuilder {
             return;
         }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emit a deferred table seek when the index can identify a table row.
+    pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
+        let cursor_type = self.get_cursor_type(index_cursor_id);
+        // A rowid-free index cannot identify a base-table row. Such a plan must
+        // read all required values from the index. SQLite emits no DeferredSeek.
+        if matches!(cursor_type, Some(CursorType::BTreeIndex(index)) if !index.has_rowid) {
+            return;
+        }
+        turso_assert!(
+            matches!(
+                cursor_type,
+                Some(CursorType::BTreeIndex(_) | CursorType::IndexMethod(_))
+            ),
+            "a deferred seek requires an index cursor"
+        );
+        self.emit_insn(Insn::DeferredSeek {
+            index_cursor_id,
+            table_cursor_id,
+        });
     }
 
     /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
@@ -1674,6 +1724,12 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IsType { target_pc, .. } => {
+                    resolve(target_pc, "IsType")?;
+                }
+                Insn::IfNullRow { target_pc, .. } => {
+                    resolve(target_pc, "IfNullRow")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
@@ -1760,7 +1816,14 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
                 Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashProbe {
+                    target_pc,
+                    deferred_target_pc,
+                    ..
+                } => {
+                    resolve(target_pc, "HashProbe")?;
+                    resolve(deferred_target_pc, "HashProbe")?;
+                }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::HashScanUnmatched { target_pc, .. } => {
@@ -1789,15 +1852,26 @@ impl ProgramBuilder {
         Ok(())
     }
 
-    /// Set a cursor override for a table. When resolving a table cursor for this table,
-    /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    /// Use a different table cursor until [`Self::clear_table_cursor_override`] removes it.
+    pub fn set_table_cursor_override(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+    ) {
+        self.cursor_overrides
+            .push((CursorKey::table(table_ref_id), cursor_id));
     }
 
-    /// Clear the cursor override for a table.
-    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
-        self.cursor_overrides.remove(&table_ref_id.into());
+    /// Remove the newest table-cursor mapping for this table reference.
+    pub fn clear_table_cursor_override(&mut self, table_ref_id: TableInternalId) {
+        let key = CursorKey::table(table_ref_id);
+        if let Some(position) = self
+            .cursor_overrides
+            .iter()
+            .rposition(|(candidate, _)| candidate.equals(&key))
+        {
+            self.cursor_overrides.remove(position);
+        }
     }
 
     /// Clear all cursor overrides.
@@ -1805,21 +1879,37 @@ impl ProgramBuilder {
         self.cursor_overrides.clear();
     }
 
-    /// Check if a cursor override is active for a given table.
-    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
-        self.cursor_overrides.contains_key(&table_ref_id.into())
+    /// Return true if this table reference has a temporary table cursor.
+    pub fn has_table_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
+        let key = CursorKey::table(table_ref_id);
+        self.cursor_overrides
+            .iter()
+            .any(|(candidate, _)| candidate.equals(&key))
+    }
+
+    /// Emit code with temporary cursor mappings, then restore the prior mappings.
+    /// The mappings are also restored when code generation returns an error.
+    pub fn with_cursor_overrides<T>(
+        &mut self,
+        overrides: &[(CursorKey, CursorID)],
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous_overrides = self.cursor_overrides.clone();
+        self.cursor_overrides.extend_from_slice(overrides);
+        let result = emit(self);
+        self.cursor_overrides = previous_overrides;
+        result
     }
 
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
-        // Check cursor overrides first, only apply override for table cursors.
-        // Index cursor lookups are not overridden because when a cursor override is active,
-        // the calling code (translate_expr) should skip index logic entirely.
-        if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                return Some(cursor_id);
-            }
+        if let Some((_, cursor_id)) = self
+            .cursor_overrides
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate.equals(key))
+        {
+            return Some(*cursor_id);
         }
         self.cursor_ref
             .iter()
@@ -1935,7 +2025,7 @@ impl ProgramBuilder {
         }
     }
 
-    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// Tries to mirror: <https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379>
     pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
         self.write_databases.set(crate::MAIN_DB_ID)
@@ -2079,7 +2169,11 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
+    pub fn cursor_loop<R>(
+        &mut self,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut ProgramBuilder, usize) -> R,
+    ) -> R {
         let loop_start = self.allocate_label();
         let loop_end = self.allocate_label();
 
@@ -2101,14 +2195,16 @@ impl ProgramBuilder {
             target_pc: loop_end,
         });
 
-        f(self, rowid);
+        let result = f(self, rowid);
 
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
             fullscan: false,
+            is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
+        result
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
@@ -2157,6 +2253,9 @@ impl ProgramBuilder {
 
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        if matches!(affinity, Affinity::Blob | Affinity::None) {
+            return;
+        }
         self.emit_insn(Insn::Affinity {
             start_reg: register,
             count: NonZeroUsize::MIN,
@@ -2253,6 +2352,26 @@ impl ProgramBuilder {
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
+        // Fill in the is_index field on Next and Prev, now that we know all cursor types
+        for (insn, _) in self.insns.iter_mut() {
+            if let Insn::Next {
+                cursor_id,
+                is_index,
+                ..
+            }
+            | Insn::Prev {
+                cursor_id,
+                is_index,
+                ..
+            } = insn
+            {
+                *is_index = self
+                    .cursor_ref
+                    .get(*cursor_id)
+                    .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+            }
+        }
+
         self.parameters.list.dedup();
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
@@ -2319,5 +2438,35 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_override_scope_restores_prior_mapping_after_error() {
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(3, 0, 0));
+        let table_id = TableInternalId::default();
+        let table_key = CursorKey::table(table_id);
+        let main_cursor = builder.alloc_cursor_id_keyed(table_key.clone(), CursorType::Sorter);
+        let outer_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        builder.set_table_cursor_override(table_id, outer_cursor);
+
+        let inner_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        let result: Result<()> =
+            builder.with_cursor_overrides(&[(table_key.clone(), inner_cursor)], |builder| {
+                assert_eq!(builder.resolve_cursor_id(&table_key), inner_cursor);
+                Err(crate::LimboError::InternalError(
+                    "expected test error".into(),
+                ))
+            });
+
+        assert!(result.is_err());
+        assert_eq!(builder.resolve_cursor_id(&table_key), outer_cursor);
+        builder.clear_table_cursor_override(table_id);
+        assert_eq!(builder.resolve_cursor_id(&table_key), main_cursor);
     }
 }

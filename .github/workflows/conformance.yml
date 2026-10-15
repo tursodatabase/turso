@@ -56,9 +56,16 @@ jobs:
         run: npm run test:better-sqlite3
 
   sqlite-tcl:
-    name: SQLite TCL conformance tests
+    name: SQLite TCL conformance tests (part ${{ matrix.part }}/3)
     timeout-minutes: 60
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # The suite runs its test files one at a time (they share files in the
+    # test directory), so it is spread over several machines instead.
+    # all.test picks this part's files; every file runs in exactly one part.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -79,4 +86,13 @@ jobs:
       - name: Build libturso_tcl
         run: make -C bindings/tcl build
       - name: Run SQLite TCL conformance tests
+        env:
+          TCL_TEST_PART: ${{ matrix.part }}/3
         run: tclsh sqlite/conformance/upstream/all.test
+      - name: Upload per-file test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-tcl-logs-part-${{ matrix.part }}
+          path: sqlite/conformance/upstream/logs/
+          if-no-files-found: ignore

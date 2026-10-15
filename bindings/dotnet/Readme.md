@@ -259,7 +259,7 @@ Supported common connection string keywords include:
 | `Foreign Keys` | Parsed and preserved for compatibility. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
-| `Pooling` | Parsed and preserved for compatibility. |
+| `Pooling` | Defaults to `True`. Local files stay open after the last connection closes so the next `Open()` skips reloading the schema and WAL; each connection still gets fresh connection state. Call `SqliteConnection.ClearPool` or `ClearAllPools` before deleting or replacing a pooled file. `:memory:` and shared in-memory databases are never pooled. |
 | `Vfs` | Parsed and preserved for compatibility. |
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
@@ -280,7 +280,7 @@ Supported common connection string keywords include:
 
 ## Entity Framework Core
 
-`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through the `Turso.Data.Sqlite` facade.
+`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local, direct remote, and embedded-replica Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through the `Turso.Data.Sqlite` facade.
 
 ```bash
 dotnet add package Turso.EntityFrameworkCore.Sqlite
@@ -310,6 +310,6 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
     .Options;
 ```
 
-The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use the standard EF Core SQLite mechanisms such as `EnsureCreated`, `EnsureCreatedAsync`, and migrations against local database files.
+The provider supports normal EF Core CRUD, generated keys, transactions, migrations, and schema creation through `EnsureCreated` and `EnsureCreatedAsync`. Use the same remote and replica connection strings shown above with `UseTurso`.
 
-Remote `libsql://`/auth-token EF Core support is not part of the local provider. Use the local/embedded provider for EF Core today; remote/serverless EF support needs a separate connection, retry, and transaction design.
+Direct remote connections cannot run EF's client-side SQLite helpers, including `REGEXP`, decimal `ef_*` functions, and the `EF_DECIMAL` collation; queries that need them fail before SQL is sent. `EnsureDeleted` cannot delete a direct remote database and points callers to the Turso platform API. For embedded replicas, `EnsureDeleted` removes only the local replica and its sidecar files, never the remote database.

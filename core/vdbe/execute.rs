@@ -13,22 +13,25 @@ use crate::mvcc::database::{
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
+    SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
+    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState,
+    PageCategory,
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointResult};
+use crate::storage::pager::{
+    default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
+};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
+    compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
@@ -64,15 +67,15 @@ use crate::{
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
     turso_assert,
-    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
+    types::{AggContext, Cursor, SeekKey, SeekOp, SumAggState, Value, ValueType},
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
-    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, ConnectOpts, Connection,
+    Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -80,10 +83,11 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
-    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
+            exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -100,7 +104,7 @@ use std::{
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
-use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
+use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
@@ -124,6 +128,27 @@ fn btree_cursor_with_yield_context(
     }
 }
 
+enum OpenedBTree {
+    Plain(Box<BTreeCursor>),
+    Mvcc(Box<dyn CursorTrait>),
+}
+
+impl OpenedBTree {
+    fn into_cursor(self) -> Cursor {
+        match self {
+            Self::Plain(cursor) => Cursor::new_btree(cursor),
+            Self::Mvcc(cursor) => Cursor::new_btree_dyn(cursor),
+        }
+    }
+
+    fn into_dyn(self) -> Box<dyn CursorTrait> {
+        match self {
+            Self::Plain(cursor) => cursor,
+            Self::Mvcc(cursor) => cursor,
+        }
+    }
+}
+
 use super::{
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
@@ -133,12 +158,12 @@ use super::{
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, AggStepData, ArrayEncodeData, Cookie, IntegrityCkData, RegisterOrLiteral,
-        SortComparatorType, SorterOpenData,
+        AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
+        RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
     CommitState,
 };
-use crate::sync::{Mutex, RwLock};
+use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -187,10 +212,10 @@ macro_rules! load_insn {
 }
 
 macro_rules! return_if_io {
-    ($expr:expr) => {
+    ($state:expr, $expr:expr) => {
         match $expr {
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Ok(IOResult::IO(io)) => return Ok($state.suspend_on_io(io)),
             Err(err) => {
                 mark_unlikely();
                 return Err(err.into());
@@ -199,16 +224,24 @@ macro_rules! return_if_io {
     };
 }
 
-macro_rules! check_arg_count {
-    ($actual:expr, $expected:expr) => {
-        if unlikely($actual != $expected) {
-            return Err(LimboError::InternalError(format!(
-                "expected {} argument(s), got {}",
-                $expected, $actual
-            ))
-            .into());
-        }
-    };
+use arg_count::check_arg_count;
+mod arg_count {
+    use crate::LimboError;
+
+    macro_rules! check_arg_count {
+        ($actual:expr, $expected:expr) => {
+            if unlikely($actual != $expected) {
+                return Err(arg_count::wrong_arg_count($expected, $actual));
+            }
+        };
+    }
+    pub(super) use check_arg_count;
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn wrong_arg_count(expected: usize, actual: usize) -> Box<LimboError> {
+        LimboError::InternalError(format!("expected {expected} argument(s), got {actual}")).into()
+    }
 }
 
 /// Errors are boxed so an op's whole return value stays small: a LimboError
@@ -217,6 +250,29 @@ macro_rules! check_arg_count {
 /// at the point the error is created.
 pub type InsnResult = Result<InsnFunctionStepResult, Box<LimboError>>;
 pub type InsnFunction = fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> InsnResult;
+
+#[cold]
+#[inline(never)]
+fn unresolved_branch_target(target_pc: crate::vdbe::BranchOffset) -> Box<LimboError> {
+    LimboError::Corrupt(format!("Unresolved label: {target_pc:?}")).into()
+}
+
+/// This is an optimization over `checked_add(n).ok_or(LimboError::Overflow)`. With `ok_or`, the
+/// compiler generates [LimboError] drop glue even though [LimboError::Overflow] owns nothing.
+/// But with [OkOverflow], it's able to skip the drop glue.
+trait OrOverflow<T> {
+    fn or_overflow(self) -> Result<T>;
+}
+
+impl<T> OrOverflow<T> for Option<T> {
+    #[inline(always)]
+    fn or_overflow(self) -> Result<T> {
+        match self {
+            Some(value) => Ok(value),
+            None => Err(LimboError::IntegerOverflow),
+        }
+    }
+}
 
 /// Parse a Value (text, int, float, or blob) into a BigDecimal.
 fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
@@ -398,20 +454,18 @@ fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool
     }
 }
 
+/// The outcome of one instruction. An instruction that waits for IO leaves
+/// its completion in `ProgramState::io_completions` (see
+/// `ProgramState::suspend_on_io`) and answers `IO` without a payload: with
+/// a pointer payload in this variant and a byte in the others, `InsnResult`
+/// went through memory on every call of an opcode function. Fieldless with
+/// a word-sized discriminant, the `Result` is returned in two registers.
+#[repr(u64)]
 pub enum InsnFunctionStepResult {
     Done,
-    IO(IOCompletions),
+    IO,
     Row,
     Step,
-}
-
-impl<T> From<IOResult<T>> for InsnFunctionStepResult {
-    fn from(value: IOResult<T>) -> Self {
-        match value {
-            IOResult::Done(_) => InsnFunctionStepResult::Done,
-            IOResult::IO(io) => InsnFunctionStepResult::IO(io),
-        }
-    }
 }
 
 pub fn op_init(
@@ -422,7 +476,7 @@ pub fn op_init(
 ) -> InsnResult {
     load_insn!(Init { target_pc }, insn);
     if unlikely(!target_pc.is_offset()) {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
@@ -435,8 +489,8 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -450,8 +504,8 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -465,16 +519,16 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_multiply)
 }
 
-/// Add, Subtract and Multiply for every operand pair that is not two
-/// integers without overflow: affinity conversions, floats and NULLs.
+/// Arithmetic for every operand pair the fast path of the opcode does not
+/// cover: affinity conversions, NULLs and results that are not a number.
 #[inline(never)]
 fn op_arithmetic_slow(
     state: &mut ProgramState,
@@ -489,6 +543,16 @@ fn op_arithmetic_slow(
     ));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The two operands of an arithmetic opcode when both are numbers, the case
+/// that needs no affinity conversion.
+#[inline(always)]
+fn numeric_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(Numeric, Numeric)> {
+    match (&state.registers[lhs], &state.registers[rhs]) {
+        (Register::Value(Value::Numeric(l)), Register::Value(Value::Numeric(r))) => Some((*l, *r)),
+        _ => None,
+    }
 }
 
 /// The two operands of an arithmetic opcode when both are integers, the
@@ -734,7 +798,7 @@ pub fn op_checkpoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
@@ -754,18 +818,25 @@ pub fn op_null(
 ) -> InsnResult {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
-            if let Some(dest_end) = dest_end {
-                for i in *dest..=*dest_end {
-                    state.registers[i].set_null();
-                    // Clear any associated RowSet so it can be reused in a fresh
-                    // state.  In SQLite the RowSet lives inside the register and
-                    // is destroyed by OP_Null; we keep RowSets in a side map, so
-                    // we must remove them explicitly.
+            let Some(dest_end) = *dest_end else {
+                state.registers[*dest].set_null();
+                if !state.rowsets.is_empty() {
+                    state.rowsets.remove(dest);
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            };
+            for i in *dest..=dest_end {
+                state.registers[i].set_null();
+            }
+            // Clear any associated RowSet so it can be reused in a fresh
+            // state. In SQLite the RowSet lives inside the register and is
+            // destroyed by OP_Null; we keep RowSets in a side map, so we must
+            // remove them explicitly.
+            if !state.rowsets.is_empty() {
+                for i in *dest..=dest_end {
                     state.rowsets.remove(&i);
                 }
-            } else {
-                state.registers[*dest].set_null();
-                state.rowsets.remove(dest);
             }
         }
         _ => {
@@ -809,6 +880,38 @@ pub fn op_null_row(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_null_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IfNullRow {
+            cursor_id,
+            target_pc,
+            dest
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+    let cursor_is_null = state
+        .cursors
+        .get(*cursor_id)
+        .expect("cursor_id should be valid")
+        .as_ref()
+        .is_some_and(Cursor::get_null_flag);
+    if cursor_is_null {
+        state.registers[*dest].set_null();
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_compare(
     _program: &Program,
     state: &mut ProgramState,
@@ -846,17 +949,29 @@ pub fn op_compare(
         }
     }
 
-    // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
-    // TODO: There are tons of cases like this where we could reuse this in a similar vein
-    let a_range =
-        (start_reg_a..start_reg_a + count + 1).map(|idx| state.registers[idx].get_value());
-    let b_range =
-        (start_reg_b..start_reg_b + count + 1).map(|idx| state.registers[idx].get_value());
-    let cmp = compare_immutable(a_range, b_range, key_info);
+    return op_compare_slow(state, start_reg_a, start_reg_b, count, key_info);
 
-    state.last_compare = Some(cmp);
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    // keep slow path out of line to keep stack frame small
+    #[inline(never)]
+    fn op_compare_slow(
+        state: &mut ProgramState,
+        start_reg_a: usize,
+        start_reg_b: usize,
+        count: usize,
+        key_info: &[crate::types::KeyInfo],
+    ) -> InsnResult {
+        // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
+        // TODO: There are tons of cases like this where we could reuse this in a similar vein
+        let a_range =
+            (start_reg_a..start_reg_a + count + 1).map(|idx| state.registers[idx].get_value());
+        let b_range =
+            (start_reg_b..start_reg_b + count + 1).map(|idx| state.registers[idx].get_value());
+        let cmp = compare_immutable(a_range, b_range, key_info);
+
+        state.last_compare = Some(cmp);
+        state.pc += 1;
+        Ok(InsnFunctionStepResult::Step)
+    }
 }
 
 pub fn op_jump(
@@ -907,10 +1022,8 @@ pub fn op_move(
     let dest_reg = *dest_reg;
     let count = *count;
     for i in 0..count {
-        state.registers[dest_reg + i] = std::mem::replace(
-            &mut state.registers[source_reg + i],
-            Register::Value(Value::Null),
-        );
+        state.registers.swap(source_reg + i, dest_reg + i);
+        state.registers[source_reg + i].set_null();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -931,14 +1044,16 @@ pub fn op_if_pos(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     let reg = *reg;
     let target_pc = *target_pc;
     match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(n)) if *n > 0 => {
             state.pc = target_pc.as_offset_int();
-            state.registers[reg].set_int(*n - *decrement_by as i64);
+            if *decrement_by != 0 {
+                state.registers[reg].set_int(*n - *decrement_by as i64);
+            }
         }
         Value::Numeric(Numeric::Integer(_)) => {
             state.pc += 1;
@@ -962,7 +1077,7 @@ pub fn op_not_null(
 ) -> InsnResult {
     load_insn!(NotNull { reg, target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     let reg = *reg;
     let target_pc = *target_pc;
@@ -977,98 +1092,99 @@ pub fn op_not_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_comparison(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    let (lhs, rhs, target_pc, op) = match insn {
-        Insn::Eq {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Eq),
-        Insn::Ne {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Ne),
-        Insn::Lt {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Lt),
-        Insn::Le {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Le),
-        Insn::Gt {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Gt),
-        Insn::Ge {
-            lhs,
-            rhs,
-            target_pc,
-            ..
-        } => (*lhs, *rhs, *target_pc, ComparisonOp::Ge),
-        _ => unreachable!("unexpected Insn {:?}", insn),
-    };
-    let crate::vdbe::BranchOffset::Offset(target_pc) = target_pc else {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
-    };
+macro_rules! comparison_opcode {
+    ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
+        #[inline(always)]
+        pub fn $name(
+            program: &Program,
+            state: &mut ProgramState,
+            insn: &Insn,
+            _pager: &Arc<Pager>,
+        ) -> InsnResult {
+            load_insn!(
+                $variant {
+                    lhs,
+                    rhs,
+                    target_pc,
+                    flags,
+                    collation
+                },
+                insn
+            );
+            let crate::vdbe::BranchOffset::Offset(target_pc) = *target_pc else {
+                return Err(unresolved_branch_target(*target_pc));
+            };
 
-    // Two integers compare directly: no NULL handling, affinity or collation.
-    if let (
-        Register::Value(Value::Numeric(Numeric::Integer(l))),
-        Register::Value(Value::Numeric(Numeric::Integer(r))),
-    ) = (&state.registers[lhs], &state.registers[rhs])
-    {
-        let should_jump = match op {
-            ComparisonOp::Eq => l == r,
-            ComparisonOp::Ne => l != r,
-            ComparisonOp::Lt => l < r,
-            ComparisonOp::Le => l <= r,
-            ComparisonOp::Gt => l > r,
-            ComparisonOp::Ge => l >= r,
-        };
-        state.pc = if should_jump { target_pc } else { state.pc + 1 };
-        return Ok(InsnFunctionStepResult::Step);
-    }
-    let (flags, collation) = match insn {
-        Insn::Eq {
-            flags, collation, ..
+            // Two integers compare directly: no NULL handling, affinity or collation.
+            if let (
+                Register::Value(Value::Numeric(Numeric::Integer(l))),
+                Register::Value(Value::Numeric(Numeric::Integer(r))),
+            ) = (&state.registers[*lhs], &state.registers[*rhs])
+            {
+                let jumps = $jumps;
+                state.pc = if jumps(*l, *r) {
+                    target_pc
+                } else {
+                    state.pc + 1
+                };
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            if let (
+                Register::Value(lhs_value @ Value::Text(l)),
+                Register::Value(rhs_value @ Value::Text(r)),
+            ) = (&state.registers[*lhs], &state.registers[*rhs])
+            {
+                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
+                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
+                        target_pc
+                    } else {
+                        state.pc + 1
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
+            op_comparison_slow(
+                program,
+                state,
+                *lhs,
+                *rhs,
+                target_pc,
+                *flags,
+                collation.unwrap_or_default(),
+                $op,
+            )
         }
-        | Insn::Ne {
-            flags, collation, ..
-        }
-        | Insn::Lt {
-            flags, collation, ..
-        }
-        | Insn::Le {
-            flags, collation, ..
-        }
-        | Insn::Gt {
-            flags, collation, ..
-        }
-        | Insn::Ge {
-            flags, collation, ..
-        } => (*flags, collation.unwrap_or_default()),
-        _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    op_comparison_slow(program, state, lhs, rhs, target_pc, flags, collation, op)
 }
 
-/// The comparison opcodes for every operand pair that is not two integers:
-/// NULLs, affinity conversions, text collations and array comparison.
+comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
+comparison_opcode!(op_ne, Ne, ComparisonOp::Ne, |l: i64, r: i64| l != r);
+comparison_opcode!(op_lt, Lt, ComparisonOp::Lt, |l: i64, r: i64| l < r);
+comparison_opcode!(op_le, Le, ComparisonOp::Le, |l: i64, r: i64| l <= r);
+comparison_opcode!(op_gt, Gt, ComparisonOp::Gt, |l: i64, r: i64| l > r);
+comparison_opcode!(op_ge, Ge, ComparisonOp::Ge, |l: i64, r: i64| l >= r);
+
+#[inline(always)]
+fn texts_compare_as_bytes(
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+) -> bool {
+    if !matches!(
+        collation,
+        None | Some(CollationSeq::Binary | CollationSeq::Unset)
+    ) {
+        return false;
+    }
+    !flags.get_affinity().is_numeric()
+        || (apply_numeric_affinity(lhs.as_value_ref(), false).is_none()
+            && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
+}
+
+/// The comparison opcodes for every operand pair that is not two integers or
+/// two texts compared by their bytes: NULLs, affinity conversions, text
+/// collations and array comparison.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
@@ -1172,6 +1288,7 @@ fn op_comparison_slow(
     take_jump_if!(should_jump);
 }
 
+#[inline(always)]
 pub fn op_if(
     _program: &Program,
     state: &mut ProgramState,
@@ -1187,7 +1304,7 @@ pub fn op_if(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     if state.registers[*reg]
         .get_value()
@@ -1200,6 +1317,7 @@ pub fn op_if(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_if_not(
     _program: &Program,
     state: &mut ProgramState,
@@ -1215,7 +1333,7 @@ pub fn op_if_not(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     if state.registers[*reg]
         .get_value()
@@ -1286,7 +1404,7 @@ pub fn op_open_read(
             .as_mut()
             .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_read(&context));
+        return_if_io!(state, cursor.open_read(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -1309,26 +1427,25 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
-                                        mv_cursor_type: MvccCursorType|
-     -> Result<Box<dyn CursorTrait>> {
-        // Without an MvStore there is no MVCC transaction to look up.
-        let Some(mv_store) = mv_store.as_ref() else {
-            return Ok(btree_cursor);
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<BTreeCursor>, mv_cursor_type: MvccCursorType| -> Result<OpenedBTree> {
+            // Without an MvStore there is no MVCC transaction to look up.
+            let Some(mv_store) = mv_store.as_ref() else {
+                return Ok(OpenedBTree::Plain(btree_cursor));
+            };
+            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                    mv_store.clone(),
+                    &program.connection,
+                    tx_id,
+                    *root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?)))
+            } else {
+                Ok(OpenedBTree::Plain(btree_cursor))
+            }
         };
-        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-            Ok(Box::new(MvCursor::new(
-                mv_store.clone(),
-                &program.connection,
-                tx_id,
-                *root_page,
-                mv_cursor_type,
-                btree_cursor,
-            )?))
-        } else {
-            Ok(btree_cursor)
-        }
-    };
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
@@ -1352,7 +1469,7 @@ pub fn op_open_read(
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                cursor,
+                cursor.into_dyn(),
                 view_mutex.clone(),
                 pager,
                 tx_state,
@@ -1371,7 +1488,7 @@ pub fn op_open_read(
                 )
                 .into());
             }
-            let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
+            let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -1391,27 +1508,31 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = BTreeCursor::new_index(
+            let btree_cursor = BTreeCursor::new_index_boxed(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            )?
-            .into_boxed();
-            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, mv_store.allocator())?
-            } else {
-                IndexInfo::new_from_index(index)?
-            });
+            )?;
+            let index_info = match mv_store.as_ref() {
+                Some(mv_store) => {
+                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?)
+                }
+                None => btree_cursor
+                    .index_info
+                    .as_ref()
+                    .expect("a cursor opened on an index holds its key")
+                    .clone(),
+            };
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -1473,7 +1594,7 @@ pub fn op_vcreate(
     let args = if let Some(args_reg) = args_reg {
         if let Register::Record(rec) = &state.registers[*args_reg] {
             rec.iter()?
-                .map(|v| v.map(|v| v.to_ffi()))
+                .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
                 .collect::<Result<_, _>>()?
         } else {
             mark_unlikely();
@@ -1523,7 +1644,10 @@ pub fn op_vfilter(
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        return_if_io!(
+            state,
+            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+        )
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1554,7 +1678,7 @@ pub fn op_vcolumn(
     let value = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.column(*column)?
+        return_if_io!(state, cursor.column(*column))
     };
     state.registers[*dest].set_value(value);
     state.pc += 1;
@@ -1625,16 +1749,19 @@ pub fn op_vupdate(
         #[cfg(feature = "cli_only")]
         {
             crate::dbpage::update_dbpage(pager, &argv)
+                .map(IOResult::Done)
+                .map_err(Box::new)
         }
         #[cfg(not(feature = "cli_only"))]
         {
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv)
+        virtual_table.update(&argv, &mut state.extension_state)
     };
     match result {
-        Ok(Some(new_rowid)) => {
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+        Ok(IOResult::Done(Some(new_rowid))) => {
             state.record_rows_written(1);
             if *conflict_action == 5 {
                 // ResolveType::Replace
@@ -1642,7 +1769,7 @@ pub fn op_vupdate(
             }
             state.pc += 1;
         }
-        Ok(None) => {
+        Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
             state.pc += 1;
@@ -1674,7 +1801,7 @@ pub fn op_vnext(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.next()?
+        return_if_io!(state, cursor.next())
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)
@@ -1813,12 +1940,13 @@ pub fn op_rewind(
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
-            Cursor::BTree(btree_cursor) => {
-                return_if_io!(btree_cursor.rewind());
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
+                let btree_cursor = cursor.as_btree_mut();
+                return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
             Cursor::MaterializedView(mv_cursor) => {
-                return_if_io!(mv_cursor.rewind());
+                return_if_io!(state, mv_cursor.rewind());
                 !mv_cursor.is_valid()?
             }
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
@@ -1851,7 +1979,7 @@ pub fn op_last(
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.last());
+        return_if_io!(state, cursor.last());
         cursor.is_empty()
     };
     if is_empty {
@@ -1867,17 +1995,11 @@ pub fn op_last(
 #[derive(Debug, Clone, Copy)]
 pub enum OpColumnState {
     Start,
-    Rowid {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
+    Seek { rowid: i64, table_cursor_id: usize },
     GetColumn,
 }
 
+#[cfg_attr(not(test), inline(always))]
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1893,7 +2015,14 @@ pub fn op_column(
         },
         insn
     );
-    op_column_impl(
+    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+        if matches!(result, InsnFunctionStepResult::Step) {
+            state.pc += 1;
+        }
+        return Ok(result);
+    }
+    op_column_deferred(
         program,
         state,
         *cursor_id,
@@ -1924,7 +2053,15 @@ pub fn op_column_range(
         },
         insn
     );
-    op_column_impl(
+    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let result =
+            op_column_range_fetch(program, state, *cursor_id, *start_column, *dest, defaults)?;
+        if matches!(result, InsnFunctionStepResult::Step) {
+            state.pc += 1;
+        }
+        return Ok(result);
+    }
+    op_column_deferred(
         program,
         state,
         *cursor_id,
@@ -1983,27 +2120,6 @@ impl ColumnFetch<'_> {
     }
 }
 
-#[inline(always)]
-fn op_column_impl(
-    program: &Program,
-    state: &mut ProgramState,
-    cursor_id: usize,
-    fetch: ColumnFetch<'_>,
-) -> InsnResult {
-    // Fast path: no deferred seek pending and no suspended state machine. The
-    // column fetch either completes or yields IO with nothing persisted, so the
-    // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
-    // resume the slot is still idle and this path re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
-        let result = fetch.fetch(program, state, cursor_id)?;
-        if matches!(result, InsnFunctionStepResult::Step) {
-            state.pc += 1;
-        }
-        return Ok(result);
-    }
-    op_column_deferred(program, state, cursor_id, fetch)
-}
-
 /// Column when a deferred seek is pending or the fetch was suspended for
 /// IO inside the seek: drives the op-state machine to completion.
 #[inline(never)]
@@ -2016,59 +2132,26 @@ fn op_column_deferred(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.column() = OpColumnState::Rowid {
-                        index_cursor_id: deferred.index_cursor_id,
+                // SQLite gives a null row priority over a pending deferred seek.
+                // A later outer join can leave both states set on one cursor.
+                if state.get_cursor(cursor_id).get_null_flag() {
+                    fetch.write_null_regs(state);
+                    break 'outer;
+                } else if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                    *state.active_op_state.column() = OpColumnState::Seek {
+                        rowid: deferred.rowid,
                         table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     *state.active_op_state.column() = OpColumnState::GetColumn;
                 }
             }
-            OpColumnState::Rowid {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let Some(rowid) = ({
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
-                        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
-                        _ => panic!("unexpected cursor type"),
-                    }
-                }) else {
-                    fetch.write_null_regs(state);
-                    break 'outer;
-                };
-                *state.active_op_state.column() = OpColumnState::Seek {
-                    rowid,
-                    table_cursor_id,
-                };
-            }
             OpColumnState::Seek {
                 rowid,
                 table_cursor_id,
             } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    // MaterializedView cursors shouldn't go through deferred seek logic
-                    // but if we somehow get here, handle it appropriately
-                    match table_cursor {
-                        Cursor::MaterializedView(mv_cursor) => {
-                            // Seek to the rowid in the materialized view
-                            return_if_io!(mv_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
-                        }
-                        _ => {
-                            // Regular btree cursor
-                            let table_cursor = table_cursor.as_btree_mut();
-                            return_if_io!(table_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
-                        }
-                    }
-                }
-                state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
-                state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
+                return_if_io!(state, seek_deferred_row(state, table_cursor_id, rowid));
+                count_deferred_seek(state);
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
@@ -2102,14 +2185,14 @@ fn op_column_fetch(
         .get_mut(cursor_id)
         .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
     {
-        Some(Cursor::BTree(cursor)) => cursor,
+        Some(Cursor::BTree(cursor, ..)) => cursor,
         Some(Cursor::Pseudo(pseudo)) => {
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(cursor.record_payload()) else {
+    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
         state.registers[dest].set_null();
@@ -2184,7 +2267,7 @@ fn op_column_fetch_other(
         let cursor = state.get_cursor(cursor_id);
         if let Cursor::MaterializedView(mv_cursor) = cursor {
             // Handle materialized view column access
-            let value = return_if_io!(mv_cursor.column(column));
+            let value = return_if_io!(state, mv_cursor.column(column));
             state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -2215,7 +2298,7 @@ fn op_column_fetch_other(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
+                let record_result = return_if_io!(state, cursor.record());
                 let Some(record) = record_result else {
                     // Cursor is not positioned on a valid row (e.g., empty table).
                     // Return NULL, not the column's default value.
@@ -2271,7 +2354,7 @@ fn op_column_fetch_other(
                 .as_mut()
                 .expect("cursor should exist");
             let cursor = cursor.as_index_method_mut();
-            let value = return_if_io!(cursor.query_column(column));
+            let value = return_if_io!(state, cursor.query_column(column));
             state.registers[dest].set_value(value);
         }
         CursorType::VirtualTable(_) => {
@@ -2309,7 +2392,7 @@ fn op_column_range_fetch(
     defaults: &[Option<Value>],
 ) -> InsnResult {
     let count = defaults.len();
-    let Some(Cursor::BTree(cursor)) = state
+    let Some(Cursor::BTree(cursor, ..)) = state
         .cursors
         .get_mut(cursor_id)
         .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
@@ -2323,7 +2406,7 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(cursor.record_payload()) else {
+    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }
@@ -2392,7 +2475,7 @@ fn op_column_range_fetch_other(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(cursor.record());
+                let record_result = return_if_io!(state, cursor.record());
                 let Some(record) = record_result else {
                     for reg in &mut state.registers[dest..dest + count] {
                         reg.set_null();
@@ -2486,7 +2569,7 @@ pub fn op_column_has_field(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let (_, cursor_type) = program
@@ -2507,7 +2590,7 @@ pub fn op_column_has_field(
                 if cursor.get_null_flag() {
                     false
                 } else {
-                    match return_if_io!(cursor.record()) {
+                    match return_if_io!(state, cursor.record()) {
                         Some(record) => record.column_count() > *column,
                         None => false,
                     }
@@ -2536,16 +2619,20 @@ pub fn op_type_check(
         TypeCheck {
             start_reg,
             count,
-            check_generated: _,
+            check_generated,
             table_reference,
         },
         insn
     );
     assert!(table_reference.is_strict);
-    state.registers[*start_reg..*start_reg + *count]
-        .iter_mut()
-        .zip(table_reference.columns().iter())
-        .try_for_each(|(reg, col)| {
+    table_reference.columns().iter().enumerate().try_for_each(
+        |(column_idx, col)| -> Result<(), LimboError> {
+            if col.is_virtual_generated() && !check_generated {
+                return Ok(());
+            }
+            let offset = table_reference.logical_to_physical_column(column_idx);
+            assert!(offset < *count);
+            let reg = &mut state.registers[*start_reg + offset];
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
             if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
             {
@@ -2557,49 +2644,58 @@ pub fn op_type_check(
                 )
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                // (Turbofish pins the closure's error type; the bail macros are
-                // polymorphic over boxed and unboxed LimboError.)
-                return Ok::<(), LimboError>(());
+                return Ok(());
             } else if matches!(reg.get_value(), Value::Null) {
                 // STRICT only enforces type affinity on non-NULL values.
                 // NULL is valid in any column without NOT NULL constraint.
                 return Ok(());
             }
-            let ty_str = &col.ty_str;
-            let ty_bytes = ty_str.as_bytes();
-            let is_builtin_type = turso_macros::match_ignore_ascii_case!(match ty_bytes {
-                b"ANY" | b"INTEGER" | b"INT" | b"REAL" | b"BLOB" | b"TEXT" => true,
-                _ => false,
-            });
-            if is_builtin_type {
-                match_ignore_ascii_case!(match ty_bytes {
-                    b"ANY" => {}
-                    _ => {
-                        let col_affinity = col.affinity();
-                        let _applied = apply_affinity_char(reg, col_affinity);
-                        let value_type = reg.get_value().value_type();
-                        match_ignore_ascii_case!(match ty_bytes {
-                            b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
-                            b"REAL" if value_type == ValueType::Float => {}
-                            b"BLOB" if value_type == ValueType::Blob => {}
-                            b"TEXT" if value_type == ValueType::Text => {}
-                            _ => bail_constraint_error!(
-                                "cannot store {} value in {} column {}.{} ({})",
-                                value_type,
-                                ty_str,
-                                &table_reference.name,
-                                col.name.as_deref().unwrap_or(""),
-                                SQLITE_CONSTRAINT
-                            ),
-                        });
-                    }
-                });
+            if let Some(expected_type) = col.strict_value_type() {
+                let _applied = apply_affinity_char(reg, col.affinity());
+                let value_type = reg.get_value().value_type();
+                if value_type != expected_type {
+                    bail_constraint_error!(
+                        "cannot store {} value in {} column {}.{} ({})",
+                        value_type,
+                        col.ty_str,
+                        &table_reference.name,
+                        col.name.as_deref().unwrap_or(""),
+                        SQLITE_CONSTRAINT
+                    );
+                }
             }
-            // Custom types: skip type check — encode function validates
             Ok(())
-        })?;
+        },
+    )?;
 
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_is_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IsType {
+            reg,
+            target_pc,
+            value_type
+        },
+        insn
+    );
+    let actual = state.registers[*reg].get_value().value_type();
+    // REAL columns can store integral values using integer serial types.
+    if actual == ValueType::Null
+        || actual == *value_type
+        || (*value_type == ValueType::Float && actual == ValueType::Integer)
+    {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -3278,14 +3374,13 @@ pub fn op_make_record(
             ))
             .into());
         }
-        for (i, affinity_ch) in affinity_str.chars().enumerate().take(count) {
-            let reg_index = start_reg + i;
-            let affinity = Affinity::from_char(affinity_ch);
-            apply_affinity_char(&mut state.registers[reg_index], affinity);
+        let registers = &mut state.registers[start_reg..start_reg + count];
+        for (register, &affinity_code) in registers.iter_mut().zip(affinity_str.as_bytes()) {
+            apply_affinity_char(register, Affinity::from_char_code(affinity_code));
         }
     }
 
-    if dest_reg >= start_reg && dest_reg - start_reg < count {
+    if dest_reg.wrapping_sub(start_reg) < count {
         return Err(LimboError::InternalError(format!(
             "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
             start_reg + count
@@ -3344,7 +3439,8 @@ fn blob_btree_cursor<'a>(
     opcode: &str,
 ) -> Result<&'a mut dyn crate::storage::btree::CursorTrait> {
     match state.get_cursor(cursor) {
-        Cursor::BTree(btree) => Ok(btree.as_mut()),
+        Cursor::BTree(btree, ..) => Ok(btree.as_mut()),
+        Cursor::Dyn(btree, ..) => Ok(btree.as_mut()),
         _ => Err(LimboError::InternalError(format!(
             "{opcode} requires a b-tree cursor"
         ))),
@@ -3386,7 +3482,7 @@ pub fn op_blob_read(
         .blob_read_column(*column, off, amt, &mut out)
     {
         Ok(IOResult::Done(())) => {}
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
             return Ok(blob_expired_ack(state, *dest))
         }
@@ -3414,7 +3510,10 @@ pub fn op_blob_len(
         },
         insn
     );
-    let len = return_if_io!(blob_btree_cursor(state, *cursor, "BlobLen")?.blob_column_len(*column));
+    let len = return_if_io!(
+        state,
+        blob_btree_cursor(state, *cursor, "BlobLen")?.blob_column_len(*column)
+    );
     let len = i64::try_from(len)
         .map_err(|_| LimboError::Corrupt("column byte length does not fit in i64".to_string()))?;
     state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(len)));
@@ -3452,7 +3551,7 @@ pub fn op_blob_write(
     };
     match blob_btree_cursor(state, *cursor, "BlobWrite")?.blob_write_column(*column, off, &data) {
         Ok(IOResult::Done(())) => {}
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
             return Ok(blob_expired_ack(state, *dest))
         }
@@ -3488,7 +3587,7 @@ pub fn op_result_row(
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_next(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3498,23 +3597,22 @@ pub fn op_next(
             cursor_id,
             pc_if_next,
             fullscan,
+            is_index,
         },
         insn
     );
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
-            Cursor::BTree(btree_cursor) => !return_if_io!(btree_cursor.next_row()),
-            Cursor::MaterializedView(mv_cursor) => {
-                let has_more = return_if_io!(mv_cursor.next());
-                !has_more
-            }
-            Cursor::IndexMethod(_) => {
-                let cursor = cursor.as_index_method_mut();
-                let has_more = return_if_io!(cursor.query_next());
-                !has_more
-            }
-            _ => panic!("Next on non-btree/materialized-view cursor"),
+            Cursor::BTree(btree_cursor, ..) => match btree_cursor.next_row() {
+                CursorStep::Row => false,
+                CursorStep::Empty => true,
+                CursorStep::Error(err) => return Err(err),
+                CursorStep::IO(io) => {
+                    return Ok(state.suspend_on_io(io));
+                }
+            },
+            _ => !return_if_io!(state, next_row_of_other_cursor(cursor)),
         }
     };
     if !is_empty {
@@ -3524,19 +3622,29 @@ pub fn op_next(
         state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
-        if *fullscan {
-            state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(1);
-        }
-        if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
-            if cursor_type.is_index() {
-                state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
-            }
-        }
+        // Added as 0 or 1 so neither counter costs a branch per row.
+        state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(*fullscan as u64);
+        state.metrics.index_steps = state.metrics.index_steps.wrapping_add(*is_index as u64);
         state.pc = pc_if_next.as_offset_int();
     } else {
         state.pc += 1;
     }
-    Ok(InsnFunctionStepResult::Step)
+    return Ok(InsnFunctionStepResult::Step);
+
+    #[inline(never)]
+    fn next_row_of_other_cursor(cursor: &mut Cursor) -> IOResultOr<bool> {
+        match cursor {
+            Cursor::Dyn(btree_cursor, ..) => match btree_cursor.next_row() {
+                CursorStep::Row => Ok(IOResult::Done(true)),
+                CursorStep::Empty => Ok(IOResult::Done(false)),
+                CursorStep::Error(err) => Err(err),
+                CursorStep::IO(io) => Ok(IOResult::IO(io)),
+            },
+            Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
+            Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
+            _ => panic!("Next on non-btree/materialized-view cursor"),
+        }
+    }
 }
 
 pub fn op_prev(
@@ -3550,12 +3658,21 @@ pub fn op_prev(
             cursor_id,
             pc_if_prev,
             fullscan,
+            is_index,
         },
         insn
     );
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
-        !return_if_io!(cursor.as_btree_mut().prev_row())
+        let cursor = cursor.as_btree_mut();
+        match cursor.prev_row() {
+            CursorStep::Row => false,
+            CursorStep::Empty => true,
+            CursorStep::Error(err) => return Err(err),
+            CursorStep::IO(io) => {
+                return Ok(state.suspend_on_io(io));
+            }
+        }
     };
     if !is_empty {
         // Increment metrics for row read
@@ -3564,14 +3681,9 @@ pub fn op_prev(
         state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
-        if *fullscan {
-            state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(1);
-        }
-        if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
-            if cursor_type.is_index() {
-                state.metrics.index_steps = state.metrics.index_steps.wrapping_add(1);
-            }
-        }
+        // Added as 0 or 1 so neither counter costs a branch per row.
+        state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(*fullscan as u64);
+        state.metrics.index_steps = state.metrics.index_steps.wrapping_add(*is_index as u64);
         state.pc = pc_if_prev.as_offset_int();
     } else {
         state.pc += 1;
@@ -3605,7 +3717,7 @@ pub fn halt(
             }
             IOResult::IO(io) => {
                 state.pending_fail_error = Some(pending_error); // put it back and wait
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
         }
     }
@@ -3623,7 +3735,7 @@ pub fn halt(
             // writes now, exactly like the normal trigger-subprogram halt
             // below, so the kept base rows keep their index entries too.
             if program.is_trigger_subprogram() {
-                return_if_io!(index_method_stage_statement_all(state));
+                return_if_io!(state, index_method_stage_statement_all(state));
             }
             return Err(LimboError::RaiseIgnore.into());
         }
@@ -3665,7 +3777,7 @@ pub fn halt(
             Some(LimboError::ForeignKeyConstraint(description.to_string()))
         }
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
-        SQLITE_FULL => Some(LimboError::DatabaseFull(description.to_string())),
+        SQLITE_FULL => Some(LimboError::DatabaseFull),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
@@ -3686,7 +3798,7 @@ pub fn halt(
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(LimboError::ForeignKeyConstraint(
-                    "immediate foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 )
                 .into());
             }
@@ -3700,7 +3812,7 @@ pub fn halt(
             // interrupt, deadline, and progress-handler requests from
             // replacing the outcome while the staged work is in flight.
             vtab_commit_all(&program.connection)?;
-            return_if_io!(index_method_stage_statement_all(state));
+            return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
 
             // Commit the transaction with partial changes
@@ -3712,7 +3824,7 @@ pub fn halt(
                 IOResult::IO(io) => {
                     // store the error for reentrancy
                     state.pending_fail_error = Some(error);
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(state.suspend_on_io(io));
                 }
             }
         }
@@ -3746,10 +3858,9 @@ pub fn halt(
     if program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
-        return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
-        )
-        .into());
+        return Err(
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
+        );
     }
 
     if program.is_trigger_subprogram() {
@@ -3757,7 +3868,7 @@ pub fn halt(
         // Stage their index-method writes now so reset cannot drop pending
         // work from an earlier row in the parent statement. The parent still
         // owns the statement savepoint and the final transaction outcome.
-        return_if_io!(index_method_stage_statement_all(state));
+        return_if_io!(state, index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
     }
 
@@ -3781,14 +3892,14 @@ pub fn halt(
                 }
                 program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
-                    "deferred foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 )
                 .into());
             }
         }
         if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
-            return_if_io!(index_method_stage_statement_all(state));
+            return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             // Sequence backing-table compaction and sqlite_sequence sync
             // are emitted as straight-line bytecode inside the
@@ -3799,9 +3910,8 @@ pub fn halt(
             // `sqlite_sequence` is already in sync, so the commit does
             // not invoke a sequence flush — keeping op_halt within the
             // vdbe async contract.
-            let result = program
-                .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
-                .map(Into::into);
+            let result = program.commit_txn(pager.clone(), state, mv_store.as_ref(), false);
+            let result = state.done_or_suspend(result);
             // Apply deferred CDC state and reset CDC txn ID after successful commit
             if matches!(result, Ok(InsnFunctionStepResult::Done)) {
                 index_method_on_transaction_committed_all(state, &program.connection);
@@ -3819,7 +3929,7 @@ pub fn halt(
             // savepoint is released, and its cursors handed to the connection
             // so the sibling that eventually commits (or rolls back) the
             // shared transaction delivers their outcome.
-            return_if_io!(index_method_stage_statement_all(state));
+            return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             index_method_register_transaction_all(state, &program.connection)?;
             //
@@ -3862,7 +3972,7 @@ pub fn halt(
         // Otherwise the cursor's Drop fallback performs these writes after
         // statement success, where an I/O error can no longer be returned to
         // the caller or rolled back at statement scope.
-        return_if_io!(index_method_stage_statement_all(state));
+        return_if_io!(state, index_method_stage_statement_all(state));
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         index_method_register_transaction_all(state, &program.connection)?;
         // Apply deferred CDC state after successful statement completion
@@ -3901,69 +4011,74 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
 /// Stage pending writes on every index-method cursor before releasing the
 /// statement savepoint. Cursor order is bytecode cursor order, which is stable
 /// across resumptions and avoids attachment-order ambiguity.
+#[inline]
 pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IOResultOr<()> {
     if state.index_methods_finalized || !has_index_method_work(state) {
         return Ok(IOResult::Done(()));
     }
+    return stage_statement_all_cold(state);
 
-    while state.index_method_finalize_cursor < state.cursors.len() {
-        let cursor_id = state.index_method_finalize_cursor;
-        if matches!(
-            state.cursors[cursor_id].as_ref(),
-            Some(Cursor::IndexMethod(_))
-        ) {
-            let Some(context) = state.index_method_contexts[cursor_id].clone() else {
-                return Err(LimboError::InternalError(format!(
-                    "index-method cursor {cursor_id} has no execution context"
-                ))
-                .into());
-            };
-            crate::mvcc::yield_points::inject_io_yield!(
-                context,
-                crate::index_method::IndexMethodYieldPoint::BeforePrepareStatement
-            );
-            let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].as_mut() else {
-                unreachable!("cursor kind checked above")
-            };
-            match cursor.stage_statement_commit(&context)? {
-                IOResult::Done(()) => {}
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+    #[inline(never)]
+    fn stage_statement_all_cold(state: &mut ProgramState) -> IOResultOr<()> {
+        while state.index_method_finalize_cursor < state.cursors.len() {
+            let cursor_id = state.index_method_finalize_cursor;
+            if matches!(
+                state.cursors[cursor_id].as_ref(),
+                Some(Cursor::IndexMethod(_))
+            ) {
+                let Some(context) = state.index_method_contexts[cursor_id].clone() else {
+                    return Err(LimboError::InternalError(format!(
+                        "index-method cursor {cursor_id} has no execution context"
+                    ))
+                    .into());
+                };
+                crate::mvcc::yield_points::inject_io_yield!(
+                    context,
+                    crate::index_method::IndexMethodYieldPoint::BeforePrepareStatement
+                );
+                let Some(Cursor::IndexMethod(cursor)) = state.cursors[cursor_id].as_mut() else {
+                    unreachable!("cursor kind checked above")
+                };
+                match cursor.stage_statement_commit(&context)? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+                state.index_method_finalize_cursor += 1;
+                crate::mvcc::yield_points::inject_io_yield!(
+                    context,
+                    crate::index_method::IndexMethodYieldPoint::AfterPrepareStatement
+                );
+                continue;
             }
             state.index_method_finalize_cursor += 1;
-            crate::mvcc::yield_points::inject_io_yield!(
-                context,
-                crate::index_method::IndexMethodYieldPoint::AfterPrepareStatement
-            );
-            continue;
         }
-        state.index_method_finalize_cursor += 1;
-    }
 
-    let subprogram_keys = state
-        .index_method_finalize_subprogram_keys
-        .get_or_insert_with(|| {
-            let mut keys = state
+        let subprogram_keys = state
+            .index_method_finalize_subprogram_keys
+            .get_or_insert_with(|| {
+                let mut keys = state
+                    .subprogram_stmt_cache
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                keys.sort_unstable();
+                keys
+            });
+        while state.index_method_finalize_subprogram < subprogram_keys.len() {
+            let key = subprogram_keys[state.index_method_finalize_subprogram];
+            let statement = state
                 .subprogram_stmt_cache
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            keys.sort_unstable();
-            keys
-        });
-    while state.index_method_finalize_subprogram < subprogram_keys.len() {
-        let key = subprogram_keys[state.index_method_finalize_subprogram];
-        let statement = state
-            .subprogram_stmt_cache
-            .get_mut(&key)
-            .expect("finalization key must reference a cached subprogram");
-        match statement.prepare_index_methods()? {
-            IOResult::Done(()) => state.index_method_finalize_subprogram += 1,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                .get_mut(&key)
+                .expect("finalization key must reference a cached subprogram");
+            match statement.prepare_index_methods()? {
+                IOResult::Done(()) => state.index_method_finalize_subprogram += 1,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
         }
-    }
 
-    state.index_methods_finalized = true;
-    Ok(IOResult::Done(()))
+        state.index_methods_finalized = true;
+        Ok(IOResult::Done(()))
+    }
 }
 
 /// Discard statement-owned index-method work before a statement savepoint or
@@ -4044,6 +4159,7 @@ pub(crate) fn index_method_on_transaction_committed_all(
 /// statement into connection-level transaction ownership. Replacing an older
 /// cursor for the same attachment keeps outcome delivery exactly once while
 /// retaining the newest in-transaction view.
+#[inline]
 pub(crate) fn index_method_register_transaction_all(
     state: &mut ProgramState,
     connection: &Connection,
@@ -4051,6 +4167,14 @@ pub(crate) fn index_method_register_transaction_all(
     if !has_index_method_work(state) {
         return Ok(());
     }
+    register_index_method_transactions(state, connection)
+}
+
+#[inline(never)]
+fn register_index_method_transactions(
+    state: &mut ProgramState,
+    connection: &Connection,
+) -> crate::Result<()> {
     let mut registered = 0usize;
     for cursor_id in 0..state.cursors.len() {
         if !matches!(state.cursors[cursor_id], Some(Cursor::IndexMethod(_))) {
@@ -4090,6 +4214,7 @@ pub(crate) fn index_method_register_transaction_all(
 /// Whether this statement has index-method cursors, closed index-method
 /// cursors or cached subprograms that the commit hooks must visit. Almost
 /// every statement has none, and every halt calls the hooks.
+#[inline]
 fn has_index_method_work(state: &ProgramState) -> bool {
     !state.closed_index_method_cursors.is_empty()
         || !state.subprogram_stmt_cache.is_empty()
@@ -4100,7 +4225,7 @@ fn has_index_method_work(state: &ProgramState) -> bool {
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
-fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
+pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -4468,14 +4593,6 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
-    if *db == crate::TEMP_DB_ID {
-        program.connection.ensure_temp_database()?;
-    }
-    let pager = pager_for_db(program, pager, *db)?;
-    // Get the MvStore for the specific database (main or attached).
-    let mv_store = mv_store_for_db(program, state, *db);
-    let is_main_db = *db == crate::MAIN_DB_ID;
-    let is_secondary_db = !is_main_db;
     let write = matches!(
         tx_mode,
         TransactionMode::Write | TransactionMode::Concurrent
@@ -4485,6 +4602,26 @@ pub fn op_transaction_inner(
     // `write_databases` count for same-connection writer blocking and
     // active-writer cleanup.
     let statement_writes_db = program.write_databases.get(*db);
+    if *db == crate::TEMP_DB_ID {
+        // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT emit a write Transaction for
+        // temp without touching it. Like SQLite (OP_Transaction is a no-op when
+        // the temp btree is not open), don't create the temp database just to
+        // lock it: it is private to this connection, so there is no lock to
+        // contend for. A later statement that uses temp creates it and begins
+        // its transaction lazily, exactly as after BEGIN DEFERRED. Creating it
+        // here would cost a temp file, a page 1 write and an fsync on every
+        // new connection, plus tearing it down on close.
+        if write && !statement_writes_db && !program.connection.has_temp_database() {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        program.connection.ensure_temp_database()?;
+    }
+    let pager = pager_for_db(program, pager, *db)?;
+    // Get the MvStore for the specific database (main or attached).
+    let mv_store = mv_store_for_db(program, state, *db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
@@ -4538,7 +4675,7 @@ pub fn op_transaction_inner(
                             TransactionYieldPoint::BeforeStart,
                         )
                     {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(state.suspend_on_io(io));
                     }
                 }
 
@@ -4630,7 +4767,7 @@ pub fn op_transaction_inner(
                                         TransactionYieldPoint::BeforeMvccBegin,
                                     )
                                 {
-                                    return Ok(InsnFunctionStepResult::IO(io));
+                                    return Ok(state.suspend_on_io(io));
                                 }
                             }
                             match begin_fresh_mvcc_tx(
@@ -4736,7 +4873,7 @@ pub fn op_transaction_inner(
                                         TransactionYieldPoint::BeforeMvccBegin,
                                     )
                                 {
-                                    return Ok(InsnFunctionStepResult::IO(io));
+                                    return Ok(state.suspend_on_io(io));
                                 }
                             }
                             match begin_fresh_mvcc_tx(
@@ -4893,7 +5030,7 @@ pub fn op_transaction_inner(
                             conn.set_tx_state(TransactionState::PendingUpgrade {
                                 has_read_txn: matches!(current_state, TransactionState::Read),
                             });
-                            return Ok(InsnFunctionStepResult::IO(io));
+                            return Ok(state.suspend_on_io(io));
                         }
                     }
                 }
@@ -4918,7 +5055,7 @@ pub fn op_transaction_inner(
                 let conn = program.connection.clone();
                 let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(state.suspend_on_io(io));
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
@@ -4939,7 +5076,7 @@ pub fn op_transaction_inner(
                         }
                         continue;
                     }
-                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                    IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
                 }
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
@@ -4958,7 +5095,7 @@ pub fn op_transaction_inner(
                             return Err(LimboError::SchemaUpdated.into());
                         }
                     }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
                     // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
                     Err(err) if matches!(*err, LimboError::Page1NotAlloc) => {}
                     Err(err) => {
@@ -4980,7 +5117,7 @@ pub fn op_transaction_inner(
                             statement_writes_db,
                         )?;
                         if let IOResult::IO(io) = res {
-                            return Ok(InsnFunctionStepResult::IO(io));
+                            return Ok(state.suspend_on_io(io));
                         }
                     } else if statement_writes_db && in_explicit_txn {
                         if !state.has_stmt_transaction {
@@ -5004,6 +5141,7 @@ pub fn op_transaction_inner(
                         } else {
                             // Attached WAL DB: open a pager savepoint for statement rollback.
                             let db_size = return_if_io!(
+                                state,
                                 pager.with_header(|header| header.database_size.get())
                             );
                             pager.open_subjournal()?;
@@ -5113,9 +5251,8 @@ pub fn op_auto_commit(
     // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
     // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
     if !matches!(state.commit_state, CommitState::Ready) {
-        let res = program
-            .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
-            .map(Into::into);
+        let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
+        let res = state.done_or_suspend(res);
         // Only clear after a final, successful non-rollback COMMIT.
         if fk_on
             && !*rollback
@@ -5195,6 +5332,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
@@ -5208,6 +5346,7 @@ pub fn op_auto_commit(
                     // persist a partial statement, so COMMIT rolls back the
                     // whole transaction and reports the abandoned write.
                     conn.rollback_manual_txn_cleanup(pager, true);
+                    vtab_rollback_all(&conn)?;
                     return Err(LimboError::TxError(
                         "cannot commit - an unfinished write statement was abandoned".to_string(),
                     )
@@ -5215,6 +5354,7 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -5258,12 +5398,9 @@ pub fn op_auto_commit(
     // an IO yield would then fail `valid_transition` with a torn-down
     // transaction.
 
-    let res = match program
-        .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
-        .map(Into::<InsnFunctionStepResult>::into)?
-    {
-        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
-        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+    let res = match program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)? {
+        IOResult::Done(_) => InsnFunctionStepResult::Done,
+        IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     };
 
     if mv_store.is_none() {
@@ -5333,7 +5470,7 @@ pub fn op_savepoint(
             // cannot yield halfway through. Load every active WAL header
             // before opening the first savepoint so an I/O yield is restartable.
             if let IOResult::IO(io) = load_active_non_main_wal_headers_for_named_savepoint(&conn)? {
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
             #[cfg(any(test, injected_yields))]
             {
@@ -5346,7 +5483,7 @@ pub fn op_savepoint(
                             TransactionYieldPoint::BeforeMvccBegin,
                         )
                     {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(state.suspend_on_io(io));
                     }
                 }
             }
@@ -5394,8 +5531,10 @@ pub fn op_savepoint(
                             conn.set_tx_state(TransactionState::Read);
                         }
                         pager.open_subjournal()?;
-                        let db_size =
-                            return_if_io!(pager.with_header(|header| header.database_size.get()));
+                        let db_size = return_if_io!(
+                            state,
+                            pager.with_header(|header| header.database_size.get())
+                        );
                         pager.open_named_savepoint(
                             name.clone(),
                             db_size,
@@ -5457,6 +5596,12 @@ pub fn op_savepoint(
             .map_err(Into::into)
         }
         SavepointOp::Release => {
+            // A RELEASE that commits the transaction may suspend on I/O inside
+            // op_auto_commit after the savepoint was already removed. On
+            // re-entry, resume that commit instead of looking up the savepoint again.
+            if !matches!(state.commit_state, CommitState::Ready) {
+                return op_auto_commit(program, state, &release_commit_insn(), pager);
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
@@ -5484,11 +5629,7 @@ pub fn op_savepoint(
                         SavepointMirror::Release(name),
                     )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
-                    let auto_commit = Insn::AutoCommit {
-                        auto_commit: true,
-                        rollback: false,
-                    };
-                    return op_auto_commit(program, state, &auto_commit, pager);
+                    return op_auto_commit(program, state, &release_commit_insn(), pager);
                 }
             }
 
@@ -5563,18 +5704,26 @@ pub fn op_savepoint(
     }
 }
 
+fn release_commit_insn() -> Insn {
+    Insn::AutoCommit {
+        auto_commit: true,
+        rollback: false,
+    }
+}
+
 fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
     if !conn.foreign_keys_enabled() {
         return Ok(());
     }
     if conn.get_deferred_foreign_key_violations() > 0 {
         return Err(LimboError::ForeignKeyConstraint(
-            "deferred foreign key constraint failed on commit".into(),
+            "FOREIGN KEY constraint failed".into(),
         ));
     }
     Ok(())
 }
 
+#[inline(always)]
 pub fn op_goto(
     _program: &Program,
     state: &mut ProgramState,
@@ -5583,12 +5732,13 @@ pub fn op_goto(
 ) -> InsnResult {
     load_insn!(Goto { target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_gosub(
     _program: &Program,
     state: &mut ProgramState,
@@ -5603,13 +5753,14 @@ pub fn op_gosub(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     state.registers[*return_reg].set_int((state.pc + 1) as i64);
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_return(
     _program: &Program,
     state: &mut ProgramState,
@@ -5624,21 +5775,29 @@ pub fn op_return(
         insn
     );
     if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*return_reg].get_value() {
-        let pc: u32 = (*pc)
-            .try_into()
-            .unwrap_or_else(|_| panic!("Return register is negative: {pc}"));
-        state.pc = pc;
+        state.pc = u32::try_from(*pc).unwrap_or_else(|_| negative_return_address(*pc));
     } else {
         if unlikely(!*can_fallthrough) {
-            return Err(
-                LimboError::InternalError("Return register is not an integer".to_string()).into(),
-            );
+            return Err(return_register_not_an_integer());
         }
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[cold]
+#[inline(never)]
+fn negative_return_address(pc: i64) -> ! {
+    panic!("Return register is negative: {pc}")
+}
+
+#[cold]
+#[inline(never)]
+fn return_register_not_an_integer() -> Box<LimboError> {
+    LimboError::InternalError("Return register is not an integer".to_string()).into()
+}
+
+#[cfg_attr(not(test), inline(always))]
 pub fn op_integer(
     _program: &Program,
     state: &mut ProgramState,
@@ -5829,7 +5988,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Ok(InsnFunctionStepResult::IO(io));
+                                return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
@@ -5907,6 +6066,38 @@ pub fn op_program(
     }
 }
 
+pub(super) fn abort_active_subprogram(
+    program: &Program,
+    state: &mut ProgramState,
+    err: Option<&LimboError>,
+) -> Result<()> {
+    let Some(subprogram) = state.active_op_state.program_mut() else {
+        return Ok(());
+    };
+    let subprogram = std::mem::take(subprogram);
+    state.active_op_state.clear();
+    if let OpProgramState::Step {
+        is_trigger,
+        mut statement,
+        saved_last_insert_rowid,
+        saved_changes_value,
+    } = subprogram
+    {
+        let result = statement.abort_subprogram(err);
+        finish_subprogram(
+            program,
+            &statement,
+            is_trigger,
+            true,
+            saved_last_insert_rowid,
+            saved_changes_value,
+        );
+        result
+    } else {
+        Ok(())
+    }
+}
+
 pub fn op_real(
     _program: &Program,
     state: &mut ProgramState,
@@ -5975,7 +6166,7 @@ pub fn op_row_data(
     let record = {
         let cursor_ref = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
         let cursor = cursor_ref.as_btree_mut();
-        let record_option = return_if_io!(cursor.record());
+        let record_option = return_if_io!(state, cursor.record());
 
         let record = record_option.ok_or_else(|| {
             mark_unlikely();
@@ -5989,20 +6180,6 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpRowIdState {
-    Start,
-    Record {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
-    GetRowid,
-}
-
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
@@ -6014,145 +6191,66 @@ pub fn op_row_id(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
-    // Fast path: no deferred seek pending and no suspended state machine, so
-    // the op-state slot (enum write + drop on clear) is bypassed. On an IO
-    // yield nothing is persisted and this path simply re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
-        let result = op_row_id_read(state, *cursor_id, *dest)?;
-        if matches!(result, InsnFunctionStepResult::Step) {
-            state.pc += 1;
+    if let Some(deferred) = &state.deferred_seeks[*cursor_id] {
+        let rowid = deferred.rowid;
+        // SQLite gives a null row priority over a pending deferred seek.
+        // A later outer join can leave both states set on one cursor.
+        // Like SQLite, RowId does not finish the deferred table seek.
+        if state.get_cursor(*cursor_id).get_null_flag() {
+            state.registers[*dest].set_null();
+        } else {
+            state.registers[*dest].set_int(rowid);
         }
-        return Ok(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
-    op_row_id_deferred(state, *cursor_id, *dest)
-}
-
-/// RowId when a deferred seek is pending or the read was suspended for IO
-/// inside the seek: drives the op-state machine to completion.
-#[inline(never)]
-fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
-    loop {
-        match *state.active_op_state.row_id() {
-            OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.row_id() = OpRowIdState::Record {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-                }
-            }
-            OpRowIdState::Record {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let rowid = {
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(index_cursor) => {
-                            let record = return_if_io!(index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
-                        _ => panic!("unexpected cursor type"),
-                    }
-                };
-                *state.active_op_state.row_id() = OpRowIdState::Seek {
-                    rowid,
-                    table_cursor_id,
-                }
-            }
-            OpRowIdState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
-                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-            }
-            OpRowIdState::GetRowid => {
-                let result = op_row_id_read(state, cursor_id, dest)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetRowid so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break;
-            }
-        }
+    let result = op_row_id_read(state, *cursor_id, *dest)?;
+    if matches!(result, InsnFunctionStepResult::Step) {
+        state.pc += 1;
     }
-
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    Ok(result)
 }
 
 /// Reads the rowid of the cursor's current position into a register.
+#[inline(always)]
 fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
     let cursor = state
         .cursors
         .get_mut(cursor_id)
         .expect("cursor_id should be valid");
-    match cursor {
-        Some(Cursor::NullRow) => {
-            state.registers[dest].set_null();
-        }
-        Some(Cursor::BTree(btree_cursor)) => {
-            // rowid() answers None for a cursor in the null-row state.
-            if let Some(rowid) = return_if_io!(btree_cursor.rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
+    let rowid = match cursor {
+        Some(Cursor::BTree(btree_cursor, ..)) => return_if_io!(state, btree_cursor.rowid()),
+        Some(Cursor::Dyn(btree_cursor, ..)) => return_if_io!(state, btree_cursor.rowid()),
+        _ => return_if_io!(state, row_id_of_other_cursor(cursor)),
+    };
+    match rowid {
+        Some(rowid) => state.registers[dest].set_int(rowid),
+        None => state.registers[dest].set_null(),
+    }
+    return Ok(InsnFunctionStepResult::Step);
+
+    // out of line to keep the stack frame small
+    #[inline(never)]
+    fn row_id_of_other_cursor(cursor: &mut Option<Cursor>) -> IOResultOr<Option<i64>> {
+        match cursor {
+            Some(Cursor::NullRow) => Ok(IOResult::Done(None)),
+            Some(Cursor::Virtual(virtual_cursor)) => {
+                let rowid = virtual_cursor.rowid();
+                Ok(IOResult::Done((rowid != 0).then_some(rowid)))
             }
-        }
-        Some(Cursor::Virtual(virtual_cursor)) => {
-            let rowid = virtual_cursor.rowid();
-            if rowid != 0 {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
+            Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
+            Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
+            Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
+            _ => {
+                mark_unlikely();
+                Err(LimboError::InternalError(
+                    "RowId: cursor is not a table, virtual, or materialized view cursor"
+                        .to_string(),
+                )
+                .into())
             }
-        }
-        Some(Cursor::MaterializedView(mv_cursor)) => {
-            if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        Some(Cursor::IndexMethod(cursor)) => {
-            if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
-                state.registers[dest].set_int(rowid);
-            } else {
-                state.registers[dest].set_null();
-            }
-        }
-        _ => {
-            mark_unlikely();
-            return Err(LimboError::InternalError(
-                "RowId: cursor is not a table, virtual, or materialized view cursor".to_string(),
-            )
-            .into());
         }
     }
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_idx_row_id(
@@ -6170,8 +6268,9 @@ pub fn op_idx_row_id(
         .expect("cursor should exist");
 
     let rowid = match cursor {
-        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
-        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
+        Cursor::BTree(cursor, ..) => return_if_io!(state, cursor.rowid()),
+        Cursor::Dyn(cursor, ..) => return_if_io!(state, cursor.rowid()),
+        Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
     };
@@ -6198,7 +6297,7 @@ pub fn op_seek_rowid(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     let (pc, did_seek) = {
@@ -6215,8 +6314,11 @@ pub fn op_seek_rowid(
 
                 match rowid {
                     Some(rowid) => {
-                        let seek_result = return_if_io!(mv_cursor
-                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        let seek_result = return_if_io!(
+                            state,
+                            mv_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                        );
                         let pc = if !matches!(seek_result, SeekResult::Found) {
                             target_pc.as_offset_int()
                         } else {
@@ -6227,7 +6329,8 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            Cursor::BTree(btree_cursor) => {
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
+                let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
                     Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
@@ -6249,8 +6352,11 @@ pub fn op_seek_rowid(
 
                 match rowid {
                     Some(rowid) => {
-                        let seek_result = return_if_io!(btree_cursor
-                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        let seek_result = return_if_io!(
+                            state,
+                            btree_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                        );
                         let pc = if !matches!(seek_result, SeekResult::Found) {
                             target_pc.as_offset_int()
                         } else {
@@ -6268,6 +6374,7 @@ pub fn op_seek_rowid(
     // Increment btree_seeks metric for SeekRowid operation after cursor is dropped
     if did_seek {
         state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
+        state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
     }
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
@@ -6286,12 +6393,73 @@ pub fn op_deferred_seek(
         },
         insn
     );
+    let rowid = {
+        let index_cursor = state.get_cursor(*index_cursor_id);
+        match index_cursor {
+            Cursor::BTree(index_cursor, _) => return_if_io!(state, index_cursor.rowid()),
+            Cursor::Dyn(index_cursor, _) => return_if_io!(state, index_cursor.rowid()),
+            Cursor::IndexMethod(index_cursor) => return_if_io!(state, index_cursor.query_rowid()),
+            _ => panic!("DeferredSeek requires an index cursor"),
+        }
+    }
+    .expect("DeferredSeek index cursor must have a rowid");
+    // SQLite clears the table's null row when the index identifies a row.
+    // The table read stays deferred until a later instruction needs it.
+    state.get_cursor(*table_cursor_id).set_null_flag(false);
     state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,
+        rowid,
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Complete the table move recorded by DeferredSeek.
+///
+/// SQLite emits this before a write when no Column instruction had to move
+/// the table cursor.
+pub fn op_finish_seek(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FinishSeek { cursor_id }, insn);
+    let Some(rowid) = state.deferred_seeks[*cursor_id]
+        .as_ref()
+        .map(|deferred| deferred.rowid)
+    else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    return_if_io!(state, seek_deferred_row(state, *cursor_id, rowid));
+    state.deferred_seeks[*cursor_id] = None;
+    count_deferred_seek(state);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Move a table cursor to the row that DeferredSeek saved.
+fn seek_deferred_row(
+    state: &mut ProgramState,
+    table_cursor_id: usize,
+    rowid: i64,
+) -> IOResultOr<SeekResult> {
+    let key = SeekKey::TableRowId(rowid);
+    let op = SeekOp::GE { eq_only: true };
+    match state.get_cursor(table_cursor_id) {
+        // Materialized views should not use deferred seeks, but seek them correctly if one does.
+        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
+        table_cursor => table_cursor.as_btree_mut().seek(key, op),
+    }
+}
+
+fn count_deferred_seek(state: &mut ProgramState) {
+    state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
+    state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
+    state.metrics.btree_deferred_seeks = state.metrics.btree_deferred_seeks.wrapping_add(1);
+    state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
 }
 
 /// Separate enum for seek key to avoid lifetime issues
@@ -6311,8 +6479,8 @@ pub enum OpSeekState {
     Start,
     /// Position cursor with seek operation with (rowid, op) search parameters
     Seek { key: OpSeekKey, op: SeekOp },
-    /// Advance cursor (with [BTreeCursor::next]/[BTreeCursor::prev] methods) which was
-    /// positioned after [OpSeekState::Seek] state if [BTreeCursor::seek] returned [SeekResult::TryAdvance]
+    /// Advance cursor (with `BTreeCursor::next`/`BTreeCursor::prev` methods) which was
+    /// positioned after [OpSeekState::Seek] state if `BTreeCursor::seek` returned [SeekResult::TryAdvance]
     Advance { op: SeekOp },
     /// Move cursor to the last BTree row if DB knows that comparison result will be fixed (due to type ordering, e.g. NUMBER always <= TEXT)
     MoveLast,
@@ -6423,7 +6591,7 @@ pub fn op_seek(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(SeekInternalResult::IO(io)) => Ok(state.suspend_on_io(io)),
         Err(e) => Err(e.into()),
     }
 }
@@ -6659,6 +6827,13 @@ pub fn seek_internal(
                     };
                     // Increment btree_seeks metric after seek operation and cursor is dropped
                     state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
+                    if is_index {
+                        state.metrics.btree_index_seeks =
+                            state.metrics.btree_index_seeks.wrapping_add(1);
+                    } else {
+                        state.metrics.btree_table_seeks =
+                            state.metrics.btree_table_seeks.wrapping_add(1);
+                    }
                     let found = match seek_result {
                         SeekResult::Found => true,
                         SeekResult::NotFound => false,
@@ -6811,24 +6986,18 @@ pub fn op_idx_ge(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            // Create the comparison record from registers
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                idx_record,  // The serialized record from the index
-                values,      // The record built from registers
-                &index_info, // Sort order flags
-                0,
+            let ord = compare_record(
+                idx_payload,
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
+                index_info,
                 tie_breaker,
             )?;
 
@@ -6858,7 +7027,7 @@ pub fn op_seek_end(
     {
         let cursor = state.get_cursor(cursor_id);
         let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.seek_end());
+        return_if_io!(state, cursor.seek_end());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6881,19 +7050,20 @@ pub fn op_idx_le(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_record(
+                idx_payload,
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
+                index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -6928,19 +7098,20 @@ pub fn op_idx_gt(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_record(
+                idx_payload,
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
+                index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -6975,20 +7146,20 @@ pub fn op_idx_lt(
         insn
     );
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
-        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
-
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_record(
+                idx_payload,
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
+                index_info,
+                tie_breaker,
+            )?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()
@@ -7014,7 +7185,7 @@ pub fn op_decr_jump_zero(
 ) -> InsnResult {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
     if !target_pc.is_offset() {
-        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+        return Err(unresolved_branch_target(*target_pc));
     }
     match &mut state.registers[*reg] {
         Register::Value(Value::Numeric(Numeric::Integer(n))) => {
@@ -7060,23 +7231,26 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     // When t is infinite, the KBN correction computes inf - inf = NaN,
     // which is meaningless. Skip compensation in that case.
     if t.is_finite() {
-        let correction = if s.abs() > r.abs() {
-            (s - t) + r
-        } else {
-            (r - t) + s
-        };
-        state.r_err += correction;
+        state.r_err += kbn_correction(s, r, t);
     }
     *acc = Value::from_f64(t);
 }
+
+fn kbn_correction(s: f64, r: f64, t: f64) -> f64 {
+    if s.abs() > r.abs() {
+        (s - t) + r
+    } else {
+        (r - t) + s
+    }
+}
+
+const KBN_EXACT_INTEGER_LIMIT: u64 = 1 << 52;
 
 // Add a (possibly large) integer to the running float sum. An integer big
 // enough to lose precision as a single f64 is split into a high and a low
 // part, each added separately, so no bits are dropped.
 fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
-    const THRESHOLD: i64 = 4503599627370496; // 2^52
-
-    if i <= -THRESHOLD || i >= THRESHOLD {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
         let i_sm = i % 16384;
         let i_big = i - i_sm;
 
@@ -7093,9 +7267,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// a low part (the running error term) and lose no bits. Mirrors
 /// SQLite's `kahanBabuskaNeumaierInit` (func.c).
 fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
-    const THRESHOLD: i64 = 4503599627370496; // 2^52
-
-    if i <= -THRESHOLD || i >= THRESHOLD {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
         let i_sm = i % 16384;
         *acc = Value::from_f64((i - i_sm) as f64);
         state.r_err = i_sm as f64;
@@ -7120,9 +7292,14 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+    // This initializes `payload` at exactly the right size.
     match func {
-        AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
+        AggFunc::Count | AggFunc::Count0 => {
+            payload.try_reserve_exact(1)?;
+            payload.push(Value::from_i64(0));
+        }
         AggFunc::Sum | AggFunc::Total => {
+            payload.try_reserve_exact(5)?;
             let acc = if matches!(func, AggFunc::Total) {
                 Value::from_f64(0.0)
             } else {
@@ -7135,12 +7312,17 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
         }
         AggFunc::Avg => {
+            payload.try_reserve_exact(3)?;
             payload.push(Value::from_f64(0.0));
             payload.push(Value::from_f64(0.0));
             payload.push(Value::from_i64(0));
         }
-        AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
+        AggFunc::Min | AggFunc::Max => {
+            payload.try_reserve_exact(1)?;
+            payload.push(Value::Null);
+        }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
+            payload.try_reserve_exact(4)?;
             // Use Null as sentinel to distinguish "no values yet" from an
             // accumulated empty string. SQLite normally remembers one
             // separator length and only materializes the per-separator queue
@@ -7150,38 +7332,42 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
             payload.push(Value::Blob(crate::alloc::vec![]));
         }
-        AggFunc::External(_) => {
-            mark_unlikely();
-            // External aggregates use ExternalAggState, not flat payload
-            return Err(LimboError::InternalError(
-                "External aggregate not supported in init_agg_payload".to_string(),
-            ));
-        }
         AggFunc::ArrayAgg => {
+            payload.try_reserve_exact(1)?;
             // payload[0] = element count (Integer), remaining slots = accumulated values.
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
         AggFunc::Mode => {
+            payload.try_reserve_exact(2)?;
             // [0] = collation bits, [1] = count, [2..] = buffered values.
-            payload.push(Value::from_i64(0)); // collation (recorded at step time)
-            payload.push(Value::from_i64(0)); // count
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            payload.try_reserve_exact(3)?;
             // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
-            payload.push(Value::from_i64(0)); // collation (recorded at step time)
-            payload.push(Value::from_i64(0)); // count
-            payload.push(Value::Null); // fraction (set on first step)
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::Null);
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+            payload.try_reserve_exact(1)?;
             payload.push(Value::Blob(crate::alloc::vec![]));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+            payload.try_reserve_exact(1)?;
             payload.push(Value::Blob(crate::alloc::vec![]));
         }
-    };
+        AggFunc::External(_) => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "External aggregate not supported in init_agg_payload".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -7235,7 +7421,7 @@ fn update_agg_payload(
                         "Count: payload is not an integer".to_string(),
                     ));
                 };
-                *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                *i = i.checked_add(1).or_overflow()?;
             }
         }
         AggFunc::Count0 => {
@@ -7246,7 +7432,7 @@ fn update_agg_payload(
                     "Count0: payload is not an integer".to_string(),
                 ));
             };
-            *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *i = i.checked_add(1).or_overflow()?;
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
@@ -7279,7 +7465,7 @@ fn update_agg_payload(
                 NumericArg::Null => unreachable!("NULL early-returned above"),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
-            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *count = count.checked_add(1).or_overflow()?;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
@@ -7316,7 +7502,7 @@ fn update_agg_payload(
                 ovrfl: *ovrfl_i != 0,
             };
             if !matches!(arg, Value::Null) {
-                *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                *count = count.checked_add(1).or_overflow()?;
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
                 return Ok(());
@@ -7472,7 +7658,7 @@ fn update_agg_payload(
                         separator_lengths.try_reserve(
                             count
                                 .checked_mul(std::mem::size_of::<i64>())
-                                .ok_or(LimboError::IntegerOverflow)?,
+                                .or_overflow()?,
                         )?;
                         let bytes = first_separator_len.to_be_bytes();
                         for _ in 0..prior_separator_count {
@@ -7485,7 +7671,7 @@ fn update_agg_payload(
                 }
             }
             acc.exec_group_concat(arg)?;
-            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *count = count.checked_add(1).or_overflow()?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -7502,6 +7688,11 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
+            // SQLite skips rows whose object label is SQL NULL. A NULL value is
+            // still encoded as JSON null, so only the key is filtered here.
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
@@ -7570,6 +7761,10 @@ fn update_agg_payload(
     }
     Ok(())
 }
+
+/// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
+/// strategy, but it works well for now.
+const SPARE_AGG_PAYLOADS: usize = 8;
 
 /// Convert the intermediate aggregate state in `payload` into the final result value.
 ///
@@ -7715,12 +7910,20 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject => {
             let data = payload[0].to_blob().expect("Should be blob");
-            json_from_raw_bytes_agg(data, false)?
+            if data.is_empty() {
+                Value::Text(Text::json("{}".to_string()))
+            } else {
+                json_from_raw_bytes_agg(data, false)?
+            }
         }
         #[cfg(feature = "json")]
         AggFunc::JsonbGroupObject => {
             let data = payload[0].to_blob().expect("Should be blob");
-            json_from_raw_bytes_agg(data, true)?
+            if data.is_empty() {
+                Value::Blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())
+            } else {
+                json_from_raw_bytes_agg(data, true)?
+            }
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray => {
@@ -7996,7 +8199,7 @@ fn op_window_step(
             let Value::Numeric(Numeric::Integer(step)) = &payload[1] else {
                 unreachable!("nth_value step count must be Integer");
             };
-            let step = step.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            let step = step.checked_add(1).or_overflow()?;
             payload[1] = Value::from_i64(step);
             if step == n {
                 payload[0].try_clone_from(arg_slot.get_value())?;
@@ -8621,7 +8824,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let expected_separator_bytes = old_count
                 .saturating_sub(1)
                 .checked_mul(std::mem::size_of::<i64>())
-                .ok_or(LimboError::IntegerOverflow)?;
+                .or_overflow()?;
             if !separator_lengths.is_empty() && separator_lengths.len() != expected_separator_bytes
             {
                 return Err(LimboError::InternalError(format!(
@@ -8653,9 +8856,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             } else {
                 0
             };
-            let remove_len = value_len
-                .checked_add(separator_len)
-                .ok_or(LimboError::IntegerOverflow)?;
+            let remove_len = value_len.checked_add(separator_len).or_overflow()?;
             let Value::Text(text) = acc else {
                 unreachable!("GroupConcat accumulator is Text after a non-NULL xStep");
             };
@@ -8709,7 +8910,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             for _ in 0..element_count {
                 end = end
                     .checked_add(raw_jsonb_element_len(data, end)?)
-                    .ok_or(LimboError::IntegerOverflow)?;
+                    .or_overflow()?;
             }
             data.drain(1..end);
         }
@@ -8724,32 +8925,110 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
-    // Fast paths for the common integer cases of sum and min/max over
-    // an initialized accumulator. The slow path keeps every other function
-    // and value type, the first-row initialization and the error cases.
+    // Fast paths for the common numeric cases of count, sum, avg and min/max
+    // over an initialized accumulator. The slow path keeps every other
+    // function and value type, the first-row initialization and the error
+    // cases.
     if let AccumulatorFunc::Agg(agg) = &data.func {
         match agg {
             AggFunc::Sum | AggFunc::Total => {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
+                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
                     if let Register::Aggregate(AggContext::Builtin(payload)) =
                         &mut state.registers[data.acc_reg]
                     {
-                        // Integer total so far, no float seen (payload[2] is the
-                        // approx flag), and neither the total nor the row count
-                        // overflows: the same result as the generic step.
-                        if let [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..] =
+                        // payload[2] is the approx flag and payload[3] the overflow flag.
+                        match (arg, payload.as_mut_slice()) {
+                            (
+                                Numeric::Integer(arg),
+                                [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..],
+                            ) => {
+                                if let (Some(sum), Some(rows)) =
+                                    (acc.checked_add(arg), count.checked_add(1))
+                                {
+                                    *acc = sum;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            (
+                                Numeric::Float(arg),
+                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
+                            ) => {
+                                if let (Some((sum, err)), Some(rows)) = (
+                                    kbn_step_finite(*acc, *r_err, f64::from(arg)),
+                                    count.checked_add(1),
+                                ) {
+                                    *acc = sum;
+                                    *r_err = err;
+                                    *ovrfl = 0;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            (
+                                Numeric::Integer(arg),
+                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
+                            ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
+                                if let (Some((sum, err)), Some(rows)) = (
+                                    kbn_step_finite(*acc, *r_err, arg as f64),
+                                    count.checked_add(1),
+                                ) {
+                                    *acc = sum;
+                                    *r_err = err;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            AggFunc::Avg => {
+                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
+                    let arg = match arg {
+                        Numeric::Float(f) => Some(f64::from(f)),
+                        Numeric::Integer(i) if i.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
+                            Some(i as f64)
+                        }
+                        Numeric::Integer(_) => None,
+                    };
+                    if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
+                        (arg, &mut state.registers[data.acc_reg])
+                    {
+                        if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
                             payload.as_mut_slice()
                         {
-                            if let (Some(sum), Some(rows)) =
-                                (acc.checked_add(arg), count.checked_add(1))
+                            if let (Some((sum, err)), Some(rows)) =
+                                (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
                             {
                                 *acc = sum;
+                                *r_err = err;
                                 *count = rows;
                                 state.pc += 1;
                                 return Ok(InsnFunctionStepResult::Step);
                             }
+                        }
+                    }
+                }
+            }
+            AggFunc::Count | AggFunc::Count0 => {
+                let counts = matches!(agg, AggFunc::Count0)
+                    || matches!(
+                        state.registers[data.col],
+                        Register::Value(Value::Numeric(_))
+                    );
+                if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
+                    (counts, &mut state.registers[data.acc_reg])
+                {
+                    if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
+                        if let Some(rows) = count.checked_add(1) {
+                            *count = rows;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
                         }
                     }
                 }
@@ -8799,37 +9078,45 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        return_if_io!(
+            state,
+            ext_func.step_aggregate(&mut state.registers, *acc_reg, *col)
+        );
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
-        state.registers[*acc_reg] = match func {
-            AggFunc::External(ext_func) => match ext_func.as_ref() {
-                ExtFunc::Aggregate {
-                    context,
-                    init,
-                    step,
-                    finalize,
-                    argc,
-                    aggregate_destructor,
-                    value_destructor,
-                    ..
-                } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    context: *context,
-                    state: unsafe { (init)(*context) },
-                    argc: (*argc).max(0) as usize,
-                    step_fn: *step,
-                    finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
-                    value_destructor: *value_destructor,
-                })),
-                _ => unreachable!("scalar function called in aggregate context"),
-            },
-            _ => {
-                // Built-in aggregates use flat payload
-                let mut payload = crate::alloc::vec![];
+        // Fast path for the first row of a COUNT group
+        if let AggFunc::Count | AggFunc::Count0 = func {
+            let counts = match (func, &state.registers[*col]) {
+                (AggFunc::Count0, _) => Some(true),
+                (_, Register::Value(Value::Null)) => Some(false),
+                (_, Register::Value(_) | Register::Record(_)) => Some(true),
+                (_, Register::Aggregate(_)) => None,
+            };
+            if let Some(counts) = counts {
+                let mut payload = state
+                    .spare_agg_payloads
+                    .pop()
+                    .unwrap_or_else(|| crate::alloc::vec![]);
                 init_agg_payload(func, &mut payload)?;
-                Register::Aggregate(AggContext::Builtin(payload))
+                if counts {
+                    payload[0] = Value::from_i64(1);
+                }
+                state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
-        };
+        }
+        let mut payload = state
+            .spare_agg_payloads
+            .pop()
+            .unwrap_or_else(|| crate::alloc::vec![]);
+        init_agg_payload(func, &mut payload)?;
+        state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
     let current_collation = collation.unwrap_or(CollationSeq::Binary);
@@ -8848,52 +9135,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     // Step the aggregate
     match func {
         AggFunc::External(_) => {
-            // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
-                let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
-                    unreachable!();
-                };
-                let AggContext::External(agg_state) = agg else {
-                    unreachable!();
-                };
-                (
-                    agg_state.context,
-                    agg_state.step_fn,
-                    agg_state.state,
-                    agg_state.argc,
-                    agg_state.aggregate_destructor,
-                    agg_state.value_destructor,
-                )
-            };
-            let mut ext_values = Vec::with_capacity(argc);
-            if argc != 0 {
-                let register_slice = &state.registers[*col..*col + argc];
-                for ov in register_slice.iter() {
-                    ext_values.push(ov.get_value().to_ffi());
-                }
-            }
-            let argv_ptr = if ext_values.is_empty() {
-                std::ptr::null()
-            } else {
-                ext_values.as_ptr()
-            };
-            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
-            let value = Value::from_ffi_ref(&result);
-            if let Some(value_destructor) = value_destructor {
-                unsafe { value_destructor(&mut result) };
-            } else {
-                unsafe { result.__free_internal_type() };
-            }
-            for ext_value in ext_values {
-                unsafe { ext_value.__free_internal_type() };
-            }
-            if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
-                state.registers[*acc_reg].set_value(Value::Null);
-                return Err(err.into());
-            }
+            unreachable!("extension aggregates are stepped above")
         }
         _ => {
             let maybe_arg2 = match func {
@@ -8944,6 +9186,19 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Adds `value` to a float total and its error term like [apply_kbn_step], or
+/// returns `None` when the result is not finite and the generic step must run.
+#[inline]
+fn kbn_step_finite(sum: NonNan, r_err: NonNan, value: f64) -> Option<(NonNan, NonNan)> {
+    let s = f64::from(sum);
+    let t = s + value;
+    if !t.is_finite() {
+        return None;
+    }
+    let err = f64::from(r_err) + kbn_correction(s, value, t);
+    Some((NonNan::new(t)?, NonNan::new(err)?))
+}
+
 pub fn op_agg_final(
     _program: &Program,
     state: &mut ProgramState,
@@ -8965,19 +9220,44 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        let value = return_if_io!(
+            state,
+            ext_func.finalize_aggregate(&mut state.registers[acc_reg])
+        );
+        state.registers[dest_reg].set_value(value);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
-                AggContext::External(_) => {
-                    // External aggregates use FFI finalization
-                    agg.compute_external()?
+                AggContext::External(_) | AggContext::Native(_) => {
+                    unreachable!("external aggregates are finalized above")
                 }
-                AggContext::Builtin(payload) => {
-                    // Built-in aggregates use shared finalization
-                    finalize_agg_payload(func, payload)?
-                }
+                AggContext::Builtin(payload) => match func {
+                    AggFunc::Count | AggFunc::Count0 => {
+                        let [Value::Numeric(Numeric::Integer(count))] = payload.as_slice() else {
+                            unreachable!("COUNT payload must contain one integer");
+                        };
+                        Value::from_i64(*count)
+                    }
+                    _ => finalize_agg_payload(func, payload)?,
+                },
             };
-            state.registers[dest_reg].set_value(value);
+            if acc_reg == dest_reg {
+                let accumulator =
+                    std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
+                if let Register::Aggregate(AggContext::Builtin(mut payload)) = accumulator {
+                    if state.spare_agg_payloads.len() < SPARE_AGG_PAYLOADS {
+                        payload.clear();
+                        state.spare_agg_payloads.push(payload);
+                    }
+                }
+            } else {
+                state.registers[dest_reg].set_value(value);
+            }
         }
         Register::Value(Value::Null) => {
             // No row was stepped: write the empty-set default explicitly.
@@ -9009,32 +9289,8 @@ pub fn op_agg_final(
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
-                AggFunc::External(ext_func) => {
-                    let value = match ext_func.as_ref() {
-                        ExtFunc::Aggregate {
-                            context,
-                            init,
-                            finalize,
-                            aggregate_destructor,
-                            value_destructor,
-                            ..
-                        } => {
-                            let aggregate_context = unsafe { init(*context) };
-                            let mut result = unsafe { finalize(*context, aggregate_context) };
-                            let value = Value::from_ffi_ref(&result);
-                            if let Some(value_destructor) = value_destructor {
-                                unsafe { value_destructor(&mut result) };
-                            } else {
-                                unsafe { result.__free_internal_type() };
-                            }
-                            if let Some(aggregate_destructor) = aggregate_destructor {
-                                unsafe { aggregate_destructor(aggregate_context as usize) };
-                            }
-                            value?
-                        }
-                        _ => unreachable!("scalar function called in aggregate context"),
-                    };
-                    state.registers[dest_reg].set_value(value);
+                AggFunc::External(_) => {
+                    unreachable!("extension aggregates are finalized above")
                 }
                 _ => {
                     state.registers[dest_reg].set_value(Value::Null);
@@ -9067,7 +9323,7 @@ pub fn op_sorter_open(
     let page_size = match pager.with_header(|header| header.page_size) {
         Ok(IOResult::Done(page_size)) => page_size,
         Err(_) => PageSize::default(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
     };
     let page_size = page_size.get() as usize;
 
@@ -9192,7 +9448,7 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        return_if_io!(cursor.insert(record));
+        return_if_io!(state, cursor.insert(record));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9216,7 +9472,7 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            return_if_io!(cursor.sort());
+            return_if_io!(state, cursor.sort());
         }
         (is_empty, !is_empty)
     };
@@ -9250,7 +9506,7 @@ pub fn op_sorter_next(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        return_if_io!(cursor.next());
+        return_if_io!(state, cursor.next());
         cursor.has_more()
     };
     if has_more {
@@ -9656,76 +9912,58 @@ pub fn op_function(
                 )?);
             }
             JsonFunc::JsonRemove => {
-                if let Ok(json) = json_remove(
+                let json = json_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbRemove => {
-                if let Ok(json) = jsonb_remove(
+                let json = jsonb_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_replace(
+                let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_replace(
+                let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_insert(
+                let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_insert(
+                let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonPretty => {
                 let json_value = &state.registers[*start_reg];
@@ -9927,25 +10165,13 @@ pub fn op_function(
                     if is_null_result {
                         state.registers[*dest].set_null();
                     } else {
-                        // 3. Prepare Pattern and Text
-                        let pattern_cow = match pattern_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT")? {
-                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                _ => unreachable!("Cast to TEXT should yield Text"),
-                            },
+                        // 3. and 4. Prepare Pattern and Text, then execute Like.
+                        let matches = match (pattern_value, match_value) {
+                            (Value::Text(pattern), Value::Text(text)) => {
+                                Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
+                            }
+                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
                         };
-
-                        let match_cow = match match_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT")? {
-                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                _ => unreachable!("Cast to TEXT should yield Text"),
-                            },
-                        };
-
-                        // 4. Execute Like
-                        let matches = Value::exec_like(&pattern_cow, &match_cow, escape_char)?;
                         state.registers[*dest].set_int(matches as i64);
                     }
                 }
@@ -10080,7 +10306,13 @@ pub fn op_function(
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
                 };
-                state.registers[*dest].set_value(result.unwrap_or(Value::Null));
+                // this is a `match` instead of `unwrap_or_else` because on the current pinned
+                // toolchain, it compiles to fewer instructions
+                let value = match result {
+                    Some(value) => value,
+                    None => Value::Null,
+                };
+                state.registers[*dest].set_value(value);
             }
             ScalarFunc::Hex => {
                 let reg_value = state.registers[*start_reg].borrow_mut();
@@ -10211,13 +10443,13 @@ pub fn op_function(
             ScalarFunc::Date => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_date(values);
+                let result = exec_date(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_time(values);
+                let result = exec_time(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
@@ -10227,7 +10459,8 @@ pub fn op_function(
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff([start, end]);
+                    let result =
+                        crate::functions::datetime::exec_timediff(pager.io.as_ref(), [start, end]);
 
                     state.registers[*dest].set_value(result);
                 }
@@ -10240,19 +10473,19 @@ pub fn op_function(
             ScalarFunc::DateTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_datetime_full(values);
+                let result = exec_datetime_full(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_julianday(values);
+                let result = exec_julianday(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_unixepoch(values);
+                let result = exec_unixepoch(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
@@ -10260,8 +10493,8 @@ pub fn op_function(
                     state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
                 } else {
                     let version_integer =
-                        return_if_io!(pager.with_header(|header| header.version_number)).get()
-                            as i64;
+                        return_if_io!(state, pager.with_header(|header| header.version_number))
+                            .get() as i64;
                     let version = execute_turso_version(version_integer);
                     state.registers[*dest].set_text(Text::new(version))?;
                 }
@@ -10302,7 +10535,7 @@ pub fn op_function(
             ScalarFunc::StrfTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_strftime(values);
+                let result = exec_strftime(pager.io.as_ref(), values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
@@ -10316,7 +10549,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 {
@@ -10370,7 +10604,8 @@ pub fn op_function(
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 #[cfg(feature = "json")]
                 'outer: {
@@ -10463,11 +10698,14 @@ pub fn op_function(
                     .into());
                 };
 
-                return_if_io!(program.connection.attach_database(
-                    filename_str.as_str(),
-                    dbname_str.as_str(),
-                    state.active_op_state.attach(),
-                ));
+                return_if_io!(
+                    state,
+                    program.connection.attach_database(
+                        filename_str.as_str(),
+                        dbname_str.as_str(),
+                        state.active_op_state.attach(),
+                    )
+                );
                 // Sequence descriptors for the attached database are
                 // loaded lazily by `maybe_reparse_schema` on the next
                 // statement (ATTACH bumps the schema cookie, so the
@@ -10965,6 +11203,17 @@ pub fn op_function(
                     }
                 };
             }
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+                check_arg_count!(arg_count, 2);
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let result = match scalar_func {
+                    ScalarFunc::DatePlus => exec_date_plus(pager.io.as_ref(), lhs, rhs)?,
+                    ScalarFunc::DateMinus => exec_date_minus(pager.io.as_ref(), lhs, rhs)?,
+                    _ => unreachable!(),
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();
@@ -11136,48 +11385,17 @@ pub fn op_function(
                 }
             }
         }
-        crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar {
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-                ..
-            } => {
-                let mut ext_values = Vec::with_capacity(arg_count);
-                if arg_count != 0 {
-                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    for ov in register_slice.iter() {
-                        ext_values.push(ov.get_value().to_ffi());
-                    }
-                }
-                let argv_ptr = if ext_values.is_empty() {
-                    std::ptr::null()
-                } else {
-                    ext_values.as_ptr()
-                };
-                let mut result = unsafe {
-                    callback(
-                        context,
-                        arg_count as i32,
-                        argv_ptr,
-                        context_destructor,
-                        value_destructor,
-                    )
-                };
-                let value = Value::from_ffi_ref(&result);
-                if let Some(value_destructor) = value_destructor {
-                    unsafe { value_destructor(&mut result) };
-                } else {
-                    unsafe { result.__free_internal_type() };
-                }
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
-                }
-                state.registers[*dest].set_value(value?);
-            }
-            _ => unreachable!("aggregate called in scalar context"),
-        },
+        crate::function::Func::External(f) => {
+            let value = return_if_io!(
+                state,
+                f.func.call_scalar(
+                    &mut state.extension_state,
+                    &program.connection,
+                    &state.registers[*start_reg..*start_reg + arg_count],
+                )
+            );
+            state.registers[*dest].set_value(value);
+        }
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {
@@ -11701,17 +11919,11 @@ pub fn op_function(
                                                 ..
                                             } => {
                                                 for col in pk_cols {
-                                                    let (ast::Expr::Name(ref name)
-                                                    | ast::Expr::Id(ref name)) = *col.expr
-                                                    else {
-                                                        return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()).into());
-                                                    };
-                                                    if normalize_ident(name.as_str()) == rename_from
-                                                    {
-                                                        *col.expr = ast::Expr::Name(Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        ));
-                                                    }
+                                                    rename_identifiers(
+                                                        col.expr.as_mut(),
+                                                        &rename_from,
+                                                        column_def.col_name.as_str(),
+                                                    );
                                                 }
                                             }
                                             ast::TableConstraint::Unique {
@@ -11719,17 +11931,11 @@ pub fn op_function(
                                                 ..
                                             } => {
                                                 for col in uniq_cols {
-                                                    let (ast::Expr::Name(ref name)
-                                                    | ast::Expr::Id(ref name)) = *col.expr
-                                                    else {
-                                                        return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()).into());
-                                                    };
-                                                    if normalize_ident(name.as_str()) == rename_from
-                                                    {
-                                                        *col.expr = ast::Expr::Name(Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        ));
-                                                    }
+                                                    rename_identifiers(
+                                                        col.expr.as_mut(),
+                                                        &rename_from,
+                                                        column_def.col_name.as_str(),
+                                                    );
                                                 }
                                             }
                                             ast::TableConstraint::ForeignKey {
@@ -11869,51 +12075,13 @@ pub fn op_function(
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         crate::function::Func::Fts(fts_func) => {
-            // FTS functions are typically handled via index method pattern matching.
-            // If we reach here, just return a fallback since no FTS index matched.
             use crate::function::FtsFunc;
             match fts_func {
-                FtsFunc::Score => {
-                    // Without an FTS index match, return 0.0 as a default score
-                    state.registers[*dest]
-                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
-                }
-                FtsFunc::Match => {
-                    // fts_match(col1, col2, ..., query): returns 1 if any column matches query
-                    // Minimum: fts_match(text, query) = 2 args
-                    if arg_count < 2 {
-                        return Err(LimboError::InvalidArgument(
-                            "fts_match requires at least 2 arguments: text, query".to_string(),
-                        )
-                        .into());
-                    }
-
-                    // Last arg is the query, first N-1 args are text columns
-                    let num_text_cols = arg_count - 1;
-                    let query = state.registers[*start_reg + num_text_cols].get_value();
-
-                    if matches!(query, Value::Null) {
-                        state.registers[*dest].set_int(0);
-                    } else {
-                        let query_str = query.to_string();
-
-                        // Concatenate all text columns with space separator
-                        let est_len = 16;
-                        let mut combined_text = String::with_capacity(num_text_cols * est_len);
-                        for i in 0..num_text_cols {
-                            let text = state.registers[*start_reg + i].get_value();
-                            if !matches!(text, Value::Null) {
-                                if !combined_text.is_empty() {
-                                    combined_text.push(' ');
-                                }
-                                combined_text.push_str(&text.to_string());
-                            }
-                        }
-
-                        let matches =
-                            crate::index_method::fts::fts_match(&combined_text, &query_str);
-                        state.registers[*dest].set_int(matches.into());
-                    }
+                FtsFunc::Score | FtsFunc::Match => {
+                    return Err(LimboError::InternalError(
+                        "unplanned FTS function reached execution".to_string(),
+                    )
+                    .into());
                 }
                 FtsFunc::Highlight => {
                     // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
@@ -11979,6 +12147,30 @@ pub fn op_function(
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+
+/// LIKE with an operand that is not TEXT: both are converted to TEXT first.
+#[inline(never)]
+fn exec_like_converted(
+    pattern_value: &Value,
+    match_value: &Value,
+    escape_char: Option<char>,
+) -> Result<bool> {
+    let pattern_cow = match pattern_value {
+        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        v => match v.exec_cast("TEXT")? {
+            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+            _ => unreachable!("Cast to TEXT should yield Text"),
+        },
+    };
+    let match_cow = match match_value {
+        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        v => match v.exec_cast("TEXT")? {
+            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+            _ => unreachable!("Cast to TEXT should yield Text"),
+        },
+    };
+    Value::exec_like(&pattern_cow, &match_cow, escape_char)
+}
 
 pub fn op_sequence(
     _program: &Program,
@@ -12134,6 +12326,7 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
+    pub has_dependent_views: bool,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
@@ -12194,6 +12387,7 @@ pub fn op_insert(
                         .get_dependent_materialized_views(table_name)
                         .is_empty()
                 };
+                state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
@@ -12233,14 +12427,9 @@ pub fn op_insert(
                     is_without_rowid,
                     SeekOp::GE { eq_only: true },
                 )? {
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(state.suspend_on_io(io));
                 }
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_dependent_views = state.active_op_state.insert().has_dependent_views;
                 let needs_capture =
                     has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
@@ -12267,10 +12456,10 @@ pub fn op_insert(
 
                 let cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_btree_mut();
-                let maybe_key = return_if_io!(cursor.rowid());
+                let maybe_key = return_if_io!(state, cursor.rowid());
                 let old_record = if let Some(key) = maybe_key {
                     if key == insert_key {
-                        let maybe_record = return_if_io!(cursor.record());
+                        let maybe_record = return_if_io!(state, cursor.record());
                         if let Some(record) = maybe_record {
                             let mut values = record.get_values_owned()?;
                             let schema = program.connection.schema.read();
@@ -12309,26 +12498,21 @@ pub fn op_insert(
                 // The noop check is fundamentally incompatible with the MVCC
                 // Delete+Insert update pattern.
                 state.active_op_state.insert().is_noop_update = false;
-                let is_mvcc = {
-                    let cursor_ref = get_cursor!(state, *cursor_id);
-                    cursor_ref.as_btree_mut().is_mvcc()
-                };
-                let has_rowid = {
-                    let cursor = get_cursor!(state, *cursor_id);
-                    cursor.as_btree_mut().has_rowid()
-                };
-                if !is_mvcc
-                    && has_rowid
-                    && flag.has(InsertFlags::SKIP_LAST_ROWID)
+                let may_be_noop_update = flag.has(InsertFlags::SKIP_LAST_ROWID)
                     && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
-                {
+                    && {
+                        let cursor = get_cursor!(state, *cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        !cursor.is_mvcc() && cursor.has_rowid()
+                    };
+                if may_be_noop_update {
                     let key = match &state.registers[*key_reg].get_value() {
                         Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => unreachable!("expected integer key"),
                     };
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    let existing_key = return_if_io!(cursor.rowid());
+                    let existing_key = return_if_io!(state, cursor.rowid());
                     if existing_key == Some(key) {
                         let record = match &state.registers[*record_reg] {
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
@@ -12341,8 +12525,8 @@ pub fn op_insert(
                                 unreachable!("Cannot insert an aggregate value.")
                             }
                         };
-                        let existing_record = return_if_io!(cursor.record());
-                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                        let existing_payload = return_if_io!(state, cursor.record_payload());
+                        if existing_payload.is_some_and(|p| p == record.as_ref().get_payload()) {
                             state.active_op_state.insert().is_noop_update = true;
                         }
                     }
@@ -12370,9 +12554,13 @@ pub fn op_insert(
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => unreachable!("expected integer key"),
                         };
-                        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                        return_if_io!(
+                            state,
+                            cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record)))
+                        );
                     } else {
                         return_if_io!(
+                            state,
                             cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
                         );
                     }
@@ -12407,21 +12595,18 @@ pub fn op_insert(
                     cursor.has_rowid()
                 };
                 if has_rowid {
-                    let maybe_rowid = {
-                        let cursor = state.get_cursor(*cursor_id);
-                        let cursor = cursor.as_btree_mut();
-                        return_if_io!(cursor.rowid())
-                    };
-                    if let Some(rowid) = maybe_rowid {
-                        if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
-                            program.connection.update_last_rowid(rowid);
-                        }
-                        if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
-                            if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
-                                state.record_total_change();
-                            } else {
-                                state.record_statement_change();
-                            }
+                    if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                        let rowid = match &state.registers[*key_reg].get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => unreachable!("expected integer key"),
+                        };
+                        program.connection.update_last_rowid(rowid);
+                    }
+                    if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
+                        if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
+                            state.record_total_change();
+                        } else {
+                            state.record_statement_change();
                         }
                     }
                 } else if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
@@ -12431,9 +12616,7 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if !dependent_views.is_empty() {
+                if state.active_op_state.insert().has_dependent_views {
                     if !has_rowid {
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
@@ -12576,12 +12759,12 @@ pub fn op_delete(
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     // Get the current key
-                    let maybe_key = return_if_io!(cursor.rowid());
+                    let maybe_key = return_if_io!(state, cursor.rowid());
                     let key = maybe_key.ok_or_else(|| {
                         LimboError::InternalError("Cannot delete: no current row".to_string())
                     })?;
                     // Get the current record before deletion and extract values
-                    let maybe_record = return_if_io!(cursor.record());
+                    let maybe_record = return_if_io!(state, cursor.record());
                     if let Some(record) = maybe_record {
                         let mut values = record.get_values_owned()?;
 
@@ -12606,7 +12789,7 @@ pub fn op_delete(
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.delete());
+                    return_if_io!(state, cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
@@ -12670,7 +12853,10 @@ pub fn op_idx_delete(
     );
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
-        return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
+        return_if_io!(
+            state,
+            cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs])
+        );
         state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -12702,7 +12888,7 @@ pub fn op_idx_delete(
                 ) {
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Ok(SeekInternalResult::IO(io)) => return Ok(state.suspend_on_io(io)),
                     Err(e) => return Err(e.into()),
                 };
 
@@ -12733,7 +12919,7 @@ pub fn op_idx_delete(
                 let rowid = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.rowid())
+                    return_if_io!(state, cursor.rowid())
                 };
 
                 if rowid.is_none() && *raise_error_if_no_matching_entry {
@@ -12750,7 +12936,7 @@ pub fn op_idx_delete(
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.delete());
+                    return_if_io!(state, cursor.delete());
                 }
                 // Increment metrics for index write (delete is a write operation)
                 state.record_rows_written(1);
@@ -12803,7 +12989,10 @@ pub fn op_idx_insert(
             )
             .into());
         };
-        return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
+        return_if_io!(
+            state,
+            cursor.insert(&state.registers[start..start + count as usize])
+        );
         state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -12859,16 +13048,14 @@ pub fn op_idx_insert(
                     *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
                     Ok(InsnFunctionStepResult::Step)
                 }
-                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+                SeekInternalResult::IO(io) => Ok(state.suspend_on_io(io)),
             }
         }
         OpIdxInsertState::UniqueConstraintCheck => {
             let ignore_conflict = 'i: {
-                let cursor = get_cursor!(state, cursor_id);
-                let cursor = cursor.as_btree_mut();
+                let (cursor, index_info) = get_cursor!(state, cursor_id).as_index_cursor_mut();
                 let has_rowid = cursor.has_rowid();
-                let index_info = cursor.get_index_info().clone();
-                let record_opt = return_if_io!(cursor.record());
+                let record_opt = return_if_io!(state, cursor.record());
                 let Some(record) = record_opt.as_ref() else {
                     // Cursor not pointing at a record — table is empty or past last
                     break 'i false;
@@ -12915,6 +13102,7 @@ pub fn op_idx_insert(
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
                 return_if_io!(
+                    state,
                     cursor.insert(&BTreeKey::new_index_key(record_to_insert.as_record_ref()))
                 );
             }
@@ -12992,15 +13180,15 @@ fn new_rowid_inner(
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
-    let mv_store = program.connection.mv_store();
+    let has_mv_store = state.mv_store(&program.connection).is_some();
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        match return_if_io!(mvcc_cursor.start_new_rowid()) {
+                        match return_if_io!(state, mvcc_cursor.start_new_rowid()) {
                             NextRowidResult::Uninitialized => {
                                 *state.active_op_state.new_rowid() =
                                     OpNewRowidState::SeekingToLast {
@@ -13053,7 +13241,7 @@ fn new_rowid_inner(
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.seek_to_last());
+                    return_if_io!(state, cursor.seek_to_last());
                 }
                 if mvcc_already_initialized {
                     *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
@@ -13066,10 +13254,10 @@ fn new_rowid_inner(
                 let current_max = {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.rowid())
+                    return_if_io!(state, cursor.rowid())
                 };
 
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13125,7 +13313,7 @@ fn new_rowid_inner(
 
             OpNewRowidState::GeneratingRandom { attempts } => {
                 if attempts >= MAX_ATTEMPTS {
-                    return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()).into());
+                    return Err(LimboError::DatabaseFull.into());
                 }
 
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
@@ -13148,9 +13336,10 @@ fn new_rowid_inner(
                 let exists = {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    let seek_result =
-                        return_if_io!(cursor
-                            .seek(SeekKey::TableRowId(candidate), SeekOp::GE { eq_only: true }));
+                    let seek_result = return_if_io!(
+                        state,
+                        cursor.seek(SeekKey::TableRowId(candidate), SeekOp::GE { eq_only: true })
+                    );
                     matches!(seek_result, SeekResult::Found)
                 };
 
@@ -13160,7 +13349,7 @@ fn new_rowid_inner(
                     state.active_op_state.clear();
                     state.pc += 1;
 
-                    if mv_store.is_some() {
+                    if has_mv_store {
                         let cursor = state.get_cursor(*cursor);
                         let cursor = cursor.as_btree_mut() as &mut dyn Any;
                         if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13180,12 +13369,12 @@ fn new_rowid_inner(
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.next());
+                    return_if_io!(state, cursor.next());
                 }
                 state.active_op_state.clear();
                 state.pc += 1;
 
-                if mv_store.is_some() {
+                if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -13199,7 +13388,19 @@ fn new_rowid_inner(
     }
 }
 
+#[inline]
 fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
+    if matches!(
+        state.registers[reg].get_value(),
+        Value::Numeric(Numeric::Integer(_))
+    ) {
+        return true;
+    }
+    convert_register_to_integer(state, reg)
+}
+
+#[inline(never)]
+fn convert_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
     let converted = match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => return true,
         Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
@@ -13337,7 +13538,7 @@ pub fn op_no_conflict(
                         state.active_op_state.clear();
                         Ok(InsnFunctionStepResult::Step)
                     }
-                    SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+                    SeekInternalResult::IO(io) => Ok(state.suspend_on_io(io)),
                 };
             }
         }
@@ -13360,7 +13561,10 @@ pub fn op_not_exists(
     );
     let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
     let cursor = cursor.as_btree_mut();
-    let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
+    let exists = return_if_io!(
+        state,
+        cursor.exists(state.registers[*rowid_reg].get_value())
+    );
 
     if exists {
         state.pc += 1;
@@ -13453,7 +13657,7 @@ pub fn op_open_write(
             .as_mut()
             .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_write(&context));
+        return_if_io!(state, cursor.open_write(&context));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -13481,11 +13685,7 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            if !mv_store.is_exclusive_tx(&tx_id) {
-                return Err(LimboError::TxError(
-                    "DDL statements require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-                ).into());
-            }
+            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
         }
     }
 
@@ -13499,49 +13699,47 @@ pub fn op_open_write(
         _ => None,
     };
 
-    // Check if we can reuse the existing cursor
-    let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
-    {
-        // Reuse if the root_page matches (same table/index)
-        btree_cursor.root_page() == root_page
-    } else {
-        false
+    // Reuse the existing cursor if the root_page matches (same table/index)
+    let can_reuse_cursor = match cursors.get(*cursor_id) {
+        Some(Some(Cursor::BTree(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
+        Some(Some(Cursor::Dyn(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
+        _ => false,
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
-         -> Result<Box<dyn CursorTrait>> {
+         -> Result<OpenedBTree> {
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                 let mv_store = mv_store
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(Box::new(MvCursor::new(
+                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store,
                     &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
                     btree_cursor,
-                )?))
+                )?)))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
                 ))
             } else {
-                Ok(btree_cursor)
+                Ok(OpenedBTree::Plain(btree_cursor))
             }
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
             let btree_cursor = btree_cursor_with_yield_context(
-                Box::new(BTreeCursor::new_index(
+                BTreeCursor::new_index_boxed(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     index.as_ref(),
                     num_columns,
-                )?),
+                )?,
                 &program.connection,
             );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
@@ -13554,7 +13752,7 @@ pub fn op_open_write(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         } else {
             if matches!(cursor_type, CursorType::BTreeTable(table_rc) if !table_rc.has_rowid)
                 && program.connection.get_mv_tx_id_for_db(*db).is_some()
@@ -13572,7 +13770,7 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
+            let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
                         Box::new(BTreeCursor::new_without_rowid_table(
@@ -13597,7 +13795,7 @@ pub fn op_open_write(
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
     }
     state.pc += 1;
@@ -13618,18 +13816,46 @@ pub fn op_copy(
         },
         insn
     );
-    for i in 0..=*extra_amount {
-        let (src, dst) = (*src_reg + i, *dst_reg + i);
-        if src == dst {
-            continue;
+    if *extra_amount == 0 {
+        copy_one_register(&mut state.registers, *src_reg, *dst_reg)?;
+    } else {
+        for i in 0..=*extra_amount {
+            copy_one_register(&mut state.registers, *src_reg + i, *dst_reg + i)?;
         }
-        // try_clone_from reuses the destination register's allocation.
-        let [src, dst] = state
-            .registers
+    }
+
+    #[inline]
+    fn copy_one_register(
+        registers: &mut [Register],
+        src: usize,
+        dst: usize,
+    ) -> Result<(), Box<LimboError>> {
+        if src == dst {
+            return Ok(());
+        }
+        if let Some(value) = heapless_value(&registers[src]) {
+            match &mut registers[dst] {
+                Register::Value(dst @ (Value::Null | Value::Numeric(_))) => *dst = value,
+                dst => *dst = Register::Value(value),
+            }
+            return Ok(());
+        }
+        let [src, dst] = registers
             .get_disjoint_mut([src, dst])
             .expect("Copy source and destination registers are distinct");
         dst.try_clone_from(src)?;
+        Ok(())
     }
+
+    #[inline]
+    fn heapless_value(src: &Register) -> Option<Value> {
+        match src {
+            Register::Value(Value::Numeric(n)) => Some(Value::Numeric(*n)),
+            Register::Value(Value::Null) => Some(Value::Null),
+            _ => None,
+        }
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13665,13 +13891,16 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
+        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+            mv_store.record_created_table_id(tx_id, root_page);
+        }
         state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     let pager = program.get_pager_from_database_index(db)?;
     // FIXME: handle page cache is full
-    let root_page = return_if_io!(pager.btree_create(flags));
+    let root_page = return_if_io!(state, pager.btree_create(flags));
     state.registers[*root].set_int(root_page as i64);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13705,7 +13934,7 @@ pub fn op_index_method_create(
         .as_mut()
         .expect("cursor should exist")
         .as_index_method_mut();
-    return_if_io!(cursor.create(&context));
+    return_if_io!(state, cursor.create(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13737,7 +13966,7 @@ pub fn op_index_method_destroy(
         .as_mut()
         .expect("cursor should exist")
         .as_index_method_mut();
-    return_if_io!(cursor.destroy(&context));
+    return_if_io!(state, cursor.destroy(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13769,7 +13998,7 @@ pub fn op_index_method_optimize(
         .as_mut()
         .expect("cursor should exist")
         .as_index_method_mut();
-    return_if_io!(cursor.optimize(&context));
+    return_if_io!(state, cursor.optimize(&context));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13795,8 +14024,10 @@ pub fn op_index_method_query(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    let has_rows =
-        return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    let has_rows = return_if_io!(
+        state,
+        cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg])
+    );
     if !has_rows {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -13857,7 +14088,8 @@ pub fn op_destroy(
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
             OpDestroyState::DestroyBtree(ref mut cursor) => {
-                let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
+                let destroyed = cursor.write().btree_destroy();
+                let maybe_former_root_page = return_if_io!(state, destroyed);
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
                 state.active_op_state.clear();
@@ -13897,7 +14129,7 @@ fn op_clear_btree_inner(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(ClearBtree { db, root }, insn);
+    load_insn!(ClearBtree { db, root, count }, insn);
 
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
@@ -13916,19 +14148,35 @@ fn op_clear_btree_inner(
     loop {
         match state.active_op_state.clear_btree() {
             OpClearBtreeState::CreateCursor => {
-                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
+                let cursor = Arc::new(RwLock::new(BTreeCursor::new(clear_pager.clone(), *root, 0)));
+                cursor.read().register_with_pager();
                 *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
                     pager: clear_pager.clone(),
-                    cursor: Arc::new(RwLock::new(cursor)),
+                    cursor,
                 };
             }
             OpClearBtreeState::ClearBtree { pager, cursor } => {
-                return_if_io!(cursor.write().clear_btree());
+                let cleared = cursor.write().clear_btree();
+                let removed_entries = return_if_io!(state, cleared);
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(ref mut btree_cursor) = other_cursor_opt {
+                    if let Cursor::BTree(..) | Cursor::Dyn(..) = other_cursor_opt {
+                        let btree_cursor = other_cursor_opt.as_btree_mut();
                         if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
                             btree_cursor.invalidate_btree_cache();
                         }
+                    }
+                }
+                match count {
+                    ClearBtreeCount::Nothing => {}
+                    ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+                    ClearBtreeCount::ChangesAndRowsWritten => {
+                        let changes = i64::try_from(removed_entries).map_err(|_| {
+                            LimboError::InternalError(format!(
+                                "ClearBtree: removed row count {removed_entries} does not fit in i64"
+                            ))
+                        })?;
+                        state.record_statement_changes(changes);
+                        state.record_rows_written(removed_entries);
                     }
                 }
                 state.active_op_state.clear();
@@ -13956,7 +14204,7 @@ pub fn op_reset_sorter(
     match cursor_type {
         CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
             let cursor = cursor.as_btree_mut();
-            return_if_io!(cursor.clear_btree());
+            return_if_io!(state, cursor.clear_btree());
         }
         CursorType::Sorter => {
             return Err(LimboError::InternalError(
@@ -14103,7 +14351,22 @@ pub fn op_drop_sequence(
 ) -> InsnResult {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
+        // In MVCC mode, track the backing table's root page so integrity_check knows about it.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs
+        // to include them to avoid "page never used" false positives.
+        if is_mvcc {
+            let backing_table_name =
+                crate::translate::sequence::sequence_backing_table_name(seq_name);
+            let root_page = schema
+                .get_btree_table(&backing_table_name)
+                .expect("DROP SEQUENCE: backing table must exist in schema")
+                .root_page;
+            if root_page > 0 {
+                schema.dropped_root_pages.insert(root_page);
+            }
+        }
         schema.remove_sequence(seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
@@ -14141,7 +14404,8 @@ pub fn op_add_type(
 /// the next value is the existing value (the start has not yet been
 /// emitted). Otherwise the next value is `value + increment`, wrapping
 /// to the opposite bound when `cycle` is set, or returning
-/// `LimboError::DatabaseFull` on exhaustion.
+/// `LimboError::SequenceExhausted` on exhaustion (`DatabaseFull` for the
+/// implicit AUTOINCREMENT sequence).
 pub fn op_sequence_compute_next(
     program: &Program,
     state: &mut ProgramState,
@@ -14227,25 +14491,16 @@ pub fn op_sequence_compute_next(
                     .name
                     .starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
                 {
-                    // AUTOINCREMENT exhaustion uses SQLite's canonical
-                    // SQLITE_FULL "database or disk is full" message so
-                    // callers and tests don't have to know whether the
-                    // rowid came from a SERIAL-style implicit sequence
-                    // or any other autoinc path.
-                    return Err(crate::LimboError::DatabaseFull(
-                        "database or disk is full".to_string(),
-                    )
-                    .into());
+                    // AUTOINCREMENT exhaustion is SQLITE_FULL, as in SQLite,
+                    // so callers don't have to know whether the rowid came
+                    // from a SERIAL-style implicit sequence or any other
+                    // autoinc path.
+                    return Err(crate::LimboError::DatabaseFull.into());
                 } else {
-                    return Err(crate::LimboError::DatabaseFull(format!(
-                        "nextval: reached {} value of sequence \"{}\"",
-                        if seq.increment_by > 0 {
-                            "maximum"
-                        } else {
-                            "minimum"
-                        },
-                        seq.name
-                    ))
+                    return Err(crate::LimboError::SequenceExhausted {
+                        name: seq.name.clone(),
+                        ascending: seq.increment_by > 0,
+                    }
                     .into());
                 }
             } else {
@@ -14586,7 +14841,7 @@ pub fn op_sequence_begin_inner_tx(
 /// Commit the autonomous inner tx started by a paired
 /// `SequenceBeginInnerTx`. Multi-step. Drives the inner's
 /// `CommitStateMachine` one step per opcode call, yielding
-/// `InsnFunctionStepResult::IO(io)` to the VDBE driver when commit
+/// `InsnFunctionStepResult::IO` to the VDBE driver when commit
 /// state machine wants IO. Mirrors `op_auto_commit`'s drive of the
 /// outer commit's state machine.
 ///
@@ -14668,7 +14923,7 @@ pub fn op_sequence_commit_inner_tx(
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
 
     match commit_sm.step(&mv_store) {
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
         Ok(IOResult::Done(())) => {
             state.sequence_inner_commit = None;
             state.sequence_inner_tx_pending = None;
@@ -14769,7 +15024,7 @@ pub fn op_close(
                 ))
             })?
             .clone();
-        return_if_io!(cursor.stage_statement_commit(&context));
+        return_if_io!(state, cursor.stage_statement_commit(&context));
         let Some(Cursor::IndexMethod(cursor)) = state.cursors[*cursor_id].take() else {
             unreachable!("cursor variant checked above");
         };
@@ -14820,7 +15075,7 @@ pub fn op_page_count(
     }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
     };
     state.registers[*dest].set_int(count);
     state.pc += 1;
@@ -14973,7 +15228,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     .stmt
                     .take_io_completions()
                     .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
             StepResult::Row => {
                 let inner = state
@@ -15239,7 +15494,7 @@ fn drive_init_cdc_version(
                     .stmt
                     .take_io_completions()
                     .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
             StepResult::Row => match &inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
@@ -15351,7 +15606,8 @@ pub fn op_populate_materialized_views(
                 })?;
 
             let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
+                crate::types::Cursor::BTree(btree_cursor, ..) => btree_cursor.root_page(),
+                crate::types::Cursor::Dyn(btree_cursor, ..) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -15386,7 +15642,9 @@ pub fn op_populate_materialized_views(
 
             // Extract the BTreeCursor
             let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor,
+                crate::types::Cursor::BTree(..) | crate::types::Cursor::Dyn(..) => {
+                    cursor.as_btree_mut()
+                }
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
@@ -15396,7 +15654,7 @@ pub fn op_populate_materialized_views(
             };
 
             // Now populate it with the cursor for writing
-            return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));
+            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
         }
     }
 
@@ -15435,12 +15693,14 @@ pub fn op_read_cookie(
                 Cookie::UserVersion => header.user_version.get().into(),
                 Cookie::SchemaVersion => header.schema_cookie.get().into(),
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+                Cookie::PageSize => header.page_size.get().into(),
+                Cookie::FreePageCount => header.freelist_pages.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
             Err(_) => 0.into(),
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         };
 
     state.registers[*dest].set_int(cookie_value);
@@ -15472,13 +15732,9 @@ pub fn op_set_cookie(
             )
             .into());
         };
-        if !mv_store.is_exclusive_tx(&tx_id) {
-            // Header cookies are global metadata with no row-level conflict keys; require
-            // SQLite-style single-writer semantics (same policy as DDL in MVCC).
-            return Err(LimboError::TxError(
-                "Header updates require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-            ).into());
-        }
+        // Header cookies are global metadata with no row-level conflict keys; they need
+        // SQLite-style single-writer semantics (same policy as DDL in MVCC).
+        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -15537,15 +15793,37 @@ pub fn op_set_cookie(
                 })?;
                 header.schema_cookie = (*value as u32).into();
             }
+            Cookie::PageSize => unreachable!(
+                "page size is not set via SetCookie; changing it is deferred to Connection::reset_page_size"
+            ),
+            Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
         };
         Ok(())
     })? {
         IOResult::Done(result) => result?,
-        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// DDL and header updates need SQLite single-writer semantics. When they run
+/// inside a concurrent MVCC transaction, upgrade it to exclusive in place
+/// instead of failing the statement. The upgrade returns Busy if another
+/// transaction committed after this one began (the snapshot is stale) or if
+/// another transaction holds the exclusive slot.
+fn upgrade_mv_tx_to_exclusive(
+    program: &Program,
+    pager: &Arc<Pager>,
+    mv_store: &MvStore,
+    tx_id: TxID,
+) -> Result<()> {
+    if mv_store.is_exclusive_tx(&tx_id) {
+        return Ok(());
+    }
+    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
+    Ok(())
 }
 
 pub fn op_shift_right(
@@ -15778,7 +16056,7 @@ pub enum OpOpenEphemeralState {
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
-        cursor: Box<dyn CursorTrait>,
+        cursor: Box<BTreeCursor>,
         temp_file: Option<TempFile>,
     },
 }
@@ -15813,13 +16091,12 @@ pub fn op_open_ephemeral(
             }
             // Ephemeral tables always use the main DB's page size (db index 0)
             // regardless of which database triggered the ephemeral allocation.
-            let page_size = return_if_io!(with_header(
-                pager,
-                mv_store.as_ref(),
-                program,
-                0,
-                |header| { header.page_size }
-            ));
+            let page_size = return_if_io!(
+                state,
+                with_header(pager, mv_store.as_ref(), program, 0, |header| {
+                    header.page_size
+                })
+            );
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
             let temp_store = conn.get_temp_store();
@@ -15830,21 +16107,16 @@ pub fn op_open_ephemeral(
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
-            // Ephemeral databases always start empty, so create their own init_page_1
-            let ephemeral_init_page_1 =
-                Arc::new(arc_swap::ArcSwapOption::new(Some(default_page1(None))));
-
             let pager = Arc::new(Pager::new(
                 db_file,
                 None,
                 db_file_io,
                 PageCache::default(),
                 buffer_pool,
-                Arc::new(Mutex::new(())),
-                ephemeral_init_page_1,
+                Arc::new(SharedPagerState::new(Some(default_page1(None)))),
             )?);
 
-            pager.set_page_size(page_size);
+            pager.set_initial_page_size(page_size)?;
 
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::StartingTxn {
                 pager,
@@ -15858,7 +16130,7 @@ pub fn op_open_ephemeral(
                 .expect("cursor should exist in ClearExisting state");
             let btree_cursor = cursor.as_btree_mut();
             btree_cursor.set_null_flag(false);
-            return_if_io!(btree_cursor.clear_btree());
+            return_if_io!(state, btree_cursor.clear_btree());
             invalidate_deferred_seeks_for_cursor(state, cursor_id);
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::RewindExisting;
         }
@@ -15868,7 +16140,7 @@ pub fn op_open_ephemeral(
                 .as_mut()
                 .expect("cursor should exist in RewindExisting state");
             let btree_cursor = cursor.as_btree_mut();
-            return_if_io!(btree_cursor.rewind());
+            return_if_io!(state, btree_cursor.rewind());
             state.pc += 1;
             state.active_op_state.clear();
         }
@@ -15877,7 +16149,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx(WalAutoActions::all_enabled()));
+            return_if_io!(state, pager.begin_write_tx(WalAutoActions::all_enabled()));
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
                 temp_file: temp_file.take(),
@@ -15891,7 +16163,7 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag)) as i64;
+            let root_page = return_if_io!(state, pager.btree_create(flag)) as i64;
 
             let (_, cursor_type) = program
                 .cursor_ref
@@ -15922,7 +16194,7 @@ pub fn op_open_ephemeral(
             cursor,
             temp_file: _,
         } => {
-            return_if_io!(cursor.rewind());
+            return_if_io!(state, cursor.rewind());
 
             let cursors = &mut state.cursors;
 
@@ -16020,7 +16292,7 @@ pub fn op_open_dup(
                 )
                 .into());
             }
-            let cursor: Box<dyn CursorTrait> = if table.has_rowid {
+            let cursor: Box<BTreeCursor> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
@@ -16034,31 +16306,31 @@ pub fn op_open_dup(
                     table.columns().len(),
                 ))
             };
-            let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
+            let cursor = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    Box::new(MvCursor::new(
+                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
                         mv_store,
                         &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
                         cursor,
-                    )?)
+                    )?))
                 } else {
-                    cursor
+                    OpenedBTree::Plain(cursor)
                 }
             } else {
-                cursor
+                OpenedBTree::Plain(cursor)
             };
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_btree(cursor));
+                .replace(cursor.into_cursor());
         }
         CursorType::BTreeIndex(_) => {
             return Err(LimboError::InternalError(
@@ -16170,7 +16442,7 @@ pub fn op_found(
     ) {
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
-        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(SeekInternalResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(e) => return Err(e.into()),
     };
 
@@ -16207,12 +16479,9 @@ pub fn op_affinity(
         .into());
     }
 
-    for (i, affinity_char) in affinities.chars().enumerate().take(count.get()) {
-        let reg_index = *start_reg + i;
-
-        let affinity = Affinity::from_char(affinity_char);
-
-        apply_affinity_char(&mut state.registers[reg_index], affinity);
+    let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
+    for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
+        apply_affinity_char(register, Affinity::from_char_code(affinity_code));
     }
 
     state.pc += 1;
@@ -16237,7 +16506,7 @@ pub fn op_count(
     let count = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
         let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.count())
+        return_if_io!(state, cursor.count())
     };
 
     state.registers[*target_reg].set_int(count as i64);
@@ -16318,25 +16587,31 @@ pub fn op_integrity_check(
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
-            let (freelist_trunk_page, db_size) = return_if_io!(with_header(
-                &target_pager,
-                physical_header_store,
-                program,
-                *db,
-                |header| (header.freelist_trunk_page.get(), header.database_size.get())
-            ));
+            let (freelist_trunk_page, db_size) = return_if_io!(
+                state,
+                with_header(
+                    &target_pager,
+                    physical_header_store,
+                    program,
+                    *db,
+                    |header| (header.freelist_trunk_page.get(), header.database_size.get())
+                )
+            );
             let mut errors: crate::alloc::Vec<_> = crate::alloc::vec![];
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
 
             if freelist_trunk_page > 0 {
-                let expected_freelist_count = return_if_io!(with_header(
-                    &target_pager,
-                    physical_header_store,
-                    program,
-                    *db,
-                    |header| { header.freelist_pages.get() }
-                ));
+                let expected_freelist_count = return_if_io!(
+                    state,
+                    with_header(
+                        &target_pager,
+                        physical_header_store,
+                        program,
+                        *db,
+                        |header| { header.freelist_pages.get() }
+                    )
+                );
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
                     freelist_trunk_page as i64,
@@ -16362,12 +16637,15 @@ pub fn op_integrity_check(
             current_dropped_idx,
             state: integrity_check_state,
         } => {
-            return_if_io!(integrity_check(
-                integrity_check_state,
-                errors,
-                &target_pager,
-                mv_store.as_ref()
-            ));
+            return_if_io!(
+                state,
+                integrity_check(
+                    integrity_check_state,
+                    errors,
+                    &target_pager,
+                    mv_store.as_ref()
+                )
+            );
 
             if errors.len() >= *max_errors {
                 errors.truncate(*max_errors);
@@ -16982,21 +17260,30 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
-        table
+        let old_column_name = table
             .get_column_at(*column_index)
             .expect("column being ALTERed should be in schema")
             .name
             .as_ref()
             .expect("column being ALTERed should be named")
-            .clone()
+            .clone();
+        (old_column_name, table.is_strict())
     });
-    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    let new_column = crate::schema::Column::from_definition(
+        definition.as_ref(),
+        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
+    )?;
     let new_name = definition.col_name.as_str().to_owned();
+    let (domain_not_null, domain_checks) = if is_strict && !*rename {
+        conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
+    } else {
+        (false, crate::alloc::vec![])
+    };
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
@@ -17157,6 +17444,26 @@ pub fn op_alter_column(
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
             if clears_autoincrement_sequence {
                 btree.has_autoincrement = false;
+            }
+
+            btree
+                .check_constraints
+                .retain(|check| check.column.as_deref() != Some(new_name.as_str()));
+            for constraint in &definition.constraints {
+                if let ast::ColumnConstraint::Check { expr, source } = &constraint.constraint {
+                    btree
+                        .check_constraints
+                        .push(crate::schema::CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            source.as_deref(),
+                            Some(&new_name),
+                        ));
+                }
+            }
+            btree.check_constraints.extend(domain_checks);
+            if domain_not_null {
+                btree.columns_mut()[*column_index].set_notnull(true);
             }
         }
 
@@ -17439,10 +17746,9 @@ pub fn op_fk_check(
         state.get_fk_immediate_violations_during_stmt()
     };
     if v > 0 {
-        return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
-        )
-        .into());
+        return Err(
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
+        );
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17526,12 +17832,13 @@ pub fn op_hash_build(
     if op_state.rowid.is_none() {
         let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
-            Cursor::BTree(btree_cursor) => {
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
+                let btree_cursor = cursor.as_btree_mut();
                 let rowid_opt = match btree_cursor.rowid() {
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
                         *state.active_op_state.hash_build() = Some(op_state);
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(state.suspend_on_io(io));
                     }
                     Err(e) => {
                         *state.active_op_state.hash_build() = Some(op_state);
@@ -17566,7 +17873,7 @@ pub fn op_hash_build(
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
                 *state.active_op_state.hash_build() = Some(op_state);
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
         }
     }
@@ -17634,7 +17941,10 @@ pub fn op_hash_distinct(
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
     key_refs.extend(key_values.iter().map(|v| v.as_ref()));
-    match hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))? {
+    let inserted =
+        hash_table.insert_distinct(key_values, &key_refs, Some(&mut state.metrics.hash_join))?;
+    drop(key_refs);
+    match inserted {
         IOResult::Done(inserted) => {
             state.pc = if inserted {
                 state.pc + 1
@@ -17643,7 +17953,7 @@ pub fn op_hash_distinct(
             };
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
 }
 
@@ -17659,7 +17969,7 @@ pub fn op_hash_build_finalize(
         match ht.finalize_build(Some(&mut state.metrics.hash_join))? {
             crate::types::IOResult::Done(()) => {}
             crate::types::IOResult::IO(io) => {
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(state.suspend_on_io(io));
             }
         }
     }
@@ -17697,6 +18007,7 @@ pub fn op_hash_probe(
             num_keys,
             dest_reg,
             target_pc,
+            deferred_target_pc,
             payload_dest_reg,
             num_payload,
             probe_rowid_reg,
@@ -17757,7 +18068,7 @@ pub fn op_hash_probe(
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
-                state.pc = target_pc.as_offset_int();
+                state.pc = deferred_target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -17780,11 +18091,10 @@ pub fn op_hash_probe(
                             partition_idx,
                             probe_buffered: true,
                         });
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(state.suspend_on_io(io));
                     }
                 }
-                // Jump to target_pc: this row is deferred to grace processing.
-                state.pc = target_pc.as_offset_int();
+                state.pc = deferred_target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -17976,6 +18286,7 @@ pub fn op_hash_scan_unmatched(
         *payload_dest_reg,
         *num_payload,
         &mut state.metrics.hash_join,
+        &mut state.io_completions,
     )
 }
 
@@ -18009,6 +18320,7 @@ pub fn op_hash_next_unmatched(
         *payload_dest_reg,
         *num_payload,
         &mut state.metrics.hash_join,
+        &mut state.io_completions,
     )
 }
 
@@ -18024,6 +18336,7 @@ fn advance_unmatched_scan(
     payload_dest_reg: Option<usize>,
     num_payload: usize,
     metrics: &mut HashJoinMetrics,
+    io_slot: &mut Option<IOCompletions>,
 ) -> InsnResult {
     if hash_table.has_spilled() {
         if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
@@ -18031,7 +18344,8 @@ fn advance_unmatched_scan(
                 match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                     crate::types::IOResult::Done(()) => {}
                     crate::types::IOResult::IO(io) => {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        *io_slot = Some(io);
+                        return Ok(InsnFunctionStepResult::IO);
                     }
                 }
             }
@@ -18053,7 +18367,8 @@ fn advance_unmatched_scan(
                             match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                                 crate::types::IOResult::Done(()) => continue,
                                 crate::types::IOResult::IO(io) => {
-                                    return Ok(InsnFunctionStepResult::IO(io));
+                                    *io_slot = Some(io);
+                                    return Ok(InsnFunctionStepResult::IO);
                                 }
                             }
                         }
@@ -18096,7 +18411,7 @@ pub fn op_hash_grace_init(
     match hash_table.finalize_probe_spill(Some(&mut state.metrics.hash_join))? {
         IOResult::Done(()) => {}
         IOResult::IO(io) => {
-            return Ok(InsnFunctionStepResult::IO(io));
+            return Ok(state.suspend_on_io(io));
         }
     }
 
@@ -18138,7 +18453,7 @@ pub fn op_hash_grace_load_partition(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
 }
 
@@ -18185,7 +18500,7 @@ pub fn op_hash_grace_next_probe(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
 }
 
@@ -18217,7 +18532,32 @@ pub fn op_hash_grace_advance_partition(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
+    // handle the common cases that don't require a conversion inline
+    if let Register::Value(value) = target {
+        let settled = match affinity {
+            Affinity::Blob | Affinity::None => true,
+            Affinity::Text => matches!(value, Value::Text(_) | Value::Null | Value::Blob(_)),
+            Affinity::Integer | Affinity::Numeric => matches!(
+                value,
+                Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
+            ),
+            Affinity::Real => match value {
+                Value::Numeric(Numeric::Float(f)) => *f != 0.0,
+                Value::Null | Value::Blob(_) => true,
+                _ => false,
+            },
+        };
+        if settled {
+            return true;
+        }
+    }
+    apply_affinity_char_slow(target, affinity)
+}
+
+#[inline(never)]
+fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
             return true;
@@ -18298,7 +18638,14 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     *value = Value::from_f64(*i as f64);
                     return true;
                 }
-                Value::Numeric(Numeric::Float(_)) | Value::Null => {
+                Value::Numeric(Numeric::Float(f)) => {
+                    // SQLite stores a whole-number real as an integer, so -0.0 is read back as 0.0
+                    if *f == 0.0 {
+                        *value = Value::from_f64(0.0);
+                    }
+                    return true;
+                }
+                Value::Null => {
                     return true;
                 }
                 Value::Text(t) => {
@@ -18416,7 +18763,7 @@ pub fn op_max_pgcnt(
         pager.get_max_page_count()
     } else {
         // Set new maximum page count (will be clamped to current database size)
-        return_if_io!(pager.set_max_page_count(*new_max as u32))
+        return_if_io!(state, pager.set_max_page_count(*new_max as u32))
     };
 
     state.registers[*dest].set_int(result_value.into());
@@ -18529,7 +18876,7 @@ pub fn op_journal_mode(
 ) -> InsnResult {
     match op_journal_mode_inner(program, state, insn, pager) {
         Ok(result) => {
-            if !matches!(result, InsnFunctionStepResult::IO(_)) {
+            if !matches!(result, InsnFunctionStepResult::IO) {
                 // Reset state if we are done with this instruction
                 state.active_op_state.clear();
             }
@@ -18564,7 +18911,7 @@ fn op_journal_mode_inner(
                     header.read_version
                 });
 
-                let prev_mode_raw = return_if_io!(header_result);
+                let prev_mode_raw = return_if_io!(state, header_result);
 
                 let prev_mode_version = prev_mode_raw
                     .to_version()
@@ -18606,6 +18953,22 @@ fn op_journal_mode_inner(
                     state.registers[*dest].set_text(Text::new(ret))?;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // SQLite refuses this too. Switching to MVCC inside the user's
+                // transaction wrote to the MVCC log before the MVCC metadata
+                // table existed. After the user's COMMIT or ROLLBACK, the
+                // database could not be opened again.
+                if !program.connection.get_auto_commit() {
+                    let direction = if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                        "into"
+                    } else {
+                        "out of"
+                    };
+                    return Err(LimboError::TxError(format!(
+                        "cannot change {direction} mvcc mode from within a transaction"
+                    ))
+                    .into());
                 }
 
                 // Check if database is readonly - cannot change journal mode on readonly databases
@@ -18687,7 +19050,7 @@ fn op_journal_mode_inner(
                         .checkpoint_sm
                         .as_mut()
                         .unwrap();
-                    return_if_io!(ckpt_sm.step(&()));
+                    return_if_io!(state, ckpt_sm.step(&()));
                     state.active_op_state.journal_mode().checkpoint_sm = None;
                     state.active_op_state.journal_mode().sub_state =
                         OpJournalModeSubState::UpdateHeader;
@@ -18700,7 +19063,7 @@ fn op_journal_mode_inner(
                         program.connection.get_sync_mode(),
                         false, // Don't clear cache yet, we'll do it in Finalize
                     );
-                    return_if_io!(checkpoint_result);
+                    return_if_io!(state, checkpoint_result);
                     state.active_op_state.journal_mode().sub_state =
                         OpJournalModeSubState::UpdateHeader;
                 }
@@ -18719,8 +19082,10 @@ fn op_journal_mode_inner(
 
                 // Get the header page reference (handles both initialized and uninitialized databases)
                 // This uses the pager's cache and won't fail for empty database files
-                let header_ref =
-                    return_if_io!(crate::storage::pager::HeaderRefMut::from_pager(pager));
+                let header_ref = return_if_io!(
+                    state,
+                    crate::storage::pager::HeaderRefMut::from_pager(pager)
+                );
 
                 // Update the header version
                 {
@@ -18745,7 +19110,7 @@ fn op_journal_mode_inner(
                     .expect("page_ref should be set");
                 let completion = begin_write_btree_page(pager, page, None)?;
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
-                return Ok(InsnFunctionStepResult::IO(IOCompletions(completion)));
+                return Ok(state.suspend_on_io(IOCompletions(completion)));
             }
 
             OpJournalModeSubState::Finalize => {
@@ -18768,7 +19133,7 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
-                        program.connection.db.mv_store_allocator.clone(),
+                        program.connection.db.allocators.mv_store.clone(),
                         program
                             .connection
                             .db
@@ -18808,10 +19173,13 @@ fn op_journal_mode_inner(
                     )
                     .into());
                 };
-                return_if_io!(mv_store.bootstrap_nonblock(
-                    &program.connection,
-                    &mut state.active_op_state.journal_mode().bootstrap_state
-                ));
+                return_if_io!(
+                    state,
+                    mv_store.bootstrap_nonblock(
+                        &program.connection,
+                        &mut state.active_op_state.journal_mode().bootstrap_state
+                    )
+                );
 
                 // Bootstrap finished: disarm the abandonment guard so it does
                 // not roll back the now-published MVCC store on drop.
@@ -18991,9 +19359,9 @@ pub fn op_vacuum_into(
             state.op_vacuum_state = VacuumOpState::None;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(InsnFunctionStepResult::IO(io)) => {
+        Ok(InsnFunctionStepResult::IO) => {
             // Waiting for I/O, keep state for resumption
-            Ok(InsnFunctionStepResult::IO(io))
+            Ok(InsnFunctionStepResult::IO)
         }
         Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
@@ -19125,8 +19493,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // Pin source metadata before building the output database. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
+                // Spelled BEGIN DEFERRED so a non-SQLite dialect (postgres maps
+                // plain BEGIN to BEGIN CONCURRENT) cannot reinterpret it.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute("BEGIN")?;
+                program.connection.execute("BEGIN DEFERRED")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
                     &program
@@ -19198,10 +19568,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect_with_page_codec(codec)?,
-                    None => output_db.connect()?,
+                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
+                    None => output_db.connect(ConnectOpts::new())?,
                 };
-                output_conn.reset_page_size(page_size)?;
+                output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
                 // this is important for databases using encryption or checksums
                 // must be set before page 1 is allocated (before any schema operations)
@@ -19246,7 +19616,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     }
                     crate::IOResult::IO(io) => {
                         vacuum_state.phase = VacuumIntoOpPhase::Build;
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(state.suspend_on_io(io));
                     }
                 }
             }
@@ -19300,7 +19670,7 @@ pub fn op_vacuum(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
         Err(err) => {
             let VacuumOpState::InPlace(vacuum_state) = std::mem::take(&mut state.op_vacuum_state)
             else {
@@ -19405,7 +19775,7 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -19418,7 +19788,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -19479,7 +19849,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -19544,7 +19914,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -19606,7 +19976,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -19631,7 +20001,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -19676,7 +20046,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -19731,6 +20101,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            deferred_target_pc: BranchOffset::Offset(98),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
@@ -19785,6 +20156,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            deferred_target_pc: BranchOffset::Offset(98),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
@@ -19886,6 +20258,45 @@ mod tests {
     }
 
     #[test]
+    fn if_null_row_does_nothing_for_unopened_cursor() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept an unopened cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 1);
+        assert_eq!(state.get_register(0).get_value(), &Value::from_i64(7));
+    }
+
+    #[test]
+    fn if_null_row_clears_destination_and_jumps() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.cursors[0] = Some(Cursor::NullRow);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept a null-row cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 9);
+        assert_eq!(state.get_register(0).get_value(), &Value::Null);
+    }
+
+    #[test]
     fn test_ascii_whitespace_is_trimmed() {
         // Regular ASCII whitespace SHOULD be trimmed
         let ascii_whitespace_cases = vec![
@@ -19973,6 +20384,38 @@ mod tests {
                     panic!("'{input}' should remain text, got {other:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_init_agg_payload_reserves_exact_capacity() {
+        let funcs = [
+            AggFunc::Count,
+            AggFunc::Count0,
+            AggFunc::Sum,
+            AggFunc::Total,
+            AggFunc::Avg,
+            AggFunc::Min,
+            AggFunc::Max,
+            AggFunc::GroupConcat,
+            AggFunc::StringAgg,
+            AggFunc::ArrayAgg,
+            AggFunc::Mode,
+            AggFunc::PercentileCont,
+            AggFunc::PercentileDisc,
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupObject,
+            #[cfg(feature = "json")]
+            AggFunc::JsonbGroupObject,
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupArray,
+            #[cfg(feature = "json")]
+            AggFunc::JsonbGroupArray,
+        ];
+        for func in funcs {
+            let mut payload = crate::alloc::vec![];
+            init_agg_payload(&func, &mut payload).unwrap();
+            assert_eq!(payload.capacity(), payload.len(), "{func:?}");
         }
     }
 
@@ -20286,7 +20729,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

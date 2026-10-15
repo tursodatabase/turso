@@ -7,6 +7,7 @@
 //!
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
+use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
@@ -1931,7 +1932,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::from_slice(ast::blob_literal_hex(b).as_bytes())?),
+            ast::Literal::Blob(b) => Ok(Value::Blob(ast::blob_literal_bytes(b).try_collect()?)),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
@@ -2406,7 +2407,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use turso_parser::parser::Parser;
 
@@ -2423,9 +2424,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),
@@ -2458,9 +2457,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),
@@ -2505,9 +2502,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),

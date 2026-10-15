@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 use bitmaps::Bitmap;
@@ -45,7 +46,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
-            .connect()
+            .connect(ConnectOpts::new())
             .expect("Failed to connect to aux DB for MVCC setup");
         aux_conn
             .execute("PRAGMA journal_mode = 'mvcc'")
@@ -949,6 +950,37 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_generation_requires_explicit_rowids() {
+        use clap::Parser;
+        for mvcc in [false, true] {
+            let output = tempfile::tempdir().unwrap();
+            let args = SimulatorCLI::parse_from([
+                "limbo_sim",
+                "--io-backend",
+                "memory",
+                "--mvcc",
+                if mvcc { "true" } else { "false" },
+            ]);
+            let env = SimulatorEnv::new(
+                1,
+                &args,
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::default(),
+            );
+            assert_eq!(
+                env.profile
+                    .query
+                    .gen_opts
+                    .query
+                    .insert
+                    .allow_implicit_rowids,
+                !mvcc
+            );
+        }
+    }
+
+    #[test]
     fn savepoint_outside_transaction_commits_on_release() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = None;
@@ -1026,6 +1058,7 @@ mod tests {
                     constraints: vec![
                         ColumnConstraint::Unique(None),
                         ColumnConstraint::Generated {
+                            generated_always: false,
                             expr: Box::new(generated_expr),
                             typ: Some(ast::GeneratedColumnType::Virtual),
                         },
@@ -1308,7 +1341,7 @@ impl SimulatorEnv {
         // Re-enable MVCC mode if the profile says to use MVCC
         if self.profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1368,6 +1401,12 @@ impl SimulatorEnv {
 
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
         rng.random_range(0..self.connections.len())
+    }
+
+    pub(crate) fn can_simulate_power_loss(&self) -> bool {
+        !self.profile.mvcc
+            && self.io_backend == IoBackend::Memory
+            && matches!(self.type_, SimulationType::Default)
     }
 
     /// Rng only used for generating interactions. By having a separate Rng we can guarantee that a particular seed
@@ -1454,6 +1493,9 @@ impl SimulatorEnv {
         if let Some(mvcc) = cli_opts.mvcc {
             profile.mvcc = mvcc;
         }
+        if profile.mvcc {
+            profile.query.gen_opts.query.insert.allow_implicit_rowids = false;
+        }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
         }
@@ -1529,7 +1571,7 @@ impl SimulatorEnv {
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1582,7 +1624,7 @@ impl SimulatorEnv {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect()
+                    .connect(ConnectOpts::new())
                     .expect("Failed to connect to Limbo database");
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))

@@ -22,6 +22,12 @@ path = "fuzz/mod.rs"
 name = "pending_byte_tests"
 path = "fuzz/pending_byte.rs"
 
+# Separate binary: uses a counting #[global_allocator] to detect
+# per-database memory leaks, which must not affect the other test targets.
+[[test]]
+name = "leak_tests"
+path = "leak/mod.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }
@@ -36,6 +42,7 @@ log = "0.4.22"
 assert_cmd = "^2"
 rand_chacha = { workspace = true }
 rand = { workspace = true }
+serde_json = { workspace = true }
 zerocopy = "0.8.26"
 ctor = "0.5.0"
 twox-hash = "2.1.1"
@@ -47,9 +54,11 @@ turso-dbhash.workspace = true
 
 [dev-dependencies]
 similar-asserts.workspace = true
+asserting.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
+crossbeam-epoch = "0.9.18"
 
 [features]
 default = ["test_helper", "fts", "io_uring"]

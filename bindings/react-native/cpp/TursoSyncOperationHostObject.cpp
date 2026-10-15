@@ -21,12 +21,13 @@ void TursoSyncOperationHostObject::throwError(jsi::Runtime &rt, const char *erro
 
 jsi::Value TursoSyncOperationHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "resume") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->resume(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->resume(rt);
             }
         );
     }
@@ -34,8 +35,8 @@ jsi::Value TursoSyncOperationHostObject::get(jsi::Runtime &rt, const jsi::PropNa
     if (propName == "resultKind") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->resultKind(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->resultKind(rt);
             }
         );
     }
@@ -43,8 +44,8 @@ jsi::Value TursoSyncOperationHostObject::get(jsi::Runtime &rt, const jsi::PropNa
     if (propName == "extractConnection") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->extractConnection(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->extractConnection(rt);
             }
         );
     }
@@ -52,8 +53,8 @@ jsi::Value TursoSyncOperationHostObject::get(jsi::Runtime &rt, const jsi::PropNa
     if (propName == "extractChanges") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->extractChanges(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->extractChanges(rt);
             }
         );
     }
@@ -61,8 +62,8 @@ jsi::Value TursoSyncOperationHostObject::get(jsi::Runtime &rt, const jsi::PropNa
     if (propName == "extractStats") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->extractStats(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->extractStats(rt);
             }
         );
     }

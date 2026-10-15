@@ -1,5 +1,5 @@
 //! Reference for implementation
-//! https://github.com/sqlite/sqlite/blob/a80089c5167856f0aadc9c878bd65843df724c06/ext/misc/completion.c
+//! <https://github.com/sqlite/sqlite/blob/a80089c5167856f0aadc9c878bd65843df724c06/ext/misc/completion.c>
 
 mod keywords;
 

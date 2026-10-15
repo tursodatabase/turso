@@ -1,3 +1,4 @@
+use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::agg_arg_collation,
@@ -24,16 +25,6 @@ enum LoopEmitTarget {
     QueryResult,
 }
 
-/// Emits the bytecode for the inner loop of a query.
-/// At this point the cursors for all tables have been opened and rewound.
-pub fn emit_loop<'a>(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx<'a>,
-    plan: &'a SelectPlan,
-) -> Result<()> {
-    LoopBodyEmitter::emit(program, t_ctx, plan)
-}
-
 /// Emits the select-loop body.
 pub struct LoopBodyEmitter;
 
@@ -46,6 +37,7 @@ struct LoopBody<'prog, 'ctx, 'plan> {
     program: &'prog mut ProgramBuilder,
     t_ctx: &'ctx mut TranslateCtx<'plan>,
     plan: &'plan SelectPlan,
+    row_continue_label: Option<BranchOffset>,
 }
 
 impl LoopBodyEmitter {
@@ -54,7 +46,16 @@ impl LoopBodyEmitter {
         t_ctx: &mut TranslateCtx<'a>,
         plan: &'a SelectPlan,
     ) -> Result<()> {
-        LoopBody::new(program, t_ctx, plan).emit()
+        LoopBody::new(program, t_ctx, plan, None).emit()
+    }
+
+    fn emit_with_row_continue_label<'a>(
+        program: &mut ProgramBuilder,
+        t_ctx: &mut TranslateCtx<'a>,
+        plan: &'a SelectPlan,
+        row_continue_label: BranchOffset,
+    ) -> Result<()> {
+        LoopBody::new(program, t_ctx, plan, Some(row_continue_label)).emit()
     }
 }
 
@@ -63,11 +64,13 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
         program: &'prog mut ProgramBuilder,
         t_ctx: &'ctx mut TranslateCtx<'plan>,
         plan: &'plan SelectPlan,
+        row_continue_label: Option<BranchOffset>,
     ) -> Self {
         Self {
             program,
             t_ctx,
             plan,
+            row_continue_label,
         }
     }
 
@@ -121,6 +124,7 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
             self.t_ctx,
             self.plan,
             self.select_emit_target(),
+            self.row_continue_label,
         )
     }
 }
@@ -133,6 +137,7 @@ fn emit_loop_source<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
+    row_continue_label: Option<BranchOffset>,
 ) -> Result<()> {
     match emit_target {
         LoopEmitTarget::GroupBy => {
@@ -370,6 +375,9 @@ fn emit_loop_source<'a>(
             // They are cached in expr_to_reg_cache so that when the full
             // expression is evaluated after AggFinal, translate_expr finds
             // the cached values instead of reading from the exhausted cursor.
+            // Columns of an outer query are not pre-read: the outer cursor does
+            // not move while this loop runs, and a value read here would be stale
+            // for an outer row where this loop finds no rows.
             for rc in plan
                 .result_columns
                 .iter()
@@ -377,6 +385,14 @@ fn emit_loop_source<'a>(
             {
                 walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
                     match expr {
+                        Expr::Column { table, .. } | Expr::RowId { table, .. }
+                            if plan
+                                .table_references
+                                .find_joined_table_by_internal_id(*table)
+                                .is_none() =>
+                        {
+                            Ok(WalkControl::SkipChildren)
+                        }
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
                             translate_expr(
@@ -417,11 +433,8 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = plan
-                .join_order
-                .first()
-                .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
-                .map(|l| l.next)
+            let offset_jump_to = row_continue_label
+                .or_else(|| offset_continue_label(t_ctx, plan))
                 .or(t_ctx.label_main_loop_end);
 
             emit_select_result(
@@ -451,6 +464,35 @@ fn emit_loop_source<'a>(
     }
 }
 
+fn offset_continue_label(t_ctx: &TranslateCtx<'_>, plan: &SelectPlan) -> Option<BranchOffset> {
+    let join = plan.join_order.last()?;
+    let table = &plan.table_references.joined_tables()[join.original_idx];
+    if let HashJoin(hash_join) = &table.op {
+        return t_ctx
+            .hash_table_contexts
+            .get(&hash_join.build_table_idx)
+            .map(|context| {
+                context
+                    .labels
+                    .inner_loop_return
+                    .unwrap_or(context.labels.next)
+            });
+    }
+    if table
+        .join_info
+        .as_ref()
+        .is_some_and(|join_info| join_info.is_semi_or_anti())
+    {
+        return t_ctx.meta_semi_anti_joins[join.original_idx]
+            .as_ref()
+            .map(|meta| meta.label_next_outer);
+    }
+    t_ctx
+        .labels_main_loop
+        .get(join.original_idx)
+        .map(|labels| labels.next)
+}
+
 /// Whether every column a condition reads holds the right value at the
 /// unmatched-row scan point.
 ///
@@ -460,15 +502,30 @@ fn emit_loop_source<'a>(
 /// by anything else are stale here: nothing refills them once the probe loop has
 /// exited. Skipping a condition whose columns are all readable silently drops it
 /// from the null-extended rows, letting through rows the query filtered out.
+///
+/// A correlated subquery result is readable only if every table the subquery
+/// reads is one of `allowed`. Otherwise the subquery runs inside the inner
+/// loop, and its result register still holds the value from an earlier row.
 fn condition_operands_are_available(
     expr: &Expr,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
     allowed: &TableMask,
     resolver: &Resolver,
     payload_regs: Range<usize>,
-) -> bool {
+) -> Result<bool> {
     let mut ok = true;
-    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { .. } = e {
+            if !allowed.contains_all_set_bits_of(&table_mask_from_expr(
+                e,
+                table_references,
+                subqueries,
+            )?) {
+                ok = false;
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         let (Expr::Column { table, .. } | Expr::RowId { table, .. }) = e else {
             return Ok(WalkControl::Continue);
         };
@@ -490,11 +547,11 @@ fn condition_operands_are_available(
         }
         // Outer query references are already in scope — allow them.
         Ok(WalkControl::Continue)
-    });
-    ok
+    })?;
+    Ok(ok)
 }
 
-/// Emit WHERE conditions and inner-loop entry for an unmatched outer hash join row.
+/// Emit WHERE conditions and inner-loop entry for an unmatched hash build row.
 ///
 /// Filters applicable WHERE terms (non-ON, non-consumed), optionally restricted to
 /// the ones whose columns are readable here when a Gosub wraps inner tables. Then
@@ -506,6 +563,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     plan: &'a SelectPlan,
     build_table_idx: usize,
     probe_table_idx: usize,
+    join_type: HashJoinType,
     skip_label: BranchOffset,
     gosub: Option<(usize, BranchOffset)>,
     payload_regs: Range<usize>,
@@ -527,41 +585,71 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                 .expect("probe table must be in join order");
             for join in &plan.join_order[..probe_pos] {
                 m.set(join.original_idx)?;
+                // An earlier hash join's build table is also accessible.
+                if let HashJoin(hj) = &plan.table_references.joined_tables()[join.original_idx].op {
+                    m.set(hj.build_table_idx)?;
+                }
             }
         }
         m
     };
-    let conditions = plan
+    let probe_join_index = plan
+        .join_order
+        .iter()
+        .position(|member| member.original_idx == probe_table_idx)
+        .expect("probe table must be in join order");
+    // Terms the hash build already applied hold for every row in the hash
+    // table, so the unmatched scan does not repeat them.
+    let prefiltered_terms = super::conditions::hash_build_prefilter_where_terms(
+        t_ctx,
+        &plan.table_references,
+        &plan.join_order,
+        &plan.where_clause,
+        &plan.non_from_clause_subqueries,
+        probe_join_index,
+    )?;
+    let mut conditions = Vec::new();
+    for (condition_idx, condition) in plan
         .where_clause
         .iter()
-        .filter(|c| !c.consumed && c.from_outer_join.is_none())
-        .filter(|c| {
-            !has_gosub
-                || condition_operands_are_available(
-                    &c.expr,
-                    &plan.table_references,
-                    &allowed_tables,
-                    &t_ctx.resolver,
-                    payload_regs.clone(),
-                )
-        })
-        .collect::<Vec<_>>();
+        .enumerate()
+        .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
+    {
+        if prefiltered_terms.contains(&condition_idx) {
+            continue;
+        }
+        if join_type == HashJoinType::LeftAnti
+            && table_mask_from_expr(
+                &condition.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?
+            .get(probe_table_idx)
+        {
+            continue;
+        }
+        if has_gosub
+            && !condition_operands_are_available(
+                &condition.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+                &allowed_tables,
+                &t_ctx.resolver,
+                payload_regs.clone(),
+            )?
+        {
+            continue;
+        }
+        conditions.push(condition);
+    }
     for cond in conditions {
-        let jump_target_when_true = program.allocate_label();
-        let condition_metadata = ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true,
-            jump_target_when_false: skip_label,
-            jump_target_when_null: skip_label,
-        };
-        translate_condition_expr(
+        super::conditions::emit_where_term(
             program,
             &plan.table_references,
-            &cond.expr,
-            condition_metadata,
+            cond,
+            skip_label,
             &t_ctx.resolver,
         )?;
-        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     if let Some((reg, label)) = gosub {
@@ -570,7 +658,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
             return_reg: reg,
         });
     } else {
-        emit_loop(program, t_ctx, plan)?;
+        LoopBodyEmitter::emit_with_row_continue_label(program, t_ctx, plan, skip_label)?;
     }
     Ok(())
 }

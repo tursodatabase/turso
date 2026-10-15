@@ -214,7 +214,7 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
-| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`) |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`, `postgres`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 #### Skip Conditions
@@ -225,6 +225,7 @@ The `@skip-if` decorator supports the following conditions:
 |-----------|-------------|
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 | `sqlite` | Skip when running with the sqlite CLI backend |
+| `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
 
 #### Capabilities
 
@@ -400,6 +401,12 @@ Snapshots support all the same decorators as tests:
 | `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
 | `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
+| `@sqlite-reference` | Add SQLite's plan, bytecode, and an opcode diff to this snapshot |
+
+`@sqlite-reference` runs the setup and query against the bundled SQLite library.
+Use it only with `@database :memory:`. The runner rejects other database locations.
+The snapshot then shows both engines' EXPLAIN output and the difference in opcode order.
+Review this difference when the snapshot changes. The decorator also works with `snapshot-eqp`, but that form shows only the two query plans.
 
 ### Snapshot File Location
 
@@ -535,6 +542,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
 
 skip_condition  = "mvcc"
                 | "sqlite"
+                | "postgres"
 
 capability      = "trigger" | "strict" | "materialized_views"
 

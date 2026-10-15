@@ -2,6 +2,17 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert!(conn
+        .prepare("SET TRANSACTION SNAPSHOT '00000003-0000001B-1'")
+        .is_err());
+    assert!(conn
+        .prepare("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .is_err());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_frontend_rejects_pragma(db: TempDatabase) {
     let conn = db.connect_postgres();
 

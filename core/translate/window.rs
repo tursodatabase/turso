@@ -454,7 +454,7 @@ fn rewrite_expr_referencing_current_window(
         push_into_source_subquery(filter_expr, aggregates, ctx)?;
     }
     let filter_expr = filter_over.filter_clause.as_deref().cloned();
-    filter_over.over_clause = Some(Over::Name(Name::exact(window_name)));
+    filter_over.over_clause = Some(Box::new(Over::Name(Name::exact(window_name))));
     Ok(RewrittenWindowCall {
         expr: expr.clone(),
         filter_expr,
@@ -2439,6 +2439,7 @@ fn emit_window_full_scan(
         cursor_id: scan_cursor,
         pc_if_next: label_loop,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(label_break);
     emit_window_agg_final(program, window, &registers, &minmax, true);
@@ -2934,6 +2935,7 @@ fn emit_window_op(
         cursor_id: cursor_for_op,
         pc_if_next: label_after_next,
         fullscan: false,
+        is_index: false,
     });
     if let Some(break_target) = break_on_eof {
         program.emit_insn(Insn::Goto {

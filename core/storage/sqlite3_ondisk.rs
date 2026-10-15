@@ -39,7 +39,7 @@
 //!
 //! For more information, see the SQLite file format specification:
 //!
-//! https://www.sqlite.org/fileformat.html
+//! <https://www.sqlite.org/fileformat.html>
 
 #![allow(clippy::arc_with_non_send_sync)]
 
@@ -109,21 +109,12 @@ impl PageSize {
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
-        if size < PageSize::MIN || size > PageSize::MAX {
-            return None;
-        }
-
-        // Page size must be a power of two.
-        if size.count_ones() != 1 {
-            return None;
-        }
-
-        if size == PageSize::MAX {
+        match size {
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => Some(Self(U16BE::new(size as u16))),
             // Internally, the value 1 represents 65536, since the on-disk value of the page size in the DB header is 2 bytes.
-            return Some(Self(U16BE::new(1)));
+            PageSize::MAX => Some(Self(U16BE::new(1))),
+            _ => None,
         }
-
-        Some(Self(U16BE::new(size as u16)))
     }
 
     /// Interpret a u16 on disk (DB file header) as either a valid page size or
@@ -479,7 +470,7 @@ impl Default for WalHeader {
 }
 
 /// Immediately following the wal-header are zero or more frames.
-/// Each frame consists of a 24-byte frame-header followed by <page-size> bytes of page data.
+/// Each frame consists of a 24-byte frame-header followed by `<page-size>` bytes of page data.
 /// The frame-header is six big-endian 32-bit unsigned integer values, as follows:
 #[allow(dead_code)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -636,11 +627,11 @@ pub fn begin_write_btree_page(
     page: &PageRef,
     group: Option<&mut CompletionGroup>,
 ) -> Result<Completion> {
-    tracing::trace!("begin_write_btree_page(page={})", page.get().id);
+    tracing::trace!("begin_write_btree_page(page={})", page.get().id());
     let page_source = &pager.db_file;
     let page_finish = page.clone();
 
-    let page_id = page.get().id;
+    let page_id = page.get().id();
     tracing::trace!("begin_write_btree_page(page_id={})", page_id);
 
     let buffer = page.get().buffer().cloned().expect("buffer not loaded");
@@ -673,10 +664,10 @@ pub fn begin_write_btree_page(
 ///
 /// we have a batch of pages to write, lets say the following:
 /// (they are already sorted by id thanks to BTreeMap)
-/// [1,2,3,6,7,9,10,11,12]
+/// `[1,2,3,6,7,9,10,11,12]`
 //
 /// we want to collect this into runs of:
-/// [1,2,3], [6,7], [9,10,11,12]
+/// `[1,2,3]`, `[6,7]`, `[9,10,11,12]`
 /// and submit each run as a `writev` call,
 /// for 3 total syscalls instead of 9.
 ///
@@ -807,6 +798,17 @@ pub enum BTreeCell {
     IndexLeafCell(IndexLeafCell),
 }
 
+impl BTreeCell {
+    pub fn first_overflow_page(&self) -> Option<u32> {
+        match self {
+            BTreeCell::TableLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexInteriorCell(cell) => cell.first_overflow_page,
+            BTreeCell::TableInteriorCell(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableInteriorCell {
     pub left_child_page: u32,
@@ -866,9 +868,13 @@ pub fn read_btree_cell(
             let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -908,9 +914,13 @@ pub fn read_btree_cell(
             let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -934,9 +944,13 @@ pub fn read_btree_cell(
             let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(page, pos..))?;
             pos += nr;
 
-            let (overflows, to_read) =
-                payload_overflows(payload_size as usize, max_local, min_local, usable_size);
-            let to_read = if overflows { to_read } else { page.len() - pos };
+            let to_read = if let Some(local_size) =
+                payload_overflows(payload_size as usize, max_local, min_local, usable_size)
+            {
+                local_size
+            } else {
+                page.len() - pos
+            };
 
             crate::assert_or_bail_corrupt!(
                 pos + to_read <= page.len(),
@@ -1117,10 +1131,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                mark_unlikely();
-                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-            })?;
+            let val = read_text(data)?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1247,10 +1258,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
+                let val = read_text(data)?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -1263,6 +1271,14 @@ pub fn read_value_serial_type<'a>(
             crate::bail_corrupt_error!("Invalid serial type for integer")
         }
     }
+}
+
+#[inline(always)]
+pub fn read_text(payload: &[u8]) -> Result<&str> {
+    crate::types::validate_utf8(payload).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+    })
 }
 
 #[inline(always)]
@@ -1335,6 +1351,19 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
 /// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => return Ok((*b0 as u64, 1)),
+        [b0, b1, ..] if *b1 < 0x80 => {
+            return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, 2));
+        }
+        [b0, b1, b2, ..] if *b2 < 0x80 => {
+            return Ok((
+                (((*b0 & 0x7f) as u64) << 14) | (((*b1 & 0x7f) as u64) << 7) | *b2 as u64,
+                3,
+            ));
+        }
+        _ => {}
+    }
     let mut v: u64 = 0;
     for i in 0..8 {
         match buf.get(i) {
@@ -1367,6 +1396,34 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             bail_corrupt_error!("Invalid varint");
         }
     }
+}
+
+#[inline(always)]
+pub(crate) fn split_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
+    match buf {
+        [b0, rest @ ..] if *b0 < 0x80 => return Ok((*b0 as u64, rest)),
+        [b0, b1, rest @ ..] if *b1 < 0x80 => {
+            return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, rest));
+        }
+        _ => {}
+    }
+    let (value, len) = read_varint(buf)?;
+    Ok((value, &buf[len..]))
+}
+
+#[inline(always)]
+pub fn read_varint_len(buf: &[u8]) -> Result<usize> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => Ok(1),
+        [_, b1, ..] if *b1 < 0x80 => Ok(2),
+        [_, _, b2, ..] if *b2 < 0x80 => Ok(3),
+        _ => read_varint_len_long(buf),
+    }
+}
+
+#[inline(never)]
+fn read_varint_len_long(buf: &[u8]) -> Result<usize> {
+    read_varint(buf).map(|(_, len)| len)
 }
 
 #[inline(always)]
@@ -1462,7 +1519,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 /// Created by [`BuildSharedWal::begin`] (which performs only synchronous
 /// setup and may complete immediately for an empty/headerless WAL), then
 /// driven via [`BuildSharedWal::poll`] until it returns `Done`. All recovery
-/// state lives in the [`StreamingWalReader`] (atomics + `RwLock<StreamingState>`)
+/// state lives in the `StreamingWalReader` (atomics + `RwLock<StreamingState>`)
 /// and is updated by the read completions' callbacks, so the only state this
 /// driver tracks is which phase/completion it's waiting on.
 pub struct BuildSharedWal {
@@ -1526,6 +1583,8 @@ impl BuildSharedWal {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                #[cfg(test)]
+                frames_compared: AtomicU64::new(0),
             },
         }));
 
@@ -2195,27 +2254,27 @@ pub fn begin_write_wal_header<F: File + ?Sized>(
     Ok(c)
 }
 
-/// Checks if payload will overflow a cell based on the maximum allowed size.
-/// It will return the min size that will be stored in that case,
-/// including overflow pointer
-/// see e.g. https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+/// If the payload overflows the given limits, returns `Some(local_size)`, where `local_size` is
+/// the size that shall be occupied on the page by the payload plus its overflow page pointer.
+///
+/// Otherwise, returns `None`.
 #[inline]
 pub fn payload_overflows(
     payload_size: usize,
-    payload_overflow_threshold_max: usize,
-    payload_overflow_threshold_min: usize,
+    max_local_bytes: usize,
+    min_local_bytes: usize,
     usable_size: usize,
-) -> (bool, usize) {
-    if payload_size <= payload_overflow_threshold_max {
-        return (false, 0);
+) -> Option<usize> {
+    // See https://github.com/sqlite/sqlite/blob/9591d3fe93936533c8c3b0dc4d025ac999539e11/src/dbstat.c#L371
+    if payload_size <= max_local_bytes {
+        return None;
     }
 
-    let mut space_left = payload_overflow_threshold_min
-        + (payload_size - payload_overflow_threshold_min) % (usable_size - 4);
-    if space_left > payload_overflow_threshold_max {
-        space_left = payload_overflow_threshold_min;
+    let mut space_left = min_local_bytes + (payload_size - min_local_bytes) % (usable_size - 4);
+    if space_left > max_local_bytes {
+        space_left = min_local_bytes;
     }
-    (true, space_left + 4)
+    Some(space_left + 4)
 }
 
 /// The checksum is computed by interpreting the input as an even number of unsigned 32-bit integers: x(0) through x(N).
@@ -2246,22 +2305,19 @@ pub fn checksum_wal(
     turso_assert_eq!(buf.len() % 8, 0, "buffer must be a multiple of 8");
     let mut s0: u32 = input.0;
     let mut s1: u32 = input.1;
-    let mut i = 0;
     if native_endian {
-        while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap());
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap());
+        for words in buf.chunks_exact(8) {
+            let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]);
+            let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]);
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
-            i += 8;
         }
     } else {
-        while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()).swap_bytes();
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap()).swap_bytes();
+        for words in buf.chunks_exact(8) {
+            let v0 = u32::from_ne_bytes([words[0], words[1], words[2], words[3]]).swap_bytes();
+            let v1 = u32::from_ne_bytes([words[4], words[5], words[6], words[7]]).swap_bytes();
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
-            i += 8;
         }
     }
     (s0, s1)
@@ -2283,7 +2339,63 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use asserting::prelude::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(0, None)]
+    #[case(1, None)]
+    #[case(511, None)]
+    #[case(512, Some(512))]
+    #[case(513, None)]
+    #[case(4096, Some(4096))]
+    #[case(6144, None)]
+    #[case(32768, Some(32768))]
+    #[case(65536, Some(65536))]
+    #[case(65537, None)]
+    #[case(u32::MAX, None)]
+    fn page_size_accepts_only_a_power_of_two_in_range(
+        #[case] size: u32,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(PageSize::new(size).map(PageSize::get), expected);
+    }
+
+    #[rstest]
+    #[case(PageType::TableLeaf, 4096, 0, None)]
+    #[case(PageType::TableLeaf, 4096, 4061, None)]
+    #[case(PageType::TableLeaf, 4096, 4062, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 4500, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 4581, Some(493))]
+    #[case(PageType::TableLeaf, 4096, 5000, Some(912))]
+    #[case(PageType::TableLeaf, 4096, 8153, Some(4065))]
+    #[case(PageType::TableLeaf, 4096, 8154, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 1002, None)]
+    #[case(PageType::IndexLeaf, 4096, 1003, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 4581, Some(493))]
+    #[case(PageType::IndexLeaf, 4096, 5094, Some(1006))]
+    #[case(PageType::IndexLeaf, 4096, 5095, Some(493))]
+    #[case(PageType::IndexInterior, 4096, 5000, Some(912))]
+    #[case(PageType::TableLeaf, 512, 477, None)]
+    #[case(PageType::TableLeaf, 512, 478, Some(43))]
+    #[case(PageType::IndexLeaf, 512, 102, None)]
+    #[case(PageType::IndexLeaf, 512, 103, Some(43))]
+    #[case(PageType::TableLeaf, 65536, 65501, None)]
+    #[case(PageType::TableLeaf, 65536, 65502, Some(8203))]
+    fn test_payload_overflows(
+        #[case] page_type: PageType,
+        #[case] usable_size: usize,
+        #[case] payload_size: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let result = payload_overflows(
+            payload_size,
+            payload_overflow_threshold_max(page_type, usable_size),
+            payload_overflow_threshold_min(page_type, usable_size),
+            usable_size,
+        );
+        assert_eq!(result, expected);
+    }
 
     #[rstest]
     #[case(&[], SerialType::null(), Value::Null)]
@@ -2292,9 +2404,12 @@ mod tests {
     #[case(&[0xFE], SerialType::i8(), Value::from_i64(-2))]
     #[case(&[0x12, 0x34, 0x56], SerialType::i24(), Value::from_i64(0x123456))]
     #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), Value::from_i64(0x12345678))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::from_i64(0x123456789ABC))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::from_i64(0x123456789ABCDEFF))]
-    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::from_i64(0x123456789ABC)
+    )]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::from_i64(0x123456789ABCDEFF)
+    )]
+    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI)
+    )]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
     #[case(
@@ -2318,8 +2433,10 @@ mod tests {
     #[case(&[0x7f, 0xff], SerialType::i16(), Value::from_i64(32767))]
     #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), Value::from_i64(8388607))]
     #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), Value::from_i64(2147483647))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::from_i64(140737488355327))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::from_i64(9223372036854775807))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::from_i64(140737488355327)
+    )]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::from_i64(9223372036854775807)
+    )]
     fn test_read_value(
         #[case] buf: &[u8],
         #[case] serial_type: SerialType,
@@ -2330,6 +2447,51 @@ mod tests {
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
         );
+    }
+
+    #[test]
+    fn read_text_agrees_with_the_standard_library() {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=528usize {
+            payloads.push(vec![b'a'; len]);
+        }
+        for len in 1..=528usize {
+            for at in 0..len {
+                for tail in [&[0xC3u8, 0xA9][..], &[0xFF][..], &[0x80][..]] {
+                    let mut payload = vec![b'a'; len];
+                    payload.splice(at..at + 1, tail.iter().copied());
+                    payloads.push(payload);
+                }
+            }
+        }
+        for broken in [
+            &[0xE2u8, 0x82][..],
+            &[0xC0, 0xAF][..],
+            &[0xED, 0xA0, 0x80][..],
+        ] {
+            for pad in [0usize, 508, 518] {
+                let mut payload = vec![b'a'; pad];
+                payload.extend_from_slice(broken);
+                payloads.push(payload);
+            }
+        }
+
+        for payload in payloads {
+            assert_that!(crate::types::is_ascii(&payload))
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(payload.iter().all(u8::is_ascii));
+
+            let expected = std::str::from_utf8(&payload);
+            match (read_text(&payload), expected) {
+                (Ok(got), Ok(want)) => {
+                    assert_that!(got)
+                        .described_as(format!("payload {payload:?}"))
+                        .is_equal_to(want);
+                }
+                (Err(LimboError::Corrupt(_)), Err(_)) => {}
+                (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2544,5 +2706,43 @@ mod tests {
         let mut buf = [0u8; 9];
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
+    }
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_reads_back_what_write_varint_wrote(value: u64) -> bool {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        read_varint(&buf[..written])
+            .map(|(read, len)| read == value && len == written)
+            .unwrap_or(false)
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn split_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (split_varint(&bytes), read_varint(&bytes)) {
+            (Ok((split_value, rest)), Ok((value, len))) => {
+                split_value == value && rest == &bytes[len..]
+            }
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn split_varint_cuts_the_tail_at_every_varint_length() {
+        let mut seen_lengths = std::collections::HashSet::new();
+        for bits in 0..64 {
+            let value = 1u64 << bits;
+            let mut buf = [0u8; 12];
+            let written = write_varint(&mut buf, value);
+            seen_lengths.insert(written);
+            buf[written..written + 3].copy_from_slice(b"abc");
+            let (read, rest) = split_varint(&buf[..written + 3]).unwrap();
+            assert_eq!(read, value, "value at {written} bytes");
+            assert_eq!(rest, b"abc", "tail at {written} bytes");
+        }
+        assert_eq!(
+            seen_lengths,
+            (1..=9).collect::<std::collections::HashSet<_>>()
+        );
     }
 }

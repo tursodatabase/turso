@@ -43,6 +43,7 @@ turso_parser = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = "0.4.3"
+tempfile.workspace = true
 twox-hash = { version = "2.1.1", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -1028,6 +1028,10 @@ impl Jsonb {
     /// rendering translates the JSON5 \v escape to \u0009 for SQLite
     /// bug-compatibility, while extraction must yield the real 0x0B.
     pub fn scalar_string_value(&self) -> Result<String> {
+        Ok(unescape_string(self.scalar_payload_text()?))
+    }
+
+    pub fn scalar_payload_text(&self) -> Result<&str> {
         let (JsonbHeader(_, len), header_size) = self.read_header(0)?;
         // The 8-byte size format lets a crafted header declare a length
         // near usize::MAX, so the end must be computed without overflow.
@@ -1038,9 +1042,8 @@ impl Jsonb {
             .data
             .get(header_size..payload_end)
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        let text = from_utf8(payload)
-            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))?;
-        Ok(unescape_string(text))
+        from_utf8(payload)
+            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -2668,6 +2671,11 @@ impl Jsonb {
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
+        // With nested array locators ($[0][2]) the element of the outer
+        // entry is the container of the inner entry, whose header the
+        // previous round already resized; resizing it again would count
+        // the change twice.
+        let mut last_container: Option<usize> = None;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
@@ -2676,17 +2684,19 @@ impl Jsonb {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
-                let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
-                    self.read_header(arr_element_idx)?;
+                if last_container != Some(arr_element_idx) {
+                    let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
+                        self.read_header(arr_element_idx)?;
 
-                let new_arr_el_header_len = self.write_element_header(
-                    arr_element_idx,
-                    arr_el_type,
-                    (arr_el_size as isize + delta) as usize,
-                    true,
-                )?;
+                    let new_arr_el_header_len = self.write_element_header(
+                        arr_element_idx,
+                        arr_el_type,
+                        (arr_el_size as isize + delta) as usize,
+                        true,
+                    )?;
 
-                delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                    delta += new_arr_el_header_len as isize - arr_el_header_len as isize;
+                }
             }
             let new_size = el_size as isize + delta;
             let new_header_size = self.write_element_header(
@@ -2700,6 +2710,7 @@ impl Jsonb {
 
             delta += parent.delta;
             delta += header_diff;
+            last_container = Some(parent.field_value_index);
         }
 
         Ok(())
@@ -2715,6 +2726,9 @@ impl Jsonb {
 
         match segment {
             SegmentVariant::Single(PathElement::Root()) => {
+                if !mode.allows_replace() {
+                    bail_parse_error!("Not found!");
+                }
                 return Ok(JsonTraversalResult::new(
                     pos,
                     JsonLocationKind::DocumentRoot,

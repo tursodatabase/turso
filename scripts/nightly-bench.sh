@@ -21,6 +21,17 @@
 #     started and finished even when it loses the log, so the step that never
 #     finished is the culprit.
 #
+# `run` also turns Criterion's plots off. Criterion draws them into
+# target/criterion, nothing in the nightly reads them, and drawing them is most
+# of the wall time: parser_benchmark takes 992 s with plots and 85 s without.
+# Only Criterion takes --noplot, so `run` asks each bench binary whether its
+# harness offers the flag rather than assuming.
+#
+# The Nyrkiö runner kills the job after 92 minutes, before the step that uploads
+# the results to Nyrkiö. `build` sets a deadline, and `run` stops a benchmark
+# that is still running at the deadline and skips benchmarks after it, so the
+# upload step always gets to run with whatever results there are.
+#
 # `check` keeps the step list in the workflow file in sync with the bench
 # targets cargo actually builds: a new bench with no step fails the job.
 set -euo pipefail
@@ -30,6 +41,9 @@ target_dir=${CARGO_TARGET_DIR:-target}
 # The bench job runs on a fresh checkout with no cargo cache, so the target
 # directory the bookkeeping files below are written to does not exist yet.
 mkdir -p "$target_dir"
+
+budget_minutes=${NIGHTLY_BENCH_BUDGET_MINUTES:-85}
+deadline_file="$target_dir/nightly-bench-deadline"
 
 # Same target list as `make bench-exclude-tpc-h`.
 bench_targets() {
@@ -44,8 +58,16 @@ built_benches() {
            | .target.name' "$target_dir/nightly-bench-build.json" | sort -u
 }
 
+# Where cargo put one bench binary.
+bench_executable() {
+    jq -r --arg name "$1" 'select(.reason == "compiler-artifact" and .executable != null
+                  and (.target.kind | index("bench")) and .target.name == $name)
+           | .executable' "$target_dir/nightly-bench-build.json" | sort -u | tail -1
+}
+
 case "${1:-}" in
 build)
+    echo $(($(date +%s) + budget_minutes * 60)) > "$deadline_file"
     args=()
     while read -r name; do
         args+=(--bench "$name")
@@ -67,15 +89,34 @@ check)
     ;;
 run)
     name=$2
+    exe=$(bench_executable "$name")
+    if [ -z "$exe" ]; then
+        echo "error: cargo built no bench binary named $name; run '$0 build' first." >&2
+        exit 1
+    fi
+    remaining=$(($(cat "$deadline_file") - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
+        echo "error: skipping $name because the ${budget_minutes}-minute benchmark budget is used up." >&2
+        exit 1
+    fi
+    harness_args=()
+    if "$exe" --help 2>&1 | grep -q -- --noplot; then
+        harness_args=(-- --noplot)
+    fi
     # Address-space cap in KiB. Well under the 8 GiB runner, well above the
     # ~2.5 GiB the biggest benchmark reaches.
     cap_kb=${NIGHTLY_BENCH_MEMORY_CAP_KB:-6291456}
     echo "free -m before $name:"
     free -m
     ulimit -v "$cap_kb"
-    cargo bench --bench "$name" --features bench 2>&1 | tee -a output.txt
+    status=0
+    timeout --kill-after=30 "$remaining" cargo bench --bench "$name" --features bench "${harness_args[@]}" 2>&1 | tee -a output.txt || status=$?
     echo "free -m after $name:"
     free -m
+    if [ "$status" -eq 124 ]; then
+        echo "error: stopped $name because the ${budget_minutes}-minute benchmark budget ran out." >&2
+    fi
+    exit "$status"
     ;;
 *)
     echo "usage: $0 build | check <workflow-file> | run <bench-name>" >&2

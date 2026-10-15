@@ -1,7 +1,8 @@
+use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
 use turso_core::SqliteDialect;
-use turso_core::{Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
@@ -32,7 +33,7 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect().unwrap();
+    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -65,13 +66,10 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect().unwrap();
-    let result = conn_a2.execute("SELECT x FROM t");
-    assert!(
-        result.is_err(),
-        "New database at A.db should not have table 't' — \
-         DATABASE_MANAGER returned stale Database after rename"
-    );
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    // A new database at A.db has no table `t`. Before the fix,
+    // DATABASE_MANAGER returned the stale Database after the rename.
+    assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
 }
 
 fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> {
@@ -93,15 +91,10 @@ fn assert_sqlite_says_not_a_database(path: &std::path::Path) {
     let err = conn
         .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
         .unwrap_err();
-    match err {
-        rusqlite::Error::SqliteFailure(e, _) => assert_eq!(
-            e.code,
-            rusqlite::ErrorCode::NotADatabase,
-            "sqlite reported {err:?} for {}",
-            path.display()
-        ),
-        other => panic!("expected SQLITE_NOTADB from sqlite, got {other:?}"),
-    }
+    let rusqlite::Error::SqliteFailure(failure, _) = &err else {
+        panic!("expected SQLITE_NOTADB from sqlite, got {err:?}");
+    };
+    assert_that!(failure.code).is_equal_to(rusqlite::ErrorCode::NotADatabase);
 }
 
 fn assert_turso_says_not_a_database(path: &std::path::Path) {
@@ -150,6 +143,60 @@ fn test_open_short_file_reports_not_a_database() {
     std::fs::write(&truncated, bytes).unwrap();
     assert_sqlite_says_not_a_database(&truncated);
     assert_turso_says_not_a_database(&truncated);
+}
+
+/// Turso has no fts5 module. Opening a file that has an fts5 table must fail:
+/// with only part of the schema loaded, writes skip index updates and
+/// corrupt the file.
+#[test]
+fn test_open_refuses_file_with_unknown_virtual_table_module() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("fts5.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE a(x); CREATE INDEX ax ON a(x);
+             CREATE VIRTUAL TABLE f USING fts5(b);
+             CREATE TABLE z(y);",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ExtensionError(msg)) => {
+            assert_that!(msg).contains("fts5");
+        }
+        Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
+        Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
+}
+
+/// The SQLite dialect must refuse a table written by the PostgreSQL frontend,
+/// as sqlite3 does. Reading it as a plain SQLite table drops the PostgreSQL
+/// column types and rowid alias, so writes store values tursopg cannot read.
+#[test]
+fn test_open_refuses_file_with_postgres_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("postgres.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE t(id serial PRIMARY KEY, n numeric(10,2));
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = '/* turso_frontend:postgres */ ' || sql
+              WHERE name = 't';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let err = match open_plain_file(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("expected malformed schema error, got a successful open"),
+    };
+    let turso_core::LimboError::Corrupt(msg) = err else {
+        panic!("expected malformed schema error, got {err:?}");
+    };
+    assert_that!(msg).contains("malformed database schema");
 }
 
 /// Regression test: TursoConnection.close() must finalize outstanding statements
@@ -237,7 +284,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect().unwrap();
+    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -266,7 +313,7 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 

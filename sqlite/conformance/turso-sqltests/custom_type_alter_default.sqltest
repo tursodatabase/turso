@@ -66,3 +66,60 @@ test alter-add-notnull-type-default-empty-table {
 expect {
     1|Alice|75
 }
+
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-encodes-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, NULL);
+    ALTER TABLE t ALTER COLUMN v TO v2 uuid;
+    SELECT id, v2, typeof(v2) FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|550e8400-e29b-41d4-a716-446655440000|text
+    2||null
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-rejects-invalid-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'not a uuid');
+    ALTER TABLE t ALTER COLUMN v TO v2 uuid;
+}
+expect error {
+    invalid UUID value
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-with-same-affinity-runs-encode {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'too long');
+    ALTER TABLE t ALTER COLUMN v TO v2 varchar(3);
+}
+expect error {
+    value too long for varchar
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-from-custom-type-decodes-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v uuid) STRICT;
+    INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000');
+    ALTER TABLE t ALTER COLUMN v TO v2 TEXT;
+    SELECT id, v2, typeof(v2) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|550e8400-e29b-41d4-a716-446655440000|text
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-custom-type-parameter-change-runs-encode {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(5)) STRICT;
+    INSERT INTO t VALUES (1, 'abcde');
+    ALTER TABLE t ALTER COLUMN v TO v2 varchar(2);
+}
+expect error {
+    value too long for varchar
+}

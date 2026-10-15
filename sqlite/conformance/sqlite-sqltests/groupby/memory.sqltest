@@ -1,5 +1,108 @@
 @database :memory:
 
+setup group_key_expression {
+    CREATE TABLE t(x TEXT, z INT);
+    INSERT INTO t VALUES ('C', 1), ('A', 2), ('B', 3);
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-order-asc {
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x), min(z);
+}
+expect {
+    A
+    B
+    C
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-order-desc {
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x) DESC, min(z);
+}
+expect {
+    C
+    B
+    A
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-collate-limit {
+    SELECT min(x) FROM t
+    GROUP BY x COLLATE NOCASE ORDER BY x COLLATE NOCASE, min(z) LIMIT 1;
+}
+expect {
+    A
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-nested-order {
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x) || '', min(z);
+}
+expect {
+    A
+    B
+    C
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-nested-result {
+    SELECT lower(x) || '' FROM t GROUP BY lower(x) ORDER BY min(z);
+}
+expect {
+    c
+    a
+    b
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-having {
+    SELECT min(x) FROM t GROUP BY lower(x) HAVING lower(x) = 'a' ORDER BY min(z);
+}
+expect {
+    A
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-expression-index {
+    CREATE INDEX t_lower ON t(lower(x));
+    SELECT min(x) FROM t INDEXED BY t_lower
+    GROUP BY lower(x) ORDER BY lower(x), min(z);
+}
+expect {
+    A
+    B
+    C
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-bare-column {
+    SELECT min(x) FROM t GROUP BY x ORDER BY x, min(z);
+}
+expect {
+    A
+    B
+    C
+}
+
+@setup group_key_expression
+@cross-check-integrity
+test group-by-key-single-order-term {
+    SELECT min(x) FROM t GROUP BY lower(x) ORDER BY lower(x) DESC;
+}
+expect {
+    C
+    B
+    A
+}
+
 @cross-check-integrity
 test group_by_no_sorting_required_reordered_columns {
     create table t0 (a INT, b INT, c INT);
@@ -387,4 +490,45 @@ test group-by-negative {
 }
 expect error {
     1st GROUP BY term out of range - should be between 1 and 2
+}
+
+setup group_key_predicate {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, c TEXT);
+    INSERT INTO t VALUES (1, 'y'), (2, 'xy'), (3, 'z');
+}
+
+# A HAVING predicate that repeats a GROUP BY term must read the stored group
+# value, not the table column after the scan has finished.
+@setup group_key_predicate
+test having-repeats-group-by-is-null {
+    SELECT c FROM t GROUP BY c, a IS NULL HAVING a IS NULL;
+}
+expect {
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-comparison {
+    SELECT c, a > 1 FROM t GROUP BY c, a > 1 HAVING a > 1 ORDER BY c;
+}
+expect {
+    xy|1
+    z|1
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-in-list {
+    SELECT c FROM t GROUP BY c, a IN (2, 3) HAVING a IN (2, 3) ORDER BY c;
+}
+expect {
+    xy
+    z
+}
+
+@setup group_key_predicate
+test having-repeats-group-by-term-inside-or {
+    SELECT c FROM t GROUP BY c, a = 2 HAVING a = 2 OR c = 'y' ORDER BY c;
+}
+expect {
+    xy
+    y
 }

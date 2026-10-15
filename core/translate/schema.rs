@@ -11,6 +11,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
@@ -30,7 +31,7 @@ use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
-use crate::{Connection, MAIN_DB_ID};
+use crate::{Connection, Value, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
 use turso_parser::ast;
@@ -139,6 +140,15 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
             | ast::Expr::Subquery(_)
             | ast::Expr::SubqueryResult { .. }
             | ast::Expr::Id(_) => {
+                bail_parse_error!(
+                    "default value of column [{}] is not constant",
+                    col.col_name.as_str()
+                );
+            }
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
+            {
                 bail_parse_error!(
                     "default value of column [{}] is not constant",
                     col.col_name.as_str()
@@ -1692,14 +1702,14 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     } else {
         ""
     };
-    let ext_args = vtab
+    let module_args = vtab
         .args
         .iter()
-        .map(|a| turso_ext::Value::from_text(a.to_string()))
+        .map(|a| Value::from_text(a.to_string()))
         .collect::<Vec<_>>();
     let schema = module
         .implementation
-        .create_schema(ext_args)
+        .create_schema(module_args)
         .unwrap_or_default();
     let vtab_args = if let Some(first_paren) = schema.find('(') {
         let closing_paren = schema.rfind(')').unwrap_or_default();
@@ -1927,7 +1937,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -1954,7 +1964,6 @@ pub fn translate_drop_table(
                 schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
-                schema_table.is_strict,
             ))
         } else {
             None
@@ -1983,6 +1992,7 @@ pub fn translate_drop_table(
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
@@ -2093,6 +2103,7 @@ pub fn translate_drop_table(
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
                     fullscan: false,
+                    is_index: false,
                 });
                 program.preassign_label_to_next_insn(temp_end_label);
             }
@@ -2101,7 +2112,10 @@ pub fn translate_drop_table(
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(tbl_name.name.as_str()).cloned().collect()
+        s.get_indices(tbl_name.name.as_str())
+            .chain(s.get_unowned_backing_btrees(tbl_name.name.as_str()))
+            .cloned()
+            .collect()
     });
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
@@ -2247,6 +2261,7 @@ pub fn translate_drop_table(
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
@@ -2314,6 +2329,7 @@ pub fn translate_drop_table(
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(copy_temp_table_to_schema_loop_end_label);
         // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
@@ -2362,7 +2378,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(CollationSeq::NoCase),
         });
 
         program.emit_insn(Insn::Delete {
@@ -2376,6 +2392,7 @@ pub fn translate_drop_table(
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
             fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_loop_label);
@@ -2477,6 +2494,7 @@ pub fn translate_drop_table(
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
             fullscan: false,
+            is_index: false,
         });
 
         program.preassign_label_to_next_insn(end_ver_loop_label);
@@ -2945,16 +2963,31 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
-    // Check if any table uses this type
-    for (_, table) in resolver.schema().tables.iter() {
-        for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
-                bail_parse_error!(
-                    "cannot drop type {normalized_name}: used by column {} in table {}",
-                    col.name.as_deref().unwrap_or("?"),
-                    table.get_name()
-                );
-            }
+    // Check if any table in any database uses this type
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    database_ids.set(MAIN_DB_ID)?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
+        let column_using_type = resolver.with_schema(database_id, |schema| {
+            schema.tables.values().find_map(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .find(|col| normalize_ident(&col.ty_str) == normalized_name)
+                    .map(|col| {
+                        (
+                            col.name.as_deref().unwrap_or("?").to_string(),
+                            table.get_name().to_string(),
+                        )
+                    })
+            })
+        });
+        if let Some((column_name, table_name)) = column_using_type {
+            bail_parse_error!(
+                "cannot drop type {normalized_name}: used by column {column_name} in table {table_name}"
+            );
         }
     }
 
@@ -3025,6 +3058,7 @@ pub fn translate_drop_type(
         cursor_id: types_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(end_loop_label);

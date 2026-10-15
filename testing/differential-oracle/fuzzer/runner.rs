@@ -13,6 +13,7 @@ use std::io::Write;
 use std::panic::RefUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 use anyhow::{Context, Result, bail};
@@ -372,7 +373,7 @@ impl Fuzzer {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect()?;
+        let turso_conn = turso_db.connect(ConnectOpts::new())?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {

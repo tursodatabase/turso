@@ -102,4 +102,3 @@ test nested-shadowed-table-alias-same-column {
 expect {
     2
 }
-

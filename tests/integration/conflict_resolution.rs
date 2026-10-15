@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::params;
 
 // ---------------------------------------------------------------------------
@@ -2031,14 +2032,8 @@ fn test_update_or_fail_partial_success(tmp_db: TempDatabase) -> anyhow::Result<(
     let update = "UPDATE OR FAIL t SET val = 100 WHERE id >= 2";
     let limbo_res = limbo_db.execute(update);
     let sqlite_res = sqlite_db.execute(update, params![]);
-    assert!(
-        limbo_res.is_err(),
-        "limbo should return UNIQUE constraint error"
-    );
-    assert!(
-        sqlite_res.is_err(),
-        "sqlite should return UNIQUE constraint error"
-    );
+    assert_that!(limbo_res).is_err();
+    assert_that!(sqlite_res).is_err();
 
     // Verify: row 1 unchanged, row 2 updated, row 3 unchanged
     let verify = "SELECT id, val FROM t ORDER BY id";
@@ -2090,8 +2085,8 @@ fn test_update_or_fail_partial_success_in_txn(tmp_db: TempDatabase) -> anyhow::R
     let update = "UPDATE OR FAIL t SET val = 100 WHERE id >= 2";
     let limbo_res = limbo_db.execute(update);
     let sqlite_res = sqlite_db.execute(update, params![]);
-    assert!(limbo_res.is_err());
-    assert!(sqlite_res.is_err());
+    assert_that!(limbo_res).is_err();
+    assert_that!(sqlite_res).is_err();
 
     // Verify state inside the transaction: row 4 exists, row 2 updated
     let verify = "SELECT id, val FROM t ORDER BY id";
@@ -2145,8 +2140,8 @@ fn test_trigger_or_fail_preserves_prior_changes(tmp_db: TempDatabase) -> anyhow:
     let insert = "INSERT INTO t VALUES(1), (2)";
     let limbo_res = limbo_db.execute(insert);
     let sqlite_res = sqlite_db.execute(insert, params![]);
-    assert!(limbo_res.is_err(), "limbo should return UNIQUE error");
-    assert!(sqlite_res.is_err(), "sqlite should return UNIQUE error");
+    assert_that!(limbo_res).is_err();
+    assert_that!(sqlite_res).is_err();
 
     let verify = "SELECT id FROM t ORDER BY id";
     let limbo_rows = limbo_exec_rows(&limbo_db, verify);
@@ -2155,12 +2150,8 @@ fn test_trigger_or_fail_preserves_prior_changes(tmp_db: TempDatabase) -> anyhow:
         limbo_rows, sqlite_rows,
         "data mismatch after trigger UPDATE OR FAIL: limbo={limbo_rows:?} sqlite={sqlite_rows:?}"
     );
-    use rusqlite::types::Value::Integer;
-    assert_eq!(
-        sqlite_rows,
-        vec![vec![Integer(1)], vec![Integer(807742)]],
-        "expected the first row's insert and rename to persist"
-    );
+    // The first row's insert and its rename both persist.
+    assert_that!(sqlite_rows).is_equal_to(vec![row![1], row![807742]]);
 
     Ok(())
 }
@@ -2193,12 +2184,8 @@ fn test_ddl_replace_cascade_two_indexes(tmp_db: TempDatabase) -> anyhow::Result<
         limbo_rows, sqlite_rows,
         "DDL REPLACE cascade: limbo={limbo_rows:?} sqlite={sqlite_rows:?}"
     );
-    use rusqlite::types::Value::{Integer, Text};
-    assert_eq!(
-        sqlite_rows,
-        vec![vec![Integer(3), Text("x".into()), Text("q".into())]],
-        "only row 3 should remain"
-    );
+    // Only row 3 remains.
+    assert_that!(sqlite_rows).is_equal_to(vec![row![3, "x", "q"]]);
 
     Ok(())
 }
@@ -2234,12 +2221,8 @@ fn test_ddl_replace_cascade_two_indexes_update(tmp_db: TempDatabase) -> anyhow::
         "DDL REPLACE cascade update: limbo={limbo_rows:?} sqlite={sqlite_rows:?}"
     );
     {
-        use rusqlite::types::Value::{Integer, Text};
-        assert_eq!(
-            sqlite_rows,
-            vec![vec![Integer(3), Text("x".into()), Text("q".into())]],
-            "only row 3 should remain after REPLACE cascade"
-        );
+        // Only row 3 remains after the REPLACE cascade.
+        assert_that!(sqlite_rows).is_equal_to(vec![row![3, "x", "q"]]);
     }
 
     Ok(())
@@ -2268,11 +2251,8 @@ fn test_ddl_mixed_abort_replace_insert(tmp_db: TempDatabase) -> anyhow::Result<(
     let insert = "INSERT INTO t VALUES(3, 'x', 'q')";
     let limbo_res = limbo_db.execute(insert);
     let sqlite_res = sqlite_db.execute(insert, params![]);
-    assert!(limbo_res.is_err(), "limbo should fail on ABORT constraint");
-    assert!(
-        sqlite_res.is_err(),
-        "sqlite should fail on ABORT constraint"
-    );
+    assert_that!(limbo_res).is_err();
+    assert_that!(sqlite_res).is_err();
 
     let verify = "SELECT id, a, b FROM t ORDER BY id";
     let limbo_rows = limbo_exec_rows(&limbo_db, verify);
@@ -2319,11 +2299,8 @@ fn test_ddl_mixed_replace_abort_insert(tmp_db: TempDatabase) -> anyhow::Result<(
     let insert = "INSERT INTO t VALUES(3, 'x', 'q')";
     let limbo_res = limbo_db.execute(insert);
     let sqlite_res = sqlite_db.execute(insert, params![]);
-    assert!(limbo_res.is_err(), "limbo should fail on ABORT constraint");
-    assert!(
-        sqlite_res.is_err(),
-        "sqlite should fail on ABORT constraint"
-    );
+    assert_that!(limbo_res).is_err();
+    assert_that!(sqlite_res).is_err();
 
     let verify = "SELECT id, a, b FROM t ORDER BY id";
     let limbo_rows = limbo_exec_rows(&limbo_db, verify);
@@ -2479,8 +2456,8 @@ fn test_update_fk_child_violation_in_txn(tmp_db: TempDatabase) -> anyhow::Result
     let fail_sql = "UPDATE child SET pid = 999 WHERE id <= 2";
     let limbo_res = limbo_try_exec(&limbo_conn, fail_sql);
     let sqlite_res = sqlite_try_exec(&sqlite_conn, fail_sql);
-    assert!(sqlite_res.is_err(), "[{label}] SQLite should fail");
-    assert!(limbo_res.is_err(), "[{label}] Limbo should fail");
+    assert_that!(sqlite_res).is_err();
+    assert_that!(limbo_res).is_err();
 
     // Transaction should still be active, row 3 from the earlier INSERT should persist.
     limbo_conn.execute("COMMIT").unwrap();
@@ -4015,8 +3992,8 @@ fn test_statement_or_overrides_ddl_multirow_insert_or_fail_uq_replace(tmp_db: Te
         limbo_try_exec(&limbo_conn, s).unwrap();
     }
     let conflict_sql = "INSERT OR FAIL INTO t VALUES(2, 'y', 'new'), (3, 'x', 'conflict')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "multi-row OR FAIL overrides UQ REPLACE",
         &sqlite_conn,
@@ -4195,8 +4172,8 @@ fn test_trigger_before_insert_raise_fail_multirow(tmp_db: TempDatabase) {
     }
     // Multi-row insert: rows 2 succeeds, row 3 fails (FAIL keeps prior changes)
     let conflict_sql = "INSERT INTO t VALUES(2, 'second'), (3, 'third'), (4, 'fourth')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "trigger RAISE(FAIL) multi-row",
         &sqlite_conn,
@@ -4288,8 +4265,8 @@ fn test_trigger_before_insert_raise_rollback_in_txn(tmp_db: TempDatabase) {
     let conflict_sql = "INSERT INTO t VALUES(3, 'triggers-rollback')";
     let sqlite_err = sqlite_try_exec(&sqlite_conn, conflict_sql);
     let limbo_err = limbo_try_exec(&limbo_conn, conflict_sql);
-    assert!(sqlite_err.is_err(), "SQLite should fail");
-    assert!(limbo_err.is_err(), "Limbo should fail");
+    assert_that!(sqlite_err).is_err();
+    assert_that!(limbo_err).is_err();
     // After ROLLBACK, the transaction is gone — row 2 should not exist
     let diff = compare_tables(
         "trigger RAISE(ROLLBACK) in txn",
@@ -4398,8 +4375,8 @@ fn test_autocommit_fail_insert_partial_committed(tmp_db: TempDatabase) {
     }
     // Row (2,'new') succeeds, row (3,'existing') fails on UNIQUE — prior rows committed
     let conflict_sql = "INSERT OR FAIL INTO t VALUES(2, 'new'), (3, 'existing')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL INSERT partial",
         &sqlite_conn,
@@ -4433,8 +4410,8 @@ fn test_explicit_txn_fail_insert_partial_in_txn(tmp_db: TempDatabase) {
         limbo_try_exec(&limbo_conn, s).unwrap();
     }
     let conflict_sql = "INSERT OR FAIL INTO t VALUES(2, 'new'), (3, 'existing')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     // Row 2 should be visible within the transaction (FAIL keeps prior changes)
     let diff = compare_tables(
         "txn FAIL INSERT partial (before commit)",
@@ -4479,8 +4456,8 @@ fn test_autocommit_fail_update_partial_committed(tmp_db: TempDatabase) {
     }
     // UPDATE sets b='x' for all rows — row 1 is fine (already 'x'), row 2 conflicts
     let conflict_sql = "UPDATE OR FAIL t SET b = 'x'";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL UPDATE partial",
         &sqlite_conn,
@@ -4512,8 +4489,8 @@ fn test_explicit_txn_fail_update_partial_in_txn(tmp_db: TempDatabase) {
         limbo_try_exec(&limbo_conn, s).unwrap();
     }
     let conflict_sql = "UPDATE OR FAIL t SET b = 'x'";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     {
         let s = "COMMIT";
         sqlite_try_exec(&sqlite_conn, s).unwrap();
@@ -4547,8 +4524,8 @@ fn test_autocommit_fail_insert_pk_conflict(tmp_db: TempDatabase) {
         limbo_try_exec(&limbo_conn, s).unwrap();
     }
     let conflict_sql = "INSERT OR FAIL INTO t VALUES(2, 'ok'), (1, 'dup-pk'), (3, 'never')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL INSERT PK partial",
         &sqlite_conn,
@@ -4580,8 +4557,8 @@ fn test_autocommit_fail_update_notnull(tmp_db: TempDatabase) {
     }
     // NOT NULL violation on row 2 (set b=NULL conditionally)
     let conflict_sql = "UPDATE OR FAIL t SET b = CASE WHEN a = 2 THEN NULL ELSE b END";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL UPDATE NOT NULL",
         &sqlite_conn,
@@ -4612,8 +4589,8 @@ fn test_autocommit_fail_insert_mixed_constraints(tmp_db: TempDatabase) {
     }
     // Row (3,'z','ok') succeeds, row (4,'x','dup') fails on UNIQUE b='x'
     let conflict_sql = "INSERT OR FAIL INTO t VALUES(3, 'z', 'ok'), (4, 'x', 'dup')";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL INSERT mixed constraints",
         &sqlite_conn,
@@ -4645,8 +4622,8 @@ fn test_autocommit_fail_update_check_constraint(tmp_db: TempDatabase) {
     }
     // Set b to negative for row where a=2 — CHECK violation
     let conflict_sql = "UPDATE OR FAIL t SET b = CASE WHEN a = 2 THEN -1 ELSE b END";
-    assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    assert_that!(sqlite_try_exec(&sqlite_conn, conflict_sql)).is_err();
+    assert_that!(limbo_try_exec(&limbo_conn, conflict_sql)).is_err();
     let diff = compare_tables(
         "autocommit FAIL UPDATE CHECK",
         &sqlite_conn,

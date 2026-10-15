@@ -7,6 +7,7 @@ members = [
     "limbo",
     "pyturso",
     "scripts",
+    "thesis",
     "turso-test",
 ]
 
@@ -17,6 +18,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ee/67/531ea369ba64dcff5ec9c3402f9f51bf748cec26dde048a2f973a4eea7f5/annotated_types-0.7.0.tar.gz", hash = "sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89", size = 16081, upload-time = "2024-05-20T21:33:25.928Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/78/b6/6307fbef88d9b5ee7421e68d78a9f162e0da4900bc5f5793f6d3d0e34fb8/annotated_types-0.7.0-py3-none-any.whl", hash = "sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53", size = 13643, upload-time = "2024-05-20T21:33:24.1Z" },
+]
+
+[[package]]
+name = "antithesis"
+version = "0.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/55/66b63df7f5135506df6f51013b09b81880257024505db7010bcfe8129f07/antithesis-0.3.1.tar.gz", hash = "sha256:767778b72bb7cd02bc669107c5c6fc926988bd0dfac2fa0d6556db12dff4fee6", size = 32981, upload-time = "2026-09-03T15:30:13.556Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/3a/07d951fd4e96fa494011dae1a616c1190eef6c6bea134b59d533aa5df7a4/antithesis-0.3.1-py3-none-any.whl", hash = "sha256:4f6f2abca3abbde2e27a8d4333ea5c128d3998a3040899c24de1e7c13c3f7fd7", size = 25674, upload-time = "2026-09-03T15:30:12.472Z" },
 ]
 
 [[package]]
@@ -172,8 +182,22 @@ dependencies = [
     { name = "rich" },
 ]
 
+[package.dev-dependencies]
+antithesis = [
+    { name = "antithesis" },
+    { name = "pyturso" },
+    { name = "thesis" },
+]
+
 [package.metadata]
 requires-dist = [{ name = "rich", specifier = ">=15.0.0" }]
+
+[package.metadata.requires-dev]
+antithesis = [
+    { name = "antithesis", specifier = ">=0.1.17" },
+    { name = "pyturso", editable = "bindings/python" },
+    { name = "thesis", editable = "tools/thesis" },
+]
 
 [[package]]
 name = "markdown-it-py"
@@ -503,6 +527,25 @@ wheels = [
 ]
 
 [[package]]
+name = "thesis"
+version = "0.1.0"
+source = { editable = "tools/thesis" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "antithesis" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "antithesis", specifier = ">=0.1.17" },
+    { name = "pytest", specifier = ">=8" },
+]
+
+[[package]]
 name = "turso-test"
 version = "0.1.0"
 source = { editable = "testing" }
@@ -551,9 +594,9 @@ wheels = [
 
 [[package]]
 name = "urllib3"
-version = "2.7.0"
+version = "2.8.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]

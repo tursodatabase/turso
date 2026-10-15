@@ -10,6 +10,7 @@ use super::{
 use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
+    expression_index::selected_expression_index,
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -22,7 +23,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+    translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -170,11 +171,12 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
+                    let collation = Some(resolve_comparison_collseq_with_symbols(
+                        expr,
                         expr,
                         &plan.table_references,
                         Some(t_ctx.resolver.symbol_table),
-                    )?;
+                    )?);
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -357,9 +359,18 @@ pub fn compute_group_by_sort_order(
 /// scan loop, stored in the sorter, and read back during the sorter loop so that
 /// each sorted row sees the correct subquery result instead of a stale register
 /// value left over from the last scanned row.
+///
+/// An expression that the selected index stores is saved whole, as in SQLite,
+/// so the sorter row keeps the index value instead of recomputing it.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
     let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        if selected_expression_index(expr, &plan.table_references).is_some() {
+            if !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
+                leaf_columns.push(expr.clone());
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
         match expr {
             ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
                 if plan
@@ -507,14 +518,16 @@ fn collect_result_columns<'a>(
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
                     return Ok(WalkControl::SkipChildren);
                 }
-                // Skip children of GROUP BY expressions — their leaf columns
-                // are already covered by the GROUP BY key and don't need
-                // separate materialization in the sorter.
+                // GROUP BY uses this expression to form groups, but ORDER BY or HAVING
+                // may need its value afterward. We add it to result_columns so that
+                // value is read back even when the expression isn't selected, and skip
+                // its children because we reuse the expression's computed value.
                 if plan
                     .group_by
                     .as_ref()
                     .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
                 {
+                    result_columns.push(expr);
                     return Ok(WalkControl::SkipChildren);
                 }
             }
@@ -680,12 +693,13 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
+        let collation = resolve_comparison_collseq_with_symbols(
+            &group_by.exprs[i],
             &group_by.exprs[i],
             &plan.table_references,
             Some(t_ctx.resolver.symbol_table),
         )?;
-        c.collation = maybe_collation.unwrap_or_default();
+        c.collation = collation;
     }
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not

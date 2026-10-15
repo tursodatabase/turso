@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::util::{escape_sql_string_literal, quote_identifier};
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
@@ -97,7 +98,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             &["schema_version"],
         ),
         Synchronous => Pragma::new(
-            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["synchronous"],
         ),
         TempStore => Pragma::new(
@@ -140,6 +141,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["user_version"],
         ),
+        WalAutocheckpoint => Pragma::new(PragmaFlags::empty(), &["wal_autocheckpoint"]),
         WalCheckpoint => Pragma::new(PragmaFlags::NeedSchema, &["busy", "log", "checkpointed"]),
         AutoVacuum => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
@@ -189,6 +191,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         PragmaName::MvccGroupCommit => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_group_commit"],
+        ),
+        PragmaName::FtsMergeThreshold => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["fts_merge_threshold"],
         ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
@@ -447,16 +453,23 @@ impl PragmaVirtualTableCursor {
         // return the same rowids, as SQLite does.
         self.pos = 0;
 
-        if let Some(schema) = schema {
-            // Schema-qualified PRAGMA statements are not supported yet
+        // TODO: only synchronous supports a schema arg so far. Unblock the
+        // rest one by one, then delete this check.
+        if schema.is_some() && self.pragma_name != "synchronous" {
             return Err(LimboError::ParseError(format!(
-                "Schema argument is not supported yet (got schema: '{schema}')"
+                "Schema argument is not supported yet (got schema: '{}')",
+                schema.unwrap()
             )));
         }
 
-        let mut sql = format!("PRAGMA {}", self.pragma_name);
+        let mut sql = String::from("PRAGMA ");
+        if let Some(schema) = &schema {
+            sql.push_str(&quote_identifier(schema));
+            sql.push('.');
+        }
+        sql.push_str(&self.pragma_name);
         if let Some(arg) = &self.arg {
-            sql.push_str(&format!("=\"{arg}\""));
+            sql.push_str(&format!("='{}'", escape_sql_string_literal(arg)));
         }
 
         // Table-valued pragma helpers execute inside the parent statement's VM step.
@@ -472,14 +485,14 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Database, MemoryIO, SqliteDialect};
+    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
 
     #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE scan_target(first, second)")
             .unwrap();
 

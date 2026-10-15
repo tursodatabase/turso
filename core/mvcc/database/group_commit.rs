@@ -1,18 +1,21 @@
 use super::{LogRecord, TxID};
+use crate::io::Completion;
 use crate::storage::wal::TursoRwLock;
 #[cfg(test)]
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::SyncMode;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug)]
 pub(crate) struct QueuedCommit {
     pub ticket: u64,
     pub tx_id: TxID,
     pub log_record: LogRecord,
+    pub sync_mode: SyncMode,
 }
 
 #[derive(Debug)]
@@ -37,6 +40,7 @@ struct GroupState {
     next_ticket: u64,
     durable_through: u64,
     written_through: u64,
+    full_sync_written_through: u64,
     pending: VecDeque<QueuedCommit>,
     /// Tickets whose in-flight `log_tx` was discarded before the offset was
     /// advanced. The waiter rebuilds its log record instead of hanging.
@@ -46,6 +50,9 @@ struct GroupState {
     /// Waiters that dropped after `log_tx`. The leader finishes or rolls them
     /// back. They must not roll back themselves.
     abandoned: HashSet<TxID>,
+    /// Waiters asleep until the leader makes their ticket durable, asks
+    /// them to retry, or releases the commit lock.
+    parked: BTreeMap<u64, Completion>,
 }
 
 pub(crate) enum GroupWork {
@@ -64,25 +71,61 @@ pub(crate) struct CommitCoordinator {
     group: Mutex<GroupState>,
     #[cfg(test)]
     last_group_size: AtomicUsize,
+    #[cfg(test)]
+    park_calls: AtomicUsize,
 }
 
 impl CommitCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             pager_commit_lock: Arc::new(TursoRwLock::new()),
-            group_commit_enabled: AtomicBool::new(false),
+            group_commit_enabled: AtomicBool::new(true),
             group: Mutex::new(GroupState {
                 next_ticket: 0,
                 durable_through: 0,
                 written_through: 0,
+                full_sync_written_through: 0,
                 pending: VecDeque::new(),
                 retry: HashSet::default(),
                 issued: None,
                 abandoned: HashSet::default(),
+                parked: BTreeMap::new(),
             }),
             #[cfg(test)]
             last_group_size: AtomicUsize::new(0),
+            #[cfg(test)]
+            park_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// The completion a waiter sleeps on while another transaction holds the
+    /// commit lock. Returns a plain yield when the waiter can already make
+    /// progress, so the lock check and the registration happen under one
+    /// lock and a release cannot slip in between them.
+    pub(crate) fn park(&self, ticket: u64) -> Completion {
+        #[cfg(test)]
+        self.park_calls.fetch_add(1, Ordering::Relaxed);
+        let mut group = self.group.lock();
+        let can_progress = group.durable_through >= ticket
+            || group.retry.contains(&ticket)
+            || !self.pager_commit_lock.is_write_locked();
+        if can_progress {
+            return Completion::new_yield();
+        }
+        group
+            .parked
+            .entry(ticket)
+            .or_insert_with(Completion::new_wait)
+            .clone()
+    }
+
+    pub(crate) fn unlock_pager_commit_lock(&self) {
+        self.pager_commit_lock.unlock();
+        let woken = {
+            let mut group = self.group.lock();
+            take_parked_through(&mut group, u64::MAX)
+        };
+        wake(woken);
     }
 
     pub(crate) fn group_commit_enabled(&self) -> bool {
@@ -93,7 +136,7 @@ impl CommitCoordinator {
         self.group_commit_enabled.store(enabled, Ordering::Release);
     }
 
-    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord) -> u64 {
+    pub(crate) fn enqueue(&self, tx_id: TxID, log_record: LogRecord, sync_mode: SyncMode) -> u64 {
         let mut group = self.group.lock();
         group.next_ticket += 1;
         let ticket = group.next_ticket;
@@ -101,6 +144,7 @@ impl CommitCoordinator {
             ticket,
             tx_id,
             log_record,
+            sync_mode,
         });
         ticket
     }
@@ -148,9 +192,14 @@ impl CommitCoordinator {
     }
 
     pub(crate) fn mark_durable(&self, ticket: u64) {
-        let mut group = self.group.lock();
-        let ticket = dense_prefix_cap(ticket, group.written_through, &group.retry);
-        group.durable_through = group.durable_through.max(ticket);
+        let woken = {
+            let mut group = self.group.lock();
+            let ticket = dense_prefix_cap(ticket, group.written_through, &group.retry);
+            group.durable_through = group.durable_through.max(ticket);
+            let durable_through = group.durable_through;
+            take_parked_through(&mut group, durable_through)
+        };
+        wake(woken);
     }
 
     pub(crate) fn durable_through(&self) -> u64 {
@@ -165,6 +214,16 @@ impl CommitCoordinator {
         group.written_through = group.written_through.max(ticket);
     }
 
+    pub(crate) fn note_full_sync_written(&self, ticket: u64) {
+        let mut group = self.group.lock();
+        group.full_sync_written_through = group.full_sync_written_through.max(ticket);
+    }
+
+    pub(crate) fn needs_full_sync(&self) -> bool {
+        let group = self.group.lock();
+        group.full_sync_written_through > group.durable_through
+    }
+
     pub(crate) fn written_through(&self) -> u64 {
         self.group.lock().written_through
     }
@@ -173,6 +232,7 @@ impl CommitCoordinator {
     pub(crate) fn drop_pending(&self, ticket: u64) -> bool {
         let mut group = self.group.lock();
         group.retry.remove(&ticket);
+        group.parked.remove(&ticket);
         if let Some(index) = group
             .pending
             .iter()
@@ -186,14 +246,18 @@ impl CommitCoordinator {
     }
 
     pub(crate) fn request_retry(&self, ticket: u64) {
-        let mut group = self.group.lock();
-        group.retry.insert(ticket);
-        if group.written_through >= ticket {
-            group.written_through = ticket.saturating_sub(1);
-        }
-        if group.durable_through >= ticket {
-            group.durable_through = ticket.saturating_sub(1);
-        }
+        let woken = {
+            let mut group = self.group.lock();
+            group.retry.insert(ticket);
+            if group.written_through >= ticket {
+                group.written_through = ticket.saturating_sub(1);
+            }
+            if group.durable_through >= ticket {
+                group.durable_through = ticket.saturating_sub(1);
+            }
+            group.parked.remove(&ticket)
+        };
+        wake(woken);
     }
 
     pub(crate) fn take_retry(&self, ticket: u64) -> bool {
@@ -229,6 +293,29 @@ impl CommitCoordinator {
     #[cfg(test)]
     pub(crate) fn last_group_size(&self) -> usize {
         self.last_group_size.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parked_tickets(&self) -> Vec<u64> {
+        self.group.lock().parked.keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_calls(&self) -> usize {
+        self.park_calls.load(Ordering::Relaxed)
+    }
+}
+
+fn take_parked_through(group: &mut GroupState, through: u64) -> Vec<Completion> {
+    let keep = group.parked.split_off(&through.saturating_add(1));
+    std::mem::replace(&mut group.parked, keep)
+        .into_values()
+        .collect()
+}
+
+fn wake(parked: impl IntoIterator<Item = Completion>) {
+    for completion in parked {
+        completion.complete(0);
     }
 }
 

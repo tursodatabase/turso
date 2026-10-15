@@ -1,3 +1,4 @@
+use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -98,6 +99,15 @@ pub fn translate_create_trigger(
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_trigger_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            trigger_name.name.as_str()
+        );
+    }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
@@ -157,6 +167,13 @@ pub fn translate_create_trigger(
         );
     }
 
+    if time
+        .as_ref()
+        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
+    {
+        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+    }
+
     // Verify the table exists (use the table's database, not the trigger's).
     let table = resolver.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)
@@ -178,13 +195,6 @@ pub fn translate_create_trigger(
     };
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
-    }
-
-    if time
-        .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
@@ -586,6 +596,7 @@ pub fn translate_drop_trigger(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: search_loop_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(done_label);

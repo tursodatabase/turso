@@ -1134,7 +1134,9 @@ mod tests {
         user_url: String,
         db_url: String,
         host: String,
+        db_prefix: String,
         server: Option<Child>,
+        _sync_dir_created_by_harness: Option<TempDir>,
         client: Client,
     }
 
@@ -1174,11 +1176,18 @@ mod tests {
                     user_url: USER_URL.to_string(),
                     db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
                     host: format!("{name}--{name}--{name}.localhost"),
+                    db_prefix: String::new(),
                     server: None,
+                    _sync_dir_created_by_harness: None,
                     client,
                 })
             } else {
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
+
+                let sync_dir = env::var("LOCAL_SYNC_SERVER_DIR")
+                    .is_ok()
+                    .then(|| TempDir::new().context("failed to create --sync-dir tempdir"))
+                    .transpose()?;
 
                 // The random port can be unusable: Windows runners reserve
                 // large chunks of 10_000..=65_535 for Hyper-V (bind fails with
@@ -1192,13 +1201,19 @@ mod tests {
                 for attempt in 1..=SPAWN_ATTEMPTS {
                     let port: u16 = rand::rng().random_range(10_000..=65_535);
 
+                    let mut args = vec!["--sync-server".to_string(), format!("0.0.0.0:{port}")];
+                    if let Some(dir) = &sync_dir {
+                        args.push("--sync-dir".to_string());
+                        args.push(dir.path().to_string_lossy().into_owned());
+                    }
+
                     // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
                     // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
                     // fills, the child blocks forever inside write() and stops
                     // servicing HTTP requests, deadlocking sync operations in
                     // long-running tests like test_sync_parallel_writes_with_sync_ops.
                     let mut child = Command::new(&server_bin)
-                        .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                        .args(&args)
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
@@ -1210,11 +1225,19 @@ mod tests {
                     let started = Instant::now();
                     loop {
                         if client.get(&user_url).send().await.is_ok() {
+                            let db_prefix = if sync_dir.is_some() {
+                                format!("/db/{}", random_str().to_ascii_lowercase())
+                            } else {
+                                String::new()
+                            };
+                            let db_url = format!("{user_url}{db_prefix}");
                             return Ok(Self {
-                                user_url: user_url.clone(),
-                                db_url: user_url,
+                                user_url,
+                                db_url,
                                 host: String::new(),
+                                db_prefix,
                                 server: Some(child),
+                                _sync_dir_created_by_harness: sync_dir,
                                 client,
                             });
                         }
@@ -1258,7 +1281,7 @@ mod tests {
         pub async fn db_sql(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
             let resp = self
                 .client
-                .post(format!("{}/v2/pipeline", self.user_url))
+                .post(format!("{}{}/v2/pipeline", self.user_url, self.db_prefix))
                 .header("Host", &self.host)
                 .json(&json!({
                     "requests": [{
@@ -1771,6 +1794,57 @@ mod tests {
             assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
             assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
+    }
+
+    /// A partial-sync replica on a real file uses `SparseLinuxIo`, unlike the
+    /// `:memory:` replicas the other partial-sync tests build. Checkpointing
+    /// twice must work: the first call folds the WAL frames and truncates the
+    /// WAL file to zero bytes, the second call runs with an empty WAL.
+    ///
+    /// Linux-only: elsewhere a file-backed partial replica gets `PlatformIO`,
+    /// whose `has_hole` panics, so partial sync needs a memory database there.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    pub async fn test_sync_partial_checkpoint_with_empty_wal() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.db");
+        let wal_path = dir.path().join("partial.db-wal");
+        let db = crate::sync::Builder::new_remote(path.to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .with_partial_sync_opts_experimental(PartialSyncOpts {
+                bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
+                segment_size: 128 * 1024,
+                prefetch: false,
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let conn = db.connect().await.unwrap();
+        conn.execute("INSERT INTO t VALUES (randomblob(1024))", ())
+            .await
+            .unwrap();
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "local write must leave frames in the main WAL"
+        );
+
+        db.checkpoint().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "checkpoint must leave an empty main WAL file"
+        );
+
+        db.checkpoint().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

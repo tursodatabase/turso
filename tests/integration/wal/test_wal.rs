@@ -1,7 +1,8 @@
 use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
+use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::{ConnectOpts, Connection, LimboError, Result};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -24,19 +25,19 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     // checkpoint result should return > 0 num pages now as database has data
     let res = execute_and_get_ints(&conn, "pragma wal_checkpoint;")?;
     println!("'pragma wal_checkpoint;' returns: {res:?}");
-    assert_eq!(res.len(), 3);
-    assert_eq!(res[0], 0); // checkpoint successfully
-    assert!(res[1] > 0); // num pages in wal
-    assert!(res[2] > 0); // num pages checkpointed successfully
+    // [busy, pages in the wal, pages checkpointed]
+    assert_that!(res)
+        .has_length(3)
+        .satisfies_with_message("report no busy flag and some pages", |res| {
+            res[0] == 0 && res[1] > 0 && res[2] > 0
+        });
 
     do_flush(&conn, &tmp_db).unwrap();
 
     // hash AFTER checkpoint - must be identical
     let hash_after = compute_dbhash(&tmp_db);
-    assert_eq!(
-        hash_before.hash, hash_after.hash,
-        "checkpoint changed database content!!!!!!"
-    );
+    // A checkpoint must not change the database content.
+    assert_that!(hash_after.hash).is_equal_to(hash_before.hash);
 
     Ok(())
 }
@@ -56,11 +57,8 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     conn.execute("ROLLBACK;")?;
 
     let checkpoint = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
-    assert_eq!(
-        checkpoint,
-        vec![0, 0, 0],
-        "truncate checkpoint should not return busy after rollback"
-    );
+    // A truncate checkpoint must not come back busy after a rollback.
+    assert_that!(checkpoint).is_equal_to(vec![0, 0, 0]);
     Ok(())
 }
 
@@ -196,7 +194,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     let db = tmp_db.lock().unwrap().limbo_database();
 
     {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         match conn.query("CREATE TABLE t (id)")? {
             Some(ref mut rows) => {
                 rows.run_with_row_callback(|_| Ok(())).unwrap();
@@ -210,7 +208,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     const ROWS_WRITE: usize = 1000;
     let tmp_db_w = db.clone();
     let writer_thread = std::thread::spawn(move || {
-        let conn = tmp_db_w.connect().unwrap();
+        let conn = tmp_db_w.connect(ConnectOpts::new()).unwrap();
         for i in 0..ROWS_WRITE {
             conn.execute(format!("INSERT INTO t values({i})").as_str())
                 .unwrap();
@@ -220,7 +218,7 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     });
     let rows_ = rows.clone();
     let reader_thread = std::thread::spawn(move || {
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         loop {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
@@ -294,14 +292,14 @@ fn test_wal_read_lock_released_on_conn_drop() {
     let db = tmp_db.limbo_database();
 
     // Setup: create table and insert data so WAL has content
-    let setup_conn = db.connect().unwrap();
+    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
     setup_conn
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
     setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let conn1 = db.connect().unwrap();
-    let conn2 = db.connect().unwrap();
+    let conn1 = db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
     // conn1 starts a read transaction and panics while holding the read lock
     let join_result = std::thread::spawn(move || {
@@ -332,8 +330,8 @@ fn test_wal_write_lock_released_on_conn_drop() {
     let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
     let db = tmp_db.limbo_database();
 
-    let conn1 = db.connect().unwrap();
-    let conn2 = db.connect().unwrap();
+    let conn1 = db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db.connect(ConnectOpts::new()).unwrap();
 
     let join_result = std::thread::spawn(move || {
         conn1.execute("BEGIN IMMEDIATE").unwrap();

@@ -155,7 +155,7 @@ impl Connection {
     ///
     /// The statements execute in order. Execution stops at the first
     /// statement that fails: the remaining statements are skipped and the
-    /// returned [`Error::BatchStatementFailed`](crate::Error::BatchStatementFailed)
+    /// returned [`Error::BatchStatementFailed`]
     /// carries the zero-based index of the failing statement together with
     /// the underlying error.
     ///
@@ -208,7 +208,7 @@ impl Connection {
     /// Like [`batch`](Connection::batch), but the statements are wrapped in
     /// `BEGIN <behavior>` / `COMMIT`, with a `ROLLBACK` on failure: either
     /// every statement commits or none does. On failure the returned
-    /// [`Error::BatchStatementFailed`](crate::Error::BatchStatementFailed)
+    /// [`Error::BatchStatementFailed`]
     /// carries the zero-based index of the failing statement.
     ///
     /// This method owns the surrounding transaction, so the statements must
@@ -486,7 +486,7 @@ impl Connection {
 
     /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
     ///
-    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
+    /// This api defers slighty from: <https://www.sqlite.org/c3ref/busy_timeout.html>
     ///
     /// Instead of sleeping for linear amount of time specified by the user,
     /// we will sleep in phases, until the the total amount of time is reached.

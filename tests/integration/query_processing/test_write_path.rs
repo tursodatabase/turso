@@ -1,13 +1,16 @@
+use crate::assertions::NULL;
 use crate::common::{
     self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
+use asserting::prelude::*;
 use log::debug;
-use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
+use turso_core::{
+    CheckpointMode, ConnectOpts, Connection, LimboError, Numeric, Row, Statement, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -864,7 +867,7 @@ fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
 #[turso_macros::test()]
 pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -873,18 +876,13 @@ pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Null
-        ]],
-        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
-    );
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id"))
+        .is_equal_to(vec![row![1, NULL]]);
 }
 
 #[turso_macros::test]
 pub fn delete_eq_correct(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -894,24 +892,13 @@ pub fn delete_eq_correct(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Null
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(-2),
-            ]
-        ],
-        limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id")
-    );
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id"))
+        .is_equal_to(vec![row![1, NULL], row![2, -2]]);
 }
 
 #[turso_macros::test]
 pub fn upsert_conflict(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
         "INSERT INTO t VALUES (1, 2, 100);",
@@ -923,6 +910,36 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     assert_eq!(rows, vec![(1, 2, 42)]);
 }
 
+#[test]
+fn insert_continues_sqlite_created_mixed_case_autoincrement_sequence() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(
+        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO T1(a, b) VALUES(40, 0); DELETE FROM T1",
+    )?;
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO T1(b) VALUES(1)")?;
+    conn.execute("INSERT INTO T1(b) VALUES(2), (3)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM T1 ORDER BY a");
+    assert_eq!(rows, vec![(41,), (42,), (43,)]);
+    drop(conn);
+    drop(db);
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let sequences: Vec<(String, i64)> = sqlite
+        .prepare("SELECT name, seq FROM sqlite_sequence")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(sequences, vec![("T1".to_string(), 43)]);
+    sqlite.execute("INSERT INTO T1(b) VALUES(4)", [])?;
+    let last: i64 = sqlite.query_row("SELECT max(a) FROM T1", [], |row| row.get(0))?;
+    assert_eq!(last, 44);
+    Ok(())
+}
+
 #[turso_macros::test]
 pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // Regression: qualified column refs in RETURNING (e.g. "users"."id")
@@ -930,25 +947,20 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // quoted identifiers, because INSERT stored the joined-table identifier
     // via `Name::to_string` (which preserves quotes) instead of normalizing
     // it like DELETE/UPDATE do.
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
         .unwrap();
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Text("ret".to_string()),
-        ]],
-        limbo_exec_rows(
-            &conn,
-            r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
-        )
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
+    ))
+    .is_equal_to(vec![row![1, "ret"]]);
 }
 
 #[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for _ in 0..COUNT {
@@ -998,7 +1010,7 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for i in 0..COUNT {
@@ -1039,7 +1051,7 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
     conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
@@ -1069,7 +1081,7 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1111,7 +1123,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
 #[turso_macros::test]
 pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1195,8 +1207,8 @@ fn test_unique_complex_key() {
 #[turso_macros::test]
 pub fn test_conflict_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1206,39 +1218,17 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
         LimboError::Constraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![2, 20]]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![2, 20]]);
 }
 
 #[turso_macros::test]
 pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1250,39 +1240,17 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
         LimboError::Constraint(_)
     ));
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ],
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ],
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![4, 40]]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t"))
+        .is_equal_to(vec![row![1, 10], row![4, 40]]);
 }
 
 #[turso_macros::test]
 pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1296,48 +1264,18 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
     conn1.execute("COMMIT").unwrap();
     conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(3),
-                rusqlite::types::Value::Integer(30),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ]
-        ],
-        limbo_exec_rows(&conn1, "SELECT * FROM t")
-    );
-    assert_eq!(
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(3),
-                rusqlite::types::Value::Integer(30),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(4),
-                rusqlite::types::Value::Integer(40),
-            ]
-        ],
-        limbo_exec_rows(&conn2, "SELECT * FROM t")
-    );
+    assert_that!(limbo_exec_rows(&conn1, "SELECT * FROM t")).is_equal_to(vec![
+        row![1, 10],
+        row![2, 20],
+        row![3, 30],
+        row![4, 40],
+    ]);
+    assert_that!(limbo_exec_rows(&conn2, "SELECT * FROM t")).is_equal_to(vec![
+        row![1, 10],
+        row![2, 20],
+        row![3, 30],
+        row![4, 40],
+    ]);
 }
 
 #[turso_macros::test]
@@ -1345,8 +1283,8 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
     limbo: TempDatabase,
 ) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect()?;
-    let conn2 = limbo.db.connect()?;
+    let conn1 = limbo.db.connect(ConnectOpts::new())?;
+    let conn2 = limbo.db.connect(ConnectOpts::new())?;
 
     conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
     for i in 1..=8 {
@@ -1460,13 +1398,7 @@ pub fn test_busy_snapshot_immediate() {
     conn1.execute("CREATE TABLE t1(x)").unwrap();
 
     let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
-    assert_eq!(
-        rows,
-        vec![
-            vec![rusqlite::types::Value::Text("t2".to_string())],
-            vec![rusqlite::types::Value::Text("t1".to_string())],
-        ]
-    );
+    assert_that!(rows).is_equal_to(vec![row!["t2"], row!["t1"]]);
 }
 
 #[test]
@@ -1829,6 +1761,37 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+#[turso_macros::test(views)]
+fn test_delete_all_updates_dependent_materialized_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT id, title FROM t",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "WITH RECURSIVE c(x) AS (
+            VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 300
+         ) INSERT INTO t SELECT x, printf('title-%d', x) FROM c",
+    )?;
+
+    common::run_query(&tmp_db, &conn, "DELETE FROM t")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t")).is_empty();
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM v")).is_empty();
+
+    common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES(301, 'after-clear')")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT id, title FROM v"))
+        .is_equal_to(vec![row![301, "after-clear"]]);
+    Ok(())
+}
+
 /// Regression test for simulator seed 867: UPDATE on an attached database table
 /// that changes the primary key (rowid) while a UNIQUE index exists would use
 /// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,
@@ -1849,13 +1812,11 @@ fn test_update_pk_on_attached_table_with_unique_index(tmp_db: TempDatabase) -> a
     conn.execute("INSERT INTO aux1.t1 VALUES (1, 'a'), (2, 'b')")?;
     conn.execute("UPDATE aux1.t1 SET pk = 100 WHERE pk = 2")?;
 
-    let rows = limbo_exec_rows(&conn, "SELECT pk, extra FROM aux1.t1 ORDER BY pk");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![RValue::Integer(1), RValue::Text("a".into())]);
-    assert_eq!(
-        rows[1],
-        vec![RValue::Integer(100), RValue::Text("b".into())]
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT pk, extra FROM aux1.t1 ORDER BY pk"
+    ))
+    .is_equal_to(vec![row![1, "a"], row![100, "b"]]);
 
     Ok(())
 }
@@ -1932,14 +1893,9 @@ fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> an
 
     // conn2 reads from the attached table. With the bug, it would use a stale
     // snapshot and only see 1 row instead of 2.
-    let rows = limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x");
-    assert_eq!(
-        rows.len(),
-        2,
-        "conn2 should see both rows after conn1's commit"
-    );
-    assert_eq!(rows[0], vec![RValue::Integer(1)]);
-    assert_eq!(rows[1], vec![RValue::Integer(2)]);
+    // conn2 sees both rows after conn1 commits.
+    assert_that!(limbo_exec_rows(&conn2, "SELECT x FROM aux1.t1 ORDER BY x"))
+        .is_equal_to(vec![row![1], row![2]]);
 
     Ok(())
 }
@@ -1988,32 +1944,15 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
     assert_eq!(ic, "ok", "integrity_check inside transaction: {ic}");
 
     let rows = limbo_exec_rows(&conn, "SELECT id,u,b,c FROM t ORDER BY id");
-    assert_eq!(
-        rows,
-        vec![
-            vec![
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(1),
-                rusqlite::types::Value::Integer(10),
-                rusqlite::types::Value::Integer(10)
-            ],
-            vec![
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(2),
-                rusqlite::types::Value::Integer(20),
-                rusqlite::types::Value::Integer(20)
-            ],
-        ],
-        "table contents must be unchanged after failed UPSERT"
-    );
+    assert_that!(rows).is_equal_to(vec![row![1, 1, 10, 10], row![2, 2, 20, 20]]);
 
     // Row 1 must still be reachable through every index.
     let via_idx_b = limbo_exec_rows(&conn, "SELECT id FROM t INDEXED BY idx_b WHERE b=10");
-    assert_eq!(via_idx_b, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_idx_b).is_equal_to(vec![row![1]]);
     let via_u = limbo_exec_rows(&conn, "SELECT id FROM t WHERE u=1");
-    assert_eq!(via_u, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_u).is_equal_to(vec![row![1]]);
     let via_c = limbo_exec_rows(&conn, "SELECT id FROM t WHERE c=10");
-    assert_eq!(via_c, vec![vec![rusqlite::types::Value::Integer(1)]]);
+    assert_that!(via_c).is_equal_to(vec![row![1]]);
 
     conn.execute("COMMIT")?;
 

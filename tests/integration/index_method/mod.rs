@@ -1,3 +1,11 @@
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
+use turso_core::ConnectOpts;
+
+fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
+    matches!(detail, rusqlite::types::Value::Text(d)
+        if d.contains("INDEX METHOD") || d.contains("fts_articles"))
+}
+use asserting::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -108,6 +116,46 @@ fn fts_stats_in_txn(
     stats
 }
 
+/// The ids whose `body` matches `term`, in id order. There is one row per
+/// hit, so a document that matches twice (two live postings) shows up twice.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn fts_ids(conn: &Arc<turso_core::Connection>, term: &str) -> Vec<i64> {
+    limbo_exec_rows(
+        conn,
+        &format!("SELECT id FROM docs WHERE fts_match(body, '{term}') ORDER BY id"),
+    )
+    .into_iter()
+    .map(|row| match row.as_slice() {
+        [rusqlite::types::Value::Integer(id)] => *id,
+        other => panic!("expected one integer id, got {other:?}"),
+    })
+    .collect()
+}
+
+/// The paths of every tombstone row in an FTS index's backing store, read
+/// at a fresh snapshot of `conn`.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn fts_tombstone_paths(
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    index_name: &str,
+) -> Vec<String> {
+    conn.execute("BEGIN").unwrap();
+    let _ = limbo_exec_rows(conn, &format!("SELECT count(*) FROM {table_name}"));
+    let mut dumper =
+        turso_core::index_method::fts::FtsBackingRowDumper::new(conn, MAIN_DB_ID, index_name)
+            .unwrap();
+    run(db, || dumper.step()).unwrap();
+    let rows = std::mem::take(&mut dumper.rows);
+    drop(dumper);
+    conn.execute("ROLLBACK").unwrap();
+    rows.into_iter()
+        .map(|(path, _, _, _)| path)
+        .filter(|path| path.starts_with("fts2/tomb/"))
+        .collect()
+}
+
 fn sparse_vector(v: &str) -> Value {
     let vector = vector::operations::text::vector_from_text(VectorType::Float32Sparse, v).unwrap();
     vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
@@ -165,6 +213,56 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(schema_rows(), vec!["t"]);
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_backing_btree_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE example (name TEXT)").unwrap();
+    conn.execute("CREATE INDEX example_idx ON example USING backing_btree (name)")
+        .unwrap();
+    conn.execute("DROP TABLE example").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_on_the_same_table(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("DROP TABLE vectors").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
+}
+
+#[turso_macros::test]
+fn drop_table_frees_pages_of_index_method_with_backing_btrees_after_table_rename(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("ALTER TABLE vectors RENAME TO renamed")
+        .unwrap();
+    conn.execute("DROP TABLE renamed").unwrap();
+
+    let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
+    assert_eq!(rows, Vec::<(String,)>::new());
 }
 
 // This raw-cursor test manually opens pager write transactions.
@@ -390,6 +488,25 @@ fn test_vector_sparse_ivf_mvcc_sql(tmp_db: TempDatabase) {
         nearest("[0, 1, 0]"),
         vec![vec![rusqlite::types::Value::Integer(2)]]
     );
+}
+
+#[turso_macros::test]
+fn vector_argument_dependencies_own_row(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding, query)",
+        "CREATE INDEX vx ON vectors USING toy_vector_sparse_ivf(embedding)",
+        "INSERT INTO vectors VALUES
+         (1, vector32_sparse('[1,0,0]'), vector32_sparse('[0,1,0]')),
+         (2, vector32_sparse('[0,1,0]'), vector32_sparse('[0,1,0]')),
+         (3, vector32_sparse('[1,1,0]'), vector32_sparse('[1,0,0]'))",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let query = "SELECT id FROM vectors ORDER BY vector_distance_jaccard(embedding, query) LIMIT 2";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![2], row![3]]);
+    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert_that!(plan).has_no_step_containing("INDEX METHOD");
 }
 
 // This differential harness disables automatic WAL actions on both databases.
@@ -665,6 +782,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)), // pattern index
             Register::Value(Value::Text(turso_core::types::Text::from("Rust"))),
             Register::Value(Value::from_i64(10)), // limit
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -701,12 +819,81 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(turso_core::types::Text::from("Python"))),
             Register::Value(Value::from_i64(10)),
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
         let rowid = run(&tmp_db, || cursor.query_rowid()).unwrap().unwrap();
         assert_eq!(rowid, 2);
         assert!(!run(&tmp_db, || cursor.query_next()).unwrap());
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_query_input_types(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO d VALUES (1, '42'), (2, NULL), (3, '7.5')")
+        .unwrap();
+
+    for (query, expected) in [("NULL", vec![]), ("42", vec![1]), ("7.5", vec![3])] {
+        for suffix in ["", " LIMIT 10"] {
+            let sql = format!("SELECT id FROM d WHERE fts_match(body, {query}){suffix}");
+            let rows = limbo_exec_rows(&conn, &sql);
+            assert_that!(rows)
+                .named(&sql)
+                .column(0)
+                .contains_exactly(expected.iter().copied().map(Cell::from).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_bound_query_input_types(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO d VALUES (1, '42'), (2, NULL), (3, '7.5')")
+        .unwrap();
+
+    for sql in [
+        "SELECT id FROM d WHERE fts_match(body, ?1)",
+        "SELECT id FROM d WHERE fts_match(body, ?1) LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1)",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d ORDER BY score DESC LIMIT 10",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        for (query, expected) in [
+            (Value::build_text("42"), vec![Value::from_i64(1)]),
+            (Value::Null, vec![]),
+            (Value::from_i64(42), vec![Value::from_i64(1)]),
+            (Value::from_f64(7.5), vec![Value::from_i64(3)]),
+            (Value::from_blob(b"42".to_vec()), vec![Value::from_i64(1)]),
+            (Value::Null, vec![]),
+        ] {
+            stmt.reset().unwrap();
+            stmt.bind_at(1.try_into().unwrap(), query.clone()).unwrap();
+            let mut ids = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                ids.push(row.get_value(0).clone());
+                if row.len() > 1 {
+                    assert!(row.get_value(1).as_float() > 0.0);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ids, expected, "{sql}, query={query:?}");
+        }
     }
 }
 
@@ -737,17 +924,10 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'database') as score, id, title FROM articles WHERE fts_match(title, body, 'database') ORDER BY score DESC LIMIT 10",
     );
-    assert_eq!(rows.len(), 2); // Should match docs 1 and 3
-                               // Verify results contain expected IDs
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
+    assert_that!(rows)
+        .named("ids matching 'database'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test fts_match in WHERE clause with fts_score (combined pattern)
     // 'web' appears in doc 2 ("Web Development") and doc 4 ("web services")
@@ -755,16 +935,10 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'web') as score, id, title FROM articles WHERE fts_match(title, body, 'web')",
     );
-    assert_eq!(rows.len(), 2); // Should match docs 2 and 4
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&2));
-    assert!(ids.contains(&4));
+    assert_that!(rows)
+        .named("ids matching 'web'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(2), Cell::from(4)]);
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -794,39 +968,24 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
         &conn,
         "SELECT fts_score(title, body, 'test') as score, id FROM notes WHERE fts_match(title, body, 'test') ORDER BY score DESC LIMIT 2",
     );
-    assert_eq!(rows.len(), 2);
-    // First result should have higher score than second
-    let score1 = match &rows[0][0] {
-        rusqlite::types::Value::Real(r) => *r,
-        _ => panic!("Expected Real"),
-    };
-    let score2 = match &rows[1][0] {
-        rusqlite::types::Value::Real(r) => *r,
-        _ => panic!("Expected Real"),
-    };
-    assert!(score1 >= score2, "Results should be ordered by score DESC");
+    assert_that!(rows)
+        .has_length(2)
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 
     // Test without LIMIT - should return all matches
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_score(title, body, 'test') as score, id FROM notes WHERE fts_match(title, body, 'test') ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 3); // Posts 1, 2, and 4 contain "test"
-
-    // Verify all scores are in descending order
-    let scores: Vec<f64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    for i in 1..scores.len() {
-        assert!(
-            scores[i - 1] >= scores[i],
-            "Scores should be in descending order"
-        );
-    }
+    assert_that!(rows)
+        .has_length(3) // Posts 1, 2, and 4 contain "test"
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -907,61 +1066,55 @@ fn test_fts_function_recognition(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, author, title, category, views, fts_score(title, body, 'Rust') as score FROM articles WHERE fts_match(title, body, 'Rust')",
     );
-    assert_eq!(rows.len(), 3); // Posts 1, 3, 4 contain "Rust"
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
-    assert!(ids.contains(&4));
+    assert_that!(rows)
+        .named("ids matching 'Rust'")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3), Cell::from(4)]);
 
     // Test 2: Query with extra WHERE and multiple columns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, title, views FROM articles WHERE fts_match(title, body, 'Rust') AND author = 'Alice'",
     );
-    assert_eq!(rows.len(), 2); // Posts 1 and 3 by Alice containing Rust
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&3));
+    assert_that!(rows)
+        .named("ids by Alice matching 'Rust'")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test 3: Complex query with score, extra columns, WHERE, and ORDER BY
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_score(title, body, 'Rust') as score, id, title, author FROM articles WHERE fts_match(title, body, 'Rust') AND category = 'tech' ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 2); // Posts 1 and 4 are tech posts about Rust
-                               // Verify scores are in descending order
-    let scores: Vec<f64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Real(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    assert!(scores.len() == 2);
-    assert!(scores[0] >= scores[1]);
+    assert_that!(rows)
+        .has_length(2) // Posts 1 and 4 are tech posts about Rust
+        .column(0)
+        .satisfies_with_message(REAL_SCORES_NEVER_INCREASE, |scores| {
+            scores_never_increase(scores)
+        });
 
     // Test 4: Query with only fts_match (no fts_score) and extra columns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, author, views FROM articles WHERE fts_match(title, body, 'Python')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 2),
-        _ => panic!("Expected integer id"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(2));
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+const REAL_SCORES_NEVER_INCREASE: &str = "hold real scores that never increase";
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn scores_never_increase(scores: &[rusqlite::types::Value]) -> bool {
+    scores.windows(2).all(|pair| match (&pair[0], &pair[1]) {
+        (rusqlite::types::Value::Real(before), rusqlite::types::Value::Real(after)) => {
+            before >= after
+        }
+        _ => false,
+    })
 }
 
 /// Test query patterns that wouldn't work with pattern-based matching
@@ -1008,32 +1161,25 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, title FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY id ASC",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify order by id
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ids, vec![1, 3, 4, 5]);
+    assert_that!(rows)
+        .named("ids read in ascending order")
+        .column(0)
+        .contains_exactly([Cell::from(1), Cell::from(3), Cell::from(4), Cell::from(5)]);
 
     // Test 3: ORDER BY non-score column DESC - wouldn't match patterns
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id, created_at FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY created_at DESC",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify order by created_at DESC
-    let created_ats: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(created_ats, vec![5000, 4000, 3000, 1000]);
+    assert_that!(rows)
+        .named("created_at read in descending order")
+        .column(1)
+        .contains_exactly([
+            Cell::from(5000),
+            Cell::from(4000),
+            Cell::from(3000),
+            Cell::from(1000),
+        ]);
 
     // Test 4: Multiple WHERE conditions with different operators
     // Patterns don't have additional WHERE conditions
@@ -1041,16 +1187,10 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'Rust') AND created_at >= 3000 AND author = 'Alice'",
     );
-    assert_eq!(rows.len(), 2); // Posts 3 and 5 (Alice, Rust, created_at >= 3000)
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&3));
-    assert!(ids.contains(&5));
+    assert_that!(rows)
+        .named("ids by Alice created at 3000 or later")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(3), Cell::from(5)]);
 
     // Test 5: LIMIT with non-pattern SELECT columns
     let rows = limbo_exec_rows(
@@ -1064,11 +1204,10 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, author || ' wrote ' || title as description FROM docs WHERE fts_match(title, body, 'Python')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][1] {
-        rusqlite::types::Value::Text(t) => assert_eq!(t, "Bob wrote Python Guide"),
-        _ => panic!("Expected text"),
-    }
+    assert_that!(rows)
+        .single_element()
+        .nth_element(1)
+        .is_equal_to(Cell::from("Bob wrote Python Guide"));
 
     // Test 7: fts_score with extra columns and WHERE - wouldn't match combined patterns
     let rows = limbo_exec_rows(
@@ -1076,44 +1215,30 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
         "SELECT fts_score(title, body, 'Rust') as score, id, author, category FROM docs WHERE fts_match(title, body, 'Rust') AND category = 'tech'",
     );
     // Should return tech posts about Rust: 1, 4, 5
-    assert_eq!(rows.len(), 3);
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&4));
-    assert!(ids.contains(&5));
-    // Verify scores are returned
-    for row in &rows {
-        match &row[0] {
-            rusqlite::types::Value::Real(score) => assert!(*score > 0.0),
-            _ => panic!("Expected real score"),
-        }
-    }
+    assert_that!(rows.clone())
+        .named("ids of tech posts matching 'Rust'")
+        .column(1)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(4), Cell::from(5)]);
+    assert_that!(rows)
+        .named("scores of tech posts matching 'Rust'")
+        .column(0)
+        .all_satisfy(|score| matches!(score, rusqlite::types::Value::Real(score) if *score > 0.0));
 
     // Test 8: Multiple SELECT expressions with score
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id * 10 as id_times_ten, fts_score(title, body, 'Rust') as score FROM docs WHERE fts_match(title, body, 'Rust')",
     );
-    assert_eq!(rows.len(), 4);
-    // Verify id * 10 calculation works
-    let id_times_tens: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    // Should contain 10, 30, 40, 50 (ids 1,3,4,5 * 10)
-    assert!(id_times_tens.contains(&10));
-    assert!(id_times_tens.contains(&30));
-    assert!(id_times_tens.contains(&40));
-    assert!(id_times_tens.contains(&50));
+    // Ids 1, 3, 4 and 5, each multiplied by 10.
+    assert_that!(rows)
+        .named("id * 10")
+        .column(0)
+        .contains_exactly_in_any_order([
+            Cell::from(10),
+            Cell::from(30),
+            Cell::from(40),
+            Cell::from(50),
+        ]);
 }
 
 /// Test FTS with different tokenizer configurations via WITH clause
@@ -1159,11 +1284,10 @@ fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs_raw WHERE fts_match(tag, 'user-123')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
-        _ => panic!("Expected integer"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(1));
 
     // Partial match should NOT work with raw tokenizer
     let rows = limbo_exec_rows(
@@ -1246,11 +1370,10 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM products WHERE fts_match(name, 'pho')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
-        _ => panic!("Expected integer"),
-    }
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(1));
 
     // Search for "Gal" should match "Galaxy"
     let rows = limbo_exec_rows(
@@ -1410,91 +1533,163 @@ fn fts_with_clause_rejects_bad_ngram_window(tmp_db: TempDatabase) {
     }
 }
 
-/// Test fts_highlight function for text highlighting
-/// Signature: fts_highlight(text1, text2, ..., before_tag, after_tag, query)
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
-fn test_fts_highlight_basic(tmp_db: TempDatabase) {
-    let _ = env_logger::try_init();
+fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, other TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'quick fox', 'quick')")
+        .unwrap();
 
-    // Test basic highlighting (single text column)
+    for sql in [
+        "SELECT fts_match('salt and pepper', 'quick AND fox')",
+        "SELECT fts_score('quick fox', 'quick')",
+        "SELECT 'quick fox' MATCH 'quick'",
+        "SELECT fts_match(other, 'quick') FROM docs",
+        "SELECT fts_score(body, 'quick') FROM docs WHERE id = 1",
+        "SELECT id FROM docs WHERE fts_match(body, 'quick') ORDER BY fts_score(body, 'fox') DESC LIMIT 1",
+        "SELECT fts_match(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
+        "SELECT fts_score(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
+        "SELECT id FROM docs WHERE fts_match(body, 'quick') OR fts_match(body, 'fox')",
+    ] {
+        let error = conn.prepare(sql).expect_err(sql);
+        assert!(
+            matches!(&error, turso_core::LimboError::ParseError(_)),
+            "expected a parse error for {sql}, got {error}"
+        );
+        assert!(error.to_string().contains("FTS"), "{sql}: {error}");
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_highlight_without_selected_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'haystack'), (2, 'a needle in the haystack')")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight(body, '<b>', '</b>', 'needle') FROM docs WHERE id = 2"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "a <b>needle</b> in the haystack".to_string()
+        )]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight('quick fox', '<b>', '</b>', 'fox')"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "quick <b>fox</b>".to_string()
+        )]]
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_score_uses_selected_match_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'quick'), (2, 'quick quick quick')")
+        .unwrap();
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'quick')",
+        "SELECT id, fts_score(body, 'quick') FROM docs WHERE fts_match(body, 'quick') AND id > 0 ORDER BY id",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "The <b>quick</b> brown fox");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(rows.len(), 2);
+    let [rusqlite::types::Value::Real(first), rusqlite::types::Value::Real(second)] =
+        [&rows[0][1], &rows[1][1]]
+    else {
+        panic!("expected real FTS scores: {rows:?}");
+    };
+    assert!(
+        first > &0.0 && second > first,
+        "expected ranked scores: {rows:?}"
+    );
+}
 
-    // Test multiple matches
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_query_restricts_matches_to_named_field(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'needle', 'haystack'), (2, 'haystack', 'needle')")
+        .unwrap();
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('hello world hello', '[', ']', 'hello')",
+        "SELECT id, fts_score(body, 'needle') FROM docs \
+         WHERE fts_match(body, 'needle') ORDER BY id",
     );
     assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "[hello] world [hello]");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+    assert!(matches!(rows[0][1], rusqlite::types::Value::Real(score) if score > 0.0));
 
-    // Test case-insensitive matching (tokenizer lowercases)
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE body MATCH 'needle'");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Hello World', '<em>', '</em>', 'hello')",
+        "SELECT id, fts_score(body, 'needle') AS score FROM docs ORDER BY score DESC LIMIT 1",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "<em>Hello</em> World");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
 
-    // Test no matches - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'zebra')",
+        "SELECT id FROM docs WHERE fts_match(title, 'needle')",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "The quick brown fox");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
 
-    // Test empty query - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Some text here', '<b>', '</b>', '')",
+        "SELECT id FROM docs WHERE fts_match(title, body, 'needle') ORDER BY id",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "Some text here");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(1));
+    assert_eq!(rows[1][0], rusqlite::types::Value::Integer(2));
 
-    // Test multiple text columns
+    let error = limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "SELECT fts_score(title, body, 'needle') FROM docs WHERE fts_match(body, 'needle')",
+    )
+    .expect_err("score must use the same fields as the match predicate");
+    assert!(error.to_string().contains("selected FTS index"));
+
+    conn.execute("CREATE TABLE more(id INTEGER PRIMARY KEY, title TEXT, summary TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX more_fts ON more USING fts(title, summary, body)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO more VALUES (1, 'needle', '', ''), (2, '', 'needle', ''), (3, '', '', 'needle')",
+    )
+    .unwrap();
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Hello world', 'Goodbye moon', '<b>', '</b>', 'world')",
+        "SELECT id FROM more WHERE fts_match(body, title, 'needle') ORDER BY id",
     );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "Hello <b>world</b> Goodbye moon");
-        }
-        _ => panic!("Expected text result"),
-    }
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
+    );
 }
 
 /// Test fts_highlight with FTS index queries
@@ -1546,37 +1741,21 @@ fn test_fts_highlight_with_fts_query(tmp_db: TempDatabase) {
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
-    let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(body TEXT)").unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES ('some text')")
+        .unwrap();
 
-    // NULL text should skip that column (not return NULL)
-    // New behavior: NULL text columns are skipped when concatenating
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight(NULL, 'some text', '<b>', '</b>', 'text')",
-    );
-    assert_eq!(rows.len(), 1);
-    match &rows[0][0] {
-        rusqlite::types::Value::Text(s) => {
-            assert_eq!(s, "some <b>text</b>");
-        }
-        _ => panic!("Expected text result"),
+    for sql in [
+        "SELECT fts_highlight(body, NULL, '</b>', 'text') FROM docs WHERE fts_match(body, 'text')",
+        "SELECT fts_highlight(body, '<b>', NULL, 'text') FROM docs WHERE fts_match(body, 'text')",
+    ] {
+        assert_that!(limbo_exec_rows(&conn, sql))
+            .single_element()
+            .is_equal_to(row![NULL]);
     }
-
-    // NULL query should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', '</b>', NULL)");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
-
-    // NULL before_tag should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', NULL, '</b>', 'query')");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
-
-    // NULL after_tag should return NULL
-    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', NULL, 'query')");
-    assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
 }
 
 /// Test field weights configuration for FTS indexes
@@ -1607,33 +1786,24 @@ fn test_fts_field_weights(tmp_db: TempDatabase) {
         &conn,
         "SELECT id, fts_score(title, body, 'rust') as score FROM articles WHERE fts_match(title, body, 'rust') ORDER BY score DESC",
     );
-    assert_eq!(rows.len(), 2);
+    // Article 1 scores higher: rust is in its title, which carries a 2x boost.
+    assert_that!(rows.clone())
+        .named("ids read from the highest score down")
+        .column(0)
+        .contains_exactly([Cell::from(1), Cell::from(2)]);
 
-    // Article 1 should have higher score (rust in title with 2x boost)
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 1),
-        _ => panic!("Expected integer id"),
-    }
-
-    // Article 2 should have lower score (rust in body with 1x boost)
-    match &rows[1][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 2),
-        _ => panic!("Expected integer id"),
-    }
-
-    // Verify scores - title match should have higher score than body match
-    let score1 = match &rows[0][1] {
-        rusqlite::types::Value::Real(s) => *s,
-        _ => panic!("Expected real score"),
-    };
-    let score2 = match &rows[1][1] {
-        rusqlite::types::Value::Real(s) => *s,
-        _ => panic!("Expected real score"),
-    };
-    assert!(
-        score1 > score2,
-        "Title match (boosted 2x) should score higher than body match"
-    );
+    assert_that!(rows)
+        .named("scores of the two articles")
+        .column(1)
+        .satisfies_with_message("score the title match above the body match", |scores| {
+            matches!(
+                scores[..],
+                [
+                    rusqlite::types::Value::Real(title),
+                    rusqlite::types::Value::Real(body),
+                ] if title > body
+            )
+        });
 }
 
 /// Test that invalid weight configurations are rejected
@@ -1848,11 +2018,11 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'ownership borrowing')",
     );
-    assert_eq!(rows.len(), 1, "Should find the memory safety document");
-    match &rows[0][0] {
-        rusqlite::types::Value::Integer(id) => assert_eq!(*id, 102),
-        _ => panic!("Expected integer id"),
-    }
+    assert_that!(rows)
+        .named("ids of memory safety documents")
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(102));
 
     // 5. Delete from table
     conn.execute("DELETE FROM docs WHERE id = 101").unwrap();
@@ -1864,10 +2034,9 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         "SELECT id FROM docs WHERE fts_match(title, body, 'Advanced Techniques')",
     );
     // After delete, should not find document 101's content
-    let has_deleted_doc = rows
-        .iter()
-        .any(|r| matches!(&r[0], rusqlite::types::Value::Integer(101)));
-    assert!(!has_deleted_doc && rows.is_empty());
+    assert_that!(rows)
+        .named("rows matching the deleted document")
+        .is_empty();
 
     // Other documents should still be queryable
     let rows = limbo_exec_rows(
@@ -2780,11 +2949,14 @@ fn test_fts_mvcc_savepoint_rollback_does_not_block_concurrent_writer() {
     );
 }
 
+/// A merge holds its segments through the row deletes of its transaction.
+/// Closing the connection mid-transaction rolls those deletes back, so a
+/// later merge gets the segments.
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_connection_close_releases_merge_lease() {
+fn fts_mvcc_connection_close_releases_claimed_segments() {
     let tmp_db = TempDatabase::builder()
-        .with_db_name("fts-close-merge-lease.db")
+        .with_db_name("fts-close-claimed-segments.db")
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
         .build();
@@ -2803,8 +2975,8 @@ fn fts_mvcc_connection_close_releases_merge_lease() {
             .unwrap();
     }
 
-    // Take the per-index merge lease mid-transaction, then close without
-    // committing: the abandoned lease must not starve later merges.
+    // Claim every segment mid-transaction, then close without committing:
+    // the abandoned claim must not starve later merges.
     first.execute("BEGIN CONCURRENT").unwrap();
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
     first.close().unwrap();
@@ -2852,7 +3024,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -2878,7 +3050,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         std::sync::Arc::new(turso_core::SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         limbo_exec_rows(
             &conn,
@@ -3263,20 +3435,10 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM articles WHERE (title, body) MATCH 'database'",
     );
-    assert_eq!(
-        rows_standard.len(),
-        2,
-        "Standard order should find 2 matches (articles 1 and 3)"
-    );
-    let ids_standard: Vec<i64> = rows_standard
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids_standard.contains(&1));
-    assert!(ids_standard.contains(&3));
+    assert_that!(rows_standard)
+        .named("ids for the standard column order")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test reversed column order: (body, title)
     // This should work with column-order-agnostic matching
@@ -3284,44 +3446,248 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM articles WHERE (body, title) MATCH 'database'",
     );
-    assert_eq!(
-        rows_reversed.len(),
-        2,
-        "Reversed column order should find same 2 matches"
-    );
-    let ids_reversed: Vec<i64> = rows_reversed
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids_reversed.contains(&1));
-    assert!(ids_reversed.contains(&3));
+    assert_that!(rows_reversed)
+        .named("ids for the reversed column order")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
 
     // Test fts_score with reversed column order
     let rows_score_reversed = limbo_exec_rows(
         &conn,
         "SELECT id, fts_score(body, title, 'database') as score FROM articles WHERE (body, title) MATCH 'database' ORDER BY score DESC",
     );
-    assert_eq!(
-        rows_score_reversed.len(),
-        2,
-        "fts_score with reversed columns should work"
-    );
+    assert_that!(rows_score_reversed)
+        .named("fts_score rows for the reversed column order")
+        .has_length(2);
+}
 
-    // Verify both orderings return the same results
-    assert_eq!(
-        ids_standard.len(),
-        ids_reversed.len(),
-        "Both column orderings should return same number of results"
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_own_row(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    let direct = limbo_exec_rows(&conn, "SELECT id FROM d WHERE fts_match(body, body)");
+    let nested = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM d WHERE fts_match(body, coalesce(body, 'database'))",
     );
-    for id in &ids_standard {
-        assert!(
-            ids_reversed.contains(id),
-            "Both orderings should return same IDs"
+    assert_eq!(
+        direct,
+        vec![row![1], row![2], row![3]],
+        "coalesce result: {nested:?}"
+    );
+    assert_eq!(nested, vec![row![1], row![2], row![3]]);
+    for argument in ["body", "coalesce(body, 'database')"] {
+        let plan = limbo_exec_rows(
+            &conn,
+            &format!("EXPLAIN QUERY PLAN SELECT id FROM d WHERE fts_match(body, {argument})"),
         );
+        assert_that!(plan).has_step_containing("QUERY INDEX METHOD fts");
     }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_later_table(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    let query = "SELECT q.rowid, d.id FROM d CROSS JOIN q
+                 WHERE fts_match(d.body, q.term) ORDER BY q.rowid, d.id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            row![1, 1],
+            row![1, 3],
+            row![3, 2],
+            row![3, 3],
+            row![4, 1],
+            row![4, 3]
+        ]
+    );
+    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert_that!(plan).has_step_containing("QUERY INDEX METHOD fts");
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_argument_dependencies_indexed_predicate(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body, term)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "CREATE INDEX source ON d(body, term)",
+        "INSERT INTO d VALUES
+         (1, 'database', 'sql'),
+         (2, 'sql', 'sql'),
+         (3, 'database sql', 'database NOT sql'),
+         (4, 'database', 'database NOT sql'),
+         (5, 'database sql', 'database AND sql'),
+         (6, 'nothing', 'database'),
+         (7, NULL, 'database'),
+         (8, 'database', NULL)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for source in ["d", "d INDEXED BY source"] {
+        let query = format!("SELECT id FROM {source} WHERE fts_match(body, term) ORDER BY id");
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            vec![row![2], row![4], row![5]]
+        );
+        assert_fts_indexed_predicate(&conn, &query);
+    }
+    let query = "SELECT id FROM d WHERE fts_match(body, (SELECT term)) ORDER BY id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row![2], row![4], row![5]]
+    );
+    assert_fts_indexed_predicate(&conn, query);
+    let query = "SELECT id FROM d WHERE fts_match(body, term) ORDER BY id DESC LIMIT 1 OFFSET 1";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![4]]);
+    assert_fts_indexed_predicate(&conn, query);
+    let query = "SELECT id FROM d WHERE id = 3 AND fts_match(body, term)";
+    assert!(limbo_exec_rows(&conn, query).is_empty());
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("INSERT INTO d VALUES(9, 'database NOT sql', 'unused')")
+        .unwrap();
+    let query = "SELECT id FROM d WHERE id = 9 AND fts_match(body, body)";
+    assert!(limbo_exec_rows(&conn, query).is_empty());
+    assert_fts_indexed_predicate(&conn, query);
+
+    let query = "SELECT id FROM d WHERE fts_match(body, 'database')
+                 AND fts_match(body, term) ORDER BY id";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![4], row![5]]);
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("CREATE TABLE q(id)").unwrap();
+    conn.execute("INSERT INTO q VALUES(3), (4), (10)").unwrap();
+    let query = "SELECT q.id, d.id FROM q LEFT JOIN d
+                 ON d.id = q.id AND fts_match(d.body, d.term) ORDER BY q.id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row![3, NULL], row![4, 4], row![10, NULL]]
+    );
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE d SET body = 'changed' WHERE fts_match(body, term)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d WHERE body = 'changed' ORDER BY id"),
+        vec![row![2], row![4], row![5]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM d WHERE fts_match(body, term)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d ORDER BY id"),
+        vec![row![1], row![3], row![6], row![7], row![8], row![9]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_hash_join(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body, term)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "INSERT INTO d VALUES
+         (41, 'database sql', 'database NOT sql'),
+         (62, 'database', 'database NOT sql'),
+         (83, 'sql', 'sql')",
+        "CREATE TABLE q(term)",
+        "INSERT INTO q VALUES('database NOT sql'), ('missing')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let query = "SELECT d.body, q.term FROM d JOIN q ON d.term = q.term
+                 WHERE fts_match(d.body, d.term) ORDER BY d.body";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row!["database", "database NOT sql"]]
+    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {query}")
+    ))
+    .has_step_containing("HASH JOIN");
+    assert_fts_indexed_predicate(&conn, query);
+
+    // The FULL JOIN's unmatched q rows have a NULL d, so the WHERE term cannot
+    // use the FTS index for d, and fts_match has no direct evaluation. SQLite
+    // fails the same way: "unable to use function MATCH in the requested context".
+    let error = conn
+        .prepare(
+            "SELECT d.body, q.term FROM d FULL JOIN q ON d.term = q.term
+             WHERE fts_match(d.body, d.term)",
+        )
+        .expect_err("fts_match on the left table of a FULL JOIN must fail");
+    assert!(
+        error.to_string().contains("requires an FTS index query"),
+        "{error}"
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn assert_fts_indexed_predicate(conn: &Arc<turso_core::Connection>, query: &str) {
+    let bytecode = limbo_exec_rows(conn, &format!("EXPLAIN {query}"));
+    assert!(
+        bytecode
+            .iter()
+            .any(|row| row[1] == rusqlite::types::Value::Text("IndexMethodQuery".into())),
+        "{bytecode:?}"
+    );
+    assert!(
+        !bytecode.iter().any(
+            |row| row[1] == rusqlite::types::Value::Text("Function".into())
+                && row[5] == rusqlite::types::Value::Text("fts_match".into())
+        ),
+        "{bytecode:?}"
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_outer_rows(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    for from in ["q CROSS JOIN d", "d JOIN q"] {
+        let query = format!(
+            "SELECT q.rowid, d.id FROM {from}
+                             WHERE fts_match(d.body, coalesce(q.term, 'missing'))
+                             ORDER BY q.rowid, d.id"
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            vec![
+                row![1, 1],
+                row![1, 3],
+                row![3, 2],
+                row![3, 3],
+                row![4, 1],
+                row![4, 3]
+            ],
+            "{from}"
+        );
+        let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+        assert_that!(plan).has_table_access_order(["q", "fts"]);
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn fts_argument_dependencies_fixture(tmp_db: &TempDatabase) -> Arc<turso_core::Connection> {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "INSERT INTO d VALUES(1, 'database'), (2, 'sql'), (3, 'database sql')",
+        "CREATE TABLE q(term)",
+        "INSERT INTO q VALUES('database'), ('missing'), ('sql'), ('database')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn
 }
 
 /// Test that FTS works with JOINS
@@ -3373,49 +3739,26 @@ fn test_fts_with_join(tmp_db: TempDatabase) {
         &conn,
         "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE (a.title, a.body) MATCH 'database'",
     );
-    assert_eq!(
-        rows.len(),
-        2,
-        "Should find 2 articles about database (articles 1 and 3)"
-    );
-
-    // Verify the results contain expected data
-    let result_ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(result_ids.contains(&1), "Should include article 1");
-    assert!(result_ids.contains(&3), "Should include article 3");
-
-    // Verify author names are correctly joined
-    let author_names: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match &r[2] {
-            rusqlite::types::Value::Text(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-    // Both articles 1 and 3 are by Alice
-    assert_eq!(
-        author_names.iter().filter(|&n| n == "Alice").count(),
-        2,
-        "Both matching articles should be by Alice"
-    );
+    assert_that!(rows.clone())
+        .named("ids of articles about database")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3)]);
+    assert_that!(rows)
+        .named("author names of articles about database")
+        .column(2)
+        .contains_only([Cell::from("Alice")]);
 
     // Test FTS with JOIN and additional WHERE conditions
     let rows = limbo_exec_rows(
         &conn,
         "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE (a.title, a.body) MATCH 'web' AND u.name = 'Bob'",
     );
-    assert_eq!(rows.len(), 1, "Should find 1 article about web by Bob");
-    let id = match &rows[0][0] {
-        rusqlite::types::Value::Integer(i) => *i,
-        _ => panic!("Expected integer id"),
-    };
-    assert_eq!(id, 2, "Should be article 2 (Web Development by Bob)");
+    // Article 2 is Web Development, by Bob.
+    assert_that!(rows)
+        .named("ids of articles about web by Bob")
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(2));
 }
 
 /// Test FTS with LEFT JOIN to ensure outer joins work correctly with FTS.
@@ -3464,29 +3807,16 @@ fn test_fts_with_left_join(tmp_db: TempDatabase) {
         &conn,
         "SELECT p.id, p.title, c.name FROM posts p LEFT JOIN categories c ON p.category_id = c.id WHERE fts_match(p.title, p.content, 'Rust')",
     );
-    assert_eq!(rows.len(), 3, "Should find 3 posts about Rust");
-
-    // Verify we got the right posts
-    let result_ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(result_ids.contains(&1), "Should include post 1");
-    assert!(result_ids.contains(&3), "Should include post 3");
-    assert!(
-        result_ids.contains(&4),
-        "Should include post 4 (uncategorized)"
-    );
-
-    // Verify NULL category is preserved in LEFT JOIN
-    let null_category_count = rows
-        .iter()
-        .filter(|r| matches!(&r[2], rusqlite::types::Value::Null))
-        .count();
-    assert_eq!(null_category_count, 1, "One post should have NULL category");
+    // Post 4 is the uncategorized one.
+    assert_that!(rows.clone())
+        .named("ids of posts about Rust")
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(3), Cell::from(4)]);
+    assert_that!(rows)
+        .named("category names of posts about Rust")
+        .column(2)
+        .filtered_on(|category| *category == NULL)
+        .has_length(1);
 }
 
 /// Test that FTS participates in join order optimization.
@@ -3538,109 +3868,39 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
         .unwrap();
     }
 
-    // Check the query plan using EXPLAIN QUERY PLAN
     let query = "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'database')";
     let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
 
-    // Extract table access order and check for FTS usage
-    let mut table_order = Vec::new();
-    let mut has_fts_search = false;
-    for row in &eqp_rows {
-        if let rusqlite::types::Value::Text(detail) = &row[3] {
-            // Check for FTS index method query (format: "QUERY INDEX METHOD fts")
-            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
-                has_fts_search = true;
-            }
-            // Extract table name from SCAN or SEARCH lines
-            if let Some(rest) = detail.strip_prefix("SCAN ") {
-                let table = rest.split_whitespace().next().unwrap();
-                table_order.push(table.to_string());
-            } else if let Some(rest) = detail.strip_prefix("SEARCH ") {
-                let table = rest.split_whitespace().next().unwrap();
-                table_order.push(table.to_string());
-            } else if detail.starts_with("QUERY INDEX METHOD") {
-                // FTS queries show up as "QUERY INDEX METHOD fts"
-                table_order.push("articles".to_string());
-            }
-        }
-    }
-
-    // Verify that the optimizer is using the FTS index
-    assert!(
-        has_fts_search,
-        "Expected FTS index to be used in query plan. Plan details: {:?}",
-        eqp_rows
-            .iter()
-            .filter_map(|r| r.get(3).and_then(|v| match v {
-                rusqlite::types::Value::Text(t) => Some(t.as_str()),
-                _ => None,
-            }))
-            .collect::<Vec<_>>()
-    );
-
-    // Verify the join order: FTS should be first, authors second
-    assert_eq!(
-        table_order.len(),
-        2,
-        "Expected 2 tables in join order, got: {table_order:?}"
-    );
-    assert_eq!(
-        table_order[0], "articles",
-        "Expected articles (FTS) to be first in join order, got: {table_order:?}"
-    );
-    assert!(
-        table_order[1] == "u" || table_order[1] == "authors",
-        "Expected authors to be second in join order, got: {table_order:?}"
-    );
+    assert_that!(&eqp_rows)
+        .described_as("the FTS index method must drive the join, with authors second")
+        .has_table_access_order(["fts", "u"]);
+    assert_that!(eqp_rows)
+        .described_as("the optimizer must use the FTS index")
+        .column(3)
+        .any_satisfies(is_fts_lookup);
 
     // Execute the query and verify results
     let rows = limbo_exec_rows(&conn, query);
 
-    // Should find 5 articles about database
-    assert_eq!(rows.len(), 5, "Should find 5 articles about database");
-
-    // Verify all results have valid author names
-    for row in &rows {
-        let author_name = match &row[2] {
-            rusqlite::types::Value::Text(t) => t.clone(),
-            _ => panic!("Expected text for author name"),
-        };
-        assert!(
-            author_name.starts_with("Author"),
-            "Author name should start with 'Author'"
+    assert_that!(rows)
+        .described_as("every match must carry its author name")
+        .has_length(5)
+        .column(2)
+        .all_satisfy(
+            |name| matches!(name, rusqlite::types::Value::Text(n) if n.starts_with("Author")),
         );
-    }
 
-    // Test with reversed table order in SQL, optimizer should still use FTS
     let query2 = "SELECT a.id, a.title, u.name FROM authors u JOIN articles a ON u.id = a.author_id WHERE fts_match(a.title, a.body, 'database')";
     let eqp_rows2 = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query2}"));
 
-    let mut has_fts_search2 = false;
-    for row in &eqp_rows2 {
-        if let rusqlite::types::Value::Text(detail) = &row[3] {
-            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
-                has_fts_search2 = true;
-            }
-        }
-    }
-    assert!(
-        has_fts_search2,
-        "Expected FTS index to be used with reversed table order. Plan details: {:?}",
-        eqp_rows2
-            .iter()
-            .filter_map(|r| r.get(3).and_then(|v| match v {
-                rusqlite::types::Value::Text(t) => Some(t.as_str()),
-                _ => None,
-            }))
-            .collect::<Vec<_>>()
-    );
+    assert_that!(eqp_rows2)
+        .described_as("the FTS index must still be used with the table order reversed")
+        .column(3)
+        .any_satisfies(is_fts_lookup);
 
-    let rows2 = limbo_exec_rows(&conn, query2);
-    assert_eq!(
-        rows2.len(),
-        5,
-        "Should find same 5 articles with reversed table order"
-    );
+    assert_that!(limbo_exec_rows(&conn, query2))
+        .described_as("the reversed table order must find the same 5 articles")
+        .has_length(5);
 }
 
 /// Test FTS with multiple joins to verify cost-based optimization works
@@ -3707,18 +3967,13 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
     );
 
     // Should find 2 articles about database (articles 1 and 3)
-    assert_eq!(rows.len(), 2, "Should find 2 articles about database");
-
-    // Verify we got the right combination
-    let titles: Vec<String> = rows
-        .iter()
-        .filter_map(|r| match &r[0] {
-            rusqlite::types::Value::Text(t) => Some(t.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(titles.contains(&"Database Systems".to_string()));
-    assert!(titles.contains(&"SQL Performance".to_string()));
+    assert_that!(rows)
+        .named("titles of articles about database")
+        .column(0)
+        .contains_exactly_in_any_order([
+            Cell::from("Database Systems"),
+            Cell::from("SQL Performance"),
+        ]);
 }
 
 /// Regression test for issue 7522: a rolled-back transaction containing FTS
@@ -4232,7 +4487,7 @@ fn fts_tiny_retained_cache_budget_only_affects_performance() {
     assert_eq!(
         limbo_exec_rows(
             &conn_a,
-            "SELECT id FROM docs WHERE fts_match(body, 'bravo') OR fts_match(body, 'charlie') ORDER BY id"
+            "SELECT id FROM docs WHERE fts_match(body, 'bravo') UNION SELECT id FROM docs WHERE fts_match(body, 'charlie') ORDER BY id"
         ),
         vec![
             vec![rusqlite::types::Value::Integer(2)],
@@ -4255,8 +4510,9 @@ fn fts_create_persists_real_index_incarnation() {
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
 
-    // CREATE INDEX stages the v2 control row, which mints a real
-    // incarnation so drop/recreate lifetimes are distinguishable.
+    // CREATE INDEX stages the control row. The control row gets a real
+    // incarnation number, so the code can tell a dropped and recreated
+    // index from the old one.
     let stats = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
     assert_eq!(stats.storage_format_version, Some(2));
     assert!(
@@ -5156,15 +5412,17 @@ fn fts_update_then_delete_with_interleaved_reads_keeps_tombstones() {
     );
 }
 
-/// Two concurrent OPTIMIZE transactions on one index. Registry-row deletes
-/// get no engine-level commit validation (non-unique index keys skip
-/// `check_index_for_conflicts`), so the merge mutex is the ONLY thing
-/// standing between two merges that each retire the same descriptor rows.
-/// If both ran, each would publish its own merged segment over the same
-/// inputs and every document would match twice.
+/// Two concurrent OPTIMIZE transactions on one index. The first merge
+/// deletes the registry row of every segment. The second merge tries the
+/// same deletes, every one conflicts with the open first merge, so it skips
+/// every segment and publishes nothing. If both merges ran, each would
+/// publish its own merged segment over the same inputs and every document
+/// would match twice. Registry rows get no commit-time validation (the
+/// backing index is not unique), so the statement-time conflict is the
+/// only thing between the two merges.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
+fn fts_mvcc_concurrent_optimize_skips_segments_another_merge_holds() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5191,17 +5449,13 @@ fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
     first.execute("BEGIN CONCURRENT").unwrap();
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // The merge mutex must refuse the overlapping merge outright.
+    // The overlapping merge finds every segment held: it is a no-op and
+    // its transaction stays usable.
     second.execute("BEGIN CONCURRENT").unwrap();
-    let refused = second.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(
-            refused,
-            Err(turso_core::LimboError::Busy | turso_core::LimboError::WriteWriteConflict)
-        ),
-        "second concurrent OPTIMIZE must be refused by the merge mutex, got: {refused:?}"
-    );
-    second.execute("ROLLBACK").unwrap();
+    second
+        .execute("OPTIMIZE INDEX docs_fts")
+        .expect("a merge whose segments another merge holds must skip, not fail");
+    second.execute("COMMIT").unwrap();
     first.execute("COMMIT").unwrap();
 
     // Exactly one merged segment; every document matches exactly once.
@@ -5225,10 +5479,12 @@ fn fts_mvcc_concurrent_optimize_refused_by_merge_mutex() {
     second.execute("OPTIMIZE INDEX docs_fts").unwrap();
 }
 
-/// The §11 claim: the merge mutex survives checkpoints. Checkpoint GC can
-/// erase the version-chain evidence the eager delete-conflict check needs,
-/// so if the lease's staleness refusal depended on version chains, a
-/// checkpoint between the two merges would let the second one through.
+/// A merge from a snapshot older than a committed and checkpointed merge.
+/// The old snapshot still sees the input segments, but their registry rows
+/// were deleted after that snapshot: every delete conflicts, the stale
+/// merge skips every segment, and the checkpointed merge stays the only
+/// one. Without the statement-time conflict, the stale merge would publish
+/// a second copy of every document.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
@@ -5268,20 +5524,12 @@ fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
     // The merge commits and is checkpointed immediately (threshold 0).
     first.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // A merge from the still-open older snapshot must be refused: its
-    // snapshot predates the last publish, and merging a superseded segment
-    // set would resurrect the retired descriptors.
-    let refused = second.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(
-            refused,
-            Err(turso_core::LimboError::Busy | turso_core::LimboError::WriteWriteConflict)
-        ),
-        "stale-snapshot OPTIMIZE must be refused even after a checkpoint, got: {refused:?}"
-    );
-    // The WriteWriteConflict refusal aborts the transaction outright, while
-    // a Busy refusal leaves it open — accept either termination state.
-    let _ = second.execute("ROLLBACK");
+    // A merge from the still-open older snapshot finds every segment
+    // already taken: it publishes nothing and commits cleanly.
+    second
+        .execute("OPTIMIZE INDEX docs_fts")
+        .expect("a stale merge must skip the segments a newer merge took, not fail");
+    second.execute("COMMIT").unwrap();
 
     let third = tmp_db.connect_limbo();
     assert_eq!(
@@ -5300,6 +5548,68 @@ fn fts_mvcc_optimize_vs_optimize_across_checkpoint() {
     third
         .execute("INSERT INTO docs VALUES (100, 'still writable')")
         .unwrap();
+}
+
+/// A merge holds the old segments while a writer appends new ones. A later
+/// OPTIMIZE from a snapshot that sees both merges only the new segments:
+/// the deletes of the old registry rows conflict with the open merge, the
+/// new rows are free. Both merges commit, and every document matches once.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_optimize_merges_only_the_segments_no_other_merge_holds() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let early_merger = tmp_db.connect_limbo();
+    let late_merger = tmp_db.connect_limbo();
+
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    writer.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+    for id in 0..4 {
+        writer
+            .execute(format!(
+                "INSERT INTO docs VALUES ({id}, 'common old doc {id}')"
+            ))
+            .unwrap();
+    }
+
+    early_merger.execute("BEGIN CONCURRENT").unwrap();
+    early_merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    for id in 10..14 {
+        writer
+            .execute(format!(
+                "INSERT INTO docs VALUES ({id}, 'common new doc {id}')"
+            ))
+            .unwrap();
+    }
+
+    late_merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&late_merger, "common").len(), 8);
+    late_merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(
+        fts_ids(&late_merger, "common"),
+        vec![0, 1, 2, 3, 10, 11, 12, 13],
+        "the late merge keeps the old segments it could not take"
+    );
+    late_merger.execute("COMMIT").unwrap();
+    early_merger.execute("COMMIT").unwrap();
+
+    let fresh = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&fresh, "common"), vec![0, 1, 2, 3, 10, 11, 12, 13]);
+    assert_eq!(fts_ids(&fresh, "new"), vec![10, 11, 12, 13]);
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &fresh, "docs", "docs_fts").segment_count,
+        Some(2),
+        "one merged segment per merge: the old four and the new four"
+    );
 }
 
 /// A merge and a plain writer overlap; both must commit in either commit
@@ -5581,12 +5891,10 @@ fn fts_mvcc_scores_stable_within_snapshot_and_adapt_across() {
         23,
         "fresh snapshot: 4 original - 1 deleted + 20 filler"
     );
-    assert!(
-        !after
-            .iter()
-            .any(|row| row[0] == rusqlite::types::Value::Integer(2)),
-        "the tombstoned document must not appear on the score path"
-    );
+    assert_that!(after.clone())
+        .named("ids on the score path")
+        .column(0)
+        .does_not_contain(Cell::from(2));
     assert_ne!(
         after[..4],
         before[..],
@@ -5652,15 +5960,24 @@ fn fts_mvcc_drop_index_vs_concurrent_writer_stays_consistent() {
     );
 }
 
-/// A tombstone writer whose snapshot predates a committed merge must be
-/// refused. Its visible segment set is the pre-merge one, so its tombstones
-/// would target retired segments — and the "deleted" postings would
-/// resurrect through the merged segment after both commit.
+// ============ MVCC deletes do not conflict with merges ============
+//
+// A tombstone names a document by the identity the index gave it. A merge
+// copies that identity into the merged segment. So a delete and a merge
+// never need to conflict. Whichever commits first, a later reader applies
+// the tombstone to the segment that holds the document now, and every
+// surviving document matches exactly once.
+
+/// A tombstone writer whose snapshot is older than a committed merge. Its
+/// visible segment set is the one from before the merge, but the tombstone
+/// it writes names the document, so the merged segment applies it too.
+/// Both commit.
 ///
-/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919.
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+/// Reduced from `fts_mvcc_concurrent_writers_model_fuzz` seed 8919. The
+/// old code refused this case with a conflict.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_stale_snapshot_deleter_refused_after_merge() {
+fn fts_mvcc_stale_snapshot_update_commits_after_merge() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5682,60 +5999,121 @@ fn fts_mvcc_stale_snapshot_deleter_refused_after_merge() {
 
     // Pin the writer's snapshot before the merge, then merge and commit.
     writer.execute("BEGIN CONCURRENT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &writer,
-            "SELECT id FROM docs WHERE fts_match(body, 'stale')"
-        )
-        .len(),
-        4
-    );
+    assert_eq!(fts_ids(&writer, "stale"), vec![0, 1, 2, 3]);
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
 
-    // The writer's UPDATE tombstones postings in segments the merge just
-    // retired; it must be refused rather than allowed to publish tombstones
-    // no future reader will apply.
-    let refused = writer.execute("UPDATE docs SET body = 'fresh doc' WHERE id = 1");
-    let lost = refused.is_err() || writer.execute("COMMIT").is_err();
-    assert!(
-        lost,
-        "a stale-snapshot tombstone writer must lose against a committed merge, got: {refused:?}"
-    );
-    let _ = writer.execute("ROLLBACK");
-
-    // Retried at a fresh snapshot, the update succeeds — and the old posting
-    // must be gone everywhere, not resurrected by the merged segment.
+    // The writer deletes id 1 from a segment that the merge dropped, then
+    // indexes it again under a fresh identity. Both must commit.
     writer
         .execute("UPDATE docs SET body = 'fresh doc' WHERE id = 1")
         .unwrap();
+    writer.execute("COMMIT").unwrap();
+
     let fresh = tmp_db.connect_limbo();
     assert_eq!(
-        limbo_exec_rows(
-            &fresh,
-            "SELECT id FROM docs WHERE fts_match(body, 'stale') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
+        fts_ids(&fresh, "stale"),
+        vec![0, 2, 3],
         "id 1's old posting must not survive the update"
     );
+    assert_eq!(fts_ids(&fresh, "fresh"), vec![1]);
+    assert_eq!(fts_ids(&fresh, "doc"), vec![0, 1, 2, 3]);
     assert_eq!(
-        limbo_exec_rows(&fresh, "SELECT id FROM docs WHERE fts_match(body, 'fresh')"),
-        vec![vec![rusqlite::types::Value::Integer(1)]]
+        fts_stats_in_txn(&tmp_db, &fresh, "docs", "docs_fts").segment_count,
+        Some(2),
+        "the merged segment plus the writer's re-indexed document"
     );
 }
 
-// ============ MVCC merge lease vs. tombstone writers ============
-
-/// An uncommitted DELETE registers its transaction as a tombstone writer.
-/// A merge that starts while that deleter is still active must be refused
-/// (Busy): committing it would retire the segment the deleter's tombstone
-/// targets and resurrect the deleted posting in the merged segment.
+/// A DELETE and a merge overlap and commit in either order, for both an
+/// explicit OPTIMIZE and the automatic merge on the write path. Both
+/// commit, the deleted document stays hidden, and every other document
+/// matches once.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_active_deleter_blocks_merge() {
+fn fts_mvcc_delete_and_merge_commit_in_either_order() {
+    for (merge_sql, auto_merge) in [
+        ("OPTIMIZE INDEX docs_fts", false),
+        (
+            "INSERT INTO docs VALUES (100, 'common auto-merge trigger')",
+            true,
+        ),
+    ] {
+        for delete_commits_first in [true, false] {
+            let label =
+                format!("merge_sql={merge_sql:?} delete_commits_first={delete_commits_first}");
+            let tmp_db = TempDatabase::builder()
+                .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+                .with_mvcc(true)
+                .build();
+            let deleter = tmp_db.connect_limbo();
+            let merger = tmp_db.connect_limbo();
+
+            deleter
+                .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+                .unwrap();
+            deleter
+                .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+                .unwrap();
+            for id in 0..4 {
+                deleter
+                    .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+                    .unwrap();
+            }
+            if auto_merge {
+                merger.execute("PRAGMA fts_merge_threshold = 1").unwrap();
+            }
+
+            deleter.execute("BEGIN CONCURRENT").unwrap();
+            deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+
+            merger.execute("BEGIN CONCURRENT").unwrap();
+            merger
+                .execute(merge_sql)
+                .unwrap_or_else(|e| panic!("merge must not be refused ({label}): {e}"));
+
+            if delete_commits_first {
+                deleter.execute("COMMIT").unwrap();
+                merger.execute("COMMIT").unwrap_or_else(|e| {
+                    panic!("merge must commit after the delete ({label}): {e}")
+                });
+            } else {
+                merger.execute("COMMIT").unwrap();
+                deleter.execute("COMMIT").unwrap_or_else(|e| {
+                    panic!("delete must commit after the merge ({label}): {e}")
+                });
+            }
+
+            let mut expected = vec![0, 2, 3];
+            if auto_merge {
+                expected.push(100);
+            }
+            let reader = tmp_db.connect_limbo();
+            assert_eq!(fts_ids(&reader, "common"), expected, "{label}");
+            assert_eq!(
+                fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+                Some(1),
+                "{label}"
+            );
+
+            // A later merge drops the concurrent tombstone, and nothing
+            // comes back.
+            reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            assert_eq!(fts_ids(&reader, "common"), expected, "{label}");
+            assert!(
+                fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty(),
+                "{label}"
+            );
+        }
+    }
+}
+
+/// The merger fixes its snapshot with a read, then a deleter commits. The
+/// merge cannot see the tombstone and keeps the document. But the tombstone
+/// names the document's identity, and the merged segment keeps that
+/// identity, so readers still hide the document. Both commit.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_merge_at_stale_snapshot_keeps_committed_delete() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
@@ -5755,120 +6133,160 @@ fn fts_mvcc_active_deleter_blocks_merge() {
             .unwrap();
     }
 
-    deleter.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&merger, "common"), vec![0, 1, 2, 3]);
+
     deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
 
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
-    assert!(
-        matches!(refused, Err(turso_core::LimboError::Busy)),
-        "merge overlapping an active deleter must be Busy, got: {refused:?}"
-    );
-    merger.execute("ROLLBACK").unwrap();
-
-    deleter.execute("COMMIT").unwrap();
-
-    // With the deleter committed, a fresh-snapshot merge succeeds and the
-    // deleted posting must not come back.
     merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    merger.execute("COMMIT").unwrap();
+
     let reader = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
     assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
     );
+    assert_eq!(
+        fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").len(),
+        1,
+        "the merge could not see the tombstone, so it must leave it in place"
+    );
+    // A fresh merge sees the tombstone and drops it.
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
+    assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
+}
+
+/// A running merge holds its segments. A deleter that arrives while the
+/// merge runs is not a merge and touches none of those rows. The deleter
+/// commits before the merge does, and the merge still commits.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_delete_during_in_flight_merge_commits() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let deleter = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    deleter
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    deleter
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..4 {
+        deleter
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+            .unwrap();
+    }
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    deleter.execute("BEGIN CONCURRENT").unwrap();
+    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
+    deleter.execute("COMMIT").unwrap();
+    merger.execute("COMMIT").unwrap();
+
+    let reader = tmp_db.connect_limbo();
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 2, 3]);
     assert_eq!(
         fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
         Some(1)
     );
 }
 
-/// The merger pins its snapshot (a read), then a deleter commits. The merge
-/// at the stale snapshot cannot see the tombstone; letting it commit would
-/// drop the tombstone with the retired segment. Must be refused.
+/// An UPDATE is a delete plus an insert of the same rowid. The old document
+/// gets a tombstone by identity, and the new document gets a fresh
+/// identity in a new segment. When the UPDATE races a merge in either
+/// commit order, the new document must stay visible and the old one must
+/// stay hidden.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_merge_at_stale_snapshot_refused_after_delete_commit() {
-    let tmp_db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
-        .with_mvcc(true)
-        .build();
-    let deleter = tmp_db.connect_limbo();
-    let merger = tmp_db.connect_limbo();
+fn fts_mvcc_update_racing_merge_keeps_new_document_visible() {
+    for merge_commits_first in [true, false] {
+        let tmp_db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(true)
+            .build();
+        let updater = tmp_db.connect_limbo();
+        let merger = tmp_db.connect_limbo();
 
-    deleter
-        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
-        .unwrap();
-    deleter
-        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-        .unwrap();
-    for id in 0..4 {
-        deleter
-            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+        updater
+            .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
+        updater
+            .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        for id in 0..4 {
+            updater
+                .execute(format!("INSERT INTO docs VALUES ({id}, 'stale doc {id}')"))
+                .unwrap();
+        }
+
+        updater.execute("BEGIN CONCURRENT").unwrap();
+        updater
+            .execute("UPDATE docs SET body = 'fresh doc 1' WHERE id = 1")
+            .unwrap();
+        merger.execute("BEGIN CONCURRENT").unwrap();
+        merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+        if merge_commits_first {
+            merger.execute("COMMIT").unwrap();
+            updater.execute("COMMIT").unwrap_or_else(|e| {
+                panic!("update must commit after the merge (merge_commits_first={merge_commits_first}): {e}")
+            });
+        } else {
+            updater.execute("COMMIT").unwrap();
+            merger.execute("COMMIT").unwrap_or_else(|e| {
+                panic!("merge must commit after the update (merge_commits_first={merge_commits_first}): {e}")
+            });
+        }
+
+        let reader = tmp_db.connect_limbo();
+        assert_eq!(
+            fts_ids(&reader, "stale"),
+            vec![0, 2, 3],
+            "the old posting must stay hidden (merge_commits_first={merge_commits_first})"
+        );
+        assert_eq!(
+            fts_ids(&reader, "fresh"),
+            vec![1],
+            "the re-indexed document must be visible (merge_commits_first={merge_commits_first})"
+        );
+        assert_eq!(
+            fts_ids(&reader, "doc"),
+            vec![0, 1, 2, 3],
+            "every document matches exactly once (merge_commits_first={merge_commits_first})"
+        );
+
+        reader.execute("OPTIMIZE INDEX docs_fts").unwrap();
+        assert_eq!(fts_ids(&reader, "stale"), vec![0, 2, 3]);
+        assert_eq!(fts_ids(&reader, "fresh"), vec![1]);
+        assert_eq!(
+            fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+            Some(1)
+        );
     }
-
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &merger,
-            "SELECT id FROM docs WHERE fts_match(body, 'common')"
-        )
-        .len(),
-        4
-    );
-
-    deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
-
-    let refused = merger.execute("OPTIMIZE INDEX docs_fts");
-    let lost = refused.is_err() || merger.execute("COMMIT").is_err();
-    assert!(
-        lost,
-        "a merge whose snapshot predates a committed delete must be refused, got: {refused:?}"
-    );
-    let _ = merger.execute("ROLLBACK");
-
-    let reader = tmp_db.connect_limbo();
-    assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        ),
-        vec![
-            vec![rusqlite::types::Value::Integer(0)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-        ],
-    );
-    // A fresh merge sees the tombstone and compacts it away.
-    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
-    assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        )
-        .len(),
-        3
-    );
 }
 
-/// A merge in flight holds the lease; a deleter arriving while it is held
-/// must be refused (Busy), and succeed once retried at a fresh snapshot.
+/// A merge deletes the tombstone rows of exactly the documents it dropped.
+/// A tombstone that it could not see (one committed after its snapshot)
+/// names a document it kept. That row must survive the merge and still
+/// apply to the merged segment.
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
-fn fts_mvcc_in_flight_merge_blocks_deleter() {
+fn fts_merge_deletes_only_tombstones_of_dropped_documents() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .with_mvcc(true)
         .build();
     let deleter = tmp_db.connect_limbo();
     let merger = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
 
     deleter
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
@@ -5876,34 +6294,45 @@ fn fts_mvcc_in_flight_merge_blocks_deleter() {
     deleter
         .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
         .unwrap();
-    for id in 0..4 {
-        deleter
-            .execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
-            .unwrap();
-    }
-
-    merger.execute("BEGIN CONCURRENT").unwrap();
-    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
-
-    deleter.execute("BEGIN CONCURRENT").unwrap();
-    let refused = deleter.execute("DELETE FROM docs WHERE id = 1");
-    assert!(
-        matches!(refused, Err(turso_core::LimboError::Busy)),
-        "delete overlapping an in-flight merge must be Busy, got: {refused:?}"
-    );
-    deleter.execute("ROLLBACK").unwrap();
-    merger.execute("COMMIT").unwrap();
+    deleter
+        .execute(
+            "INSERT INTO docs VALUES (0, 'common doc 0'), (1, 'common doc 1'), \
+             (2, 'common doc 2'), (3, 'common doc 3'), (4, 'common doc 4')",
+        )
+        .unwrap();
 
     deleter.execute("DELETE FROM docs WHERE id = 1").unwrap();
-    let reader = tmp_db.connect_limbo();
+    let seen_by_merge = fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts");
+    assert_eq!(seen_by_merge.len(), 1);
+
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(fts_ids(&merger, "common"), vec![0, 2, 3, 4]);
+    deleter.execute("DELETE FROM docs WHERE id = 2").unwrap();
+    let before_merge = fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts");
+    assert_eq!(before_merge.len(), 2);
+    let hidden_from_merge: Vec<&String> = before_merge
+        .iter()
+        .filter(|path| !seen_by_merge.contains(path))
+        .collect();
+    assert_eq!(hidden_from_merge.len(), 1);
+
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    merger.execute("COMMIT").unwrap();
+
     assert_eq!(
-        limbo_exec_rows(
-            &reader,
-            "SELECT id FROM docs WHERE fts_match(body, 'common') ORDER BY id"
-        )
-        .len(),
-        3
+        fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts"),
+        vec![hidden_from_merge[0].clone()],
+        "the merge retires the tombstone it applied and leaves the one it could not see"
     );
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 3, 4]);
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &reader, "docs", "docs_fts").segment_count,
+        Some(1)
+    );
+
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert!(fts_tombstone_paths(&tmp_db, &reader, "docs", "docs_fts").is_empty());
+    assert_eq!(fts_ids(&reader, "common"), vec![0, 3, 4]);
 }
 
 /// Two transactions each delete a different row from the same segment and
@@ -6142,7 +6571,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
     let db1 = open();
     let db2 = open();
 
-    let setup = db1.connect().unwrap();
+    let setup = db1.connect(ConnectOpts::new()).unwrap();
     setup
         .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -6177,7 +6606,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 1: "process" 1, connection X pins an old snapshot and warms the
     // shared cache with FTS backing pages at that snapshot.
-    let conn_x = db1.connect().unwrap();
+    let conn_x = db1.connect(ConnectOpts::new()).unwrap();
     conn_x.execute("BEGIN").unwrap();
     let _ = run_rows(
         &conn_x,
@@ -6186,7 +6615,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 2: "process" 2 commits FTS churn — deletes make old postings
     // dead (tombstones) and add new ones. Process 1's cache sees none of it.
-    let writer = db2.connect().unwrap();
+    let writer = db2.connect(ConnectOpts::new()).unwrap();
     for id in 0..50 {
         writer
             .execute(format!(
@@ -6197,7 +6626,7 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
 
     // Step 3: process 1, connection Z begins a fresh snapshot: its
     // changed-detection clears the shared cache and loads some NEW pages.
-    let conn_z = db1.connect().unwrap();
+    let conn_z = db1.connect(ConnectOpts::new()).unwrap();
     let _ = run_rows(&conn_z, "SELECT count(*) FROM docs WHERE id < 10");
 
     // Step 4: connection X (still pinned at the OLD snapshot) runs another
@@ -6236,4 +6665,415 @@ fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
              served from the shared page cache"
         );
     }
+}
+
+/// B1 write-path auto-merge: single-row autocommit inserts must not let the
+/// visible segment set grow past `PRAGMA fts_merge_threshold` by more than
+/// the one segment the triggering statement itself appends. Runs in both
+/// WAL and MVCC modes (in WAL the pager write lock serializes merges).
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_auto_merge_bounds_segment_count() {
+    for mvcc in [false, true] {
+        let tmp_db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(mvcc)
+            .build();
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("PRAGMA fts_merge_threshold = 4").unwrap();
+        assert_eq!(
+            limbo_exec_rows(&conn, "PRAGMA fts_merge_threshold"),
+            vec![vec![rusqlite::types::Value::Integer(4)]]
+        );
+
+        const ROWS: i64 = 30;
+        for id in 0..ROWS {
+            conn.execute(format!("INSERT INTO docs VALUES ({id}, 'common doc {id}')"))
+                .unwrap();
+        }
+
+        let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+        let segment_count = stats.segment_count.expect("snapshot must be loaded");
+        assert!(
+            segment_count <= 5,
+            "auto-merge must keep the visible set at threshold + 1 at most, \
+             got {segment_count} segments (mvcc={mvcc})"
+        );
+
+        // Every document still matches exactly once through the merged view.
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT count(*) FROM docs WHERE fts_match(body, 'common')"
+            ),
+            vec![vec![rusqlite::types::Value::Integer(ROWS)]],
+            "mvcc={mvcc}"
+        );
+    }
+}
+
+/// B1: a merge-threshold of 0 disables the write path merge entirely — each
+/// autocommit insert keeps appending its own segment.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_auto_merge_disabled_by_zero_threshold() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+    for id in 0..12 {
+        conn.execute(format!("INSERT INTO docs VALUES ({id}, 'plain doc {id}')"))
+            .unwrap();
+    }
+    assert_eq!(
+        fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts").segment_count,
+        Some(12),
+        "threshold 0 must leave one segment per single-row insert"
+    );
+    assert!(
+        conn.execute("PRAGMA fts_merge_threshold = -1").is_err(),
+        "negative thresholds must be rejected"
+    );
+}
+
+/// B1: a concurrent merge that holds every visible segment makes the
+/// write-path merge skip silently. The writer's inserts must succeed, and
+/// the deferred merge happens on a later insert once the segments are free.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_auto_merge_skips_segments_another_merge_holds() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let merger = tmp_db.connect_limbo();
+
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    writer.execute("PRAGMA fts_merge_threshold = 2").unwrap();
+    for id in 0..3 {
+        writer
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'early doc {id}')"))
+            .unwrap();
+    }
+
+    // The merger's open transaction holds the three early segments.
+    merger.execute("BEGIN CONCURRENT").unwrap();
+    merger.execute("OPTIMIZE INDEX docs_fts").unwrap();
+
+    // Every insert is past the threshold, so each one attempts the merge.
+    // The held segments must never fail the writer. The segments the
+    // writer itself appends are free, so it merges those among themselves.
+    for id in 10..16 {
+        writer
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'later doc {id}')"))
+            .unwrap_or_else(|e| {
+                panic!("a contended auto-merge must skip, not fail the writer: {e}")
+            });
+    }
+    merger.execute("COMMIT").unwrap();
+
+    // The segments are free again: the next insert merges everything down.
+    writer
+        .execute("INSERT INTO docs VALUES (100, 'final doc')")
+        .unwrap();
+    let fresh = tmp_db.connect_limbo();
+    let stats = fts_stats_in_txn(&tmp_db, &fresh, "docs", "docs_fts");
+    let segment_count = stats.segment_count.expect("snapshot must be loaded");
+    assert!(
+        segment_count <= 3,
+        "the deferred merge must collapse the backlog, got {segment_count} segments"
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &fresh,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'doc')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(10)]],
+        "every document must match exactly once after skipped and deferred merges"
+    );
+}
+
+/// B2 helper: build one large (>100KB) merged segment from `rows` documents
+/// with wide vocabulary, then return the connection. The follow-up OPTIMIZE
+/// compacts the batch flushes into a single segment.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn fts_build_large_segment(conn: &Arc<turso_core::Connection>, rows: usize) {
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    let mut sql = String::from("INSERT INTO docs VALUES ");
+    for id in 0..rows {
+        if id > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "({id}, 'bulk document number{id} vocab{} vocab{} filler{} extra{} common corpus text')",
+            id * 7 % 3000,
+            id * 13 % 3000,
+            id * 17 % 3000,
+            id * 19 % 3000,
+        ));
+    }
+    conn.execute(sql).unwrap();
+    conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+}
+
+/// B2 tiered candidacy: the write-path merge must only rewrite the small
+/// tier — one large segment plus many single-row segments merge down to
+/// exactly two segments (the untouched large one and the merged smalls),
+/// not one.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_auto_merge_spares_large_segments() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    fts_build_large_segment(&conn, 3000);
+    let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+    assert_eq!(stats.segment_count, Some(1));
+    assert!(
+        stats.cached_bytes.unwrap() > 100 * 1024,
+        "premise: the merged segment must exceed the smallest merge layer \
+         (100KB), got {} bytes",
+        stats.cached_bytes.unwrap()
+    );
+
+    conn.execute("PRAGMA fts_merge_threshold = 2").unwrap();
+    for id in 10_000..10_006 {
+        conn.execute(format!("INSERT INTO docs VALUES ({id}, 'tiny doc {id}')"))
+            .unwrap();
+    }
+
+    let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+    assert_eq!(
+        stats.segment_count,
+        Some(2),
+        "the large segment must not be rewritten by the small-tier merge"
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'tiny')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(6)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'corpus')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(3000)]]
+    );
+}
+
+/// B2 dead-space awareness: a segment that is at least half tombstoned is
+/// picked by the write-path merge even when its size tier would spare it.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_auto_merge_rewrites_tombstone_heavy_segments() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+    fts_build_large_segment(&conn, 3000);
+    let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+    assert!(
+        stats.cached_bytes.unwrap() > 100 * 1024,
+        "premise: large segment"
+    );
+
+    // Tombstone 60% of the large segment, then trigger the write-path merge
+    // exactly once (the second small insert pushes the count past the
+    // threshold).
+    conn.execute("DELETE FROM docs WHERE id < 1800").unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 2").unwrap();
+    for id in 10_000..10_002 {
+        conn.execute(format!("INSERT INTO docs VALUES ({id}, 'tiny doc {id}')"))
+            .unwrap();
+    }
+
+    let stats = fts_stats_in_txn(&tmp_db, &conn, "docs", "docs_fts");
+    assert_eq!(
+        stats.segment_count,
+        Some(1),
+        "a >=50% tombstoned segment must be rewritten regardless of its size tier"
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'corpus')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1200)]],
+        "only the live documents survive the compaction"
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'tiny')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(2)]]
+    );
+}
+
+/// While two other connections run a loop of single-row UPDATEs, each in
+/// its own BEGIN CONCURRENT transaction, an OPTIMIZE in a BEGIN CONCURRENT
+/// transaction must succeed within a bounded number of attempts. Afterwards
+/// the index must agree with the table.
+///
+/// The transactions overlap, so UPDATEs commit tombstones for documents
+/// that a merge in progress is moving. A merge keeps the identity that keys
+/// each tombstone, so an UPDATE and a merge never conflict. The retry loop
+/// only covers engine-level contention (checkpoints, schema reloads).
+///
+/// The connections must not use plain write transactions here. Plain MVCC
+/// write transactions take one exclusive slot, and two tight UPDATE loops
+/// hold that slot almost all of the time, so OPTIMIZE would starve for a
+/// reason that has nothing to do with the index.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_optimize_succeeds_under_concurrent_update_churn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp_db = Arc::new(
+        TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(true)
+            .build(),
+    );
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for id in 0..40 {
+        setup
+            .execute(format!("INSERT INTO docs VALUES ({id}, 'seed doc {id}')"))
+            .unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut updaters = Vec::new();
+    // Two updaters on disjoint id ranges. They never conflict with each
+    // other on base rows.
+    for (lo, hi) in [(0i64, 20i64), (20, 40)] {
+        let tmp_db = Arc::clone(&tmp_db);
+        let stop = Arc::clone(&stop);
+        updaters.push(std::thread::spawn(move || {
+            let conn = tmp_db.connect_limbo();
+            // Keep the churn manual-OPTIMIZE-shaped: no write-path merges.
+            conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+            let mut round = 0i64;
+            let mut committed = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                for id in lo..hi {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let update =
+                        format!("UPDATE docs SET body = 'round {round} doc {id}' WHERE id = {id}");
+                    match run_in_concurrent_transaction(&conn, &update) {
+                        Ok(()) => committed += 1,
+                        Err(
+                            turso_core::LimboError::Busy
+                            | turso_core::LimboError::BusySnapshot
+                            | turso_core::LimboError::WriteWriteConflict
+                            | turso_core::LimboError::CommitDependencyAborted
+                            | turso_core::LimboError::SchemaUpdated,
+                        ) => {}
+                        Err(e) => panic!("updater failed abnormally: {e}"),
+                    }
+                }
+                round += 1;
+            }
+            committed
+        }));
+    }
+
+    // Give the churn a moment to be genuinely concurrent.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let optimizer = tmp_db.connect_limbo();
+    const MAX_ATTEMPTS: usize = 500;
+    let mut attempts = 0;
+    let succeeded = loop {
+        attempts += 1;
+        match run_in_concurrent_transaction(&optimizer, "OPTIMIZE INDEX docs_fts") {
+            Ok(()) => break true,
+            Err(
+                turso_core::LimboError::Busy
+                | turso_core::LimboError::BusySnapshot
+                | turso_core::LimboError::WriteWriteConflict
+                | turso_core::LimboError::CommitDependencyAborted
+                | turso_core::LimboError::SchemaUpdated,
+            ) => {
+                if attempts >= MAX_ATTEMPTS {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => panic!("OPTIMIZE failed abnormally: {e}"),
+        }
+    };
+
+    stop.store(true, Ordering::Release);
+    let committed_updates: u64 = updaters
+        .into_iter()
+        .map(|updater| updater.join().unwrap())
+        .sum();
+    assert!(
+        succeeded,
+        "OPTIMIZE was starved for {MAX_ATTEMPTS} attempts under concurrent UPDATE churn"
+    );
+    assert!(
+        committed_updates > 0,
+        "the updaters must have committed some UPDATEs"
+    );
+    println!(
+        "OPTIMIZE succeeded after {attempts} attempt(s) against {committed_updates} committed UPDATEs"
+    );
+
+    // The index is still coherent after the churn + merge.
+    let check = tmp_db.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(
+            &check,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'doc')"
+        ),
+        vec![vec![rusqlite::types::Value::Integer(40)]]
+    );
+}
+
+/// Run one statement inside its own BEGIN CONCURRENT transaction. On any
+/// error the transaction is rolled back, so the connection is ready for the
+/// next attempt.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn run_in_concurrent_transaction(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> turso_core::Result<()> {
+    conn.execute("BEGIN CONCURRENT")?;
+    let result = conn.execute(sql).and_then(|()| conn.execute("COMMIT"));
+    if result.is_err() {
+        let _ = conn.execute("ROLLBACK");
+    }
+    result
 }

@@ -14,18 +14,29 @@ use crate::{
         journal_mode::JournalMode,
     },
     translate::emitter::TransactionMode,
-    types::{IOResult, IndexInfo, KeyInfo},
+    types::IOResult,
     vdbe::Register,
     Connection, LimboError, MvCursor, Result, Value,
 };
 
 pub mod backing_btree;
+pub mod backing_store;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
+pub use backing_store::{
+    BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp, BackingTable,
+};
+
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
 pub const TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME: &str = "toy_vector_sparse_ivf";
+
+/// Default for `PRAGMA fts_merge_threshold`: the number of visible FTS
+/// segments a statement flush may leave behind before the write path merges
+/// them. Lives here (not in the feature-gated `fts` module) because the
+/// connection setting exists regardless of the feature.
+pub const DEFAULT_FTS_MERGE_THRESHOLD: i64 = 32;
 
 /// index method "entry point" which can create attachment of the method to the table with given configuration
 /// (this trait acts like a "factory")
@@ -54,6 +65,20 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+    fn backing_schema(&self) -> BackingSchema;
+
+    /// Returns the result expression this index provides for the captured query parameters.
+    /// The planner compares it with the requested expression before using an index result
+    /// instead of evaluating the function. Return None if the index cannot provide it.
+    /// By default, this only replaces pattern placeholders; FTS also limits scores to
+    /// the fields selected by the search query.
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        crate::util::try_substitute_parameters(pattern, parameters)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,14 +90,13 @@ pub enum IndexMethodMvccSupport {
     /// Persistent state is stored exclusively through core-provided,
     /// MVCC-aware backing storage.
     ///
-    /// Under MVCC, concurrent `BEGIN CONCURRENT` transactions may write one
-    /// index of this kind at the same time when the method's writes commute
-    /// (FTS appends immutable segments under fresh ids). Deletes and
-    /// updates that target existing entries are mutually excluded with
-    /// index maintenance: merge/OPTIMIZE holds the per-index lease (the
-    /// merge mutex, `Busy` on contention, `WriteWriteConflict` when its
-    /// snapshot is stale), and tombstone writers overlapping a merge are
-    /// refused the same way so their deletes cannot be lost.
+    /// Under MVCC, concurrent `BEGIN CONCURRENT` transactions can write one
+    /// index of this kind at the same time when the method's writes do not
+    /// conflict. FTS appends immutable segments under fresh ids, and its
+    /// deletes write tombstones keyed by a document identity that merges
+    /// keep. Two merges that want the same segment are serialized by the
+    /// MVCC row conflict on the row that says the segment exists: the merge
+    /// that deletes it first owns the segment, and the other merge skips it.
     TransactionalBackingStore,
     /// Persistent state is external and implements transaction outcome hooks.
     ExternalTransactional,
@@ -135,6 +159,18 @@ pub enum IndexMethodSnapshotIdentity {
 pub(crate) enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeFlushStaged = 2,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeClaimStaged = 3,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsOptimizeMergeStaged = 4,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsStatementFlushStaged = 5,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsAutoMergeClaimStaged = 6,
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    FtsAutoMergeStaged = 7,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -371,19 +407,6 @@ impl IndexMethodContext {
     pub fn open_table_cursor(&self, table: &str) -> Result<Box<dyn CursorTrait>> {
         open_table_cursor(&self.connection()?, self.database.id, table)
     }
-
-    pub fn open_index_cursor<I, E>(
-        &self,
-        table: &str,
-        index: &str,
-        keys: I,
-    ) -> Result<Box<dyn CursorTrait>>
-    where
-        I: IntoIterator<Item = KeyInfo, IntoIter = E>,
-        E: ExactSizeIterator<Item = KeyInfo>,
-    {
-        open_index_cursor(&self.connection()?, self.database.id, table, index, keys)
-    }
 }
 
 #[cfg(any(test, injected_yields))]
@@ -508,11 +531,10 @@ pub struct IndexMethodTestStats {
     pub manifest_validation_hits: Option<usize>,
     /// Cross-snapshot control-record validations that rejected a stale cache.
     pub manifest_validation_misses: Option<usize>,
-    /// Number of successful MVCC writer-lease acquisitions, including
-    /// reentrant acquisition by the owning transaction.
-    pub write_lease_acquisitions: Option<usize>,
-    /// Number of writer-lease acquisitions rejected due to contention.
-    pub write_lease_rejections: Option<usize>,
+    /// Number of segments a merge got.
+    pub merge_segments_claimed: Option<usize>,
+    /// Number of segments a merge skipped because another merge held them.
+    pub merge_segments_skipped: Option<usize>,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
@@ -717,44 +739,6 @@ pub(crate) fn open_table_cursor(
         root_page,
         cursor,
         MvccCursorType::Table,
-    )
-}
-
-/// Helper method to open an index cursor in an index method implementation.
-pub(crate) fn open_index_cursor<I, E>(
-    connection: &Arc<Connection>,
-    database_id: usize,
-    table: &str,
-    index: &str,
-    keys: I,
-) -> Result<Box<dyn CursorTrait>>
-where
-    I: IntoIterator<Item = KeyInfo, IntoIter = E>,
-    E: ExactSizeIterator<Item = KeyInfo>,
-{
-    let pager = connection.get_pager_from_database_index(&database_id)?;
-    let Some(scratch) = connection.with_schema(database_id, |schema| {
-        schema.get_index(table, index).cloned()
-    }) else {
-        return Err(LimboError::InternalError(format!(
-            "index {index} for table {table} not found",
-        )));
-    };
-    let keys = keys.into_iter();
-    let num_cols = keys.len();
-    let index_info = Arc::new(IndexInfo::new(keys, false, num_cols, scratch.unique)?);
-    let mut cursor = BTreeCursor::new(
-        pager,
-        btree_root_page(connection, database_id, scratch.root_page),
-        num_cols,
-    );
-    cursor.index_info = Some(index_info.clone());
-    promote_to_mvcc_cursor(
-        connection,
-        database_id,
-        scratch.root_page,
-        Box::new(cursor),
-        MvccCursorType::Index(index_info),
     )
 }
 

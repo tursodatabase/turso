@@ -1,5 +1,8 @@
+use asserting::prelude::*;
+use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Result, StatementStatusCounter, Value};
+
+use turso_core::{Connection, LimboError, Result, StatementStatusCounter, Value};
 
 use crate::common::{ExecRows, TempDatabase};
 
@@ -37,16 +40,12 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     // but the automatic reprepare should handle it.
 
     // First, let's verify the statement can execute (it will be automatically reprepared)
-    let mut found_row = false;
+    let mut rows = Vec::new();
     stmt.run_with_row_callback(|row| {
-        let a = row.get::<&Value>(0).unwrap();
-        let b = row.get::<&Value>(1).unwrap();
-        assert_eq!(*a, Value::from_i64(1));
-        assert_eq!(*b, Value::build_text("first"));
-        found_row = true;
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
         Ok(())
     })?;
-    assert!(found_row, "Expected to find a row");
+    assert_that!(rows).is_equal_to(vec![row![1, "first"]]);
 
     // Verify the transaction is still active by executing another statement
     conn1.execute("INSERT INTO t (a, b) VALUES (3, 'third')")?;
@@ -110,7 +109,7 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
     conn.execute("INSERT INTO m VALUES (1)")?;
 
     let mut stmt = conn.prepare("SELECT x FROM m")?;
-    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_that!(stmt.stmt_status(StatementStatusCounter::Reprepare)).is_zero();
 
     conn.execute("CREATE TEMP TABLE temp_t(y INTEGER)")?;
 
@@ -120,9 +119,71 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
         Ok(())
     })?;
 
-    assert_eq!(rows, vec![1]);
-    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
+    assert_that!(rows).is_equal_to(vec![1]);
+    assert_that!(stmt.stmt_status(StatementStatusCounter::Reprepare)).is_one();
 
+    Ok(())
+}
+
+#[test]
+fn test_prepared_schema_pragmas_reprepare_after_ddl() -> Result<()> {
+    let cases: [(&[&str], &str, &[&str]); 7] = [
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_info(t1)",
+            &["ALTER TABLE t1 ADD COLUMN b"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_xinfo(t1)",
+            &["ALTER TABLE t1 ADD COLUMN b"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_list",
+            &["CREATE TABLE t2(a)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_list(t1)",
+            &["CREATE INDEX i2 ON t1(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_info(i1)",
+            &["DROP INDEX i1", "CREATE INDEX i1 ON t1(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_xinfo(i1)",
+            &["DROP INDEX i1", "CREATE INDEX i1 ON t1(b)"],
+        ),
+        (
+            &[
+                "CREATE TABLE t1(a PRIMARY KEY)",
+                "CREATE TABLE t2(b REFERENCES t1(a))",
+            ],
+            "PRAGMA foreign_key_list(t2)",
+            &["DROP TABLE t2", "CREATE TABLE t2(b)"],
+        ),
+    ];
+    for (setup, pragma, ddl) in cases {
+        let tmp_db = TempDatabase::new_empty();
+        let conn = tmp_db.connect_limbo();
+        for sql in setup {
+            conn.execute(*sql)?;
+        }
+        let mut stmt = conn.prepare(pragma)?;
+        stmt.run_collect_rows()?;
+        for sql in ddl {
+            conn.execute(*sql)?;
+        }
+
+        stmt.reset()?;
+        let reused = stmt.run_collect_rows()?;
+        let fresh = conn.prepare(pragma)?.run_collect_rows()?;
+        assert_that!(reused).named(pragma).is_equal_to(fresh);
+    }
     Ok(())
 }
 
@@ -204,8 +265,8 @@ fn test_deferred_seeks_resize_on_reprepare(tmp_db: TempDatabase) -> Result<()> {
         Ok(())
     })?;
 
-    // Verify we got the expected results (orders with total > 100.0)
-    assert_eq!(results.len(), 3);
+    // Three orders have a total over 100.0.
+    assert_that!(results).has_length(3);
 
     Ok(())
 }
@@ -312,4 +373,169 @@ fn test_alter_table_alter_column_clears_autoincrement_reopen() {
 
         conn.close().unwrap();
     }
+}
+
+#[test]
+fn test_strict_generated_any_index_after_reopen() -> Result<()> {
+    for (create_sql, alter_sql) in [
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, g aNy AS(a)) STRICT",
+            None,
+        ),
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY) STRICT",
+            Some("ALTER TABLE t ADD COLUMN g aNy AS(a)"),
+        ),
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, c ANY) STRICT",
+            Some("ALTER TABLE t ALTER COLUMN c TO g aNy AS(a)"),
+        ),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("generated_any.db");
+        let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+        let expected = vec![
+            (1, "'00042'".to_string(), "text".to_string()),
+            (2, "42".to_string(), "integer".to_string()),
+            (3, "'42'".to_string(), "text".to_string()),
+        ];
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(create_sql)?;
+            conn.execute("INSERT INTO t(id,a) VALUES(1,'00042'),(2,42)")?;
+            if let Some(alter_sql) = alter_sql {
+                conn.execute(alter_sql)?;
+            }
+            conn.execute("CREATE UNIQUE INDEX t_g ON t(g)")?;
+            conn.execute("INSERT INTO t(id,a) VALUES(3,'42')")?;
+            let rows: Vec<(i64, String, String)> =
+                conn.exec_rows("SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g ORDER BY id");
+            assert_that!(rows)
+                .named(create_sql)
+                .is_equal_to(expected.clone());
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            for access in ["NOT INDEXED", "INDEXED BY t_g"] {
+                let rows: Vec<(i64, String, String)> = conn.exec_rows(&format!(
+                    "SELECT id,quote(g),typeof(g) FROM t {access} ORDER BY id"
+                ));
+                assert_that!(rows)
+                    .named(create_sql)
+                    .is_equal_to(expected.clone());
+            }
+
+            conn.execute("UPDATE t SET a='00043' WHERE g='00042'")?;
+            conn.execute("DELETE FROM t WHERE g=42")?;
+            let rows: Vec<(i64, String, String)> =
+                conn.exec_rows("SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g ORDER BY id");
+            assert_that!(rows).named(create_sql).is_equal_to(vec![
+                (1, "'00043'".to_string(), "text".to_string()),
+                (3, "'42'".to_string(), "text".to_string()),
+            ]);
+            let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_that!(integrity)
+                .named(create_sql)
+                .is_equal_to(vec![("ok".to_string(),)]);
+            conn.close()?;
+        }
+    }
+    Ok(())
+}
+
+/// A statement that went stale because a connection setting changed is
+/// prepared again before it starts. That must not end the transaction of
+/// another statement that is still returning rows.
+#[turso_macros::test(mvcc)]
+fn test_stale_statement_keeps_writes_of_a_statement_returning_rows(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (x)")?;
+    let mut stale = conn.prepare("SELECT 1")?;
+    let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2) RETURNING x")?;
+    assert_eq!(step_to_first_row(&mut insert)?, vec![Value::from_i64(1)]);
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert_eq!(stale.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+    insert.run_ignore_rows()?;
+
+    assert_eq!(count_rows(&conn, "t")?, Value::from_i64(2));
+    assert_eq!(
+        count_rows(&tmp_db.connect_limbo(), "t")?,
+        Value::from_i64(2)
+    );
+    Ok(())
+}
+
+/// Preparing a stale statement again must not end the read transaction of a
+/// SELECT that is part-way through its rows: the SELECT keeps reading the
+/// snapshot it started with, even after another connection deletes the rows
+/// and checkpoints.
+#[turso_macros::test(mvcc)]
+fn test_stale_statement_keeps_the_snapshot_of_a_running_select(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    let mut stale = conn.prepare("SELECT 1")?;
+    let mut select = conn.prepare("SELECT x FROM t ORDER BY x")?;
+    assert_eq!(step_to_first_row(&mut select)?, vec![Value::from_i64(1)]);
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert_eq!(stale.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+    other.execute("DELETE FROM t")?;
+    match other.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        Ok(()) | Err(LimboError::Busy) => {}
+        Err(err) => return Err(err),
+    }
+
+    assert_eq!(
+        select.run_collect_rows()?,
+        vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]]
+    );
+    Ok(())
+}
+
+/// With no other statement running, a stale statement is prepared again and
+/// runs with the new setting.
+#[turso_macros::test(mvcc)]
+fn test_stale_statement_uses_the_new_setting(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))")?;
+    let mut insert = conn.prepare("INSERT INTO child VALUES (1)")?;
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    let err = insert.run_ignore_rows().unwrap_err();
+    assert!(
+        matches!(err, LimboError::ForeignKeyConstraint(_)),
+        "unexpected error: {err:?}"
+    );
+
+    tmp_db
+        .connect_limbo()
+        .execute("INSERT INTO parent VALUES (1)")?;
+    assert_eq!(count_rows(&conn, "parent")?, Value::from_i64(1));
+    assert_eq!(count_rows(&conn, "child")?, Value::from_i64(0));
+    Ok(())
+}
+
+fn step_to_first_row(stmt: &mut turso_core::Statement) -> Result<Vec<Value>> {
+    let row = stmt
+        .run_one_step_blocking(|| Ok(()), || Ok(()))?
+        .expect("statement should return a row");
+    Ok(row.get_values().cloned().collect())
+}
+
+fn count_rows(conn: &Arc<Connection>, table: &str) -> Result<Value> {
+    let mut rows = conn
+        .prepare(format!("SELECT count(*) FROM {table}"))?
+        .run_collect_rows()?;
+    Ok(rows.remove(0).remove(0))
 }

@@ -365,6 +365,27 @@ expect {
     -9e999
 }
 
+test json_keeps_infinity_text_from_input {
+    SELECT json('["9.0e+999"]'), json('{"note":"x 9.0e+999 y"}'), json('[9.0e+999]'), json(jsonb_array(9e999)), json(jsonb_object('a', -9e999));
+}
+expect {
+    ["9.0e+999"]|{"note":"x 9.0e+999 y"}|[9.0e+999]|[9.0e+999]|{"a":-9.0e+999}
+}
+
+test json_set_insert_replace_infinity {
+    SELECT json_set('[1]', '$[0]', 9e999), json_insert('[]', '$[#]', -9e999), json_replace('[1]', '$[0]', 9e999), json(jsonb_set('[1]', '$[0]', 9e999)), json(jsonb_replace('[1]', '$[0]', -9e999));
+}
+expect {
+    [9e999]|[-9e999]|[9e999]|[9e999]|[-9e999]
+}
+
+test json_quote_and_arrow_infinity {
+    SELECT json_quote(9e999), json_object('a', 9e999), 9e999 -> '$', json_group_array(x) FROM (SELECT -9e999 AS x);
+}
+expect {
+    9.0e+999|{"a":9.0e+999}|9e999|[-9.0e+999]
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }
@@ -1686,6 +1707,207 @@ expect error {
     .*JSON cannot hold BLOB values.*
 }
 
+test json_set_blob_value_null_path {
+    SELECT json_set('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_set_bad_path_before_blob_value {
+    SELECT json_set('[1]', 'bad', x'7b7d');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test jsonb_set_blob_value {
+    SELECT jsonb_set('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_array_append {
+    SELECT json_insert('[]', '$[#]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_object_key {
+    SELECT json_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_null_path {
+    SELECT json_insert('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_insert_jsonb_blob_value {
+    SELECT json_insert('{}', '$.a', x'01');
+}
+expect {
+    {"a":true}
+}
+
+test jsonb_insert_blob_value {
+    SELECT jsonb_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_jsonb_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'01');
+}
+expect {
+    [true]
+}
+
+test jsonb_replace_blob_value {
+    SELECT jsonb_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+# x'245b305d' = '$[0]', x'245b315d' = '$[1]', x'61' = 'a', x'2461' = '$a'
+test json_set_blob_path {
+    SELECT json_set('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_insert_blob_path {
+    SELECT json_insert('[1]', x'245b315d', 5);
+}
+expect {
+    [1,5]
+}
+
+test json_replace_blob_path {
+    SELECT json_replace('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_set_blob_path_blob_value {
+    SELECT json_set('[1]', x'245b305d', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_remove_blob_path {
+    SELECT json_remove('[1,2]', x'245b305d');
+}
+expect {
+    [2]
+}
+
+test json_extract_blob_path {
+    SELECT json_extract('[1]', x'245b305d');
+}
+expect {
+    1
+}
+
+test json_extract_bad_blob_path {
+    SELECT json_extract('{"a":1}', x'2461');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test json_type_blob_path {
+    SELECT json_type('[1]', x'245b305d');
+}
+expect {
+    integer
+}
+
+test json_arrow_blob_path {
+    SELECT '[1]' -> x'245b305d', '{"a":1}' ->> x'61';
+}
+expect {
+    1|1
+}
+
+test json_each_blob_path {
+    SELECT key, value FROM json_each('[1,[2]]', x'245b315d');
+}
+expect {
+    0|2
+}
+
+test json_tree_blob_path {
+    SELECT key, value FROM json_tree('[1,[2]]', x'245b315d');
+}
+expect {
+    1|[2]
+    0|2
+}
+
+test json_extract_path_stops_at_nul {
+    SELECT json_extract('[1]', '$' || char(0) || '[0]'), json_extract('[1]', x'24005b305d');
+}
+expect {
+    [1]|[1]
+}
+
+test json_edit_path_stops_at_nul {
+    SELECT json_set('{"a":1}', '$.b' || char(0) || 'x', 5),
+           json_insert('{"a":1}', '$.c' || char(0) || 'x', 5),
+           json_replace('{"a":1}', '$.a' || char(0) || 'x', 5),
+           json_remove('{"a":1,"b":2}', '$.a' || char(0) || 'x');
+}
+expect {
+    {"a":1,"b":5}|{"a":1,"c":5}|{"a":5}|{"b":2}
+}
+
+test json_type_path_stops_at_nul {
+    SELECT json_type('{"a":[1]}', '$.a' || char(0) || '[0]');
+}
+expect {
+    array
+}
+
+test json_arrow_path_stops_at_nul {
+    SELECT '{"a":{"b":2}}' -> ('$.a' || char(0) || '.b'), '{"a":{"b":2}}' ->> ('a' || char(0) || '.b');
+}
+expect {
+    {"b":2}|{"b":2}
+}
+
+test json_each_path_stops_at_nul {
+    SELECT key, path, fullkey FROM json_each('{"a":{"b":2}}', '$.a' || char(0) || 'x');
+}
+expect {
+    b|$.a|$.a.b
+}
+
+test json_path_starting_with_nul {
+    SELECT json_extract('[1]', char(0) || '$');
+}
+expect error {
+    .*bad JSON path.*
+}
+
 test json_set_field_empty_object {
     SELECT json_set('{}', '$.field', 'value');
 }
@@ -1913,6 +2135,13 @@ test json_basics {
 }
 expect {
     {"name":"John","age":30,"city":"New York"}
+}
+
+test jsonb_null_is_sql_null {
+    SELECT typeof(jsonb(NULL)), jsonb(NULL) IS NULL;
+}
+expect {
+    null|1
 }
 
 test json_complex_nested {
@@ -3459,7 +3688,8 @@ expect error {
 test jsonb-oversized-child-remove {
     SELECT json_remove(x'8BC7C8000000000000', '$[0]');
 }
-expect {
+expect error {
+    malformed JSON
 }
 
 test json_each_over_null_column {

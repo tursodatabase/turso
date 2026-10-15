@@ -130,6 +130,10 @@ pub enum Token {
     #[token("@cross-check-integrity")]
     AtCrossCheckIntegrity,
 
+    /// Include bundled SQLite's EXPLAIN output in a snapshot.
+    #[token("@sqlite-reference")]
+    AtSqliteReference,
+
     /// `@var` (matrix variable decorator)
     #[token("@var")]
     AtVar,
@@ -251,6 +255,7 @@ impl fmt::Display for Token {
             Token::CustomTypes => write!(f, "custom_types"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtCrossCheckIntegrity => write!(f, "@cross-check-integrity"),
+            Token::AtSqliteReference => write!(f, "@sqlite-reference"),
             Token::AtVar => write!(f, "@var"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
@@ -317,7 +322,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend, @cross-check-integrity, @var. Did you mean one of these?".to_string())
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend, @cross-check-integrity, @sqlite-reference, @var. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"

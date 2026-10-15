@@ -38,4 +38,4 @@ print("Running integrity check...")
 
 result = cur.execute("PRAGMA integrity_check")
 row = result.fetchone()
-always(row == ("ok",), f"Integrity check failed: {row}", {})
+always(row == ("ok",), "Integrity check failed", {"row": row})

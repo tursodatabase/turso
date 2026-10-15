@@ -1,4 +1,6 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
 use core_tester::common::sqlite_exec_rows;
 use rusqlite::types::Value;
 
@@ -259,6 +261,19 @@ fn hash_join_preserves_join_predicates_after_outer_join_conversion() {
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
 
+    // This test covers the hash-join rewrite, so use estimates that select that path.
+    limbo_exec_rows(&conn, "ANALYZE");
+    limbo_exec_rows(&conn, "DELETE FROM sqlite_stat1");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+            ('t1', NULL, '3'),
+            ('t2', NULL, '3'),
+            ('t3', NULL, '3'),
+            ('t4', NULL, '3')",
+    );
+    limbo_exec_rows(&conn, "ANALYZE sqlite_schema");
+
     let query = "SELECT t1.id, t2.id, t3.id, sub_t4.a \
 FROM t1 \
 JOIN t2 ON t1.d = t2.d \
@@ -268,13 +283,10 @@ LEFT JOIN (SELECT a, sum(b) AS sum_b, max(c) AS max_c, count(*) AS cnt FROM t4 G
 WHERE t1.c IS NOT NULL AND sub_t4.a = 15 \
 ORDER BY t1.id, t2.id, t3.id, sub_t4.a LIMIT 50";
 
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1)
-            .and_then(value_as_text)
-            .is_some_and(|op| op == "HashBuild" || op == "HashProbe")
-    });
-    assert!(has_hash, "expected hash join in EXPLAIN output");
+    assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
+        .named("opcodes of the join")
+        .column(1)
+        .contains_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
     let limbo_rows = limbo_exec_rows(&conn, query);
@@ -337,6 +349,7 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
     }
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
+    limbo_exec_rows(&conn, "ANALYZE");
 
     for predicate in [
         "t3.d IS t4.d",
@@ -350,31 +363,90 @@ LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
         );
 
-        let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-        let has_unmatched_scan = explain_rows.iter().any(|row| {
-            row.get(1)
-                .and_then(value_as_text)
-                .is_some_and(|op| op == "HashScanUnmatched")
-        });
-        assert!(
-            has_unmatched_scan,
-            "expected a hash join unmatched-row scan for `{predicate}`"
-        );
+        assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
+            .named(format!("opcodes of the join on `{predicate}`"))
+            .column(1)
+            .contains(Cell::from("HashScanUnmatched"));
 
         let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
-        let limbo_rows = limbo_exec_rows(&conn, &query);
-        assert_eq!(
-            sqlite_rows, limbo_rows,
-            "null-extended rows were not filtered by `{predicate}`"
-        );
-        // Guard against the assertion passing because both sides return nothing.
-        assert!(
-            sqlite_rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(value_as_i64)
-                .is_some_and(|count| count > 0),
-            "`{predicate}` should match some rows"
-        );
+        assert_that!(limbo_exec_rows(&conn, &query))
+            .named(format!("rows for `{predicate}`"))
+            .is_equal_to(sqlite_rows.clone());
+        // Guard against the comparison passing because both sides return nothing.
+        assert_that!(sqlite_rows)
+            .named(format!("sqlite count for `{predicate}`"))
+            .column(0)
+            .single_element()
+            .satisfies_with_message(
+                "be more than zero",
+                |count| matches!(count, Value::Integer(count) if *count > 0),
+            );
     }
+}
+
+#[test]
+// The hash build applies build-only WHERE terms while filling the hash table,
+// so every row a probe can match has already passed them. Re-checking the same
+// terms on every probe match is wasted work.
+fn hash_join_build_filter_runs_once_not_per_probe_match() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE build_side(id INTEGER PRIMARY KEY, k INTEGER, name TEXT)",
+    );
+    limbo_exec_rows(&conn, "CREATE TABLE probe_side(k INTEGER, v INTEGER)");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO build_side VALUES (1, 10, 'keep'), (2, 20, 'drop'), (3, 30, 'keep')",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO build_side
+         SELECT value + 3, value + 1000, 'drop' FROM generate_series(1, 97)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO probe_side VALUES (10, 100), (20, 200), (30, 300), (30, 301)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO probe_side
+         SELECT value + 10000, value + 10000 FROM generate_series(1, 996)",
+    );
+    limbo_exec_rows(&conn, "ANALYZE");
+
+    let query = "SELECT probe_side.v FROM build_side \
+JOIN probe_side ON probe_side.k = build_side.k \
+WHERE build_side.name = 'keep' ORDER BY probe_side.v";
+
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
+    let opcode_count = |opcode: &str| {
+        explain_rows
+            .iter()
+            .filter(|row| {
+                row.get(1)
+                    .and_then(value_as_text)
+                    .is_some_and(|op| op == opcode)
+            })
+            .count()
+    };
+    assert!(opcode_count("HashBuild") > 0, "expected a hash join");
+    // The name filter compiles to a single Ne (jump when the names differ)
+    // inside the hash build loop. A second Ne means the probe loop re-checks it.
+    assert_eq!(
+        opcode_count("Ne"),
+        1,
+        "build-side filter must be evaluated once, during the hash build"
+    );
+
+    let rows = limbo_exec_rows(&conn, query);
+    let expected: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(100)],
+        vec![Value::Integer(300)],
+        vec![Value::Integer(301)],
+    ];
+    assert_eq!(rows, expected);
 }

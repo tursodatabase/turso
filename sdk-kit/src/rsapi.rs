@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -739,7 +739,9 @@ impl From<LimboError> for TursoError {
             }
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
-            LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
+            e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
+                TursoError::DatabaseFull(e.to_string())
+            }
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
             // Same-connection rejections carry SQLITE_BUSY semantics, but the
@@ -747,6 +749,9 @@ impl From<LimboError> for TursoError {
             err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
+            ),
+            LimboError::CommitDependencyAborted => TursoError::BusySnapshot(
+                "Commit dependency aborted, rollback and retry the whole transaction".to_string(),
             ),
             LimboError::CompletionError(turso_core::CompletionError::IOError(kind, op)) => {
                 TursoError::IoError(kind, op)
@@ -923,9 +928,9 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                })?),
+                IoBackend::IoUring => Arc::new(
+                    turso_core::UringIO::new().map_err(|e| TursoError::Error(e.to_string()))?,
+                ),
                 #[cfg(all(target_os = "windows", not(miri)))]
                 IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
                     TursoError::Error(format!("unable to create win_iocp backend: {e}"))
@@ -1071,16 +1076,16 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect_with_page_codec(page_codec.clone())?
+            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
         } else {
-            // Parse encryption key if configured - needed for connect_with_encryption
+            // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
             let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
                 Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
             } else {
                 None
             };
-            db.connect_with_encryption(encryption_key)?
+            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -1183,7 +1188,7 @@ impl TursoConnection {
     }
     /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
     pub fn get_query_timeout(&self) -> Duration {
-        self.connection.get_query_timeout()
+        Duration::from_millis(self.connection.get_query_timeout_ms())
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -1834,6 +1839,21 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn commit_dependency_abort_requires_transaction_retry() {
+        for error in [
+            TursoError::from(LimboError::CommitDependencyAborted),
+            TursoError::from(Box::new(LimboError::CommitDependencyAborted)),
+        ] {
+            assert!(matches!(error, TursoError::BusySnapshot(_)), "{error:?}");
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_BUSY_SNAPSHOT
+            ));
+            assert!(error.to_string().contains("Commit dependency aborted"));
+        }
+    }
 
     fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
         TursoDatabaseConfig {

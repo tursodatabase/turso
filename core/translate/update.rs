@@ -281,12 +281,14 @@ fn prepare_update_plan(
         identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_plan: None,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     };
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];
@@ -346,9 +348,6 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
-    if from_tables.right_join_swapped() {
-        read_scope_tables.set_right_join_swapped();
-    }
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
@@ -404,17 +403,17 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
-    append_vtab_predicates_to_where_clause(
-        &mut vtab_predicates,
-        &mut read_scope_tables,
-        &result_columns,
-        &mut where_clause,
-        resolver,
-    )?;
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
         Some(&result_columns),
+        &mut where_clause,
+        resolver,
+    )?;
+    append_vtab_predicates_to_where_clause(
+        &mut vtab_predicates,
+        &mut read_scope_tables,
+        &result_columns,
         &mut where_clause,
         resolver,
     )?;
