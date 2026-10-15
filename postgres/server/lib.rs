@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -31,6 +32,7 @@ pub struct TursoPgServer {
     address: String,
     db_file: String,
     connect: Arc<Connect>,
+    schemas: Arc<SharedSchemas>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -47,6 +49,7 @@ impl TursoPgServer {
             address,
             db_file,
             connect: Arc::new(connect),
+            schemas: Arc::new(SharedSchemas::default()),
             interrupt_count,
         }
     }
@@ -80,6 +83,7 @@ impl TursoPgServer {
                             let factory = Arc::new(TursoPgFactory {
                                 handler: Arc::new(TursoPgHandler {
                                     conn: Arc::new(Mutex::new(conn.clone())),
+                                    schemas: self.schemas.clone(),
                                     db_file: self.db_file.clone(),
                                     query_parser: Arc::new(NoopQueryParser::new()),
                                 }),
@@ -116,11 +120,18 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
+    schemas: Arc<SharedSchemas>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl TursoPgHandler {
+    fn prepare(&self, conn: &PgConnection, sql: &str) -> PgWireResult<turso_core::Statement> {
+        self.schemas
+            .prepare(conn, sql)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))
+    }
+
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
@@ -166,6 +177,46 @@ impl TursoPgHandler {
     }
 }
 
+/// The schemas of the server, by name, with the database file of each. A
+/// schema is a database file attached to a connection, and every client has
+/// its own connection, so a schema that one client creates or drops is
+/// attached or detached on the connection of every other client before its
+/// next statement.
+#[derive(Default)]
+struct SharedSchemas {
+    schemas: Mutex<Option<BTreeMap<String, String>>>,
+}
+
+impl SharedSchemas {
+    fn prepare(&self, conn: &PgConnection, sql: &str) -> turso_pg::Result<turso_core::Statement> {
+        let mut schemas = self.schemas.lock().unwrap();
+        let attached = attached_schemas(conn);
+        let schemas = schemas.get_or_insert_with(|| attached.clone());
+        for (name, path) in &attached {
+            if schemas.get(name) != Some(path) {
+                conn.inner().detach(name)?;
+            }
+        }
+        for (name, path) in schemas.iter() {
+            if attached.get(name) != Some(path) {
+                conn.inner().attach(path, name)?;
+            }
+        }
+        let stmt = conn.prepare(sql);
+        *schemas = attached_schemas(conn);
+        stmt
+    }
+}
+
+fn attached_schemas(conn: &PgConnection) -> BTreeMap<String, String> {
+    conn.inner()
+        .list_all_databases()
+        .into_iter()
+        .filter(|(_, name, _)| name != "main" && name != "temp")
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
 }
@@ -200,9 +251,7 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn.prepare(sql).map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
-            })?;
+            let mut stmt = self.prepare(&conn, sql)?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -239,9 +288,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn.prepare(query).map_err(|e| {
-            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
-        })?;
+        let mut stmt = self.prepare(&conn, query)?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -266,9 +313,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn.prepare(&target.statement).map_err(|e| {
-            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
-        })?;
+        let stmt = self.prepare(&conn, &target.statement)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -289,9 +334,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn.prepare(&portal.statement.statement).map_err(|e| {
-            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
-        })?;
+        let stmt = self.prepare(&conn, &portal.statement.statement)?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))

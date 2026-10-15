@@ -999,6 +999,10 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_on(":memory:")
+}
+
+fn start_tursopg_server_on(database: &str) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -1007,7 +1011,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(database)
             .arg("--server")
             .arg(&addr)
             .stdout(Stdio::piped())
@@ -1367,6 +1371,36 @@ fn wire_load_extension_is_disabled() {
             "wire listener must not reach the filesystem open: {text}"
         );
     });
+}
+
+#[test]
+fn wire_schema_created_by_one_client_is_visible_to_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("shared-schemas.db");
+    let (mut server, port) = start_tursopg_server_on(database.to_str().unwrap());
+    let mut creator = PgTestClient::connect(port);
+    let mut reader = PgTestClient::connect(port);
+    let mut restricted = PgTestClient::connect(port);
+    creator.query_command_tags("CREATE ROLE alice");
+    restricted.query_command_tags("SET ROLE alice");
+
+    creator.query_command_tags("CREATE SCHEMA shared");
+    creator.query_command_tags("CREATE TABLE shared.t (x INT)");
+    creator.query_command_tags("INSERT INTO shared.t VALUES (1)");
+    assert_eq!(
+        reader.query_single_text("SELECT count(*) FROM shared.t"),
+        "1"
+    );
+    assert_eq!(restricted.query_single_text("SELECT 1"), "1");
+
+    creator.query_command_tags("DROP SCHEMA shared CASCADE");
+    reader.send_query("SELECT count(*) FROM shared.t");
+    let response = String::from_utf8_lossy(&reader.read_until_ready()).to_string();
+    assert!(response.contains("shared"), "{response}");
+    assert_eq!(reader.query_single_text("SELECT 1"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
 }
 
 #[test]

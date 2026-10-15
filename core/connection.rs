@@ -3097,6 +3097,23 @@ impl Connection {
         self.schema.read().clone()
     }
 
+    /// Attaches the database file at `path` as `alias`, like `ATTACH`.
+    /// Unlike the statement, it is not checked against the current role,
+    /// because only the host program can call it.
+    pub fn attach(&self, path: &str, alias: &str) -> Result<()> {
+        let mut state = AttachDatabaseState::default();
+        self.db
+            .io
+            .block(|| self.attach_database(path, alias, &mut state))
+    }
+
+    /// Detaches the database attached as `alias`, like `DETACH`. Unlike the
+    /// statement, it is not checked against the current role, because only
+    /// the host program can call it.
+    pub fn detach(&self, alias: &str) -> Result<()> {
+        self.detach_database(alias)
+    }
+
     pub fn attached_database_names(&self) -> Vec<String> {
         self.attached_databases
             .read()
