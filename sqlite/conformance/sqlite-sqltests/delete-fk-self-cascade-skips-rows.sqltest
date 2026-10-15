@@ -1,0 +1,117 @@
+@database :memory:
+
+# Issue #8713: DELETE on a table whose own rows reference it with a cascading
+# FK action must materialize its target rowids. The cascade deletes rows of the
+# same table while the cascade's own scan is still iterating it, so without
+# materialization later sibling rows are skipped and survive pointing at a row
+# that is already gone.
+
+@cross-check-integrity
+test delete-self-cascade-grandchild-under-one-sibling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE node(id INTEGER PRIMARY KEY,
+                      parent INTEGER REFERENCES node(id) ON DELETE CASCADE,
+                      label TEXT);
+    INSERT INTO node VALUES (1,NULL,'root'),(2,1,'a'),(3,1,'b'),(4,2,'a1');
+    DELETE FROM node WHERE id=1;
+    SELECT count(*) FROM node;
+    SELECT 'sep';
+    SELECT id, parent, label FROM node ORDER BY id;
+}
+expect {
+    0
+    sep
+}
+
+@cross-check-integrity
+test delete-self-cascade-wide-tree-leaves-unrelated-roots {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE node(id INTEGER PRIMARY KEY,
+                      parent INTEGER REFERENCES node(id) ON DELETE CASCADE);
+    INSERT INTO node VALUES (1,NULL),(2,1),(3,1),(4,1),(5,2),(6,3),(7,5),(8,NULL),(9,8);
+    DELETE FROM node WHERE id=1;
+    SELECT id, parent FROM node ORDER BY id;
+}
+expect {
+    8|
+    9|8
+}
+
+@cross-check-integrity
+test delete-self-cascade-scan-deletes-every-root {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE node(id INTEGER PRIMARY KEY,
+                      parent INTEGER REFERENCES node(id) ON DELETE CASCADE);
+    INSERT INTO node VALUES (1,NULL),(2,1),(3,1),(4,2),(5,NULL),(6,5),(7,5),(8,6);
+    DELETE FROM node WHERE parent IS NULL;
+    SELECT count(*) FROM node;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test delete-self-cascade-with-index-on-referencing-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE node(id INTEGER PRIMARY KEY,
+                      parent INTEGER REFERENCES node(id) ON DELETE CASCADE);
+    CREATE INDEX node_parent ON node(parent);
+    INSERT INTO node VALUES (1,NULL),(2,1),(3,1),(4,2);
+    DELETE FROM node WHERE id=1;
+    SELECT count(*) FROM node;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test delete-self-set-null-keeps-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE node(id INTEGER PRIMARY KEY,
+                      parent INTEGER REFERENCES node(id) ON DELETE SET NULL);
+    INSERT INTO node VALUES (1,NULL),(2,1),(3,1),(4,2);
+    DELETE FROM node WHERE id=1;
+    SELECT id, parent FROM node ORDER BY id;
+}
+expect {
+    2|
+    3|
+    4|2
+}
+
+@cross-check-integrity
+test delete-fk-cascade-cycle-through-second-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bref INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aref INTEGER REFERENCES a(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES (1,NULL),(4,NULL);
+    INSERT INTO b VALUES (10,1),(20,1),(30,4);
+    INSERT INTO a VALUES (2,10),(3,20);
+    DELETE FROM a WHERE id=1;
+    SELECT id, bref FROM a ORDER BY id;
+    SELECT 'sep';
+    SELECT id, aref FROM b ORDER BY id;
+}
+expect {
+    4|
+    sep
+    30|4
+}
+
+@cross-check-integrity
+test delete-fk-cascade-plain-parent-child-unaffected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (1),(2),(3);
+    INSERT INTO child VALUES (10,1),(20,1),(30,2),(40,3);
+    DELETE FROM parent WHERE id < 3;
+    SELECT id FROM parent ORDER BY id;
+    SELECT 'sep';
+    SELECT id, pid FROM child ORDER BY id;
+}
+expect {
+    3
+    sep
+    40|3
+}
