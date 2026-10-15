@@ -255,7 +255,6 @@ inserted. These still go to legacy:
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
-| OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
 | WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
 
@@ -352,8 +351,10 @@ DELETE action still goes to legacy.
 
 UPSERT is lowered as legacy does it. The constraints an ON CONFLICT clause
 names are checked first, in clause order; a conflict on one goes to the first
-clause naming it, or to a final catch-all clause, and any other conflict stops
-the statement (an UPSERT also turns REPLACE off). DO NOTHING skips the row. DO
+clause naming it, or to a final catch-all clause. Like SQLite, any other
+conflict resolves as without the UPSERT, by the statement's OR clause or the
+constraint's own ON CONFLICT (legacy drops the UPSERT under OR IGNORE and stops
+the statement on those conflicts). DO NOTHING skips the row. DO
 UPDATE seeks to the conflicting row, reads it through the target and the new
 values through `excluded`, builds the new row in registers bound to the
 UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index

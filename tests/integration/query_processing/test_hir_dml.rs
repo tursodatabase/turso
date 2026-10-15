@@ -1259,6 +1259,40 @@ fn hir_foreign_key_actions_match_sqlite() {
     }
 }
 
+/// An UPSERT takes over conflicts on the constraints it names; any other
+/// conflict resolves as without it, by the statement's OR clause or the
+/// constraint's own ON CONFLICT, as in SQLite. Legacy drops the UPSERT under
+/// OR IGNORE and stops the statement on the other conflicts.
+#[test]
+fn hir_upsert_other_conflicts_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE uo(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "INSERT INTO uo VALUES (1, 1, 'x')",
+        "INSERT OR IGNORE INTO uo VALUES (1, 2, 'y') ON CONFLICT(a) DO UPDATE SET c = 'up'",
+        "SELECT * FROM uo",
+        "INSERT OR IGNORE INTO uo VALUES (2, 1, 'z') ON CONFLICT(a) DO UPDATE SET c = 'up2'",
+        "SELECT * FROM uo",
+        "INSERT OR REPLACE INTO uo VALUES (5, 1, 'r') ON CONFLICT(a) DO UPDATE SET c = 'up3'",
+        "SELECT * FROM uo",
+        "CREATE TABLE uc(a INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT REPLACE, c UNIQUE ON CONFLICT IGNORE, d)",
+        "INSERT INTO uc VALUES (1, 1, 1, 'x'), (2, 2, 2, 'y')",
+        "INSERT INTO uc VALUES (3, 1, 9, 'z') ON CONFLICT(a) DO UPDATE SET d = 'up'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT INTO uc VALUES (4, 8, 2, 'w') ON CONFLICT(a) DO UPDATE SET d = 'up'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT INTO uc VALUES (3, 2, 7, 'v') ON CONFLICT(a) DO UPDATE SET d = 'up3'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT OR FAIL INTO uc VALUES (10, 2, 70, 'f') ON CONFLICT(a) DO NOTHING",
+        "SELECT * FROM uc ORDER BY a",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
 /// Legacy rejects it.
 #[test]

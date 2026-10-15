@@ -45,10 +45,6 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    // Like legacy, OR IGNORE drops the UPSERT clauses.
-    if !insert.upserts.is_empty() && insert.conflict == Some(ResolveType::Ignore) {
-        return Ok(true);
-    }
     let (defaults, foreign_keys) = match &insert.target_kind {
         hir::InsertTargetKind::BTree {
             autoincrement,
@@ -1446,12 +1442,10 @@ impl InsertRow<'_> {
     }
 
     /// Whether some constraint of the row resolves conflicts with REPLACE.
-    /// Like legacy, an UPSERT turns REPLACE off.
+    /// Like SQLite, a constraint an UPSERT names takes the UPSERT instead,
+    /// but the others keep their resolution.
     fn may_replace(&self) -> bool {
         let table = self.target.table;
-        if !self.upserts.is_empty() {
-            return false;
-        }
         if self.has_statement_conflict {
             return self.or_conflict == ResolveType::Replace;
         }
@@ -1617,7 +1611,7 @@ impl InsertRow<'_> {
             ResolveType::Ignore => program.emit_insn(Insn::Goto {
                 target_pc: row_done,
             }),
-            ResolveType::Replace if self.upserts.is_empty() => {
+            ResolveType::Replace => {
                 let conflict = program.alloc_register();
                 program.emit_insn(Insn::Copy {
                     src_reg: self.rowid,
@@ -1759,12 +1753,12 @@ impl InsertRow<'_> {
                         }
                     }
                 }
-                // Like legacy, with an UPSERT any other conflict stops the
-                // statement.
-                ResolveType::Ignore if self.upserts.is_empty() => program.emit_insn(Insn::Goto {
+                // Like SQLite, a conflict no UPSERT names resolves as without
+                // an UPSERT.
+                ResolveType::Ignore => program.emit_insn(Insn::Goto {
                     target_pc: row_done,
                 }),
-                ResolveType::Replace if self.upserts.is_empty() => {
+                ResolveType::Replace => {
                     let conflicting = program.alloc_register();
                     program.emit_insn(Insn::IdxRowId {
                         cursor_id: cursor,
@@ -2024,8 +2018,11 @@ mod tests {
 
     #[test]
     fn insert_that_needs_legacy_is_left_to_it() {
-        for sql in ["INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING"] {
-            let plan = analyze_plan(indexed_items_schema(), sql);
+        for sql in [
+            // A DO UPDATE that moves the row.
+            "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5",
+        ] {
+            let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
             assert!(needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
         }
