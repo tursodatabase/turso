@@ -479,6 +479,32 @@ fn hir_displays_arrays_passed_through_expressions_like_legacy() {
 }
 
 #[test]
+fn hir_real_column_comparisons_keep_large_integers_exact() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE reals(f REAL)",
+        "CREATE INDEX reals_f ON reals(f)",
+        "INSERT INTO reals VALUES (-2701729208700874036)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    // A REAL column against an integer compares as NUMERIC, so the integer
+    // is not rounded to the stored float.
+    for sql in [
+        "SELECT count(*) FROM reals WHERE f = -2701729208700874036",
+        "SELECT count(*) FROM reals WHERE f = -2701729208700874240",
+        "SELECT count(*) FROM reals NOT INDEXED WHERE f = -2701729208700874036",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);

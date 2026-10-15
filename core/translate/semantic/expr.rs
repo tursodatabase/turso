@@ -4430,11 +4430,21 @@ fn comparison_component(
     lhs: &ResolvedScopeExpr,
     rhs: &ResolvedScopeExpr,
 ) -> hir::ComparisonComponent {
+    // Like legacy and SQLite's sqlite3CompareAffinity, a numeric affinity on
+    // either side compares as NUMERIC, even alone: REAL affinity would turn a
+    // large integer into a float and lose its exact value.
+    let lone = |affinity: Affinity| {
+        if affinity.is_numeric() {
+            Affinity::Numeric
+        } else {
+            affinity
+        }
+    };
     let affinity = match (lhs.has_affinity, rhs.has_affinity) {
         (true, true) if lhs.affinity.is_numeric() || rhs.affinity.is_numeric() => Affinity::Numeric,
         (true, true) => Affinity::Blob,
-        (true, false) => lhs.affinity,
-        (false, true) => rhs.affinity,
+        (true, false) => lone(lhs.affinity),
+        (false, true) => lone(rhs.affinity),
         (false, false) => Affinity::Blob,
     };
     hir::ComparisonComponent {

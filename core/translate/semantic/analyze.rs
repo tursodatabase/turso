@@ -8738,16 +8738,26 @@ mod tests {
             .all(|value| matches!(value, Expr::Row(values) if values.len() == 2)));
         assert_eq!(comparisons.len(), 2);
         for comparison in comparisons {
-            assert_row_comparison_facts(comparison);
+            assert_row_in_comparison_facts(comparison);
         }
     }
 
     fn assert_row_comparison_facts(comparison: &hir::ComparisonSemantics) {
+        // An INTEGER column against a literal compares as NUMERIC.
+        assert_row_comparison_facts_with(comparison, crate::vdbe::affinity::Affinity::Numeric);
+    }
+
+    /// IN compares with the left side's affinity, so it stays INTEGER.
+    fn assert_row_in_comparison_facts(comparison: &hir::ComparisonSemantics) {
+        assert_row_comparison_facts_with(comparison, crate::vdbe::affinity::Affinity::Integer);
+    }
+
+    fn assert_row_comparison_facts_with(
+        comparison: &hir::ComparisonSemantics,
+        first_affinity: crate::vdbe::affinity::Affinity,
+    ) {
         assert_eq!(comparison.components.len(), 2);
-        assert_eq!(
-            comparison.components[0].affinity,
-            crate::vdbe::affinity::Affinity::Integer
-        );
+        assert_eq!(comparison.components[0].affinity, first_affinity);
         assert_eq!(
             comparison.components[1].affinity,
             crate::vdbe::affinity::Affinity::Text
