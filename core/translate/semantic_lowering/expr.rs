@@ -338,6 +338,7 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::Upper
             | ScalarFunc::Length
             | ScalarFunc::OctetLength
+            | ScalarFunc::Subtype
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr

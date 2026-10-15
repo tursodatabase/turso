@@ -75,6 +75,7 @@ fn hir_select_matches_legacy_rows_and_columns() {
         "SELECT extra, count(*) FROM items GROUP BY extra ORDER BY count(*) DESC",
         "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY value DESC",
         "SELECT json_valid('{a:1}', 6), json_valid('{}')",
+        "SELECT subtype(json('{}')), subtype('{}'), subtype(1)",
         // Blocks without FROM run GROUP BY and HAVING over their one row.
         "SELECT 1 GROUP BY 1 HAVING count(*) FILTER (WHERE 1 IN (SELECT 1)) = 1",
         "SELECT 1 GROUP BY 1 HAVING count(*) FILTER (WHERE 1 IN (SELECT 2)) = 1",
