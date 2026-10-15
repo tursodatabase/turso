@@ -83,3 +83,14 @@ expect {
     0|0|a|0|BINARY|1
     1|-1||0|BINARY|0
 }
+
+@cross-check-integrity
+test pragma-index-xinfo-rowid-name-is-null {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(b);
+    SELECT seqno, cid, name, typeof(name) FROM pragma_index_xinfo('idx1');
+}
+expect {
+    0|1|b|text
+    1|-1||null
+}
