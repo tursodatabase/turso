@@ -1071,7 +1071,12 @@ fn emit_planned_query_block(
         },
         distinct: distinct.as_ref(),
     };
-    emit_planned_query_block_with_output(program, plan, query, block_index, &output, done)
+    // A row the block skips (WHERE, OFFSET) ends only this block; the next
+    // block of a compound still runs. A spent LIMIT ends the whole query.
+    let block_done = program.allocate_label();
+    emit_planned_query_block_with_output(program, plan, query, block_index, &output, block_done)?;
+    program.preassign_label_to_next_insn(block_done);
+    Ok(())
 }
 
 fn emit_planned_query_block_with_output(

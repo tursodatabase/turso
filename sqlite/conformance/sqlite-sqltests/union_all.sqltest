@@ -56,3 +56,47 @@ expect {
     A|apple|1
     B|xenon|2
 }
+
+# A row that one block skips, through WHERE or OFFSET, must not end the
+# blocks after it.
+test union-all-false-where-in-first-block {
+    SELECT 1 WHERE 0
+    UNION ALL
+    SELECT 2;
+}
+expect {
+    2
+}
+
+@setup schema
+test union-all-false-where-before-table-block {
+    SELECT 'none' WHERE 0
+    UNION ALL
+    SELECT val FROM t1;
+}
+expect {
+    apple
+    banana
+}
+
+test union-all-offset-skips-first-block {
+    SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1;
+}
+expect {
+    2
+}
+
+test union-all-offset-skips-into-later-blocks {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 5 OFFSET 1;
+}
+expect {
+    2
+    3
+}
+
+test union-all-offset-in-from-subquery {
+    SELECT * FROM (SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1);
+}
+expect {
+    2
+}
