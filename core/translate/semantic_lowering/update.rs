@@ -82,9 +82,8 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // STRICT type checks, custom types and generated columns are not
-    // lowered yet.
-    if table.is_strict
+    // Custom types and generated columns are not lowered yet.
+    if super::dml::strict_needs_legacy(&table)
         || table.columns().iter().any(Column::is_generated)
         || source.column_type_programs.iter().any(Option::is_some)
     {
@@ -977,8 +976,11 @@ impl UpdateRow<'_, '_> {
                 rowid: Some(self.rowid),
             },
         );
-        // Like legacy, CHECK constraints run after NOT NULL and before any
-        // index is checked.
+        // Like legacy, a STRICT type check and then CHECK constraints run
+        // after NOT NULL and before any index is checked.
+        if table.is_strict {
+            super::dml::emit_strict_type_check(program, table, self.start());
+        }
         super::dml::emit_check_constraints(
             program,
             document,
@@ -1147,15 +1149,16 @@ impl UpdateRow<'_, '_> {
             }
         }
         // Like legacy, apply column affinity to the new row before any index
-        // or constraint reads it.
+        // or constraint reads it. A STRICT table is type checked later.
         let affinities = table
             .columns()
             .iter()
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
-        if affinities
-            .iter()
-            .any(|affinity| *affinity != Affinity::Blob)
+        if !table.is_strict
+            && affinities
+                .iter()
+                .any(|affinity| *affinity != Affinity::Blob)
         {
             if let Some(count) = NonZeroUsize::new(affinities.len()) {
                 program.emit_insn(Insn::Affinity {

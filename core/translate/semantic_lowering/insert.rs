@@ -84,10 +84,10 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // WITHOUT ROWID tables, STRICT type checks, custom types and generated
-    // columns are not lowered yet.
+    // WITHOUT ROWID tables, custom types and generated columns are not
+    // lowered yet.
     if !table.has_rowid
-        || table.is_strict
+        || super::dml::strict_needs_legacy(&table)
         || table.columns().iter().any(Column::is_generated)
         || table.columns().iter().any(Column::hidden)
         || source.column_type_programs.iter().any(Option::is_some)
@@ -666,14 +666,16 @@ impl InsertRow<'_> {
             emit_value(program, position, self.rowid)?;
         }
         // Like legacy, apply column affinity before any check reads the row.
+        // A STRICT table is type checked once the rowid is known instead.
         let affinities = table
             .columns()
             .iter()
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
-        if affinities
-            .iter()
-            .any(|affinity| *affinity != Affinity::Blob)
+        if !table.is_strict
+            && affinities
+                .iter()
+                .any(|affinity| *affinity != Affinity::Blob)
         {
             if let Some(count) = NonZeroUsize::new(affinities.len()) {
                 program.emit_insn(Insn::Affinity {
@@ -770,6 +772,9 @@ impl InsertRow<'_> {
             }),
         }
         program.preassign_label_to_next_insn(ready);
+        if table.is_strict {
+            super::dml::emit_strict_type_check(program, table, self.columns);
+        }
         if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
             sequence.emit_given_rowid(program, self.rowid);
         }
@@ -1097,7 +1102,9 @@ impl InsertRow<'_> {
             .iter()
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
-        if affinities
+        if table.is_strict {
+            super::dml::emit_strict_type_check(program, table, new_row);
+        } else if affinities
             .iter()
             .any(|affinity| *affinity != Affinity::Blob)
         {
@@ -1816,8 +1823,9 @@ mod tests {
     };
 
     /// `indexed_items_schema` with `checked(id INTEGER PRIMARY KEY, a
-    /// CHECK (a > 0), b CHECK (b > 0))` and `counted(id INTEGER PRIMARY KEY
-    /// AUTOINCREMENT, b)`.
+    /// CHECK (a > 0), b CHECK (b > 0))`, `counted(id INTEGER PRIMARY KEY
+    /// AUTOINCREMENT, b)` and the STRICT table `typed(id INTEGER PRIMARY
+    /// KEY, n INT, t TEXT)`.
     fn schema() -> crate::schema::Schema {
         let mut schema = indexed_items_schema();
         for (sql, root) in [
@@ -1830,6 +1838,10 @@ mod tests {
                 101,
             ),
             ("CREATE TABLE sqlite_sequence(name, seq)", 102),
+            (
+                "CREATE TABLE typed(id INTEGER PRIMARY KEY, n INT, t TEXT) STRICT",
+                103,
+            ),
         ] {
             schema
                 .add_btree_table(Arc::new(
@@ -1915,6 +1927,19 @@ mod tests {
         // A rowid from the statement raises the sequence too.
         let given = emit("INSERT INTO counted VALUES (5, 1)");
         assert!(writes_sequence(&given) > writes_sequence(&program));
+    }
+
+    #[test]
+    fn strict_rows_are_type_checked_instead_of_given_affinity() {
+        let program = emit("INSERT INTO typed(n, t) VALUES ('1', 2)");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::TypeCheck { .. })),
+            1
+        );
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::Affinity { .. })),
+            0
+        );
     }
 
     #[test]

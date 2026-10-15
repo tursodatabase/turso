@@ -564,6 +564,34 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
+/// Whether the target is a STRICT table HIR does not lower yet: one with a
+/// custom type or array column, whose type check needs the resolved types.
+pub(super) fn strict_needs_legacy(table: &BTreeTable) -> bool {
+    table.is_strict
+        && table.columns().iter().any(|column| {
+            column.is_array()
+                || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+                    .iter()
+                    .any(|name| column.ty_str.eq_ignore_ascii_case(name))
+        })
+}
+
+/// STRICT: check each value of the row in `start..` against its column's
+/// type, converting it where SQLite allows and failing otherwise, as legacy
+/// does. A STRICT table gets this instead of column affinity.
+pub(super) fn emit_strict_type_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: table.clone(),
+    });
+}
+
 /// Whether an expression contains a subquery.
 pub(super) fn has_subquery(expression: &hir::Expr) -> bool {
     let mut found = false;

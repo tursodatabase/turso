@@ -233,7 +233,7 @@ subquery in SET runs as the loop reaches each row. These still go to legacy:
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
-| STRICT tables, custom types, generated columns | Type checks, encoding, computed columns |
+| Custom types, array columns, generated columns | Encoding, computed columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -254,7 +254,7 @@ inserted. These still go to legacy:
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
-| WITHOUT ROWID and STRICT tables, custom types, generated columns | Their lowering |
+| WITHOUT ROWID tables, custom types, array columns, generated columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -262,6 +262,11 @@ those that read a changed column; an UPSERT DO UPDATE checks all of them with
 ABORT. A NULL result passes, IGNORE skips the row, and REPLACE aborts. A
 failure reports the constraint's name, or its expression as the user wrote
 it. `PRAGMA ignore_check_constraints` turns them off.
+
+A STRICT table gets no column affinity; like legacy, its new row is type
+checked (`TypeCheck`) instead: once the rowid is known for INSERT, after NOT
+NULL for UPDATE, and in place of affinity for UPSERT DO UPDATE. A value is
+converted where SQLite allows and the statement fails otherwise.
 
 AUTOINCREMENT is lowered as legacy does it (`semantic_lowering/autoincrement.rs`).
 Each row opens `sqlite_sequence` and reads the target's row; a generated
