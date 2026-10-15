@@ -271,6 +271,12 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    if resolver.resolve_cached_expr_reg(expr).is_some() {
+        let reg = program.alloc_register();
+        translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+        emit_cond_jump(program, condition_metadata, reg);
+        return Ok(());
+    }
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
