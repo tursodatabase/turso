@@ -951,6 +951,10 @@ fn hir_update_subqueries_match_sqlite() {
         "UPDATE u SET b = (SELECT max(b) FROM u) + a",
         "UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2",
         "UPDATE u SET d = d + 1 WHERE b < (SELECT max(b) FROM u)",
+        // One subquery row assigned to several columns runs once per row.
+        "UPDATE u SET (c, d) = (SELECT 'm', a FROM u AS x WHERE x.a = u.a + 1) WHERE a > 4",
+        "UPDATE u SET (c, b) = (SELECT 'k', 100), d = 7 WHERE a = 1",
+        "UPDATE u SET (b, c) = (SELECT max(b) + 1, count(*) FROM u) WHERE a = 2",
     ] {
         conn.execute(sql).unwrap();
         sqlite.execute(sql, ()).unwrap();

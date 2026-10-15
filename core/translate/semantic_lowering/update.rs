@@ -54,15 +54,6 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // `SET (a, b) = (SELECT ...)` assigns one subquery row to several
-    // columns, which is not lowered yet.
-    if update
-        .assignments
-        .iter()
-        .any(|assignment| assignment.columns.len() != 1)
-    {
-        return Ok(true);
-    }
     let foreign_keys = match &update.target_kind {
         hir::UpdateTargetKind::BTree { foreign_keys, .. } => foreign_keys,
         hir::UpdateTargetKind::Virtual => return Ok(true),
@@ -239,12 +230,22 @@ pub(super) fn emit_update(
     let assigned = assigned_columns(update)?;
     let mut values = vec![None; table.columns().len()];
     for assignment in &update.assignments {
-        let [hir::TargetColumn::Column(column)] = assignment.columns.as_slice() else {
-            return Err(LimboError::InternalError(
-                "HIR UPDATE assignment does not set exactly one column".into(),
-            ));
-        };
-        values[*column] = Some(&assignment.value);
+        let width = assignment.columns.len();
+        for (part, target_column) in assignment.columns.iter().enumerate() {
+            let hir::TargetColumn::Column(column) = target_column else {
+                return Err(LimboError::InternalError(
+                    "HIR UPDATE assignment sets the rowid".into(),
+                ));
+            };
+            values[*column] = Some(match width {
+                1 => NewValue::Expr(&assignment.value),
+                _ => NewValue::RowPart {
+                    row: &assignment.value,
+                    part,
+                    width,
+                },
+            });
+        }
     }
     // Indexes whose key or WHERE term reads a changed column, in schema
     // order, with the NEW-row expressions for the same index.
@@ -439,10 +440,70 @@ pub(super) fn emit_update(
     Ok(())
 }
 
+/// The new value of one column an UPDATE sets.
+#[derive(Clone, Copy)]
+enum NewValue<'a> {
+    Expr(&'a hir::Expr),
+    /// `SET (a, b) = (SELECT ...)`: value `part` of a row of `width` values.
+    RowPart {
+        row: &'a hir::Expr,
+        part: usize,
+        width: usize,
+    },
+}
+
+/// The rows of `SET (a, b) = (SELECT ...)` already computed for the current
+/// row, each in consecutive registers, so that each runs once.
+#[derive(Default)]
+struct RowValues<'a> {
+    computed: Vec<(&'a hir::Expr, usize)>,
+}
+
+/// Lowers one HIR expression into a register.
+type Translate = fn(&mut ProgramBuilder, &hir::HirDocument, &hir::Expr, usize) -> Result<usize>;
+
+impl<'a> NewValue<'a> {
+    fn emit(
+        self,
+        program: &mut ProgramBuilder,
+        document: &hir::HirDocument,
+        register: usize,
+        rows: &mut RowValues<'a>,
+        translate: Translate,
+    ) -> Result<()> {
+        match self {
+            NewValue::Expr(value) => {
+                translate(program, document, value, register)?;
+            }
+            NewValue::RowPart { row, part, width } => {
+                let start = match rows
+                    .computed
+                    .iter()
+                    .find(|(computed, _)| std::ptr::eq(*computed, row))
+                {
+                    Some((_, start)) => *start,
+                    None => {
+                        let start = program.alloc_registers(width);
+                        super::expr::translate_expr_no_constant_opt(program, document, row, start)?;
+                        rows.computed.push((row, start));
+                        start
+                    }
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: start + part,
+                    dst_reg: register,
+                    extra_amount: 0,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What every row of an UPDATE computes, shared by both loops.
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
-    values: &'a [Option<&'a hir::Expr>],
+    values: &'a [Option<NewValue<'a>>],
     /// UPDATE ... FROM: the scratch table the join filled, and for each
     /// assigned column the scratch column holding its value.
     scratch: Option<(CursorID, &'a [Option<usize>])>,
@@ -648,8 +709,15 @@ fn emit_from_update(
         .collect::<Vec<_>>();
     let write = |program: &mut ProgramBuilder, _next: BranchOffset| -> Result<()> {
         let start = program.alloc_registers(width.max(1));
+        let mut rows = RowValues::default();
         for (offset, value) in assigned.iter().enumerate() {
-            super::expr::translate_expr_no_constant_opt(program, document, value, start + offset)?;
+            value.emit(
+                program,
+                document,
+                start + offset,
+                &mut rows,
+                super::expr::translate_expr_no_constant_opt,
+            )?;
         }
         let rowid = program.alloc_register();
         super::expr::translate_expr(
@@ -1112,6 +1180,7 @@ impl UpdateRow<'_, '_> {
         check_notnull: bool,
     ) -> Result<()> {
         let table = self.target.table;
+        let mut rows = RowValues::default();
         for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate() {
             let register = self.start() + position;
             match value {
@@ -1132,11 +1201,12 @@ impl UpdateRow<'_, '_> {
                             });
                         }
                         None => {
-                            super::expr::translate_expr(
+                            value.emit(
                                 program,
                                 self.target.document,
-                                value,
                                 register,
+                                &mut rows,
+                                super::expr::translate_expr,
                             )?;
                         }
                     }
@@ -1587,6 +1657,7 @@ mod tests {
         for sql in [
             "UPDATE items SET extra = (SELECT max(extra) FROM items)",
             "UPDATE items SET extra = (SELECT max(i.extra) FROM items AS i WHERE i.id < items.id)",
+            "UPDATE items SET (value, extra) = (SELECT 1, 'x') WHERE id = 1",
         ] {
             // `emit` checks that HIR takes the statement.
             let program = emit(sql);
@@ -1613,7 +1684,6 @@ mod tests {
             "UPDATE items SET id = id + 1",
             "UPDATE items SET rowid = 5 WHERE id = 1",
             "UPDATE OR REPLACE items SET value = 1",
-            "UPDATE items SET (value, extra) = (SELECT 1, 'x')",
             // The loop reads the index whose key changes.
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
         ] {
