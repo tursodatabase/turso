@@ -7,14 +7,16 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
-use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
+use crate::translate::optimizer::{optimize_plan, Optimizable};
+use crate::translate::plan::{
+    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+};
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
@@ -604,12 +606,26 @@ fn prepare_one_select_plan(
                             )?;
                         }
 
+                        let exprs: Vec<ast::Expr> =
+                            group_by.exprs.into_iter().map(|expr| *expr).collect();
+                        let having = match having_predicates {
+                            Some(having) => Some(move_group_by_only_having_terms_to_where(
+                                having,
+                                &exprs,
+                                &aggregate_expressions,
+                                &plan.table_references,
+                                resolver,
+                                &mut plan.where_clause,
+                            )?)
+                            .filter(|having| !having.is_empty()),
+                            None => None,
+                        };
                         plan.group_by = Some(GroupBy {
                             sort_order: Vec::new(),
                             nulls_order: Vec::new(),
-                            exprs: group_by.exprs.into_iter().map(|expr| *expr).collect(),
+                            exprs,
                             sort_elided: false,
-                            having: having_predicates,
+                            having,
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
@@ -1863,6 +1879,89 @@ fn check_aliased_aggregate_misuse(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Moves each HAVING term that reads only constants and GROUP BY terms into WHERE,
+/// like SQLite's havingToWhere(). Such a term has the same value for every row of a
+/// group, so filtering the rows before grouping removes the same groups, and the
+/// aggregates of those groups are never computed. Like SQLite, a literal false term
+/// stays in HAVING.
+fn move_group_by_only_having_terms_to_where(
+    having: Vec<ast::Expr>,
+    group_by_exprs: &[ast::Expr],
+    aggregates: &[super::plan::Aggregate],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    where_clause: &mut Vec<WhereTerm>,
+) -> Result<Vec<ast::Expr>> {
+    let mut remaining = Vec::new();
+    for term in having {
+        if !is_literal_false(&term)
+            && is_constant_or_group_by(
+                &term,
+                group_by_exprs,
+                aggregates,
+                table_references,
+                resolver,
+            )?
+        {
+            where_clause.push(term.into());
+        } else {
+            remaining.push(term);
+        }
+    }
+    Ok(remaining)
+}
+
+/// Matches the terms SQLite keeps in HAVING as always false: `0`, `FALSE` and `x IN ()`.
+fn is_literal_false(expr: &ast::Expr) -> bool {
+    match expr {
+        Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<i64>() == Ok(0),
+        Expr::Literal(ast::Literal::False) => true,
+        Expr::InList {
+            rhs, not: false, ..
+        } => rhs.is_empty(),
+        _ => false,
+    }
+}
+
+/// Checks that `term` has no aggregates and is constant once every GROUP BY term in
+/// it is replaced by NULL. Like SQLite's sqlite3ExprIsConstantOrGroupBy(), a GROUP BY
+/// term is only replaced when it groups with BINARY collation, because rows that
+/// another collation puts in one group can differ under BINARY.
+fn is_constant_or_group_by(
+    term: &ast::Expr,
+    group_by_exprs: &[ast::Expr],
+    aggregates: &[super::plan::Aggregate],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut term = term.clone();
+    let mut has_aggregate = false;
+    walk_expr_mut(&mut term, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, e))
+        {
+            has_aggregate = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        for group_by_expr in group_by_exprs {
+            if exprs_are_equivalent(e, group_by_expr)
+                && resolve_comparison_collseq_with_symbols(
+                    group_by_expr,
+                    group_by_expr,
+                    table_references,
+                    Some(resolver.symbol_table),
+                )? == CollationSeq::Binary
+            {
+                *e = Expr::Literal(ast::Literal::Null);
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(!has_aggregate && term.is_constant(resolver))
 }
 
 /// Check if an expression (inside an aggregate's arguments) contains an identifier
