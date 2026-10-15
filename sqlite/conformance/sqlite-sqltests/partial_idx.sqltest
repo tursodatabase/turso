@@ -1790,3 +1790,19 @@ expect {
     0
     ok
 }
+
+# The query BETWEEN implies the index WHERE through its lower bound, but its
+# upper bound still reads column a, so the index cannot cover the query.
+test partial-index-between-implies-where-still-reads-column {
+    CREATE TABLE t(a INT, b);
+    CREATE INDEX i ON t(b) WHERE a >= 2;
+    INSERT INTO t VALUES (3, 'x'), (1, 'y'), (5, 'z');
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT b FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND NULL;
+}
+expect {
+    1
+    x
+    0
+}
