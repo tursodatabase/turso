@@ -2578,6 +2578,7 @@ impl Database {
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
+            explicit_tx_is_concurrent: AtomicBool::new(false),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             poisoned_tx: AtomicBool::new(false),
             last_insert_rowid: AtomicI64::new(0),

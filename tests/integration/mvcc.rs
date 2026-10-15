@@ -1943,6 +1943,9 @@ fn test_ddl_in_concurrent_tx_busy_after_other_commit(tmp_db: TempDatabase) -> an
 
     let conn2 = tmp_db.connect_limbo();
     conn2.execute("BEGIN CONCURRENT")?;
+    // BEGIN CONCURRENT is deferred; read to pin the snapshot before the
+    // other connection commits.
+    let _: Vec<(i64,)> = conn2.exec_rows("SELECT count(*) FROM t");
 
     conn.execute("INSERT INTO t VALUES (1)")?;
 

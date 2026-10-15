@@ -2240,14 +2240,19 @@ pub fn insn_to_row(
             Insn::AutoCommit {
                 auto_commit,
                 rollback,
+                concurrent,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,
                 *rollback as i64,
-                0,
+                *concurrent as i64,
                 Value::build_text(""),
                 0,
-                format!("auto_commit={auto_commit}, rollback={rollback}"),
+                if *concurrent {
+                    format!("auto_commit={auto_commit}, rollback={rollback}, concurrent=true")
+                } else {
+                    format!("auto_commit={auto_commit}, rollback={rollback}")
+                },
             ),
             Insn::Savepoint { op, name } => (
                 "Savepoint",
