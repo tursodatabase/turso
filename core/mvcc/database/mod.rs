@@ -869,6 +869,9 @@ pub struct Savepoint<A: RowVersionAllocator = TursoAllocator> {
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
     newly_added_to_write_set: Vec<(RowID, RowVersions<A>)>,
+    /// Length of the transaction's sequence watermark undo log when this
+    /// savepoint began. On rollback: the entries after it are undone.
+    sequence_watermark_undo_len: usize,
 }
 
 impl<A: RowVersionAllocator> Default for Savepoint<A> {
@@ -883,16 +886,22 @@ impl<A: RowVersionAllocator> Default for Savepoint<A> {
             deleted_table_versions: Vec::new(),
             deleted_index_versions: Vec::new(),
             newly_added_to_write_set: Vec::new(),
+            sequence_watermark_undo_len: 0,
         }
     }
 }
 
 impl<A: RowVersionAllocator> Savepoint<A> {
     /// Creates an internal statement savepoint used for per-statement rollback.
-    fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
+    fn statement(
+        header: DatabaseHeader,
+        header_dirty: bool,
+        sequence_watermark_undo_len: usize,
+    ) -> Self {
         Self {
             header,
             header_dirty,
+            sequence_watermark_undo_len,
             ..Default::default()
         }
     }
@@ -904,6 +913,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
         deferred_fk_violations: isize,
         header: DatabaseHeader,
         header_dirty: bool,
+        sequence_watermark_undo_len: usize,
     ) -> Self {
         Self {
             kind: SavepointKind::Named {
@@ -913,6 +923,7 @@ impl<A: RowVersionAllocator> Savepoint<A> {
             deferred_fk_violations,
             header,
             header_dirty,
+            sequence_watermark_undo_len,
             ..Default::default()
         }
     }
@@ -1054,6 +1065,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
+    /// Sequence watermarks this transaction removed or lowered, each with the
+    /// value it had before, oldest first, so a rollback can put them back.
+    sequence_watermark_undo: Mutex<SequenceWatermarkUndo>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1081,6 +1095,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+            sequence_watermark_undo: Mutex::new(Vec::new()),
         }
     }
 
@@ -1110,9 +1125,12 @@ impl<A: RowVersionAllocator> Transaction<A> {
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
         let header = *self.header.read();
         let header_dirty = self.header_dirty.load(Ordering::Acquire);
-        self.savepoint_stack
-            .write()
-            .push(Savepoint::statement(header, header_dirty));
+        let sequence_watermark_undo_len = self.sequence_watermark_undo.lock().len();
+        self.savepoint_stack.write().push(Savepoint::statement(
+            header,
+            header_dirty,
+            sequence_watermark_undo_len,
+        ));
     }
 
     /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
@@ -1133,12 +1151,14 @@ impl<A: RowVersionAllocator> Transaction<A> {
         );
         let header = *self.header.read();
         let header_dirty = self.header_dirty.load(Ordering::Acquire);
+        let sequence_watermark_undo_len = self.sequence_watermark_undo.lock().len();
         self.savepoint_stack.write().push(Savepoint::named(
             name,
             starts_transaction,
             deferred_fk_violations,
             header,
             header_dirty,
+            sequence_watermark_undo_len,
         ));
     }
 
@@ -1242,6 +1262,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
         let header = savepoints[target_idx].header;
         let header_dirty = savepoints[target_idx].header_dirty;
+        let sequence_watermark_undo_len = savepoints[target_idx].sequence_watermark_undo_len;
 
         let drained: Vec<Savepoint<A>> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
@@ -1250,6 +1271,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             deferred_fk_violations,
             header,
             header_dirty,
+            sequence_watermark_undo_len,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -4512,9 +4534,6 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// database live in one process. Multi-process MVCC will need a shared
     /// coordination mechanism before sync can rely on this watermark.
     sequence_allocations: Mutex<HashMap<String, StdHashMap<TxID, i64>>>,
-    /// Sequence watermarks that each active transaction removed or lowered,
-    /// with the value they had before, so a rollback can put them back.
-    sequence_watermark_undo: Mutex<StdHashMap<TxID, SequenceWatermarkUndo>>,
 
     /// Approximate count of live row versions across `rows` + `index_rows`.
     /// Incremented on every inserted version, decremented when versions are
@@ -4685,7 +4704,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
-            sequence_watermark_undo: Mutex::new(StdHashMap::default()),
             live_version_count_approx: AtomicUsize::new(0),
             live_versions_at_last_gc: AtomicUsize::new(0),
             gc_version_threshold: AtomicI64::new(Self::DEFAULT_GC_VERSION_THRESHOLD),
@@ -6779,13 +6797,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
         self.remove_sequence_allocations(tx_id);
-        let committed = self
-            .txs
-            .get(&tx_id)
-            .is_some_and(|tx| matches!(tx.value().state.load(), TransactionState::Committed(_)));
-        self.finish_sequence_watermark_changes(tx_id, committed);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
+            let sequence_watermark_undo = std::mem::take(&mut *tx.sequence_watermark_undo.lock());
+            if !matches!(tx.state.load(), TransactionState::Committed(_)) {
+                self.undo_sequence_watermark_changes(sequence_watermark_undo);
+            }
             let held_checkpoint_read = tx.holds_blocking_checkpoint_read.load(Ordering::Acquire);
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
@@ -6925,23 +6942,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         sequence_name: String,
         previous: Option<i64>,
     ) {
-        self.sequence_watermark_undo
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while changing a sequence watermark")
+        });
+        tx.value()
+            .sequence_watermark_undo
             .lock()
-            .entry(tx_id)
-            .or_default()
             .push((sequence_name, previous));
     }
 
-    /// On rollback, puts back the watermarks the transaction removed or
-    /// lowered. A value restored by raising keeps any higher value that
+    /// Puts back the watermarks a rolled back transaction or savepoint removed
+    /// or lowered. A value restored by raising keeps any higher value that
     /// `nextval` published in the meantime.
-    fn finish_sequence_watermark_changes(&self, tx_id: TxID, committed: bool) {
-        let Some(changes) = self.sequence_watermark_undo.lock().remove(&tx_id) else {
-            return;
-        };
-        if committed {
-            return;
-        }
+    fn undo_sequence_watermark_changes(&self, changes: SequenceWatermarkUndo) {
         for (sequence_name, previous) in changes.into_iter().rev() {
             match previous {
                 Some(watermark) => self.raise_sequence_watermark(&sequence_name, watermark),
@@ -7530,8 +7543,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deleted_table_versions,
             deleted_index_versions,
             newly_added_to_write_set,
+            sequence_watermark_undo_len,
             ..
         } = savepoint;
+
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while rolling back savepoint")
+        });
+        let sequence_watermark_undo: SequenceWatermarkUndo = tx
+            .value()
+            .sequence_watermark_undo
+            .lock()
+            .drain(sequence_watermark_undo_len..)
+            .collect();
+        self.undo_sequence_watermark_changes(sequence_watermark_undo);
 
         tracing::debug!(
             "rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",

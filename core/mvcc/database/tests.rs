@@ -7253,6 +7253,47 @@ fn test_sequence_watermark_comes_back_when_drop_and_create_sequence_rolls_back()
 }
 
 #[test]
+fn test_sequence_watermark_comes_back_when_drop_sequence_rolls_back_to_savepoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT x").unwrap();
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("ROLLBACK TO x").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_statement_with_setval_fails() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("CREATE TABLE t(x CHECK (x < 0))").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    assert!(conn
+        .execute("INSERT INTO t VALUES (-1), (setval('s', 2))")
+        .is_err());
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
 fn test_sequence_watermark_restarts_when_drop_and_create_sequence_commit_together() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -7846,6 +7887,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        sequence_watermark_undo: Mutex::new(Vec::new()),
     }
 }
 
@@ -9574,6 +9616,7 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        sequence_watermark_undo: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
