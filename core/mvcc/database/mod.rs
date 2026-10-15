@@ -1979,7 +1979,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
         }
-        crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx).expect(ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx));
         Ok(())
     }
 
@@ -3326,7 +3326,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3400,7 +3400,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.unlock_pager_commit_lock();
                     }
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3733,7 +3733,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
@@ -6769,7 +6769,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
+    pub fn remove_tx(&self, tx_id: TxID) {
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6811,10 +6811,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
-            return Ok(());
+            return;
         }
         self.txs.remove(&tx_id);
-        Ok(())
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
@@ -6921,14 +6920,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Use this anywhere the commit state machine would otherwise call
     /// `remove_tx` directly. Other call sites that don't have a connection
     /// context (e.g. tests poking internal state) keep using `remove_tx`.
-    pub fn finish_committed_tx(
-        &self,
-        tx_id: TxID,
-        conn: &Connection,
-        db_id: usize,
-    ) -> Result<(), TryReserveError> {
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
         conn.set_mv_tx_for_db(db_id, None);
-        self.remove_tx(tx_id)
+        self.remove_tx(tx_id);
     }
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
@@ -7193,7 +7187,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // already completed its register_commit_dependency call (it runs under the
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
-        crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(self.remove_tx(tx_id));
     }
 
     /// Removes the slots of a table or index created by a transaction that rolled back.
@@ -7279,9 +7273,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(self
-                    .finish_committed_tx(tx_id, connection, db_id)
-                    .expect(ALLOC_ERR_MSG));
+                crate::without_allocation_faults!(
+                    self.finish_committed_tx(tx_id, connection, db_id)
+                );
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {

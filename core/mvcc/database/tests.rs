@@ -557,7 +557,7 @@ fn mvcc_active_read_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store.remove_tx(tx_id).unwrap();
+    db.mvcc_store.remove_tx(tx_id);
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -11725,7 +11725,7 @@ fn test_gc_active_reader_pins_lwm() {
     );
 
     // Close the reader transaction.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
 
     // LWM should now be u64::MAX.
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
@@ -12297,7 +12297,7 @@ fn test_gc_incremental_respects_held_snapshot() {
 
     // Close the snapshot; now incremental GC reclaims the superseded v1
     // without any checkpoint having run.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
     assert_eq!(
         db.mvcc_store
             .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
