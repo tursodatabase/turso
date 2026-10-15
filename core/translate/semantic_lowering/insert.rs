@@ -38,7 +38,6 @@ use super::trigger::{CompiledTrigger, TriggerRow};
 pub(super) fn needs_legacy(
     plan: &HirPlan,
     insert: &hir::Insert,
-    foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
@@ -69,14 +68,9 @@ pub(super) fn needs_legacy(
             autoincrement,
             defaults,
             triggers,
-            foreign_keys,
+            ..
         } => {
             if autoincrement.is_some() || !triggers.upsert_update.is_empty() {
-                return Ok(true);
-            }
-            if foreign_keys_enabled
-                && (!foreign_keys.outgoing.is_empty() || !foreign_keys.incoming.is_empty())
-            {
                 return Ok(true);
             }
             defaults
@@ -143,7 +137,12 @@ pub(super) fn emit_insert(
     triggers: &[CompiledTrigger],
 ) -> Result<()> {
     let document = &plan.document;
-    let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
+    let hir::InsertTargetKind::BTree {
+        defaults,
+        foreign_keys,
+        ..
+    } = &insert.target_kind
+    else {
         return Err(LimboError::InternalError(
             "HIR INSERT target is not a B-tree table".into(),
         ));
@@ -195,8 +194,10 @@ pub(super) fn emit_insert(
         program.set_multi_write(false);
     }
     let indexes = &target.source.index_expressions;
+    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
     program.set_may_abort(
         !triggers.is_empty()
+            || has_foreign_keys
             || constraint_may_abort(
                 has_statement_conflict,
                 or_conflict,
@@ -225,6 +226,7 @@ pub(super) fn emit_insert(
         or_conflict,
         has_statement_conflict,
         triggers,
+        foreign_keys,
     };
     let done = program.allocate_label();
     match rows {
@@ -335,6 +337,7 @@ struct InsertRow<'a> {
     or_conflict: ResolveType,
     has_statement_conflict: bool,
     triggers: &'a [CompiledTrigger],
+    foreign_keys: &'a hir::DmlForeignKeys,
 }
 
 impl InsertRow<'_> {
@@ -524,6 +527,15 @@ impl InsertRow<'_> {
                     .collect(),
             ),
         });
+        // Like legacy, the parent must exist before anything is written.
+        super::fkey::emit_insert_child_checks(
+            program,
+            document,
+            self.foreign_keys,
+            self.target.source.id,
+            self.rowid,
+            self.target.database,
+        )?;
         for ((index, cursor), key) in index_cursors.iter().zip(&keys) {
             let skip = key.in_index.map(|in_index| {
                 let skip = program.allocate_label();
@@ -576,6 +588,13 @@ impl InsertRow<'_> {
             )?;
         }
         program.preassign_label_to_next_insn(after_triggers);
+        super::fkey::emit_insert_parent_repairs(
+            program,
+            document,
+            self.foreign_keys,
+            self.target.source.id,
+            self.target.database,
+        )?;
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document)?;
             returning.emit_buffer(program, start);
@@ -786,10 +805,7 @@ mod tests {
         let plan = Arc::new(analyze_plan(indexed_items_schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
-        assert!(
-            !needs_legacy(&plan, insert, true, &program).unwrap(),
-            "{sql}"
-        );
+        assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
         emit_insert(&mut program, &plan, insert, &[]).unwrap();
         program
@@ -852,10 +868,7 @@ mod tests {
         ] {
             let plan = analyze_plan(indexed_items_schema(), sql);
             let insert = insert_root(&plan).unwrap();
-            assert!(
-                needs_legacy(&plan, insert, false, &program()).unwrap(),
-                "{sql}"
-            );
+            assert!(needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
         }
     }
 }

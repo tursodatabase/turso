@@ -274,7 +274,7 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
 /// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
 /// Returns the destination start register.
 #[inline]
-fn copy_with_affinity(
+pub(super) fn copy_with_affinity(
     program: &mut ProgramBuilder,
     src_start: usize,
     len: usize,
@@ -451,7 +451,7 @@ pub(super) fn emit_skip_if_any_null(
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
-fn table_scan_match_any<F>(
+pub(super) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
     child_cols: &[String],

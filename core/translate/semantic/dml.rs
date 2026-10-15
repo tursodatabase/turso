@@ -103,20 +103,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 target.clone(),
                 parent_table,
                 foreign_key,
-            ));
+            )?);
         }
 
         let mut resolved_incoming = Vec::with_capacity(incoming.len());
         for foreign_key in incoming {
             let child_name = foreign_key.child_table.name.clone();
-            let child_source = self.analyze_base_table_source(
-                &ast::QualifiedName {
-                    db_name: None,
-                    name: ast::Name::exact(child_name.clone()),
-                    alias: None,
-                },
-                None,
-                None,
+            // The child table is always in the parent's database.
+            let child_source = self.analyze_base_table_source_in_database(
+                &ast::Name::exact(child_name.clone()),
+                database,
                 hir::SourceOwner::Root,
             )?;
             let child_table = match &self
@@ -141,7 +137,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 child_table,
                 target.clone(),
                 foreign_key,
-            ));
+            )?);
         }
 
         Ok(hir::DmlForeignKeys {
@@ -264,16 +260,27 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         child_table: hir::ResolvedTable,
         parent_table: hir::ResolvedTable,
         foreign_key: crate::schema::ResolvedFkRef,
-    ) -> hir::ResolvedForeignKey {
-        let parent_unique_index = foreign_key.parent_unique_index.map(|index| {
-            let id = self.catalog_object_id(
-                Some(database),
-                CatalogObjectKind::Index,
-                normalize_ident(&index.name),
-            );
-            hir::CatalogObject::new(id, self.context().snapshot(), Some(database), index)
-        });
-        hir::ResolvedForeignKey {
+    ) -> Result<hir::ResolvedForeignKey> {
+        let parent_unique_index = foreign_key
+            .parent_unique_index
+            .map(|index| self.freeze_foreign_key_index(database, index));
+        // Like legacy, the child index must list exactly the child columns,
+        // in the same order.
+        let child_index = self
+            .context()
+            .schema(database)?
+            .get_indices(child_table.value().get_name())
+            .find(|index| {
+                index.columns.len() == foreign_key.fk.child_columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(foreign_key.fk.child_columns.iter())
+                        .all(|(column, child)| column.name.eq_ignore_ascii_case(child))
+            })
+            .cloned();
+        let child_index = child_index.map(|index| self.freeze_foreign_key_index(database, index));
+        Ok(hir::ResolvedForeignKey {
             child_table,
             child_source,
             parent_table,
@@ -283,8 +290,22 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             parent_positions: foreign_key.parent_pos,
             parent_uses_rowid: foreign_key.parent_uses_rowid,
             parent_unique_index,
+            child_index,
             parent_action_guarantees_new_parent: false,
-        }
+        })
+    }
+
+    fn freeze_foreign_key_index(
+        &mut self,
+        database: hir::DatabaseId,
+        index: Arc<crate::schema::Index>,
+    ) -> hir::ResolvedIndex {
+        let id = self.catalog_object_id(
+            Some(database),
+            CatalogObjectKind::Index,
+            normalize_ident(&index.name),
+        );
+        hir::CatalogObject::new(id, self.context().snapshot(), Some(database), index)
     }
 }
 

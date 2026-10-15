@@ -46,7 +46,6 @@ pub(super) fn needs_legacy(
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
-    foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
@@ -74,16 +73,10 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    match &update.target_kind {
-        hir::UpdateTargetKind::BTree { foreign_keys, .. } => {
-            if foreign_keys_enabled
-                && (!foreign_keys.outgoing.is_empty() || !foreign_keys.incoming.is_empty())
-            {
-                return Ok(true);
-            }
-        }
+    let foreign_keys = match &update.target_kind {
+        hir::UpdateTargetKind::BTree { foreign_keys, .. } => foreign_keys,
         hir::UpdateTargetKind::Virtual => return Ok(true),
-    }
+    };
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
     }
@@ -117,6 +110,10 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     let assigned = assigned_columns(update)?;
+    // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
+    if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&assigned)) {
+        return Ok(true);
+    }
     // NOT NULL ON CONFLICT REPLACE stores the column's default instead.
     if assigned.iter().any(|column| {
         matches!(column, hir::TargetColumn::Column(column)
@@ -198,6 +195,11 @@ pub(super) fn emit_update(
             "HIR UPDATE target does not use a B-tree loop".into(),
         ));
     };
+    let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE target is not a B-tree table".into(),
+        ));
+    };
     let target = DmlTarget::new(program, document, update.target, "UPDATE")?;
     let table = target.table;
     let new_source = document.source(update.new_source).ok_or_else(|| {
@@ -244,7 +246,8 @@ pub(super) fn emit_update(
     }
 
     // Same statement-journal facts as legacy.
-    if triggers.is_empty() && touches_at_most_one_row(operation) {
+    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    if triggers.is_empty() && !has_foreign_keys && touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
     let has_notnull = values
@@ -257,6 +260,7 @@ pub(super) fn emit_update(
             .any(|(old, _)| old.index.value().unique);
     program.set_may_abort(
         !triggers.is_empty()
+            || has_foreign_keys
             || constraint_may_abort(
                 has_statement_conflict,
                 or_conflict,
@@ -281,10 +285,13 @@ pub(super) fn emit_update(
         has_statement_conflict,
     };
 
+    let assigned = assigned_positions(&assigned);
     let row_layout = UpdateRowLayout {
         values: &values,
+        assigned: &assigned,
         changed_indexes: &changed_indexes,
         new_source: new_source.id,
+        foreign_keys,
         returning,
         triggers,
         mvcc,
@@ -306,9 +313,12 @@ pub(super) fn emit_update(
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
     values: &'a [Option<&'a hir::Expr>],
+    /// The positions of the columns the UPDATE sets.
+    assigned: &'a [usize],
     /// The indexes the UPDATE changes, with their OLD- and NEW-row expressions.
     changed_indexes: &'a [(&'a hir::IndexExpressions, &'a hir::IndexExpressions)],
     new_source: hir::SourceId,
+    foreign_keys: &'a hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'a>>,
     triggers: &'a [CompiledTrigger],
     mvcc: bool,
@@ -500,6 +510,18 @@ pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPla
     Ok((update, access))
 }
 
+/// The table positions of `assigned`. The rowid has none; an UPDATE that
+/// sets it goes to legacy.
+fn assigned_positions(assigned: &[hir::TargetColumn]) -> Vec<usize> {
+    assigned
+        .iter()
+        .filter_map(|column| match column {
+            hir::TargetColumn::Column(column) => Some(*column),
+            hir::TargetColumn::RowId => None,
+        })
+        .collect()
+}
+
 fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
     Ok(update
         .assignments
@@ -664,6 +686,18 @@ impl UpdateRow<'_, '_> {
         for ((old, new), cursor) in layout.changed_indexes.iter().zip(index_cursors) {
             new_keys.push(self.emit_new_index_key(program, old, new, *cursor)?);
         }
+        // Like legacy, foreign keys are checked after the other constraints
+        // and before anything is rewritten.
+        super::fkey::emit_update_checks(
+            program,
+            document,
+            layout.foreign_keys,
+            source.id,
+            layout.new_source,
+            self.rowid,
+            layout.assigned,
+            self.target.database,
+        )?;
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1059,7 +1093,7 @@ mod tests {
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
         assert!(
-            !needs_legacy(&plan, update, access, true, &program).unwrap(),
+            !needs_legacy(&plan, update, access, &program).unwrap(),
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
@@ -1128,7 +1162,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
             assert!(
-                needs_legacy(&plan, update, access, false, &program()).unwrap(),
+                needs_legacy(&plan, update, access, &program()).unwrap(),
                 "{sql}"
             );
         }

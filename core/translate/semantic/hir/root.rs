@@ -253,6 +253,9 @@ pub struct ResolvedForeignKey {
     pub parent_positions: BoxedSlice<usize>,
     pub parent_uses_rowid: bool,
     pub parent_unique_index: Option<ResolvedIndex>,
+    /// An index of the child table whose columns are exactly the child key,
+    /// in order. Checks from the parent side probe it instead of scanning.
+    pub child_index: Option<ResolvedIndex>,
     /// This generated CASCADE update copies the key of a parent row that the
     /// calling mutation has already created.
     pub parent_action_guarantees_new_parent: bool,

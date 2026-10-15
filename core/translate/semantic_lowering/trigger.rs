@@ -123,7 +123,6 @@ fn compile_trigger(
         conflict_override,
     })?;
     let (environment, root, commands) = trigger_program(&plan)?;
-    let foreign_keys_enabled = connection.foreign_keys_enabled();
     let mut builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
         parent.capture_data_changes_info().clone(),
@@ -140,7 +139,7 @@ fn compile_trigger(
         let needs_legacy = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                if super::insert::needs_legacy(&plan, insert, foreign_keys_enabled, &builder)? {
+                if super::insert::needs_legacy(&plan, insert, &builder)? {
                     true
                 } else {
                     match insert_triggers(session, &builder, &plan, insert)? {
@@ -153,13 +152,7 @@ fn compile_trigger(
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                if super::update::needs_legacy(
-                    &plan,
-                    update,
-                    access,
-                    foreign_keys_enabled,
-                    &builder,
-                )? {
+                if super::update::needs_legacy(&plan, update, access, &builder)? {
                     true
                 } else {
                     match update_triggers(session, &builder, &plan, update)? {
@@ -172,7 +165,7 @@ fn compile_trigger(
                 }
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                if super::delete::needs_legacy(delete, access, foreign_keys_enabled, &builder)? {
+                if super::delete::needs_legacy(delete, access, &builder)? {
                     true
                 } else {
                     match delete_triggers(session, &builder, &plan, delete, conflict_override)? {

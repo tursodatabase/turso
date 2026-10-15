@@ -394,6 +394,161 @@ fn hir_insert_matches_legacy() {
     }
 }
 
+/// Tables with foreign keys for `hir_foreign_keys_match_legacy`, filled
+/// with foreign keys off so that some child rows have no parent.
+const FK_SETUP: &[&str] = &[
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE, a INTEGER, b INTEGER, UNIQUE(a, b))",
+    "CREATE TABLE c(x INTEGER REFERENCES p(id), y TEXT REFERENCES p(k))",
+    "CREATE INDEX c_y ON c(y)",
+    "CREATE TABLE r(x INTEGER REFERENCES p(id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+    "CREATE TABLE d(x INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, a, b, \
+     FOREIGN KEY(a, b) REFERENCES p(a, b) DEFERRABLE INITIALLY DEFERRED)",
+    "CREATE TABLE s(id INTEGER PRIMARY KEY, up INTEGER REFERENCES s(id))",
+    "CREATE TABLE q(k TEXT UNIQUE, up INTEGER REFERENCES q(k))",
+    "CREATE TABLE rk(k TEXT REFERENCES p(k) ON UPDATE RESTRICT)",
+    // ON UPDATE CASCADE still goes to legacy, on a parent of its own so the
+    // other UPDATEs of `p` stay on HIR.
+    "CREATE TABLE p2(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
+    "CREATE TABLE ck(k TEXT REFERENCES p2(k) ON UPDATE CASCADE)",
+    "INSERT INTO p VALUES (1, 'one', 1, 1), (2, 'two', 2, 2), (3, 'three', 3, 3), \
+     (4, 'four', 4, 4), (5, 'five', 5, 5)",
+    "INSERT INTO c VALUES (1, NULL), (NULL, 'two'), (9, NULL)",
+    "INSERT INTO r VALUES (3)",
+    "INSERT INTO d VALUES (4, 4, 4), (8, 8, 8)",
+    "INSERT INTO s VALUES (1, 1), (2, 1), (3, 2), (4, NULL)",
+    "INSERT INTO q VALUES ('m', 'm'), ('n', 'm')",
+    "INSERT INTO rk VALUES ('three')",
+    "INSERT INTO p2 VALUES (1, 'one')",
+    "INSERT INTO ck VALUES ('one')",
+    "PRAGMA foreign_keys = ON",
+];
+
+#[test]
+fn hir_foreign_keys_match_legacy() {
+    for statements in [
+        &["DELETE FROM p WHERE id = 5"][..],
+        // A child found by scanning `c`, and one found through `c_y`.
+        &["DELETE FROM p WHERE id = 1"],
+        &["DELETE FROM p WHERE id = 2"],
+        // RESTRICT stops at once.
+        &["DELETE FROM p WHERE id = 3"],
+        // The whole statement is undone.
+        &["DELETE FROM p WHERE id IN (5, 1)"],
+        &["DELETE FROM c", "DELETE FROM p WHERE id < 3"],
+        // A deferred child is checked at COMMIT.
+        &["DELETE FROM p WHERE id = 4"],
+        &["BEGIN", "DELETE FROM p WHERE a = 4", "COMMIT", "ROLLBACK"],
+        &[
+            "BEGIN",
+            "DELETE FROM p WHERE id = 4",
+            "DELETE FROM d WHERE x = 4",
+            "COMMIT",
+        ],
+        // Deleting a child whose parent is missing takes back its violation.
+        &[
+            "BEGIN",
+            "INSERT INTO d VALUES (7, NULL, NULL)",
+            "DELETE FROM d WHERE x = 7",
+            "COMMIT",
+        ],
+        // A row may point at itself.
+        &["DELETE FROM s WHERE id = 1"],
+        &["DELETE FROM s WHERE id = 4", "DELETE FROM s WHERE id = 3"],
+        &["DELETE FROM s"],
+        &["DELETE FROM s WHERE id > 1 RETURNING id"],
+        // INSERT into a child: the parent must exist.
+        &["INSERT INTO c VALUES (2, 'one'), (NULL, NULL), ('1', 'two') RETURNING *"],
+        &["INSERT INTO c VALUES (7, NULL)"],
+        &["INSERT INTO c VALUES (NULL, 'nope')"],
+        &["INSERT INTO c VALUES ('abc', NULL)"],
+        &["INSERT INTO c VALUES (1, 'one'), (2, 'nope')"],
+        &["INSERT OR IGNORE INTO c VALUES (8, NULL)"],
+        &["INSERT INTO r VALUES (6)"],
+        &["INSERT INTO d VALUES (6, NULL, NULL)"],
+        &["INSERT INTO d VALUES (NULL, 6, 6)"],
+        // INSERT into a parent repairs a deferred child.
+        &[
+            "BEGIN",
+            "INSERT INTO d VALUES (6, 6, 6)",
+            "INSERT INTO p VALUES (6, 'six', 6, 6)",
+            "COMMIT",
+        ],
+        &["BEGIN", "INSERT INTO d VALUES (6, 6, 6)", "COMMIT"],
+        // A new row may be its own parent.
+        &["INSERT INTO s VALUES (5, 5), (6, 5), (NULL, NULL)"],
+        &["INSERT INTO s VALUES (6, 7)"],
+        &["INSERT INTO s VALUES (7, 8), (8, 7)"],
+        &["INSERT INTO q VALUES ('a', 'a'), ('b', 'a')"],
+        &["INSERT INTO q VALUES (1, '1')"],
+        &["INSERT INTO q VALUES ('1', 1)"],
+        &["INSERT INTO q VALUES ('x', 'y')"],
+        // UPDATE of a parent key: children of the old key become violations.
+        &["UPDATE p SET k = 'TWO' WHERE id = 2"],
+        &["UPDATE p SET k = 'uno' WHERE id = 1 RETURNING *"],
+        &["UPDATE p SET k = k WHERE id = 2"],
+        &["UPDATE p SET k = 'THREE' WHERE id = 3"],
+        &["UPDATE p SET a = 40 WHERE id = 4"],
+        &[
+            "BEGIN",
+            "UPDATE p SET a = 40, b = 40 WHERE id = 4",
+            "UPDATE d SET a = 40, b = 40 WHERE x = 4",
+            "COMMIT",
+        ],
+        // A new parent key repairs a deferred child.
+        &[
+            "BEGIN",
+            "INSERT INTO d VALUES (NULL, 7, 7)",
+            "UPDATE p SET a = 7, b = 7 WHERE id = 5",
+            "COMMIT",
+        ],
+        &["UPDATE p2 SET k = 'ONE'"],
+        // UPDATE of a child key: the new parent must exist.
+        &["UPDATE c SET y = 'one' WHERE y = 'two'"],
+        &["UPDATE c SET y = 'zzz'"],
+        &["UPDATE c SET x = 3 WHERE x = 1"],
+        &["UPDATE c SET x = 77 WHERE x = 1"],
+        &["UPDATE OR IGNORE c SET x = 78"],
+        &[
+            "BEGIN",
+            "UPDATE d SET x = 3 WHERE x = 8",
+            "UPDATE d SET x = 4 WHERE x = 3",
+            "COMMIT",
+        ],
+        &["BEGIN", "UPDATE d SET x = 99 WHERE x = 4", "COMMIT"],
+        // A row may be its own parent.
+        &["UPDATE s SET up = 4 WHERE id = 3"],
+        &["UPDATE s SET up = 9"],
+        &["UPDATE s SET up = id"],
+        &["UPDATE q SET k = 'z' WHERE k = 'm'"],
+        &["UPDATE q SET k = 'z', up = 'z' WHERE k = 'm'"],
+        &["UPDATE q SET k = 'z', up = 'z' WHERE k = 'n'"],
+        &["UPDATE q SET up = 'n' WHERE k = 'n'"],
+        &["UPDATE q SET up = 'nope' WHERE k = 'n'"],
+    ] {
+        let statements = FK_SETUP
+            .iter()
+            .chain(statements)
+            .chain(&[
+                "SELECT * FROM p ORDER BY id",
+                "SELECT * FROM c ORDER BY rowid",
+                "SELECT * FROM r ORDER BY rowid",
+                "SELECT * FROM d ORDER BY rowid",
+                "SELECT * FROM s ORDER BY id",
+                "SELECT k, up, typeof(k), typeof(up) FROM q ORDER BY rowid",
+                "SELECT * FROM rk ORDER BY rowid",
+                "SELECT * FROM ck ORDER BY rowid",
+                "PRAGMA foreign_key_check",
+            ])
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run(true, &statements),
+            run(false, &statements),
+            "results differ for {statements:?}"
+        );
+    }
+}
+
 #[test]
 fn hir_delete_returning_names_columns_like_legacy() {
     let db = TempDatabase::new_empty();

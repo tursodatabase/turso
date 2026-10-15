@@ -4,7 +4,7 @@
 //! access path, index entries removed with `IdxDelete`, then the row removed
 //! with `Delete`. RETURNING rows are buffered and returned after the last
 //! row is deleted. A WHERE clause with a subquery first collects the rowids,
-//! as legacy does. Statements that need triggers, foreign keys, a RETURNING
+//! as legacy does. Statements that need foreign-key actions, a RETURNING
 //! subquery, CDC, or a virtual table still go through legacy; see
 //! [`needs_legacy`].
 
@@ -40,7 +40,6 @@ use super::trigger::{CompiledTrigger, TriggerRow};
 pub(super) fn needs_legacy(
     delete: &hir::Delete,
     access: &HirAccessPlan,
-    foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
@@ -58,9 +57,7 @@ pub(super) fn needs_legacy(
     }
     match &delete.target_kind {
         hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
-            if foreign_keys_enabled
-                && (!foreign_keys.outgoing.is_empty() || !foreign_keys.incoming.is_empty())
-            {
+            if super::fkey::delete_needs_legacy(foreign_keys) {
                 return Ok(true);
             }
         }
@@ -110,6 +107,11 @@ pub(super) fn emit_delete(
             "HIR DELETE target does not use a B-tree loop".into(),
         ));
     };
+    let hir::DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE target is not a B-tree table".into(),
+        ));
+    };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?;
     // Like legacy, a DELETE that fires triggers first collects its rowids,
     // since a trigger can change the table.
@@ -117,10 +119,11 @@ pub(super) fn emit_delete(
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
     // After collecting rowids, legacy treats the delete as a scan.
-    if !uses_rowset && touches_at_most_one_row(operation) {
+    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    if !uses_rowset && !has_foreign_keys && touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
-    program.set_may_abort(!triggers.is_empty());
+    program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
 
     program.emit_source_explain(
         target.source.id,
@@ -129,9 +132,26 @@ pub(super) fn emit_delete(
     let returning = ReturningBuffer::open(program, target.table, delete.returning.as_ref());
     let done = program.allocate_label();
     if uses_rowset {
-        emit_rowset_delete(program, plan, &target, access, returning, triggers, done)?;
+        emit_rowset_delete(
+            program,
+            plan,
+            &target,
+            access,
+            foreign_keys,
+            returning,
+            triggers,
+            done,
+        )?;
     } else {
-        emit_scan_delete(program, &target, access, operation, returning, done)?;
+        emit_scan_delete(
+            program,
+            &target,
+            access,
+            operation,
+            foreign_keys,
+            returning,
+            done,
+        )?;
     }
     program.preassign_label_to_next_insn(done);
     if let Some(returning) = returning {
@@ -153,6 +173,7 @@ fn emit_scan_delete(
     target: &DmlTarget<'_>,
     access: &HirAccessPlan,
     operation: &HirBtreeOperation,
+    foreign_keys: &hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'_>>,
     done: BranchOffset,
 ) -> Result<()> {
@@ -206,7 +227,11 @@ fn emit_scan_delete(
     emit_delete_row(
         program,
         target,
-        table_cursor,
+        DeletedRow {
+            table_cursor,
+            rowid,
+            foreign_keys,
+        },
         iteration,
         &other_indexes,
         returning,
@@ -217,11 +242,13 @@ fn emit_scan_delete(
 
 /// Collect the rowids of the rows to delete with read cursors, then delete
 /// each collected row.
+#[allow(clippy::too_many_arguments)]
 fn emit_rowset_delete(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     target: &DmlTarget<'_>,
     access: &HirAccessPlan,
+    foreign_keys: &hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'_>>,
     triggers: &[CompiledTrigger],
     done: BranchOffset,
@@ -323,19 +350,40 @@ fn emit_rowset_delete(
             target_pc: next,
         });
     }
-    emit_delete_row(program, target, table_cursor, None, &indexes, returning)?;
+    emit_delete_row(
+        program,
+        target,
+        DeletedRow {
+            table_cursor,
+            rowid,
+            foreign_keys,
+        },
+        None,
+        &indexes,
+        returning,
+    )?;
     fire(program, TriggerTime::After)?;
     program.emit_insn(Insn::Goto { target_pc: next });
     Ok(())
 }
 
-/// Delete the row the table cursor is on: its RETURNING values, its index
-/// entries, then the row. `iteration` is the index the loop reads, whose
-/// entry is removed last so the loop can still advance.
+/// The row a DELETE is about to remove.
+struct DeletedRow<'a> {
+    /// The table cursor, positioned on the row.
+    table_cursor: CursorID,
+    /// The register holding the row's rowid.
+    rowid: usize,
+    foreign_keys: &'a hir::DmlForeignKeys,
+}
+
+/// Delete the row the table cursor is on: its foreign-key checks, its
+/// RETURNING values, its index entries, then the row. `iteration` is the
+/// index the loop reads, whose entry is removed last so the loop can still
+/// advance.
 fn emit_delete_row(
     program: &mut ProgramBuilder,
     target: &DmlTarget<'_>,
-    table_cursor: CursorID,
+    row: DeletedRow<'_>,
     iteration: Option<(CursorID, &hir::IndexExpressions)>,
     other_indexes: &[(&hir::IndexExpressions, CursorID)],
     returning: Option<ReturningBuffer<'_>>,
@@ -344,10 +392,11 @@ fn emit_delete_row(
         document,
         source,
         table,
-        ..
+        database,
     } = *target;
-    // Index keys and RETURNING values are read from the table row, as
-    // legacy does.
+    let table_cursor = row.table_cursor;
+    // Foreign-key keys, index keys and RETURNING values are read from the
+    // table row, as legacy does.
     program.bind_source(
         source.id,
         SourceBinding::BTree {
@@ -355,6 +404,14 @@ fn emit_delete_row(
             table_cursor: None,
         },
     );
+    super::fkey::emit_delete_checks(
+        program,
+        document,
+        row.foreign_keys,
+        source.id,
+        row.rowid,
+        database,
+    )?;
     // The key of the index the loop reads is taken before the row is
     // deleted and removed after it.
     let iteration_key = iteration
@@ -439,7 +496,7 @@ mod tests {
         let plan = Arc::new(plan);
         let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(delete, access, true, &program).unwrap());
+        assert!(!needs_legacy(delete, access, &program).unwrap());
         program.set_hir_plan(plan.clone());
         emit_delete(&mut program, &plan, delete, access, &[]).unwrap();
         program
@@ -513,16 +570,21 @@ mod tests {
             "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
         );
         let (delete, access) = root(&plan);
-        assert!(needs_legacy(delete, access, false, &program()).unwrap());
+        assert!(needs_legacy(delete, access, &program()).unwrap());
     }
 
     #[test]
-    fn delete_with_foreign_keys_stays_on_legacy_only_when_they_are_enforced() {
+    fn delete_stays_on_legacy_only_for_foreign_key_actions() {
         let schema = || {
             let mut schema = Schema::new();
             for (sql, root_page) in [
                 ("CREATE TABLE parent(id INTEGER PRIMARY KEY)", 2),
                 ("CREATE TABLE child(x INTEGER REFERENCES parent(id))", 3),
+                ("CREATE TABLE other(id INTEGER PRIMARY KEY)", 4),
+                (
+                    "CREATE TABLE cascade(x INTEGER REFERENCES other(id) ON DELETE CASCADE)",
+                    5,
+                ),
             ] {
                 schema
                     .add_btree_table(Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()))
@@ -530,15 +592,17 @@ mod tests {
             }
             schema
         };
-        for sql in ["DELETE FROM parent", "DELETE FROM child"] {
+        for (sql, legacy) in [
+            ("DELETE FROM parent", false),
+            ("DELETE FROM child", false),
+            ("DELETE FROM other", true),
+            ("DELETE FROM cascade", false),
+        ] {
             let plan = analyze_plan(schema(), sql);
             let (delete, access) = root(&plan);
-            assert!(
-                needs_legacy(delete, access, true, &program()).unwrap(),
-                "{sql}"
-            );
-            assert!(
-                !needs_legacy(delete, access, false, &program()).unwrap(),
+            assert_eq!(
+                needs_legacy(delete, access, &program()).unwrap(),
+                legacy,
                 "{sql}"
             );
         }

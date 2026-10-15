@@ -209,7 +209,7 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| Enforced foreign keys (`PRAGMA foreign_keys = ON` with a constraint on the table) | Parent-key checks and CASCADE/SET NULL/SET DEFAULT actions |
+| ON DELETE CASCADE, SET NULL or SET DEFAULT on a table that references the target | Running the action on the child rows |
 | A subquery in RETURNING | RETURNING read from a copy of the deleted row |
 | CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
@@ -243,7 +243,7 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
-| Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
 | UPSERT and REPLACE (statement, column, index or INTEGER PRIMARY KEY) | Conflict actions |
@@ -268,6 +268,19 @@ read the OLD row, run BEFORE triggers, check that the row still exists, write,
 and run AFTER triggers. UPDATE reads the columns it does not set again after
 BEFORE triggers and checks NOT NULL only then. INSERT runs BEFORE triggers
 with NEW.rowid -1 when the rowid is not given yet.
+
+With `PRAGMA foreign_keys = ON`, DELETE and INSERT check foreign keys the
+way legacy does (`semantic_lowering/fkey.rs`), reading key values through the
+HIR target source. Before a row is deleted, child rows that still point at
+it are counted as violations (RESTRICT stops at once), found through a child
+index that lists exactly the child key, or by scanning the child table; a
+deleted child of a deferred constraint whose parent was missing takes back
+its violation. Before a new row is written, its parent must exist: an
+immediate constraint stops the statement, a deferred one adds a violation. A
+row may be its own parent. After a new row is written, children of a
+deferred or self-referencing constraint that point at its key take back
+their violations. With foreign keys off, DML carries no foreign-key metadata,
+so a child of a missing parent table can still be written.
 
 ### Non-lowering phase complete
 

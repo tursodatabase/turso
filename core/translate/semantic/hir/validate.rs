@@ -879,6 +879,25 @@ impl<'document> HirValidator<'document> {
             "only an UPDATE CASCADE action can guarantee the new parent",
         )?;
 
+        if let Some(index) = &foreign_key.child_index {
+            self.visit_catalog_object(index, "foreign-key child index")?;
+            self.require(
+                index
+                    .value()
+                    .table_name
+                    .eq_ignore_ascii_case(&child_table.name)
+                    && index.database() == foreign_key.child_table.database()
+                    && index.value().columns.len() == width
+                    && index
+                        .value()
+                        .columns
+                        .iter()
+                        .zip(foreign_key.child_positions.iter())
+                        .all(|(column, position)| column.pos_in_table == *position),
+                "foreign-key child index does not list exactly the child key",
+            )?;
+        }
+
         match &foreign_key.parent_unique_index {
             Some(index) => {
                 self.visit_catalog_object(index, "foreign-key parent index")?;

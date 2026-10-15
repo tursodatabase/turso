@@ -3,6 +3,7 @@
 mod delete;
 mod dml;
 pub(super) mod expr;
+mod fkey;
 mod insert;
 pub(super) mod query;
 mod trigger;
@@ -70,7 +71,7 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
-    if delete::needs_legacy(delete, access, connection.foreign_keys_enabled(), program)? {
+    if delete::needs_legacy(delete, access, program)? {
         return Ok(false);
     }
     // Triggers are compiled before anything is emitted, so one that needs
@@ -100,13 +101,7 @@ pub(crate) fn translate_update(
     let session = HirSession::new(schema, resolver, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
-    if update::needs_legacy(
-        &plan,
-        update,
-        access,
-        connection.foreign_keys_enabled(),
-        program,
-    )? {
+    if update::needs_legacy(&plan, update, access, program)? {
         return Ok(false);
     }
     let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
@@ -139,7 +134,7 @@ pub(crate) fn translate_insert(
     let session = HirSession::new(schema, resolver, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
-    if insert::needs_legacy(&plan, insert, connection.foreign_keys_enabled(), program)? {
+    if insert::needs_legacy(&plan, insert, program)? {
         return Ok(false);
     }
     let Some(triggers) = trigger::insert_triggers(&session, program, &plan, insert)? else {
