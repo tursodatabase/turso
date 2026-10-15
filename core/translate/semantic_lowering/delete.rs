@@ -3,8 +3,10 @@
 //! This covers a plain DELETE from a B-tree table: one loop over the planned
 //! access path, index entries removed with `IdxDelete`, then the row removed
 //! with `Delete`. RETURNING rows are buffered and returned after the last
-//! row is deleted. Statements that need triggers, foreign keys, subqueries,
-//! CDC, or a virtual table still go through legacy; see [`needs_legacy`].
+//! row is deleted. A WHERE clause with a subquery first collects the rowids,
+//! as legacy does. Statements that need triggers, foreign keys, a RETURNING
+//! subquery, CDC, or a virtual table still go through legacy; see
+//! [`needs_legacy`].
 
 use turso_parser::ast;
 
@@ -15,19 +17,19 @@ use crate::{
         expr::{emit_returning_scan_back, ConditionMetadata, ReturningBufferCtx},
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, HirRoot},
-        semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
         insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
-        CursorID,
+        BranchOffset, CursorID,
     },
     CaptureDataChangesExt, LimboError, Result,
 };
 
 use super::query::{
     close_hir_btree_loop, emit_array_results, hir_loop_explain, predicate_loop,
-    start_hir_btree_loop, PreparedHirBtreeLoop,
+    prepare_hir_btree_loop, start_hir_btree_loop, PreparedHirBtreeLoop,
 };
 
 /// Whether this DELETE uses something the HIR lowering does not handle yet.
@@ -52,10 +54,17 @@ pub(super) fn needs_legacy(
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
-    // Subqueries and CTEs: legacy collects the rowids first when the WHERE
-    // clause has a subquery, and a RETURNING subquery that reads the target
-    // must see the table after the row is deleted.
-    if !document.queries.is_empty() {
+    // A RETURNING subquery that reads the target must see the table after
+    // the row is deleted, but HIR reads RETURNING values before.
+    if delete.returning.as_ref().is_some_and(|returning| {
+        returning.outputs.iter().any(|output| {
+            let mut has_subquery = false;
+            output.expr.for_each(&mut |expression| {
+                has_subquery |= matches!(expression, hir::Expr::Subquery(_));
+            });
+            has_subquery
+        })
+    }) {
         return Ok(true);
     }
     match &delete.target_kind {
@@ -157,7 +166,8 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
     program.begin_write_on_database(database.index(), schema_version)?;
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
-    if hir_delete_touches_at_most_one_row(operation) {
+    // After collecting rowids, legacy treats the delete as a scan.
+    if !uses_rowset(plan) && hir_delete_touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
     program.set_may_abort(false);
@@ -175,73 +185,150 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
         (cursor, returning.outputs.as_slice())
     });
 
+    let target = DeleteTarget {
+        document,
+        source,
+        table,
+        database: database.index(),
+    };
+    let done = program.allocate_label();
+    if uses_rowset(plan) {
+        emit_rowset_delete(program, plan, &target, access, returning, done)?;
+    } else {
+        emit_scan_delete(program, &target, access, operation, returning, done)?;
+    }
+    program.preassign_label_to_next_insn(done);
+    if let Some((cursor, outputs)) = returning {
+        // Legacy checks foreign keys before returning any row.
+        program.emit_insn(Insn::FkCheck { deferred: false });
+        emit_returning_scan_back(
+            program,
+            &ReturningBufferCtx {
+                cursor_id: cursor,
+                num_columns: outputs.len(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The table a DELETE removes rows from.
+struct DeleteTarget<'a> {
+    document: &'a HirDocument,
+    source: &'a hir::Source,
+    table: &'a Arc<BTreeTable>,
+    database: usize,
+}
+
+impl DeleteTarget<'_> {
+    fn open_table_for_write(&self, program: &mut ProgramBuilder) -> CursorID {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(self.table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: cursor,
+            root_page: RegisterOrLiteral::Literal(self.table.root_page),
+            db: self.database,
+        });
+        cursor
+    }
+
+    /// Open every index for writing, except `skip`.
+    fn open_indexes_for_write(
+        &self,
+        program: &mut ProgramBuilder,
+        skip: Option<&Arc<crate::schema::Index>>,
+    ) -> Result<Vec<(&hir::IndexExpressions, CursorID)>> {
+        let mut indexes = Vec::with_capacity(self.source.index_expressions.len());
+        for expressions in &self.source.index_expressions {
+            let index = expressions.index.value();
+            if expressions.columns.len() != index.columns.len() {
+                return Err(LimboError::InternalError(format!(
+                    "HIR index {} has {} key expressions for {} columns",
+                    index.name,
+                    expressions.columns.len(),
+                    index.columns.len()
+                )));
+            }
+            if skip.is_some_and(|skip| skip.name == index.name) {
+                continue;
+            }
+            let cursor =
+                program.alloc_cursor_id(CursorType::BTreeIndex(expressions.index.handle()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: cursor,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: self.database,
+            });
+            indexes.push((expressions, cursor));
+        }
+        Ok(indexes)
+    }
+
+    fn index_expressions(&self, index: &crate::schema::Index) -> Result<&hir::IndexExpressions> {
+        self.source
+            .index_expressions
+            .iter()
+            .find(|expressions| expressions.index.value().name == index.name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR DELETE target {} does not list index {}",
+                    self.source.id, index.name
+                ))
+            })
+    }
+}
+
+/// Whether the DELETE first collects the rowids of the rows to delete, then
+/// deletes them. Like legacy, a WHERE clause with a subquery does this, so
+/// the subquery never reads a table that is changing under it.
+fn uses_rowset(plan: &HirPlan) -> bool {
+    !plan.document.queries.is_empty()
+}
+
+/// Delete each row as the loop reaches it.
+fn emit_scan_delete(
+    program: &mut ProgramBuilder,
+    target: &DeleteTarget<'_>,
+    access: &HirAccessPlan,
+    operation: &HirBtreeOperation,
+    returning: Option<(CursorID, &[hir::Output])>,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = target.document;
     // Like legacy, open the table, then the index the loop reads, then every
     // other index, all for writing.
     let iteration_index = hir_operation_index(operation);
-    let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: database.index(),
-    });
-    let iteration_cursor = iteration_index.map(|index| {
-        let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: cursor,
-            root_page: RegisterOrLiteral::Literal(index.root_page),
-            db: database.index(),
-        });
-        cursor
-    });
-    let mut iteration_entry = None;
-    let mut other_indexes = Vec::with_capacity(source.index_expressions.len());
-    for expressions in &source.index_expressions {
-        let index = expressions.index.value();
-        if expressions.columns.len() != index.columns.len() {
-            return Err(LimboError::InternalError(format!(
-                "HIR index {} has {} key expressions for {} columns",
-                index.name,
-                expressions.columns.len(),
-                index.columns.len()
-            )));
-        }
-        if iteration_index.is_some_and(|iteration| iteration.name == index.name) {
-            iteration_entry = Some(expressions);
-            continue;
-        }
-        let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(expressions.index.handle()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: cursor,
-            root_page: RegisterOrLiteral::Literal(index.root_page),
-            db: database.index(),
-        });
-        other_indexes.push((expressions, cursor));
-    }
-    if iteration_index.is_some() && iteration_entry.is_none() {
-        return Err(LimboError::InternalError(format!(
-            "HIR DELETE target {} does not list the index its loop reads",
-            source.id
-        )));
-    }
+    let table_cursor = target.open_table_for_write(program);
+    let iteration = iteration_index
+        .map(|index| -> Result<_> {
+            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: cursor,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: target.database,
+            });
+            Ok((cursor, target.index_expressions(index)?))
+        })
+        .transpose()?;
+    let other_indexes = target.open_indexes_for_write(program, iteration_index)?;
 
+    let scan_cursor = iteration.map_or(table_cursor, |(cursor, _)| cursor);
+    let lookup_cursor = iteration.map(|_| table_cursor);
     program.bind_source(
-        source.id,
+        target.source.id,
         SourceBinding::BTree {
-            scan_cursor: iteration_cursor.unwrap_or(table_cursor),
-            table_cursor: iteration_cursor.map(|_| table_cursor),
+            scan_cursor,
+            table_cursor: lookup_cursor,
         },
     );
     let prepared = PreparedHirBtreeLoop {
-        source,
+        source: target.source,
         operation,
         index: iteration_index,
-        cursor: iteration_cursor.unwrap_or(table_cursor),
-        table_cursor: iteration_cursor.map(|_| table_cursor),
+        cursor: scan_cursor,
+        table_cursor: lookup_cursor,
         autoindex_source_cursor: None,
-        table_has_rowid: table.has_rowid,
+        table_has_rowid: target.table.has_rowid,
     };
-
-    let done = program.allocate_label();
     emit_delete_predicates(program, document, access, None, done)?;
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
     emit_delete_predicates(program, document, access, Some(0), hir_loop.next)?;
@@ -253,7 +340,101 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
         cursor_id: table_cursor,
         dest: rowid,
     });
-    // Index keys are read from the table row, as legacy does.
+    emit_delete_row(
+        program,
+        target,
+        table_cursor,
+        iteration,
+        &other_indexes,
+        returning,
+    )?;
+    close_hir_btree_loop(program, &hir_loop, &[]);
+    Ok(())
+}
+
+/// Collect the rowids of the rows to delete with read cursors, then delete
+/// each collected row.
+fn emit_rowset_delete(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    target: &DeleteTarget<'_>,
+    access: &HirAccessPlan,
+    returning: Option<(CursorID, &[hir::Output])>,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = target.document;
+    let [planned_loop] = access.loops.as_slice() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR DELETE plan has {} loops for one target",
+            access.loops.len()
+        )));
+    };
+    let rowset = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowset,
+        dest_end: None,
+    });
+    let collected = program.allocate_label();
+    let prepared = prepare_hir_btree_loop(program, plan, planned_loop)?;
+    emit_delete_predicates(program, document, access, None, collected)?;
+    let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
+    emit_delete_predicates(program, document, access, Some(0), hir_loop.next)?;
+    let rowid = program.alloc_register();
+    super::expr::translate_expr(
+        program,
+        document,
+        &hir::Expr::RowId(target.source.id),
+        rowid,
+    )?;
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg: rowset,
+        value_reg: rowid,
+    });
+    close_hir_btree_loop(program, &hir_loop, &[]);
+    program.preassign_label_to_next_insn(collected);
+    for cursor in std::iter::once(prepared.cursor).chain(prepared.table_cursor) {
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
+
+    let table_cursor = target.open_table_for_write(program);
+    let indexes = target.open_indexes_for_write(program, None)?;
+    let next = program.allocate_label();
+    let rowid = program.alloc_register();
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg: rowset,
+        pc_if_empty: done,
+        dest_reg: rowid,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor: table_cursor,
+        rowid_reg: rowid,
+        target_pc: next,
+    });
+    emit_delete_row(program, target, table_cursor, None, &indexes, returning)?;
+    program.emit_insn(Insn::Goto { target_pc: next });
+    Ok(())
+}
+
+/// Delete the row the table cursor is on: its RETURNING values, its index
+/// entries, then the row. `iteration` is the index the loop reads, whose
+/// entry is removed last so the loop can still advance.
+fn emit_delete_row(
+    program: &mut ProgramBuilder,
+    target: &DeleteTarget<'_>,
+    table_cursor: CursorID,
+    iteration: Option<(CursorID, &hir::IndexExpressions)>,
+    other_indexes: &[(&hir::IndexExpressions, CursorID)],
+    returning: Option<(CursorID, &[hir::Output])>,
+) -> Result<()> {
+    let DeleteTarget {
+        document,
+        source,
+        table,
+        ..
+    } = *target;
+    // Index keys and RETURNING values are read from the table row, as
+    // legacy does.
     program.bind_source(
         source.id,
         SourceBinding::BTree {
@@ -263,14 +444,13 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
     );
     // The key of the index the loop reads is taken before the row is
     // deleted and removed after it.
-    let iteration_key = match (iteration_entry, iteration_cursor) {
-        (Some(expressions), Some(cursor)) => {
+    let iteration_key = iteration
+        .map(|(cursor, expressions)| -> Result<_> {
             let (start, count) =
                 emit_index_key(program, document, source, table, table_cursor, expressions)?;
-            Some((cursor, start, count, expressions))
-        }
-        _ => None,
-    };
+            Ok((cursor, start, count, expressions))
+        })
+        .transpose()?;
     // RETURNING reads the row before it is deleted. Without subqueries this
     // gives the same values as legacy, which reads a copy of the row after.
     let returning_row = returning
@@ -288,7 +468,7 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
             Ok((start, outputs.len()))
         })
         .transpose()?;
-    for (expressions, cursor) in &other_indexes {
+    for (expressions, cursor) in other_indexes {
         let skip = match &expressions.predicate {
             Some(predicate) => {
                 let skip = program.allocate_label();
@@ -353,19 +533,6 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
             raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
         });
     }
-    close_hir_btree_loop(program, &hir_loop, &[]);
-    program.preassign_label_to_next_insn(done);
-    if let Some((cursor, outputs)) = returning {
-        // Legacy checks foreign keys before returning any row.
-        program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(
-            program,
-            &ReturningBufferCtx {
-                cursor_id: cursor,
-                num_columns: outputs.len(),
-            },
-        );
-    }
     Ok(())
 }
 
@@ -374,9 +541,9 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
 fn emit_delete_predicates(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    access: &crate::translate::semantic_to_plan::HirAccessPlan,
+    access: &HirAccessPlan,
     loop_index: Option<usize>,
-    fail: crate::vdbe::BranchOffset,
+    fail: BranchOffset,
 ) -> Result<()> {
     for predicate in access
         .predicates
@@ -536,15 +703,23 @@ mod tests {
         translate::semantic_lowering::query::tests::{analyze_plan, indexed_items_schema, program},
     };
 
+    /// Lower a DELETE that HIR accepts, as `translate_delete` does.
+    fn emit(plan: HirPlan) -> ProgramBuilder {
+        let plan = Arc::new(plan);
+        let mut program = program();
+        assert!(!needs_legacy(&plan, true, &program).unwrap());
+        program.set_hir_plan(plan.clone());
+        emit_delete(&mut program, &plan).unwrap();
+        program
+    }
+
     #[test]
     fn plain_delete_removes_the_row_and_every_index_entry() {
         let plan = analyze_plan(
             indexed_items_schema(),
             "DELETE FROM items WHERE extra = 'x'",
         );
-        let mut program = program();
-        assert!(!needs_legacy(&plan, true, &program).unwrap());
-        emit_delete(&mut program, &plan).unwrap();
+        let program = emit(plan);
         let count = |matches: fn(&Insn) -> bool| {
             program
                 .insns
@@ -565,9 +740,7 @@ mod tests {
             indexed_items_schema(),
             "DELETE FROM items WHERE value = 1 RETURNING extra, value + 1",
         );
-        let mut program = program();
-        assert!(!needs_legacy(&plan, false, &program).unwrap());
-        emit_delete(&mut program, &plan).unwrap();
+        let program = emit(plan);
         let position = |matches: fn(&Insn) -> bool| {
             program
                 .insns
@@ -582,15 +755,32 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_a_subquery_stays_on_legacy() {
-        for sql in [
+    fn delete_with_a_where_subquery_collects_rowids_before_deleting() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "DELETE FROM items WHERE value IN (SELECT value FROM items WHERE extra = 'x')",
+        );
+        let program = emit(plan);
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let collected = position(|insn| matches!(insn, Insn::RowSetAdd { .. }));
+        let read = position(|insn| matches!(insn, Insn::RowSetRead { .. }));
+        let delete = position(|insn| matches!(insn, Insn::Delete { .. }));
+        assert!(collected < read && read < delete);
+    }
+
+    #[test]
+    fn delete_with_a_returning_subquery_stays_on_legacy() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
             "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
-            "DELETE FROM items WHERE value IN (SELECT value FROM items)",
-            "DELETE FROM items WHERE value = (SELECT 1)",
-        ] {
-            let plan = analyze_plan(indexed_items_schema(), sql);
-            assert!(needs_legacy(&plan, false, &program()).unwrap(), "{sql}");
-        }
+        );
+        assert!(needs_legacy(&plan, false, &program()).unwrap());
     }
 
     #[test]

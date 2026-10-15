@@ -77,9 +77,17 @@ fn hir_delete_matches_legacy() {
             "DELETE FROM t WHERE b = 2 RETURNING a",
             "DELETE FROM t WHERE b = 5",
         ],
+        // A WHERE subquery: the rowids are collected before any row is
+        // deleted, so a subquery that reads `t` sees all of it.
+        &["DELETE FROM t WHERE b IN (SELECT b FROM t WHERE c = 'x')"],
+        &["DELETE FROM t WHERE b > (SELECT avg(b) FROM t)"],
+        &["DELETE FROM t WHERE EXISTS (SELECT 1 FROM t AS o WHERE o.b = t.b - 2)"],
+        &["DELETE FROM t WHERE EXISTS (SELECT 1 FROM log WHERE log.a = t.d) OR c IS NULL"],
+        &["DELETE FROM t WHERE c NOT IN (SELECT c FROM t WHERE b > 4 AND c IS NOT NULL)"],
+        &["DELETE FROM t WHERE a IN (SELECT a FROM t ORDER BY a DESC LIMIT 2) RETURNING a, g"],
+        &["WITH m AS (SELECT max(a) AS v FROM t) DELETE FROM t WHERE a = (SELECT v FROM m)"],
         // Statements that still go through legacy.
         &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
-        &["DELETE FROM t WHERE b IN (SELECT b FROM t WHERE c = 'x')"],
         &[
             "CREATE TRIGGER tr AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a); END",
             "DELETE FROM t WHERE b = 2",

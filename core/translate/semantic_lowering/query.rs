@@ -4672,7 +4672,7 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
     ))
 }
 
-fn prepare_hir_btree_loop<'a>(
+pub(super) fn prepare_hir_btree_loop<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,

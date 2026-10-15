@@ -331,7 +331,9 @@ impl<'a> HirPlanContext<'a> {
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirAccessPlan> {
-        let usage = delete.direct_column_usage();
+        let usage = self
+            .document
+            .root_column_usage(delete.direct_column_usage());
         let mut input = HirQueryBlockPlanInput {
             sources: vec![self.plan_source(delete.target, None, &usage)?],
             groups: Vec::new(),
