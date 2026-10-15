@@ -2419,6 +2419,9 @@ struct HirRightOuterJoin {
     loop_index: usize,
     matched: CursorID,
     empty_record: usize,
+    /// The ephemeral table of a materialized right subquery. Its rowids key
+    /// the matched set, and the unmatched pass scans it again.
+    materialized: Option<CursorID>,
 }
 
 /// The joins of one FROM clause that loop lowering supports.
@@ -3080,7 +3083,7 @@ fn emit_btree_loops(
         })
         .transpose()?;
     let left_joins = prepare_hir_left_joins(program, block_plan, &prepared_loops, &joins.owners)?;
-    let right_outer = prepare_hir_right_outer_join(program, document, block_plan, &joins)?;
+    let right_outer = prepare_hir_right_outer_join(program, block_plan, &prepared_loops, &joins)?;
 
     let nest = HirLoopNest {
         document,
@@ -3279,35 +3282,43 @@ impl HirLoopNest<'_, '_> {
                 program.emit_insn(Insn::NullRow { cursor_id: cursor });
             }
         }
-        let PreparedHirLoop::BTree(prepared) = &self.prepared_loops[right] else {
-            return Err(LimboError::InternalError(
-                "HIR RIGHT or FULL JOIN right source is not a B-tree table".into(),
-            ));
+        // A materialized subquery is scanned again through its own cursor.
+        // A table gets a new cursor, since its loop may have read an index.
+        let (scan, original) = match (&self.prepared_loops[right], right_outer.materialized) {
+            (PreparedHirLoop::Materialized(_), Some(cursor)) => (cursor, None),
+            (PreparedHirLoop::BTree(prepared), None) => {
+                let hir::SourceKind::Table(table) = &prepared.source.kind else {
+                    unreachable!("B-tree loops read table sources")
+                };
+                let Some(table) = table.value().btree() else {
+                    unreachable!("B-tree loops read B-tree tables")
+                };
+                let database = prepared
+                    .source
+                    .database
+                    .expect("B-tree loop sources have a database");
+                let scan = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: scan,
+                    root_page: table.root_page,
+                    db: database.index(),
+                });
+                let original = program.source_binding(right_outer.source).cloned();
+                program.bind_source(
+                    right_outer.source,
+                    SourceBinding::BTree {
+                        scan_cursor: scan,
+                        table_cursor: None,
+                    },
+                );
+                (scan, original)
+            }
+            _ => {
+                return Err(LimboError::InternalError(
+                    "HIR RIGHT or FULL JOIN right loop does not match its matched set".into(),
+                ))
+            }
         };
-        let hir::SourceKind::Table(table) = &prepared.source.kind else {
-            unreachable!("B-tree loops read table sources")
-        };
-        let Some(table) = table.value().btree() else {
-            unreachable!("B-tree loops read B-tree tables")
-        };
-        let database = prepared
-            .source
-            .database
-            .expect("B-tree loop sources have a database");
-        let scan = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: scan,
-            root_page: table.root_page,
-            db: database.index(),
-        });
-        let original = program.source_binding(right_outer.source).cloned();
-        program.bind_source(
-            right_outer.source,
-            SourceBinding::BTree {
-                scan_cursor: scan,
-                table_cursor: None,
-            },
-        );
 
         let done = program.allocate_label();
         let loop_start = program.allocate_label();
@@ -3375,8 +3386,8 @@ impl HirLoopNest<'_, '_> {
 /// Open the matched-row set of the block's RIGHT or FULL join, if any.
 fn prepare_hir_right_outer_join(
     program: &mut ProgramBuilder,
-    document: &HirDocument,
     block_plan: &HirQueryBlockPlan,
+    prepared_loops: &[PreparedHirLoop<'_>],
     joins: &HirOuterJoins,
 ) -> Result<Option<HirRightOuterJoin>> {
     let source = match joins.right_outer.as_slice() {
@@ -3388,18 +3399,6 @@ fn prepare_hir_right_outer_join(
             ))
         }
     };
-    let rowid_table = document
-        .source(source)
-        .and_then(|source| match &source.kind {
-            hir::SourceKind::Table(table) => table.value().btree(),
-            _ => None,
-        })
-        .filter(|table| table.has_rowid);
-    let Some(table) = rowid_table else {
-        return Err(LimboError::InternalError(format!(
-            "HIR RIGHT or FULL JOIN source {source} is not a rowid table"
-        )));
-    };
     let loop_index = block_plan
         .loops
         .iter()
@@ -3409,6 +3408,27 @@ fn prepare_hir_right_outer_join(
                 "HIR RIGHT or FULL JOIN source {source} has no loop"
             ))
         })?;
+    let (table, materialized) = match &prepared_loops[loop_index] {
+        PreparedHirLoop::BTree(prepared) => {
+            let rowid_table = match &prepared.source.kind {
+                hir::SourceKind::Table(table) => table.value().btree(),
+                _ => None,
+            }
+            .filter(|table| table.has_rowid);
+            let Some(table) = rowid_table else {
+                return Err(LimboError::InternalError(format!(
+                    "HIR RIGHT or FULL JOIN source {source} is not a rowid table"
+                )));
+            };
+            (table, None)
+        }
+        PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
+        PreparedHirLoop::Virtual(_) | PreparedHirLoop::Registers(_) => {
+            return Err(LimboError::InternalError(format!(
+                "HIR RIGHT or FULL JOIN source {source} has no rowids"
+            )));
+        }
+    };
     let matched = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: matched,
@@ -3427,6 +3447,7 @@ fn prepare_hir_right_outer_join(
         loop_index,
         matched,
         empty_record,
+        materialized,
     }))
 }
 
@@ -3438,7 +3459,14 @@ impl HirRightOuterJoin {
         document: &HirDocument,
     ) -> Result<()> {
         let rowid = program.alloc_register();
-        super::expr::translate_expr(program, document, &hir::Expr::RowId(self.source), rowid)?;
+        if let Some(cursor) = self.materialized {
+            program.emit_insn(Insn::RowId {
+                cursor_id: cursor,
+                dest: rowid,
+            });
+        } else {
+            super::expr::translate_expr(program, document, &hir::Expr::RowId(self.source), rowid)?;
+        }
         program.emit_insn(Insn::Insert {
             cursor: self.matched,
             key_reg: rowid,

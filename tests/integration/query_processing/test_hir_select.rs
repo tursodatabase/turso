@@ -264,7 +264,8 @@ fn hir_right_and_full_joins_match_legacy_rows() {
         );
     }
 
-    // HIR must match SQLite here. Legacy returns wrong rows for the last two.
+    // HIR must match SQLite here. Legacy returns wrong rows for the last two
+    // and rejects the FULL JOIN of a subquery.
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SETUP).unwrap();
     for sql in [
@@ -274,6 +275,11 @@ fn hir_right_and_full_joins_match_legacy_rows() {
         // A WHERE term on the left side runs after the match is recorded, so
         // every tag counts as matched and no NULL-extended row appears.
         "SELECT i.id, t.tag FROM items i RIGHT JOIN tags t ON 1 WHERE i.id IS NULL",
+        // A materialized subquery on the right is scanned again by rowid.
+        "SELECT i.id, d.item_id FROM items i \
+         FULL JOIN (SELECT DISTINCT item_id FROM tags) AS d ON d.item_id = i.id ORDER BY 1, 2",
+        "SELECT i.extra, d.tag FROM (SELECT extra FROM items WHERE value > 15) AS i \
+         RIGHT JOIN (SELECT tag FROM tags) AS d ON d.tag > i.extra ORDER BY 1, 2",
         // Legacy puts the inner join's columns before the RIGHT JOIN's.
         "SELECT * FROM items i RIGHT JOIN tags t ON t.item_id = i.id \
          JOIN items j ON j.id = t.item_id ORDER BY t.tag, i.id",

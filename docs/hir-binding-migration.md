@@ -168,7 +168,8 @@ rejects it).
 
 RIGHT and FULL joins use SQLite's nested-loop method instead of legacy's hash
 join. The right loop records each matched rowid in an ephemeral table, and
-after the main loops a second pass scans the right table for rows not in it,
+after the main loops a second pass scans the right table, or the ephemeral
+table of a materialized subquery, for rows not in it,
 with the left tables reading NULL. As in SQLite, WHERE terms run only after the
 match is recorded, and the second pass checks WHERE terms but not ON terms.
 HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
