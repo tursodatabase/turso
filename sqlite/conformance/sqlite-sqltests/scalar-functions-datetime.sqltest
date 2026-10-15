@@ -344,6 +344,24 @@ expect {
     1650153600
 }
 
+test datetime-time-offset-of-24-hours-adds-nothing {
+    SELECT datetime('2024-01-01 10:00', '+24:00'),
+           datetime('2024-01-01 10:00', '-24:00:00.000'),
+           unixepoch('2024-01-01', '+24:00'),
+           datetime('2024-01-01 10:00', '+23:59');
+}
+expect {
+    2024-01-01 10:00:00|2024-01-01 10:00:00|1704067200|2024-01-02 09:59:00
+}
+
+test datetime-date-and-time-offset-of-24-hours-adds-only-the-date {
+    SELECT datetime('2024-01-01 10:00', '+0001-00-00 24:00'),
+           datetime('2024-01-01 10:00', '-0000-00-01 24:00');
+}
+expect {
+    2025-01-01 10:00:00|2023-12-31 10:00:00
+}
+
 test date-with-auto-julianday-top {
     SELECT date(5373484, 'auto');
 }
