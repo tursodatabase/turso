@@ -1707,6 +1707,83 @@ expect error {
     .*JSON cannot hold BLOB values.*
 }
 
+test json_set_blob_value_null_path {
+    SELECT json_set('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_set_bad_path_before_blob_value {
+    SELECT json_set('[1]', 'bad', x'7b7d');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test jsonb_set_blob_value {
+    SELECT jsonb_set('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_array_append {
+    SELECT json_insert('[]', '$[#]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_object_key {
+    SELECT json_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_null_path {
+    SELECT json_insert('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_insert_jsonb_blob_value {
+    SELECT json_insert('{}', '$.a', x'01');
+}
+expect {
+    {"a":true}
+}
+
+test jsonb_insert_blob_value {
+    SELECT jsonb_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_jsonb_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'01');
+}
+expect {
+    [true]
+}
+
+test jsonb_replace_blob_value {
+    SELECT jsonb_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
 test json_set_field_empty_object {
     SELECT json_set('{}', '$.field', 'value');
 }
