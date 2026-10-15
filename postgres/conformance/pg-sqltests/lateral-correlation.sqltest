@@ -689,11 +689,11 @@ expect {
 test lateral-reads-an-outer-column-in-like {
     CREATE TABLE t6(p TEXT);
     INSERT INTO t6 VALUES ('p%'), ('%s'), ('z%');
-    SELECT t6.p, s.b FROM t6, LATERAL (SELECT b FROM t1 WHERE t1.b LIKE t6.p) AS s ORDER BY 1, 2;
+    SELECT t6.p, s.b FROM t6, LATERAL (SELECT b FROM t1 WHERE t1.b LIKE t6.p) AS s ORDER BY 2;
 }
 expect {
-    %s|s
     p%|p
+    %s|s
 }
 
 @setup data
