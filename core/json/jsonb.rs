@@ -1551,11 +1551,12 @@ impl Jsonb {
             });
         }
 
+        let value_start = pos;
         pos = skip_whitespace_tracking(input, pos, info);
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
+                location: Some(value_start),
             });
         }
 
@@ -1688,8 +1689,6 @@ impl Jsonb {
                     }
                     pos += 1; // consume ':'
 
-                    pos = skip_whitespace_tracking(input, pos, info);
-
                     // Parse value - can be any JSON value including another object
                     pos = self.deserialize_value(input, pos, depth + 1, info)?;
                     pos = skip_whitespace_tracking(input, pos, info);
@@ -1729,11 +1728,12 @@ impl Jsonb {
         let mut first = true;
 
         loop {
+            let element_start = pos;
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
+                    location: Some(if first { element_start } else { pos }),
                 });
             }
 
@@ -1754,11 +1754,12 @@ impl Jsonb {
                 }
                 b',' if !first => {
                     pos += 1; // consume ','
+                    let element_start = pos;
                     pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma".to_string(),
-                            location: Some(pos),
+                            location: Some(element_start),
                         });
                     }
                     if input[pos] == b',' {
@@ -2516,13 +2517,6 @@ impl Jsonb {
         let mut result = Self::new(input.len())?;
         let input = input.as_bytes();
         let mut info = ParseInfo::default();
-
-        if input.is_empty() {
-            return Err(PError::Message {
-                msg: "Unexpected input after json".to_string(),
-                location: None,
-            });
-        }
 
         // Parse the first complete JSON value
         let mut pos = 0;

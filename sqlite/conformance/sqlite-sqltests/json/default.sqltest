@@ -1225,6 +1225,36 @@ expect {
     9
 }
 
+test json_error_position_missing_value_at_end_of_input {
+    SELECT json_error_position(''),
+           json_error_position(' '),
+           json_error_position(char(0)),
+           json_error_position('/* c */'),
+           json_error_position('// c'),
+           json_error_position('[ '),
+           json_error_position('[[ '),
+           json_error_position('[1, '),
+           json_error_position('[1,' || char(10)),
+           json_error_position('[1, /* c */'),
+           json_error_position('\{"a": '),
+           json_error_position('\{"a":[ ');
+}
+expect {
+    1|1|1|1|1|2|3|4|4|4|6|7
+}
+
+test json_error_position_end_of_input_after_value_or_key {
+    SELECT json_error_position('[1 '),
+           json_error_position('\{ '),
+           json_error_position('\{"a" '),
+           json_error_position('\{"a":1, '),
+           json_error_position('[1, x'),
+           json_error_position('  x');
+}
+expect {
+    4|3|6|9|5|3
+}
+
 test json_object_simple {
     SELECT json_object('key', 'value');
 }
