@@ -168,6 +168,37 @@ fn test_alter_column_strict_int_to_integer_keeps_rows_and_index(
     Ok(())
 }
 
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")]
+fn test_alter_column_rejects_rows_failing_new_constraints(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, -1), (2, NULL)")?;
+
+    assert_that!(conn.execute("ALTER TABLE t ALTER COLUMN v TO v2 INTEGER CHECK(v2 > 0)"))
+        .err()
+        .display_string()
+        .contains("CHECK constraint failed");
+    assert_that!(conn.execute("ALTER TABLE t ALTER COLUMN v TO v2 INTEGER NOT NULL"))
+        .err()
+        .display_string()
+        .contains("NOT NULL constraint failed");
+
+    let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+    assert_eq!(
+        schema,
+        vec![("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)".to_string(),)]
+    );
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    conn.execute("UPDATE t SET v = 5 WHERE id = 2")?;
+    conn.execute("ALTER TABLE t ALTER COLUMN v TO v2 INTEGER NOT NULL CHECK(v2 < id + 10)")?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v2 FROM t");
+    assert_eq!(rows, vec![(1, -1), (2, 5)]);
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_view_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

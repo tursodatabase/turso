@@ -559,10 +559,10 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
-/// Validate NOT NULL and CHECK constraints for a new virtual generated column
-/// by scanning each row and computing the expression.
+/// Validate NOT NULL and CHECK constraints for a new or altered column by
+/// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
-fn emit_add_virtual_column_validation(
+fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     column: &Column,
@@ -1465,7 +1465,7 @@ pub fn translate_alter_table(
             };
 
             if is_generated {
-                emit_add_virtual_column_validation(
+                emit_column_constraints_validation(
                     program,
                     &btree,
                     &column,
@@ -2285,17 +2285,16 @@ pub fn translate_alter_table(
 
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
+                emit_column_constraints_validation(
+                    program,
+                    &altered_table,
+                    &altered_table.columns()[column_index],
+                    &definition.constraints,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
                 if rewrites_physical_layout {
-                    emit_add_virtual_column_validation(
-                        program,
-                        &altered_table,
-                        &altered_table.columns()[column_index],
-                        &definition.constraints,
-                        resolver,
-                        connection,
-                        database_id,
-                    )?;
-
                     let original_columns = original_btree.columns();
                     let source_column_by_schema_idx: Vec<Option<usize>> = altered_table
                         .columns()
