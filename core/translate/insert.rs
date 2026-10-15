@@ -31,7 +31,7 @@ use crate::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -356,8 +356,15 @@ pub fn translate_insert(
     );
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
+    let mut returning_table_refs = Vec::new();
+    for column in &returning {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+        }
+    }
     plan_ctes_as_outer_refs(
         with_for_returning,
+        &returning_table_refs,
         resolver,
         program,
         &mut table_references,
