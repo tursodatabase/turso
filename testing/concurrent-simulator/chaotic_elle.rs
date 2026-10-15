@@ -29,7 +29,7 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
-use crate::operations::{OpResult, Operation, TxMode};
+use crate::operations::{ElleLookup, OpResult, Operation, TxMode};
 
 /// A chaotic workload instance (one per fiber, drives a single transaction).
 ///
@@ -65,6 +65,7 @@ enum PlannedOp {
 struct ChaoticElleWorkload {
     table_name: String,
     model: ElleModelKind,
+    lookup: ElleLookup,
     enable_mvcc: bool,
     ops: Vec<PlannedOp>,
     index: usize,
@@ -74,12 +75,14 @@ impl ChaoticElleWorkload {
     fn new(
         table_name: String,
         model: ElleModelKind,
+        lookup: ElleLookup,
         enable_mvcc: bool,
         ops: Vec<PlannedOp>,
     ) -> Self {
         Self {
             table_name,
             model,
+            lookup,
             enable_mvcc,
             ops,
             index: 0,
@@ -99,10 +102,12 @@ impl ChaoticElleWorkload {
                 ElleModelKind::ListAppend => Operation::ElleRead {
                     table_name: self.table_name.clone(),
                     key: key.clone(),
+                    lookup: self.lookup,
                 },
                 ElleModelKind::RwRegister => Operation::ElleRwRead {
                     table_name: self.table_name.clone(),
                     key: key.clone(),
+                    lookup: self.lookup,
                 },
             },
             PlannedOp::Write { key, value } => match self.model {
@@ -110,11 +115,13 @@ impl ChaoticElleWorkload {
                     table_name: self.table_name.clone(),
                     key: key.clone(),
                     value: *value,
+                    lookup: self.lookup,
                 },
                 ElleModelKind::RwRegister => Operation::ElleRwWrite {
                     table_name: self.table_name.clone(),
                     key: key.clone(),
                     value: *value,
+                    lookup: self.lookup,
                 },
             },
             PlannedOp::Commit => Operation::Commit,
@@ -149,6 +156,7 @@ impl ChaoticWorkload for ChaoticElleWorkload {
 pub struct ChaoticElleProfile {
     table_name: String,
     model: ElleModelKind,
+    lookup: ElleLookup,
     value_counter: Arc<AtomicI64>,
     enable_mvcc: bool,
 }
@@ -160,9 +168,26 @@ impl ChaoticElleProfile {
         value_counter: Arc<AtomicI64>,
         enable_mvcc: bool,
     ) -> Self {
+        Self::with_lookup(
+            table_name,
+            model,
+            ElleLookup::PrimaryKey,
+            value_counter,
+            enable_mvcc,
+        )
+    }
+
+    pub fn with_lookup(
+        table_name: String,
+        model: ElleModelKind,
+        lookup: ElleLookup,
+        value_counter: Arc<AtomicI64>,
+        enable_mvcc: bool,
+    ) -> Self {
         Self {
             table_name,
             model,
+            lookup,
             value_counter,
             enable_mvcc,
         }
@@ -357,6 +382,7 @@ impl ChaoticWorkloadProfile for ChaoticElleProfile {
         Box::new(ChaoticElleWorkload::new(
             self.table_name.clone(),
             self.model,
+            self.lookup,
             self.enable_mvcc,
             ops,
         ))
