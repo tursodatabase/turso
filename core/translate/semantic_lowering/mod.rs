@@ -64,6 +64,14 @@ pub(crate) fn translate_delete(
     }
     program.set_hir_plan(plan.clone());
     delete::emit_delete(program, &plan)?;
+    if let HirRoot::Delete(hir::Delete {
+        returning: Some(returning),
+        ..
+    }) = &plan.document.root
+    {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
     Ok(true)
 }
 
@@ -147,8 +155,16 @@ fn resolved_result_columns(
     let block = query.blocks.first().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query {} has no blocks", query.id))
     })?;
-    block
-        .outputs
+    resolved_output_columns(document, &block.outputs)
+}
+
+/// Result-column metadata for a list of outputs, such as a SELECT block's
+/// or a RETURNING clause's.
+fn resolved_output_columns(
+    document: &HirDocument,
+    outputs: &[hir::Output],
+) -> Result<Vec<ResolvedResultColumn>> {
+    outputs
         .iter()
         .map(|output| {
             Ok(ResolvedResultColumn {

@@ -6367,7 +6367,7 @@ fn emit_hir_window_output_subroutine(
     Ok(())
 }
 
-fn emit_array_results(
+pub(super) fn emit_array_results(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     outputs: &[hir::Output],

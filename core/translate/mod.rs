@@ -576,7 +576,7 @@ fn translate_statement(
     // A statement with RETURNING already produces rows, so it never also returns
     // a count row (same as SQLite).
     if let Some(column_name) = count_changes_column {
-        if program.result_columns.is_empty() {
+        if program.result_columns.is_empty() && program.resolved_result_columns.is_empty() {
             let reg = program.alloc_register();
             program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
             program.emit_result_row(reg, 1);

@@ -8075,18 +8075,11 @@ mod tests {
             &schema,
             "INSERT INTO writable(id) VALUES (4) RETURNING writable.*",
         )
-        .expect("qualified RETURNING star binds");
-        let HirRoot::Insert(insert) = &qualified.root else {
-            panic!("INSERT produces INSERT root");
-        };
+        .err()
+        .expect("qualified RETURNING star is rejected");
         assert_eq!(
-            insert
-                .returning
-                .as_ref()
-                .expect("qualified star is preserved")
-                .outputs
-                .len(),
-            3
+            qualified.to_string(),
+            "Parse error: RETURNING may not use \"TABLE.*\" wildcards"
         );
     }
 
@@ -11010,7 +11003,7 @@ mod tests {
         let document = analyze_sql_with_schema(
             &schema,
             "UPDATE writable AS old SET value = 'changed' \
-             RETURNING writable.*, value COLLATE nocase AS folded",
+             RETURNING *, value COLLATE nocase AS folded",
         )
         .expect("UPDATE RETURNING binds");
         document
@@ -11603,7 +11596,7 @@ mod tests {
         let document = analyze_sql_with_schema(
             &schema,
             "DELETE FROM writable AS deleted WHERE id = 1 \
-             RETURNING deleted.*, deleted.rowid, value COLLATE nocase AS folded",
+             RETURNING *, deleted.rowid, value COLLATE nocase AS folded",
         )
         .expect("DELETE RETURNING binds");
         document

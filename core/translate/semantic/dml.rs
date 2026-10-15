@@ -152,9 +152,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     let expanded = scope.expand_star()?;
                     self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
                 }
-                ast::ResultColumn::TableStar(table) => {
-                    let expanded = scope.expand_table_star(table.as_str())?;
-                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                // Like SQLite and legacy, only a bare `*` expands here.
+                ast::ResultColumn::TableStar(_) => {
+                    crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
                 }
             }
         }

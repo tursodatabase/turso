@@ -2,9 +2,9 @@
 //!
 //! This covers a plain DELETE from a B-tree table: one loop over the planned
 //! access path, index entries removed with `IdxDelete`, then the row removed
-//! with `Delete`. Statements that need triggers, foreign keys, RETURNING,
-//! subqueries, CDC, or a virtual table still go through legacy; see
-//! [`needs_legacy`].
+//! with `Delete`. RETURNING rows are buffered and returned after the last
+//! row is deleted. Statements that need triggers, foreign keys, subqueries,
+//! CDC, or a virtual table still go through legacy; see [`needs_legacy`].
 
 use turso_parser::ast;
 
@@ -12,22 +12,22 @@ use crate::{
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
-        expr::ConditionMetadata,
+        expr::{emit_returning_scan_back, ConditionMetadata, ReturningBufferCtx},
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, HirRoot},
         semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
         CursorID,
     },
     CaptureDataChangesExt, LimboError, Result,
 };
 
 use super::query::{
-    close_hir_btree_loop, hir_loop_explain, predicate_loop, start_hir_btree_loop,
-    PreparedHirBtreeLoop,
+    close_hir_btree_loop, emit_array_results, hir_loop_explain, predicate_loop,
+    start_hir_btree_loop, PreparedHirBtreeLoop,
 };
 
 /// Whether this DELETE uses something the HIR lowering does not handle yet.
@@ -49,11 +49,12 @@ pub(super) fn needs_legacy(
             "HIR DELETE plan has no DELETE access plan".into(),
         ));
     };
-    if delete.returning.is_some() || !delete.order_by.is_empty() || delete.limit.is_some() {
+    if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
     // Subqueries and CTEs: legacy collects the rowids first when the WHERE
-    // clause has a subquery.
+    // clause has a subquery, and a RETURNING subquery that reads the target
+    // must see the table after the row is deleted.
     if !document.queries.is_empty() {
         return Ok(true);
     }
@@ -163,6 +164,17 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
 
     program.emit_source_explain(source.id, hir_loop_explain(document, None, planned_loop)?);
 
+    // Like legacy, RETURNING rows wait in an ephemeral table until every row
+    // is deleted.
+    let returning = delete.returning.as_ref().map(|returning| {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor,
+            is_table: true,
+        });
+        (cursor, returning.outputs.as_slice())
+    });
+
     // Like legacy, open the table, then the index the loop reads, then every
     // other index, all for writing.
     let iteration_index = hir_operation_index(operation);
@@ -259,6 +271,23 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
         }
         _ => None,
     };
+    // RETURNING reads the row before it is deleted. Without subqueries this
+    // gives the same values as legacy, which reads a copy of the row after.
+    let returning_row = returning
+        .map(|(_, outputs)| -> Result<(usize, usize)> {
+            let start = program.alloc_registers(outputs.len());
+            for (position, output) in outputs.iter().enumerate() {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &output.expr,
+                    start + position,
+                )?;
+            }
+            emit_array_results(program, document, outputs, start);
+            Ok((start, outputs.len()))
+        })
+        .transpose()?;
     for (expressions, cursor) in &other_indexes {
         let skip = match &expressions.predicate {
             Some(predicate) => {
@@ -293,6 +322,29 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
         table_name: table.name.clone(),
         is_part_of_update: false,
     });
+    if let (Some((cursor, _)), Some((start, count))) = (returning, returning_row) {
+        let record = program.alloc_register();
+        let key = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start),
+            count: to_u32(count),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor,
+            rowid_reg: key,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor,
+            key_reg: key,
+            record_reg: record,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+    }
     if let Some((cursor, start, count, expressions)) = iteration_key {
         program.emit_insn(Insn::IdxDelete {
             start_reg: start,
@@ -303,6 +355,17 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
     }
     close_hir_btree_loop(program, &hir_loop, &[]);
     program.preassign_label_to_next_insn(done);
+    if let Some((cursor, outputs)) = returning {
+        // Legacy checks foreign keys before returning any row.
+        program.emit_insn(Insn::FkCheck { deferred: false });
+        emit_returning_scan_back(
+            program,
+            &ReturningBufferCtx {
+                cursor_id: cursor,
+                num_columns: outputs.len(),
+            },
+        );
+    }
     Ok(())
 }
 
@@ -497,9 +560,31 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_returning_or_a_subquery_stays_on_legacy() {
+    fn delete_returning_buffers_rows_until_every_row_is_deleted() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "DELETE FROM items WHERE value = 1 RETURNING extra, value + 1",
+        );
+        let mut program = program();
+        assert!(!needs_legacy(&plan, false, &program).unwrap());
+        emit_delete(&mut program, &plan).unwrap();
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let delete = position(|insn| matches!(insn, Insn::Delete { .. }));
+        let buffered = position(|insn| matches!(insn, Insn::Insert { .. }));
+        let returned = position(|insn| matches!(insn, Insn::ResultRow { count: 2, .. }));
+        assert!(delete < buffered && buffered < returned);
+    }
+
+    #[test]
+    fn delete_with_a_subquery_stays_on_legacy() {
         for sql in [
-            "DELETE FROM items WHERE value = 1 RETURNING extra",
+            "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
             "DELETE FROM items WHERE value IN (SELECT value FROM items)",
             "DELETE FROM items WHERE value = (SELECT 1)",
         ] {

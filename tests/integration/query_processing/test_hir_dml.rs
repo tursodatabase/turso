@@ -68,8 +68,17 @@ fn hir_delete_matches_legacy() {
         &["DELETE FROM t NOT INDEXED WHERE b > 1"],
         // A second DELETE runs on what the first one left behind.
         &["DELETE FROM t WHERE b = 2", "DELETE FROM t WHERE c = 'x'"],
-        // Statements that still go through legacy.
         &["DELETE FROM t WHERE b = 2 RETURNING a, g"],
+        &["DELETE FROM t WHERE c > 'x' RETURNING *, rowid, d * 2, upper(c) AS u"],
+        &["DELETE FROM t WHERE 0 RETURNING a"],
+        // A count row is returned only without RETURNING.
+        &[
+            "PRAGMA count_changes = 1",
+            "DELETE FROM t WHERE b = 2 RETURNING a",
+            "DELETE FROM t WHERE b = 5",
+        ],
+        // Statements that still go through legacy.
+        &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
         &["DELETE FROM t WHERE b IN (SELECT b FROM t WHERE c = 'x')"],
         &[
             "CREATE TRIGGER tr AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a); END",
@@ -95,6 +104,60 @@ fn hir_delete_matches_legacy() {
             "results differ for {statements:?}"
         );
     }
+}
+
+#[test]
+fn hir_delete_returning_names_columns_like_legacy() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE r(a INTEGER PRIMARY KEY, b TEXT, c REAL)")
+        .unwrap();
+    for sql in [
+        "DELETE FROM r RETURNING *",
+        "DELETE FROM r AS x RETURNING x.a, b AS bee, c + 1, rowid",
+    ] {
+        let metadata = |hir: bool| {
+            conn.set_experimental_hir(hir);
+            let stmt = conn.prepare(sql).unwrap();
+            (0..stmt.num_columns())
+                .map(|column| {
+                    (
+                        stmt.get_column_name(column).to_string(),
+                        stmt.get_column_decltype(column),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(metadata(true), metadata(false), "{sql}");
+    }
+}
+
+#[test]
+fn hir_delete_returning_commits_when_reset_after_the_first_row() {
+    let run = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE r(a INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (1), (2), (3)").unwrap();
+        conn.set_experimental_hir(hir);
+        let mut stmt = conn
+            .prepare("DELETE FROM r WHERE a > 1 RETURNING a")
+            .unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::Row => break,
+                turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+                other => panic!("DELETE RETURNING stopped before its first row: {other:?}"),
+            }
+        }
+        // Every row is deleted before the first one is returned, so the
+        // DELETE commits even though the caller stops reading here.
+        stmt.reset().unwrap();
+        drop(stmt);
+        limbo_exec_rows(&conn, "SELECT a FROM r ORDER BY a")
+    };
+    assert_eq!(run(true), run(false));
 }
 
 #[test]
@@ -139,6 +202,7 @@ fn hir_delete_errors_match_legacy() {
         "DELETE FROM t WHERE x.b = 1",
         "DELETE FROM sqlite_schema",
         "DELETE FROM t INDEXED BY nosuch",
+        "DELETE FROM t RETURNING t.*",
     ] {
         let legacy_error = legacy
             .prepare(sql)

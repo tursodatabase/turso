@@ -711,7 +711,8 @@ impl Statement {
         if matches!(res, Ok(StepResult::Row))
             && self.query_mode == QueryMode::Normal
             && self.program.change_cnt_on
-            && !self.program.result_columns.is_empty()
+            && (!self.program.result_columns.is_empty()
+                || !self.program.resolved_result_columns.is_empty())
         {
             self.has_returned_row = true;
         }
