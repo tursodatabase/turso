@@ -283,6 +283,7 @@ impl<'document> HirValidator<'document> {
             InsertTargetKind::BTree {
                 autoincrement,
                 defaults,
+                replace_defaults,
                 triggers,
                 foreign_keys,
             } => {
@@ -349,7 +350,7 @@ impl<'document> HirValidator<'document> {
                         )?;
                     }
                 }
-                for default in defaults {
+                for default in defaults.iter().chain(replace_defaults) {
                     self.validate_column_position(insert.target, default.column)?;
                     self.visit_expr(&default.value)?;
                 }

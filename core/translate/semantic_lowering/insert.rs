@@ -18,7 +18,7 @@ use crate::{
         insert::{format_unique_violation_desc, halt_desc_and_on_error},
         semantic::hir::{self, HirRoot},
         semantic_to_plan::HirPlan,
-        stmt_journal::constraint_may_abort,
+        stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,
@@ -57,23 +57,21 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    if !insert.upserts.is_empty()
-        || insert.excluded_source.is_some()
-        || matches!(insert.conflict, Some(ResolveType::Replace))
-    {
+    if !insert.upserts.is_empty() || insert.excluded_source.is_some() {
         return Ok(true);
     }
-    let defaults = match &insert.target_kind {
+    let (defaults, foreign_keys) = match &insert.target_kind {
         hir::InsertTargetKind::BTree {
             autoincrement,
             defaults,
             triggers,
+            foreign_keys,
             ..
         } => {
             if autoincrement.is_some() || !triggers.upsert_update.is_empty() {
                 return Ok(true);
             }
-            defaults
+            (defaults, foreign_keys)
         }
         hir::InsertTargetKind::Virtual => return Ok(true),
     };
@@ -103,19 +101,19 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // REPLACE deletes the conflicting row, or stores a column's default.
-    if matches!(
-        table.rowid_alias_conflict_clause,
-        Some(ResolveType::Replace)
-    ) || table
-        .columns()
-        .iter()
-        .any(|column| matches!(column.notnull_conflict_clause, Some(ResolveType::Replace)))
-        || source
-            .index_expressions
-            .iter()
-            .any(|index| matches!(index.index.value().on_conflict, Some(ResolveType::Replace)))
-    {
+    // REPLACE deletes the conflicting row; an ON DELETE action on it still
+    // needs legacy.
+    let may_replace = match insert.conflict {
+        Some(conflict) => conflict == ResolveType::Replace,
+        None => {
+            table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
+                || source
+                    .index_expressions
+                    .iter()
+                    .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+        }
+    };
+    if may_replace && super::fkey::delete_needs_legacy(foreign_keys) {
         return Ok(true);
     }
     // A DEFAULT on an INTEGER PRIMARY KEY makes the rowid come from it.
@@ -139,6 +137,7 @@ pub(super) fn emit_insert(
     let document = &plan.document;
     let hir::InsertTargetKind::BTree {
         defaults,
+        replace_defaults,
         foreign_keys,
         ..
     } = &insert.target_kind
@@ -190,10 +189,16 @@ pub(super) fn emit_insert(
 
     // Same statement-journal facts as legacy.
     let several_rows = rows.len() > 1;
-    if !several_rows && triggers.is_empty() {
+    let indexes = &target.source.index_expressions;
+    let any_replace = any_effective_replace(
+        has_statement_conflict,
+        or_conflict,
+        table.rowid_alias_conflict_clause,
+        indexes.iter().map(|index| index.index.value().on_conflict),
+    );
+    if !several_rows && triggers.is_empty() && !any_replace {
         program.set_multi_write(false);
     }
-    let indexes = &target.source.index_expressions;
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
     program.set_may_abort(
         !triggers.is_empty()
@@ -227,6 +232,7 @@ pub(super) fn emit_insert(
         has_statement_conflict,
         triggers,
         foreign_keys,
+        replace_defaults,
     };
     let done = program.allocate_label();
     match rows {
@@ -338,6 +344,7 @@ struct InsertRow<'a> {
     has_statement_conflict: bool,
     triggers: &'a [CompiledTrigger],
     foreign_keys: &'a hir::DmlForeignKeys,
+    replace_defaults: &'a [hir::ResolvedDefault],
 }
 
 impl InsertRow<'_> {
@@ -492,25 +499,30 @@ impl InsertRow<'_> {
 
         for (position, column) in table.columns().iter().enumerate() {
             if column.notnull() && !column.is_rowid_alias() {
-                self.emit_notnull_check(program, column, self.columns + position, row_done);
+                self.emit_notnull_check(program, position, column, row_done)?;
             }
         }
         // Index expressions, partial-index WHERE terms and RETURNING read
         // the new row.
-        program.bind_source(
-            self.target.source.id,
-            SourceBinding::Registers {
-                start: self.columns,
-                rowid: Some(self.rowid),
-            },
-        );
-        if rowid_value.is_some() {
-            self.emit_rowid_check(program, row_done);
+        self.bind_new_row(program);
+        // Like legacy, an INTEGER PRIMARY KEY whose own conflict clause is
+        // REPLACE is checked after the indexes, so that a FAIL or IGNORE on
+        // an index acts before any row is deleted.
+        let rowid_last = !self.has_statement_conflict
+            && table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
+            && rowid_value.is_some()
+            && !index_cursors.is_empty();
+        if rowid_value.is_some() && !rowid_last {
+            self.emit_rowid_check(program, index_cursors, row_done)?;
         }
-        // Check every index before writing any of them.
+        // Check every index before writing any of them. Under REPLACE, an
+        // index is written as soon as it is checked, as in legacy.
         let mut keys = Vec::with_capacity(index_cursors.len());
         for (index, cursor) in index_cursors {
-            keys.push(self.emit_index_key(program, index, *cursor, row_done)?);
+            keys.push(self.emit_index_key(program, index, *cursor, index_cursors, row_done)?);
+        }
+        if rowid_last {
+            self.emit_rowid_check(program, index_cursors, row_done)?;
         }
 
         let record = program.alloc_register();
@@ -537,6 +549,9 @@ impl InsertRow<'_> {
             self.target.database,
         )?;
         for ((index, cursor), key) in index_cursors.iter().zip(&keys) {
+            if key.written {
+                continue;
+            }
             let skip = key.in_index.map(|in_index| {
                 let skip = program.allocate_label();
                 program.emit_insn(Insn::IfNot {
@@ -565,11 +580,17 @@ impl InsertRow<'_> {
                 program.preassign_label_to_next_insn(skip);
             }
         }
+        // A REPLACE may have deleted a row and moved the cursor.
+        let flag = if self.may_replace() {
+            InsertFlags::new().require_seek()
+        } else {
+            InsertFlags::new()
+        };
         program.emit_insn(Insn::Insert {
             cursor: self.table_cursor,
             key_reg: self.rowid,
             record_reg: record,
-            flag: InsertFlags::new(),
+            flag,
             table_name: table.name.clone(),
         });
         // RAISE(IGNORE) in an AFTER trigger only ends that trigger's body.
@@ -594,6 +615,7 @@ impl InsertRow<'_> {
             self.foreign_keys,
             self.target.source.id,
             self.target.database,
+            self.may_replace(),
         )?;
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document)?;
@@ -610,14 +632,67 @@ impl InsertRow<'_> {
         }
     }
 
+    /// Whether some constraint of the row resolves conflicts with REPLACE.
+    fn may_replace(&self) -> bool {
+        let table = self.target.table;
+        if self.has_statement_conflict {
+            return self.or_conflict == ResolveType::Replace;
+        }
+        table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
+            || self
+                .target
+                .source
+                .index_expressions
+                .iter()
+                .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+    }
+
+    fn bind_new_row(&self, program: &mut ProgramBuilder) {
+        program.bind_source(
+            self.target.source.id,
+            SourceBinding::Registers {
+                start: self.columns,
+                rowid: Some(self.rowid),
+            },
+        );
+    }
+
     fn emit_notnull_check(
         &self,
         program: &mut ProgramBuilder,
+        position: usize,
         column: &Column,
-        register: usize,
         row_done: BranchOffset,
-    ) {
-        match self.conflict(column.notnull_conflict_clause) {
+    ) -> Result<()> {
+        let register = self.columns + position;
+        let conflict = self.conflict(column.notnull_conflict_clause);
+        // REPLACE stores the column's DEFAULT instead of a NULL. Without a
+        // DEFAULT, or if it is NULL too, the statement aborts.
+        if conflict == ResolveType::Replace {
+            if let Some(default) = self
+                .replace_defaults
+                .iter()
+                .find(|default| default.column == position)
+            {
+                let not_null = program.allocate_label();
+                program.emit_insn(Insn::NotNull {
+                    reg: register,
+                    target_pc: not_null,
+                });
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    self.target.document,
+                    &default.value,
+                    register,
+                )?;
+                let affinity = column.affinity();
+                if !self.target.table.is_strict && affinity != Affinity::Blob {
+                    program.emit_column_affinity(register, affinity);
+                }
+                program.preassign_label_to_next_insn(not_null);
+            }
+        }
+        match conflict {
             ResolveType::Ignore => program.emit_insn(Insn::IsNull {
                 reg: register,
                 target_pc: row_done,
@@ -632,10 +707,124 @@ impl InsertRow<'_> {
                 ),
             }),
         }
+        Ok(())
+    }
+
+    /// REPLACE: delete the row whose rowid is in `conflict`, its index
+    /// entries and the foreign-key checks of deleting it, as legacy does. No
+    /// DELETE trigger fires. The new row's binding is restored after.
+    fn emit_replace_delete(
+        &self,
+        program: &mut ProgramBuilder,
+        index_cursors: &[(&hir::IndexExpressions, CursorID)],
+        conflict: usize,
+    ) -> Result<()> {
+        let DmlTarget {
+            document,
+            source,
+            table,
+            database,
+        } = *self.target;
+        let missing = program.allocate_label();
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.table_cursor,
+            src_reg: conflict,
+            target_pc: missing,
+        });
+        // Keys and foreign keys of the deleted row are read from the table.
+        program.bind_source(
+            source.id,
+            SourceBinding::BTree {
+                scan_cursor: self.table_cursor,
+                table_cursor: None,
+            },
+        );
+        super::fkey::emit_delete_checks(
+            program,
+            document,
+            self.foreign_keys,
+            source.id,
+            conflict,
+            database,
+        )?;
+        for (expressions, cursor) in index_cursors {
+            let skip = match &expressions.predicate {
+                Some(predicate) => {
+                    let skip = program.allocate_label();
+                    let register = program.alloc_register();
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, predicate, register,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: register,
+                        jump_if_null: true,
+                        target_pc: skip,
+                    });
+                    Some(skip)
+                }
+                None => None,
+            };
+            let (start, count) = super::dml::emit_index_key(
+                program,
+                document,
+                source,
+                table,
+                self.table_cursor,
+                expressions,
+            )?;
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: start,
+                num_regs: count,
+                cursor_id: *cursor,
+                raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            });
+            if let Some(skip) = skip {
+                program.preassign_label_to_next_insn(skip);
+            }
+        }
+        program.emit_insn(Insn::Delete {
+            cursor_id: self.table_cursor,
+            table_name: table.name.clone(),
+            is_part_of_update: true,
+        });
+        program.preassign_label_to_next_insn(missing);
+        self.bind_new_row(program);
+        Ok(())
+    }
+
+    /// Write an index entry for the new row as soon as it is checked, as
+    /// legacy does under REPLACE.
+    fn emit_index_insert(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        key: &IndexKey,
+        name: &str,
+    ) {
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(key.start),
+            count: to_u32(key.count),
+            dest_reg: to_u32(record),
+            index_name: Some(name.to_string()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: cursor,
+            record_reg: record,
+            unpacked_start: Some(key.start),
+            unpacked_count: Some(to_u32(key.count)),
+            flags: IdxInsertFlags::new().nchange(true),
+        });
     }
 
     /// An explicit rowid must not belong to another row.
-    fn emit_rowid_check(&self, program: &mut ProgramBuilder, row_done: BranchOffset) {
+    fn emit_rowid_check(
+        &self,
+        program: &mut ProgramBuilder,
+        index_cursors: &[(&hir::IndexExpressions, CursorID)],
+        row_done: BranchOffset,
+    ) -> Result<()> {
         let table = self.target.table;
         let unique = program.allocate_label();
         program.emit_insn(Insn::NotExists {
@@ -647,6 +836,15 @@ impl InsertRow<'_> {
             ResolveType::Ignore => program.emit_insn(Insn::Goto {
                 target_pc: row_done,
             }),
+            ResolveType::Replace => {
+                let conflict = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: self.rowid,
+                    dst_reg: conflict,
+                    extra_amount: 0,
+                });
+                self.emit_replace_delete(program, index_cursors, conflict)?;
+            }
             conflict => {
                 let column = table
                     .get_rowid_alias_column()
@@ -666,6 +864,7 @@ impl InsertRow<'_> {
             }
         }
         program.preassign_label_to_next_insn(unique);
+        Ok(())
     }
 
     /// Build an index's key for the new row and, for a UNIQUE index, check
@@ -675,6 +874,7 @@ impl InsertRow<'_> {
         program: &mut ProgramBuilder,
         expressions: &hir::IndexExpressions,
         cursor: CursorID,
+        index_cursors: &[(&hir::IndexExpressions, CursorID)],
         row_done: BranchOffset,
     ) -> Result<IndexKey> {
         let document = self.target.document;
@@ -722,6 +922,9 @@ impl InsertRow<'_> {
             dst_reg: start + columns,
             extra_amount: 0,
         });
+        let conflict = self.conflict(index.on_conflict);
+        // A row outside a partial index is neither checked nor written now.
+        let outside = program.allocate_label();
         if index.unique {
             let unique = program.allocate_label();
             // A row outside a partial index cannot conflict in it.
@@ -757,10 +960,18 @@ impl InsertRow<'_> {
                 record_reg: start,
                 num_regs: columns,
             });
-            match self.conflict(index.on_conflict) {
+            match conflict {
                 ResolveType::Ignore => program.emit_insn(Insn::Goto {
                     target_pc: row_done,
                 }),
+                ResolveType::Replace => {
+                    let conflicting = program.alloc_register();
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: cursor,
+                        dest: conflicting,
+                    });
+                    self.emit_replace_delete(program, index_cursors, conflicting)?;
+                }
                 conflict => {
                     let (description, on_error) = halt_desc_and_on_error(
                         &format_unique_violation_desc(&table.name, index),
@@ -777,11 +988,24 @@ impl InsertRow<'_> {
             }
             program.preassign_label_to_next_insn(unique);
         }
-        Ok(IndexKey {
+        let key = IndexKey {
             start,
             count: columns + 1,
             in_index,
-        })
+            written: conflict == ResolveType::Replace,
+        };
+        if key.written {
+            if let Some(in_index) = in_index {
+                program.emit_insn(Insn::IfNot {
+                    reg: in_index,
+                    target_pc: outside,
+                    jump_if_null: true,
+                });
+            }
+            self.emit_index_insert(program, cursor, &key, &index.name);
+        }
+        program.preassign_label_to_next_insn(outside);
+        Ok(key)
     }
 }
 
@@ -791,6 +1015,8 @@ struct IndexKey {
     count: usize,
     /// Partial index: whether the new row is in the index.
     in_index: Option<usize>,
+    /// REPLACE already wrote the entry when the index was checked.
+    written: bool,
 }
 
 #[cfg(test)]
@@ -862,7 +1088,6 @@ mod tests {
     fn insert_that_needs_legacy_is_left_to_it() {
         for sql in [
             "INSERT INTO items SELECT value, extra FROM items",
-            "INSERT OR REPLACE INTO items VALUES (1, 'x')",
             "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
             "INSERT INTO items VALUES ((SELECT 1), 'x')",
         ] {

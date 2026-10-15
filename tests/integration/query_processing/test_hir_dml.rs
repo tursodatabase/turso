@@ -323,6 +323,32 @@ fn hir_insert_matches_legacy() {
         &["INSERT OR FAIL INTO u(b) VALUES (43), (1), (44)"],
         &["INSERT OR ROLLBACK INTO u(b) VALUES (45), (1)"],
         &["INSERT OR ABORT INTO u(b) VALUES (46), (1)"],
+        // REPLACE deletes the rows the new row conflicts with.
+        &["INSERT OR REPLACE INTO u VALUES (1, 10, 'r', 1)"],
+        &["INSERT OR REPLACE INTO u VALUES (10, 2, 'r', 1)"],
+        &["INSERT OR REPLACE INTO u VALUES (3, 4, 'r', 1) RETURNING *"],
+        &["INSERT OR REPLACE INTO u VALUES (11, 12, 'p', 5)"],
+        &["REPLACE INTO u VALUES (1, 1, 'x', 1.0), (12, 1, 'y', 2), (NULL, 3, 'p', 5)"],
+        &["INSERT OR REPLACE INTO u(a, b) VALUES (2, NULL)"],
+        &[
+            "INSERT OR REPLACE INTO u(b, c) VALUES (5, 'yy')",
+            "SELECT last_insert_rowid()",
+        ],
+        &[
+            "CREATE TABLE rr(a INTEGER PRIMARY KEY ON CONFLICT REPLACE, \
+             b UNIQUE ON CONFLICT REPLACE, c NOT NULL ON CONFLICT REPLACE DEFAULT 7, \
+             d UNIQUE, e NOT NULL ON CONFLICT REPLACE)",
+            "CREATE INDEX rr_c ON rr(c)",
+            "INSERT INTO rr VALUES (1, 1, NULL, 1, 0), (2, 2, 3, 2, 0)",
+            "INSERT INTO rr VALUES (1, 2, NULL, 9, 0)",
+            "INSERT INTO rr VALUES (5, 9, 1, 9, 0)",
+            "INSERT OR IGNORE INTO rr VALUES (1, 5, 5, 5, 0)",
+            "INSERT OR FAIL INTO rr VALUES (6, 6, 6, 6, 0), (1, 7, 7, 7, 0)",
+            "INSERT INTO rr VALUES (8, 8, 8, 8, NULL)",
+            "SELECT *, typeof(c) FROM rr ORDER BY a",
+            "SELECT c FROM rr INDEXED BY rr_c ORDER BY c",
+            "PRAGMA integrity_check",
+        ],
         &[
             "PRAGMA count_changes = 1",
             "INSERT INTO u(b) VALUES (47), (48)",
@@ -482,6 +508,15 @@ fn hir_foreign_keys_match_legacy() {
         &["INSERT INTO q VALUES (1, '1')"],
         &["INSERT INTO q VALUES ('1', 1)"],
         &["INSERT INTO q VALUES ('x', 'y')"],
+        // REPLACE checks the foreign keys of the row it deletes.
+        &["INSERT OR REPLACE INTO p VALUES (1, 'one', 1, 1)"],
+        &["INSERT OR REPLACE INTO p VALUES (1, 'uno', 1, 1)"],
+        &["INSERT OR REPLACE INTO p VALUES (6, 'two', 6, 6)"],
+        &["INSERT OR REPLACE INTO s VALUES (1, 1)"],
+        &[
+            "INSERT OR REPLACE INTO d VALUES (4, 4, 4)",
+            "INSERT OR REPLACE INTO c VALUES (7, NULL)",
+        ],
         // UPDATE of a parent key: children of the old key become violations.
         &["UPDATE p SET k = 'TWO' WHERE id = 2"],
         &["UPDATE p SET k = 'uno' WHERE id = 1 RETURNING *"],

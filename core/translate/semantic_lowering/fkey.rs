@@ -287,16 +287,21 @@ pub(super) fn emit_insert_child_checks(
 /// of a deferred or self-referencing constraint, each child row that points
 /// at the new key had a missing parent until now, so take back its
 /// violation. `target` must be bound to the row's registers.
+///
+/// Under REPLACE (`replaced`), a deleted conflicting row may have counted
+/// children of any constraint, so every constraint is repaired, as legacy
+/// does.
 pub(super) fn emit_insert_parent_repairs(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     foreign_keys: &hir::DmlForeignKeys,
     target: SourceId,
     database: usize,
+    replaced: bool,
 ) -> Result<()> {
     for foreign_key in &foreign_keys.incoming {
         let deferred = foreign_key.declaration.deferred;
-        if !deferred && !is_self_reference(foreign_key) {
+        if !replaced && !deferred && !is_self_reference(foreign_key) {
             continue;
         }
         let width = foreign_key.parent_positions.len();

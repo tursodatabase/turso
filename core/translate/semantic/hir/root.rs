@@ -90,6 +90,9 @@ pub enum InsertTargetKind {
     BTree {
         autoincrement: Option<ResolvedAutoincrement>,
         defaults: Vec<ResolvedDefault>,
+        /// The DEFAULT of each NOT NULL column that declares one: what NOT
+        /// NULL ON CONFLICT REPLACE stores instead of a NULL.
+        replace_defaults: Vec<ResolvedDefault>,
         triggers: InsertTriggers,
         foreign_keys: DmlForeignKeys,
     },
@@ -204,6 +207,8 @@ pub struct Update {
 #[derive(Clone, Debug)]
 pub enum UpdateTargetKind {
     BTree {
+        /// The DEFAULT of each NOT NULL column that declares one: what NOT
+        /// NULL ON CONFLICT REPLACE stores instead of a NULL.
         defaults: Vec<ResolvedDefault>,
         triggers: Vec<ResolvedTrigger>,
         foreign_keys: DmlForeignKeys,

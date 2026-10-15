@@ -222,6 +222,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::InsertTargetKind::BTree {
                 autoincrement,
                 defaults: self.analyze_insert_defaults(target, table.value(), &columns)?,
+                replace_defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_insert_triggers(table, &upserts)?,
                 foreign_keys: self.analyze_dml_foreign_keys(table, target)?,
             }
@@ -544,6 +545,36 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect::<Vec<_>>();
         let mut defaults = Vec::with_capacity(missing.len());
         for column in missing {
+            defaults.push(hir::ResolvedDefault {
+                column,
+                value: self.analyze_write_default(
+                    target,
+                    table,
+                    hir::TargetColumn::Column(column),
+                )?,
+            });
+        }
+        Ok(defaults)
+    }
+
+    /// The DEFAULT of each NOT NULL column that declares one, for NOT NULL
+    /// ON CONFLICT REPLACE.
+    pub(super) fn analyze_replace_defaults(
+        &mut self,
+        target: hir::SourceId,
+        table: &Table,
+    ) -> Result<Vec<hir::ResolvedDefault>> {
+        let columns = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                column.notnull() && !column.is_rowid_alias() && column.default.is_some()
+            })
+            .map(|(column, _)| column)
+            .collect::<Vec<_>>();
+        let mut defaults = Vec::with_capacity(columns.len());
+        for column in columns {
             defaults.push(hir::ResolvedDefault {
                 column,
                 value: self.analyze_write_default(

@@ -111,7 +111,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::UpdateTargetKind::Virtual
         } else {
             hir::UpdateTargetKind::BTree {
-                defaults: Vec::new(),
+                defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_update_triggers(&table, &assignments)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
             }
