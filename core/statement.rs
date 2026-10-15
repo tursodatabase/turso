@@ -711,7 +711,10 @@ impl Statement {
                 break;
             }
             tracing::debug!("reprepare: attempt={}", attempt);
-            if let Err(err) = self.reprepare() {
+            if let Err(err) = self
+                .rollback_autocommit_txn()
+                .and_then(|()| self.reprepare())
+            {
                 self.release_active_root_if_counted();
                 return Err(err);
             }
@@ -963,9 +966,7 @@ impl Statement {
         Ok(result)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self) -> Result<()> {
-        tracing::trace!("repreparing statement");
+    fn rollback_autocommit_txn(&mut self) -> Result<()> {
         let conn = self.program.connection.clone();
         let main_pager = conn.pager.load().clone();
 
@@ -987,9 +988,6 @@ impl Statement {
         if conn.get_auto_commit() && has_implicit_txn_state {
             conn.rollback_current_txn_state(&main_pager, true);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
-        }
-        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
-            conn.maybe_reparse_schema()?;
         }
 
         // End transactions on attached database pagers so they get a fresh view
@@ -1019,6 +1017,16 @@ impl Statement {
             if pager.holds_read_lock() {
                 pager.rollback_attached();
             }
+        }
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn reprepare(&mut self) -> Result<()> {
+        tracing::trace!("repreparing statement");
+        let conn = self.program.connection.clone();
+        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
+            conn.maybe_reparse_schema()?;
         }
 
         // Refresh from shared schema only when shared is newer; this preserves a
