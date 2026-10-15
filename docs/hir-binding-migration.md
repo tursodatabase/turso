@@ -146,14 +146,15 @@ subquery emits the same shell when its loop opens.
 `scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-15 a run
-passed 14119 and failed 52; legacy passes all of them. What is left:
+passed 14236 and failed 53, with every file running to the end; legacy
+passes all of them. What is left:
 
 | Gap | Failing tests | Example |
 |---|---|---|
 | EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
 | Aggregates of outer columns inside subqueries (`count(outer.x)` belongs to the outer query) | 4 | `aggregate-of-outer-column` |
 | ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
-| Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
+| Compound ORDER BY expression inside a recursive CTE | 1 | `recursive-cte-order-qualified-expression` |
 | Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
 | A named window whose definition uses an aggregate, with GROUP BY | 1 | `named-window-with-group-by` |
 | `nth_value` with LIMIT stops before an invalid later argument | 1 | `nth-value-limit-stops-before-late-invalid-n` |
@@ -185,9 +186,10 @@ still differ where the bytecode differs: legacy runs uncorrelated subqueries
 before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
 joins, which HIR does not.
 
-Legacy runs FROM subqueries and CTEs as coroutines when it can, so the outer
-loop pulls rows on demand. HIR always materializes them first. Results match
-except when the source never ends, but the plans differ.
+Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
+as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
+stop an endless recursive CTE. HIR still materializes them in blocks with an
+outer join, where legacy can stream some of them.
 
 ### Non-lowering phase complete
 
