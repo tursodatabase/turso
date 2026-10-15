@@ -635,7 +635,13 @@ mod tests {
                 .unwrap(),
             ),
         ] {
-            assert_eq!(result, Value::Blob(vec![0x00]), "{name}");
+            assert_eq!(
+                result,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(&[0x00]).expect("test blob allocation")
+                ),
+                "{name}"
+            );
         }
 
         // Removing the whole document is the one case where SQLite does give
@@ -660,7 +666,14 @@ mod tests {
             (
                 "json_set",
                 json_set(
-                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &[
+                        create_json("[1]"),
+                        Value::Null,
+                        Value::Blob(
+                            crate::types::value_blob_from_slice(&[0xff])
+                                .expect("test blob allocation"),
+                        ),
+                    ],
                     &JsonCacheCell::new(),
                 )
                 .unwrap(),
@@ -668,7 +681,14 @@ mod tests {
             (
                 "json_insert",
                 json_insert(
-                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &[
+                        create_json("[1]"),
+                        Value::Null,
+                        Value::Blob(
+                            crate::types::value_blob_from_slice(&[0xff])
+                                .expect("test blob allocation"),
+                        ),
+                    ],
                     &JsonCacheCell::new(),
                 )
                 .unwrap(),
@@ -676,7 +696,14 @@ mod tests {
             (
                 "json_replace",
                 json_replace(
-                    &[create_json("[1]"), Value::Null, Value::Blob(vec![0xff])],
+                    &[
+                        create_json("[1]"),
+                        Value::Null,
+                        Value::Blob(
+                            crate::types::value_blob_from_slice(&[0xff])
+                                .expect("test blob allocation"),
+                        ),
+                    ],
                     &JsonCacheCell::new(),
                 )
                 .unwrap(),
