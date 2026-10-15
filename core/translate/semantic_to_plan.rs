@@ -141,6 +141,8 @@ pub(crate) struct HirQueryBlockPlan {
     /// never reorders them.
     pub(crate) where_start: usize,
     pub(crate) group_sort_elided: bool,
+    /// The loops return rows in ORDER BY order, so the query needs no sorter.
+    pub(crate) order_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -151,6 +153,8 @@ pub(crate) struct HirAccessPlan {
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) group_sort_elided: bool,
+    /// The loops return rows in ORDER BY order.
+    pub(crate) order_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -865,6 +869,7 @@ impl<'a> HirPlanContext<'a> {
                 predicates: input.predicates,
                 where_start: input.where_start,
                 group_sort_elided: false,
+                order_sort_elided: false,
                 output_cardinality,
                 cost: Cost(0.0),
             });
@@ -901,6 +906,7 @@ impl<'a> HirPlanContext<'a> {
             predicates: access.predicates,
             where_start,
             group_sort_elided: access.group_sort_elided,
+            order_sort_elided: access.order_sort_elided,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
@@ -983,23 +989,25 @@ impl<'a> HirPlanContext<'a> {
         let Some(result) = result else {
             return Ok(None);
         };
-        let group_sort_elided = if order_target.is_some_and(|target| {
-            matches!(
-                &target.purpose,
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group)
-            )
-        }) {
-            hir_plan_satisfies_order_target(
-                &result.best_plan,
-                &access_methods,
-                &input.sources,
-                self.document,
-                order_target.expect("GROUP BY order target exists"),
-                schema,
-            )?
-        } else {
-            false
+        // Whether the chosen loops already return rows in the order the
+        // GROUP BY or ORDER BY target asks for, so its sort can be skipped.
+        let sort_elided = |by: EliminatesSortBy| -> Result<bool> {
+            match order_target {
+                Some(target) if target.purpose == OrderTargetPurpose::EliminatesSort(by) => {
+                    hir_plan_satisfies_order_target(
+                        &result.best_plan,
+                        &access_methods,
+                        &input.sources,
+                        self.document,
+                        target,
+                        schema,
+                    )
+                }
+                _ => Ok(false),
+            }
         };
+        let group_sort_elided = sort_elided(EliminatesSortBy::Group)?;
+        let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
@@ -1107,6 +1115,7 @@ impl<'a> HirPlanContext<'a> {
             loops,
             predicates: input.predicates,
             group_sort_elided,
+            order_sort_elided,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))

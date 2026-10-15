@@ -967,7 +967,13 @@ pub(crate) fn emit_planned_query_body(
     let block = &query.blocks[0];
     let done = program.allocate_label();
     let distinct = initialize_hir_distinct(program, block)?;
-    let sorter = (!query.order_by.is_empty())
+    // Without grouping, aggregates or windows, rows leave the loops in scan
+    // order, so a scan that already follows ORDER BY needs no sorter.
+    let scan_order_is_output_order = hir_grouping(block).is_none()
+        && block.aggregate_count == 0
+        && block.windows.is_empty();
+    let sort_elided = scan_order_is_output_order && planned_query.blocks[0].order_sort_elided;
+    let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;
     let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
@@ -6485,6 +6491,28 @@ mod tests {
     }
 
     #[test]
+    fn planned_order_by_follows_an_index_without_a_sorter() {
+        let emits_sorter = |sql| {
+            let plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let mut program = program();
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("ORDER BY HIR query emits");
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SorterOpen { .. }))
+        };
+        assert!(!emits_sorter("SELECT value FROM items ORDER BY value"));
+        assert!(!emits_sorter("SELECT value FROM items ORDER BY value DESC"));
+        // The index has no `extra`, and grouping puts rows in key order.
+        assert!(emits_sorter("SELECT value FROM items ORDER BY extra"));
+        assert!(emits_sorter(
+            "SELECT value, count(*) FROM items GROUP BY value ORDER BY value DESC"
+        ));
+    }
+
+    #[test]
     fn planned_grouped_distinct_aggregate_clears_each_group_state() {
         let plan = analyze_plan(
             indexed_items_schema(),
@@ -7185,7 +7213,8 @@ mod tests {
     fn planned_distinct_order_by_deduplicates_before_sorting() {
         let plan = analyze_plan(
             indexed_items_schema(),
-            "SELECT DISTINCT value FROM items ORDER BY value DESC",
+            // No index supplies `extra` order, so rows go through a sorter.
+            "SELECT DISTINCT value, extra FROM items ORDER BY extra DESC",
         );
         let query = root_query(&plan.document);
         let mut program = program();
