@@ -7,7 +7,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+        collate::{get_sort_collseq_from_expr_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
@@ -210,7 +210,7 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = get_collseq_from_expr_with_symbols(
+                let collation = get_sort_collseq_from_expr_with_symbols(
                     column,
                     referenced_tables,
                     Some(t_ctx.resolver.symbol_table),
@@ -286,7 +286,7 @@ impl EmitOrderBy {
             )> = order_by
                 .iter()
                 .map(|(expr, dir, nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
+                    let collation = get_sort_collseq_from_expr_with_symbols(
                         expr,
                         referenced_tables,
                         Some(t_ctx.resolver.symbol_table),
