@@ -429,13 +429,9 @@ where
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
 
-        ensure_blob_arg_is_jsonb(second.as_value_ref())?;
-
-        let path = json_path_from_db_value(&first, true)?;
-
-        let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
-        let mut op = SetOperation::new(value);
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
+            let mut op = SetOperation::new(value);
             let _ = json.operate_on_path(&path, &mut op);
         }
     }
@@ -469,14 +465,12 @@ where
                 "args should have at least 2 elements in loop".to_string(),
             )
         })?;
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
-        let mut op = SetOperation::new(value);
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
+            let mut op = SetOperation::new(value);
             let _ = json.operate_on_path(&path, &mut op);
         }
     }
@@ -819,6 +813,22 @@ fn json_path_from_db_value<'a>(
     };
 
     Ok(Some(json_path))
+}
+
+/// Parses the path of a json_set, json_insert or json_replace path/value pair.
+/// Like SQLite, a non-JSONB BLOB value is rejected as soon as the path is known
+/// to start with `$`, before the rest of the path is parsed, and is not looked
+/// at when the path is NULL.
+fn json_edit_path<'a>(
+    path: &'a (impl AsValueRef + 'a),
+    value: &impl AsValueRef,
+) -> crate::Result<Option<JsonPath<'a>>> {
+    if let ValueRef::Text(text) = path.as_value_ref() {
+        if text.as_str().starts_with('$') {
+            ensure_blob_arg_is_jsonb(value.as_value_ref())?;
+        }
+    }
+    json_path_from_db_value(path, true)
 }
 
 pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
