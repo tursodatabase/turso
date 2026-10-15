@@ -181,6 +181,10 @@ fn hir_expression_subqueries_match_legacy_rows() {
         "SELECT extra, (SELECT count(*) FROM tags WHERE item_id = items.id) FROM items GROUP BY extra",
         "SELECT count(*), (SELECT items.value + 1) FROM items WHERE id = 3",
         "SELECT value + 1, count(*) FROM items GROUP BY value + 1 HAVING value + 1 > 11 ORDER BY value + 1",
+        // The index on `value` does not cover `items` here: the subquery reads
+        // `items.extra`.
+        "SELECT value FROM items WHERE value > 15 \
+         AND EXISTS (SELECT 1 FROM tags WHERE tags.tag <> items.extra) ORDER BY value",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),

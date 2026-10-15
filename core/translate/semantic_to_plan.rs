@@ -855,7 +855,7 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
-        let usage = query.direct_column_usage(|source| self.document.source(source));
+        let usage = self.document.source_column_usage(query.id);
         if block.from.is_none() {
             let input = self.query_block_input(block, order_by, &usage)?;
             let output_cardinality = match &block.body {
