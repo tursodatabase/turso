@@ -440,6 +440,32 @@ fn hir_materialized_view_shows_the_transactions_own_changes() {
 }
 
 #[test]
+fn hir_displays_arrays_passed_through_expressions_like_legacy() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let [legacy, hir] = connections(&db);
+    legacy
+        .execute("CREATE TABLE a(id INTEGER PRIMARY KEY, vals integer[]) STRICT")
+        .unwrap();
+    legacy
+        .execute("INSERT INTO a VALUES (1, '{4,5,6}'), (2, NULL)")
+        .unwrap();
+    for sql in [
+        "SELECT COALESCE(vals, vals), IFNULL(vals, ARRAY[1]) FROM a ORDER BY id",
+        "SELECT CASE WHEN id = 1 THEN vals END, vals || vals FROM a ORDER BY id",
+        "SELECT COALESCE(NULL, ARRAY[3, 4]), MAX(ARRAY[1, 2], ARRAY[1, 2, 3])",
+        "SELECT NULLIF(vals, NULL) FROM a ORDER BY vals",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);

@@ -6,7 +6,7 @@ use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
 use crate::translate::collate::CollationSeq;
 use crate::{
     emit_explain,
-    function::{AccumulatorFunc, AggFunc},
+    function::{AccumulatorFunc, AggFunc, Func, ScalarFunc},
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, PseudoCursorType,
         Table, Type,
@@ -858,7 +858,7 @@ pub(crate) fn emit_query_body(
     };
     emit_query_block_without_from(program, document, block, &output, done)?;
     if let Some(sorter) = sorter.as_ref() {
-        emit_hir_sorted_rows(program, block, sorter, destination, limit, done)?;
+        emit_hir_sorted_rows(program, document, block, sorter, destination, limit, done)?;
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
@@ -997,7 +997,7 @@ pub(crate) fn emit_planned_query_body(
     };
     emit_planned_query_block_with_output(program, plan, query, 0, &output, done)?;
     if let Some(sorter) = sorter.as_ref() {
-        emit_hir_sorted_rows(program, block, sorter, destination, limit, done)?;
+        emit_hir_sorted_rows(program, document, block, sorter, destination, limit, done)?;
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
@@ -2353,6 +2353,7 @@ fn emit_hir_compound_order_by(
         .collect::<Vec<_>>();
     emit_hir_sorter_rows(
         program,
+        document,
         &query.blocks[0].outputs,
         sort_cursor,
         sorter_record,
@@ -5234,6 +5235,7 @@ fn emit_hir_sort_key(
 #[allow(clippy::too_many_arguments)]
 fn emit_hir_sorted_rows(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     block: &hir::QueryBlock,
     sorter: &HirSorterOutput<'_>,
     destination: &QueryDestination,
@@ -5242,6 +5244,7 @@ fn emit_hir_sorted_rows(
 ) -> Result<()> {
     emit_hir_sorter_rows(
         program,
+        document,
         &block.outputs,
         sorter.cursor,
         sorter.record,
@@ -5256,6 +5259,7 @@ fn emit_hir_sorted_rows(
 #[allow(clippy::too_many_arguments)]
 fn emit_hir_sorter_rows(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     output_definitions: &[hir::Output],
     sorter_cursor: CursorID,
     sorter_record: usize,
@@ -5304,7 +5308,7 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, output_definitions, outputs);
+    emit_array_results(program, document, output_definitions, outputs);
     emit_columns_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -5552,7 +5556,7 @@ fn emit_query_row_with_inputs<'expr>(
     }
 
     if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
-        emit_array_results(program, outputs, start);
+        emit_array_results(program, document, outputs, start);
     }
 
     if let Some(distinct) = output.distinct {
@@ -6081,9 +6085,14 @@ fn emit_hir_window_output_subroutine(
     Ok(())
 }
 
-fn emit_array_results(program: &mut ProgramBuilder, outputs: &[hir::Output], start: usize) {
+fn emit_array_results(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    outputs: &[hir::Output],
+    start: usize,
+) {
     for (position, output) in outputs.iter().enumerate() {
-        if !output.type_fact.is_array() {
+        if !output.type_fact.is_array() && !hir_expr_passes_array(document, &output.expr) {
             continue;
         }
         let register = start + position;
@@ -6094,6 +6103,51 @@ fn emit_array_results(program: &mut ProgramBuilder, outputs: &[hir::Output], sta
         });
         program.emit_insn(Insn::ArrayDecode { reg: register });
         program.preassign_label_to_next_insn(skip);
+    }
+}
+
+/// Like legacy, an expression that can pass an array value through is
+/// decoded for display too: COALESCE, IFNULL, scalar MIN and MAX, IIF,
+/// NULLIF, CASE and `||` over array operands, and array functions.
+fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool {
+    let is_array = |expression| hir_expr_passes_array(document, expression);
+    match expression {
+        hir::Expr::Array(_) => true,
+        hir::Expr::Column(reference) => document
+            .source(reference.source)
+            .and_then(|source| source.columns.get(reference.column))
+            .is_some_and(|column| column.type_fact.is_array()),
+        hir::Expr::Output(output) => document
+            .output(*output)
+            .is_some_and(|output| output.type_fact.is_array() || is_array(&output.expr)),
+        hir::Expr::Function(call) => {
+            let arguments = call.arguments.expressions();
+            match call.function.value() {
+                Func::Scalar(function) if function.returns_array_blob() => true,
+                Func::Agg(AggFunc::ArrayAgg) => true,
+                Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Min | ScalarFunc::Max,
+                ) => arguments.iter().any(is_array),
+                Func::Scalar(ScalarFunc::Iif) => arguments.iter().skip(1).any(is_array),
+                Func::Scalar(ScalarFunc::Nullif) => arguments.first().is_some_and(is_array),
+                _ => false,
+            }
+        }
+        hir::Expr::Binary {
+            operator: turso_parser::ast::Operator::Concat,
+            lhs,
+            rhs,
+            ..
+        } => is_array(lhs) || is_array(rhs),
+        hir::Expr::Case {
+            when_then,
+            else_expr,
+            ..
+        } => {
+            when_then.iter().any(|(_, then)| is_array(then))
+                || else_expr.as_deref().is_some_and(is_array)
+        }
+        _ => false,
     }
 }
 
@@ -6892,6 +6946,7 @@ mod tests {
         let output_end = program.insns.len();
         emit_hir_sorted_rows(
             &mut program,
+            &document,
             block,
             &sorter,
             &QueryDestination::ResultRows,
@@ -7070,6 +7125,7 @@ mod tests {
             if let Some(sorter) = &sorter {
                 emit_hir_sorted_rows(
                     &mut program,
+                    &document,
                     block,
                     sorter,
                     &QueryDestination::ResultRows,
