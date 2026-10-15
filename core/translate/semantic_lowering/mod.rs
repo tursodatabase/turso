@@ -76,7 +76,7 @@ pub(crate) fn translate_delete(
     }
     // Triggers are compiled before anything is emitted, so one that needs
     // legacy still leaves the whole statement to legacy.
-    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete, None)? else {
+    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete)? else {
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());

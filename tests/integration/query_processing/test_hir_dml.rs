@@ -235,6 +235,14 @@ fn hir_update_matches_legacy() {
             "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
             "UPDATE OR REPLACE u SET b = 1 WHERE a > 2",
         ],
+        // A DELETE inside the trigger fires its own triggers with ABORT.
+        &[
+            "CREATE UNIQUE INDEX log_a ON log(a)",
+            "CREATE TRIGGER lbd BEFORE DELETE ON log BEGIN INSERT INTO log VALUES (1), (1); END",
+            "INSERT INTO log VALUES (5)",
+            "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN DELETE FROM log WHERE a = 5; END",
+            "UPDATE OR REPLACE u SET d = 9 WHERE a = 1",
+        ],
         &[
             "CREATE TABLE ur(a INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT REPLACE, \
              c NOT NULL ON CONFLICT REPLACE DEFAULT 'dflt', d UNIQUE)",

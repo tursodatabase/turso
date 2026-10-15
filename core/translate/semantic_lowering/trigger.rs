@@ -168,7 +168,7 @@ fn compile_trigger(
                 if super::delete::needs_legacy(delete, access, &builder)? {
                     true
                 } else {
-                    match delete_triggers(session, &builder, &plan, delete, conflict_override)? {
+                    match delete_triggers(session, &builder, &plan, delete)? {
                         Some(triggers) => {
                             command_triggers = triggers;
                             false
@@ -373,7 +373,6 @@ pub(super) fn delete_triggers(
     parent: &ProgramBuilder,
     plan: &HirPlan,
     delete: &hir::Delete,
-    conflict_override: Option<ResolveType>,
 ) -> Result<Option<Vec<CompiledTrigger>>> {
     let hir::DeleteTargetKind::BTree { triggers, .. } = &delete.target_kind else {
         return Ok(Some(Vec::new()));
@@ -384,7 +383,10 @@ pub(super) fn delete_triggers(
         plan,
         delete.target,
         triggers,
-        conflict_override,
+        // Like SQLite and legacy, a DELETE fires its triggers with the
+        // default conflict policy, even inside a trigger fired by an OR
+        // REPLACE statement.
+        None,
     )
 }
 
