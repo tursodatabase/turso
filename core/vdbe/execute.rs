@@ -10249,17 +10249,19 @@ pub fn op_function(
                         .into());
                     }
                 };
-                if arg_count > 2
-                    && state.registers[*start_reg + 2]
-                        .get_value()
-                        .as_int()
-                        .is_none()
-                {
-                    return Err(crate::LimboError::ParseError(
-                        "setval() requires an integer is_called argument".to_string(),
-                    )
-                    .into());
-                }
+                let is_called = if arg_count > 2 {
+                    match state.registers[*start_reg + 2].get_value().as_int() {
+                        Some(is_called) => is_called != 0,
+                        None => {
+                            return Err(crate::LimboError::ParseError(
+                                "setval() requires an integer is_called argument".to_string(),
+                            )
+                            .into());
+                        }
+                    }
+                } else {
+                    true
+                };
                 let seq = program.connection.find_sequence(&seq_name)?;
                 if value < seq.min_value || value > seq.max_value {
                     return Err(crate::LimboError::ParseError(format!(
@@ -10267,6 +10269,20 @@ pub fn op_function(
                         value, seq.name, seq.min_value, seq.max_value
                     ))
                     .into());
+                }
+                let (db_id, sequence_key) = program.connection.resolve_sequence_name(&seq_name)?;
+                if let Some(mv_store) = program.connection.mv_store_for_db(db_id) {
+                    let (tx_id, _) = program
+                        .connection
+                        .get_mv_tx_for_db(db_id)
+                        .expect("setval must run inside an MVCC transaction");
+                    mv_store.lower_sequence_watermark(
+                        tx_id,
+                        &sequence_key,
+                        crate::mvcc::database::first_unsafe_sequence_watermark(
+                            &seq, value, is_called,
+                        ),
+                    );
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
@@ -10833,14 +10849,7 @@ pub fn op_function(
                     }
                 };
                 let (db_id, sequence_key) =
-                    if let Some((schema_name, sequence_name)) = sequence_name.split_once('.') {
-                        (
-                            program.connection.get_database_id_by_name(schema_name)?,
-                            crate::util::normalize_ident(sequence_name),
-                        )
-                    } else {
-                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
-                    };
+                    program.connection.resolve_sequence_name(sequence_name)?;
                 program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
@@ -14355,7 +14364,8 @@ pub fn op_drop_sequence(
 ) -> InsnResult {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
-    let is_mvcc = conn.mv_store_for_db(*db).is_some();
+    let mv_store = conn.mv_store_for_db(*db);
+    let is_mvcc = mv_store.is_some();
     conn.with_database_schema_mut(*db, |schema| {
         // In MVCC mode, track the backing table's root page so integrity_check knows about it.
         // The btree pages won't be freed until checkpoint, so integrity_check needs
@@ -14380,6 +14390,14 @@ pub fn op_drop_sequence(
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
     conn.clear_sequence_currval(seq_name);
+    // A sequence created later under the same name starts from scratch, and
+    // `nextval` only ever raises the watermark.
+    if let Some(mv_store) = mv_store {
+        let (tx_id, _) = conn
+            .get_mv_tx_for_db(*db)
+            .expect("DROP SEQUENCE must run inside an MVCC transaction");
+        mv_store.remove_sequence_watermark(tx_id, seq_name);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14615,7 +14633,11 @@ pub fn op_sequence_track_allocation(
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        if seq.increment_by > 0 && !seq.cycle {
+            mv_store.raise_sequence_watermark(&normalized_seq_name, current_watermark);
+        } else {
+            mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        }
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
@@ -16986,6 +17008,12 @@ pub fn op_rename_table(
                 crate::translate::sequence::sequence_backing_table_name(&old_seq_name);
             let new_backing_table =
                 crate::translate::sequence::sequence_backing_table_name(&new_seq_name);
+            if let Some(mv_store) = conn.mv_store_for_db(*db) {
+                let (tx_id, _) = conn
+                    .get_mv_tx_for_db(*db)
+                    .expect("ALTER TABLE RENAME must run inside an MVCC transaction");
+                mv_store.rename_sequence_watermark(tx_id, &old_seq_name, &new_seq_name);
+            }
             schema.sequences.insert(new_seq_name, seq_arc);
             if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {

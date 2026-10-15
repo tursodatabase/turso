@@ -4387,6 +4387,10 @@ pub(crate) struct GcDebugSnapshot {
     pub backfill_floor: WalPos,
 }
 
+/// Sequence names a transaction changed the watermark of, each with the value
+/// it had before the change, oldest first.
+type SequenceWatermarkUndo = Vec<(String, Option<i64>)>;
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -4508,6 +4512,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// database live in one process. Multi-process MVCC will need a shared
     /// coordination mechanism before sync can rely on this watermark.
     sequence_allocations: Mutex<HashMap<String, StdHashMap<TxID, i64>>>,
+    /// Sequence watermarks that each active transaction removed or lowered,
+    /// with the value they had before, so a rollback can put them back.
+    sequence_watermark_undo: Mutex<StdHashMap<TxID, SequenceWatermarkUndo>>,
 
     /// Approximate count of live row versions across `rows` + `index_rows`.
     /// Incremented on every inserted version, decremented when versions are
@@ -4678,6 +4685,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
+            sequence_watermark_undo: Mutex::new(StdHashMap::default()),
             live_version_count_approx: AtomicUsize::new(0),
             live_versions_at_last_gc: AtomicUsize::new(0),
             gc_version_threshold: AtomicI64::new(Self::DEFAULT_GC_VERSION_THRESHOLD),
@@ -6771,6 +6779,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
         self.remove_sequence_allocations(tx_id);
+        let committed = self
+            .txs
+            .get(&tx_id)
+            .is_some_and(|tx| matches!(tx.value().state.load(), TransactionState::Committed(_)));
+        self.finish_sequence_watermark_changes(tx_id, committed);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             let held_checkpoint_read = tx.holds_blocking_checkpoint_read.load(Ordering::Acquire);
@@ -6860,6 +6873,83 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.sequence_watermarks
             .lock()
             .insert(sequence_name, watermark);
+    }
+
+    /// Like [`Self::set_sequence_watermark`], but never lowers the stored value.
+    /// Concurrent `nextval` calls can publish their allocations out of order, so
+    /// an older, smaller allocation may be published after a newer one.
+    pub fn raise_sequence_watermark(&self, sequence_name: &str, watermark: i64) {
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        self.sequence_watermarks
+            .lock()
+            .entry(sequence_name)
+            .and_modify(|current| *current = (*current).max(watermark))
+            .or_insert(watermark);
+    }
+
+    /// Like [`Self::set_sequence_watermark`], but never raises the stored value.
+    /// `setval` can move a sequence back, and its transaction can still roll
+    /// back, so a higher value is left for the next `nextval` to publish.
+    pub fn lower_sequence_watermark(&self, tx_id: TxID, sequence_name: &str, watermark: i64) {
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        let mut watermarks = self.sequence_watermarks.lock();
+        let previous = watermarks.get(&sequence_name).copied();
+        watermarks.insert(
+            sequence_name.clone(),
+            previous.unwrap_or(watermark).min(watermark),
+        );
+        self.record_sequence_watermark_undo(tx_id, sequence_name, previous);
+    }
+
+    pub fn remove_sequence_watermark(&self, tx_id: TxID, sequence_name: &str) {
+        let sequence_name = crate::util::normalize_ident(sequence_name);
+        let previous = self.sequence_watermarks.lock().remove(&sequence_name);
+        self.record_sequence_watermark_undo(tx_id, sequence_name, previous);
+    }
+
+    pub fn rename_sequence_watermark(&self, tx_id: TxID, old_name: &str, new_name: &str) {
+        let old_name = crate::util::normalize_ident(old_name);
+        let new_name = crate::util::normalize_ident(new_name);
+        let mut watermarks = self.sequence_watermarks.lock();
+        let Some(watermark) = watermarks.remove(&old_name) else {
+            return;
+        };
+        let previous_new = watermarks.insert(new_name.clone(), watermark);
+        self.record_sequence_watermark_undo(tx_id, old_name, Some(watermark));
+        self.record_sequence_watermark_undo(tx_id, new_name, previous_new);
+    }
+
+    fn record_sequence_watermark_undo(
+        &self,
+        tx_id: TxID,
+        sequence_name: String,
+        previous: Option<i64>,
+    ) {
+        self.sequence_watermark_undo
+            .lock()
+            .entry(tx_id)
+            .or_default()
+            .push((sequence_name, previous));
+    }
+
+    /// On rollback, puts back the watermarks the transaction removed or
+    /// lowered. A value restored by raising keeps any higher value that
+    /// `nextval` published in the meantime.
+    fn finish_sequence_watermark_changes(&self, tx_id: TxID, committed: bool) {
+        let Some(changes) = self.sequence_watermark_undo.lock().remove(&tx_id) else {
+            return;
+        };
+        if committed {
+            return;
+        }
+        for (sequence_name, previous) in changes.into_iter().rev() {
+            match previous {
+                Some(watermark) => self.raise_sequence_watermark(&sequence_name, watermark),
+                None => {
+                    self.sequence_watermarks.lock().remove(&sequence_name);
+                }
+            }
+        }
     }
 
     /// Returns the first sequence value that is not safe for cursor scans to pass.

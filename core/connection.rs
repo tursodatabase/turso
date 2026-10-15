@@ -4060,17 +4060,22 @@ impl Connection {
     /// - `"my_seq"` → searches main database only
     /// - `"aux.my_seq"` → searches the attached database named `aux`
     pub fn find_sequence(&self, name: &str) -> Result<Arc<crate::schema::Sequence>> {
-        let (db_id, seq_name) = if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
-            (db_id, crate::util::normalize_ident(seq))
-        } else {
-            (MAIN_DB_ID, crate::util::normalize_ident(name))
-        };
-
+        let (db_id, seq_name) = self.resolve_sequence_name(name)?;
         self.with_schema(db_id, |schema| {
             schema.get_sequence(&seq_name).map(Arc::clone)
         })
         .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist")))
+    }
+
+    /// Split a possibly schema-qualified sequence name into its database id
+    /// and normalized bare name.
+    pub(crate) fn resolve_sequence_name(&self, name: &str) -> Result<(usize, String)> {
+        if let Some((schema, seq)) = name.split_once('.') {
+            let db_id = self.get_database_id_by_name(schema)?;
+            Ok((db_id, crate::util::normalize_ident(seq)))
+        } else {
+            Ok((MAIN_DB_ID, crate::util::normalize_ident(name)))
+        }
     }
 
     /// Record that this connection has seen a value from the named sequence (for currval).

@@ -7018,6 +7018,309 @@ fn test_sequence_watermark_tracks_nextval_allocations() {
     assert_eq!(rows[0][0].as_int().unwrap(), 3);
 }
 
+#[test]
+fn test_sequence_watermark_does_not_go_back_when_older_concurrent_allocation_is_tracked_after_exclusive_commit(
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    let reader = db.connect();
+    concurrent.execute("CREATE SEQUENCE s").unwrap();
+
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut concurrent_nextval = concurrent.prepare("SELECT nextval('s')").unwrap();
+    assert!(matches!(
+        concurrent_nextval.step().unwrap(),
+        StepResult::Yield
+    ));
+
+    exclusive.execute("BEGIN").unwrap();
+    let rows = get_rows(&exclusive, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    exclusive.execute("COMMIT").unwrap();
+
+    while !matches!(concurrent_nextval.step().unwrap(), StepResult::Row) {}
+    assert_eq!(
+        concurrent_nextval.row().unwrap().get_value(0).as_int(),
+        Some(1)
+    );
+    while !matches!(concurrent_nextval.step().unwrap(), StepResult::Done) {}
+    concurrent.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_does_not_go_back_when_older_allocation_is_tracked_last() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let first = db.connect();
+    let second = db.connect();
+    let reader = db.connect();
+    first.execute("CREATE SEQUENCE s").unwrap();
+
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut first_nextval = first.prepare("SELECT nextval('s')").unwrap();
+    assert!(matches!(first_nextval.step().unwrap(), StepResult::Yield));
+
+    second.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&second, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    second.execute("COMMIT").unwrap();
+
+    while !matches!(first_nextval.step().unwrap(), StepResult::Row) {}
+    assert_eq!(first_nextval.row().unwrap().get_value(0).as_int(), Some(1));
+    while !matches!(first_nextval.step().unwrap(), StepResult::Done) {}
+    first.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&reader, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_restarts_when_sequence_is_dropped_and_created_again() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert!(matches!(rows[0][0], Value::Null));
+
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_restarts_when_autoincrement_table_is_dropped_and_created_again() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    for _ in 0..10 {
+        conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    }
+    let watermark = "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_t')";
+    let rows = get_rows(&conn, watermark);
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+
+    conn.execute("DROP TABLE t").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&conn, watermark);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_follows_renamed_autoincrement_table() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    for _ in 0..10 {
+        conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    }
+
+    conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+    let rows = get_rows(
+        &conn,
+        "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_u')",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    let rows = get_rows(
+        &conn,
+        "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_t')",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_moves_back_with_setval() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    get_rows(&conn, "SELECT setval('s', 2)");
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 4);
+
+    get_rows(&conn, "SELECT setval('s', 2, false)");
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_stays_low_when_setval_forward_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    get_rows(&conn, "SELECT nextval('s')");
+
+    conn.execute("BEGIN").unwrap();
+    get_rows(&conn, "SELECT setval('s', 100)");
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_setval_backward_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    get_rows(&conn, "SELECT setval('s', 2)");
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_drop_sequence_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_drop_and_create_sequence_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    let rows = get_rows(&conn, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
+fn test_sequence_watermark_restarts_when_drop_and_create_sequence_commit_together() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    for _ in 0..10 {
+        get_rows(&conn, "SELECT nextval('s')");
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DROP SEQUENCE s").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    get_rows(&conn, "SELECT nextval('s')");
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_drop_autoincrement_table_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    for _ in 0..10 {
+        conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DROP TABLE t").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_t')",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+}
+
+#[test]
+fn test_sequence_watermark_comes_back_when_autoincrement_table_rename_rolls_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    for _ in 0..10 {
+        conn.execute("INSERT INTO t(x) VALUES (1)").unwrap();
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_t')",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 11);
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY AUTOINCREMENT, x)")
+        .unwrap();
+    conn.execute("INSERT INTO u(x) VALUES (1)").unwrap();
+    let rows = get_rows(
+        &conn,
+        "SELECT sequence_watermark_experimental('__turso_internal_autoincrement_u')",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
 /// What this test checks: a sync-style cursor that bounds its scan by
 /// `sequence_watermark_experimental()` (read *outside* a transaction, as the
 /// contract requires) never skips a committed row, even while many writers
