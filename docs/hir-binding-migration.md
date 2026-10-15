@@ -254,7 +254,7 @@ inserted. These still go to legacy:
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
-| UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
+| UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY | Moving the row |
 | AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
 | WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
 
@@ -359,7 +359,10 @@ UPDATE seeks to the conflicting row, reads it through the target and the new
 values through `excluded`, builds the new row in registers bound to the
 UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index
 (with ABORT) before rewriting the indexes and the row, and returns the
-updated row to RETURNING. INSERT triggers do not fire for it.
+updated row to RETURNING. INSERT triggers do not fire for it; the UPDATE triggers of the
+columns it sets do, with the conflicting row as OLD and with ABORT: BEFORE
+once the new row passed its CHECK constraints, AFTER once RETURNING has read
+the row, as in SQLite (legacy fires them before RETURNING).
 
 Semantic analysis matches each ON CONFLICT target against the HIR target
 source, as SQLite does: `rowid` or the bare INTEGER PRIMARY KEY column names

@@ -182,11 +182,16 @@ pub(crate) fn translate_insert(
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
+    let Some(upsert_triggers) = trigger::upsert_update_triggers(&session, program, &plan, insert)?
+    else {
+        return Ok(false);
+    };
     insert::emit_insert(
         program,
         &plan,
         insert,
         &triggers,
+        &upsert_triggers,
         !connection.check_constraints_ignored(),
     )?;
     if let Some(returning) = &insert.returning {

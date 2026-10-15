@@ -58,7 +58,7 @@ pub(super) fn needs_legacy(
             let mvcc_autoincrement = autoincrement.as_ref().is_some_and(|autoincrement| {
                 autoincrement.mvcc_sequence.is_some() || program.is_mvcc_enabled()
             });
-            if mvcc_autoincrement || !triggers.upsert_update.is_empty() {
+            if mvcc_autoincrement {
                 return Ok(true);
             }
             (defaults, foreign_keys)
@@ -144,6 +144,7 @@ pub(super) fn emit_insert(
     plan: &HirPlan,
     insert: &hir::Insert,
     triggers: &[CompiledTrigger],
+    upsert_triggers: &[CompiledTrigger],
     enforce_checks: bool,
 ) -> Result<()> {
     let document = &plan.document;
@@ -271,6 +272,7 @@ pub(super) fn emit_insert(
         conflict_rowid: program.alloc_register(),
         enforce_checks,
         sequence: sequence.as_ref(),
+        upsert_triggers,
     };
     let done = program.allocate_label();
     match rows {
@@ -609,6 +611,8 @@ struct InsertRow<'a> {
     enforce_checks: bool,
     /// AUTOINCREMENT: the target's `sqlite_sequence` row.
     sequence: Option<&'a Sequence>,
+    /// The UPDATE triggers an UPSERT's DO UPDATE fires.
+    upsert_triggers: &'a [CompiledTrigger],
 }
 
 impl InsertRow<'_> {
@@ -1134,6 +1138,49 @@ impl InsertRow<'_> {
                 row_done,
             )?;
         }
+        // Like legacy, the UPDATE triggers see the conflicting row as OLD
+        // and the new row as NEW; BEFORE triggers run once the new row
+        // passed its CHECK constraints.
+        let fires = |time: TriggerTime| {
+            self.upsert_triggers
+                .iter()
+                .filter(move |trigger| trigger.time == time)
+        };
+        let old_row = (!self.upsert_triggers.is_empty())
+            .then(|| -> Result<TriggerRow> {
+                let start = program.alloc_registers(columns);
+                for column in 0..columns {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: source.id,
+                            column,
+                        }),
+                        start + column,
+                    )?;
+                }
+                Ok(TriggerRow {
+                    columns: start,
+                    rowid: conflict,
+                })
+            })
+            .transpose()?;
+        let new_trigger_row = TriggerRow {
+            columns: new_row,
+            rowid: conflict,
+        };
+        if fires(TriggerTime::Before).next().is_some() {
+            for trigger in fires(TriggerTime::Before) {
+                trigger.emit_fire(program, old_row, Some(new_trigger_row), columns, row_done)?;
+            }
+            // The trigger may have deleted or moved the row.
+            program.emit_insn(Insn::NotExists {
+                cursor: self.table_cursor,
+                rowid_reg: conflict,
+                target_pc: row_done,
+            });
+        }
 
         // Virtual generated columns that read a set column change too.
         let assigned = super::update::with_generated_dependents(
@@ -1407,6 +1454,19 @@ impl InsertRow<'_> {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
+        // Like UPDATE, AFTER triggers fire after RETURNING has read the row,
+        // and RAISE(IGNORE) in one only ends that trigger's body.
+        let after_triggers = program.allocate_label();
+        for trigger in fires(TriggerTime::After) {
+            trigger.emit_fire(
+                program,
+                old_row,
+                Some(new_trigger_row),
+                columns,
+                after_triggers,
+            )?;
+        }
+        program.preassign_label_to_next_insn(after_triggers);
         program.emit_insn(Insn::Goto {
             target_pc: row_done,
         });
@@ -1865,7 +1925,7 @@ mod tests {
         let insert = insert_root(&plan).unwrap();
         assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan, insert, &[], true).unwrap();
+        emit_insert(&mut program, &plan, insert, &[], &[], true).unwrap();
         program
     }
 

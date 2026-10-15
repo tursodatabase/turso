@@ -1293,6 +1293,37 @@ fn hir_upsert_other_conflicts_match_sqlite() {
     }
 }
 
+/// An UPSERT's DO UPDATE fires the UPDATE triggers of the columns it sets,
+/// with the conflicting row as OLD: BEFORE once the new row passed its CHECK
+/// constraints, AFTER once RETURNING has read the row, as in SQLite.
+#[test]
+fn hir_upsert_triggers_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c, n DEFAULT 0)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('before ' || old.c || '>' || new.c); END",
+        "CREATE TRIGGER au AFTER UPDATE OF c ON t BEGIN INSERT INTO log VALUES ('after ' || old.c || '>' || new.c || ' ' || (SELECT count(*) FROM log)); END",
+        "CREATE TRIGGER an AFTER UPDATE OF n ON t BEGIN INSERT INTO log VALUES ('n ' || new.n); END",
+        "CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('insert ' || new.a); END",
+        "INSERT INTO t(a, b, c) VALUES (1, 1, 'x')",
+        "INSERT INTO t(a, b, c) VALUES (1, 2, 'y') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "INSERT INTO t(a, b, c) VALUES (2, 1, 'z') ON CONFLICT(b) DO UPDATE SET n = n + 1 RETURNING a, n, (SELECT count(*) FROM log)",
+        "INSERT INTO t(a, b, c) VALUES (3, 3, 'w') ON CONFLICT DO UPDATE SET c = 'never'",
+        "CREATE TRIGGER ig BEFORE UPDATE ON t WHEN new.c = 'skip' BEGIN SELECT RAISE(IGNORE); END",
+        "INSERT INTO t(a, b, c) VALUES (1, 9, 'skip') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "CREATE TRIGGER del BEFORE UPDATE ON t WHEN new.c = 'gone' BEGIN DELETE FROM t WHERE a = old.a; END",
+        "INSERT INTO t(a, b, c) VALUES (3, 9, 'gone') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "SELECT * FROM t ORDER BY a",
+        "SELECT * FROM log",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
 /// Legacy rejects it.
 #[test]

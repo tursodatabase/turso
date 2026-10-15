@@ -136,21 +136,28 @@ fn compile_trigger(
     let mut nested = Vec::with_capacity(commands.len());
     // Foreign-key actions that the body's own DML fires, per command.
     let mut nested_actions = Vec::with_capacity(commands.len());
+    // UPDATE triggers that an INSERT's UPSERT fires, per command.
+    let mut nested_upsert = Vec::with_capacity(commands.len());
     for (command, command_plan) in root.commands.iter().zip(commands) {
         let mut command_triggers = Vec::new();
         let mut command_actions = Vec::new();
+        let mut command_upsert = Vec::new();
         let needs_legacy = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
                 if super::insert::needs_legacy(&plan, insert, &builder)? {
                     true
                 } else {
-                    match insert_triggers(session, &builder, &plan, insert)? {
-                        Some(triggers) => {
+                    match (
+                        insert_triggers(session, &builder, &plan, insert)?,
+                        upsert_update_triggers(session, &builder, &plan, insert)?,
+                    ) {
+                        (Some(triggers), Some(upsert)) => {
                             command_triggers = triggers;
+                            command_upsert = upsert;
                             false
                         }
-                        None => true,
+                        _ => true,
                     }
                 }
             }
@@ -199,6 +206,7 @@ fn compile_trigger(
         }
         nested.push(command_triggers);
         nested_actions.push(command_actions);
+        nested_upsert.push(command_upsert);
     }
 
     builder.prologue();
@@ -243,12 +251,13 @@ fn compile_trigger(
         )?;
         builder.preassign_label_to_next_insn(passed);
     }
-    for (((command, command_plan), command_triggers), command_actions) in root
+    for ((((command, command_plan), command_triggers), command_actions), command_upsert) in root
         .commands
         .iter()
         .zip(commands)
         .zip(&nested)
         .zip(&nested_actions)
+        .zip(&nested_upsert)
     {
         match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(query)) => {
@@ -266,6 +275,7 @@ fn compile_trigger(
                     &plan,
                     insert,
                     command_triggers,
+                    command_upsert,
                     !connection.check_constraints_ignored(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
@@ -369,6 +379,28 @@ pub(super) fn insert_triggers(
         insert.target,
         &triggers.insert,
         conflict_override,
+    )
+}
+
+/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. `None` means one
+/// needs legacy. Like legacy, an OR IGNORE or OR REPLACE inside them does
+/// not hide an error: they run with ABORT.
+pub(super) fn upsert_update_triggers(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+) -> Result<Option<Vec<CompiledTrigger>>> {
+    let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    target_triggers(
+        session,
+        parent,
+        plan,
+        insert.target,
+        &triggers.upsert_update,
+        Some(ResolveType::Abort),
     )
 }
 
