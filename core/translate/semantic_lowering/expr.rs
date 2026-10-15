@@ -4617,6 +4617,7 @@ mod tests {
                 dialect: Arc::new(SqliteDialect),
                 custom_types_enabled: true,
                 dqs_dml: DoubleQuotedDml::Enabled,
+                foreign_keys_enabled: true,
             },
             SemanticRootInput::Statement(&statement),
         )

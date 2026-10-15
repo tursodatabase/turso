@@ -79,6 +79,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: &hir::ResolvedTable,
         outgoing_child_source: hir::SourceId,
     ) -> Result<hir::DmlForeignKeys> {
+        if !self.context().foreign_keys_enabled() {
+            return Ok(hir::DmlForeignKeys::default());
+        }
         let database = target.database().ok_or_else(|| {
             LimboError::InternalError("DML target has no owning database".to_string())
         })?;

@@ -205,6 +205,7 @@ impl<'a> HirSession<'a> {
                 dialect: self.dialect.clone(),
                 custom_types_enabled: self.custom_types_enabled,
                 dqs_dml: self.dqs_dml,
+                foreign_keys_enabled: self.connection.foreign_keys_enabled(),
             },
             input,
         )?;

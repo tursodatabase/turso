@@ -54,6 +54,9 @@ pub(crate) struct SemanticContext<'catalog> {
     database_names: HashMap<String, DatabaseId>,
     unqualified_database_search_path: Vec<DatabaseId>,
     dqs_dml: DoubleQuotedDml,
+    /// `PRAGMA foreign_keys`. When off, DML carries no foreign-key metadata,
+    /// so a child table whose parent is missing can still be written.
+    foreign_keys_enabled: bool,
     snapshot: CatalogSnapshot,
 }
 
@@ -64,6 +67,7 @@ impl<'catalog> SemanticContext<'catalog> {
         custom_types_enabled: bool,
         dialect: Arc<dyn Dialect>,
         dqs_dml: DoubleQuotedDml,
+        foreign_keys_enabled: bool,
     ) -> Result<Self> {
         Self::for_databases(
             catalog.databases.iter().map(|database| {
@@ -74,7 +78,11 @@ impl<'catalog> SemanticContext<'catalog> {
             custom_types_enabled,
             dialect,
         )
-        .map(|context| context.with_dqs_dml(dqs_dml))
+        .map(|context| {
+            context
+                .with_dqs_dml(dqs_dml)
+                .with_foreign_keys(foreign_keys_enabled)
+        })
     }
 
     pub(crate) fn for_main_schema_object(
@@ -147,12 +155,18 @@ impl<'catalog> SemanticContext<'catalog> {
             database_names,
             unqualified_database_search_path,
             dqs_dml: DoubleQuotedDml::Enabled,
+            foreign_keys_enabled: true,
             snapshot: CatalogSnapshot::from_id(snapshot),
         })
     }
 
     pub(crate) fn with_dqs_dml(mut self, dqs_dml: DoubleQuotedDml) -> Self {
         self.dqs_dml = dqs_dml;
+        self
+    }
+
+    pub(crate) fn with_foreign_keys(mut self, enabled: bool) -> Self {
+        self.foreign_keys_enabled = enabled;
         self
     }
 
@@ -335,6 +349,10 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) const fn dqs_dml(&self) -> DoubleQuotedDml {
         self.dqs_dml
+    }
+
+    pub(crate) const fn foreign_keys_enabled(&self) -> bool {
+        self.foreign_keys_enabled
     }
 
     pub(crate) const fn snapshot(&self) -> CatalogSnapshot {

@@ -158,6 +158,15 @@ fn hir_delete_matches_legacy() {
              DELETE FROM t WHERE a = old.x; INSERT INTO log VALUES (old.x); END",
             "DELETE FROM tt WHERE x = 2",
         ],
+        // With foreign keys off, a child table whose parent table is
+        // missing can still be written.
+        &[
+            "CREATE TABLE orphan(x REFERENCES missing(id))",
+            "INSERT INTO orphan VALUES (1), (2)",
+            "UPDATE orphan SET x = 3 WHERE x = 2",
+            "DELETE FROM orphan WHERE x = 1",
+            "SELECT x FROM orphan",
+        ],
         // Statements that still go through legacy.
         &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
         &[

@@ -19,6 +19,7 @@ pub(crate) struct SemanticOptions {
     pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
     pub(crate) custom_types_enabled: bool,
     pub(crate) dqs_dml: context::DoubleQuotedDml,
+    pub(crate) foreign_keys_enabled: bool,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
@@ -49,6 +50,7 @@ pub(crate) fn analyze_root(
         options.custom_types_enabled,
         options.dialect,
         options.dqs_dml,
+        options.foreign_keys_enabled,
     )?;
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
@@ -200,6 +202,7 @@ mod tests {
             dialect: Arc::new(SqliteDialect),
             custom_types_enabled: true,
             dqs_dml: DoubleQuotedDml::Disabled,
+            foreign_keys_enabled: true,
         };
         let document = analyze_root(
             &catalog,
