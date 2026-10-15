@@ -73,14 +73,13 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // Custom types and generated columns are not lowered yet.
+    // Custom types are not lowered yet.
     if super::dml::strict_needs_legacy(&table)
-        || table.columns().iter().any(Column::is_generated)
         || source.column_type_programs.iter().any(Option::is_some)
     {
         return Ok(true);
     }
-    let assigned = assigned_columns(update)?;
+    let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
     // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
     if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&table, &assigned)) {
         return Ok(true);
@@ -226,7 +225,7 @@ pub(super) fn emit_update(
         .flags
         .set_has_statement_conflict(has_statement_conflict);
 
-    let assigned = assigned_columns(update)?;
+    let assigned = with_generated_dependents(table, assigned_columns(update)?)?;
     let mut values = vec![None; table.columns().len()];
     // The new rowid, when the UPDATE sets it. The INTEGER PRIMARY KEY
     // column keeps NULL, as in the stored record.
@@ -929,6 +928,26 @@ fn assigned_positions(
     positions
 }
 
+/// `assigned` and the virtual generated columns that read one of them, which
+/// change with them.
+fn with_generated_dependents(
+    table: &crate::schema::BTreeTable,
+    mut assigned: Vec<hir::TargetColumn>,
+) -> Result<Vec<hir::TargetColumn>> {
+    if !table.has_virtual_columns() {
+        return Ok(assigned);
+    }
+    let affected = table.columns_affected_by_update(assigned_positions(table, &assigned))?;
+    for (position, column) in table.columns().iter().enumerate() {
+        let dependent = hir::TargetColumn::Column(position);
+        if column.is_virtual_generated() && affected.get(position) && !assigned.contains(&dependent)
+        {
+            assigned.push(dependent);
+        }
+    }
+    Ok(assigned)
+}
+
 fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
     Ok(update
         .assignments
@@ -1004,6 +1023,29 @@ impl UpdateRow<'_, '_> {
         self.new_rowid.unwrap_or(self.rowid)
     }
 
+    /// Bind the NEW row to its registers and compute its virtual generated
+    /// columns there.
+    fn emit_virtual_columns(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+    ) -> Result<()> {
+        program.bind_source(
+            layout.new_source,
+            SourceBinding::Registers {
+                start: self.start(),
+                rowid: Some(self.written_rowid()),
+            },
+        );
+        super::dml::emit_virtual_columns(
+            program,
+            self.target.document,
+            layout.new_source,
+            self.target.table,
+            self.start(),
+        )
+    }
+
     /// Rewrite the row the table cursor is on.
     fn emit(
         &self,
@@ -1033,6 +1075,7 @@ impl UpdateRow<'_, '_> {
         );
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before)?;
+        self.emit_virtual_columns(program, layout)?;
         let new_row = TriggerRow {
             columns: self.start(),
             rowid: self.written_rowid(),
@@ -1073,7 +1116,7 @@ impl UpdateRow<'_, '_> {
             });
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
             {
-                if value.is_none() && !column.is_rowid_alias() {
+                if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
                     program.emit_column_or_rowid(
                         self.table_cursor,
                         position,
@@ -1088,13 +1131,10 @@ impl UpdateRow<'_, '_> {
                 }
             }
         }
-        program.bind_source(
-            layout.new_source,
-            SourceBinding::Registers {
-                start: self.start(),
-                rowid: Some(self.written_rowid()),
-            },
-        );
+        if has_before {
+            // The trigger may have changed the columns they read.
+            self.emit_virtual_columns(program, layout)?;
+        }
         // Like legacy, a new rowid is checked first, unless REPLACE resolves
         // its conflict, which happens after the indexes are checked.
         if self.new_rowid.is_some() && self.rowid_conflict() != ResolveType::Replace {
@@ -1187,20 +1227,7 @@ impl UpdateRow<'_, '_> {
             }
         }
 
-        let record = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(self.start()),
-            count: to_u32(columns),
-            dest_reg: to_u32(record),
-            index_name: None,
-            affinity_str: Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
-                    .collect(),
-            ),
-        });
+        let record = super::dml::emit_row_record(program, table, self.start());
         // MVCC keeps every version of a row, so the old one is deleted and
         // the new one inserted. A row with a new rowid moves the same way.
         if layout.mvcc || self.new_rowid.is_some() {
@@ -1297,7 +1324,10 @@ impl UpdateRow<'_, '_> {
                         self.emit_notnull_check(program, position, column)?;
                     }
                 }
-                None if column.is_rowid_alias() => program.emit_null(register, None),
+                // A virtual column is computed once the row is built.
+                None if column.is_rowid_alias() || column.is_virtual_generated() => {
+                    program.emit_null(register, None)
+                }
                 None => program.emit_column_or_rowid(self.table_cursor, position, register),
             }
         }

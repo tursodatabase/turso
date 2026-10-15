@@ -1123,6 +1123,86 @@ fn hir_returning_subqueries_match_sqlite() {
     }
 }
 
+/// Virtual generated columns: computed for each new row from its other
+/// columns, indexed, checked and returned as SQLite does, and not stored.
+/// Legacy reports a NOT NULL failure for the UNIQUE conflict on `e` below.
+#[test]
+fn hir_generated_columns_match_sqlite() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE g(a INTEGER PRIMARY KEY, b, c AS (b * 2), d TEXT, e AS (c + length(d)) NOT NULL, f AS (a + 100), CHECK (c < 100))",
+        "CREATE INDEX g_c ON g(c)",
+        "CREATE UNIQUE INDEX g_e ON g(e)",
+        "CREATE INDEX g_x ON g(f * 2)",
+        "CREATE TABLE log(x, y)",
+        "INSERT INTO g(b, d) VALUES (1, 'x'), (2, 'yy')",
+        "INSERT INTO g(a, b, d) VALUES (10, 3, 'zzz')",
+        "SELECT * FROM g ORDER BY a",
+        "INSERT INTO g(b, d) VALUES (60, 'x')",
+        "INSERT INTO g(b, d) VALUES (1, NULL)",
+        "INSERT INTO g(b, d) VALUES (2, 'x')",
+        "INSERT OR IGNORE INTO g(b, d) VALUES (2, 'x'), (5, 'k')",
+        "INSERT INTO g(c) VALUES (1)",
+        "SELECT * FROM g ORDER BY a",
+        "UPDATE g SET b = b + 1",
+        "SELECT * FROM g ORDER BY a",
+        "UPDATE g SET d = 'long' WHERE a = 1",
+        "UPDATE g SET b = 70 WHERE a = 1",
+        "UPDATE g SET c = 1",
+        "UPDATE g SET a = a + 1000 WHERE a = 10",
+        "SELECT * FROM g ORDER BY a",
+        "SELECT c, a FROM g INDEXED BY g_c ORDER BY c",
+        "SELECT e, a FROM g INDEXED BY g_e ORDER BY e",
+        "CREATE TRIGGER tb BEFORE UPDATE ON g BEGIN INSERT INTO log VALUES (old.c, new.c); END",
+        "CREATE TRIGGER ta AFTER INSERT ON g BEGIN INSERT INTO log VALUES (new.c, new.e); END",
+        "UPDATE g SET b = 0 WHERE a = 2",
+        "INSERT INTO g(b, d) VALUES (7, 'q') RETURNING a, c, e, f",
+        "INSERT INTO g(a, b, d) VALUES (2, 9, 'w') ON CONFLICT(a) DO UPDATE SET b = excluded.b RETURNING *",
+        "SELECT * FROM log",
+        "SELECT * FROM g ORDER BY a",
+        "DELETE FROM g WHERE c > 10",
+        "SELECT * FROM g ORDER BY a",
+        "PRAGMA integrity_check",
+    ] {
+        if sql.starts_with("SELECT") || sql.starts_with("PRAGMA") {
+            assert_eq!(
+                limbo_exec_rows(&conn, sql),
+                sqlite_exec_rows(&sqlite, sql),
+                "{sql}"
+            );
+            continue;
+        }
+        let turso = limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string());
+        let reference = sqlite
+            .prepare(sql)
+            .and_then(|mut statement| {
+                let mut rows = statement.query(())?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let mut value = Vec::new();
+                    for i in 0..row.as_ref().column_count() {
+                        value.push(row.get::<_, rusqlite::types::Value>(i)?);
+                    }
+                    values.push(value);
+                }
+                Ok(values)
+            })
+            .map_err(|e| e.to_string());
+        match (&turso, &reference) {
+            (Ok(turso), Ok(reference)) => assert_eq!(turso, reference, "{sql}"),
+            (Err(turso), Err(reference)) => {
+                assert!(turso.contains(reference.as_str()), "{sql}: {turso} vs {reference}")
+            }
+            _ => panic!("{sql}: {turso:?} vs {reference:?}"),
+        }
+    }
+}
+
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
 /// Legacy rejects it.
 #[test]

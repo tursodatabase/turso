@@ -84,11 +84,9 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // WITHOUT ROWID tables, custom types and generated columns are not
-    // lowered yet.
+    // WITHOUT ROWID tables and custom types are not lowered yet.
     if !table.has_rowid
         || super::dml::strict_needs_legacy(&table)
-        || table.columns().iter().any(Column::is_generated)
         || table.columns().iter().any(Column::hidden)
         || source.column_type_programs.iter().any(Option::is_some)
     {
@@ -782,6 +780,13 @@ impl InsertRow<'_> {
         // CHECK constraints, index expressions, partial-index WHERE terms
         // and RETURNING read the new row.
         self.bind_new_row(program);
+        super::dml::emit_virtual_columns(
+            program,
+            document,
+            self.target.source.id,
+            table,
+            self.columns,
+        )?;
         // Like legacy, CHECK constraints run once the rowid is known, before
         // NOT NULL.
         if self.enforce_checks {
@@ -866,20 +871,7 @@ impl InsertRow<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let record = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(self.columns),
-            count: to_u32(table.columns().len()),
-            dest_reg: to_u32(record),
-            index_name: None,
-            affinity_str: Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
-                    .collect(),
-            ),
-        });
+        let record = super::dml::emit_row_record(program, table, self.columns);
         // Like legacy, the parent must exist before anything is written.
         super::fkey::emit_insert_child_checks(
             program,
@@ -1126,6 +1118,7 @@ impl InsertRow<'_> {
                 rowid: Some(conflict),
             },
         );
+        super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
         // Like legacy, every CHECK constraint is checked with ABORT.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
@@ -1365,20 +1358,7 @@ impl InsertRow<'_> {
             }
         }
 
-        let record = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(new_row),
-            count: to_u32(columns),
-            dest_reg: to_u32(record),
-            index_name: None,
-            affinity_str: Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
-                    .collect(),
-            ),
-        });
+        let record = super::dml::emit_row_record(program, table, new_row);
         program.emit_insn(Insn::Insert {
             cursor: self.table_cursor,
             key_reg: conflict,

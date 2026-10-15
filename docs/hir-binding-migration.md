@@ -237,7 +237,7 @@ rowid. These still go to legacy:
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
 | A changed key of the index the loop reads, a changed rowid with UPDATE ... FROM | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
-| Custom types, array columns, generated columns | Encoding, computed columns |
+| Custom types, array columns, STRICT tables with generated columns | Encoding, type checks without virtual columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -258,7 +258,7 @@ inserted. These still go to legacy:
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
-| WITHOUT ROWID tables, custom types, array columns, generated columns | Their lowering |
+| WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -271,6 +271,13 @@ A STRICT table gets no column affinity; like legacy, its new row is type
 checked (`TypeCheck`) instead: once the rowid is known for INSERT, after NOT
 NULL for UPDATE, and in place of affinity for UPSERT DO UPDATE. A value is
 converted where SQLite allows and the statement fails otherwise.
+
+Virtual generated columns are computed into the new row's registers, in
+dependency order, once the row is built (for UPDATE also again after BEFORE
+triggers), so index keys, NOT NULL checks and triggers that copy registers
+see them; reads through the row's source compute them anyway. The record
+holds only the stored columns, in their stored order. An UPDATE treats a
+virtual column as changed when a column it reads changes.
 
 AUTOINCREMENT is lowered as legacy does it (`semantic_lowering/autoincrement.rs`).
 Each row opens `sqlite_sequence` and reads the target's row; a generated

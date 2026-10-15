@@ -567,13 +567,16 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
 /// Whether the target is a STRICT table HIR does not lower yet: one with a
 /// custom type or array column, whose type check needs the resolved types.
 pub(super) fn strict_needs_legacy(table: &BTreeTable) -> bool {
+    // The type check of a STRICT table with virtual columns skips them,
+    // which is not lowered yet.
     table.is_strict
-        && table.columns().iter().any(|column| {
-            column.is_array()
-                || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-                    .iter()
-                    .any(|name| column.ty_str.eq_ignore_ascii_case(name))
-        })
+        && (table.has_virtual_columns()
+            || table.columns().iter().any(|column| {
+                column.is_array()
+                    || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+                        .iter()
+                        .any(|name| column.ty_str.eq_ignore_ascii_case(name))
+            }))
 }
 
 /// STRICT: check each value of the row in `start..` against its column's
@@ -590,6 +593,88 @@ pub(super) fn emit_strict_type_check(
         check_generated: true,
         table_reference: table.clone(),
     });
+}
+
+/// Compute each virtual generated column of the row in registers
+/// `start + column` into its register, in dependency order, as legacy does.
+/// `source` must be bound to those registers. Reads of the row through
+/// `source` compute virtual columns anyway; this fills the registers that
+/// are copied directly, such as index keys, NOT NULL checks and triggers.
+pub(super) fn emit_virtual_columns(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: SourceId,
+    table: &BTreeTable,
+    start: usize,
+) -> Result<()> {
+    if !table.has_virtual_columns() {
+        return Ok(());
+    }
+    for (column, _) in table
+        .columns_topo_sort()?
+        .iter()
+        .filter(|(_, column)| column.is_virtual_generated())
+    {
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef { source, column }),
+            start + column,
+        )?;
+    }
+    Ok(())
+}
+
+/// The record of the row in registers `start + column`. A virtual
+/// generated column is not stored, so with one the stored columns are first
+/// copied together, in their stored order.
+pub(super) fn emit_row_record(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    start: usize,
+) -> usize {
+    let stored = if table.has_virtual_columns() {
+        let mut stored = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(position, column)| {
+                (table.logical_to_physical_column(position), position, column)
+            })
+            .collect::<Vec<_>>();
+        stored.sort_by_key(|(physical, _, _)| *physical);
+        let block = program.alloc_registers(stored.len());
+        for (offset, (_, position, _)) in stored.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: start + position,
+                dst_reg: block + offset,
+                extra_amount: 0,
+            });
+        }
+        let affinities = stored
+            .iter()
+            .map(|(_, _, column)| column.affinity_with_strict(table.is_strict).aff_mask())
+            .collect::<String>();
+        (block, stored.len(), affinities)
+    } else {
+        let affinities = table
+            .columns()
+            .iter()
+            .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+            .collect::<String>();
+        (start, table.columns().len(), affinities)
+    };
+    let (block, count, affinities) = stored;
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(block),
+        count: to_u32(count),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: Some(affinities),
+    });
+    record
 }
 
 /// Whether an expression contains a subquery.
