@@ -152,7 +152,7 @@ and failed 230. Legacy passes all of them. Known gaps, largest first:
 
 | Gap | Failing tests | Example |
 |---|---|---|
-| Wrong results and EXPLAIN QUERY PLAN text (see below) | ~105 | `explain-query-plan-json`, `partial_idx: plan-*` |
+| Wrong results and EXPLAIN QUERY PLAN differences (see below) | ~90 | `explain-query-plan-json`, `unnest-correlated` |
 | Correlated derived and CTE sources | 4 | `subquery-correlated-from-clause-nested` |
 | Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
 
@@ -179,6 +179,12 @@ followed by another join (legacy returns columns in the wrong order), and
 `outer_hash_join: full-outer-with-where-equijoin` (legacy ignores a WHERE term
 that repeats the ON term). Both still reject a RIGHT JOIN after another join,
 during analysis.
+
+EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
+legacy does, so simple plans print the same rows with the same ids. Plans
+still differ where the bytecode differs: legacy runs uncorrelated subqueries
+before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
+joins, which HIR does not.
 
 Legacy runs FROM subqueries and CTEs as coroutines when it can, so the outer
 loop pulls rows on demand. HIR always materializes them first. Results match

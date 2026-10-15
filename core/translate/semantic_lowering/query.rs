@@ -16,7 +16,10 @@ use crate::{
         aggregation::{
             hir_aggregate_function, translate_hir_aggregation_step, HirAggregateDistinct,
         },
-        eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod},
+        eqp::{
+            seek_constraint_parts, EqpCompoundOp, EqpDetail, EqpIndex, EqpJoin, EqpRowSource,
+            EqpSearchKind, EqpSortMethod, EqpSubquery, EqpSubqueryExec, EqpTable,
+        },
         expr::ConditionMetadata,
         main_loop::{
             emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
@@ -965,13 +968,13 @@ pub(crate) fn emit_planned_query_body(
     }
 
     let block = &query.blocks[0];
+    emit_hir_block_explain(program, document, block, &planned_query.blocks[0])?;
     let done = program.allocate_label();
     let distinct = initialize_hir_distinct(program, block)?;
     // Without grouping, aggregates or windows, rows leave the loops in scan
     // order, so a scan that already follows ORDER BY needs no sorter.
-    let scan_order_is_output_order = hir_grouping(block).is_none()
-        && block.aggregate_count == 0
-        && block.windows.is_empty();
+    let scan_order_is_output_order =
+        hir_grouping(block).is_none() && block.aggregate_count == 0 && block.windows.is_empty();
     let sort_elided = scan_order_is_output_order && planned_query.blocks[0].order_sort_elided;
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
@@ -1056,6 +1059,7 @@ fn emit_planned_query_block_with_output(
             block.id, block_plan.block
         )));
     }
+    emit_hir_block_explain(program, &plan.document, block, block_plan)?;
     if !block.windows.is_empty() {
         return emit_hir_window_block(program, plan, query, block, block_plan, output);
     }
@@ -3675,7 +3679,189 @@ fn prepare_hir_left_joins(
         .collect()
 }
 
+/// Emit the EXPLAIN QUERY PLAN rows of a block's loops in loop order, as
+/// legacy does before it opens any cursor. A block without FROM reads one
+/// constant row.
+fn emit_hir_block_explain(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+) -> Result<()> {
+    if !program.start_block_explain(block.id) {
+        return Ok(());
+    }
+    let Some(from) = &block.from else {
+        emit_explain!(program, false, EqpDetail::ConstantRow);
+        return Ok(());
+    };
+    for planned_loop in &block_plan.loops {
+        let detail = hir_loop_explain(document, from, planned_loop)?;
+        program.emit_source_explain(planned_loop.source, detail);
+    }
+    Ok(())
+}
+
+/// The EXPLAIN QUERY PLAN row of one planned loop, worded like legacy's.
+fn hir_loop_explain(
+    document: &HirDocument,
+    from: &hir::From,
+    planned_loop: &HirPlannedLoop,
+) -> Result<EqpDetail> {
+    let source = document.source(planned_loop.source).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR loop references missing source {}",
+            planned_loop.source
+        ))
+    })?;
+    // Legacy names a FROM subquery by its alias.
+    let table = match &source.kind {
+        hir::SourceKind::Derived(_) => EqpTable {
+            name: source.alias.clone().unwrap_or_else(|| source.name.clone()),
+            alias: None,
+        },
+        kind => {
+            let name = match kind {
+                hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
+                    table.value().get_name().to_string()
+                }
+                _ => source.name.clone(),
+            };
+            let alias = source.alias.clone().filter(|alias| *alias != name);
+            EqpTable { name, alias }
+        }
+    };
+    let join = hir_loop_explain_join(document, from, source.id);
+    let subquery = |cte: Option<hir::CteId>, recursive| EqpDetail::Scan {
+        table: table.clone(),
+        index: None,
+        source: EqpRowSource::Subquery,
+        backwards: false,
+        join,
+        subquery: Some(EqpSubquery {
+            exec: EqpSubqueryExec::Materialized,
+            cte_id: cte.map(hir::CteId::index),
+            recursive,
+        }),
+    };
+    Ok(match &planned_loop.access {
+        HirSourceAccess::BTree {
+            operation,
+            table_lookup,
+        } => {
+            let eqp_index = |index: &Arc<Index>| EqpIndex {
+                name: index.name.clone(),
+                covering: *table_lookup == BtreeTableLookup::ScanOnly,
+                ephemeral: index.ephemeral,
+            };
+            let search =
+                |kind, index: Option<EqpIndex>, constraints, backwards| EqpDetail::Search {
+                    table: table.clone(),
+                    kind,
+                    index,
+                    constraints,
+                    backwards,
+                    join,
+                    subquery: None,
+                };
+            match operation {
+                HirBtreeOperation::Scan { iter_dir, index } => EqpDetail::Scan {
+                    table: table.clone(),
+                    index: index.as_ref().map(eqp_index),
+                    source: EqpRowSource::BTreeTable,
+                    backwards: *iter_dir == IterationDirection::Backwards,
+                    join,
+                    subquery: None,
+                },
+                HirBtreeOperation::Seek { index, seek_def } => search(
+                    EqpSearchKind::Seek,
+                    index.as_ref().map(eqp_index),
+                    match index {
+                        Some(index) => seek_constraint_parts(index, seek_def),
+                        None => vec!["rowid=?".to_string()],
+                    },
+                    seek_def.iter_dir == IterationDirection::Backwards,
+                ),
+                HirBtreeOperation::RowidEq { .. } => search(
+                    EqpSearchKind::RowidEq,
+                    None,
+                    vec!["rowid=?".to_string()],
+                    false,
+                ),
+                HirBtreeOperation::InSeek { index, .. } => search(
+                    EqpSearchKind::InSeek,
+                    index.as_ref().map(eqp_index),
+                    match index {
+                        Some(index) => index
+                            .columns
+                            .first()
+                            .map(|column| vec![format!("{}=?", column.name)])
+                            .unwrap_or_default(),
+                        None => vec!["rowid=?".to_string()],
+                    },
+                    false,
+                ),
+            }
+        }
+        HirSourceAccess::Virtual(_) => EqpDetail::Scan {
+            table,
+            index: None,
+            source: EqpRowSource::VirtualTable,
+            backwards: false,
+            join,
+            subquery: None,
+        },
+        HirSourceAccess::Derived { .. } => subquery(None, false),
+        HirSourceAccess::Cte { cte, .. } => subquery(Some(*cte), false),
+        HirSourceAccess::RecursiveCte { cte } => subquery(Some(*cte), true),
+        HirSourceAccess::RecursiveInput { .. } => EqpDetail::Scan {
+            table,
+            index: None,
+            source: EqpRowSource::RecursiveCteInput,
+            backwards: false,
+            join,
+            subquery: None,
+        },
+    })
+}
+
+/// How a source joins the sources before it, for EXPLAIN QUERY PLAN.
+fn hir_loop_explain_join(
+    document: &HirDocument,
+    from: &hir::From,
+    source: SourceId,
+) -> Option<EqpJoin> {
+    from.joins.iter().find_map(|join| {
+        if join.right == source {
+            return match join.kind {
+                hir::JoinKind::Comma | hir::JoinKind::Right => None,
+                hir::JoinKind::Inner => Some(EqpJoin::Inner),
+                hir::JoinKind::Cross => Some(EqpJoin::Cross),
+                hir::JoinKind::Left => Some(EqpJoin::Left),
+                hir::JoinKind::Full => Some(EqpJoin::Full),
+            };
+        }
+        match document.source(join.right).map(|right| &right.kind) {
+            Some(hir::SourceKind::FromGroup(group)) => {
+                hir_loop_explain_join(document, &group.from, source)
+            }
+            _ => None,
+        }
+    })
+}
+
 fn prepare_hir_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    planned_loop: &'a HirPlannedLoop,
+) -> Result<PreparedHirLoop<'a>> {
+    // A subquery's own rows go under its loop's row.
+    program.with_source_explain_parent(planned_loop.source, |program| {
+        prepare_hir_loop_unexplained(program, plan, planned_loop)
+    })
+}
+
+fn prepare_hir_loop_unexplained<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,
@@ -7652,6 +7838,44 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn explain_query_plan_names_each_loop_before_its_cursors_open() {
+        let rows = |sql| {
+            let plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let mut program = program_with_mode(QueryMode::ExplainQueryPlan {
+                format: turso_parser::ast::EqpFormat::Text,
+            });
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("EXPLAIN QUERY PLAN body emits");
+            program
+                .insns
+                .iter()
+                .enumerate()
+                .filter_map(|(position, (insn, _))| match insn {
+                    Insn::Explain { detail, .. } => Some((position, detail.to_string())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Like legacy, the loop rows come first, so their ids are stable.
+        assert_eq!(
+            rows("SELECT value FROM items ORDER BY value"),
+            [(0, "SCAN items USING COVERING INDEX items_value".to_string())]
+        );
+        assert_eq!(
+            rows("SELECT a.extra FROM items a JOIN items b ON b.value = a.value"),
+            [
+                (0, "SCAN items AS a".to_string()),
+                (
+                    1,
+                    "SEARCH b USING COVERING INDEX items_value (value=?)".to_string()
+                ),
+            ]
+        );
+        assert_eq!(rows("SELECT 1"), [(0, "SCAN CONSTANT ROW".to_string())]);
     }
 
     #[test]
