@@ -84,6 +84,20 @@ expect {
     0
 }
 
+test mvcc-analyze-in-begin-concurrent {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t24(x);
+    INSERT INTO t24 VALUES (1);
+    BEGIN CONCURRENT;
+    ANALYZE;
+    COMMIT;
+    SELECT count(*) FROM sqlite_stat1 WHERE tbl = 't24';
+}
+expect {
+    mvcc
+    1
+}
+
 test mvcc-ddl-works-in-exclusive-transaction {
     PRAGMA journal_mode = 'mvcc';
     BEGIN;
@@ -96,10 +110,6 @@ expect {
     mvcc
     42
 }
-
-# SAVEPOINT / ROLLBACK TO straddling the DDL upgrade: the rollback must undo
-# the DDL (schema row and data) while keeping the transaction open, and the
-# same name must be creatable again in the same transaction.
 
 test mvcc-savepoint-rollback-undoes-ddl-upgrade {
     PRAGMA journal_mode = 'mvcc';
