@@ -13685,11 +13685,7 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            if !mv_store.is_exclusive_tx(&tx_id) {
-                return Err(LimboError::TxError(
-                    "DDL statements require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-                ).into());
-            }
+            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
         }
     }
 
@@ -15736,13 +15732,9 @@ pub fn op_set_cookie(
             )
             .into());
         };
-        if !mv_store.is_exclusive_tx(&tx_id) {
-            // Header cookies are global metadata with no row-level conflict keys; require
-            // SQLite-style single-writer semantics (same policy as DDL in MVCC).
-            return Err(LimboError::TxError(
-                "Header updates require an exclusive transaction (use BEGIN instead of BEGIN CONCURRENT)".to_string(),
-            ).into());
-        }
+        // Header cookies are global metadata with no row-level conflict keys; they need
+        // SQLite-style single-writer semantics (same policy as DDL in MVCC).
+        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -15814,6 +15806,24 @@ pub fn op_set_cookie(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// DDL and header updates need SQLite single-writer semantics. When they run
+/// inside a concurrent MVCC transaction, upgrade it to exclusive in place
+/// instead of failing the statement. The upgrade returns Busy if another
+/// transaction committed after this one began (the snapshot is stale) or if
+/// another transaction holds the exclusive slot.
+fn upgrade_mv_tx_to_exclusive(
+    program: &Program,
+    pager: &Arc<Pager>,
+    mv_store: &MvStore,
+    tx_id: TxID,
+) -> Result<()> {
+    if mv_store.is_exclusive_tx(&tx_id) {
+        return Ok(());
+    }
+    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
+    Ok(())
 }
 
 pub fn op_shift_right(
