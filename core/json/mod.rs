@@ -719,6 +719,9 @@ pub fn json_string_to_db_type(
             }
         }
         ElementType::INT | ElementType::INT5 => {
+            if let Some(int) = json5_hex_literal_to_i64(json.scalar_payload_text()?)? {
+                return Ok(Value::from_i64(int));
+            }
             let result = i64::from_str(&json_string);
             if let Ok(int) = result {
                 Ok(Value::from_i64(int))
@@ -734,6 +737,33 @@ pub fn json_string_to_db_type(
         ElementType::FALSE => Ok(Value::from_i64(0)),
         _ => unreachable!(),
     }
+}
+
+fn json5_hex_literal_to_i64(payload: &str) -> crate::Result<Option<i64>> {
+    let (negative, unsigned) = match payload.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, payload),
+    };
+    let Some(digits) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    else {
+        return Ok(None);
+    };
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(LimboError::Constraint("malformed JSON".to_string()));
+    }
+    let magnitude = if digits.is_empty() {
+        0
+    } else {
+        u64::from_str_radix(digits, 16)? as i64
+    };
+    Ok(Some(if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    }))
 }
 
 pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate::Result<Value> {
