@@ -12,6 +12,7 @@ use crate::{
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
+        optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
@@ -812,6 +813,8 @@ fn build_materialized_build_input_plan(
     // terms for access methods (e.g. ephemeral autoindex seeks) that get
     // overwritten to scans inside the subplan. Reset each term's consumed
     // flag: only terms referencing tables outside the prefix are consumed.
+    // Terms implied by a partial index that the subplan still reads are
+    // consumed again below, after the access methods are checked.
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -937,6 +940,19 @@ fn build_materialized_build_input_plan(
             // Downgrade to a default scan. This ensures the subplan only uses
             // access paths that are valid within the prefix join order.
             joined_table.op = Operation::default_scan_for(&joined_table.table);
+        }
+
+        if let Some(index) = partial_index(joined_table.op.index()) {
+            let is_outer_join = joined_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer());
+            mark_partial_index_predicate_terms_consumed(
+                index,
+                joined_table,
+                &mut where_clause,
+                is_outer_join,
+            );
         }
     }
 
