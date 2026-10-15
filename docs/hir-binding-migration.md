@@ -229,7 +229,7 @@ new values. These still go to legacy:
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
 | Any subquery, UPDATE ... FROM | Collecting the rows to change first, as legacy does |
 | A changed rowid, or a changed key of the index the loop reads | The same |
-| REPLACE (statement, NOT NULL, or index) | Deleting the conflicting row |
+| ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
@@ -246,7 +246,7 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
-| UPSERT and REPLACE (statement, column, index or INTEGER PRIMARY KEY) | Conflict actions |
+| UPSERT | Conflict actions |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
 | WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
 
@@ -281,6 +281,16 @@ row may be its own parent. After a new row is written, children of a
 deferred or self-referencing constraint that point at its key take back
 their violations. With foreign keys off, DML carries no foreign-key metadata,
 so a child of a missing parent table can still be written.
+
+REPLACE is lowered for INSERT and UPDATE as legacy does it. The row the new
+row conflicts with is deleted inline, with its index entries and the
+foreign-key checks of deleting it (no DELETE trigger fires); an INSERT writes
+an index whose conflict resolves to REPLACE as soon as it is checked, and an
+INTEGER PRIMARY KEY with its own ON CONFLICT REPLACE after the indexes. NOT
+NULL ON CONFLICT REPLACE stores the column's DEFAULT, resolved in semantic
+analysis. UPDATE OR REPLACE first collects its rowids; after deleting the
+other row an UPDATE seeks back to its own. A REPLACE that would fire an ON
+DELETE action still goes to legacy.
 
 ### Non-lowering phase complete
 

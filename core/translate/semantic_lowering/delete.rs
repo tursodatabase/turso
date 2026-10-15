@@ -411,6 +411,7 @@ fn emit_delete_row(
         source.id,
         row.rowid,
         database,
+        None,
     )?;
     // The key of the index the loop reads is taken before the row is
     // deleted and removed after it.

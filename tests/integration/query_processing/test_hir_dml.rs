@@ -224,6 +224,29 @@ fn hir_update_matches_legacy() {
         &["UPDATE OR IGNORE u SET b = NULL WHERE a > 4"],
         &["UPDATE u SET c = 'p' WHERE a = 6"],
         &["PRAGMA count_changes = 1", "UPDATE u SET d = 0 WHERE a < 3"],
+        // REPLACE deletes the rows the new row conflicts with.
+        &["UPDATE OR REPLACE u SET b = 1 WHERE a = 2"],
+        &["UPDATE OR REPLACE u SET b = b + 1"],
+        &["UPDATE OR REPLACE u SET b = 7 - b"],
+        &["UPDATE OR REPLACE u SET c = 'p', d = 5 WHERE a = 6"],
+        &["UPDATE OR REPLACE u SET b = 3 WHERE a = 1 RETURNING *"],
+        &["UPDATE OR REPLACE u SET b = NULL WHERE a = 1"],
+        &[
+            "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "UPDATE OR REPLACE u SET b = 1 WHERE a > 2",
+        ],
+        &[
+            "CREATE TABLE ur(a INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT REPLACE, \
+             c NOT NULL ON CONFLICT REPLACE DEFAULT 'dflt', d UNIQUE)",
+            "INSERT INTO ur VALUES (1, 1, 'x', 1), (2, 2, 'y', 2), (3, 3, 'z', 3)",
+            "UPDATE ur SET b = 2 WHERE a = 1",
+            "UPDATE ur SET c = NULL WHERE a = 3",
+            "UPDATE ur SET d = 3 WHERE a = 1",
+            "UPDATE OR IGNORE ur SET b = 3 WHERE a = 1",
+            "UPDATE OR ABORT ur SET c = NULL",
+            "SELECT * FROM ur ORDER BY a",
+            "PRAGMA integrity_check",
+        ],
         // Statements that still go through legacy.
         &[
             "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
@@ -559,6 +582,15 @@ fn hir_foreign_keys_match_legacy() {
         &["UPDATE q SET k = 'z', up = 'z' WHERE k = 'n'"],
         &["UPDATE q SET up = 'n' WHERE k = 'n'"],
         &["UPDATE q SET up = 'nope' WHERE k = 'n'"],
+        // UPDATE OR REPLACE checks the foreign keys of the rows it deletes.
+        &["UPDATE OR REPLACE p SET k = 'one' WHERE id = 2"],
+        &["UPDATE OR REPLACE p SET k = 'one' WHERE id = 5"],
+        &[
+            "BEGIN",
+            "UPDATE OR REPLACE p SET a = 4, b = 4 WHERE id = 5",
+            "COMMIT",
+        ],
+        &["UPDATE OR REPLACE q SET k = 'n' WHERE k = 'm'"],
     ] {
         let statements = FK_SETUP
             .iter()

@@ -77,6 +77,10 @@ fn is_check_only(action: RefAct) -> bool {
 /// Where the target is the parent, a child row that still points at the row
 /// is a violation. Where the target is the child of a deferred constraint, a
 /// row that pointed at a missing parent takes back the violation it added.
+///
+/// `replacement` is a row that REPLACE writes in place of this one, bound to
+/// its registers. Like legacy, an immediate NO ACTION constraint whose key
+/// it keeps is not checked.
 pub(super) fn emit_delete_checks(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -84,9 +88,27 @@ pub(super) fn emit_delete_checks(
     target: SourceId,
     rowid: usize,
     database: usize,
+    replacement: Option<SourceId>,
 ) -> Result<()> {
     for foreign_key in &foreign_keys.incoming {
+        let declaration = &foreign_key.declaration;
+        let keeps_key = replacement
+            .filter(|_| declaration.on_delete == RefAct::NoAction && !declaration.deferred);
+        let kept = match keeps_key {
+            Some(replacement) => {
+                let width = foreign_key.parent_positions.len();
+                let old_key = emit_parent_key(program, document, foreign_key, target)?;
+                let new_key = emit_parent_key(program, document, foreign_key, replacement)?;
+                let kept = program.allocate_label();
+                emit_skip_if_same_key(program, old_key, new_key, width, kept);
+                Some(kept)
+            }
+            None => None,
+        };
         emit_children_still_point_here(program, document, foreign_key, target, rowid, database)?;
+        if let Some(kept) = kept {
+            program.preassign_label_to_next_insn(kept);
+        }
     }
     for foreign_key in &foreign_keys.outgoing {
         if foreign_key.declaration.deferred {
@@ -373,17 +395,23 @@ pub(super) fn emit_insert_parent_repairs(
 /// is the child and the child key changes, the old key takes back its
 /// deferred violation if its parent was missing, and a new key without a
 /// parent adds one.
+///
+/// When the UPDATE may REPLACE (`replaces`), another row may still hold the
+/// new parent key until the write, so the repairs of the new key are
+/// returned to be emitted after it with [`emit_update_repairs`].
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_update_checks(
+pub(super) fn emit_update_checks<'a>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    foreign_keys: &hir::DmlForeignKeys,
+    foreign_keys: &'a hir::DmlForeignKeys,
     old: SourceId,
     new: SourceId,
     rowid: usize,
     assigned: &[usize],
     database: usize,
-) -> Result<()> {
+    replaces: bool,
+) -> Result<Vec<PendingRepair<'a>>> {
+    let mut pending = Vec::new();
     for foreign_key in &foreign_keys.incoming {
         if !parent_key_may_change(foreign_key, assigned) {
             continue;
@@ -395,8 +423,29 @@ pub(super) fn emit_update_checks(
         let width = foreign_key.parent_positions.len();
         let old_key = emit_parent_key(program, document, foreign_key, old)?;
         let new_key = emit_parent_key(program, document, foreign_key, new)?;
+        let deferred = foreign_key.declaration.deferred;
+        // Set when the key changes, for the repairs after the write.
+        let changed = (replaces && deferred).then(|| {
+            let changed = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: changed,
+            });
+            changed
+        });
         let unchanged = program.allocate_label();
         emit_skip_if_same_key(program, old_key, new_key, width, unchanged);
+        if let Some(changed) = changed {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: changed,
+            });
+            pending.push(PendingRepair {
+                foreign_key,
+                changed,
+                new_key,
+            });
+        }
         // A row that points at itself and changes its child key too no
         // longer points at its old parent key.
         let exclude = (is_self_reference(foreign_key) && child_key_changes(foreign_key, assigned))
@@ -417,20 +466,8 @@ pub(super) fn emit_update_checks(
                 }
             },
         )?;
-        if foreign_key.declaration.deferred {
-            emit_child_probe(
-                program,
-                foreign_key,
-                new_key,
-                None,
-                database,
-                |program: &mut ProgramBuilder| {
-                    let next = program.allocate_label();
-                    emit_guarded_fk_decrement(program, next, true);
-                    program.preassign_label_to_next_insn(next);
-                    Ok(())
-                },
-            )?;
+        if deferred && !replaces {
+            emit_new_parent_key_repairs(program, foreign_key, new_key, database)?;
         }
         program.preassign_label_to_next_insn(unchanged);
     }
@@ -542,7 +579,68 @@ pub(super) fn emit_update_checks(
         }
         program.preassign_label_to_next_insn(ok);
     }
+    Ok(pending)
+}
+
+/// A repair of children of a new parent key that waits until the UPDATE has
+/// written its row.
+pub(super) struct PendingRepair<'a> {
+    foreign_key: &'a hir::ResolvedForeignKey,
+    /// Whether the key changed.
+    changed: usize,
+    new_key: usize,
+}
+
+/// After the row is written, children of a new deferred parent key take
+/// back their violations, as legacy does under REPLACE.
+pub(super) fn emit_update_repairs(
+    program: &mut ProgramBuilder,
+    pending: &[PendingRepair<'_>],
+    database: usize,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let done = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: true,
+        target_pc: done,
+    });
+    for repair in pending {
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: repair.changed,
+            target_pc: skip,
+            jump_if_null: true,
+        });
+        emit_new_parent_key_repairs(program, repair.foreign_key, repair.new_key, database)?;
+        program.preassign_label_to_next_insn(skip);
+    }
+    program.preassign_label_to_next_insn(done);
     Ok(())
+}
+
+/// Children of a new deferred parent key had no parent until now: take back
+/// one violation for each.
+fn emit_new_parent_key_repairs(
+    program: &mut ProgramBuilder,
+    foreign_key: &hir::ResolvedForeignKey,
+    new_key: usize,
+    database: usize,
+) -> Result<()> {
+    emit_child_probe(
+        program,
+        foreign_key,
+        new_key,
+        None,
+        database,
+        |program: &mut ProgramBuilder| {
+            let next = program.allocate_label();
+            emit_guarded_fk_decrement(program, next, true);
+            program.preassign_label_to_next_insn(next);
+            Ok(())
+        },
+    )
 }
 
 /// Jump to `same` when the two keys are equal, NULLs included, as legacy's

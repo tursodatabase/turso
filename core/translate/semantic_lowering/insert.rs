@@ -710,84 +710,23 @@ impl InsertRow<'_> {
         Ok(())
     }
 
-    /// REPLACE: delete the row whose rowid is in `conflict`, its index
-    /// entries and the foreign-key checks of deleting it, as legacy does. No
-    /// DELETE trigger fires. The new row's binding is restored after.
+    /// REPLACE: delete the row whose rowid is in `conflict`, then bind the
+    /// target to the new row again.
     fn emit_replace_delete(
         &self,
         program: &mut ProgramBuilder,
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
         conflict: usize,
     ) -> Result<()> {
-        let DmlTarget {
-            document,
-            source,
-            table,
-            database,
-        } = *self.target;
-        let missing = program.allocate_label();
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: self.table_cursor,
-            src_reg: conflict,
-            target_pc: missing,
-        });
-        // Keys and foreign keys of the deleted row are read from the table.
-        program.bind_source(
-            source.id,
-            SourceBinding::BTree {
-                scan_cursor: self.table_cursor,
-                table_cursor: None,
-            },
-        );
-        super::fkey::emit_delete_checks(
+        super::dml::emit_replace_delete(
             program,
-            document,
+            self.target,
+            self.table_cursor,
+            index_cursors,
             self.foreign_keys,
-            source.id,
             conflict,
-            database,
+            None,
         )?;
-        for (expressions, cursor) in index_cursors {
-            let skip = match &expressions.predicate {
-                Some(predicate) => {
-                    let skip = program.allocate_label();
-                    let register = program.alloc_register();
-                    super::expr::translate_expr_no_constant_opt(
-                        program, document, predicate, register,
-                    )?;
-                    program.emit_insn(Insn::IfNot {
-                        reg: register,
-                        jump_if_null: true,
-                        target_pc: skip,
-                    });
-                    Some(skip)
-                }
-                None => None,
-            };
-            let (start, count) = super::dml::emit_index_key(
-                program,
-                document,
-                source,
-                table,
-                self.table_cursor,
-                expressions,
-            )?;
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: start,
-                num_regs: count,
-                cursor_id: *cursor,
-                raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
-            });
-            if let Some(skip) = skip {
-                program.preassign_label_to_next_insn(skip);
-            }
-        }
-        program.emit_insn(Insn::Delete {
-            cursor_id: self.table_cursor,
-            table_name: table.name.clone(),
-            is_part_of_update: true,
-        });
-        program.preassign_label_to_next_insn(missing);
         self.bind_new_row(program);
         Ok(())
     }

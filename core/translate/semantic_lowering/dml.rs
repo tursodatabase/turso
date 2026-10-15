@@ -12,7 +12,7 @@ use crate::{
         semantic_to_plan::HirAccessPlan,
     },
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
+        builder::{CursorType, ProgramBuilder, SourceBinding},
         insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
@@ -234,6 +234,89 @@ pub(super) fn emit_index_key(
         dest: start + count - 1,
     });
     Ok((start, count))
+}
+
+/// REPLACE: delete the row whose rowid is in `conflict`, as legacy does:
+/// the foreign-key checks of deleting it, its entry in each of `indexes`,
+/// then the row. No DELETE trigger fires. The target is left bound to
+/// `table_cursor`, which no longer sits on any row.
+///
+/// `replacement` is the row an UPDATE writes in its place: an immediate NO
+/// ACTION parent key it keeps cannot leave a child without its parent.
+pub(super) fn emit_replace_delete(
+    program: &mut ProgramBuilder,
+    target: &DmlTarget<'_>,
+    table_cursor: CursorID,
+    indexes: &[(&hir::IndexExpressions, CursorID)],
+    foreign_keys: &hir::DmlForeignKeys,
+    conflict: usize,
+    replacement: Option<SourceId>,
+) -> Result<()> {
+    let DmlTarget {
+        document,
+        source,
+        table,
+        database,
+    } = *target;
+    let missing = program.allocate_label();
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: table_cursor,
+        src_reg: conflict,
+        target_pc: missing,
+    });
+    // Keys and foreign keys of the deleted row are read from the table.
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    super::fkey::emit_delete_checks(
+        program,
+        document,
+        foreign_keys,
+        source.id,
+        conflict,
+        database,
+        replacement,
+    )?;
+    for (expressions, cursor) in indexes {
+        let skip = match &expressions.predicate {
+            Some(predicate) => {
+                let skip = program.allocate_label();
+                let register = program.alloc_register();
+                super::expr::translate_expr_no_constant_opt(
+                    program, document, predicate, register,
+                )?;
+                program.emit_insn(Insn::IfNot {
+                    reg: register,
+                    jump_if_null: true,
+                    target_pc: skip,
+                });
+                Some(skip)
+            }
+            None => None,
+        };
+        let (start, count) =
+            emit_index_key(program, document, source, table, table_cursor, expressions)?;
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: start,
+            num_regs: count,
+            cursor_id: *cursor,
+            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+        });
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: table_cursor,
+        table_name: table.name.clone(),
+        is_part_of_update: true,
+    });
+    program.preassign_label_to_next_insn(missing);
+    Ok(())
 }
 
 pub(super) fn operation_index(operation: &HirBtreeOperation) -> Option<&Arc<crate::schema::Index>> {

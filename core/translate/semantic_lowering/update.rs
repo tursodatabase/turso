@@ -18,7 +18,7 @@ use crate::{
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
-        stmt_journal::constraint_may_abort,
+        stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,
@@ -53,7 +53,6 @@ pub(super) fn needs_legacy(
         || !update.order_by.is_empty()
         || update.limit.is_some()
         || update.cdc_updates_override.is_some()
-        || matches!(update.conflict, Some(ResolveType::Replace))
     {
         return Ok(true);
     }
@@ -101,26 +100,15 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // A REPLACE conflict deletes other rows while the loop runs.
-    if source
-        .index_expressions
-        .iter()
-        .any(|index| matches!(index.index.value().on_conflict, Some(ResolveType::Replace)))
-    {
-        return Ok(true);
-    }
     let assigned = assigned_columns(update)?;
     // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
     if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&assigned)) {
         return Ok(true);
     }
-    // NOT NULL ON CONFLICT REPLACE stores the column's default instead.
-    if assigned.iter().any(|column| {
-        matches!(column, hir::TargetColumn::Column(column)
-        if table.columns().get(*column).is_some_and(|column| {
-            matches!(column.notnull_conflict_clause, Some(ResolveType::Replace))
-        }))
-    }) {
+    // REPLACE deletes the rows the new row conflicts with; an ON DELETE
+    // action on them still needs legacy.
+    let replaces = may_replace(update, source);
+    if replaces && super::fkey::delete_needs_legacy(foreign_keys) {
         return Ok(true);
     }
     // Changing the rowid moves the row; legacy collects the rows first.
@@ -145,7 +133,9 @@ pub(super) fn needs_legacy(
     let Some(iteration_index) = operation_index(operation) else {
         return Ok(false);
     };
-    if iteration_index.ephemeral {
+    // A REPLACE declared on an index deletes rows while the loop reads an
+    // index; legacy does that in place.
+    if iteration_index.ephemeral || (replaces && update.conflict.is_none()) {
         return Ok(true);
     }
     // Changing the index the loop reads could visit a row again; legacy
@@ -195,7 +185,12 @@ pub(super) fn emit_update(
             "HIR UPDATE target does not use a B-tree loop".into(),
         ));
     };
-    let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
+    let hir::UpdateTargetKind::BTree {
+        foreign_keys,
+        defaults,
+        ..
+    } = &update.target_kind
+    else {
         return Err(LimboError::InternalError(
             "HIR UPDATE target is not a B-tree table".into(),
         ));
@@ -247,7 +242,15 @@ pub(super) fn emit_update(
 
     // Same statement-journal facts as legacy.
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
-    if triggers.is_empty() && !has_foreign_keys && touches_at_most_one_row(operation) {
+    let replaces = any_effective_replace(
+        has_statement_conflict,
+        or_conflict,
+        table.rowid_alias_conflict_clause,
+        changed_indexes
+            .iter()
+            .map(|(old, _)| old.index.value().on_conflict),
+    );
+    if triggers.is_empty() && !has_foreign_keys && !replaces && touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
     let has_notnull = values
@@ -288,6 +291,8 @@ pub(super) fn emit_update(
     let assigned = assigned_positions(&assigned);
     let row_layout = UpdateRowLayout {
         values: &values,
+        defaults,
+        replaces,
         assigned: &assigned,
         changed_indexes: &changed_indexes,
         new_source: new_source.id,
@@ -297,7 +302,10 @@ pub(super) fn emit_update(
         mvcc,
     };
     let done = program.allocate_label();
-    if triggers.is_empty() {
+    // Like legacy, an UPDATE with triggers or OR REPLACE first collects its
+    // rowids, since a trigger or a REPLACE can change the table.
+    let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
+    if triggers.is_empty() && !statement_replace {
         emit_scan_update(program, &target, access, operation, &row_layout, row, done)?;
     } else {
         emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?;
@@ -313,6 +321,10 @@ pub(super) fn emit_update(
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
     values: &'a [Option<&'a hir::Expr>],
+    /// What NOT NULL ON CONFLICT REPLACE stores instead of a NULL.
+    defaults: &'a [hir::ResolvedDefault],
+    /// Whether a conflict of the new row may resolve with REPLACE.
+    replaces: bool,
     /// The positions of the columns the UPDATE sets.
     assigned: &'a [usize],
     /// The indexes the UPDATE changes, with their OLD- and NEW-row expressions.
@@ -356,7 +368,7 @@ fn emit_scan_update(
         });
         cursor
     });
-    let index_cursors = open_changed_indexes(program, target, layout);
+    let index_cursors = open_changed_indexes(program, target, layout)?;
 
     let scan_cursor = iteration_cursor.unwrap_or(table_cursor);
     let lookup_cursor = iteration_cursor.map(|_| table_cursor);
@@ -386,6 +398,7 @@ fn emit_scan_update(
         rowid: program.alloc_registers(target.table.columns().len() + 1),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
+        defaults: layout.defaults,
         skip_row: hir_loop.next,
     };
     // RowId on the table cursor also finishes a deferred seek from the
@@ -450,7 +463,7 @@ fn emit_rowset_update(
     }
 
     let table_cursor = target.open_table_for_write(program);
-    let index_cursors = open_changed_indexes(program, target, layout);
+    let index_cursors = open_changed_indexes(program, target, layout)?;
     let next = program.allocate_label();
     let row = UpdateRow {
         target,
@@ -458,6 +471,7 @@ fn emit_rowset_update(
         rowid: program.alloc_registers(target.table.columns().len() + 1),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
+        defaults: layout.defaults,
         skip_row: next,
     };
     program.preassign_label_to_next_insn(next);
@@ -476,12 +490,41 @@ fn emit_rowset_update(
     Ok(())
 }
 
-fn open_changed_indexes(
+/// The index cursors an UPDATE writes through.
+struct IndexCursors<'a> {
+    /// One for each changed index, in the same order.
+    changed: Vec<CursorID>,
+    /// Every index, when a REPLACE may delete another row; empty otherwise.
+    all: Vec<(&'a hir::IndexExpressions, CursorID)>,
+}
+
+/// Open the changed indexes for writing, or every index when a REPLACE may
+/// delete another row.
+fn open_changed_indexes<'a>(
     program: &mut ProgramBuilder,
-    target: &DmlTarget<'_>,
+    target: &'a DmlTarget<'_>,
     layout: &UpdateRowLayout<'_>,
-) -> Vec<CursorID> {
-    layout
+) -> Result<IndexCursors<'a>> {
+    if layout.replaces {
+        let all = target.open_indexes_for_write(program, None)?;
+        let changed = layout
+            .changed_indexes
+            .iter()
+            .map(|(old, _)| {
+                all.iter()
+                    .find(|(expressions, _)| expressions.index == old.index)
+                    .map(|(_, cursor)| *cursor)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "HIR UPDATE did not open index {}",
+                            old.index.value().name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(IndexCursors { changed, all });
+    }
+    let changed = layout
         .changed_indexes
         .iter()
         .map(|(old, _)| {
@@ -493,7 +536,11 @@ fn open_changed_indexes(
             });
             cursor
         })
-        .collect()
+        .collect();
+    Ok(IndexCursors {
+        changed,
+        all: Vec::new(),
+    })
 }
 
 pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPlan)> {
@@ -508,6 +555,18 @@ pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPla
         ));
     };
     Ok((update, access))
+}
+
+/// Whether a conflict of the new row may resolve with REPLACE: the
+/// statement's OR REPLACE, or ON CONFLICT REPLACE on an index.
+fn may_replace(update: &hir::Update, source: &hir::Source) -> bool {
+    match update.conflict {
+        Some(conflict) => conflict == ResolveType::Replace,
+        None => source
+            .index_expressions
+            .iter()
+            .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace)),
+    }
 }
 
 /// The table positions of `assigned`. The rowid has none; an UPDATE that
@@ -568,6 +627,8 @@ struct UpdateRow<'a, 'b> {
     rowid: usize,
     or_conflict: ResolveType,
     has_statement_conflict: bool,
+    /// What NOT NULL ON CONFLICT REPLACE stores instead of a NULL.
+    defaults: &'a [hir::ResolvedDefault],
     /// Where `OR IGNORE` goes to leave the row unchanged.
     skip_row: BranchOffset,
 }
@@ -593,8 +654,9 @@ impl UpdateRow<'_, '_> {
         &self,
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
-        index_cursors: &[CursorID],
+        cursors: &IndexCursors<'_>,
     ) -> Result<()> {
+        let index_cursors = &cursors.changed;
         let document = self.target.document;
         let table = self.target.table;
         let source = self.target.source;
@@ -667,7 +729,7 @@ impl UpdateRow<'_, '_> {
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
             {
                 if value.is_some() && column.notnull() {
-                    self.emit_notnull_check(program, column, self.start() + position);
+                    self.emit_notnull_check(program, position, column)?;
                 }
             }
         }
@@ -684,11 +746,11 @@ impl UpdateRow<'_, '_> {
         // then insert the new ones.
         let mut new_keys = Vec::with_capacity(layout.changed_indexes.len());
         for ((old, new), cursor) in layout.changed_indexes.iter().zip(index_cursors) {
-            new_keys.push(self.emit_new_index_key(program, old, new, *cursor)?);
+            new_keys.push(self.emit_new_index_key(program, layout, cursors, old, new, *cursor)?);
         }
         // Like legacy, foreign keys are checked after the other constraints
         // and before anything is rewritten.
-        super::fkey::emit_update_checks(
+        let pending_repairs = super::fkey::emit_update_checks(
             program,
             document,
             layout.foreign_keys,
@@ -697,6 +759,7 @@ impl UpdateRow<'_, '_> {
             self.rowid,
             layout.assigned,
             self.target.database,
+            layout.replaces,
         )?;
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
@@ -776,6 +839,7 @@ impl UpdateRow<'_, '_> {
             flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.name.clone(),
         });
+        super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
         if let Some(returning) = layout.returning {
             let start = returning.emit_values(program, document)?;
             returning.emit_buffer(program, start);
@@ -806,7 +870,7 @@ impl UpdateRow<'_, '_> {
                 Some(value) => {
                     super::expr::translate_expr(program, self.target.document, value, register)?;
                     if check_notnull && column.notnull() {
-                        self.emit_notnull_check(program, column, register);
+                        self.emit_notnull_check(program, position, column)?;
                     }
                 }
                 None if column.is_rowid_alias() => program.emit_null(register, None),
@@ -838,12 +902,40 @@ impl UpdateRow<'_, '_> {
         Ok(())
     }
 
-    fn emit_notnull_check(&self, program: &mut ProgramBuilder, column: &Column, register: usize) {
+    fn emit_notnull_check(
+        &self,
+        program: &mut ProgramBuilder,
+        position: usize,
+        column: &Column,
+    ) -> Result<()> {
+        let register = self.start() + position;
         let conflict = if self.has_statement_conflict {
             self.or_conflict
         } else {
             column.notnull_conflict_clause.unwrap_or(ResolveType::Abort)
         };
+        // REPLACE stores the column's DEFAULT instead of a NULL. Without a
+        // DEFAULT, or if it is NULL too, the statement aborts.
+        if conflict == ResolveType::Replace {
+            if let Some(default) = self
+                .defaults
+                .iter()
+                .find(|default| default.column == position)
+            {
+                let not_null = program.allocate_label();
+                program.emit_insn(Insn::NotNull {
+                    reg: register,
+                    target_pc: not_null,
+                });
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    self.target.document,
+                    &default.value,
+                    register,
+                )?;
+                program.preassign_label_to_next_insn(not_null);
+            }
+        }
         match conflict {
             ResolveType::Ignore => program.emit_insn(Insn::IsNull {
                 reg: register,
@@ -859,6 +951,7 @@ impl UpdateRow<'_, '_> {
                 ),
             }),
         }
+        Ok(())
     }
 
     /// Build the new key of a changed index and, for a UNIQUE index, check
@@ -866,6 +959,8 @@ impl UpdateRow<'_, '_> {
     fn emit_new_index_key(
         &self,
         program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        cursors: &IndexCursors<'_>,
         old: &hir::IndexExpressions,
         new: &hir::IndexExpressions,
         cursor: CursorID,
@@ -961,7 +1056,16 @@ impl UpdateRow<'_, '_> {
         });
 
         if index.unique {
-            self.emit_unique_check(program, index, cursor, start, columns, new_in_index);
+            self.emit_unique_check(
+                program,
+                layout,
+                cursors,
+                index,
+                cursor,
+                start,
+                columns,
+                new_in_index,
+            )?;
         }
         Ok(NewIndexKey {
             start,
@@ -972,15 +1076,18 @@ impl UpdateRow<'_, '_> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_unique_check(
         &self,
         program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        cursors: &IndexCursors<'_>,
         index: &crate::schema::Index,
         cursor: CursorID,
         start: usize,
         columns: usize,
         new_in_index: Option<usize>,
-    ) {
+    ) -> Result<()> {
         let conflict = if self.has_statement_conflict {
             self.or_conflict
         } else {
@@ -1018,6 +1125,25 @@ impl UpdateRow<'_, '_> {
             ResolveType::Ignore => program.emit_insn(Insn::Goto {
                 target_pc: self.skip_row,
             }),
+            ResolveType::Replace => {
+                // Like legacy, delete the other row, then go back to this one.
+                super::dml::emit_replace_delete(
+                    program,
+                    self.target,
+                    self.table_cursor,
+                    &cursors.all,
+                    layout.foreign_keys,
+                    found,
+                    Some(layout.new_source),
+                )?;
+                let back = program.allocate_label();
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: self.table_cursor,
+                    src_reg: self.rowid,
+                    target_pc: back,
+                });
+                program.preassign_label_to_next_insn(back);
+            }
             _ => {
                 let table_name = &self.target.table.name;
                 let columns = index
@@ -1037,6 +1163,7 @@ impl UpdateRow<'_, '_> {
             }
         }
         program.preassign_label_to_next_insn(unique);
+        Ok(())
     }
 }
 
