@@ -3938,7 +3938,7 @@ fn prepare_hir_loop_unexplained<'a>(
     match &planned_loop.access {
         HirSourceAccess::BTree { .. } => Ok(PreparedHirLoop::BTree(prepare_hir_btree_loop(
             program,
-            &plan.document,
+            plan,
             planned_loop,
         )?)),
         HirSourceAccess::Virtual(operation) => Ok(PreparedHirLoop::Virtual(
@@ -4430,9 +4430,10 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
 
 fn prepare_hir_btree_loop<'a>(
     program: &mut ProgramBuilder,
-    document: &'a HirDocument,
+    plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,
 ) -> Result<PreparedHirBtreeLoop<'a>> {
+    let document = &plan.document;
     let HirSourceAccess::BTree {
         operation,
         table_lookup,
@@ -4487,13 +4488,17 @@ fn prepare_hir_btree_loop<'a>(
         ))
     })?;
     program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    // Like legacy, a materialized view's table cursor also sees the current
+    // transaction's changes.
+    let table_cursor_type = || match plan.materialized_view(source.id) {
+        Some(view) => CursorType::MaterializedView(table.clone(), view.clone()),
+        None => CursorType::BTreeTable(table.clone()),
+    };
     let (cursor, table_cursor, autoindex_source_cursor) = if let Some(index) = index {
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         let table_cursor = match table_lookup {
             BtreeTableLookup::ScanOnly => None,
-            BtreeTableLookup::TableRequired => {
-                Some(program.alloc_cursor_id(CursorType::BTreeTable(table.clone())))
-            }
+            BtreeTableLookup::TableRequired => Some(program.alloc_cursor_id(table_cursor_type())),
         };
         let autoindex_source_cursor =
             if index.ephemeral {
@@ -4511,11 +4516,7 @@ fn prepare_hir_btree_loop<'a>(
                 source.id
             )));
         }
-        (
-            program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
-            None,
-            None,
-        )
+        (program.alloc_cursor_id(table_cursor_type()), None, None)
     };
     program.bind_source(
         source.id,

@@ -19,8 +19,9 @@ use super::{
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
 use crate::{
+    incremental::view::IncrementalView,
     schema::{Index, Schema, Table},
-    sync::Arc,
+    sync::{Arc, Mutex},
     LimboError, Result,
 };
 use rustc_hash::FxHashSet as HashSet;
@@ -46,6 +47,9 @@ pub(crate) struct HirPlan {
     pub(crate) document: Arc<HirDocument>,
     pub(crate) root: HirRootPlan,
     pub(crate) queries: Vec<HirPlannedQuery>,
+    /// Table sources that read a materialized view. Their cursor merges the
+    /// current transaction's changes into the stored rows.
+    pub(crate) materialized_views: Vec<(SourceId, Arc<Mutex<IncrementalView>>)>,
 }
 
 /// Planner facts owned by the semantic root. Variants without a source scan
@@ -107,11 +111,22 @@ impl HirPlan {
                 })
         };
         let root = context.plan_root(schema, params, &query_estimate)?;
+        let materialized_views = materialized_view_sources(&document, schema)?;
         Ok(Self {
             document,
             root,
             queries,
+            materialized_views,
         })
+    }
+
+    pub(crate) fn materialized_view(
+        &self,
+        source: SourceId,
+    ) -> Option<&Arc<Mutex<IncrementalView>>> {
+        self.materialized_views
+            .iter()
+            .find_map(|(view_source, view)| (*view_source == source).then_some(view))
     }
 
     pub(crate) fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
@@ -1279,6 +1294,37 @@ fn selected_btree_index(operation: &HirBtreeOperation) -> Option<&Index> {
         | HirBtreeOperation::InSeek { index, .. } => index.as_deref(),
         HirBtreeOperation::RowidEq { .. } => None,
     }
+}
+
+/// Main-schema table sources that are materialized views, checked the way
+/// legacy checks them before reading.
+fn materialized_view_sources(
+    document: &HirDocument,
+    schema: &Schema,
+) -> Result<Vec<(SourceId, Arc<Mutex<IncrementalView>>)>> {
+    let mut views = Vec::new();
+    for source in &document.sources {
+        let hir::SourceKind::Table(table) = &source.kind else {
+            continue;
+        };
+        if source.database.map(hir::DatabaseId::index) != Some(crate::MAIN_DB_ID) {
+            continue;
+        }
+        let name = table.value().get_name();
+        let Some(view) = schema.get_materialized_view(name) else {
+            continue;
+        };
+        if !schema.has_compatible_dbsp_state_table(name) {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            return Err(LimboError::InternalError(format!(
+                "Materialized view '{name}' has an incompatible version. \n\
+                 The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
+                 Please DROP and recreate the view to use it."
+            )));
+        }
+        views.push((source.id, view));
+    }
+    Ok(views)
 }
 
 fn query_estimate_from_blocks(

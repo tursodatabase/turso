@@ -3219,10 +3219,12 @@ impl ExprLowerer<'_, '_, '_> {
             )));
         };
         match self.program.get_cursor_type(scan_cursor) {
-            Some(CursorType::BTreeTable(_)) => Ok(CursorColumn {
-                cursor: scan_cursor,
-                column: reference.column,
-            }),
+            Some(CursorType::BTreeTable(_) | CursorType::MaterializedView(..)) => {
+                Ok(CursorColumn {
+                    cursor: scan_cursor,
+                    column: reference.column,
+                })
+            }
             Some(CursorType::BTreeIndex(index)) => {
                 if let Some(column) = index.column_table_pos_to_index_pos(reference.column) {
                     Ok(CursorColumn {
@@ -3299,10 +3301,12 @@ impl ExprLowerer<'_, '_, '_> {
 
     fn emit_btree_rowid(&mut self, cursor: usize, target: usize) -> Result<()> {
         match self.program.get_cursor_type(cursor) {
-            Some(CursorType::BTreeTable(_)) => self.program.emit_insn(Insn::RowId {
-                cursor_id: cursor,
-                dest: target,
-            }),
+            Some(CursorType::BTreeTable(_) | CursorType::MaterializedView(..)) => {
+                self.program.emit_insn(Insn::RowId {
+                    cursor_id: cursor,
+                    dest: target,
+                })
+            }
             Some(CursorType::BTreeIndex(_)) => self.program.emit_insn(Insn::IdxRowId {
                 cursor_id: cursor,
                 dest: target,

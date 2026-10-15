@@ -415,6 +415,31 @@ fn hir_unqualified_sqlite_master_is_the_main_schema() {
 }
 
 #[test]
+fn hir_materialized_view_shows_the_transactions_own_changes() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let [legacy, hir] = connections(&db);
+    legacy
+        .execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+        .unwrap();
+    legacy
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    legacy
+        .execute("CREATE MATERIALIZED VIEW v AS SELECT * FROM t WHERE b > 15")
+        .unwrap();
+    let mut seen = Vec::new();
+    for conn in [&legacy, &hir] {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        let rows = limbo_exec_rows(conn, "SELECT * FROM v ORDER BY a");
+        conn.execute("ROLLBACK").unwrap();
+        seen.push(rows);
+    }
+    assert_eq!(seen[1], seen[0]);
+    assert_eq!(seen[1].len(), 2, "the uncommitted row is visible");
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);
