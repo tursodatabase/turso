@@ -1863,6 +1863,51 @@ expect {
     0|2
 }
 
+test json_extract_path_stops_at_nul {
+    SELECT json_extract('[1]', '$' || char(0) || '[0]'), json_extract('[1]', x'24005b305d');
+}
+expect {
+    [1]|[1]
+}
+
+test json_edit_path_stops_at_nul {
+    SELECT json_set('{"a":1}', '$.b' || char(0) || 'x', 5),
+           json_insert('{"a":1}', '$.c' || char(0) || 'x', 5),
+           json_replace('{"a":1}', '$.a' || char(0) || 'x', 5),
+           json_remove('{"a":1,"b":2}', '$.a' || char(0) || 'x');
+}
+expect {
+    {"a":1,"b":5}|{"a":1,"c":5}|{"a":5}|{"b":2}
+}
+
+test json_type_path_stops_at_nul {
+    SELECT json_type('{"a":[1]}', '$.a' || char(0) || '[0]');
+}
+expect {
+    array
+}
+
+test json_arrow_path_stops_at_nul {
+    SELECT '{"a":{"b":2}}' -> ('$.a' || char(0) || '.b'), '{"a":{"b":2}}' ->> ('a' || char(0) || '.b');
+}
+expect {
+    {"b":2}|{"b":2}
+}
+
+test json_each_path_stops_at_nul {
+    SELECT key, path, fullkey FROM json_each('{"a":{"b":2}}', '$.a' || char(0) || 'x');
+}
+expect {
+    b|$.a|$.a.b
+}
+
+test json_path_starting_with_nul {
+    SELECT json_extract('[1]', char(0) || '$');
+}
+expect error {
+    .*bad JSON path.*
+}
+
 test json_set_field_empty_object {
     SELECT json_set('{}', '$.field', 'value');
 }
