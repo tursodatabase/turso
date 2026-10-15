@@ -154,8 +154,6 @@ and failed 230. Legacy passes all of them. Known gaps, largest first:
 |---|---|---|
 | Wrong results and EXPLAIN QUERY PLAN text (see below) | ~105 | `explain-query-plan-json`, `partial_idx: plan-*` |
 | Indexes on generated columns produce invalid HIR | 52 | `gencol-virtual-constant-index-lookup` |
-| `no such column` for derived-table and CTE columns in ON and nested scopes | ~24 | `joins/derived_subquery_on_predicate` |
-| Compound ORDER BY on qualified result columns | 10 | `union-all-order-by-qualified-result-column` |
 | Non-FROM blocks with GROUP BY or HAVING | 7 | `having-filter-in-subquery-no-from` |
 | Correlated derived and CTE sources | 4 | `subquery-correlated-from-clause-nested` |
 | Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |

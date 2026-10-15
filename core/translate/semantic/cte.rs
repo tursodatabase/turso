@@ -852,7 +852,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .iter()
                 .enumerate()
                 .map(|(index, term)| {
-                    super::analyze::compound_order_by_position(&term.expr, &output_arms, index + 1)
+                    super::analyze::compound_order_by_position(
+                        &term.expr,
+                        &output_arms,
+                        &mut |_, _| Ok(None),
+                        index + 1,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?
         };

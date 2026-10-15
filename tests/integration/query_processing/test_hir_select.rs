@@ -77,6 +77,9 @@ fn hir_select_matches_legacy_rows_and_columns() {
          SELECT s.id, s.tag FROM s ORDER BY 1, 2",
         "SELECT d.id FROM (SELECT items.rowid FROM items) AS d WHERE d.id < 3 ORDER BY 1",
         "SELECT * FROM (SELECT i.value FROM items i WHERE i.id < 3) ORDER BY 1",
+        // A compound ORDER BY term matches an output expression of any arm.
+        "SELECT a.id FROM items a UNION ALL SELECT b.value FROM items b ORDER BY b.value",
+        "SELECT value + 1 FROM items UNION SELECT id FROM tags, items ORDER BY value + 1",
         "WITH s AS (SELECT id FROM items) SELECT s.id, x.id FROM s, s AS x WHERE s.id = x.id",
     ] {
         assert_eq!(

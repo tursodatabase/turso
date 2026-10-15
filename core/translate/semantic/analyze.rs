@@ -681,7 +681,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
         let ordinary_order_by = compounds.is_empty().then_some(order_by_syntax);
-        let (first_block, mut order_by) = self.analyze_select_block(
+        let (first_block, mut order_by, first_scope) = self.analyze_select_block(
             first_select,
             query_id,
             0,
@@ -691,8 +691,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             policies,
         )?;
         blocks.push(first_block);
+        let mut arm_scopes = vec![first_scope];
         for (index, compound) in compounds.iter().enumerate() {
-            let (block, block_order_by) = self.analyze_select_block(
+            let (block, block_order_by, scope) = self.analyze_select_block(
                 &compound.select,
                 query_id,
                 index + 1,
@@ -703,6 +704,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             )?;
             debug_assert!(block_order_by.is_empty());
             blocks.push(block);
+            arm_scopes.push(scope);
         }
 
         if let Some(rightmost) = blocks.last() {
@@ -720,7 +722,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
 
         if !compounds.is_empty() {
-            order_by = self.analyze_compound_order_by(order_by_syntax, &blocks)?;
+            order_by =
+                self.analyze_compound_order_by(order_by_syntax, &blocks, &arm_scopes, policies)?;
         }
         let limit = limit_syntax
             .map(|limit| self.analyze_limit(limit, query_id, policies))
@@ -802,7 +805,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
         policies: ExprPolicies,
-    ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
+    ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         match select {
             ast::OneSelect::Select {
                 distinctness,
@@ -835,7 +838,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     expected_outputs,
                     policies,
                 )
-                .map(|block| (block, Vec::new()))
+                .map(|block| (block, Vec::new(), Scope::new(outer_scope.cloned())))
             }
         }
     }
@@ -855,7 +858,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
         policies: ExprPolicies,
-    ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
+    ) -> Result<(QueryBlock, Vec<OrderTerm>, Scope)> {
         if from.is_none()
             && columns
                 .iter()
@@ -950,6 +953,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 },
             },
             order_by,
+            scope,
         ))
     }
 
@@ -1138,6 +1142,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         syntax: &'ast [ast::SortedColumn],
         blocks: &[QueryBlock],
+        arm_scopes: &[Scope],
+        policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let output_arms = blocks
             .iter()
@@ -1147,23 +1153,62 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .iter()
             .enumerate()
             .map(|(index, syntax)| {
+                let (position, collations) = compound_order_by_position(
+                    &syntax.expr,
+                    &output_arms,
+                    &mut |arm, term| {
+                        self.compound_order_by_arm_match(
+                            term,
+                            &blocks[arm],
+                            &arm_scopes[arm],
+                            policies,
+                        )
+                    },
+                    index + 1,
+                )?;
                 let resolved =
-                    self.resolve_compound_order_by_expr(&syntax.expr, &output_arms, index + 1)?;
+                    self.compound_order_by_output(output_arms[0], position, &collations)?;
                 Ok(order_term(syntax, resolved))
             })
             .collect()
     }
 
-    fn resolve_compound_order_by_expr(
+    /// Like legacy and SQLite, an ORDER BY term of a compound SELECT that is
+    /// not a position or a name is resolved in each arm's FROM clause and
+    /// matches the arm's output with the same expression: `ORDER BY t1.b`
+    /// matches `SELECT t1.b FROM t1`. A term that does not resolve in the arm
+    /// does not match it.
+    fn compound_order_by_arm_match(
         &mut self,
-        syntax: &ast::Expr,
-        output_arms: &[&[Output]],
-        term_number: usize,
+        term: &'ast ast::Expr,
+        block: &QueryBlock,
+        scope: &Scope,
+        policies: ExprPolicies,
+    ) -> Result<Option<usize>> {
+        // Analysis records subqueries and parameters in the document, so
+        // only terms without them are tried.
+        if term_may_record_state(term) {
+            return Ok(None);
+        }
+        let mut functions = QueryFunctionState::new(block.id);
+        let Ok(resolved) =
+            self.analyze_query_expr(term, scope, policies.order_by(false), &mut functions)
+        else {
+            return Ok(None);
+        };
+        Ok(block
+            .outputs
+            .iter()
+            .position(|output| output.expr.equivalent(&resolved.expr)))
+    }
+
+    /// The first arm's output at `position`, under the term's collations.
+    fn compound_order_by_output(
+        &mut self,
+        outputs: &[Output],
+        position: usize,
+        collations: &[&ast::Name],
     ) -> Result<ResolvedScopeExpr> {
-        let (position, collations) = compound_order_by_position(syntax, output_arms, term_number)?;
-        let outputs = output_arms
-            .first()
-            .expect("compound SELECT must have a first output arm");
         let mut resolved = resolved_output(&outputs[position]);
         for name in collations.iter().rev() {
             let collation = self.resolve_collation(name)?;
@@ -1464,9 +1509,12 @@ fn order_term(syntax: &ast::SortedColumn, resolved: ResolvedScopeExpr) -> OrderT
     }
 }
 
+/// Find the output position an ORDER BY term of a compound SELECT sorts by.
+/// `arm_match` matches a term that is not a position or a name in one arm.
 pub(super) fn compound_order_by_position<'syntax>(
     syntax: &'syntax ast::Expr,
     output_arms: &[&[Output]],
+    arm_match: &mut dyn FnMut(usize, &'syntax ast::Expr) -> Result<Option<usize>>,
     term_number: usize,
 ) -> Result<(usize, Vec<&'syntax ast::Name>)> {
     let outputs = output_arms
@@ -1478,11 +1526,9 @@ pub(super) fn compound_order_by_position<'syntax>(
         collations.push(name);
         inner = expression;
     }
-    let position = match inner {
-        ast::Expr::Literal(ast::Literal::Numeric(value)) => {
-            let Ok(position) = value.parse::<i32>() else {
-                return compound_order_by_no_match(term_number);
-            };
+    // As in SQLite, only literals that fit a 32-bit int are positions.
+    if let ast::Expr::Literal(ast::Literal::Numeric(value)) = inner {
+        if let Ok(position) = value.parse::<i32>() {
             if position <= 0 || position as usize > outputs.len() {
                 crate::bail_parse_error!(
                     "{} ORDER BY term out of range - should be between 1 and {}",
@@ -1490,31 +1536,105 @@ pub(super) fn compound_order_by_position<'syntax>(
                     outputs.len()
                 );
             }
-            position as usize - 1
+            return Ok((position as usize - 1, collations));
         }
-        ast::Expr::Id(name) => {
+    }
+    // Each arm in turn: an alias, then an output name, then an expression.
+    for (arm, outputs) in output_arms.iter().enumerate() {
+        if let ast::Expr::Id(name) = inner {
             let name = crate::util::normalize_ident(name.as_str());
-            let Some(position) = output_arms.iter().find_map(|outputs| {
-                outputs
-                    .iter()
-                    .position(|output| {
-                        output.name_kind == OutputNameKind::ExplicitAlias
+            let position = outputs
+                .iter()
+                .position(|output| {
+                    output.name_kind == OutputNameKind::ExplicitAlias
+                        && crate::util::normalize_ident(&output.name) == name
+                })
+                .or_else(|| {
+                    outputs.iter().position(|output| {
+                        !output.name.is_empty()
                             && crate::util::normalize_ident(&output.name) == name
                     })
-                    .or_else(|| {
-                        outputs.iter().position(|output| {
-                            !output.name.is_empty()
-                                && crate::util::normalize_ident(&output.name) == name
-                        })
-                    })
-            }) else {
-                return compound_order_by_no_match(term_number);
-            };
-            position
+                });
+            if let Some(position) = position {
+                return Ok((position, collations));
+            }
         }
-        _ => return compound_order_by_no_match(term_number),
-    };
-    Ok((position, collations))
+        if let Some(position) = arm_match(arm, inner)? {
+            return Ok((position, collations));
+        }
+    }
+    compound_order_by_no_match(term_number)
+}
+
+/// Whether analyzing `term` could record a subquery or a parameter in the
+/// document. Unknown shapes count as yes.
+fn term_may_record_state(term: &ast::Expr) -> bool {
+    let mut pending = vec![term];
+    while let Some(term) = pending.pop() {
+        match term {
+            ast::Expr::Id(_)
+            | ast::Expr::Name(_)
+            | ast::Expr::Qualified(..)
+            | ast::Expr::DoublyQualified(..)
+            | ast::Expr::Literal(_) => {}
+            ast::Expr::Binary(left, _, right) => {
+                pending.push(left);
+                pending.push(right);
+            }
+            ast::Expr::Unary(_, operand)
+            | ast::Expr::Collate(operand, _)
+            | ast::Expr::IsNull(operand)
+            | ast::Expr::NotNull(operand)
+            | ast::Expr::Cast { expr: operand, .. } => pending.push(operand),
+            ast::Expr::Parenthesized(operands) | ast::Expr::InList { rhs: operands, .. } => {
+                pending.extend(operands.iter().map(Box::as_ref));
+                if let ast::Expr::InList { lhs, .. } = term {
+                    pending.push(lhs);
+                }
+            }
+            ast::Expr::Between {
+                lhs, start, end, ..
+            } => {
+                pending.push(lhs);
+                pending.push(start);
+                pending.push(end);
+            }
+            ast::Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                pending.push(lhs);
+                pending.push(rhs);
+                pending.extend(escape.as_deref());
+            }
+            ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                pending.extend(base.as_deref());
+                for (when, then) in when_then_pairs {
+                    pending.push(when);
+                    pending.push(then);
+                }
+                pending.extend(else_expr.as_deref());
+            }
+            ast::Expr::FunctionCall {
+                args,
+                order_by,
+                within_group,
+                filter_over,
+                ..
+            } if order_by.is_empty()
+                && within_group.is_empty()
+                && filter_over.filter_clause.is_none()
+                && filter_over.over_clause.is_none() =>
+            {
+                pending.extend(args.iter().map(Box::as_ref));
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 fn compound_order_by_no_match<T>(term_number: usize) -> Result<T> {
@@ -3597,6 +3717,44 @@ mod tests {
             let error = analyze_sql_with_schema(&schema, sql)
                 .expect_err("compound ORDER BY only accepts result-column references");
             assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn compound_order_by_matches_an_expression_from_its_arm() {
+        let schema = schema_with_items();
+        for (sql, position) in [
+            // Resolved in the second arm, where `b.score` is output 1.
+            (
+                "SELECT a.id, a.score FROM items a UNION ALL \
+                 SELECT b.id, b.score FROM items b ORDER BY b.score",
+                1,
+            ),
+            (
+                "SELECT id + 1 FROM items UNION SELECT score FROM items ORDER BY id + 1",
+                0,
+            ),
+            // `score` is not an output name, but it reads output 1.
+            (
+                "SELECT items.id, items.score FROM items UNION ALL \
+                 SELECT id, score FROM items ORDER BY score",
+                1,
+            ),
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            document
+                .validate()
+                .expect("compound ORDER BY produces closed HIR");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let expected = OutputId::query(query.blocks[0].id, position);
+            assert!(
+                matches!(query.order_by[0].expr, Expr::Output(id) if id == expected),
+                "{sql}"
+            );
         }
     }
 
