@@ -153,7 +153,6 @@ and failed 230. Legacy passes all of them. Known gaps, largest first:
 | Gap | Failing tests | Example |
 |---|---|---|
 | Wrong results and EXPLAIN QUERY PLAN text (see below) | ~105 | `explain-query-plan-json`, `partial_idx: plan-*` |
-| Indexes on generated columns produce invalid HIR | 52 | `gencol-virtual-constant-index-lookup` |
 | Correlated derived and CTE sources | 4 | `subquery-correlated-from-clause-nested` |
 | Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
 

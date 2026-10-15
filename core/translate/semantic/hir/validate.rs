@@ -1321,9 +1321,13 @@ impl<'document> HirValidator<'document> {
                 .zip(&expressions.index.value().columns)
                 .enumerate()
             {
+                // Expression index columns, and CREATE INDEX columns over a
+                // virtual generated column, carry an expression to analyze.
+                let complete = expression.is_some() == column.expr.is_some()
+                    && (column.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL
+                        || expression.is_some());
                 self.require(
-                    expression.is_some()
-                        == (column.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL),
+                    complete,
                     format!(
                         "source {id} index column {position} has incomplete expression metadata"
                     ),

@@ -319,3 +319,37 @@ fn hir_right_and_full_joins_match_legacy_rows() {
         }
     }
 }
+
+#[test]
+fn hir_reads_indexes_on_generated_columns_like_legacy() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE t(a INTEGER, b INTEGER, c AS (a * 2) VIRTUAL, d AS (b + c) VIRTUAL, \
+         z AS ('Z') VIRTUAL)",
+        "CREATE INDEX t_c ON t(c)",
+        "CREATE INDEX t_d ON t(d, a)",
+        "CREATE INDEX t_z ON t(z)",
+        "INSERT INTO t(a, b) VALUES (1, 10), (2, 20), (3, NULL), (NULL, 5)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT a FROM t WHERE z = 'Z' ORDER BY a",
+        "SELECT a, c FROM t WHERE c > 1 ORDER BY c DESC",
+        "SELECT d, a FROM t WHERE d = 24",
+        "SELECT min(c), max(c) FROM t",
+        "SELECT c, count(*) FROM t GROUP BY c ORDER BY c",
+        // `d` is indexed and reads `c`, so `c` must be computable here too.
+        "SELECT x.a, y.a FROM t x JOIN t y ON y.c = x.a * 2 ORDER BY 1, 2",
+        "SELECT a FROM t WHERE c IN (2, 6) ORDER BY a",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}

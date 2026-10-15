@@ -360,6 +360,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for query in self.queries.iter().flatten() {
             pending.extend(query.direct_column_reads(|source| self.source(source)));
         }
+        // An index expression can read a generated column, which then needs
+        // its generation expression when the index is used.
+        for source in self.sources.iter().flatten() {
+            for index in &source.index_expressions {
+                for expression in index.columns.iter().flatten().chain(&index.predicate) {
+                    expression.for_each(&mut |expression| {
+                        if let Expr::Column(reference) = expression {
+                            pending.push(*reference);
+                        }
+                    });
+                }
+            }
+        }
         let mut inserts = Vec::new();
         let mut updates = Vec::new();
         let mut deletes = Vec::new();
