@@ -33,15 +33,6 @@ use crate::{
     LimboError, Result,
 };
 
-/// Whether an UPDATE that sets the columns at `assigned` changes a parent
-/// key whose ON UPDATE action is not a plain check.
-pub(super) fn update_needs_legacy(foreign_keys: &hir::DmlForeignKeys, assigned: &[usize]) -> bool {
-    foreign_keys.incoming.iter().any(|foreign_key| {
-        !is_check_only(foreign_key.declaration.on_update)
-            && parent_key_may_change(foreign_key, assigned)
-    })
-}
-
 /// Whether an UPDATE that sets the columns at `assigned` may change the
 /// parent key. A rowid parent key is the INTEGER PRIMARY KEY column, which
 /// `assigned` lists when the UPDATE sets the rowid.
@@ -60,10 +51,6 @@ fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) 
         .child_positions
         .iter()
         .any(|position| assigned.contains(position))
-}
-
-fn is_check_only(action: RefAct) -> bool {
-    matches!(action, RefAct::NoAction | RefAct::Restrict)
 }
 
 /// Checks before the row of `target` that the table cursor is on is deleted.

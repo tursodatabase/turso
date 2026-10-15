@@ -30,7 +30,7 @@ use crate::{
 
 use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer,
+    DmlTarget, ReturningBuffer, Subprograms,
 };
 use super::fkey_action::CompiledAction;
 use super::query::{
@@ -161,18 +161,18 @@ pub(super) fn needs_legacy(
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
 /// root or one command of a trigger in it.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_update(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
-    triggers: &[CompiledTrigger],
+    subprograms: &Subprograms<'_>,
     mvcc: bool,
     enforce_checks: bool,
-    actions: &[CompiledAction<'_>],
-    replace_actions: &[CompiledAction<'_>],
 ) -> Result<()> {
+    let triggers = &subprograms.triggers[..];
+    let actions = &subprograms.actions[..];
+    let replace_actions = &subprograms.replace_actions[..];
     let document = &plan.document;
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
     // target is the only loop.
@@ -1912,11 +1912,9 @@ mod tests {
             &plan,
             update,
             access,
-            &[],
+            &Subprograms::default(),
             false,
             true,
-            &[],
-            &[],
         )
         .unwrap();
         program

@@ -34,7 +34,7 @@ use crate::{
     LimboError, Result,
 };
 
-use super::HirSession;
+use super::{dml::Subprograms, HirSession};
 
 /// What happened to the parent row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,31 +164,20 @@ fn compile_action<'a>(
             if super::delete::needs_legacy(&plan.document, delete, access, &builder)? {
                 return Ok(None);
             }
-            let Some(triggers) = super::trigger::delete_triggers(session, &builder, &plan, delete)?
+            let Some(subprograms) = Subprograms::for_delete(session, &builder, &plan, delete)?
             else {
-                return Ok(None);
-            };
-            let Some(actions) = delete_actions(session, &builder, delete)? else {
                 return Ok(None);
             };
             builder.prologue();
             builder.set_hir_plan(plan.clone());
-            super::delete::emit_delete(&mut builder, &plan, delete, access, &triggers, &actions)?;
+            super::delete::emit_delete(&mut builder, &plan, delete, access, &subprograms)?;
         }
         (hir::HirRoot::Update(_), HirRootPlan::Update(_)) => {
             let (update, access) = super::update::update_root(&plan)?;
             if super::update::needs_legacy(&plan, update, access, &builder)? {
                 return Ok(None);
             }
-            let Some(triggers) = super::trigger::update_triggers(session, &builder, &plan, update)?
-            else {
-                return Ok(None);
-            };
-            let Some(actions) = update_actions(session, &builder, &plan, update)? else {
-                return Ok(None);
-            };
-            let Some(replace_actions) =
-                super::update::replace_actions(session, &builder, &plan, update)?
+            let Some(subprograms) = Subprograms::for_update(session, &builder, &plan, update)?
             else {
                 return Ok(None);
             };
@@ -202,11 +191,9 @@ fn compile_action<'a>(
                 &plan,
                 update,
                 access,
-                &triggers,
+                &subprograms,
                 mvcc,
                 !connection.check_constraints_ignored(),
-                &actions,
-                &replace_actions,
             )?;
         }
         _ => {
@@ -286,6 +273,50 @@ pub(super) fn update_actions<'a>(
         }
         hir::UpdateTargetKind::Virtual => Ok(Some(Vec::new())),
     }
+}
+
+/// Compile the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
+/// clause order; a DO NOTHING clause gets none.
+pub(super) fn upsert_actions<'a>(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &super::HirPlan,
+    insert: &'a hir::Insert,
+) -> Result<Option<Vec<Vec<CompiledAction<'a>>>>> {
+    let none = || Ok(Some(insert.upserts.iter().map(|_| Vec::new()).collect()));
+    let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
+        return none();
+    };
+    let source = plan.document.source(insert.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR INSERT target {} is missing", insert.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return none();
+    };
+    let table = table.value().require_btree()?;
+    let mut compiled = Vec::with_capacity(insert.upserts.len());
+    for upsert in &insert.upserts {
+        let hir::UpsertAction::Update { assignments, .. } = &upsert.action else {
+            compiled.push(Vec::new());
+            continue;
+        };
+        let assigned = super::insert::column_positions(&super::insert::do_update_columns(
+            &table,
+            assignments,
+        )?);
+        let Some(actions) = compile_actions(
+            session,
+            parent,
+            foreign_keys,
+            ParentChange::Update,
+            &assigned,
+        )?
+        else {
+            return Ok(None);
+        };
+        compiled.push(actions);
+    }
+    Ok(Some(compiled))
 }
 
 fn database_index(foreign_key: &hir::ResolvedForeignKey) -> Result<usize> {

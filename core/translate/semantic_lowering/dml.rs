@@ -20,7 +20,109 @@ use crate::{
     LimboError, Result,
 };
 
+use super::fkey_action::CompiledAction;
 use super::query::{emit_array_results, predicate_loop};
+use super::trigger::CompiledTrigger;
+use super::{HirPlan, HirSession};
+
+/// The subprograms a DML statement fires. They are compiled before anything
+/// is emitted, so one that needs legacy leaves the whole statement to it.
+#[derive(Default)]
+pub(super) struct Subprograms<'a> {
+    /// The statement's row triggers.
+    pub(super) triggers: Vec<CompiledTrigger>,
+    /// The foreign-key actions of the statement's own change: ON DELETE for
+    /// a DELETE, ON UPDATE for an UPDATE.
+    pub(super) actions: Vec<CompiledAction<'a>>,
+    /// The ON DELETE actions of the rows REPLACE deletes.
+    pub(super) replace_actions: Vec<CompiledAction<'a>>,
+    /// INSERT: the UPDATE triggers an UPSERT's DO UPDATE fires.
+    pub(super) upsert_triggers: Vec<CompiledTrigger>,
+    /// INSERT: the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
+    /// clause order.
+    pub(super) upsert_actions: Vec<Vec<CompiledAction<'a>>>,
+}
+
+impl<'a> Subprograms<'a> {
+    /// What a DELETE fires. `None` means one needs legacy.
+    pub(super) fn for_delete(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        delete: &'a hir::Delete,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::delete_triggers(session, parent, plan, delete)? else {
+            return Ok(None);
+        };
+        let Some(actions) = super::fkey_action::delete_actions(session, parent, delete)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions,
+            ..Self::default()
+        }))
+    }
+
+    /// What an UPDATE fires. `None` means one needs legacy.
+    pub(super) fn for_update(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        update: &'a hir::Update,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::update_triggers(session, parent, plan, update)? else {
+            return Ok(None);
+        };
+        let Some(actions) = super::fkey_action::update_actions(session, parent, plan, update)?
+        else {
+            return Ok(None);
+        };
+        let Some(replace_actions) = super::update::replace_actions(session, parent, plan, update)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions,
+            replace_actions,
+            ..Self::default()
+        }))
+    }
+
+    /// What an INSERT fires. `None` means one needs legacy.
+    pub(super) fn for_insert(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        insert: &'a hir::Insert,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::insert_triggers(session, parent, plan, insert)? else {
+            return Ok(None);
+        };
+        let Some(upsert_triggers) =
+            super::trigger::upsert_update_triggers(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        let Some(replace_actions) = super::insert::replace_actions(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        let Some(upsert_actions) =
+            super::fkey_action::upsert_actions(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions: Vec::new(),
+            replace_actions,
+            upsert_triggers,
+            upsert_actions,
+        }))
+    }
+}
 
 /// The B-tree table a DELETE or UPDATE writes, with what HIR resolved for it.
 pub(super) struct DmlTarget<'a> {
@@ -264,7 +366,7 @@ pub(super) fn emit_replace_delete(
     foreign_keys: &hir::DmlForeignKeys,
     conflict: usize,
     replacement: Option<SourceId>,
-    actions: &[super::fkey_action::CompiledAction<'_>],
+    actions: &[CompiledAction<'_>],
 ) -> Result<()> {
     let DmlTarget {
         document,

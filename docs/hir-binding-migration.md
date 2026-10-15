@@ -253,7 +253,6 @@ inserted. These still go to legacy:
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
-| Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
 | WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
 
@@ -333,8 +332,8 @@ table that references itself, calls the program being built. A DELETE reads
 the parent key before the row is deleted and runs the actions after; an
 UPDATE runs them once the row is written, when the key changed, before
 RETURNING. A statement with actions collects its rows first, and the
-parent-side checks skip keys with an action. An UPSERT that would fire an
-action still goes to legacy. Where legacy differs from SQLite, HIR
+parent-side checks skip keys with an action. An UPSERT's DO UPDATE runs the
+ON UPDATE actions as UPDATE does. Where legacy differs from SQLite, HIR
 follows SQLite: a DELETE whose SET DEFAULT leaves a child without a parent
 fails.
 
@@ -364,7 +363,9 @@ once the new row passed its CHECK constraints, AFTER once RETURNING has read
 the row, as in SQLite (legacy fires them before RETURNING). A DO UPDATE that
 sets the INTEGER PRIMARY KEY moves the row as UPDATE does: the new rowid must
 be free (checked with ABORT before the indexes), every index entry is
-rewritten, and the row is deleted and inserted under its new rowid.
+rewritten, and the row is deleted and inserted under its new rowid. The ON
+UPDATE actions of a parent key it changes run once the row is written,
+before RETURNING.
 
 Semantic analysis matches each ON CONFLICT target against the HIR target
 source, as SQLite does: `rowid` or the bare INTEGER PRIMARY KEY column names

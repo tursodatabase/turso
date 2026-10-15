@@ -26,7 +26,7 @@ use crate::{
 
 use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer,
+    DmlTarget, ReturningBuffer, Subprograms,
 };
 use super::fkey_action::CompiledAction;
 use super::query::{
@@ -104,9 +104,10 @@ pub(super) fn emit_delete(
     plan: &HirPlan,
     delete: &hir::Delete,
     access: &HirAccessPlan,
-    triggers: &[CompiledTrigger],
-    actions: &[CompiledAction<'_>],
+    subprograms: &Subprograms<'_>,
 ) -> Result<()> {
+    let triggers = &subprograms.triggers[..];
+    let actions = &subprograms.actions[..];
     let document = &plan.document;
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -564,7 +565,7 @@ mod tests {
         let mut program = program();
         assert!(!needs_legacy(&plan.document, delete, access, &program).unwrap());
         program.set_hir_plan(plan.clone());
-        emit_delete(&mut program, &plan, delete, access, &[], &[]).unwrap();
+        emit_delete(&mut program, &plan, delete, access, &Subprograms::default()).unwrap();
         program
     }
 

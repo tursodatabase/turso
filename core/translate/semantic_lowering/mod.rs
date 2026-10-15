@@ -34,6 +34,8 @@ use crate::{
     Connection, LimboError, Result,
 };
 
+use dml::Subprograms;
+
 /// Prepare a top-level SELECT through semantic HIR: analyze, plan, and lower
 /// it without the legacy binder, planner, or emitter.
 pub(crate) fn translate_select(
@@ -84,16 +86,11 @@ pub(crate) fn translate_delete(
     if delete::needs_legacy(&plan.document, delete, access, program)? {
         return Ok(false);
     }
-    // Triggers are compiled before anything is emitted, so one that needs
-    // legacy still leaves the whole statement to legacy.
-    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete)? else {
-        return Ok(false);
-    };
-    let Some(actions) = fkey_action::delete_actions(&session, program, delete)? else {
+    let Some(subprograms) = Subprograms::for_delete(&session, program, &plan, delete)? else {
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
-    delete::emit_delete(program, &plan, delete, access, &triggers, &actions)?;
+    delete::emit_delete(program, &plan, delete, access, &subprograms)?;
     if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -125,13 +122,7 @@ pub(crate) fn translate_update(
     if update::needs_legacy(&plan, update, access, program)? {
         return Ok(false);
     }
-    let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
-        return Ok(false);
-    };
-    let Some(actions) = fkey_action::update_actions(&session, program, &plan, update)? else {
-        return Ok(false);
-    };
-    let Some(replace_actions) = update::replace_actions(&session, program, &plan, update)? else {
+    let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
         return Ok(false);
     };
     let mvcc = plan
@@ -145,11 +136,9 @@ pub(crate) fn translate_update(
         &plan,
         update,
         access,
-        &triggers,
+        &subprograms,
         mvcc,
         !connection.check_constraints_ignored(),
-        &actions,
-        &replace_actions,
     )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
@@ -182,24 +171,15 @@ pub(crate) fn translate_insert(
     if insert::needs_legacy(&plan, insert, program)? {
         return Ok(false);
     }
-    let Some(triggers) = trigger::insert_triggers(&session, program, &plan, insert)? else {
+    let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
-    let Some(upsert_triggers) = trigger::upsert_update_triggers(&session, program, &plan, insert)?
-    else {
-        return Ok(false);
-    };
-    let Some(replace_actions) = insert::replace_actions(&session, program, &plan, insert)? else {
-        return Ok(false);
-    };
     insert::emit_insert(
         program,
         &plan,
         insert,
-        &triggers,
-        &upsert_triggers,
-        &replace_actions,
+        &subprograms,
         !connection.check_constraints_ignored(),
     )?;
     if let Some(returning) = &insert.returning {

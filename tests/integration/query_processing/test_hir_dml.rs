@@ -1289,6 +1289,33 @@ fn hir_foreign_key_actions_match_sqlite() {
         "INSERT INTO log VALUES ('w')",
         "SELECT * FROM re",
         "PRAGMA foreign_key_check",
+        // An UPSERT's DO UPDATE fires the ON UPDATE actions of a parent key
+        // it changes, after the row is written and before RETURNING.
+        "CREATE TABLE up(id INTEGER PRIMARY KEY, k UNIQUE, v)",
+        "CREATE TABLE uc(x REFERENCES up(k) ON UPDATE CASCADE, n)",
+        "CREATE TABLE ud(y REFERENCES up(k) ON UPDATE SET NULL)",
+        "CREATE TABLE ue(z REFERENCES up(id) ON UPDATE CASCADE)",
+        "CREATE TABLE ulog(m)",
+        "CREATE TRIGGER utc AFTER UPDATE ON uc BEGIN INSERT INTO ulog VALUES (old.x || '->' || new.x); END",
+        "INSERT INTO up VALUES (1, 'a', 0), (2, 'b', 0)",
+        "INSERT INTO uc VALUES ('a', 1), ('b', 2)",
+        "INSERT INTO ud VALUES ('a'), ('b')",
+        "INSERT INTO ue VALUES (1), (2)",
+        "INSERT INTO up VALUES (1, 'zz', 5) ON CONFLICT(id) DO UPDATE SET k = excluded.k RETURNING *, (SELECT count(*) FROM uc WHERE x = 'zz')",
+        "SELECT * FROM uc ORDER BY n",
+        "SELECT * FROM ud ORDER BY y",
+        "INSERT INTO up VALUES (9, 'b', 5) ON CONFLICT(k) DO UPDATE SET v = v + 1",
+        "INSERT INTO up VALUES (9, 'b', 5) ON CONFLICT(k) DO UPDATE SET id = 20",
+        "SELECT * FROM ue ORDER BY z",
+        "INSERT INTO up VALUES (20, 'q', 0), (1, 'r', 0) ON CONFLICT(id) DO UPDATE SET k = excluded.k || '!'",
+        "INSERT INTO up VALUES (20, 'q', 0) ON CONFLICT(k) DO NOTHING ON CONFLICT(id) DO UPDATE SET k = 'w'",
+        "SELECT * FROM uc ORDER BY n",
+        "SELECT * FROM ulog",
+        "CREATE TABLE us(id INTEGER PRIMARY KEY, k UNIQUE, up REFERENCES us(k) ON UPDATE CASCADE)",
+        "INSERT INTO us VALUES (1, 'a', NULL), (2, 'b', 'a'), (3, 'c', 'a')",
+        "INSERT INTO us VALUES (1, 'x', NULL) ON CONFLICT(id) DO UPDATE SET k = 'aa'",
+        "SELECT * FROM us ORDER BY id",
+        "PRAGMA foreign_key_check",
     ] {
         assert_matches_sqlite(&db, &conn, &sqlite, sql);
     }

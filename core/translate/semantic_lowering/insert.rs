@@ -33,7 +33,7 @@ use crate::{
 };
 
 use super::autoincrement::Sequence;
-use super::dml::{DmlTarget, ReturningBuffer};
+use super::dml::{DmlTarget, ReturningBuffer, Subprograms};
 use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
 
@@ -46,11 +46,10 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    let (defaults, foreign_keys) = match &insert.target_kind {
+    let defaults = match &insert.target_kind {
         hir::InsertTargetKind::BTree {
             autoincrement,
             defaults,
-            foreign_keys,
             ..
         } => {
             // AUTOINCREMENT under MVCC uses a hidden sequence, not lowered
@@ -61,7 +60,7 @@ pub(super) fn needs_legacy(
             if mvcc_autoincrement {
                 return Ok(true);
             }
-            (defaults, foreign_keys)
+            defaults
         }
         hir::InsertTargetKind::Virtual => return Ok(true),
     };
@@ -92,18 +91,12 @@ pub(super) fn needs_legacy(
         let hir::UpsertAction::Update { assignments, .. } = &upsert.action else {
             continue;
         };
-        // A DO UPDATE that moves the row, or changes a parent key with an ON
-        // UPDATE action, still needs legacy.
-        let mut assigned = Vec::new();
-        for assignment in assignments {
-            for column in &assignment.columns {
-                match column {
-                    hir::TargetColumn::Column(column) => assigned.push(*column),
-                    hir::TargetColumn::RowId => return Ok(true),
-                }
-            }
-        }
-        if super::fkey::update_needs_legacy(foreign_keys, &assigned) {
+        // `SET rowid = ...` still needs legacy.
+        if assignments
+            .iter()
+            .flat_map(|assignment| &assignment.columns)
+            .any(|column| matches!(column, hir::TargetColumn::RowId))
+        {
             return Ok(true);
         }
     }
@@ -124,11 +117,15 @@ pub(super) fn emit_insert(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
-    triggers: &[CompiledTrigger],
-    upsert_triggers: &[CompiledTrigger],
-    replace_actions: &[CompiledAction<'_>],
+    subprograms: &Subprograms<'_>,
     enforce_checks: bool,
 ) -> Result<()> {
+    let triggers = &subprograms.triggers[..];
+    if subprograms.upsert_actions.len() != insert.upserts.len() {
+        return Err(LimboError::InternalError(
+            "HIR INSERT got actions for a different number of UPSERT clauses".into(),
+        ));
+    }
     let document = &plan.document;
     let hir::InsertTargetKind::BTree {
         defaults,
@@ -254,8 +251,9 @@ pub(super) fn emit_insert(
         conflict_rowid: program.alloc_register(),
         enforce_checks,
         sequence: sequence.as_ref(),
-        upsert_triggers,
-        replace_actions,
+        upsert_triggers: &subprograms.upsert_triggers,
+        upsert_actions: &subprograms.upsert_actions,
+        replace_actions: &subprograms.replace_actions,
     };
     let done = program.allocate_label();
     match rows {
@@ -365,6 +363,32 @@ fn subquery_reads_table(
         }
     });
     reads
+}
+
+/// The columns a DO UPDATE changes: the ones it sets and the virtual
+/// generated columns that read them.
+pub(super) fn do_update_columns(
+    table: &crate::schema::BTreeTable,
+    assignments: &[hir::Assignment],
+) -> Result<Vec<hir::TargetColumn>> {
+    super::update::with_generated_dependents(
+        table,
+        assignments
+            .iter()
+            .flat_map(|assignment| assignment.columns.iter().copied())
+            .collect(),
+    )
+}
+
+/// The table positions among `columns`.
+pub(super) fn column_positions(columns: &[hir::TargetColumn]) -> Vec<usize> {
+    columns
+        .iter()
+        .filter_map(|column| match column {
+            hir::TargetColumn::Column(column) => Some(*column),
+            hir::TargetColumn::RowId => None,
+        })
+        .collect()
 }
 
 /// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
@@ -636,6 +660,8 @@ struct InsertRow<'a> {
     sequence: Option<&'a Sequence>,
     /// The UPDATE triggers an UPSERT's DO UPDATE fires.
     upsert_triggers: &'a [CompiledTrigger],
+    /// The ON UPDATE actions of each UPSERT clause's DO UPDATE.
+    upsert_actions: &'a [Vec<CompiledAction<'a>>],
     /// The ON DELETE actions of a row REPLACE deletes.
     replace_actions: &'a [CompiledAction<'a>],
 }
@@ -995,7 +1021,7 @@ impl InsertRow<'_> {
             program.emit_insn(Insn::Goto {
                 target_pc: row_done,
             });
-            for (upsert, arm) in self.upserts.iter().zip(arms) {
+            for ((upsert, arm), actions) in self.upserts.iter().zip(arms).zip(self.upsert_actions) {
                 program.preassign_label_to_next_insn(arm);
                 match &upsert.action {
                     hir::UpsertAction::Nothing => program.emit_insn(Insn::Goto {
@@ -1008,6 +1034,7 @@ impl InsertRow<'_> {
                         program,
                         assignments,
                         predicate.as_ref(),
+                        actions,
                         index_cursors,
                         returning,
                         row_done,
@@ -1022,11 +1049,13 @@ impl InsertRow<'_> {
     /// rowid in `conflict_rowid`: like legacy, rewrite that row from its
     /// current values and `excluded`, checking every UNIQUE constraint with
     /// ABORT, then go to the next row.
+    #[allow(clippy::too_many_arguments)]
     fn emit_do_update(
         &self,
         program: &mut ProgramBuilder,
         assignments: &[hir::Assignment],
         predicate: Option<&hir::Expr>,
+        actions: &[CompiledAction<'_>],
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
         returning: Option<ReturningBuffer<'_>>,
         row_done: BranchOffset,
@@ -1262,14 +1291,7 @@ impl InsertRow<'_> {
             });
         }
 
-        // Virtual generated columns that read a set column change too.
-        let assigned = super::update::with_generated_dependents(
-            table,
-            assignments
-                .iter()
-                .flat_map(|assignment| assignment.columns.iter().copied())
-                .collect(),
-        )?;
+        let assigned = do_update_columns(table, assignments)?;
         for column in &assigned {
             let hir::TargetColumn::Column(position) = *column else {
                 continue;
@@ -1287,13 +1309,6 @@ impl InsertRow<'_> {
                 });
             }
         }
-        let assigned_positions = assigned
-            .iter()
-            .filter_map(|column| match column {
-                hir::TargetColumn::Column(column) => Some(*column),
-                hir::TargetColumn::RowId => None,
-            })
-            .collect::<Vec<_>>();
         let pending_repairs = super::fkey::emit_update_checks(
             program,
             document,
@@ -1302,10 +1317,17 @@ impl InsertRow<'_> {
             new_source.id,
             conflict,
             written,
-            &assigned_positions,
+            &column_positions(&assigned),
             database,
             false,
         )?;
+        // The parent key before the change, for the actions.
+        let action_keys = actions
+            .iter()
+            .map(|action| {
+                super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Like legacy, every UNIQUE constraint is checked against the new
         // row before any index changes.
@@ -1540,6 +1562,22 @@ impl InsertRow<'_> {
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        // Like UPDATE, the actions run once the row is written, for a parent
+        // key that changed.
+        for (action, old_key) in actions.iter().zip(action_keys) {
+            let new_key =
+                super::fkey::emit_parent_key(program, document, action.foreign_key, new_source.id)?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
+        }
         // RETURNING reads the row as written.
         program.bind_source(
             source.id,
@@ -2019,13 +2057,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_that_fires_foreign_key_actions_goes_through_hir() {
+    fn insert_that_fires_foreign_key_actions_goes_through_hir() {
         let schema = || {
             let mut schema = schema();
             for (sql, root) in [
                 ("CREATE TABLE parent(id INTEGER PRIMARY KEY, k UNIQUE)", 110),
                 (
-                    "CREATE TABLE child(x REFERENCES parent(id) ON DELETE CASCADE)",
+                    "CREATE TABLE child(x REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE)",
                     111,
                 ),
             ] {
@@ -2040,6 +2078,7 @@ mod tests {
         for sql in [
             "INSERT OR REPLACE INTO parent VALUES (1, 'a')",
             "REPLACE INTO parent VALUES (1, 'a')",
+            "INSERT INTO parent VALUES (1, 'a') ON CONFLICT(id) DO UPDATE SET id = 2",
         ] {
             let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
@@ -2053,7 +2092,11 @@ mod tests {
         let insert = insert_root(&plan).unwrap();
         assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan, insert, &[], &[], &[], true).unwrap();
+        let subprograms = Subprograms {
+            upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
+            ..Subprograms::default()
+        };
+        emit_insert(&mut program, &plan, insert, &subprograms, true).unwrap();
         program
     }
 
