@@ -639,6 +639,7 @@ impl Statement {
                     .normal_step(&mut self.state, &self.pager, waker)
                 {
                     ProgramStep::Row => {
+                        self.state.pending_fresh_tx = None;
                         self.busy = true;
                         self.has_returned_row = true;
                         return Ok(StepResult::Row);
@@ -849,7 +850,22 @@ impl Statement {
         // enough because callers do not always reset on error before
         // running another statement.
         if res.is_err() {
+            self.rollback_pending_fresh_tx_if_needed();
             self.cleanup_orphaned_seq_inner_tx();
+        }
+
+        // When the step returns Busy (no more busy-handler retries) and we
+        // freshly opened an MVCC transaction for a Pending explicit tx,
+        // roll it back so the next statement gets a fresh snapshot.  Without
+        // this, the snapshot would be pinned to the moment of the failed
+        // attempt rather than to the first statement that actually succeeds,
+        // which diverges from what the caller observes.
+        if matches!(res, Ok(StepResult::Busy)) {
+            self.rollback_pending_fresh_tx_if_needed();
+        }
+
+        if matches!(res, Ok(StepResult::Done)) {
+            self.state.pending_fresh_tx = None;
         }
 
         // The interpreter chain carries a boxed error to keep per-row returns
@@ -1560,6 +1576,23 @@ impl Statement {
     /// (so subsequent `commit_dep_counter` walks may wait on it forever)
     /// and the connection's mv_tx points to a dead tx, breaking the
     /// next statement that runs on the connection.
+    fn rollback_pending_fresh_tx_if_needed(&mut self) {
+        let Some((db, concurrent)) = self.state.pending_fresh_tx.take() else {
+            return;
+        };
+        if self.has_returned_row {
+            return;
+        }
+        let conn = self.program.connection.clone();
+        if let Some(mv_store) = conn.mv_store_for_db(db) {
+            if let Some((tx_id, _)) = conn.get_mv_tx_for_db(db) {
+                mv_store.rollback_tx(tx_id, self.pager.clone(), &conn, db);
+                self.pager.end_read_tx();
+            }
+        }
+        conn.set_tx_state(TransactionState::Pending { concurrent });
+    }
+
     fn cleanup_orphaned_seq_inner_tx(&mut self) {
         let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
             return;

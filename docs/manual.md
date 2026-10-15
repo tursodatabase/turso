@@ -167,7 +167,7 @@ Turso supports three types of transactions: **deferred**, **immediate**, and **c
 
 * **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.
 * **Immediate**: The transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists. The `EXCLUSIVE` mode is always an alias for `IMMEDIATE` in Turso, just like it is in SQLite in WAL mode.
-* **Concurrent (MVCC only)**: The transaction begins immediately and allows multiple concurrent read and write transactions. When a concurrent transaction commits, the database performs row-level conflict detection and returns a `SQLITE_BUSY` (write-write conflict) error if the transaction attempted to modify a row that was concurrently modified by another transaction. This mode provides the highest level of concurrency at the cost of potential transaction conflicts that must be retried by the application. The transaction isolation level provided by concurrent transactions is snapshot isolation.
+* **Concurrent (MVCC only)**: Like a deferred transaction, the transaction starts when its first SQL statement runs, and it allows multiple concurrent read and write transactions. When a concurrent transaction commits, the database performs row-level conflict detection and returns a `SQLITE_BUSY` (write-write conflict) error if the transaction attempted to modify a row that was concurrently modified by another transaction. This mode provides the highest level of concurrency at the cost of potential transaction conflicts that must be retried by the application. The transaction isolation level provided by concurrent transactions is snapshot isolation.
 
 ### Deferred transaction lifecycle
 
@@ -179,7 +179,7 @@ If a deferred transaction remains unused (no reads or writes), it is automatical
 
 Concurrent transactions are only available when MVCC (Multi-Version Concurrency Control) is enabled in the database. They use optimistic concurrency control to allow multiple transactions to modify the database simultaneously.
 
-When the `BEGIN CONCURRENT TRANSACTION` statement executes, the database:
+Like `BEGIN DEFERRED`, the `BEGIN CONCURRENT TRANSACTION` statement itself starts nothing. When the transaction's first SQL statement executes, the database:
 
 1. Assigns a unique transaction ID to the transaction
 2. Records a begin timestamp from the logical clock
@@ -190,10 +190,10 @@ Unlike deferred transactions which delay locking, concurrent transactions start 
 
 #### Read snapshot isolation
 
-Each concurrent transaction reads from a consistent snapshot of the database as of its begin timestamp. This means:
+Each concurrent transaction reads from a consistent snapshot of the database as of its begin timestamp, which is taken at the transaction's first statement, not at `BEGIN`. This means:
 
 - Reads see all data committed before the transaction's begin timestamp
-- Reads do **not** see writes from other transactions that commit after this transaction starts
+- Reads do **not** see writes from other transactions that commit after the snapshot is taken
 - Reads from the same transaction are consistent (repeatable reads within the transaction)
 - Multiple concurrent transactions can read and write simultaneously without blocking each other
 
