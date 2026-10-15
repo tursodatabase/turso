@@ -255,6 +255,19 @@ fn hir_update_matches_legacy() {
             "SELECT * FROM ur ORDER BY a",
             "PRAGMA integrity_check",
         ],
+        // A subquery in WHERE: the rows to change are collected first, so the
+        // subquery never sees a changed row.
+        &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        &["UPDATE u SET b = b + 1 WHERE b < (SELECT max(b) FROM u)"],
+        &["UPDATE u SET d = d + 1 WHERE EXISTS (SELECT 1 FROM t WHERE t.a = u.a AND t.c = u.c)"],
+        &["UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2"],
+        &["UPDATE OR IGNORE u SET b = 2 WHERE a IN (SELECT a FROM t) RETURNING a, b"],
+        // Subqueries in SET read the table as the loop changes it, row by
+        // row.
+        &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
+        &["UPDATE u SET d = (SELECT max(x.d) FROM u AS x WHERE x.a < u.a)"],
+        &["UPDATE u SET d = (SELECT sum(x.d) FROM u AS x WHERE x.a <= u.a) WHERE a > 2"],
+        &["UPDATE u SET b = (SELECT max(b) FROM u) + a"],
         // Statements that still go through legacy.
         &[
             "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
@@ -265,8 +278,9 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET a = a + 10 WHERE a = 1"],
         &["UPDATE OR REPLACE u SET b = 1 WHERE a = 2"],
         &["UPDATE u SET b = b + 100 WHERE b > 2"],
-        &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
-        &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        &["UPDATE u SET (c, d) = (SELECT 'm', a FROM u AS x WHERE x.a = u.a + 1) WHERE a > 4"],
+        &["UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
+           (SELECT count(*) FROM u AS x WHERE x.d = u.d)"],
         // UPDATE ... FROM: the join fills a scratch table first.
         &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
         &["UPDATE u SET c = t.c, d = t.d + u.d FROM t WHERE t.a = u.a RETURNING *"],
@@ -513,8 +527,8 @@ fn hir_insert_matches_legacy() {
         &["INSERT OR REPLACE INTO u VALUES (1, 60, 'v', 1)"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
-        &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
         &["INSERT INTO t(b) VALUES (62)"],
+        &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
         // Triggers run from HIR-compiled subprograms. NEW.rowid reads -1 in
         // a BEFORE trigger until the rowid is known.
         &[
@@ -823,6 +837,41 @@ fn hir_delete_binds_parameters_like_legacy() {
         limbo_exec_rows(&conn, "SELECT a, b FROM p ORDER BY a")
     };
     assert_eq!(run(true), run(false));
+}
+
+/// Subqueries in an UPDATE's SET and WHERE see the table as SQLite's do.
+#[test]
+fn hir_update_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d)",
+        "INSERT INTO u VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', -1), (3, 3, 'z', 3), \
+         (4, 4, NULL, NULL), (5, 5, 'p', 5), (6, 6, 'q', 5)",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1",
+        "UPDATE u SET d = (SELECT max(x.d) FROM u AS x WHERE x.a < u.a)",
+        "UPDATE u SET d = (SELECT sum(x.d) FROM u AS x WHERE x.a <= u.a) WHERE a > 2",
+        "UPDATE u SET b = (SELECT max(b) FROM u) + a",
+        "UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2",
+        "UPDATE u SET d = d + 1 WHERE b < (SELECT max(b) FROM u)",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+        let select = "SELECT * FROM u ORDER BY a";
+        assert_eq!(
+            limbo_exec_rows(&conn, select),
+            sqlite_exec_rows(&sqlite, select),
+            "{sql}"
+        );
+    }
 }
 
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.

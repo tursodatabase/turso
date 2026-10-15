@@ -222,12 +222,15 @@ indexes whose key or WHERE term reads a changed column are rewritten: every
 new key is checked before any index changes, then old entries are deleted and
 new ones inserted, as in legacy. HIR's NEW-row source is bound to those
 registers, so new index keys, partial-index WHERE terms and RETURNING read the
-new values. These still go to legacy:
+new values. Like legacy, an UPDATE whose WHERE clause has a subquery first
+collects the rowids it changes, so the subquery never sees a changed row; a
+subquery in SET runs as the loop reaches each row. These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
-| A subquery in SET, WHERE or RETURNING | Reading it at the points legacy does |
+| A subquery in RETURNING (SQLite runs it again for each row) | Running it for each row |
+| `SET (a, b) = (SELECT ...)` | Assigning one subquery row to several columns |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | STRICT tables, custom types, generated columns | Type checks, encoding, computed columns |

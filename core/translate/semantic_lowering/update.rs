@@ -54,20 +54,23 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // Subqueries: legacy collects the rows to change first when the WHERE
-    // clause has one, and reads SET and RETURNING subqueries at set points.
-    if update.predicate.as_ref().is_some_and(has_subquery)
-        || update
-            .assignments
-            .iter()
-            .any(|assignment| has_subquery(&assignment.value))
-        || update.returning.as_ref().is_some_and(|returning| {
-            returning
-                .outputs
-                .iter()
-                .any(|output| has_subquery(&output.expr))
-        })
+    // `SET (a, b) = (SELECT ...)` assigns one subquery row to several
+    // columns, which is not lowered yet.
+    if update
+        .assignments
+        .iter()
+        .any(|assignment| assignment.columns.len() != 1)
     {
+        return Ok(true);
+    }
+    // Like SQLite, legacy runs a RETURNING subquery again for each row;
+    // HIR runs an uncorrelated one only once.
+    if update.returning.as_ref().is_some_and(|returning| {
+        returning
+            .outputs
+            .iter()
+            .any(|output| has_subquery(&output.expr))
+    }) {
         return Ok(true);
     }
     let foreign_keys = match &update.target_kind {
@@ -408,9 +411,11 @@ pub(super) fn emit_update(
         mvcc,
     };
     let done = program.allocate_label();
-    // Like legacy, an UPDATE with triggers or OR REPLACE first collects its
-    // rowids, since a trigger or a REPLACE can change the table.
+    // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
+    // WHERE clause first collects its rowids, since a trigger or a REPLACE
+    // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
+    let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
     match single_loop {
         None => emit_from_update(
             program,
@@ -422,7 +427,7 @@ pub(super) fn emit_update(
             row,
             done,
         )?,
-        Some((_, operation)) if triggers.is_empty() && !statement_replace => {
+        Some((_, operation)) if triggers.is_empty() && !statement_replace && !where_subquery => {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
         Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
@@ -1561,13 +1566,40 @@ mod tests {
     }
 
     #[test]
+    fn update_with_a_where_subquery_collects_its_rowids_first() {
+        let program = emit("UPDATE items SET extra = 'y' WHERE value IN (SELECT value FROM items)");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+            1
+        );
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::RowSetRead { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn update_with_set_subqueries_goes_through_hir() {
+        for sql in [
+            "UPDATE items SET extra = (SELECT max(extra) FROM items)",
+            "UPDATE items SET extra = (SELECT max(i.extra) FROM items AS i WHERE i.id < items.id)",
+        ] {
+            // `emit` checks that HIR takes the statement.
+            let program = emit(sql);
+            assert!(
+                count(&program, |insn| matches!(insn, Insn::Insert { .. })) >= 1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn update_that_needs_legacy_is_left_to_it() {
         for sql in [
             "UPDATE items SET id = id + 1",
             "UPDATE items SET rowid = 5 WHERE id = 1",
             "UPDATE OR REPLACE items SET value = 1",
-            "UPDATE items SET extra = (SELECT max(extra) FROM items)",
-            "UPDATE items SET extra = 'y' WHERE value IN (SELECT value FROM items)",
+            "UPDATE items SET (value, extra) = (SELECT 1, 'x')",
             "UPDATE items SET extra = 'y' RETURNING (SELECT 1)",
             // The loop reads the index whose key changes.
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
