@@ -950,6 +950,37 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_generation_requires_explicit_rowids() {
+        use clap::Parser;
+        for mvcc in [false, true] {
+            let output = tempfile::tempdir().unwrap();
+            let args = SimulatorCLI::parse_from([
+                "limbo_sim",
+                "--io-backend",
+                "memory",
+                "--mvcc",
+                if mvcc { "true" } else { "false" },
+            ]);
+            let env = SimulatorEnv::new(
+                1,
+                &args,
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::default(),
+            );
+            assert_eq!(
+                env.profile
+                    .query
+                    .gen_opts
+                    .query
+                    .insert
+                    .allow_implicit_rowids,
+                !mvcc
+            );
+        }
+    }
+
+    #[test]
     fn savepoint_outside_transaction_commits_on_release() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = None;
@@ -1461,6 +1492,9 @@ impl SimulatorEnv {
         // Conditionals here so that we can override some profile options from the CLI
         if let Some(mvcc) = cli_opts.mvcc {
             profile.mvcc = mvcc;
+        }
+        if profile.mvcc {
+            profile.query.gen_opts.query.insert.allow_implicit_rowids = false;
         }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
