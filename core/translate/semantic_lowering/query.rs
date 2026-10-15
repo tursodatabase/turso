@@ -4131,7 +4131,15 @@ fn prepare_hir_recursive_cte_loop<'a>(
             "HIR recursive CTE source {source_id} width does not match CTE {cte_id}"
         )));
     }
-    if let Some(shared) = program.hir_materialized_cte(cte_id).cloned() {
+    // A recursive CTE that reads outer columns runs inside the outer loop:
+    // it is computed again, into a fresh table, every time this point is
+    // reached, and each reference computes its own.
+    let correlated = hir_recursive_cte_reads_outer_sources(document, recursive);
+    if let Some(shared) = program
+        .hir_materialized_cte(cte_id)
+        .cloned()
+        .filter(|_| !correlated)
+    {
         let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
         program.emit_insn(Insn::OpenDup {
             new_cursor_id: cursor,
@@ -4154,9 +4162,11 @@ fn prepare_hir_recursive_cte_loop<'a>(
     let table = hir_materialized_table(source);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let materialized = program.allocate_label();
-    program.emit_insn(Insn::Once {
-        target_pc_when_reentered: materialized,
-    });
+    if !correlated {
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: materialized,
+        });
+    }
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
         is_table: true,
@@ -4180,19 +4190,33 @@ fn prepare_hir_recursive_cte_loop<'a>(
             table_cursor: None,
         },
     );
-    program.register_hir_materialized_cte(
-        cte_id,
-        MaterializedCteInfo {
-            cursor_id: cursor,
-            table: table.clone(),
-            num_columns: source.columns.len(),
-        },
-    );
+    if !correlated {
+        program.register_hir_materialized_cte(
+            cte_id,
+            MaterializedCteInfo {
+                cursor_id: cursor,
+                table: table.clone(),
+                num_columns: source.columns.len(),
+            },
+        );
+    }
     Ok(PreparedHirMaterializedLoop {
         source,
         cursor,
         table,
     })
+}
+
+/// Whether a recursive CTE's seed or steps read a source of an enclosing
+/// query, other than the CTE's own recursive input.
+fn hir_recursive_cte_reads_outer_sources(
+    document: &HirDocument,
+    recursive: &hir::RecursiveCte,
+) -> bool {
+    std::iter::once(recursive.seed)
+        .chain(recursive.arms.iter().map(|arm| arm.query))
+        .flat_map(|query| document.outer_sources(query))
+        .any(|source| !recursive.input_sources.contains(&source))
 }
 
 fn emit_hir_recursive_cte(
@@ -4225,23 +4249,6 @@ fn emit_hir_recursive_cte(
             cte.id
         )));
     }
-    let query_is_uncorrelated = |query_id| {
-        plan.document
-            .query(query_id)
-            .is_some_and(|query| query.captures.is_empty())
-    };
-    if !query_is_uncorrelated(recursive.seed)
-        || recursive
-            .arms
-            .iter()
-            .any(|arm| !query_is_uncorrelated(arm.query))
-    {
-        return Err(LimboError::InternalError(format!(
-            "HIR recursive CTE {} is correlated",
-            cte.id
-        )));
-    }
-
     let comparison_collations = recursive
         .comparison_collations
         .iter()

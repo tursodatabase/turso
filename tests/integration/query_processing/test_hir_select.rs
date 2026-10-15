@@ -209,6 +209,9 @@ fn hir_expression_subqueries_match_legacy_rows() {
         // plain rows.
         "SELECT EXISTS (SELECT extra FROM items ORDER BY abs(-9223372036854775807 - 1))",
         "SELECT EXISTS (SELECT DISTINCT extra FROM items ORDER BY extra LIMIT 9 OFFSET 5)",
+        // A recursive CTE that reads an outer column runs again per outer row.
+        "SELECT id, (WITH RECURSIVE c(x) AS (SELECT items.id UNION ALL SELECT x + 1 FROM c \
+         WHERE x < 4) SELECT count(*) FROM c) FROM items ORDER BY id",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \
