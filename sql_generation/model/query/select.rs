@@ -191,7 +191,7 @@ pub enum SelectTable {
 /// Convert a table name string to a QualifiedName, handling attached DB prefixes.
 /// Names like "aux0.t1" become `QualifiedName::fullname("aux0", "t1")`,
 /// while plain names like "t1" become `QualifiedName::single("t1")`.
-fn table_qualified_name(table: &str) -> ast::QualifiedName {
+pub fn table_qualified_name(table: &str) -> ast::QualifiedName {
     if let Some((db, tbl)) = table.split_once('.') {
         ast::QualifiedName::fullname(ast::Name::from_string(db), ast::Name::from_string(tbl))
     } else {
