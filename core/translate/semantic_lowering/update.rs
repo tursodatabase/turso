@@ -96,7 +96,12 @@ pub(super) fn needs_legacy(
     }
     // Changing the rowid moves the row; legacy collects the rows first.
     // Setting the rowid twice, or with UPDATE ... FROM, is not lowered yet.
-    if sets_rowid > 1 || (sets_rowid == 1 && update.from.is_some()) {
+    // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
+    // hidden sequence, which is not lowered yet either.
+    if sets_rowid > 1
+        || (sets_rowid == 1
+            && (update.from.is_some() || (table.has_autoincrement && program.is_mvcc_enabled())))
+    {
         return Ok(true);
     }
     if update.from.is_some() {
