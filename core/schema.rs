@@ -948,6 +948,28 @@ impl Schema {
         self.type_registry.get(&type_name.to_lowercase())
     }
 
+    pub fn column_type_def<'a>(
+        &'a self,
+        column: &'a Column,
+        is_strict: bool,
+    ) -> Option<&'a Arc<TypeDef>> {
+        match &column.custom_type {
+            Some(resolved) if is_strict => Some(&resolved.chain[0]),
+            _ => self.get_type_def(&column.ty_str, is_strict),
+        }
+    }
+
+    pub fn resolve_column_type(
+        &self,
+        column: &Column,
+        is_strict: bool,
+    ) -> crate::Result<Option<ResolvedType>> {
+        match &column.custom_type {
+            Some(resolved) if is_strict => Ok(Some((**resolved).clone())),
+            _ => self.resolve_type(&column.ty_str, is_strict),
+        }
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
@@ -3465,7 +3487,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| c.is_array() || schema.column_type_def(c, table.is_strict).is_some());
         if !has_custom {
             return Arc::clone(table);
         }
@@ -3475,10 +3497,11 @@ impl BTreeTable {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
+            } else if let Ok(Some(resolved)) = schema.resolve_column_type(col, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
                 col.override_affinity(Affinity::None);
             }
+            col.custom_type = None;
         }
         Arc::new(modified)
     }
@@ -3495,12 +3518,14 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| c.is_array() || schema.column_type_def(c, table.is_strict).is_some());
         if !has_custom {
             return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
         for (i, col) in modified.columns.iter_mut().enumerate() {
+            let type_def = schema.column_type_def(col, table.is_strict).cloned();
+            col.custom_type = None;
             if let Some(only) = only_columns {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
@@ -3513,7 +3538,7 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+            } else if let Some(type_def) = type_def {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
@@ -3535,11 +3560,7 @@ impl BTreeTable {
                 col.override_affinity(Affinity::Blob);
                 continue;
             }
-            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
-                let (base_ty, _) = type_from_name(&resolved.primitive);
-                col.set_ty(base_ty);
-                col.override_affinity(Affinity::affinity(&resolved.primitive));
-            }
+            col.resolve_custom_type(schema);
         }
     }
 
@@ -5429,6 +5450,7 @@ pub struct Column {
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
+    custom_type: Option<Arc<ResolvedType>>,
 }
 
 #[derive(Default)]
@@ -5515,6 +5537,16 @@ impl Column {
         })
     }
 
+    pub fn resolve_custom_type(&mut self, schema: &Schema) {
+        self.custom_type = None;
+        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
+            let (base_ty, _) = type_from_name(&resolved.primitive);
+            self.set_ty(base_ty);
+            self.override_affinity(Affinity::affinity(&resolved.primitive));
+            self.custom_type = Some(Arc::new(resolved));
+        }
+    }
+
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -5583,6 +5615,7 @@ impl Column {
             info,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
+            custom_type: None,
         }
     }
 

@@ -753,7 +753,7 @@ fn emit_add_column_check_validation(
 
     if let Ok(Some(resolved)) = resolver
         .schema()
-        .resolve_type(&column.ty_str, btree.is_strict)
+        .resolve_column_type(column, btree.is_strict)
     {
         if resolved.is_domain() {
             for td in &resolved.chain {
@@ -1270,6 +1270,9 @@ pub fn translate_alter_table(
                 FromDefinitionFlags::empty()
                     .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
             )?;
+            if btree.is_strict && !column.is_array() {
+                resolver.with_schema(database_id, |schema| column.resolve_custom_type(schema));
+            }
 
             if btree.columns().len() >= crate::types::MAX_COLUMN {
                 return Err(LimboError::ParseError(format!(
@@ -1320,9 +1323,7 @@ pub fn translate_alter_table(
                 }
 
                 if !is_builtin && btree.is_strict {
-                    let type_def = resolver
-                        .schema()
-                        .get_type_def_unchecked(&normalize_ident(ty));
+                    let type_def = resolver.schema().column_type_def(&column, true);
                     if type_def.is_none() {
                         return Err(LimboError::ParseError(format!(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
@@ -1339,7 +1340,7 @@ pub fn translate_alter_table(
             if column.default.is_none() {
                 if let Ok(Some(resolved)) = resolver
                     .schema()
-                    .resolve_type(&column.ty_str, btree.is_strict)
+                    .resolve_column_type(&column, btree.is_strict)
                 {
                     if let Some(type_default) = resolved.default_expr() {
                         column.default = Some(Box::new(type_default.clone()));
@@ -1478,7 +1479,7 @@ pub fn translate_alter_table(
                 // Check if we need to verify the table is empty at runtime.
                 let type_default = resolver
                     .schema()
-                    .resolve_type(&column.ty_str, btree.is_strict)
+                    .resolve_column_type(&column, btree.is_strict)
                     .ok()
                     .flatten()
                     .and_then(|r| r.default_expr().cloned());
@@ -1971,7 +1972,9 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_type_affinities(resolver.schema());
+                resolver.with_schema(database_id, |schema| {
+                    table.resolve_custom_type_affinities(schema)
+                });
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -2561,8 +2564,8 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
         return true;
     }
     match (
-        schema.get_type_def(&old.ty_str, true),
-        schema.get_type_def(&new.ty_str, true),
+        schema.column_type_def(old, true),
+        schema.column_type_def(new, true),
     ) {
         (None, None) => old.strict_value_type() != new.strict_value_type(),
         (Some(_), Some(_)) => {

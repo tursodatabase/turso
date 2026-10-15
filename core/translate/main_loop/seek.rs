@@ -47,7 +47,7 @@ fn encode_seek_keys_for_custom_types(
         };
         let type_def = match resolver
             .schema()
-            .get_type_def(&table_col.ty_str, table.is_strict())
+            .column_type_def(table_col, table.is_strict())
         {
             Some(td) => td,
             None => continue,

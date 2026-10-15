@@ -895,7 +895,7 @@ fn emit_update_column_values<'a>(
                             let union_td = t_ctx
                                 .resolver
                                 .schema
-                                .get_type_def_unchecked(&table_column.ty_str)
+                                .column_type_def(table_column, true)
                                 .filter(|td| td.is_union())
                                 .cloned();
                             let prev_union = program.target_union_type.take();
@@ -904,15 +904,11 @@ fn emit_update_column_values<'a>(
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
+                            let has_custom_encode = t_ctx
+                                .resolver
+                                .schema
+                                .column_type_def(table_column, true)
+                                .is_some_and(|td| td.encode().is_some());
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,

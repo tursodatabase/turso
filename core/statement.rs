@@ -1313,7 +1313,7 @@ impl Statement {
             let array_dimensions = table_column.array_dimensions();
             let schema = self.program.connection.schema.read();
             let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
+                .resolve_column_type(table_column, table_ref.is_strict())
                 .ok()
                 .flatten();
             // `kind` is computed from the leaf TypeDef in the resolution chain:

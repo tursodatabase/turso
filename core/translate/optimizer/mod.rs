@@ -4377,7 +4377,7 @@ fn autoindex_prefilter(
             let is_array = column.is_array();
             let has_custom_type = resolver
                 .schema()
-                .get_type_def(&column.ty_str, table_reference.table.is_strict())
+                .column_type_def(column, table_reference.table.is_strict())
                 .is_some();
             if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
                 continue;

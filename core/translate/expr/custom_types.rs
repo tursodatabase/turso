@@ -139,12 +139,9 @@ pub(super) fn expr_custom_type_info(
         let tables = referenced_tables?;
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
-        let type_name = &col.ty_str;
-        let type_def = resolver
-            .schema()
-            .get_type_def(type_name, table.is_strict())?;
+        let type_def = resolver.schema().column_type_def(col, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
-            type_name: type_name.to_lowercase(),
+            type_name: col.ty_str.to_lowercase(),
             column: col.clone(),
             type_def: Arc::clone(type_def),
         });
@@ -341,7 +338,7 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() {
             continue;
         }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
+        if let Some(type_def) = resolver.schema().column_type_def(col, is_strict) {
             if type_def.decode().is_some() {
                 let src_reg = column_regs[i];
                 let tmp = program.alloc_register();
@@ -394,7 +391,7 @@ pub(crate) fn emit_user_facing_column_value(
     if column.is_array() {
         return Ok(());
     }
-    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+    if let Ok(Some(resolved)) = resolver.schema().resolve_column_type(column, is_strict) {
         if resolved.chain.iter().all(|td| td.decode().is_none()) {
             return Ok(());
         }
@@ -567,7 +564,7 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
+            let type_def = resolver.schema().column_type_def(col, is_strict);
             if let Some(type_def) = type_def {
                 if let Some(decode_expr) = type_def.decode() {
                     let src = source_regs(i);

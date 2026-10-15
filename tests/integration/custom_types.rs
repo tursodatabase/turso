@@ -90,6 +90,189 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_attached_table_uses_types_from_its_own_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("custom_types_attached_aux.db");
+        let main_path = temp_dir.path().join("custom_types_attached_main.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_attach(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, amount cents) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO p VALUES (1, 5)").unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 10 DECODE value / 10")
+                .unwrap();
+            conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+                .unwrap();
+
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM aux.p");
+            assert_eq!(rows, vec![(1, 5)]);
+
+            conn.execute("INSERT INTO aux.p VALUES (2, 7)").unwrap();
+            conn.execute("UPDATE aux.p SET amount = amount + 1 WHERE id = 2")
+                .unwrap();
+            let rows: Vec<(i64, i64)> =
+                conn.exec_rows("SELECT id, amount FROM aux.p WHERE amount = 8");
+            assert_eq!(rows, vec![(2, 8)]);
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM p ORDER BY id");
+        assert_eq!(rows, vec![(1, 5), (2, 8)]);
+    }
+
+    #[test]
+    fn test_attached_table_sees_type_recreated_by_another_connection() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("custom_types_reload_aux.db");
+        let main_path = temp_dir.path().join("custom_types_reload_main.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_attach(true);
+
+        let aux_db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+        let aux_conn = aux_db.connect_limbo();
+        aux_conn
+            .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        aux_conn
+            .execute("CREATE TABLE p(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        aux_conn.execute("INSERT INTO p VALUES (1, 5)").unwrap();
+
+        let main_db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+        let main_conn = main_db.connect_limbo();
+        main_conn
+            .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let rows: Vec<(i64, i64)> = main_conn.exec_rows("SELECT id, amount FROM aux.p");
+        assert_eq!(rows, vec![(1, 5)]);
+
+        aux_conn.execute("DROP TABLE p").unwrap();
+        aux_conn.execute("DROP TYPE cents").unwrap();
+        aux_conn
+            .execute("CREATE TYPE cents BASE integer ENCODE value * 10 DECODE value / 10")
+            .unwrap();
+        aux_conn
+            .execute("CREATE TABLE p(id INTEGER PRIMARY KEY, amount cents) STRICT")
+            .unwrap();
+        aux_conn.execute("INSERT INTO p VALUES (1, 5)").unwrap();
+
+        let rows: Vec<(i64, i64)> = main_conn.exec_rows("SELECT id, amount FROM aux.p");
+        assert_eq!(rows, vec![(1, 5)]);
+        main_conn
+            .execute("INSERT INTO aux.p VALUES (2, 7)")
+            .unwrap();
+        let rows: Vec<(i64, i64)> = aux_conn.exec_rows("SELECT id, amount FROM p ORDER BY id");
+        assert_eq!(rows, vec![(1, 5), (2, 7)]);
+    }
+
+    #[test]
+    fn test_column_added_to_attached_table_uses_type_from_its_own_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("custom_types_add_column_aux.db");
+        let main_path = temp_dir.path().join("custom_types_add_column_main.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_attach(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TYPE points BASE integer ENCODE value * 2 DECODE value / 2")
+                .unwrap();
+            conn.execute("CREATE TABLE q(id INTEGER PRIMARY KEY, a cents, b INTEGER) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO q VALUES (1, 5, 7)").unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 1000 DECODE value / 1000")
+                .unwrap();
+            conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+                .unwrap();
+            conn.execute("CREATE TABLE aux.r(id INTEGER PRIMARY KEY) STRICT")
+                .unwrap();
+            conn.execute("ALTER TABLE aux.r ADD COLUMN amount cents")
+                .unwrap();
+            conn.execute("ALTER TABLE aux.r ADD COLUMN bonus points")
+                .unwrap();
+            conn.execute("INSERT INTO aux.r VALUES (1, 5, 3)").unwrap();
+            conn.execute("CREATE TABLE aux.s(id INTEGER PRIMARY KEY, amount INTEGER) STRICT")
+                .unwrap();
+            conn.execute("ALTER TABLE aux.s ALTER COLUMN amount TO total cents")
+                .unwrap();
+            conn.execute("INSERT INTO aux.s VALUES (1, 6)").unwrap();
+            conn.execute("ALTER TABLE aux.q ALTER COLUMN b TO c cents")
+                .unwrap();
+            let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, a, c FROM aux.q");
+            assert_eq!(rows, vec![(1, 5, 7)]);
+            let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, amount, bonus FROM aux.r");
+            assert_eq!(rows, vec![(1, 5, 3)]);
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, total FROM aux.s");
+            assert_eq!(rows, vec![(1, 6)]);
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, amount, bonus FROM r");
+        assert_eq!(rows, vec![(1, 5, 3)]);
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, total FROM s");
+        assert_eq!(rows, vec![(1, 6)]);
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, a, c FROM q");
+        assert_eq!(rows, vec![(1, 5, 7)]);
+    }
+
+    #[test]
+    fn test_index_on_attached_table_with_type_only_in_attached_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("custom_types_index_attached_aux.db");
+        let main_path = temp_dir.path().join("custom_types_index_attached_main.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_attach(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE neg BASE integer ENCODE -value DECODE -value OPERATOR '<'")
+                .unwrap();
+            conn.execute("CREATE TABLE t(v neg) STRICT").unwrap();
+            conn.execute("CREATE INDEX tv ON t(v)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+        let conn = db.connect_limbo();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let mut rows: Vec<(i64,)> = conn.exec_rows("SELECT v FROM aux.t WHERE v > 1");
+        rows.sort();
+        assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
     /// Custom types must be loaded from __turso_internal_types when reopening
     /// a database. Without this, SELECT returns raw encoded values and PRAGMA
     /// list_types omits user-defined types.

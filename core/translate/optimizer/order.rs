@@ -1035,7 +1035,7 @@ fn index_columns_order_consumed<'a>(
         if let ColumnTarget::Column(col_no) = &target_col.target {
             if let Some(col) = table_ref.table.columns().get(*col_no) {
                 if schema
-                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
+                    .column_type_def(col, table_ref.table.is_strict())
                     .is_some()
                 {
                     break;
