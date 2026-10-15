@@ -103,9 +103,13 @@ expect {
     7
 }
 
-test copy-reads-uncommitted-changes-without-committing {
+setup items {
     CREATE TABLE items (id int);
     INSERT INTO items VALUES (7);
+}
+
+@setup items
+test copy-reads-uncommitted-changes-without-committing {
     BEGIN;
     UPDATE items SET id = 19;
     COPY items TO STDOUT;
