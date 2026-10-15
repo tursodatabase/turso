@@ -153,7 +153,23 @@ fn compile_trigger(
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                super::update::needs_legacy(&plan, update, access, foreign_keys_enabled, &builder)?
+                if super::update::needs_legacy(
+                    &plan,
+                    update,
+                    access,
+                    foreign_keys_enabled,
+                    &builder,
+                )? {
+                    true
+                } else {
+                    match update_triggers(session, &builder, &plan, update)? {
+                        Some(triggers) => {
+                            command_triggers = triggers;
+                            false
+                        }
+                        None => true,
+                    }
+                }
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
                 if super::delete::needs_legacy(delete, access, foreign_keys_enabled, &builder)? {
@@ -245,7 +261,14 @@ fn compile_trigger(
                     .source(update.target)
                     .and_then(|source| source.database)
                     .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
-                super::update::emit_update(&mut builder, &plan, update, access, mvcc)?;
+                super::update::emit_update(
+                    &mut builder,
+                    &plan,
+                    update,
+                    access,
+                    command_triggers,
+                    mvcc,
+                )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
@@ -310,15 +333,43 @@ pub(super) fn insert_triggers(
     let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
         return Ok(Some(Vec::new()));
     };
-    let conflict_override = parent.trigger_conflict_override.or(insert
-        .conflict
-        .filter(|conflict| *conflict != ResolveType::Abort));
+    let conflict_override = parent.trigger_conflict_override.or_else(|| {
+        insert
+            .conflict
+            .filter(|conflict| *conflict != ResolveType::Abort)
+    });
     target_triggers(
         session,
         parent,
         plan,
         insert.target,
         &triggers.insert,
+        conflict_override,
+    )
+}
+
+/// Compile the triggers an UPDATE fires. `None` means one needs legacy.
+/// The conflict clause applies inside them as for INSERT.
+pub(super) fn update_triggers(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    update: &hir::Update,
+) -> Result<Option<Vec<CompiledTrigger>>> {
+    let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let conflict_override = parent.trigger_conflict_override.or_else(|| {
+        update
+            .conflict
+            .filter(|conflict| *conflict != ResolveType::Abort)
+    });
+    target_triggers(
+        session,
+        parent,
+        plan,
+        update.target,
+        triggers,
         conflict_override,
     )
 }

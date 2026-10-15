@@ -2027,6 +2027,7 @@ mod tests {
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
                 },
+                command_database: Some(DatabaseId::new(MAIN_DB_ID)),
                 predicate: when_clause.as_deref(),
                 commands: &commands,
                 conflict_override,

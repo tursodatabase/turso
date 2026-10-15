@@ -229,6 +229,7 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
         &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
         &["UPDATE t SET b = 9 WHERE a = 1"],
+        // Triggers run from HIR-compiled subprograms.
         &[
             "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (old.a); END",
             "UPDATE u SET c = 'k' WHERE a < 3",
@@ -238,6 +239,47 @@ fn hir_update_matches_legacy() {
             "CREATE TEMP TRIGGER tr AFTER UPDATE OF c ON main.u BEGIN \
              INSERT INTO log VALUES (old.a); END",
             "UPDATE u SET c = 'k' WHERE a < 3",
+        ],
+        &[
+            "CREATE TRIGGER bu BEFORE UPDATE ON u WHEN new.d > old.d BEGIN \
+             INSERT INTO log VALUES (new.rowid * 100 + old.b); END",
+            "CREATE TRIGGER au AFTER UPDATE OF d ON u BEGIN \
+             INSERT INTO log VALUES (new.d); END",
+            "CREATE TRIGGER ac AFTER UPDATE OF c ON u BEGIN INSERT INTO log VALUES (-1); END",
+            "UPDATE u SET d = d + 1 WHERE a IN (1, 3, 4) RETURNING a, d",
+        ],
+        // A BEFORE trigger that changes the row: the columns the UPDATE does
+        // not set are read again, so its change is kept.
+        &[
+            "CREATE TRIGGER bu BEFORE UPDATE OF c ON u BEGIN \
+             UPDATE u SET d = 100 WHERE a = old.a; END",
+            "UPDATE u SET c = 'k' WHERE a < 4",
+        ],
+        // A BEFORE trigger that deletes the row skips it.
+        &[
+            "CREATE TRIGGER bu BEFORE UPDATE ON u BEGIN DELETE FROM u WHERE a = old.a + 1; END",
+            "UPDATE u SET c = 'k'",
+        ],
+        &[
+            "CREATE TRIGGER ig BEFORE UPDATE ON u WHEN old.a = 2 BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TRIGGER au AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "UPDATE u SET c = 'k'",
+        ],
+        &[
+            "CREATE TRIGGER ab AFTER UPDATE ON u WHEN new.a = 3 BEGIN \
+             SELECT RAISE(ABORT, 'no'); END",
+            "UPDATE u SET c = 'k'",
+        ],
+        // NOT NULL is checked after the BEFORE triggers, which can fix the row.
+        &[
+            "CREATE TRIGGER bu BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (old.a); END",
+            "UPDATE u SET b = NULL WHERE a = 2",
+        ],
+        // OR IGNORE in the statement also applies inside the trigger.
+        &[
+            "CREATE TRIGGER au AFTER UPDATE ON u BEGIN \
+             UPDATE u SET b = 1 WHERE a = new.a + 1; INSERT INTO log VALUES (new.a); END",
+            "UPDATE OR IGNORE u SET c = 'k' WHERE a < 3",
         ],
     ] {
         assert_eq!(

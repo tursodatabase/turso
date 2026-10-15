@@ -209,7 +209,6 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| Triggers, including temp triggers on a main table | Trigger bodies lowered from HIR |
 | Enforced foreign keys (`PRAGMA foreign_keys = ON` with a constraint on the table) | Parent-key checks and CASCADE/SET NULL/SET DEFAULT actions |
 | A subquery in RETURNING | RETURNING read from a copy of the deleted row |
 | CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
@@ -227,7 +226,7 @@ new values. These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
-| Triggers, enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
 | Any subquery, UPDATE ... FROM | Collecting the rows to change first, as legacy does |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | REPLACE (statement, NOT NULL, or index) | Deleting the conflicting row |
@@ -244,11 +243,31 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
-| Triggers, enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
 | UPSERT and REPLACE (statement, column, index or INTEGER PRIMARY KEY) | Conflict actions |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
 | WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
+
+Triggers fired by these statements are compiled from HIR too
+(`semantic_lowering/trigger.rs`). Each trigger is analyzed as its own HIR
+document whose OLD and NEW sources are bound to registers, and is emitted as a
+subprogram that the statement runs with `Program`, as in legacy. The
+subprogram loads OLD and NEW from its parameters, tests WHEN, and lowers each
+command with the same DELETE, UPDATE and INSERT code; a command's own
+triggers are compiled the same way, and a trigger already being compiled is
+not fired again. TEMP triggers fire first. Every command of every trigger is
+checked before anything is emitted, so if one needs legacy the whole
+statement goes to legacy. As in SQLite, OLD.x and NEW.x compare without the
+column's affinity (a rowid alias keeps INTEGER), and triggers stored in the
+temp schema find unqualified tables by the normal temp-then-main lookup.
+
+With triggers, DELETE and UPDATE collect the rowids first, then for each row
+read the OLD row, run BEFORE triggers, check that the row still exists, write,
+and run AFTER triggers. UPDATE reads the columns it does not set again after
+BEFORE triggers and checks NOT NULL only then. INSERT runs BEFORE triggers
+with NEW.rowid -1 when the rowid is not given yet.
 
 ### Non-lowering phase complete
 

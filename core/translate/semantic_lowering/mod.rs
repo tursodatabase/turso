@@ -97,7 +97,8 @@ pub(crate) fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
     if update::needs_legacy(
         &plan,
@@ -108,13 +109,16 @@ pub(crate) fn translate_update(
     )? {
         return Ok(false);
     }
+    let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
+        return Ok(false);
+    };
     let mvcc = plan
         .document
         .source(update.target)
         .and_then(|source| source.database)
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
     program.set_hir_plan(plan.clone());
-    update::emit_update(program, &plan, update, access, mvcc)?;
+    update::emit_update(program, &plan, update, access, &triggers, mvcc)?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;

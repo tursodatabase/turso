@@ -8,13 +8,14 @@
 
 use std::num::NonZeroUsize;
 
-use turso_parser::ast::ResolveType;
+use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
         insert::halt_desc_and_on_error,
+        optimizer::HirBtreeOperation,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
         stmt_journal::constraint_may_abort,
@@ -33,8 +34,10 @@ use super::dml::{
     DmlTarget, ReturningBuffer,
 };
 use super::query::{
-    close_hir_btree_loop, hir_loop_explain, start_hir_btree_loop, PreparedHirBtreeLoop,
+    close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
+    PreparedHirBtreeLoop,
 };
+use super::trigger::{CompiledTrigger, TriggerRow};
 
 /// Whether this UPDATE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -72,14 +75,7 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     match &update.target_kind {
-        hir::UpdateTargetKind::BTree {
-            triggers,
-            foreign_keys,
-            ..
-        } => {
-            if !triggers.is_empty() {
-                return Ok(true);
-            }
+        hir::UpdateTargetKind::BTree { foreign_keys, .. } => {
             if foreign_keys_enabled
                 && (!foreign_keys.outgoing.is_empty() || !foreign_keys.incoming.is_empty())
             {
@@ -181,6 +177,7 @@ pub(super) fn emit_update(
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
+    triggers: &[CompiledTrigger],
     mvcc: bool,
 ) -> Result<()> {
     let document = &plan.document;
@@ -247,7 +244,7 @@ pub(super) fn emit_update(
     }
 
     // Same statement-journal facts as legacy.
-    if touches_at_most_one_row(operation) {
+    if triggers.is_empty() && touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
     let has_notnull = values
@@ -258,25 +255,84 @@ pub(super) fn emit_update(
         || changed_indexes
             .iter()
             .any(|(old, _)| old.index.value().unique);
-    program.set_may_abort(constraint_may_abort(
-        has_statement_conflict,
-        or_conflict,
-        table.rowid_alias_conflict_clause,
-        changed_indexes.iter().map(|(old, _)| {
-            let index = old.index.value();
-            (index.on_conflict, index.unique)
-        }),
-        has_notnull,
-        false,
-        has_unique,
-    ));
+    program.set_may_abort(
+        !triggers.is_empty()
+            || constraint_may_abort(
+                has_statement_conflict,
+                or_conflict,
+                table.rowid_alias_conflict_clause,
+                changed_indexes.iter().map(|(old, _)| {
+                    let index = old.index.value();
+                    (index.on_conflict, index.unique)
+                }),
+                has_notnull,
+                false,
+                has_unique,
+            ),
+    );
 
     program.emit_source_explain(
         target.source.id,
         hir_loop_explain(document, None, planned_loop)?,
     );
     let returning = ReturningBuffer::open(program, table, update.returning.as_ref());
+    let row = UpdateRowSettings {
+        or_conflict,
+        has_statement_conflict,
+    };
 
+    let row_layout = UpdateRowLayout {
+        values: &values,
+        changed_indexes: &changed_indexes,
+        new_source: new_source.id,
+        returning,
+        triggers,
+        mvcc,
+    };
+    let done = program.allocate_label();
+    if triggers.is_empty() {
+        emit_scan_update(program, &target, access, operation, &row_layout, row, done)?;
+    } else {
+        emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?;
+    }
+    program.preassign_label_to_next_insn(done);
+    if let Some(returning) = returning {
+        returning.emit_rows(program);
+    }
+    Ok(())
+}
+
+/// What every row of an UPDATE computes, shared by both loops.
+struct UpdateRowLayout<'a> {
+    /// Each column's assigned value, if any.
+    values: &'a [Option<&'a hir::Expr>],
+    /// The indexes the UPDATE changes, with their OLD- and NEW-row expressions.
+    changed_indexes: &'a [(&'a hir::IndexExpressions, &'a hir::IndexExpressions)],
+    new_source: hir::SourceId,
+    returning: Option<ReturningBuffer<'a>>,
+    triggers: &'a [CompiledTrigger],
+    mvcc: bool,
+}
+
+/// Registers and conflict settings of an UPDATE's row, before the cursor
+/// that reads it is known.
+#[derive(Clone, Copy)]
+struct UpdateRowSettings {
+    or_conflict: ResolveType,
+    has_statement_conflict: bool,
+}
+
+/// Update each row as the loop reaches it.
+fn emit_scan_update(
+    program: &mut ProgramBuilder,
+    target: &DmlTarget<'_>,
+    access: &HirAccessPlan,
+    operation: &HirBtreeOperation,
+    layout: &UpdateRowLayout<'_>,
+    settings: UpdateRowSettings,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = target.document;
     // Like legacy, open the table, the index the loop reads, then each index
     // the UPDATE changes, all for writing.
     let iteration_index = operation_index(operation);
@@ -290,18 +346,7 @@ pub(super) fn emit_update(
         });
         cursor
     });
-    let index_cursors = changed_indexes
-        .iter()
-        .map(|(old, _)| {
-            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(old.index.handle()));
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id: cursor,
-                root_page: RegisterOrLiteral::Literal(old.index.value().root_page),
-                db: target.database,
-            });
-            cursor
-        })
-        .collect::<Vec<_>>();
+    let index_cursors = open_changed_indexes(program, target, layout);
 
     let scan_cursor = iteration_cursor.unwrap_or(table_cursor);
     let lookup_cursor = iteration_cursor.map(|_| table_cursor);
@@ -319,19 +364,18 @@ pub(super) fn emit_update(
         cursor: scan_cursor,
         table_cursor: lookup_cursor,
         autoindex_source_cursor: None,
-        table_has_rowid: table.has_rowid,
+        table_has_rowid: target.table.has_rowid,
     };
-    let done = program.allocate_label();
     emit_access_predicates(program, document, access, None, done)?;
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
     emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
 
     let row = UpdateRow {
-        target: &target,
+        target,
         table_cursor,
-        rowid: program.alloc_registers(table.columns().len() + 1),
-        or_conflict,
-        has_statement_conflict,
+        rowid: program.alloc_registers(target.table.columns().len() + 1),
+        or_conflict: settings.or_conflict,
+        has_statement_conflict: settings.has_statement_conflict,
         skip_row: hir_loop.next,
     };
     // RowId on the table cursor also finishes a deferred seek from the
@@ -344,117 +388,102 @@ pub(super) fn emit_update(
         reg: row.rowid,
         target_pc: done,
     });
-    // The old row is read from the table, as legacy does.
-    program.bind_source(
-        target.source.id,
-        SourceBinding::BTree {
-            scan_cursor: table_cursor,
-            table_cursor: None,
-        },
-    );
-    row.emit_new_values(program, &values)?;
-    program.bind_source(
-        new_source.id,
-        SourceBinding::Registers {
-            start: row.start(),
-            rowid: Some(row.rowid),
-        },
-    );
-
-    // Like legacy, check every changed index before changing any of them:
-    // build the new keys and check UNIQUE, then delete the old entries,
-    // then insert the new ones.
-    let mut new_keys = Vec::with_capacity(changed_indexes.len());
-    for ((old, new), cursor) in changed_indexes.iter().zip(&index_cursors) {
-        new_keys.push(row.emit_new_index_key(program, old, new, *cursor)?);
-    }
-    for ((old, _), (cursor, key)) in changed_indexes
-        .iter()
-        .zip(index_cursors.iter().zip(&new_keys))
-    {
-        let skip = key.old_in_index.map(|old_in_index| {
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: old_in_index,
-                target_pc: skip,
-                jump_if_null: true,
-            });
-            skip
-        });
-        let (start, count) =
-            emit_index_key(program, document, target.source, table, table_cursor, old)?;
-        program.emit_insn(Insn::IdxDelete {
-            start_reg: start,
-            num_regs: count,
-            cursor_id: *cursor,
-            raise_error_if_no_matching_entry: true,
-        });
-        if let Some(skip) = skip {
-            program.preassign_label_to_next_insn(skip);
-        }
-    }
-    for (cursor, key) in index_cursors.iter().zip(&new_keys) {
-        let skip = key.new_in_index.map(|new_in_index| {
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: new_in_index,
-                target_pc: skip,
-                jump_if_null: true,
-            });
-            skip
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: *cursor,
-            record_reg: key.record,
-            unpacked_start: Some(key.start),
-            unpacked_count: Some(to_u32(key.count)),
-            flags: IdxInsertFlags::new().nchange(true),
-        });
-        if let Some(skip) = skip {
-            program.preassign_label_to_next_insn(skip);
-        }
-    }
-
-    let record = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(row.start()),
-        count: to_u32(table.columns().len()),
-        dest_reg: to_u32(record),
-        index_name: None,
-        affinity_str: Some(
-            table
-                .columns()
-                .iter()
-                .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
-                .collect(),
-        ),
-    });
-    // MVCC keeps every version of a row, so the old one is deleted and the
-    // new one inserted.
-    if mvcc {
-        program.emit_insn(Insn::Delete {
-            cursor_id: table_cursor,
-            table_name: table.name.clone(),
-            is_part_of_update: true,
-        });
-    }
-    program.emit_insn(Insn::Insert {
-        cursor: table_cursor,
-        key_reg: row.rowid,
-        record_reg: record,
-        flag: InsertFlags::new().skip_last_rowid(),
-        table_name: table.name.clone(),
-    });
-    if let Some(returning) = returning {
-        let start = returning.emit_values(program, document)?;
-        returning.emit_buffer(program, start);
-    }
+    row.emit(program, layout, &index_cursors)?;
     close_hir_btree_loop(program, &hir_loop, &[]);
-    program.preassign_label_to_next_insn(done);
-    if let Some(returning) = returning {
-        returning.emit_rows(program);
-    }
     Ok(())
+}
+
+/// Collect the rowids of the rows to update with read cursors, then update
+/// each collected row. Like legacy, an UPDATE with triggers does this, since
+/// a trigger can change the table.
+fn emit_rowset_update(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    target: &DmlTarget<'_>,
+    access: &HirAccessPlan,
+    layout: &UpdateRowLayout<'_>,
+    settings: UpdateRowSettings,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = target.document;
+    let [planned_loop] = access.loops.as_slice() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR UPDATE plan has {} loops for one target",
+            access.loops.len()
+        )));
+    };
+    let rowset = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowset,
+        dest_end: None,
+    });
+    let collected = program.allocate_label();
+    let prepared = prepare_hir_btree_loop(program, plan, planned_loop)?;
+    emit_access_predicates(program, document, access, None, collected)?;
+    let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
+    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
+    let rowid = program.alloc_register();
+    super::expr::translate_expr(
+        program,
+        document,
+        &hir::Expr::RowId(target.source.id),
+        rowid,
+    )?;
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg: rowset,
+        value_reg: rowid,
+    });
+    close_hir_btree_loop(program, &hir_loop, &[]);
+    program.preassign_label_to_next_insn(collected);
+    for cursor in std::iter::once(prepared.cursor).chain(prepared.table_cursor) {
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
+
+    let table_cursor = target.open_table_for_write(program);
+    let index_cursors = open_changed_indexes(program, target, layout);
+    let next = program.allocate_label();
+    let row = UpdateRow {
+        target,
+        table_cursor,
+        rowid: program.alloc_registers(target.table.columns().len() + 1),
+        or_conflict: settings.or_conflict,
+        has_statement_conflict: settings.has_statement_conflict,
+        skip_row: next,
+    };
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg: rowset,
+        pc_if_empty: done,
+        dest_reg: row.rowid,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor: table_cursor,
+        rowid_reg: row.rowid,
+        target_pc: next,
+    });
+    row.emit(program, layout, &index_cursors)?;
+    program.emit_insn(Insn::Goto { target_pc: next });
+    Ok(())
+}
+
+fn open_changed_indexes(
+    program: &mut ProgramBuilder,
+    target: &DmlTarget<'_>,
+    layout: &UpdateRowLayout<'_>,
+) -> Vec<CursorID> {
+    layout
+        .changed_indexes
+        .iter()
+        .map(|(old, _)| {
+            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(old.index.handle()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: cursor,
+                root_page: RegisterOrLiteral::Literal(old.index.value().root_page),
+                db: target.database,
+            });
+            cursor
+        })
+        .collect()
 }
 
 pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPlan)> {
@@ -511,8 +540,8 @@ fn index_reads_assigned_column(
 
 /// The registers of the row an UPDATE rewrites: the rowid, then one
 /// register per column for the new row.
-struct UpdateRow<'a> {
-    target: &'a DmlTarget<'a>,
+struct UpdateRow<'a, 'b> {
+    target: &'a DmlTarget<'b>,
     table_cursor: CursorID,
     rowid: usize,
     or_conflict: ResolveType,
@@ -532,9 +561,199 @@ struct NewIndexKey {
     new_in_index: Option<usize>,
 }
 
-impl UpdateRow<'_> {
+impl UpdateRow<'_, '_> {
     fn start(&self) -> usize {
         self.rowid + 1
+    }
+
+    /// Rewrite the row the table cursor is on.
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        index_cursors: &[CursorID],
+    ) -> Result<()> {
+        let document = self.target.document;
+        let table = self.target.table;
+        let source = self.target.source;
+        let columns = table.columns().len();
+        let fires = |time: TriggerTime| {
+            layout
+                .triggers
+                .iter()
+                .filter(move |trigger| trigger.time == time)
+        };
+        let has_before = fires(TriggerTime::Before).next().is_some();
+        // The old row is read from the table, as legacy does.
+        program.bind_source(
+            source.id,
+            SourceBinding::BTree {
+                scan_cursor: self.table_cursor,
+                table_cursor: None,
+            },
+        );
+        // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
+        self.emit_new_values(program, layout.values, !has_before)?;
+        let new_row = TriggerRow {
+            columns: self.start(),
+            rowid: self.rowid,
+        };
+        // The OLD row the triggers read, as a query would read it.
+        let old_row = (!layout.triggers.is_empty())
+            .then(|| -> Result<TriggerRow> {
+                let start = program.alloc_registers(columns);
+                for column in 0..columns {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: source.id,
+                            column,
+                        }),
+                        start + column,
+                    )?;
+                }
+                Ok(TriggerRow {
+                    columns: start,
+                    rowid: self.rowid,
+                })
+            })
+            .transpose()?;
+        if has_before {
+            for trigger in fires(TriggerTime::Before) {
+                // RAISE(IGNORE) skips the rest of this row.
+                trigger.emit_fire(program, old_row, Some(new_row), columns, self.skip_row)?;
+            }
+            // Like legacy and SQLite: the trigger may have deleted the row,
+            // and the columns the UPDATE does not set are read again, since
+            // the trigger may have changed them.
+            program.emit_insn(Insn::NotExists {
+                cursor: self.table_cursor,
+                rowid_reg: self.rowid,
+                target_pc: self.skip_row,
+            });
+            for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
+            {
+                if value.is_none() && !column.is_rowid_alias() {
+                    program.emit_column_or_rowid(
+                        self.table_cursor,
+                        position,
+                        self.start() + position,
+                    );
+                }
+            }
+            for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
+            {
+                if value.is_some() && column.notnull() {
+                    self.emit_notnull_check(program, column, self.start() + position);
+                }
+            }
+        }
+        program.bind_source(
+            layout.new_source,
+            SourceBinding::Registers {
+                start: self.start(),
+                rowid: Some(self.rowid),
+            },
+        );
+
+        // Like legacy, check every changed index before changing any of them:
+        // build the new keys and check UNIQUE, then delete the old entries,
+        // then insert the new ones.
+        let mut new_keys = Vec::with_capacity(layout.changed_indexes.len());
+        for ((old, new), cursor) in layout.changed_indexes.iter().zip(index_cursors) {
+            new_keys.push(self.emit_new_index_key(program, old, new, *cursor)?);
+        }
+        for ((old, _), (cursor, key)) in layout
+            .changed_indexes
+            .iter()
+            .zip(index_cursors.iter().zip(&new_keys))
+        {
+            let skip = key.old_in_index.map(|old_in_index| {
+                let skip = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: old_in_index,
+                    target_pc: skip,
+                    jump_if_null: true,
+                });
+                skip
+            });
+            let (start, count) =
+                emit_index_key(program, document, source, table, self.table_cursor, old)?;
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: start,
+                num_regs: count,
+                cursor_id: *cursor,
+                raise_error_if_no_matching_entry: true,
+            });
+            if let Some(skip) = skip {
+                program.preassign_label_to_next_insn(skip);
+            }
+        }
+        for (cursor, key) in index_cursors.iter().zip(&new_keys) {
+            let skip = key.new_in_index.map(|new_in_index| {
+                let skip = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: new_in_index,
+                    target_pc: skip,
+                    jump_if_null: true,
+                });
+                skip
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: *cursor,
+                record_reg: key.record,
+                unpacked_start: Some(key.start),
+                unpacked_count: Some(to_u32(key.count)),
+                flags: IdxInsertFlags::new().nchange(true),
+            });
+            if let Some(skip) = skip {
+                program.preassign_label_to_next_insn(skip);
+            }
+        }
+
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(self.start()),
+            count: to_u32(columns),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+                    .collect(),
+            ),
+        });
+        // MVCC keeps every version of a row, so the old one is deleted and
+        // the new one inserted.
+        if layout.mvcc {
+            program.emit_insn(Insn::Delete {
+                cursor_id: self.table_cursor,
+                table_name: table.name.clone(),
+                is_part_of_update: true,
+            });
+        }
+        program.emit_insn(Insn::Insert {
+            cursor: self.table_cursor,
+            key_reg: self.rowid,
+            record_reg: record,
+            flag: InsertFlags::new().skip_last_rowid(),
+            table_name: table.name.clone(),
+        });
+        if let Some(returning) = layout.returning {
+            let start = returning.emit_values(program, document)?;
+            returning.emit_buffer(program, start);
+        }
+        // Like legacy, AFTER triggers fire after RETURNING has read the row,
+        // and RAISE(IGNORE) in one only ends that trigger's body.
+        let after_triggers = program.allocate_label();
+        for trigger in fires(TriggerTime::After) {
+            trigger.emit_fire(program, old_row, Some(new_row), columns, after_triggers)?;
+        }
+        program.preassign_label_to_next_insn(after_triggers);
+        Ok(())
     }
 
     /// Fill the new-row registers: assigned columns get their value, the
@@ -544,6 +763,7 @@ impl UpdateRow<'_> {
         &self,
         program: &mut ProgramBuilder,
         values: &[Option<&hir::Expr>],
+        check_notnull: bool,
     ) -> Result<()> {
         let table = self.target.table;
         for (position, (column, value)) in table.columns().iter().zip(values).enumerate() {
@@ -551,7 +771,7 @@ impl UpdateRow<'_> {
             match value {
                 Some(value) => {
                     super::expr::translate_expr(program, self.target.document, value, register)?;
-                    if column.notnull() {
+                    if check_notnull && column.notnull() {
                         self.emit_notnull_check(program, column, register);
                     }
                 }
@@ -843,7 +1063,7 @@ mod tests {
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, update, access, false).unwrap();
+        emit_update(&mut program, &plan, update, access, &[], false).unwrap();
         program
     }
 
