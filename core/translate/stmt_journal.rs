@@ -236,18 +236,24 @@ pub(crate) fn set_update_stmt_journal_flags(
         program.set_multi_write(false);
     }
 
-    let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
-        if set_clause.column_index == crate::schema::ROWID_SENTINEL {
-            return false;
-        }
+    let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
+    let has_notnull_cols = affected_cols.iter().any(|column_index| {
         btree_table
             .columns()
-            .get(set_clause.column_index)
+            .get(column_index)
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });
     let has_check = !btree_table.check_constraints.is_empty();
-    let has_unique =
-        !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let updates_rowid = affected_cols.iter().any(|column_index| {
+        column_index == crate::schema::ROWID_SENTINEL
+            || btree_table
+                .columns()
+                .get(column_index)
+                .is_some_and(|c| c.is_rowid_alias())
+    });
+    let has_unique = updates_rowid
+        || !btree_table.unique_sets.is_empty()
+        || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
     let may_abort = has_triggers
         || has_fks
