@@ -130,6 +130,90 @@ expect {
     3|0
 }
 
+# The main plan has no loop for t3, a table of the materialized hash build
+# input. The probe of the hash join reads the columns of t3 from the hash
+# payload. A subquery that reads t3 must run in the probe loop and read the
+# payload, not before the loops with the old row of the t3 cursor.
+setup materialized-build-input-with-subquery-schema {
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t2_c ON t2(c);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 3, NULL);
+    ANALYZE;
+    INSERT INTO t2 VALUES (1, 5, NULL), (2, 6, NULL);
+    INSERT INTO t0 VALUES (1, 5, 3, 7);
+}
+
+@setup materialized-build-input-with-subquery-schema
+test exists-in-left-join-on-term-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id FROM t3
+    CROSS JOIN t2
+    LEFT JOIN t0 ON t0.a = t2.b AND EXISTS (SELECT 1 FROM t0 AS q WHERE q.b = t3.b)
+    WHERE t2.c IS NULL;
+}
+expect unordered {
+    2|5|1
+    2|6|
+}
+
+@setup materialized-build-input-with-subquery-schema
+test result-column-subquery-reads-table-of-materialized-build-input {
+    SELECT t3.a, t2.b, t0.id, (SELECT count(*) FROM t0 AS q WHERE q.b = t3.b) FROM t3
+    CROSS JOIN t2
+    JOIN t0 ON t0.a = t2.b
+    WHERE t2.c IS NULL;
+}
+expect {
+    2|5|1|1
+}
+
+# The optimizer can choose a later table for an EXISTS, to cut its calls. Here
+# it chose t6, the probe table of the hash join. The plan of the materialized
+# hash build input has no loop for t6, so the subquery runs at its earliest
+# loop in that plan.
+test exists-with-later-table-outside-plan-of-materialized-build-input {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (2, 1, 1);
+    CREATE TABLE t4(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t5(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t5 VALUES (2, 1, NULL);
+    CREATE TABLE t6(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t6 VALUES (NULL, 2, NULL);
+    CREATE TABLE t7(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t7 VALUES (NULL, 2, 1);
+    CREATE TABLE t8(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t9(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t10(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t11(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t11_a ON t11(a);
+    CREATE TABLE t12(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t13(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t14(a INTEGER, b INTEGER, c INTEGER);
+    ANALYZE;
+    SELECT * FROM t0
+      JOIN t1 ON t1.a = t0.b
+      JOIN t2 ON t2.b = t0.b
+      JOIN t3 ON t1.c = 3
+      JOIN t4 ON t4.b = t1.b
+      JOIN t5 ON t5.b = t4.b
+      JOIN t6 ON t6.c = t5.a
+      JOIN t7 ON t7.a = t5.a
+      JOIN t8 ON t8.c = t5.c
+      JOIN t11 ON t11.b = t3.c
+      JOIN t12
+      JOIN t13 ON t13.a IS t11.b
+      JOIN t14
+     WHERE t11.c IS t7.b AND t11.a = 1
+       AND EXISTS (SELECT 1 FROM t9 WHERE t9.a = t7.c)
+       AND EXISTS (SELECT 1 FROM t10 WHERE t10.b = t3.c AND t10.c IS NULL);
+}
+expect {
+}
+
 # A correlated subquery in WHERE reads a table that is not part of the
 # materialized hash build input, so it must not run while building that input.
 setup materialized-build-input-schema {
