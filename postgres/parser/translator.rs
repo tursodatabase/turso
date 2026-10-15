@@ -3554,6 +3554,16 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_array_subquery(select: ast::Select) -> ast::Expr {
+        // PostgreSQL: ARRAY(SELECT v FROM items ORDER BY v LIMIT 2)
+        // Becomes this scalar subquery in the Turso AST:
+        // (
+        //     WITH _turso_array_rows(_turso_array_value) AS MATERIALIZED (
+        //         SELECT v FROM items ORDER BY v LIMIT 2
+        //     )
+        //     SELECT coalesce(array_agg(_turso_array_value), array())
+        //     FROM _turso_array_rows
+        // )
+        // array() constructs an empty array when the query returns no rows.
         let query = select.to_string().to_ascii_lowercase();
         let mut table_name = "_turso_array_rows".to_owned();
         while query.contains(&table_name) {
