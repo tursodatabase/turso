@@ -10,7 +10,7 @@ use std::{
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
-use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -1044,7 +1044,6 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
             translate::translate(
                 &schema,
                 stmt,
@@ -1054,7 +1053,6 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
-                &prepare_options,
             )?
         };
 

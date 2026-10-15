@@ -4,7 +4,7 @@ use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, split_relation_table_name,
@@ -203,19 +203,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 
-    let options = PrepareOptions::default();
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = pg_conn
-            .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        let mut stmt = pg_conn.conn.prepare_translated_stmt(prereq, &input)?;
         stmt.run_ignore_rows()?;
     }
 
     let sql = create_table_sql.as_deref().unwrap_or(sql);
-    pg_conn
-        .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+    pg_conn.conn.prepare_translated_cmd(translated.cmd, sql)
 }
 
 /// Looks up schemas and objects for the translator through the
