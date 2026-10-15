@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_pg::{Connection, PgConnection};
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 
 use pgwire::api::auth::StartupHandler;
@@ -212,8 +212,19 @@ impl SimpleQueryHandler for TursoPgHandler {
             return Err(PgWireError::NotReadyForQuery);
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
-        turso_pg_parser::parse(&query.query).map_err(query_error)?;
-        let statements = turso_pg_parser::split_statements(&query.query).map_err(query_error)?;
+        SimpleQueryHandler::do_query(self, client, &query.query).await?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        send_ready_for_query(client, client.transaction_status()).await
+    }
+
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        turso_pg_parser::parse(query).map_err(query_error)?;
+        let statements = turso_pg_parser::split_statements(query).map_err(query_error)?;
         if statements.is_empty() {
             client
                 .feed(PgWireBackendMessage::EmptyQueryResponse(
@@ -228,7 +239,13 @@ impl SimpleQueryHandler for TursoPgHandler {
                     copy_to_stdout(client, &conn, copy).await?;
                 }
                 None => {
-                    let response = execute_simple_statement(&conn, &sql).await?;
+                    let mut stmt = conn.prepare(&sql).map_err(query_error)?;
+                    let response = if stmt.num_columns() == 0 || is_pg_non_query(&sql) {
+                        execute_non_query(&mut stmt, &sql).await?
+                    } else {
+                        let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                        execute_query(&mut stmt, header).await?
+                    };
                     self.cleanup_dropped_schema_file(&sql);
                     match response {
                         Response::Query(mut result) => {
@@ -246,39 +263,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             };
             client.set_transaction_status(status);
         }
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-        send_ready_for_query(client, client.transaction_status()).await
-    }
-
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        let conn = self.conn.lock().await;
-
-        // Per the PostgreSQL simple query protocol, a query string may contain
-        // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-        let mut responses = Vec::new();
-        for sql in &statements {
-            let response = execute_simple_statement(&conn, sql).await?;
-            self.cleanup_dropped_schema_file(sql);
-            responses.push(response);
-        }
-
-        Ok(responses)
-    }
-}
-
-async fn execute_simple_statement(conn: &PgConnection, sql: &str) -> PgWireResult<Response> {
-    let mut stmt = conn.prepare(sql).map_err(query_error)?;
-    if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-        execute_non_query(&mut stmt, sql).await
-    } else {
-        let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-        execute_query(&mut stmt, header).await
+        Ok(Vec::new())
     }
 }
 
