@@ -2833,9 +2833,13 @@ fn plan_unmatched_right_rows(
             params,
         )?
         .swap_remove(table_index);
-        // The main plan already checked the INDEXED BY index. The unmatched-row
-        // read follows the same hint, as in SQLite.
-        if let Some(indexed) = &table.indexed {
+        // A matched WITHOUT ROWID row is identified by its primary key, which
+        // Turso reads from the table cursor, never from a secondary index.
+        if table.btree().is_some_and(|btree| !btree.has_rowid) {
+            keep_index_hint_candidates(&mut constraints_for_unmatched_rows.candidates, None);
+        } else if let Some(indexed) = &table.indexed {
+            // The main plan already checked the INDEXED BY index. The unmatched-row
+            // read follows the same hint, as in SQLite.
             let forced_index = match indexed {
                 ast::Indexed::IndexedBy(name) => Some(
                     available_indexes

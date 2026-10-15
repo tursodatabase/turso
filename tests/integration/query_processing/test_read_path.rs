@@ -155,6 +155,51 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_right_join_on_without_rowid_table_with_secondary_index(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid_index.db");
+    let queries = [
+        "SELECT count(*) FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t0 RIGHT JOIN t1 ON NULL",
+        "SELECT NULL FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON NULL",
+        "SELECT NULL FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t2.c0 = t3.c0",
+    ];
+
+    let sqlite_rows = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE t0(c0);
+            CREATE TABLE t1(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t1_i0 ON t1(c1);
+            CREATE TABLE t2(c0);
+            CREATE TABLE t3(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t3_i0 ON t3(c1);
+            INSERT INTO t2 VALUES (1), (3), (7);
+            INSERT INTO t3 VALUES (1, 2), (3, 4), (5, 6);
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        queries
+            .iter()
+            .map(|query| sqlite_exec_rows(&sqlite, query))
+            .collect::<Vec<_>>()
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    for (query, sqlite_rows) in queries.iter().zip(sqlite_rows) {
+        assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
+    }
+
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "create table test (a integer, b integer, c integer, d integer);"
