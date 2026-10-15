@@ -15,7 +15,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products
+|--MATERIALIZE prices
+|  `--SCAN products
 `--SCAN prices
 
 BYTECODE

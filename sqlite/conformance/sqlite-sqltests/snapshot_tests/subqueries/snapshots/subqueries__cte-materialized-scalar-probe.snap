@@ -67,9 +67,10 @@ QUERY PLAN
 |  |     |--SCAN sample_points
 |  |     |--USE HASH TABLE FOR DISTINCT
 |  |     `--USE SORTER FOR ORDER BY
-|  |--SCAN sample_points
-|  |--USE HASH TABLE FOR DISTINCT
-|  |--USE SORTER FOR ORDER BY
+|  |--MATERIALIZE ordered_points
+|  |  |--SCAN sample_points
+|  |  |--USE HASH TABLE FOR DISTINCT
+|  |  `--USE SORTER FOR ORDER BY
 |  `--SCAN run_ids
 |     `--SCAN window_subquery_0
 |        `--SCAN run_markers
