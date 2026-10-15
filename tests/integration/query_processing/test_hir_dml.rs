@@ -1324,6 +1324,35 @@ fn hir_upsert_triggers_match_sqlite() {
     }
 }
 
+/// A DO UPDATE that sets the INTEGER PRIMARY KEY moves the row: the new
+/// rowid must be free, and every index entry and the row are rewritten.
+#[test]
+fn hir_upsert_moving_rows_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE um(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "CREATE INDEX um_c ON um(c)",
+        "CREATE TABLE umlog(m)",
+        "CREATE TRIGGER au AFTER UPDATE ON um BEGIN INSERT INTO umlog VALUES (old.a || '>' || new.a); END",
+        "INSERT INTO um VALUES (1, 1, 'x'), (2, 2, 'y')",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 10",
+        "SELECT * FROM um ORDER BY a",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 2",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = a + 5, c = 'moved' RETURNING *",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 'abc'",
+        "INSERT INTO um VALUES (15, 7, 'q') ON CONFLICT(a) DO UPDATE SET a = excluded.b, b = 70",
+        "SELECT * FROM um ORDER BY a",
+        "SELECT c, a FROM um INDEXED BY um_c ORDER BY c",
+        "SELECT * FROM umlog",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
 /// Legacy rejects it.
 #[test]

@@ -98,12 +98,8 @@ pub(super) fn needs_legacy(
         for assignment in assignments {
             for column in &assignment.columns {
                 match column {
-                    hir::TargetColumn::Column(column)
-                        if !table.columns()[*column].is_rowid_alias() =>
-                    {
-                        assigned.push(*column)
-                    }
-                    _ => return Ok(true),
+                    hir::TargetColumn::Column(column) => assigned.push(*column),
+                    hir::TargetColumn::RowId => return Ok(true),
                 }
             }
         }
@@ -1054,14 +1050,33 @@ impl InsertRow<'_> {
 
         let columns = table.columns().len();
         let mut values = vec![None; columns];
+        // A DO UPDATE that sets the INTEGER PRIMARY KEY moves the row.
+        let mut rowid_value = None;
         for assignment in assignments {
             let [hir::TargetColumn::Column(column)] = assignment.columns.as_slice() else {
                 return Err(LimboError::InternalError(
                     "HIR UPSERT assignment does not set exactly one column".into(),
                 ));
             };
-            values[*column] = Some(&assignment.value);
+            if table.columns()[*column].is_rowid_alias() {
+                rowid_value = Some(&assignment.value);
+            } else {
+                values[*column] = Some(&assignment.value);
+            }
         }
+        let new_rowid = rowid_value
+            .map(|value| -> Result<usize> {
+                let register = program.alloc_register();
+                super::expr::translate_expr_no_constant_opt(program, document, value, register)?;
+                program.emit_insn(Insn::MustBeInt {
+                    reg: register,
+                    target_pc: None,
+                });
+                Ok(register)
+            })
+            .transpose()?;
+        // The rowid the row is written with.
+        let written = new_rowid.unwrap_or(conflict);
         let new_row = program.alloc_registers(columns);
         for (position, (column, value)) in table.columns().iter().zip(&values).enumerate() {
             let register = new_row + position;
@@ -1124,7 +1139,7 @@ impl InsertRow<'_> {
             new_source.id,
             SourceBinding::Registers {
                 start: new_row,
-                rowid: Some(conflict),
+                rowid: Some(written),
             },
         );
         super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
@@ -1168,13 +1183,49 @@ impl InsertRow<'_> {
             .transpose()?;
         let new_trigger_row = TriggerRow {
             columns: new_row,
-            rowid: conflict,
+            rowid: written,
         };
         if fires(TriggerTime::Before).next().is_some() {
             for trigger in fires(TriggerTime::Before) {
                 trigger.emit_fire(program, old_row, Some(new_trigger_row), columns, row_done)?;
             }
             // The trigger may have deleted or moved the row.
+            program.emit_insn(Insn::NotExists {
+                cursor: self.table_cursor,
+                rowid_reg: conflict,
+                target_pc: row_done,
+            });
+        }
+        // Like legacy, a new rowid must not belong to another row; this is
+        // checked with ABORT before the indexes.
+        if let Some(new_rowid) = new_rowid {
+            let free = program.allocate_label();
+            program.emit_insn(Insn::Eq {
+                lhs: new_rowid,
+                rhs: conflict,
+                target_pc: free,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+            program.emit_insn(Insn::NotExists {
+                cursor: self.table_cursor,
+                rowid_reg: new_rowid,
+                target_pc: free,
+            });
+            let column = table
+                .columns()
+                .iter()
+                .find(|column| column.is_rowid_alias())
+                .and_then(|column| column.name.as_deref())
+                .unwrap_or("rowid");
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description: format!("{}.{column}", table.name),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(free);
+            // NotExists moved the cursor.
             program.emit_insn(Insn::NotExists {
                 cursor: self.table_cursor,
                 rowid_reg: conflict,
@@ -1221,7 +1272,7 @@ impl InsertRow<'_> {
             source.id,
             new_source.id,
             conflict,
-            conflict,
+            written,
             &assigned_positions,
             database,
             false,
@@ -1239,8 +1290,11 @@ impl InsertRow<'_> {
             record: usize,
         }
         let mut rebuilds = Vec::new();
+        // Every index entry holds the rowid, so a new rowid changes them all.
         for (old, cursor) in index_cursors {
-            if !super::update::index_reads_assigned_column(source.id, old, &assigned) {
+            if new_rowid.is_none()
+                && !super::update::index_reads_assigned_column(source.id, old, &assigned)
+            {
                 continue;
             }
             let index = old.index.value();
@@ -1301,7 +1355,7 @@ impl InsertRow<'_> {
                     }
                     _ => {
                         let from = if table.columns()[column.pos_in_table].is_rowid_alias() {
-                            conflict
+                            written
                         } else {
                             new_row + column.pos_in_table
                         };
@@ -1315,7 +1369,7 @@ impl InsertRow<'_> {
                 };
             }
             program.emit_insn(Insn::Copy {
-                src_reg: conflict,
+                src_reg: written,
                 dst_reg: start + width,
                 extra_amount: 0,
             });
@@ -1434,11 +1488,26 @@ impl InsertRow<'_> {
         }
 
         let record = super::dml::emit_row_record(program, table, new_row);
+        // A row with a new rowid is deleted and inserted again.
+        let flag = match new_rowid {
+            Some(_) => {
+                program.emit_insn(Insn::Delete {
+                    cursor_id: self.table_cursor,
+                    table_name: table.name.clone(),
+                    is_part_of_update: true,
+                });
+                InsertFlags::new()
+                    .require_seek()
+                    .update_rowid_change()
+                    .skip_last_rowid()
+            }
+            None => InsertFlags::new().skip_last_rowid(),
+        };
         program.emit_insn(Insn::Insert {
             cursor: self.table_cursor,
-            key_reg: conflict,
+            key_reg: written,
             record_reg: record,
-            flag: InsertFlags::new().skip_last_rowid(),
+            flag,
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
@@ -1447,7 +1516,7 @@ impl InsertRow<'_> {
             source.id,
             SourceBinding::Registers {
                 start: new_row,
-                rowid: Some(conflict),
+                rowid: Some(written),
             },
         );
         if let Some(returning) = returning {
@@ -2077,14 +2146,17 @@ mod tests {
     }
 
     #[test]
-    fn insert_that_needs_legacy_is_left_to_it() {
-        for sql in [
-            // A DO UPDATE that moves the row.
-            "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5",
-        ] {
-            let plan = analyze_plan(schema(), sql);
-            let insert = insert_root(&plan).unwrap();
-            assert!(needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
-        }
+    fn upsert_that_sets_the_rowid_moves_the_row() {
+        let program = emit("INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5");
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::Delete {
+                    is_part_of_update: true,
+                    ..
+                }
+            )),
+            1
+        );
     }
 }
