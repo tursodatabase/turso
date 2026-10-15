@@ -1011,11 +1011,16 @@ fn emit_update_column_values<'a>(
                             .map(|(_, id)| *id)
                             .unwrap_or(column_ctx.target_table_cursor_id);
                         table_column_was_read |= cursor_id == column_ctx.target_table_cursor_id;
-                        program.emit_column_or_rowid(
+                        emit_table_column(
+                            program,
                             cursor_id,
+                            column_ctx.target_table.internal_id,
+                            table_references,
+                            table_column,
                             column_idx_in_index.unwrap_or(idx),
                             target_reg,
-                        );
+                            &t_ctx.resolver,
+                        )?;
                     }
                 }
                 GeneratedType::Virtual { .. } => {
