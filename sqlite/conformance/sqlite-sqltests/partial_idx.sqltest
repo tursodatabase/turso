@@ -1806,3 +1806,23 @@ expect {
     x
     0
 }
+
+# The hash join build side reads t from the partial index, so the term
+# b > 1 must be skipped there too: the index does not store column b.
+test partial-index-hash-join-build-skips-index-where-term {
+    CREATE TABLE t(a, b);
+    CREATE TABLE u(x);
+    CREATE INDEX i ON t(a) WHERE b > 1;
+    INSERT INTO t VALUES (2, 3), (2, 0), (2, 5), (3, 9);
+    INSERT INTO u VALUES (2), (3), (2);
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t LEFT JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a + 0 WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a > 0 AND b > 1;
+}
+expect {
+    4
+    4
+    4
+    5
+}
