@@ -1952,6 +1952,28 @@ expect {
     +0000-00-02 02:00:00.000
 }
 
+test timediff-normalizes-overflowing-day {
+    SELECT timediff('2023-02-29', '2023-03-01');
+    SELECT timediff('2024-03-15', '2023-02-29');
+    SELECT timediff('2000-02-31', '2000-01-01');
+    SELECT timediff('2023-02-29 12:00', '2023-03-01');
+}
+expect {
+    +0000-00-00 00:00:00.000
+    +0001-00-14 00:00:00.000
+    +0000-02-01 00:00:00.000
+    +0000-00-00 12:00:00.000
+}
+
+test strftime-normalizes-overflowing-day {
+    SELECT strftime('%Y-%m-%d', '2023-02-29'), strftime('%d', '2000-02-31');
+    SELECT strftime('%Y-%m-%d', '2023-02-31', 'start of month');
+}
+expect {
+    2023-03-01|02
+    2023-02-01
+}
+
 test timediff-with-seconds-precision {
     SELECT timediff('12:30:45.123', '12:30:44.987');
 }

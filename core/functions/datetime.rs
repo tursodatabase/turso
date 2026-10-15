@@ -162,6 +162,12 @@ impl DateTime {
         self.tz = 0;
     }
 
+    fn normalize_overflowing_day(&mut self) {
+        if self.valid_ymd && self.d > 28 {
+            self.valid_ymd = false;
+        }
+    }
+
     fn compute_floor(&mut self) {
         assert!(self.valid_ymd || self.is_error);
         assert!(self.d >= 0 && self.d <= 31);
@@ -923,8 +929,8 @@ where
         return Value::Null;
     }
 
-    if !has_modifier && p.valid_ymd && p.d > 28 {
-        p.valid_ymd = false;
+    if !has_modifier {
+        p.normalize_overflowing_day();
     }
 
     match func_type {
@@ -1160,6 +1166,8 @@ where
         return Value::Null;
     }
 
+    d1.normalize_overflowing_day();
+    d2.normalize_overflowing_day();
     d1.compute_ymd_hms();
     d2.compute_ymd_hms();
 
@@ -1279,6 +1287,7 @@ where
         val => Cow::Owned(val.to_string()),
     };
 
+    let has_modifier = values.len() > 1;
     let mut p = DateTime::default();
     if values.len() == 0 {
         set_to_current(&mut p, clock);
@@ -1340,6 +1349,9 @@ where
         return Value::Null;
     }
 
+    if !has_modifier {
+        p.normalize_overflowing_day();
+    }
     p.compute_ymd_hms();
 
     let mut res = String::new();
