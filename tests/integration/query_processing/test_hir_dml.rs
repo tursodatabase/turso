@@ -267,7 +267,22 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET b = b + 100 WHERE b > 2"],
         &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
         &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        // UPDATE ... FROM: the join fills a scratch table first.
         &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
+        &["UPDATE u SET c = t.c, d = t.d + u.d FROM t WHERE t.a = u.a RETURNING *"],
+        &["UPDATE u SET d = t.b FROM t WHERE t.b = u.b AND t.c IS NOT NULL"],
+        &["UPDATE u SET c = x.c FROM (SELECT a, c FROM t WHERE a > 2) AS x WHERE x.a = u.a"],
+        &["WITH x AS (SELECT a, count(*) AS n FROM t GROUP BY a) UPDATE u SET d = n FROM x WHERE x.a = u.a"],
+        &["UPDATE u SET b = t.b + 100 FROM t LEFT JOIN log ON log.a = t.a WHERE t.a = u.a"],
+        &["UPDATE u SET c = coalesce(t.c, 'none') FROM t RIGHT JOIN log ON t.a = log.a WHERE u.a = 1"],
+        &["UPDATE u SET b = 2 FROM t WHERE t.a = u.a AND u.a = 1"],
+        &["UPDATE OR IGNORE u SET b = 2 FROM t WHERE t.a = u.a"],
+        &["UPDATE u SET (c, d) = ((t.c, t.d)) FROM t WHERE t.a = u.a"],
+        &["UPDATE u SET c = 'k' FROM t, t WHERE t.a = u.a"],
+        &[
+            "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "UPDATE u SET c = t.c FROM t WHERE t.a = u.a",
+        ],
         &["UPDATE t SET b = 9 WHERE a = 1"],
         // Triggers run from HIR-compiled subprograms.
         &[

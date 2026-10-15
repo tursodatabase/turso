@@ -196,6 +196,14 @@ impl<'catalog> SemanticContext<'catalog> {
         }
     }
 
+    /// The name a database is attached under, such as "main".
+    pub(crate) fn database_name(&self, database: DatabaseId) -> Option<&str> {
+        self.database_names
+            .iter()
+            .find(|(_, id)| **id == database)
+            .map(|(name, _)| name.as_str())
+    }
+
     pub(crate) fn database(&self, name: &str) -> Option<DatabaseId> {
         let name = normalize_ident(name);
         if name == "public" {

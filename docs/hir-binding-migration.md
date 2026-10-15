@@ -227,7 +227,7 @@ new values. These still go to legacy:
 | UPDATE feature | What HIR needs first |
 |---|---|
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
-| Any subquery, UPDATE ... FROM | Collecting the rows to change first, as legacy does |
+| A subquery in SET, WHERE or RETURNING | Reading it at the points legacy does |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
@@ -245,7 +245,7 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
-| INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
+| A subquery in VALUES or RETURNING | Reading it at the points legacy does |
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
@@ -302,6 +302,21 @@ values through `excluded`, builds the new row in registers bound to the
 UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index
 (with ABORT) before rewriting the indexes and the row, and returns the
 updated row to RETURNING. INSERT triggers do not fire for it.
+
+INSERT ... SELECT runs the query as a coroutine that yields one row at a
+time into the same row code as VALUES. When the query reads the target table,
+or the INSERT fires triggers, the rows are first copied into an ephemeral
+table, as legacy and SQLite do.
+
+UPDATE ... FROM first runs the join of the target and the FROM clause (the
+same loop emission as SELECT, `emit_dml_join_loops`), writing the assigned
+values of each target row into a scratch table keyed by its rowid, then
+updates each row of the scratch table. A target row joined more than once
+keeps the values of the last joined row, so the join order decides it: the
+target is planned first, as legacy ends up ordering it, except when the FROM
+clause has a RIGHT or FULL JOIN, which must not NULL-extend the target. Like
+legacy, a FROM clause that names a table twice, or whose NATURAL/USING column
+is also exposed by two other tables, is rejected up front.
 
 ### Non-lowering phase complete
 

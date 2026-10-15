@@ -290,11 +290,8 @@ fn translate_statement(
                 );
             }
             // Legacy checks these by name before it looks the table up.
-            // UPDATE ... FROM is not lowered from HIR yet, and legacy has
-            // its own checks for it.
             let table_name = crate::util::normalize_ident(update.tbl_name.name.as_str());
-            update.from.is_none()
-                && crate::schema::allow_user_dml(&table_name)
+            crate::schema::allow_user_dml(&table_name)
                 && !resolver.schema().is_materialized_view(&table_name)
                 && resolver
                     .schema()

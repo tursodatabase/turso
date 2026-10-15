@@ -167,6 +167,9 @@ pub(crate) struct HirAccessPlan {
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    /// Index of the first predicate from the WHERE clause. Earlier predicates
+    /// come from the FROM clause.
+    pub(crate) where_start: usize,
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order.
     pub(crate) order_sort_elided: bool,
@@ -305,13 +308,40 @@ impl<'a> HirPlanContext<'a> {
     ) -> Result<HirAccessPlan> {
         let usage = update.direct_column_usage(|source| self.document.source(source));
         let mut input = HirQueryBlockPlanInput {
-            sources: vec![self.plan_source(update.target, None, &usage)?],
+            sources: Vec::new(),
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
         };
-        if let Some(from) = &update.from {
-            self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
+        // The target joins the result of the FROM clause, so a RIGHT or FULL
+        // join inside FROM must never NULL-extend it: then it comes after
+        // the FROM sources. Otherwise it comes first, which leads the
+        // planner to the same join order as legacy, whose choice decides
+        // which joined row updates a target row matched more than once.
+        let right_join = update.from.as_ref().is_some_and(|from| {
+            from.joins
+                .iter()
+                .any(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+        });
+        match &update.from {
+            Some(from) if right_join => {
+                self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
+                input.sources.push(self.plan_source(
+                    update.target,
+                    Some(HirJoinInfo {
+                        kind: hir::JoinKind::Inner,
+                    }),
+                    &usage,
+                )?);
+            }
+            from => {
+                input
+                    .sources
+                    .push(self.plan_source(update.target, None, &usage)?);
+                if let Some(from) = from {
+                    self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
+                }
+            }
         }
         input.where_start = input.predicates.len();
         if let Some(predicate) = &update.predicate {
@@ -593,8 +623,22 @@ impl<'a> HirPlanContext<'a> {
                     .expect("validated HIR contains referenced CTE");
                 match &definition.body {
                     hir::CteBody::Query(query) => {
-                        let owner = match self.definition(source).owner {
-                            hir::SourceOwner::QueryBlock(block) => block.query,
+                        let materialization = match self.definition(source).owner {
+                            hir::SourceOwner::QueryBlock(block) => {
+                                self.cte_materialization(block.query, *cte, *query)
+                            }
+                            // The FROM clause of UPDATE ... FROM reads the CTE
+                            // once per reference, unless it is MATERIALIZED.
+                            hir::SourceOwner::Root => {
+                                if matches!(
+                                    definition.materialized,
+                                    turso_parser::ast::Materialized::Yes
+                                ) {
+                                    HirCteMaterialization::Explicit
+                                } else {
+                                    HirCteMaterialization::PerReference
+                                }
+                            }
                             owner => {
                                 return Err(LimboError::InternalError(format!(
                                     "CTE HIR source {source} has non-query owner {owner:?}"
@@ -605,7 +649,7 @@ impl<'a> HirPlanContext<'a> {
                             source,
                             cte: *cte,
                             query: *query,
-                            materialization: self.cte_materialization(owner, *cte, *query),
+                            materialization,
                             join_info,
                         })
                     }
@@ -1144,6 +1188,7 @@ impl<'a> HirPlanContext<'a> {
         Ok(Some(HirAccessPlan {
             groups: input.groups,
             loops,
+            where_start: input.where_start,
             predicates: input.predicates,
             group_sort_elided,
             order_sort_elided,

@@ -49,8 +49,7 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    if update.from.is_some()
-        || !update.order_by.is_empty()
+    if !update.order_by.is_empty()
         || update.limit.is_some()
         || update.cdc_updates_override.is_some()
     {
@@ -121,6 +120,23 @@ pub(super) fn needs_legacy(
     }) {
         return Ok(true);
     }
+    if update.from.is_some() {
+        // UPDATE ... FROM fills a scratch table during the join, so no loop
+        // reads a table it changes. RETURNING reads only the updated row.
+        let reads_from = update.returning.as_ref().is_some_and(|returning| {
+            returning.outputs.iter().any(|output| {
+                let mut other = false;
+                output.expr.for_each(&mut |expression| match expression {
+                    hir::Expr::Column(hir::ColumnRef { source, .. }) | hir::Expr::RowId(source) => {
+                        other |= *source != update.target && *source != update.new_source;
+                    }
+                    _ => {}
+                });
+                other
+            })
+        });
+        return Ok(reads_from);
+    }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR UPDATE plan has {} loops for one target",
@@ -168,22 +184,30 @@ pub(super) fn emit_update(
     mvcc: bool,
 ) -> Result<()> {
     let document = &plan.document;
-    let [planned_loop] = access.loops.as_slice() else {
-        return Err(LimboError::InternalError(format!(
-            "HIR UPDATE plan has {} loops for one target",
-            access.loops.len()
-        )));
-    };
-    if planned_loop.source != update.target {
-        return Err(LimboError::InternalError(format!(
-            "HIR UPDATE loop reads source {} instead of its target {}",
-            planned_loop.source, update.target
-        )));
-    }
-    let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-        return Err(LimboError::InternalError(
-            "HIR UPDATE target does not use a B-tree loop".into(),
-        ));
+    // UPDATE ... FROM joins the target with the FROM clause; otherwise the
+    // target is the only loop.
+    let single_loop = match &update.from {
+        Some(_) => None,
+        None => {
+            let [planned_loop] = access.loops.as_slice() else {
+                return Err(LimboError::InternalError(format!(
+                    "HIR UPDATE plan has {} loops for one target",
+                    access.loops.len()
+                )));
+            };
+            if planned_loop.source != update.target {
+                return Err(LimboError::InternalError(format!(
+                    "HIR UPDATE loop reads source {} instead of its target {}",
+                    planned_loop.source, update.target
+                )));
+            }
+            let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
+                return Err(LimboError::InternalError(
+                    "HIR UPDATE target does not use a B-tree loop".into(),
+                ));
+            };
+            Some((planned_loop, operation))
+        }
     };
     let hir::UpdateTargetKind::BTree {
         foreign_keys,
@@ -250,7 +274,11 @@ pub(super) fn emit_update(
             .iter()
             .map(|(old, _)| old.index.value().on_conflict),
     );
-    if triggers.is_empty() && !has_foreign_keys && !replaces && touches_at_most_one_row(operation) {
+    if triggers.is_empty()
+        && !has_foreign_keys
+        && !replaces
+        && single_loop.is_some_and(|(_, operation)| touches_at_most_one_row(operation))
+    {
         program.set_multi_write(false);
     }
     let has_notnull = values
@@ -278,10 +306,20 @@ pub(super) fn emit_update(
             ),
     );
 
-    program.emit_source_explain(
-        target.source.id,
-        hir_loop_explain(document, None, planned_loop)?,
-    );
+    match single_loop {
+        Some((planned_loop, _)) => program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, planned_loop)?,
+        ),
+        None => {
+            for planned_loop in &access.loops {
+                program.emit_source_explain(
+                    planned_loop.source,
+                    hir_loop_explain(document, update.from.as_ref(), planned_loop)?,
+                );
+            }
+        }
+    }
     let returning = ReturningBuffer::open(program, table, update.returning.as_ref());
     let row = UpdateRowSettings {
         or_conflict,
@@ -289,8 +327,53 @@ pub(super) fn emit_update(
     };
 
     let assigned = assigned_positions(&assigned);
+    // UPDATE ... FROM computes the assigned values during the join, into a
+    // scratch table with one column per assignment.
+    let scratch_columns = values
+        .iter()
+        .scan(0, |next, value| {
+            Some(value.map(|_| {
+                *next += 1;
+                *next - 1
+            }))
+        })
+        .collect::<Vec<_>>();
+    let scratch = update
+        .from
+        .as_ref()
+        .map(|_| -> Result<CursorID> {
+            let width = scratch_columns.iter().flatten().count();
+            let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
+                0,
+                "update_from_scratch".to_string(),
+                Vec::new(),
+                (0..width)
+                    // BLOB affinity keeps the values as computed; the
+                    // column's affinity is applied when the row is built.
+                    .map(|column| {
+                        crate::schema::Column::new(
+                            Some(format!("value_{column}")),
+                            "BLOB".to_string(),
+                            None,
+                            None,
+                            crate::schema::Type::Blob,
+                            None,
+                            crate::schema::ColDef::default(),
+                        )
+                    })
+                    .collect(),
+                crate::schema::BTreeCharacteristics::HAS_ROWID,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+            Ok(program.alloc_cursor_id(CursorType::BTreeTable(table)))
+        })
+        .transpose()?;
     let row_layout = UpdateRowLayout {
         values: &values,
+        scratch: scratch.map(|cursor| (cursor, scratch_columns.as_slice())),
         defaults,
         replaces,
         assigned: &assigned,
@@ -305,10 +388,21 @@ pub(super) fn emit_update(
     // Like legacy, an UPDATE with triggers or OR REPLACE first collects its
     // rowids, since a trigger or a REPLACE can change the table.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
-    if triggers.is_empty() && !statement_replace {
-        emit_scan_update(program, &target, access, operation, &row_layout, row, done)?;
-    } else {
-        emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?;
+    match single_loop {
+        None => emit_from_update(
+            program,
+            plan,
+            update,
+            &target,
+            access,
+            &row_layout,
+            row,
+            done,
+        )?,
+        Some((_, operation)) if triggers.is_empty() && !statement_replace => {
+            emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
+        }
+        Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
     }
     program.preassign_label_to_next_insn(done);
     if let Some(returning) = returning {
@@ -321,6 +415,9 @@ pub(super) fn emit_update(
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
     values: &'a [Option<&'a hir::Expr>],
+    /// UPDATE ... FROM: the scratch table the join filled, and for each
+    /// assigned column the scratch column holding its value.
+    scratch: Option<(CursorID, &'a [Option<usize>])>,
     /// What NOT NULL ON CONFLICT REPLACE stores instead of a NULL.
     defaults: &'a [hir::ResolvedDefault],
     /// Whether a conflict of the new row may resolve with REPLACE.
@@ -487,6 +584,115 @@ fn emit_rowset_update(
     });
     row.emit(program, layout, &index_cursors)?;
     program.emit_insn(Insn::Goto { target_pc: next });
+    Ok(())
+}
+
+/// UPDATE ... FROM: like legacy, run the join of the FROM clause and the
+/// target first, writing the assigned values of each target row into a
+/// scratch table keyed by its rowid (a target row joined more than once
+/// keeps the last values), then update each row of the scratch table.
+#[allow(clippy::too_many_arguments)]
+fn emit_from_update(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    update: &hir::Update,
+    target: &DmlTarget<'_>,
+    access: &HirAccessPlan,
+    layout: &UpdateRowLayout<'_>,
+    settings: UpdateRowSettings,
+    done: BranchOffset,
+) -> Result<()> {
+    let document = target.document;
+    let (scratch, columns) = layout.scratch.ok_or_else(|| {
+        LimboError::InternalError("HIR UPDATE ... FROM has no scratch table".into())
+    })?;
+    let width = columns.iter().flatten().count();
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: scratch,
+        is_table: true,
+    });
+    let assigned = layout
+        .values
+        .iter()
+        .filter_map(|value| *value)
+        .collect::<Vec<_>>();
+    let write = |program: &mut ProgramBuilder, _next: BranchOffset| -> Result<()> {
+        let start = program.alloc_registers(width.max(1));
+        for (offset, value) in assigned.iter().enumerate() {
+            super::expr::translate_expr_no_constant_opt(program, document, value, start + offset)?;
+        }
+        let rowid = program.alloc_register();
+        super::expr::translate_expr(
+            program,
+            document,
+            &hir::Expr::RowId(target.source.id),
+            rowid,
+        )?;
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start),
+            count: to_u32(width),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: scratch,
+            key_reg: rowid,
+            record_reg: record,
+            flag: InsertFlags::new()
+                .require_seek()
+                .is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        Ok(())
+    };
+    super::query::emit_dml_join_loops(
+        program,
+        plan,
+        update.from.as_ref(),
+        super::query::HirLoopsPlan::of_access(access),
+        &write,
+    )?;
+
+    let table_cursor = target.open_table_for_write(program);
+    let index_cursors = open_changed_indexes(program, target, layout)?;
+    let next = program.allocate_label();
+    let row = UpdateRow {
+        target,
+        table_cursor,
+        rowid: program.alloc_registers(target.table.columns().len() + 1),
+        or_conflict: settings.or_conflict,
+        has_statement_conflict: settings.has_statement_conflict,
+        defaults: layout.defaults,
+        skip_row: next,
+    };
+    let empty = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: scratch,
+        pc_if_empty: empty,
+    });
+    let top = program.allocate_label();
+    program.preassign_label_to_next_insn(top);
+    program.emit_insn(Insn::RowId {
+        cursor_id: scratch,
+        dest: row.rowid,
+    });
+    program.emit_insn(Insn::NotExists {
+        cursor: table_cursor,
+        rowid_reg: row.rowid,
+        target_pc: next,
+    });
+    row.emit(program, layout, &index_cursors)?;
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: scratch,
+        pc_if_next: top,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(empty);
+    program.emit_insn(Insn::Close { cursor_id: scratch });
+    program.emit_insn(Insn::Goto { target_pc: done });
     Ok(())
 }
 
@@ -677,7 +883,7 @@ impl UpdateRow<'_, '_> {
             },
         );
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
-        self.emit_new_values(program, layout.values, !has_before)?;
+        self.emit_new_values(program, layout, !has_before)?;
         let new_row = TriggerRow {
             columns: self.start(),
             rowid: self.rowid,
@@ -860,15 +1066,38 @@ impl UpdateRow<'_, '_> {
     fn emit_new_values(
         &self,
         program: &mut ProgramBuilder,
-        values: &[Option<&hir::Expr>],
+        layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
     ) -> Result<()> {
         let table = self.target.table;
-        for (position, (column, value)) in table.columns().iter().zip(values).enumerate() {
+        for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate() {
             let register = self.start() + position;
             match value {
                 Some(value) => {
-                    super::expr::translate_expr(program, self.target.document, value, register)?;
+                    match layout.scratch {
+                        // UPDATE ... FROM computed the value during the join.
+                        Some((cursor, columns)) => {
+                            let scratch_column = columns[position].ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "HIR UPDATE ... FROM has no scratch column for column {position}"
+                                ))
+                            })?;
+                            program.emit_insn(Insn::Column {
+                                cursor_id: cursor,
+                                column: scratch_column,
+                                dest: register,
+                                default: None,
+                            });
+                        }
+                        None => {
+                            super::expr::translate_expr(
+                                program,
+                                self.target.document,
+                                value,
+                                register,
+                            )?;
+                        }
+                    }
                     if check_notnull && column.notnull() {
                         self.emit_notnull_check(program, position, column)?;
                     }
