@@ -2723,6 +2723,9 @@ impl Jsonb {
 
         match segment {
             SegmentVariant::Single(PathElement::Root()) => {
+                if !mode.allows_replace() {
+                    bail_parse_error!("Not found!");
+                }
                 return Ok(JsonTraversalResult::new(
                     pos,
                     JsonLocationKind::DocumentRoot,
