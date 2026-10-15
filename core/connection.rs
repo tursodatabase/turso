@@ -78,7 +78,20 @@ pub(crate) enum TransactionState {
     PendingUpgrade {
         has_read_txn: bool,
     },
+    Pending {
+        concurrent: bool,
+    },
     None,
+}
+
+impl TransactionState {
+    pub(crate) fn no_btree_tx_open(&self) -> bool {
+        matches!(self, Self::None | Self::Pending { .. })
+    }
+
+    pub(crate) fn is_pending_concurrent(&self) -> bool {
+        matches!(self, Self::Pending { concurrent: true })
+    }
 }
 
 pub(crate) struct TempDatabase {
@@ -2035,8 +2048,12 @@ impl Connection {
         }
     }
 
+    pub(crate) fn begin_concurrent_is_pending(&self) -> bool {
+        self.get_tx_state().is_pending_concurrent()
+    }
+
     fn has_no_open_transaction_state(&self) -> bool {
-        matches!(self.get_tx_state(), TransactionState::None)
+        self.get_tx_state().no_btree_tx_open()
             && self.get_mv_tx().is_none()
             && self.next_attached_mv_tx().is_none()
     }
@@ -5305,7 +5322,7 @@ impl Connection {
         pager: &Arc<Pager>,
         clear_attached_schemas: bool,
     ) {
-        let main_has_implicit_state = self.get_tx_state() != TransactionState::None
+        let main_has_implicit_state = !self.get_tx_state().no_btree_tx_open()
             || self.get_mv_tx().is_some()
             || pager.holds_read_lock()
             || pager.holds_write_lock();

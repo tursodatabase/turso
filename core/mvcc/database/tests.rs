@@ -3700,6 +3700,312 @@ fn test_mvcc_header_updates_upgrade_concurrent_tx_to_exclusive() {
     assert_eq!(rows[0][0].as_int().unwrap(), 7);
 }
 
+/// What this test checks: BEGIN CONCURRENT is deferred like SQLite's
+/// begin-concurrent: the snapshot is taken at the first statement, not at
+/// BEGIN, so a commit that lands in between is visible.
+#[test]
+fn test_begin_concurrent_snapshot_starts_at_first_statement() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit between BEGIN CONCURRENT and the first statement must be visible"
+    );
+
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit after the snapshot was taken must not be visible"
+    );
+
+    holder.execute("COMMIT").unwrap();
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// What this test checks: an idle BEGIN CONCURRENT (no statement yet) holds
+/// no snapshot, no checkpoint gate, and no WAL read mark, so a blocking
+/// TRUNCATE checkpoint on another connection succeeds.
+#[test]
+fn test_idle_begin_concurrent_does_not_block_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup.close().unwrap();
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("an idle BEGIN CONCURRENT must not block a blocking checkpoint");
+
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    holder.execute("COMMIT").unwrap();
+}
+
+/// What this test checks: the lazily materialized transaction really is
+/// concurrent — two BEGIN CONCURRENT transactions whose first action is a
+/// write to different rows both commit. If materialization fell back to the
+/// statement's Write mode, the first write would take the exclusive slot and
+/// the second transaction's commit would abort.
+#[test]
+fn test_begin_concurrent_write_stays_concurrent_after_lazy_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// What this test checks: when SAVEPOINT is the first statement after BEGIN
+/// CONCURRENT, it materializes the transaction in concurrent mode. If it
+/// materialized a read transaction instead, the first write would upgrade to
+/// exclusive and the other connection's commit would abort.
+#[test]
+fn test_savepoint_first_statement_materializes_concurrent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("SAVEPOINT sp").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn_a.execute("ROLLBACK TO sp").unwrap();
+
+    let conn_b = db.connect();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn_b
+        .execute("COMMIT")
+        .expect("a concurrent writer must not abort against a savepoint-only transaction");
+
+    conn_a.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+}
+
+/// What this test checks: BEGIN CONCURRENT works on a read-only connection —
+/// reads proceed on a snapshot and only a write fails. Before BEGIN
+/// CONCURRENT became deferred it was rejected at BEGIN on read-only
+/// connections.
+#[test]
+fn test_begin_concurrent_on_readonly_connection_reads() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("ro_concurrent.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (7)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default() | OpenFlags::ReadOnly,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+    let err = conn
+        .execute("INSERT INTO t VALUES (8)")
+        .expect_err("writes must fail on a read-only connection");
+    assert!(
+        matches!(err, LimboError::ReadOnly),
+        "expected ReadOnly, got {err:?}"
+    );
+    // The failed write rolled the transaction back (ReadOnly is not in the
+    // keep-transaction-open error class); reads keep working in autocommit.
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+}
+
+#[test]
+fn test_begin_concurrent_first_statement_retry_after_busy_exclusive_upgrade() {
+    use crate::StepResult;
+
+    fn step_until_not_io(
+        stmt: &mut crate::Statement,
+        io: &Arc<dyn IO>,
+    ) -> Result<StepResult, LimboError> {
+        loop {
+            match stmt.step() {
+                Ok(StepResult::IO | StepResult::Yield) => io.step().unwrap(),
+                other => return other,
+            }
+        }
+    }
+
+    for (statement, holder_end, check_query, expected) in [
+        (
+            "CREATE TABLE u(x)",
+            "ROLLBACK",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'u'",
+            1,
+        ),
+        (
+            "CREATE TABLE u(x)",
+            "COMMIT",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'u'",
+            1,
+        ),
+        (
+            "PRAGMA user_version = 7",
+            "ROLLBACK",
+            "PRAGMA user_version",
+            7,
+        ),
+        (
+            "PRAGMA user_version = 7",
+            "COMMIT",
+            "PRAGMA user_version",
+            7,
+        ),
+    ] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.close().unwrap();
+
+        let holder = db.connect();
+        holder.execute("BEGIN").unwrap();
+        holder.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let conn = db.connect();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut stmt = conn.prepare(statement).unwrap();
+        let io = stmt.get_pager().io.clone();
+        let first = step_until_not_io(&mut stmt, &io);
+        assert!(
+            matches!(first, Ok(StepResult::Busy) | Err(LimboError::Busy)),
+            "{statement}: first step must be Busy while another connection holds the exclusive transaction, got {first:?}"
+        );
+
+        holder.execute(holder_end).unwrap();
+
+        let retry = step_until_not_io(&mut stmt, &io);
+        drop(stmt);
+        match (holder_end, retry) {
+            (_, Ok(StepResult::Done)) => {
+                conn.execute("COMMIT").unwrap();
+                let rows = get_rows(&db.connect(), check_query);
+                assert_eq!(
+                    rows[0][0].as_int().unwrap(),
+                    expected,
+                    "{statement} after {holder_end}: committed change must be visible"
+                );
+            }
+            ("COMMIT", Ok(StepResult::Busy) | Err(LimboError::Busy)) => {
+                conn.execute("ROLLBACK").unwrap();
+            }
+            (_, other) => {
+                panic!("{statement} after {holder_end}: retry must not fail, got {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_begin_concurrent_failed_first_statement_takes_snapshot() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup.close().unwrap();
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    let err = holder
+        .execute("INSERT INTO t VALUES (1)")
+        .expect_err("duplicate primary key must fail");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected a constraint error, got {err:?}"
+    );
+    assert!(
+        !holder.get_auto_commit(),
+        "a constraint error must not end the explicit transaction"
+    );
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit after the failed first statement must not be visible"
+    );
+    holder.execute("COMMIT").unwrap();
+}
+
 /// What this test checks: Header PRAGMAs in MVCC succeed in autocommit mode, where the VM
 /// opens an implicit single-statement write transaction.
 /// Why this matters: The exclusive-transaction gate must block BEGIN CONCURRENT, but not reject
@@ -8725,10 +9031,12 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
             .store(TransactionState::Preparing(ts));
     });
 
-    // Start a non-CONCURRENT tx that will try to get exclusive lock later.
-    // Its begin_ts is assigned now, before the read-only tx commits.
+    // Start a tx that will try to get the exclusive lock later. BEGIN
+    // CONCURRENT is deferred, so run a read to materialize it: its begin_ts
+    // must be assigned now, before the read-only tx commits.
     let exclusive_conn = db.connect();
     exclusive_conn.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&exclusive_conn, "SELECT count(*) FROM t");
     let exclusive_tx_id = exclusive_conn.get_mv_tx_id().unwrap();
 
     let (signal_tx, signal_rx) = std::sync::mpsc::channel();
@@ -16421,9 +16729,11 @@ fn test_speculative_delete_hides_committed_version_sql() {
         )
     };
 
-    // T2: begin early so T1's future commit is invisible under SI.
+    // T2: begin early so T1's future commit is invisible under SI. BEGIN
+    // CONCURRENT is deferred, so pin the snapshot with a read.
     let conn2 = db.connect();
     conn2.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn2, "SELECT count(*) FROM t");
 
     // T1: auto-commit UPSERT → insert_btree_resident, commits.
     let conn1 = db.connect();
@@ -16486,9 +16796,11 @@ fn test_elle_lost_update_exclusive_concurrent() {
         conn.close().unwrap();
     }
 
-    // T2: start concurrent transaction (begin_ts established early)
+    // T2: start concurrent transaction (begin_ts established early — BEGIN
+    // CONCURRENT is deferred, so pin the snapshot with a read)
     let conn2 = db.connect();
     conn2.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn2, "SELECT count(*) FROM elle_lists");
 
     // T1: auto-commit UPSERT on k8 → insert_btree_resident, commits immediately
     let conn1 = db.connect();
@@ -19183,12 +19495,29 @@ fn test_snapshot_stability_full() {
                     continue;
                 }
                 let mut samples: Vec<i64> = Vec::with_capacity(reader_ops);
+                let mut busy = false;
                 for _ in 0..reader_ops {
                     let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
-                    let rows = stmt.run_collect_rows().unwrap();
+                    let rows = match stmt.run_collect_rows() {
+                        Ok(rows) => rows,
+                        // BEGIN CONCURRENT is deferred: the first read
+                        // materializes the transaction and can hit the
+                        // checkpoint gate, where BEGIN used to absorb the
+                        // Busy.
+                        Err(LimboError::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        Err(e) => panic!("reader failed: {e:?}"),
+                    };
                     let c = rows[0][0].as_int().unwrap();
                     samples.push(c);
                     reader_samples.fetch_add(1, Ordering::Relaxed);
+                }
+                if busy {
+                    let _ = conn.execute("ROLLBACK");
+                    std::thread::yield_now();
+                    continue;
                 }
                 // All samples within one snapshot must be equal.
                 if let Some((i, &c)) = samples.iter().enumerate().find(|(_, &c)| c != samples[0]) {
@@ -21030,6 +21359,9 @@ fn test_passive_checkpoint_skips_late_tombstone_after_prior_destroy() {
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
+    // BEGIN CONCURRENT is deferred; run a statement to materialize the
+    // transaction before driving the MvStore directly.
+    let _ = get_rows(&conn, "SELECT count(*) FROM sqlite_schema");
     let tx = conn.get_mv_tx_id().unwrap();
     mv_store
         .delete(tx, RowID::new(table_id, RowKey::Int(1)))

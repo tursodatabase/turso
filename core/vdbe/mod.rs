@@ -1018,6 +1018,12 @@ pub struct ProgramState {
     /// The connection's MvStore handle, revalidated with one pointer compare
     /// per use instead of a full ArcSwap load (see `ProgramState::mv_store`).
     mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
+    /// Set when `begin_fresh_mvcc_tx` succeeds for the first statement of a
+    /// deferred explicit transaction (`Pending { .. }`). Holds (db_index,
+    /// concurrent_flag). When the statement fails before returning any rows,
+    /// the error path rolls back the MVCC tx and restores `Pending` so the
+    /// snapshot is taken at the first SUCCESSFUL statement instead.
+    pub(crate) pending_fresh_tx: Option<(usize, bool)>,
 }
 
 /// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
@@ -1112,6 +1118,7 @@ impl ProgramState {
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
             mv_store_cache: None,
+            pending_fresh_tx: None,
         }
     }
 
@@ -1279,6 +1286,7 @@ impl ProgramState {
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        self.pending_fresh_tx = None;
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2680,12 +2688,11 @@ impl Program {
         match err {
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
-                if self.connection.transaction_state.get() == TransactionState::None =>
+                if matches!(
+                    self.connection.transaction_state.get(),
+                    TransactionState::None | TransactionState::Pending { .. }
+                ) =>
             {
-                // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                // because the snapshot will continue to be stale no matter how many times we retry.
-                // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
             }
             err if (matches!(err, LimboError::Constraint(_))
@@ -2954,7 +2961,8 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => {
+                TransactionState::None | TransactionState::Pending { .. } => {
+                    connection.set_tx_state(TransactionState::None);
                     match self.end_attached_write_txns(&connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
@@ -3004,10 +3012,9 @@ impl Program {
             if let Some(tx_id) = conn.get_mv_tx_id() {
                 let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+            } else {
+                conn.set_tx_state(TransactionState::None);
             }
-            // If no main MVCC tx, commit_state stays Ready and we fall
-            // through directly to phase 2 (the CommittingMvcc and
-            // CommittingAttachedMvcc checks will both miss).
         }
 
         if matches!(
@@ -3421,6 +3428,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            state.pending_fresh_tx = None;
             let unfinished_statement_reset_or_drop =
                 err.is_none() && state.execution_state.is_running();
             let inside_explicit_transaction = !self.connection.get_auto_commit();
@@ -3552,6 +3560,11 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
+                            // The fresh MVCC tx opened for the first statement of a Pending
+                            // explicit tx is now adopted — FAIL keeps changes in the tx.
+                            // Clear it so rollback_pending_fresh_tx_if_needed does not
+                            // undo it after abort() returns.
+                            state.pending_fresh_tx = None;
                             if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.

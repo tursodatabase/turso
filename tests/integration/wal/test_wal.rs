@@ -325,6 +325,52 @@ fn test_wal_read_lock_released_on_conn_drop() {
 }
 
 #[test]
+fn test_deferred_transaction_first_write_retries_stale_snapshot() {
+    maybe_setup_tracing();
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp_db = TempDatabase::new("test_deferred_first_write_stale_snapshot.db");
+    let db = tmp_db.limbo_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT)")
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        while !writer_stop.load(Ordering::Relaxed) {
+            match conn.execute("INSERT INTO t(source) VALUES ('writer')") {
+                Ok(()) | Err(LimboError::Busy) => {}
+                Err(err) => panic!("writer failed: {err:?}"),
+            }
+        }
+    });
+
+    let conn = tmp_db.connect_limbo();
+    let mut result = Ok(());
+    for _ in 0..20_000 {
+        conn.execute("BEGIN DEFERRED").unwrap();
+        result = match conn.execute("INSERT INTO t(source) VALUES ('deferred')") {
+            Ok(()) | Err(LimboError::Busy) => Ok(()),
+            Err(err) => Err(err),
+        };
+        conn.execute("ROLLBACK").unwrap();
+        if result.is_err() {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "first write after BEGIN DEFERRED must not fail on a stale snapshot, got {result:?}"
+    );
+}
+
+#[test]
 fn test_wal_write_lock_released_on_conn_drop() {
     maybe_setup_tracing();
     let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
