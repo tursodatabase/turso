@@ -1818,9 +1818,7 @@ pub struct OuterQueryReference {
     /// for materialization decisions.
     pub cte_id: Option<usize>,
     /// When true, this entry is only for CTE definition lookup in subquery
-    /// FROM clauses, not for column resolution. This is set when the CTE
-    /// has been consumed by a FROM clause (with or without an alias), so
-    /// column resolution goes through the joined_table instead.
+    /// FROM clauses, not for column resolution.
     pub cte_definition_only: bool,
     /// Whether the rowid of this table is referenced. Tracked separately from
     /// col_used_mask because rowid is not a real column and setting a fake

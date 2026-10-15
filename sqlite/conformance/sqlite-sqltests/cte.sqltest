@@ -1319,6 +1319,41 @@ expect {
     0||
 }
 
+test cte-from-subquery-unused-column {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT x);
+}
+expect error {
+    no such column: x
+}
+
+test cte-from-subquery-unused-qualified-column {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT c.x);
+}
+expect error {
+    no such column: c\.x
+}
+
+test cte-from-subquery-reads-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT x FROM c);
+}
+expect {
+    5
+}
+
+test cte-from-subquery-reads-aliased-cte {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT t.x FROM c AS t);
+}
+expect {
+    5
+}
+
+test cte-from-subquery-nested-cte-read {
+    WITH c AS (SELECT 5 AS x) SELECT * FROM (SELECT * FROM (SELECT x FROM c));
+}
+expect {
+    5
+}
+
 # =============================================================================
 # Scalar subquery referencing CTE by original name after alias (#5225)
 # =============================================================================

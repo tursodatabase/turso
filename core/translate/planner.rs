@@ -1623,7 +1623,7 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: false,
+                    cte_definition_only: true,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
