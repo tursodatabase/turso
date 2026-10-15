@@ -10,7 +10,10 @@ use super::{
     schema_program::TypeTransform,
     scope::{resolve_source_column, ResolvedScopeExpr, Scope},
 };
-use crate::{schema::Table, sync::Arc, LimboError, Result};
+use crate::{
+    schema::Table, sync::Arc, translate::expr::StorageClassMask, vdbe::affinity::Affinity,
+    LimboError, Result,
+};
 
 struct AnalyzedTableSource<'ast> {
     id: hir::SourceId,
@@ -789,16 +792,130 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(first
             .outputs
             .iter()
-            .map(|output| hir::SourceColumn {
-                name: self.subquery_column_name(output),
-                type_fact: output.type_fact.clone(),
-                affinity: output.schema_affinity,
-                has_affinity: output.has_affinity,
-                collation: output.collation.clone(),
-                hidden: false,
-                rowid_alias: false,
+            .enumerate()
+            .map(|(position, output)| {
+                let (affinity, has_affinity) = if query.blocks.len() > 1 {
+                    self.compound_column_affinity(query, position)
+                } else {
+                    (output.schema_affinity, output.has_affinity)
+                };
+                hir::SourceColumn {
+                    name: self.subquery_column_name(output),
+                    type_fact: output.type_fact.clone(),
+                    affinity,
+                    has_affinity,
+                    collation: output.collation.clone(),
+                    hidden: false,
+                    rowid_alias: false,
+                }
             })
             .collect())
+    }
+
+    /// The affinity of column `position` of a compound subquery, combined
+    /// across its arms like legacy and SQLite's `sqlite3SubqueryColumnTypes`:
+    /// the first arm with an affinity sets it, and a later arm that can give
+    /// a value of the other class (text against numeric) removes it, so the
+    /// column compares by storage class.
+    fn compound_column_affinity(&self, query: &hir::Query, position: usize) -> (Affinity, bool) {
+        let outputs = query
+            .blocks
+            .iter()
+            .filter_map(|block| block.outputs.get(position))
+            .collect::<Vec<_>>();
+        let affinity_of = |output: &hir::Output| {
+            if output.has_affinity {
+                output.schema_affinity
+            } else {
+                Affinity::None
+            }
+        };
+        let mut data_types = StorageClassMask::from_null();
+        let mut arms = outputs.iter();
+        let mut affinity = Affinity::None;
+        for output in arms.by_ref() {
+            affinity = affinity_of(output);
+            if affinity != Affinity::None {
+                break;
+            }
+            data_types |= self.expr_data_type(&output.expr);
+        }
+        if affinity == Affinity::None {
+            return (Affinity::Blob, false);
+        }
+        for output in arms {
+            data_types |= self.expr_data_type(&output.expr);
+        }
+        let conflicts = match affinity {
+            Affinity::Text => data_types.has_numeric(),
+            affinity => affinity.is_numeric() && data_types.has_text(),
+        };
+        if conflicts {
+            (Affinity::Blob, false)
+        } else {
+            (affinity, true)
+        }
+    }
+
+    /// The storage classes an expression can give, like SQLite's
+    /// `sqlite3ExprDataType`.
+    fn expr_data_type(&self, expression: &hir::Expr) -> StorageClassMask {
+        let from_affinity = |affinity: Affinity| {
+            if affinity.is_numeric() {
+                StorageClassMask::NUMERIC | StorageClassMask::BLOB
+            } else if affinity == Affinity::Text {
+                StorageClassMask::TEXT | StorageClassMask::BLOB
+            } else {
+                StorageClassMask::all()
+            }
+        };
+        match expression {
+            hir::Expr::Collate { expr, .. }
+            | hir::Expr::Unary {
+                operator: ast::UnaryOperator::Positive,
+                expr,
+            } => self.expr_data_type(expr),
+            hir::Expr::Literal(literal) => {
+                match crate::translate::alter::literal_default_value(literal)
+                    .map(|value| value.value_type())
+                {
+                    Ok(crate::types::ValueType::Null) => StorageClassMask::from_null(),
+                    Ok(crate::types::ValueType::Text) => StorageClassMask::from_text(),
+                    Ok(crate::types::ValueType::Blob) => StorageClassMask::from_blob(),
+                    _ => StorageClassMask::from_numeric(),
+                }
+            }
+            hir::Expr::Binary {
+                operator: ast::Operator::Concat,
+                ..
+            } => StorageClassMask::TEXT | StorageClassMask::BLOB,
+            hir::Expr::Function(_) | hir::Expr::Parameter(_) => StorageClassMask::all(),
+            hir::Expr::Column(reference) => self
+                .source(reference.source)
+                .and_then(|source| source.columns.get(reference.column))
+                .filter(|column| column.has_affinity)
+                .map_or(StorageClassMask::all(), |column| {
+                    from_affinity(column.affinity)
+                }),
+            hir::Expr::RowId(_) => from_affinity(Affinity::Integer),
+            hir::Expr::Cast { target, .. } => from_affinity(target.affinity),
+            hir::Expr::Subquery(_) => StorageClassMask::all(),
+            hir::Expr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => {
+                let mut types = StorageClassMask::from_null();
+                for (_, then) in when_then {
+                    types |= self.expr_data_type(then);
+                }
+                if let Some(else_expr) = else_expr {
+                    types |= self.expr_data_type(else_expr);
+                }
+                types
+            }
+            _ => StorageClassMask::from_numeric(),
+        }
     }
 
     /// Like legacy and SQLite, a subquery column without an alias is named

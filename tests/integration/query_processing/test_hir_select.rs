@@ -201,6 +201,10 @@ fn hir_expression_subqueries_match_legacy_rows() {
         // stays an integer. (Legacy reports BLOB as its declared type, SQLite
         // and HIR none, so only rows are compared.)
         "SELECT x, typeof(x) FROM (SELECT 1.5 AS x UNION ALL SELECT 2)",
+        // A compound subquery column's affinity combines all arms.
+        "SELECT typeof(x), x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT 2.0)",
+        "SELECT typeof(x), x = '10' FROM (SELECT 5.0 AS x UNION ALL SELECT value FROM items \
+         WHERE id = 1)",
         // EXISTS drops DISTINCT and never evaluates ORDER BY; OFFSET counts
         // plain rows.
         "SELECT EXISTS (SELECT extra FROM items ORDER BY abs(-9223372036854775807 - 1))",

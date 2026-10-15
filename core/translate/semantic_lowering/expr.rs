@@ -3196,14 +3196,15 @@ impl ExprLowerer<'_, '_, '_> {
                     self.program
                         .emit_column_or_rowid(read.cursor, read.column, target);
                 }
-                // A REAL column gives back integral values as REAL. A
-                // subquery column without affinity, such as one computed
-                // from a literal, gives values back as they were stored.
-                if apply_storage_affinity && column.has_affinity {
-                    let Some(storage) = column.type_fact.storage else {
-                        return Ok(());
-                    };
-                    expr::maybe_apply_affinity(storage, target, self.program);
+                // A column with REAL affinity gives back integral values as
+                // REAL. A subquery column without affinity, such as one
+                // computed from a literal, gives values back as stored; a
+                // compound subquery column follows its combined affinity.
+                if apply_storage_affinity
+                    && column.has_affinity
+                    && column.affinity == crate::vdbe::affinity::Affinity::Real
+                {
+                    expr::maybe_apply_affinity(crate::schema::Type::Real, target, self.program);
                 }
             }
         }
