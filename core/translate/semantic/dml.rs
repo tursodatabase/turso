@@ -24,6 +24,51 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
+    /// The triggers on `table` that `selected` accepts, frozen. Like legacy,
+    /// these are the table's own database's triggers, then temp triggers for
+    /// it: those that name the table's database, or name no database while
+    /// temp has no table of that name.
+    pub(super) fn table_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+        selected: impl Fn(&crate::schema::Trigger) -> bool,
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
+        let database = table
+            .database()
+            .expect("a DML target table must have an owning database");
+        let name = table.value().get_name();
+        let mut triggers = self
+            .context()
+            .schema(database)?
+            .get_triggers_for_table(name)
+            .filter(|trigger| trigger_targets_database(trigger, database) && selected(trigger))
+            .cloned()
+            .map(|trigger| (database, trigger))
+            .collect::<Vec<_>>();
+        let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
+        if database != temp {
+            if let Ok(temp_schema) = self.context().schema(temp) {
+                triggers.extend(
+                    temp_schema
+                        .get_triggers_for_table(name)
+                        .filter(|trigger| {
+                            selected(trigger)
+                                && match trigger.target_database_id {
+                                    Some(target) => target == database.index(),
+                                    None => temp_schema.get_table(&trigger.table_name).is_none(),
+                                }
+                        })
+                        .cloned()
+                        .map(|trigger| (temp, trigger)),
+                );
+            }
+        }
+        Ok(triggers
+            .into_iter()
+            .map(|(database, trigger)| self.freeze_trigger(database, trigger))
+            .collect())
+    }
+
     pub(super) fn analyze_dml_foreign_keys(
         &mut self,
         target: &hir::ResolvedTable,

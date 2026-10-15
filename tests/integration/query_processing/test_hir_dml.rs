@@ -2,7 +2,7 @@
 //! legacy planner does. Each case runs on two fresh databases, one per
 //! planner, and compares what is left behind.
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 
 const SETUP: &[&str] = &[
     "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c TEXT, d REAL, g AS (b * 2) VIRTUAL)",
@@ -15,13 +15,25 @@ const SETUP: &[&str] = &[
     "CREATE INDEX t_partial ON t(c) WHERE t.b > 2",
     "CREATE UNIQUE INDEX t_unique ON t(c, d)",
     "CREATE TABLE log(a INTEGER)",
+    // No generated column, so UPDATEs of `u` can go through HIR.
+    "CREATE TABLE u(a INTEGER PRIMARY KEY, b INTEGER NOT NULL, c TEXT, d REAL)",
+    "CREATE UNIQUE INDEX u_b ON u(b)",
+    "CREATE INDEX u_c ON u(c, d DESC)",
+    "CREATE INDEX u_expr ON u(c || 'x', b)",
+    "CREATE INDEX u_partial ON u(c) WHERE u.d > 0",
+    "CREATE UNIQUE INDEX u_partial_unique ON u(d) WHERE c = 'p'",
+    "INSERT INTO u VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', -1), (3, 3, 'z', 3), \
+     (4, 4, NULL, NULL), (5, 5, 'p', 5), (6, 6, 'q', 5)",
     "INSERT INTO t(a, b, c, d) VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', 2.5), (3, 3, 'z', 3), \
      (4, NULL, NULL, NULL), (5, 5, 'x', 5.5), (6, 2, 'w', -0.0), (7, 7, 'yy', 7)",
 ];
 
+type Rows = Vec<Vec<rusqlite::types::Value>>;
+
 /// Run `statements` on a fresh database with HIR on or off, then return
-/// every row left in `t` and `log` and the integrity check.
-fn run(hir: bool, statements: &[&str]) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+/// what each one returned or its error, every row left in the tables, and
+/// the integrity check.
+fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
@@ -32,15 +44,17 @@ fn run(hir: bool, statements: &[&str]) -> Vec<Vec<Vec<rusqlite::types::Value>>> 
     conn.set_experimental_hir(hir);
     let mut results = Vec::new();
     for statement in statements {
-        results.push(limbo_exec_rows(&conn, statement));
-        results.push(limbo_exec_rows(&conn, "SELECT changes()"));
+        results.push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
+        results.push(Ok(limbo_exec_rows(&conn, "SELECT changes()")));
     }
-    results.push(limbo_exec_rows(
-        &conn,
+    for sql in [
         "SELECT a, b, c, d, g FROM t ORDER BY a",
-    ));
-    results.push(limbo_exec_rows(&conn, "SELECT a FROM log ORDER BY a"));
-    results.push(limbo_exec_rows(&conn, "PRAGMA integrity_check"));
+        "SELECT a, b, c, d FROM u ORDER BY a",
+        "SELECT a FROM log ORDER BY a",
+        "PRAGMA integrity_check",
+    ] {
+        results.push(Ok(limbo_exec_rows(&conn, sql)));
+    }
     results
 }
 
@@ -104,6 +118,73 @@ fn hir_delete_matches_legacy() {
             "INSERT INTO child VALUES (2), (6), (7)",
             "DELETE FROM t WHERE b = 2",
             "SELECT x FROM child ORDER BY x",
+        ],
+    ] {
+        assert_eq!(
+            run(true, statements),
+            run(false, statements),
+            "results differ for {statements:?}"
+        );
+    }
+}
+
+#[test]
+fn hir_update_matches_legacy() {
+    for statements in [
+        &["UPDATE u SET c = 'k' WHERE a = 3"][..],
+        &["UPDATE u SET b = b + 10, d = 5 WHERE c = 'yy'"],
+        &["UPDATE u SET d = d * 2"],
+        &["UPDATE u SET c = NULL, d = -d WHERE d > 0"],
+        &["UPDATE u SET d = '7', c = 12 WHERE a = 4"],
+        &["UPDATE u SET c = 'p' WHERE a = 6"],
+        &["UPDATE u SET c = 'p', d = 9 WHERE a = 6"],
+        &["UPDATE u AS x SET d = x.d + 1 WHERE x.c > 'p'"],
+        &["UPDATE u SET b = 7 WHERE b = 2"],
+        &["UPDATE u SET b = b WHERE 1"],
+        &["UPDATE u SET c = 'y' WHERE 0"],
+        &["UPDATE u SET d = 1 WHERE c IN ('x', 'z') RETURNING *, rowid, d + 1"],
+        // The new row reads an INTEGER PRIMARY KEY as its rowid.
+        &[
+            "CREATE TABLE w(a INTEGER PRIMARY KEY, b INTEGER)",
+            "CREATE INDEX w_expr ON w(a * 10 + b)",
+            "INSERT INTO w VALUES (1, 1), (2, 2)",
+            "UPDATE w SET b = b + 1 RETURNING a, a + 0, w.a",
+            "SELECT a FROM w WHERE a * 10 + b = 13",
+        ],
+        // The loop reads u_b while c changes.
+        &["UPDATE u INDEXED BY u_b SET c = 'w' WHERE b > 2"],
+        // Constraint failures and OR IGNORE.
+        &["UPDATE u SET b = 1 WHERE a = 3"],
+        &["UPDATE OR IGNORE u SET b = 1 WHERE a > 1"],
+        &["UPDATE OR FAIL u SET b = 3 WHERE a IN (1, 2)"],
+        &["UPDATE OR ROLLBACK u SET b = 3 WHERE a = 1"],
+        &["UPDATE u SET b = NULL WHERE a = 2"],
+        &["UPDATE OR IGNORE u SET b = NULL WHERE a > 4"],
+        &["UPDATE u SET c = 'p' WHERE a = 6"],
+        &["PRAGMA count_changes = 1", "UPDATE u SET d = 0 WHERE a < 3"],
+        // Statements that still go through legacy.
+        &[
+            "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
+            "INSERT INTO r VALUES (1, 1)",
+            "UPDATE r SET b = NULL",
+            "SELECT * FROM r",
+        ],
+        &["UPDATE u SET a = a + 10 WHERE a = 1"],
+        &["UPDATE OR REPLACE u SET b = 1 WHERE a = 2"],
+        &["UPDATE u SET b = b + 100 WHERE b > 2"],
+        &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
+        &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
+        &["UPDATE t SET b = 9 WHERE a = 1"],
+        &[
+            "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (old.a); END",
+            "UPDATE u SET c = 'k' WHERE a < 3",
+        ],
+        // A temp trigger also fires for a main table.
+        &[
+            "CREATE TEMP TRIGGER tr AFTER UPDATE OF c ON main.u BEGIN \
+             INSERT INTO log VALUES (old.a); END",
+            "UPDATE u SET c = 'k' WHERE a < 3",
         ],
     ] {
         assert_eq!(

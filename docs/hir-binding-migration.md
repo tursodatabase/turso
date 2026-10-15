@@ -124,7 +124,9 @@ statements through HIR: the owned semantic catalog, `analyze_root`,
 `HirPlan::build`, and HIR lowering. Nested engine statements still use the
 legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
 prepare, so running the test suites with the variable set lists the remaining
-gaps. The variable and the legacy path are removed at cutover.
+gaps. Top-level DELETE and UPDATE also go through HIR, except the cases
+listed under "DML through HIR", which still go to legacy. The variable and the legacy path
+are removed at cutover.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as
@@ -190,6 +192,48 @@ Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
 stop an endless recursive CTE. HIR still materializes them in blocks with an
 outer join, where legacy can stream some of them.
+
+### DML through HIR
+
+DELETE from a B-tree table is lowered from HIR
+(`semantic_lowering/delete.rs`). It follows legacy's bytecode: every index is
+opened for writing, index keys are read from the table row, the entry of the
+index the loop reads is removed after the row, and RETURNING rows wait in an
+ephemeral table until every row is deleted. A WHERE clause with a subquery
+first collects the rowids into a RowSet, then deletes them. HIR reads
+RETURNING values before the row is deleted; legacy reads a copy of the row
+after, which gives the same values when RETURNING has no subquery.
+
+Whether a DELETE needs legacy is decided before any bytecode is emitted. These
+still go to legacy:
+
+| DELETE feature | What HIR needs first |
+|---|---|
+| Triggers, including temp triggers on a main table | Trigger bodies lowered from HIR |
+| Enforced foreign keys (`PRAGMA foreign_keys = ON` with a constraint on the table) | Parent-key checks and CASCADE/SET NULL/SET DEFAULT actions |
+| A subquery in RETURNING | RETURNING read from a copy of the deleted row |
+| CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
+| Automatic indexes chosen by the planner | Building them before the delete loop |
+
+UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`)
+when it changes neither the rowid nor the index its loop reads. The new row
+is built in registers, NOT NULL and UNIQUE are checked with the statement's
+or the constraint's conflict mode (ABORT, FAIL, ROLLBACK, IGNORE), and only
+indexes whose key or WHERE term reads a changed column are rewritten: every
+new key is checked before any index changes, then old entries are deleted and
+new ones inserted, as in legacy. HIR's NEW-row source is bound to those
+registers, so new index keys, partial-index WHERE terms and RETURNING read the
+new values. These still go to legacy:
+
+| UPDATE feature | What HIR needs first |
+|---|---|
+| Triggers, enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| Any subquery, UPDATE ... FROM | Collecting the rows to change first, as legacy does |
+| A changed rowid, or a changed key of the index the loop reads | The same |
+| REPLACE (statement, NOT NULL, or index) | Deleting the conflicting row |
+| STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
+
+INSERT still uses legacy.
 
 ### Non-lowering phase complete
 

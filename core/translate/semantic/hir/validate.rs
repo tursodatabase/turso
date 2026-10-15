@@ -1286,8 +1286,12 @@ impl<'document> HirValidator<'document> {
                 self.visit_expr(&constraint.expression)?;
             }
         }
+        // An UPDATE's NEW row is a pseudo source with its own index
+        // expressions: new index keys read the new values.
         let source_table = match &source.kind {
-            SourceKind::Table(table) | SourceKind::TableFunction { table, .. } => Some(table),
+            SourceKind::Table(table)
+            | SourceKind::TableFunction { table, .. }
+            | SourceKind::Pseudo { table, .. } => Some(table),
             _ => None,
         };
         let mut index_ids = HashSet::with_capacity(source.index_expressions.len());
@@ -2515,13 +2519,22 @@ impl<'document> HirValidator<'document> {
             &source_definition.kind,
             SourceKind::Table(_) | SourceKind::TableFunction { .. }
         );
-        let needs_type_programs = reads_catalog_storage
-            && type_fact
+        let has_custom_type = |type_fact: &super::TypeFact| {
+            type_fact
                 .declared
                 .as_ref()
-                .is_some_and(|declared| !declared.custom_chain.is_empty());
+                .is_some_and(|declared| !declared.custom_chain.is_empty())
+        };
+        let needs_type_programs = reads_catalog_storage && has_custom_type(type_fact);
+        // An UPDATE's NEW row is a pseudo source that keeps the target's
+        // type programs, since it holds the values being written.
+        let has_type_programs = source_definition.column_type_programs[column].is_some();
+        let complete = match &source_definition.kind {
+            SourceKind::Pseudo { .. } => !has_type_programs || has_custom_type(type_fact),
+            _ => has_type_programs == needs_type_programs,
+        };
         self.require(
-            source_definition.column_type_programs[column].is_some() == needs_type_programs,
+            complete,
             format!("source {source} column {column} has incomplete type programs"),
         )?;
         if let Some(programs) = &source_definition.column_type_programs[column] {

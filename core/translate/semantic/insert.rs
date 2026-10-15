@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
-    dml::{trigger_matches_update, trigger_targets_database},
+    dml::trigger_matches_update,
     expr::{ExprPolicies, ExprPolicy},
     hir::{self, HirRoot, SourceOwner},
     scope::{ExprCollation, Scope},
@@ -330,9 +330,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         upserts: &[hir::Upsert],
     ) -> Result<hir::InsertTriggers> {
-        let database = table
-            .database()
-            .expect("an INSERT target table must have an owning database");
         let mut has_upsert_update = false;
         let mut updated_columns = Vec::new();
         for upsert in upserts {
@@ -346,39 +343,20 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }));
             }
         }
-        let (insert, upsert_update) = {
-            let schema = self.context().schema(database)?;
-            let triggers = schema.get_triggers_for_table(table.value().get_name());
-            let insert = triggers
-                .clone()
-                .filter(|trigger| {
-                    trigger_targets_database(trigger, database)
-                        && matches!(trigger.event, ast::TriggerEvent::Insert)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let upsert_update = if has_upsert_update {
-                triggers
-                    .filter(|trigger| {
-                        trigger_targets_database(trigger, database)
-                            && trigger_matches_update(trigger, table.value(), &updated_columns)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            (insert, upsert_update)
+        let insert = self.table_triggers(table, |trigger| {
+            matches!(trigger.event, ast::TriggerEvent::Insert)
+        })?;
+        let upsert_update = if has_upsert_update {
+            let target = table.value();
+            self.table_triggers(table, |trigger| {
+                trigger_matches_update(trigger, target, &updated_columns)
+            })?
+        } else {
+            Vec::new()
         };
         Ok(hir::InsertTriggers {
-            insert: insert
-                .into_iter()
-                .map(|trigger| self.freeze_trigger(database, trigger))
-                .collect(),
-            upsert_update: upsert_update
-                .into_iter()
-                .map(|trigger| self.freeze_trigger(database, trigger))
-                .collect(),
+            insert,
+            upsert_update,
         })
     }
 

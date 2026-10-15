@@ -3159,9 +3159,15 @@ impl ExprLowerer<'_, '_, '_> {
         };
 
         match binding {
-            SourceBinding::Registers { start, .. } => {
+            SourceBinding::Registers { start, rowid } => {
+                // A row image keeps NULL in an INTEGER PRIMARY KEY column's
+                // register; the value is the rowid.
+                let src_reg = match rowid {
+                    Some(rowid) if column.rowid_alias => rowid,
+                    _ => start + reference.column,
+                };
                 self.program.emit_insn(Insn::Copy {
-                    src_reg: start + reference.column,
+                    src_reg,
                     dst_reg: target,
                     extra_amount: 0,
                 });

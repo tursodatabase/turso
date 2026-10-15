@@ -283,6 +283,27 @@ fn translate_statement(
                     &stmt, schema, resolver, program, connection,
                 )?
         }
+        (Some(schema), ast::Stmt::Update(update)) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            // Legacy checks these by name before it looks the table up.
+            // UPDATE ... FROM is not lowered from HIR yet, and legacy has
+            // its own checks for it.
+            let table_name = crate::util::normalize_ident(update.tbl_name.name.as_str());
+            update.from.is_none()
+                && crate::schema::allow_user_dml(&table_name)
+                && !resolver.schema().is_materialized_view(&table_name)
+                && resolver
+                    .schema()
+                    .get_dependent_materialized_views(&table_name)
+                    .is_empty()
+                && semantic_lowering::translate_update(
+                    &stmt, schema, resolver, program, connection,
+                )?
+        }
         _ => false,
     };
 

@@ -1,8 +1,10 @@
 //! Bytecode lowering from resolved semantic HIR.
 
 mod delete;
+mod dml;
 pub(super) mod expr;
 pub(super) mod query;
+mod update;
 mod window;
 
 use turso_parser::ast;
@@ -69,6 +71,39 @@ pub(crate) fn translate_delete(
         ..
     }) = &plan.document.root
     {
+        program.resolved_result_columns =
+            resolved_output_columns(&plan.document, &returning.outputs)?;
+    }
+    Ok(true)
+}
+
+/// Prepare a top-level UPDATE through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_update(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    if update::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+        return Ok(false);
+    }
+    let HirRoot::Update(update) = &plan.document.root else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE analysis did not produce an UPDATE root".into(),
+        ));
+    };
+    let mvcc = plan
+        .document
+        .source(update.target)
+        .and_then(|source| source.database)
+        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
+    program.set_hir_plan(plan.clone());
+    update::emit_update(program, &plan, mvcc)?;
+    if let Some(returning) = &update.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
