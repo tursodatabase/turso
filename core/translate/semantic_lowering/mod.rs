@@ -167,16 +167,41 @@ fn resolved_result_value(
                 ))
             })?;
             let declared = column.type_fact.declared.as_ref();
+            // Like legacy, a subquery column that reads a rowid is declared
+            // INTEGER.
+            let reads_rowid = declared.is_none()
+                && matches!(
+                    &source.kind,
+                    hir::SourceKind::Derived(query)
+                        if document
+                            .query(*query)
+                            .and_then(|query| query.blocks.first())
+                            .and_then(|block| block.outputs.get(reference.column))
+                            .is_some_and(|output| matches!(output.expr, hir::Expr::RowId(_)))
+                );
+            let (declared_type, ty) = if reads_rowid {
+                ("INTEGER".to_string(), Type::Integer)
+            } else {
+                (
+                    declared
+                        .map(|declared| declared.name.clone())
+                        .unwrap_or_default(),
+                    declared
+                        .map(|declared| declared.storage)
+                        .or(column.type_fact.storage)
+                        .unwrap_or(Type::Null),
+                )
+            };
             Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
-                table_name: source.name.clone(),
+                // Legacy reports a FROM subquery by its alias and a CTE by
+                // its name.
+                table_name: match (&source.kind, &source.alias) {
+                    (hir::SourceKind::Derived(_), Some(alias)) => alias.clone(),
+                    _ => source.name.clone(),
+                },
                 column_name: column.name.clone(),
-                declared_type: declared
-                    .map(|declared| declared.name.clone())
-                    .unwrap_or_default(),
-                ty: declared
-                    .map(|declared| declared.storage)
-                    .or(column.type_fact.storage)
-                    .unwrap_or(Type::Null),
+                declared_type,
+                ty,
                 array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),
                 table_is_strict: false,
             }))

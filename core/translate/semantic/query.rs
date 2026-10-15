@@ -784,7 +784,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .outputs
             .iter()
             .map(|output| hir::SourceColumn {
-                name: output.name.clone(),
+                name: self.subquery_column_name(output),
                 type_fact: output.type_fact.clone(),
                 affinity: output.schema_affinity,
                 has_affinity: output.has_affinity,
@@ -793,6 +793,31 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 rowid_alias: false,
             })
             .collect())
+    }
+
+    /// Like legacy and SQLite, a subquery column without an alias is named
+    /// after the column it reads: `(SELECT b.k FROM l AS b)` has a column
+    /// `k`, not `b.k`. A rowid read takes the name of the rowid alias column,
+    /// or `rowid`. Other expressions keep their SQL text.
+    fn subquery_column_name(&self, output: &hir::Output) -> String {
+        if output.name_kind != hir::OutputNameKind::Inferred {
+            return output.name.clone();
+        }
+        let column_name = match &output.expr {
+            hir::Expr::Column(reference) => self
+                .source(reference.source)
+                .and_then(|source| source.columns.get(reference.column))
+                .map(|column| column.name.clone()),
+            hir::Expr::RowId(source) => self.source(*source).map(|source| {
+                source
+                    .columns
+                    .iter()
+                    .find(|column| column.rowid_alias)
+                    .map_or_else(|| "rowid".to_string(), |column| column.name.clone())
+            }),
+            _ => None,
+        };
+        column_name.unwrap_or_else(|| output.name.clone())
     }
 
     pub(super) fn analyze_base_table_source(

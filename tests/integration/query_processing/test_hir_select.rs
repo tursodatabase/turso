@@ -71,6 +71,13 @@ fn hir_select_matches_legacy_rows_and_columns() {
         "SELECT extra, sum(value) FILTER (WHERE value > 15) AS s FROM items GROUP BY extra HAVING s > 0",
         "SELECT extra AS e, count(*) FROM items GROUP BY 1 ORDER BY 1",
         "SELECT json_valid('{a:1}', 6), json_valid('{}')",
+        // A subquery column is named after the column it reads, not `i.value`.
+        "SELECT d.value FROM (SELECT i.value FROM items i WHERE i.id < 3) AS d ORDER BY 1",
+        "WITH s AS (SELECT i.id, t.tag FROM items i JOIN tags t ON t.item_id = i.id) \
+         SELECT s.id, s.tag FROM s ORDER BY 1, 2",
+        "SELECT d.id FROM (SELECT items.rowid FROM items) AS d WHERE d.id < 3 ORDER BY 1",
+        "SELECT * FROM (SELECT i.value FROM items i WHERE i.id < 3) ORDER BY 1",
+        "WITH s AS (SELECT id FROM items) SELECT s.id, x.id FROM s, s AS x WHERE s.id = x.id",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),
