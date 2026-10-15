@@ -2173,9 +2173,22 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
                     return self.resolve_atomic_expr(resolved.expr, scope);
                 }
-                if let Some(base) =
-                    scope.resolve_unqualified(table.as_str(), NamePrecedence::SourcesOnly)?
-                {
+                // `data.x` reads field `x` of a struct or union column `data`.
+                let base = scope
+                    .resolve_unqualified(table.as_str(), NamePrecedence::SourcesOnly)
+                    .map_err(|error| match error {
+                        LimboError::ParseError(message)
+                            if message.starts_with("ambiguous column name") =>
+                        {
+                            LimboError::ParseError(format!(
+                                "ambiguous column reference: '{}' — multiple tables have a \
+                                 struct/union column with this name",
+                                table.as_str()
+                            ))
+                        }
+                        error => error,
+                    })?;
+                if let Some(base) = base {
                     if custom_argument_type(&base, |definition| {
                         definition.is_struct() || definition.is_union()
                     })
@@ -3034,23 +3047,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
                 )?;
+                // Legacy reports an unknown type and an unknown field alike.
+                let unresolved = || {
+                    LimboError::ParseError(format!(
+                        "cannot resolve struct field '{field_name}' for struct_extract"
+                    ))
+                };
                 let struct_type =
                     custom_argument_type(&arguments[0], |definition| definition.is_struct())
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "struct_extract() first argument must have a known struct type"
-                                    .to_string(),
-                            )
-                        })?;
+                        .ok_or_else(unresolved)?;
                 let member = self
                     .resolve_custom_member(&arguments[0], &field_name)?
-                    .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "unknown field '{}' in struct type '{}'",
-                            field_name,
-                            struct_type.value().name
-                        ))
-                    })?;
+                    .ok_or_else(unresolved)?;
                 let hir::FieldAccessKind::Struct { field_index } = member.kind else {
                     unreachable!("struct member resolution returns a struct field")
                 };

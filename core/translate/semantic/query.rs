@@ -324,6 +324,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         crate::bail_parse_error!("no such index: {}", index.as_str());
                     }
                     self.analyze_view_source(view, alias.as_ref(), context)?
+                } else if self.context().is_broken_view(name) {
+                    crate::bail_parse_error!(
+                        "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
+                         Use DROP VIEW to remove it, then recreate it.",
+                        crate::util::normalize_ident(name.name.as_str())
+                    );
                 } else {
                     self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?
                 };

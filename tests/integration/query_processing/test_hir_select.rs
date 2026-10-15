@@ -371,3 +371,19 @@ fn hir_reads_indexes_on_generated_columns_like_legacy() {
         );
     }
 }
+
+#[test]
+fn hir_errors_match_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for sql in [
+        "SELECT * FROM main.nosuch",
+        "SELECT * FROM nosuch",
+        "SELECT x.y FROM items",
+        "SELECT nosuch FROM items",
+    ] {
+        let legacy_error = legacy.prepare(sql).err().expect("legacy rejects").to_string();
+        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
+        assert_eq!(hir_error, legacy_error, "{sql}");
+    }
+}

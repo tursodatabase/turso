@@ -291,13 +291,30 @@ impl<'catalog> SemanticContext<'catalog> {
                         .get(database)
                         .is_some_and(|schema| schema.get_table(&table_name).is_some())
                 })
-                .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?,
+                .ok_or_else(|| no_such_table(name))?,
         };
         let table = self
             .schema(database)?
             .get_table(&table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
+            .ok_or_else(|| no_such_table(name))?;
         Ok((database, table))
+    }
+
+    /// Whether `name` is a view whose stored SQL failed to parse when the
+    /// schema was loaded.
+    pub(crate) fn is_broken_view(&self, name: &turso_parser::ast::QualifiedName) -> bool {
+        let view_name = normalize_ident(name.name.as_str());
+        let broken = |database: &DatabaseId| {
+            self.database_schemas
+                .get(database)
+                .is_some_and(|schema| schema.broken_views.contains(&view_name))
+        };
+        match &name.db_name {
+            Some(database) => self
+                .database(database.as_str())
+                .is_some_and(|database| broken(&database)),
+            None => self.unqualified_database_search_path.iter().any(broken),
+        }
     }
 
     pub(crate) fn resolve_index(
@@ -320,4 +337,12 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) const fn snapshot(&self) -> CatalogSnapshot {
         self.snapshot
     }
+}
+
+/// Legacy's message, which keeps the schema name the statement used.
+fn no_such_table(name: &turso_parser::ast::QualifiedName) -> LimboError {
+    LimboError::ParseError(format!(
+        "no such table: {}",
+        crate::util::table_name_for_error(name)
+    ))
 }
