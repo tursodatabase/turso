@@ -365,6 +365,27 @@ expect {
     -9e999
 }
 
+test json_keeps_infinity_text_from_input {
+    SELECT json('["9.0e+999"]'), json('{"note":"x 9.0e+999 y"}'), json('[9.0e+999]'), json(jsonb_array(9e999)), json(jsonb_object('a', -9e999));
+}
+expect {
+    ["9.0e+999"]|{"note":"x 9.0e+999 y"}|[9.0e+999]|[9.0e+999]|{"a":-9.0e+999}
+}
+
+test json_set_insert_replace_infinity {
+    SELECT json_set('[1]', '$[0]', 9e999), json_insert('[]', '$[#]', -9e999), json_replace('[1]', '$[0]', 9e999), json(jsonb_set('[1]', '$[0]', 9e999)), json(jsonb_replace('[1]', '$[0]', -9e999));
+}
+expect {
+    [9e999]|[-9e999]|[9e999]|[9e999]|[-9e999]
+}
+
+test json_quote_and_arrow_infinity {
+    SELECT json_quote(9e999), json_object('a', 9e999), 9e999 -> '$', json_group_array(x) FROM (SELECT -9e999 AS x);
+}
+expect {
+    9.0e+999|{"a":9.0e+999}|9e999|[-9.0e+999]
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }

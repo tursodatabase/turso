@@ -27,6 +27,9 @@ use std::str::FromStr;
 pub enum Conv {
     Strict,
     NotStrict,
+    /// Like `NotStrict`, but an infinite REAL is written as 9e999 instead of
+    /// 9.0e+999, as SQLite does for json_set, json_insert and json_replace values.
+    SetValue,
     ToString,
 }
 
@@ -48,15 +51,10 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
         Value::Null => Ok(Value::Null),
         _ => {
             let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
-            let mut json = match indent {
+            let json = match indent {
                 Some(indent) => json_val.to_string_pretty(Some(indent))?,
                 None => json_val.to_string()?,
             };
-
-            // An infinite REAL argument converts to the payload
-            // 9.0e+999, but SQLite's json() renders it as 9e999 (while
-            // json_array and json_quote keep the long form) (#4196).
-            json = json.replace("9.0e+999", "9e999");
 
             if indent.is_some() {
                 // json_pretty() output carries no subtype in SQLite.
@@ -276,12 +274,15 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         }
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
-            // Handle infinity for JSON compatibility with SQLite (#4196)
+            // SQLite writes an infinite REAL as 9e999 when it converts a
+            // function argument to JSON, but json_array, json_object and
+            // json_quote print it as 9.0e+999 (#4196).
             if float.is_infinite() {
-                let json_str = if float.is_sign_negative() {
-                    "-9.0e+999"
-                } else {
-                    "9.0e+999"
+                let json_str = match (strict, float.is_sign_negative()) {
+                    (Conv::NotStrict, false) => "9.0e+999",
+                    (Conv::NotStrict, true) => "-9.0e+999",
+                    (_, false) => "9e999",
+                    (_, true) => "-9e999",
                 };
                 Jsonb::from_str(json_str).map_err(malformed_json_error)
             } else {
@@ -432,7 +433,7 @@ where
 
         let path = json_path_from_db_value(&first, true)?;
 
-        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -473,7 +474,7 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(second, Conv::SetValue)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -1081,7 +1082,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
         ValueRef::Numeric(n) => match n {
             crate::numeric::Numeric::Integer(i) => Ok(Value::Text(Text::json(i.to_string()))),
             crate::numeric::Numeric::Float(_) => {
-                let json = convert_ref_dbtype_to_jsonb(ValueRef::Numeric(n), Conv::Strict)?;
+                let json = convert_ref_dbtype_to_jsonb(ValueRef::Numeric(n), Conv::NotStrict)?;
                 Ok(Value::Text(Text::json(json.to_string()?)))
             }
         },
