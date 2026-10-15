@@ -128,7 +128,7 @@ addr  opcode                        p1   p2   p3  p4                            
   60              IdxInsert          0   23    0                                               8  key=r[23]
   61            Next                 3   55    0                                               1
   62            Null                 0   32    0                                               0  r[32]=NULL
-  63            SorterOpen           6    5    0  k(1,B)                                       0  cursor=6
+  63            SorterOpen           6    5    0  k(1,Binary)                                  0  cursor=6
   64            Integer              0   27    0                                               0  r[27]=0; clear group by abort flag
   65            Null                 0   28    0                                               0  r[28]=NULL; initialize group by comparison registers to NULL
   66            Gosub               39  164    0                                               0  ; go to clear accumulator subroutine
@@ -232,7 +232,7 @@ addr  opcode                        p1   p2   p3  p4                            
  164    Null                         0   29   32                                               0  r[29..32]=NULL; clear accumulator subroutine start
  165    Integer                      0   26    0                                               0  r[26]=0
  166  Return                        39    0    0                                               0
- 167  SorterOpen                    10    1    0  k(1,B)                                       0  cursor=10
+ 167  SorterOpen                    10    1    0  k(1,Binary)                                  0  cursor=10
  168  OpenRead                      11    5    0  k(7,B,B,B,B,B,B,B)                           0  table=supplier, root=5, iDb=0
  169  OpenRead                      12    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
  170  NullRow                        1    0    0                                               0  Set cursor 1 to a (pseudo) NULL row

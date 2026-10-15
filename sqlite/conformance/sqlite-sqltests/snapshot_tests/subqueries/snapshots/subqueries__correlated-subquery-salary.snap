@@ -28,7 +28,7 @@ addr  opcode                  p1  p2  p3  p4              p5  comment
    1          Once            49   0   0                   0  goto 49
    2          OpenEphemeral    0   0   0                   0  cursor=0 is_table=false
    3          Null             0   8   0                   0  r[8]=NULL
-   4          SorterOpen       1   2   0  k(1,B)           0  cursor=1
+   4          SorterOpen       1   2   0  k(1,Binary)      0  cursor=1
    5          Integer          0   5   0                   0  r[5]=0; clear group by abort flag
    6          Null             0   6   0                   0  r[6]=NULL; initialize group by comparison registers to NULL
    7          Gosub           12  46   0                   0  ; go to clear accumulator subroutine

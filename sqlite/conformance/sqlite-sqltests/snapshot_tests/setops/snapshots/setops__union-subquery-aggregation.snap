@@ -53,9 +53,9 @@ addr  opcode                  p1  p2  p3  p4              p5  comment
   15            Yield          1   0   0                   0
   16          Next             2  14   0                   1
   17          EndCoroutine     1   0   0                   0
-  18          SorterOpen       3   1   0  k(1,-B)          0  cursor=3
+  18          SorterOpen       3   1   0  k(1,-Binary)     0  cursor=3
   19          Null             0  12   0                   0  r[12]=NULL
-  20          SorterOpen       4   1   0  k(1,-B)          0  cursor=4
+  20          SorterOpen       4   1   0  k(1,-Binary)     0  cursor=4
   21          Integer          0   9   0                   0  r[9]=0; clear group by abort flag
   22          Null             0  10   0                   0  r[10]=NULL; initialize group by comparison registers to NULL
   23          Gosub           15  57   0                   0  ; go to clear accumulator subroutine
