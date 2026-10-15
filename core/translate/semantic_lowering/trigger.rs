@@ -126,14 +126,27 @@ fn compile_trigger(
         ProgramBuilderOpts::new(1, 32, 2),
         handle,
     );
-    // Triggers that the body's own DELETEs fire, per command.
+    if let Some(conflict) = conflict_override {
+        builder.set_trigger_conflict_override(conflict);
+    }
+    // Triggers that the body's own DML fires, per command.
     let mut nested = Vec::with_capacity(commands.len());
     for (command, command_plan) in root.commands.iter().zip(commands) {
         let mut command_triggers = Vec::new();
         let needs_legacy = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                super::insert::needs_legacy(&plan, insert, foreign_keys_enabled, &builder)?
+                if super::insert::needs_legacy(&plan, insert, foreign_keys_enabled, &builder)? {
+                    true
+                } else {
+                    match insert_triggers(session, &builder, &plan, insert)? {
+                        Some(triggers) => {
+                            command_triggers = triggers;
+                            false
+                        }
+                        None => true,
+                    }
+                }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
                 super::update::needs_legacy(&plan, update, access, foreign_keys_enabled, &builder)?
@@ -163,9 +176,6 @@ fn compile_trigger(
         nested.push(command_triggers);
     }
 
-    if let Some(conflict) = conflict_override {
-        builder.set_trigger_conflict_override(conflict);
-    }
     builder.prologue();
     builder.set_hir_plan(plan.clone());
     let columns = table.columns().len();
@@ -222,7 +232,7 @@ fn compile_trigger(
                 )?;
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                super::insert::emit_insert(&mut builder, &plan, insert)?;
+                super::insert::emit_insert(&mut builder, &plan, insert, command_triggers)?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
@@ -284,6 +294,31 @@ fn compile_trigger(
     }))
 }
 
+/// Compile the triggers an INSERT fires. `None` means one needs legacy.
+/// Like legacy, an INSERT's conflict clause other than ABORT also applies
+/// inside its triggers.
+pub(super) fn insert_triggers(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+) -> Result<Option<Vec<CompiledTrigger>>> {
+    let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let conflict_override = parent.trigger_conflict_override.or(insert
+        .conflict
+        .filter(|conflict| *conflict != ResolveType::Abort));
+    target_triggers(
+        session,
+        parent,
+        plan,
+        insert.target,
+        &triggers.insert,
+        conflict_override,
+    )
+}
+
 /// Compile the triggers a DELETE fires. `None` means one needs legacy.
 pub(super) fn delete_triggers(
     session: &HirSession<'_>,
@@ -295,21 +330,40 @@ pub(super) fn delete_triggers(
     let hir::DeleteTargetKind::BTree { triggers, .. } = &delete.target_kind else {
         return Ok(Some(Vec::new()));
     };
+    target_triggers(
+        session,
+        parent,
+        plan,
+        delete.target,
+        triggers,
+        conflict_override,
+    )
+}
+
+/// Compile `triggers`, the triggers on the table `target` writes.
+fn target_triggers(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    target: hir::SourceId,
+    triggers: &[hir::ResolvedTrigger],
+    conflict_override: Option<ResolveType>,
+) -> Result<Option<Vec<CompiledTrigger>>> {
     if triggers.is_empty() {
         return Ok(Some(Vec::new()));
     }
     let source = plan
         .document
-        .source(delete.target)
-        .ok_or_else(|| LimboError::InternalError("HIR DELETE target is missing".into()))?;
+        .source(target)
+        .ok_or_else(|| LimboError::InternalError("HIR DML target is missing".into()))?;
     let (hir::SourceKind::Table(table), Some(database)) = (&source.kind, source.database) else {
         return Err(LimboError::InternalError(
-            "HIR DELETE target with triggers is not a table".into(),
+            "HIR DML target with triggers is not a table".into(),
         ));
     };
     let Some(table) = table.value().btree() else {
         return Err(LimboError::InternalError(
-            "HIR DELETE target with triggers is not a B-tree table".into(),
+            "HIR DML target with triggers is not a B-tree table".into(),
         ));
     };
     compile_triggers(

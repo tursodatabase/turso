@@ -9,7 +9,7 @@
 
 use std::num::NonZeroUsize;
 
-use turso_parser::ast::{self, ResolveType};
+use turso_parser::ast::{self, ResolveType, TriggerTime};
 
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -30,6 +30,7 @@ use crate::{
 };
 
 use super::dml::{has_subquery, DmlTarget, ReturningBuffer};
+use super::trigger::{CompiledTrigger, TriggerRow};
 
 /// Whether this INSERT uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -70,10 +71,7 @@ pub(super) fn needs_legacy(
             triggers,
             foreign_keys,
         } => {
-            if autoincrement.is_some()
-                || !triggers.insert.is_empty()
-                || !triggers.upsert_update.is_empty()
-            {
+            if autoincrement.is_some() || !triggers.upsert_update.is_empty() {
                 return Ok(true);
             }
             if foreign_keys_enabled
@@ -142,6 +140,7 @@ pub(super) fn emit_insert(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
+    triggers: &[CompiledTrigger],
 ) -> Result<()> {
     let document = &plan.document;
     let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
@@ -192,25 +191,28 @@ pub(super) fn emit_insert(
 
     // Same statement-journal facts as legacy.
     let several_rows = rows.len() > 1;
-    if !several_rows {
+    if !several_rows && triggers.is_empty() {
         program.set_multi_write(false);
     }
     let indexes = &target.source.index_expressions;
-    program.set_may_abort(constraint_may_abort(
-        has_statement_conflict,
-        or_conflict,
-        table.rowid_alias_conflict_clause,
-        indexes.iter().map(|index| {
-            let index = index.index.value();
-            (index.on_conflict, index.unique)
-        }),
-        table
-            .columns()
-            .iter()
-            .any(|column| column.notnull() && !column.is_rowid_alias()),
-        false,
-        rowid_value.is_some() || !indexes.is_empty(),
-    ));
+    program.set_may_abort(
+        !triggers.is_empty()
+            || constraint_may_abort(
+                has_statement_conflict,
+                or_conflict,
+                table.rowid_alias_conflict_clause,
+                indexes.iter().map(|index| {
+                    let index = index.index.value();
+                    (index.on_conflict, index.unique)
+                }),
+                table
+                    .columns()
+                    .iter()
+                    .any(|column| column.notnull() && !column.is_rowid_alias()),
+                false,
+                rowid_value.is_some() || !indexes.is_empty(),
+            ),
+    );
 
     let returning = ReturningBuffer::open(program, table, insert.returning.as_ref());
     let table_cursor = target.open_table_for_write(program);
@@ -222,6 +224,7 @@ pub(super) fn emit_insert(
         columns: program.alloc_registers(table.columns().len()),
         or_conflict,
         has_statement_conflict,
+        triggers,
     };
     let done = program.allocate_label();
     match rows {
@@ -331,6 +334,7 @@ struct InsertRow<'a> {
     columns: usize,
     or_conflict: ResolveType,
     has_statement_conflict: bool,
+    triggers: &'a [CompiledTrigger],
 }
 
 impl InsertRow<'_> {
@@ -398,6 +402,60 @@ impl InsertRow<'_> {
                         .iter()
                         .map(|affinity| affinity.aff_mask())
                         .collect(),
+                });
+            }
+        }
+
+        let new_row = TriggerRow {
+            columns: self.columns,
+            rowid: self.rowid,
+        };
+        if self
+            .triggers
+            .iter()
+            .any(|trigger| trigger.time == TriggerTime::Before)
+        {
+            // Like legacy and SQLite, NEW.rowid reads -1 in a BEFORE trigger
+            // while the rowid is not known yet.
+            let saved = rowid_value.map(|_| {
+                let saved = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: self.rowid,
+                    dst_reg: saved,
+                    extra_amount: 0,
+                });
+                saved
+            });
+            let known = program.allocate_label();
+            if rowid_value.is_some() {
+                program.emit_insn(Insn::NotNull {
+                    reg: self.rowid,
+                    target_pc: known,
+                });
+            }
+            program.emit_insn(Insn::Integer {
+                value: -1,
+                dest: self.rowid,
+            });
+            program.preassign_label_to_next_insn(known);
+            for trigger in self
+                .triggers
+                .iter()
+                .filter(|trigger| trigger.time == TriggerTime::Before)
+            {
+                trigger.emit_fire(
+                    program,
+                    None,
+                    Some(new_row),
+                    table.columns().len(),
+                    row_done,
+                )?;
+            }
+            if let Some(saved) = saved {
+                program.emit_insn(Insn::Copy {
+                    src_reg: saved,
+                    dst_reg: self.rowid,
+                    extra_amount: 0,
                 });
             }
         }
@@ -502,6 +560,22 @@ impl InsertRow<'_> {
             flag: InsertFlags::new(),
             table_name: table.name.clone(),
         });
+        // RAISE(IGNORE) in an AFTER trigger only ends that trigger's body.
+        let after_triggers = program.allocate_label();
+        for trigger in self
+            .triggers
+            .iter()
+            .filter(|trigger| trigger.time == TriggerTime::After)
+        {
+            trigger.emit_fire(
+                program,
+                None,
+                Some(new_row),
+                table.columns().len(),
+                after_triggers,
+            )?;
+        }
+        program.preassign_label_to_next_insn(after_triggers);
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document)?;
             returning.emit_buffer(program, start);
@@ -717,7 +791,7 @@ mod tests {
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan, insert).unwrap();
+        emit_insert(&mut program, &plan, insert, &[]).unwrap();
         program
     }
 

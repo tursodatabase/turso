@@ -274,9 +274,39 @@ fn hir_insert_matches_legacy() {
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
         &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
         &["INSERT INTO t(b) VALUES (62)"],
+        // Triggers run from HIR-compiled subprograms. NEW.rowid reads -1 in
+        // a BEFORE trigger until the rowid is known.
         &[
             "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
             "INSERT INTO u(b) VALUES (63)",
+        ],
+        &[
+            "CREATE TRIGGER bi BEFORE INSERT ON u BEGIN INSERT INTO log VALUES (new.rowid); END",
+            "CREATE TRIGGER ai AFTER INSERT ON u WHEN new.b > 64 BEGIN \
+             INSERT INTO log VALUES (new.a * 1000 + new.b); END",
+            "INSERT INTO u(b) VALUES (64), (65)",
+            "INSERT INTO u(a, b) VALUES (100, 66), (NULL, 67)",
+            "INSERT INTO u(rowid, b) VALUES (200, 68) RETURNING a",
+        ],
+        &[
+            "CREATE TRIGGER ig BEFORE INSERT ON u WHEN new.b = 70 BEGIN SELECT RAISE(IGNORE); END",
+            "CREATE TRIGGER aig AFTER INSERT ON u WHEN new.b = 71 BEGIN \
+             SELECT RAISE(IGNORE); INSERT INTO log VALUES (0); END",
+            "INSERT INTO u(b) VALUES (69), (70), (71) RETURNING b",
+        ],
+        // The statement's OR IGNORE also applies inside its triggers.
+        &[
+            "CREATE TABLE once(p UNIQUE)",
+            "CREATE TRIGGER uo AFTER INSERT ON u BEGIN INSERT INTO once VALUES (1); END",
+            "INSERT OR IGNORE INTO u(b) VALUES (72), (73)",
+            "INSERT INTO u(b) VALUES (74), (75)",
+            "SELECT p FROM once",
+        ],
+        // A trigger fired from another trigger.
+        &[
+            "CREATE TRIGGER lg AFTER INSERT ON log BEGIN DELETE FROM u WHERE a = 1; END",
+            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b) VALUES (76)",
         ],
         &[
             "CREATE TEMP TRIGGER tr AFTER INSERT ON main.u BEGIN \

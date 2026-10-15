@@ -132,13 +132,17 @@ pub(crate) fn translate_insert(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
     if insert::needs_legacy(&plan, insert, connection.foreign_keys_enabled(), program)? {
         return Ok(false);
     }
+    let Some(triggers) = trigger::insert_triggers(&session, program, &plan, insert)? else {
+        return Ok(false);
+    };
     program.set_hir_plan(plan.clone());
-    insert::emit_insert(program, &plan, insert)?;
+    insert::emit_insert(program, &plan, insert, &triggers)?;
     if let Some(returning) = &insert.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
