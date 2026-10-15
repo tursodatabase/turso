@@ -373,6 +373,26 @@ fn hir_reads_indexes_on_generated_columns_like_legacy() {
 }
 
 #[test]
+fn hir_grouping_over_an_expression_index_matches_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    legacy
+        .execute("CREATE INDEX items_value_mod ON items((value % 20))")
+        .unwrap();
+    for sql in [
+        // The grouped rows keep `value`, which the index does not hold.
+        "SELECT (value % 20) AS m, count(*) FROM items GROUP BY m ORDER BY m",
+        "SELECT value % 20, row_number() OVER (ORDER BY value % 20, id) FROM items ORDER BY 2",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);

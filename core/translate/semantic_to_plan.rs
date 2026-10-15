@@ -743,6 +743,20 @@ impl<'a> HirPlanContext<'a> {
             append_predicates(&mut input.predicates, filter, None);
         }
 
+        // GROUP BY and window lowering copy every column the block reads into
+        // a sorter or buffer, so an expression index cannot stand in for the
+        // columns its expressions read.
+        let copies_columns = !block.windows.is_empty()
+            || matches!(
+                &block.body,
+                hir::QueryBlockBody::Select {
+                    grouping: Some(grouping),
+                    ..
+                } if !grouping.keys.is_empty()
+            );
+        if copies_columns {
+            return Ok(input);
+        }
         for output in &block.outputs {
             self.register_expression_index_usage(&mut input.sources, &output.expr)?;
         }
