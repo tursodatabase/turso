@@ -12,7 +12,7 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use super::emit::{any_effective_replace, constraint_may_abort, halt_desc_and_on_error};
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
         optimizer::HirBtreeOperation,
@@ -82,23 +82,22 @@ pub(super) fn needs_legacy(
     }
     let assigned = assigned_columns(update)?;
     // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
-    if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&assigned)) {
+    if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&table, &assigned)) {
         return Ok(true);
     }
     // REPLACE deletes the rows the new row conflicts with; an ON DELETE
     // action on them still needs legacy.
-    let replaces = may_replace(update, source);
+    let sets_rowid = assigned
+        .iter()
+        .filter(|column| is_rowid_target(&table, column))
+        .count();
+    let replaces = may_replace(update, source, &table, sets_rowid > 0);
     if replaces && super::fkey::delete_needs_legacy(foreign_keys) {
         return Ok(true);
     }
     // Changing the rowid moves the row; legacy collects the rows first.
-    if assigned.iter().any(|column| match column {
-        hir::TargetColumn::RowId => true,
-        hir::TargetColumn::Column(column) => table
-            .columns()
-            .get(*column)
-            .is_some_and(Column::is_rowid_alias),
-    }) {
+    // Setting the rowid twice, or with UPDATE ... FROM, is not lowered yet.
+    if sets_rowid > 1 || (sets_rowid == 1 && update.from.is_some()) {
         return Ok(true);
     }
     if update.from.is_some() {
@@ -229,29 +228,33 @@ pub(super) fn emit_update(
 
     let assigned = assigned_columns(update)?;
     let mut values = vec![None; table.columns().len()];
+    // The new rowid, when the UPDATE sets it. The INTEGER PRIMARY KEY
+    // column keeps NULL, as in the stored record.
+    let mut rowid_value = None;
     for assignment in &update.assignments {
         let width = assignment.columns.len();
         for (part, target_column) in assignment.columns.iter().enumerate() {
-            let hir::TargetColumn::Column(column) = target_column else {
-                return Err(LimboError::InternalError(
-                    "HIR UPDATE assignment sets the rowid".into(),
-                ));
-            };
-            values[*column] = Some(match width {
+            let value = match width {
                 1 => NewValue::Expr(&assignment.value),
                 _ => NewValue::RowPart {
                     row: &assignment.value,
                     part,
                     width,
                 },
-            });
+            };
+            match target_column {
+                column if is_rowid_target(table, column) => rowid_value = Some(value),
+                hir::TargetColumn::Column(column) => values[*column] = Some(value),
+                hir::TargetColumn::RowId => unreachable!("the rowid target was matched above"),
+            }
         }
     }
     // Indexes whose key or WHERE term reads a changed column, in schema
     // order, with the NEW-row expressions for the same index.
     let mut changed_indexes = Vec::new();
+    // Every index entry holds the rowid, so a new rowid changes them all.
     for old in &target.source.index_expressions {
-        if !index_reads_assigned_column(update.target, old, &assigned) {
+        if rowid_value.is_none() && !index_reads_assigned_column(update.target, old, &assigned) {
             continue;
         }
         let new = new_source
@@ -329,7 +332,7 @@ pub(super) fn emit_update(
         has_statement_conflict,
     };
 
-    let assigned = assigned_positions(&assigned);
+    let assigned = assigned_positions(&table, &assigned);
     // Like SQLite, only the CHECK constraints that read a changed column
     // run. They read the new row.
     let checks = if enforce_checks {
@@ -341,11 +344,15 @@ pub(super) fn emit_update(
             .filter(|constraint| {
                 let mut reads_changed = false;
                 constraint.expression.for_each(&mut |expression| {
-                    reads_changed |= matches!(
-                        expression,
-                        hir::Expr::Column(hir::ColumnRef { source, column })
-                            if *source == new_source.id && assigned.contains(column)
-                    );
+                    reads_changed |= match expression {
+                        hir::Expr::Column(hir::ColumnRef { source, column }) => {
+                            *source == new_source.id && assigned.contains(column)
+                        }
+                        hir::Expr::RowId(source) => {
+                            *source == new_source.id && rowid_value.is_some()
+                        }
+                        _ => false,
+                    };
                 });
                 reads_changed
             })
@@ -405,6 +412,7 @@ pub(super) fn emit_update(
         assigned: &assigned,
         changed_indexes: &changed_indexes,
         checks: &checks,
+        rowid_value,
         new_source: new_source.id,
         foreign_keys,
         returning,
@@ -417,6 +425,9 @@ pub(super) fn emit_update(
     // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
     let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
+    // Like legacy, an UPDATE that moves rows collects them first, so the
+    // loop never reaches a moved row again.
+    let moves_rows = rowid_value.is_some();
     match single_loop {
         None => emit_from_update(
             program,
@@ -428,7 +439,9 @@ pub(super) fn emit_update(
             row,
             done,
         )?,
-        Some((_, operation)) if triggers.is_empty() && !statement_replace && !where_subquery => {
+        Some((_, operation))
+            if triggers.is_empty() && !statement_replace && !where_subquery && !moves_rows =>
+        {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
         Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
@@ -517,6 +530,8 @@ struct UpdateRowLayout<'a> {
     changed_indexes: &'a [(&'a hir::IndexExpressions, &'a hir::IndexExpressions)],
     /// The CHECK constraints the new row must pass.
     checks: &'a [&'a hir::CheckConstraint],
+    /// The new rowid, when the UPDATE sets it.
+    rowid_value: Option<NewValue<'a>>,
     new_source: hir::SourceId,
     foreign_keys: &'a hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'a>>,
@@ -584,6 +599,7 @@ fn emit_scan_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -657,6 +673,7 @@ fn emit_rowset_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -760,6 +777,7 @@ fn emit_from_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -863,26 +881,52 @@ pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPla
 
 /// Whether a conflict of the new row may resolve with REPLACE: the
 /// statement's OR REPLACE, or ON CONFLICT REPLACE on an index.
-fn may_replace(update: &hir::Update, source: &hir::Source) -> bool {
+fn may_replace(
+    update: &hir::Update,
+    source: &hir::Source,
+    table: &crate::schema::BTreeTable,
+    sets_rowid: bool,
+) -> bool {
     match update.conflict {
         Some(conflict) => conflict == ResolveType::Replace,
-        None => source
-            .index_expressions
-            .iter()
-            .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace)),
+        None => {
+            (sets_rowid && table.rowid_alias_conflict_clause == Some(ResolveType::Replace))
+                || source
+                    .index_expressions
+                    .iter()
+                    .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+        }
     }
 }
 
-/// The table positions of `assigned`. The rowid has none; an UPDATE that
-/// sets it goes to legacy.
-fn assigned_positions(assigned: &[hir::TargetColumn]) -> Vec<usize> {
-    assigned
+/// Whether an assignment target is the rowid: `rowid` itself or the
+/// INTEGER PRIMARY KEY column.
+fn is_rowid_target(table: &crate::schema::BTreeTable, column: &hir::TargetColumn) -> bool {
+    match column {
+        hir::TargetColumn::RowId => true,
+        hir::TargetColumn::Column(column) => table
+            .columns()
+            .get(*column)
+            .is_some_and(Column::is_rowid_alias),
+    }
+}
+
+/// The table positions of `assigned`. Setting `rowid` sets the INTEGER
+/// PRIMARY KEY column, when the table has one.
+fn assigned_positions(
+    table: &crate::schema::BTreeTable,
+    assigned: &[hir::TargetColumn],
+) -> Vec<usize> {
+    let mut positions = assigned
         .iter()
         .filter_map(|column| match column {
             hir::TargetColumn::Column(column) => Some(*column),
-            hir::TargetColumn::RowId => None,
+            hir::TargetColumn::RowId => table.columns().iter().position(Column::is_rowid_alias),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
 }
 
 fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
@@ -929,6 +973,8 @@ struct UpdateRow<'a, 'b> {
     target: &'a DmlTarget<'b>,
     table_cursor: CursorID,
     rowid: usize,
+    /// The new rowid, when the UPDATE sets it.
+    new_rowid: Option<usize>,
     or_conflict: ResolveType,
     has_statement_conflict: bool,
     /// What NOT NULL ON CONFLICT REPLACE stores instead of a NULL.
@@ -951,6 +997,11 @@ struct NewIndexKey {
 impl UpdateRow<'_, '_> {
     fn start(&self) -> usize {
         self.rowid + 1
+    }
+
+    /// The rowid the row is written with.
+    fn written_rowid(&self) -> usize {
+        self.new_rowid.unwrap_or(self.rowid)
     }
 
     /// Rewrite the row the table cursor is on.
@@ -984,7 +1035,7 @@ impl UpdateRow<'_, '_> {
         self.emit_new_values(program, layout, !has_before)?;
         let new_row = TriggerRow {
             columns: self.start(),
-            rowid: self.rowid,
+            rowid: self.written_rowid(),
         };
         // The OLD row the triggers read, as a query would read it.
         let old_row = (!layout.triggers.is_empty())
@@ -1041,9 +1092,14 @@ impl UpdateRow<'_, '_> {
             layout.new_source,
             SourceBinding::Registers {
                 start: self.start(),
-                rowid: Some(self.rowid),
+                rowid: Some(self.written_rowid()),
             },
         );
+        // Like legacy, a new rowid is checked first, unless REPLACE resolves
+        // its conflict, which happens after the indexes are checked.
+        if self.new_rowid.is_some() && self.rowid_conflict() != ResolveType::Replace {
+            self.emit_rowid_check(program)?;
+        }
         // Like legacy, a STRICT type check and then CHECK constraints run
         // after NOT NULL and before any index is checked.
         if table.is_strict {
@@ -1064,6 +1120,11 @@ impl UpdateRow<'_, '_> {
         for ((old, new), cursor) in layout.changed_indexes.iter().zip(index_cursors) {
             new_keys.push(self.emit_new_index_key(program, layout, cursors, old, new, *cursor)?);
         }
+        if let Some(new_rowid) = self.new_rowid {
+            if self.rowid_conflict() == ResolveType::Replace {
+                self.emit_rowid_replace(program, layout, cursors, new_rowid)?;
+            }
+        }
         // Like legacy, foreign keys are checked after the other constraints
         // and before anything is rewritten.
         let pending_repairs = super::fkey::emit_update_checks(
@@ -1073,6 +1134,7 @@ impl UpdateRow<'_, '_> {
             source.id,
             layout.new_source,
             self.rowid,
+            self.written_rowid(),
             layout.assigned,
             self.target.database,
             layout.replaces,
@@ -1140,19 +1202,27 @@ impl UpdateRow<'_, '_> {
             ),
         });
         // MVCC keeps every version of a row, so the old one is deleted and
-        // the new one inserted.
-        if layout.mvcc {
+        // the new one inserted. A row with a new rowid moves the same way.
+        if layout.mvcc || self.new_rowid.is_some() {
             program.emit_insn(Insn::Delete {
                 cursor_id: self.table_cursor,
                 table_name: table.name.clone(),
                 is_part_of_update: true,
             });
         }
+        let flag = match self.new_rowid {
+            // The cursor is not on the new rowid's place in the table.
+            Some(_) => InsertFlags::new()
+                .require_seek()
+                .update_rowid_change()
+                .skip_last_rowid(),
+            None => InsertFlags::new().skip_last_rowid(),
+        };
         program.emit_insn(Insn::Insert {
             cursor: self.table_cursor,
-            key_reg: self.rowid,
+            key_reg: self.written_rowid(),
             record_reg: record,
-            flag: InsertFlags::new().skip_last_rowid(),
+            flag,
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
@@ -1181,6 +1251,19 @@ impl UpdateRow<'_, '_> {
     ) -> Result<()> {
         let table = self.target.table;
         let mut rows = RowValues::default();
+        if let (Some(value), Some(new_rowid)) = (layout.rowid_value, self.new_rowid) {
+            value.emit(
+                program,
+                self.target.document,
+                new_rowid,
+                &mut rows,
+                super::expr::translate_expr,
+            )?;
+            program.emit_insn(Insn::MustBeInt {
+                reg: new_rowid,
+                target_pc: None,
+            });
+        }
         for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate() {
             let register = self.start() + position;
             match value {
@@ -1351,7 +1434,7 @@ impl UpdateRow<'_, '_> {
                         .get(column.pos_in_table)
                         .is_some_and(Column::is_rowid_alias)
                     {
-                        self.rowid
+                        self.written_rowid()
                     } else {
                         self.start() + column.pos_in_table
                     };
@@ -1365,7 +1448,7 @@ impl UpdateRow<'_, '_> {
             };
         }
         program.emit_insn(Insn::Copy {
-            src_reg: self.rowid,
+            src_reg: self.written_rowid(),
             dst_reg: start + columns,
             extra_amount: 0,
         });
@@ -1416,6 +1499,110 @@ impl UpdateRow<'_, '_> {
             old_in_index,
             new_in_index,
         })
+    }
+
+    /// How a conflict on the new rowid resolves.
+    fn rowid_conflict(&self) -> ResolveType {
+        if self.has_statement_conflict {
+            self.or_conflict
+        } else {
+            self.target
+                .table
+                .rowid_alias_conflict_clause
+                .unwrap_or(ResolveType::Abort)
+        }
+    }
+
+    /// A new rowid must not belong to another row. Like legacy, this runs
+    /// before the indexes are checked; then the cursor goes back to the row.
+    fn emit_rowid_check(&self, program: &mut ProgramBuilder) -> Result<()> {
+        let new_rowid = self.new_rowid.expect("the UPDATE sets the rowid");
+        let free = program.allocate_label();
+        program.emit_insn(Insn::Eq {
+            lhs: new_rowid,
+            rhs: self.rowid,
+            target_pc: free,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: new_rowid,
+            target_pc: free,
+        });
+        match self.rowid_conflict() {
+            ResolveType::Ignore => program.emit_insn(Insn::Goto {
+                target_pc: self.skip_row,
+            }),
+            conflict => {
+                let table = self.target.table;
+                let column = table
+                    .columns()
+                    .iter()
+                    .find(|column| column.is_rowid_alias())
+                    .and_then(|column| column.name.as_deref())
+                    .unwrap_or("rowid");
+                let (description, on_error) = halt_desc_and_on_error(
+                    &format!("{}.{column}", table.name),
+                    conflict,
+                    self.has_statement_conflict,
+                );
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description,
+                    on_error,
+                    description_reg: None,
+                });
+            }
+        }
+        program.preassign_label_to_next_insn(free);
+        // NotExists moved the cursor.
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: self.rowid,
+            target_pc: self.skip_row,
+        });
+        Ok(())
+    }
+
+    /// REPLACE on a new rowid: like legacy, after the indexes are checked,
+    /// delete the row that has it, then go back to this row.
+    fn emit_rowid_replace(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        cursors: &IndexCursors<'_>,
+        new_rowid: usize,
+    ) -> Result<()> {
+        let free = program.allocate_label();
+        program.emit_insn(Insn::Eq {
+            lhs: new_rowid,
+            rhs: self.rowid,
+            target_pc: free,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: new_rowid,
+            target_pc: free,
+        });
+        super::dml::emit_replace_delete(
+            program,
+            self.target,
+            self.table_cursor,
+            &cursors.all,
+            layout.foreign_keys,
+            new_rowid,
+            Some(layout.new_source),
+        )?;
+        program.preassign_label_to_next_insn(free);
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: self.rowid,
+            target_pc: self.skip_row,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1679,10 +1866,42 @@ mod tests {
     }
 
     #[test]
-    fn update_that_needs_legacy_is_left_to_it() {
+    fn update_of_the_rowid_moves_the_row() {
         for sql in [
             "UPDATE items SET id = id + 1",
             "UPDATE items SET rowid = 5 WHERE id = 1",
+        ] {
+            let program = emit(sql);
+            // The rows are collected first, and the row is deleted and
+            // inserted again under its new rowid.
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+                1,
+                "{sql}"
+            );
+            assert_eq!(
+                count(&program, |insn| matches!(
+                    insn,
+                    Insn::Delete {
+                        is_part_of_update: true,
+                        ..
+                    }
+                )),
+                1,
+                "{sql}"
+            );
+            // The index entry holds the rowid, so it changes too.
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::IdxInsert { .. })),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_that_needs_legacy_is_left_to_it() {
+        for sql in [
             "UPDATE OR REPLACE items SET value = 1",
             // The loop reads the index whose key changes.
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",

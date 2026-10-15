@@ -1155,6 +1155,7 @@ impl InsertRow<'_> {
             source.id,
             new_source.id,
             conflict,
+            conflict,
             &assigned_positions,
             database,
             false,

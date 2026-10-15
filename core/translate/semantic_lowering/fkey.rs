@@ -50,14 +50,14 @@ pub(super) fn update_needs_legacy(foreign_keys: &hir::DmlForeignKeys, assigned: 
     })
 }
 
-/// HIR never lowers an UPDATE that changes the rowid, so a rowid parent key
-/// never changes.
+/// Whether an UPDATE that sets the columns at `assigned` may change the
+/// parent key. A rowid parent key is the INTEGER PRIMARY KEY column, which
+/// `assigned` lists when the UPDATE sets the rowid.
 fn parent_key_may_change(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
-    !foreign_key.parent_uses_rowid
-        && foreign_key
-            .parent_positions
-            .iter()
-            .any(|position| assigned.contains(position))
+    foreign_key
+        .parent_positions
+        .iter()
+        .any(|position| assigned.contains(position))
 }
 
 fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
@@ -396,6 +396,9 @@ pub(super) fn emit_insert_parent_repairs(
 /// deferred violation if its parent was missing, and a new key without a
 /// parent adds one.
 ///
+/// `rowid` holds the row's rowid in the table and `new_rowid` the one it is
+/// written with.
+///
 /// When the UPDATE may REPLACE (`replaces`), another row may still hold the
 /// new parent key until the write, so the repairs of the new key are
 /// returned to be emitted after it with [`emit_update_repairs`].
@@ -407,6 +410,7 @@ pub(super) fn emit_update_checks<'a>(
     old: SourceId,
     new: SourceId,
     rowid: usize,
+    new_rowid: usize,
     assigned: &[usize],
     database: usize,
     replaces: bool,
@@ -549,10 +553,11 @@ pub(super) fn emit_update_checks<'a>(
                 reg: parent_rowid,
                 target_pc: Some(missing),
             });
+            // The row may be its own parent, under its new rowid.
             if self_reference {
                 program.emit_insn(Insn::Eq {
                     lhs: parent_rowid,
-                    rhs: rowid,
+                    rhs: new_rowid,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
                     collation: None,

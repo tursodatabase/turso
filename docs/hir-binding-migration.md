@@ -225,13 +225,17 @@ registers, so new index keys, partial-index WHERE terms and RETURNING read the
 new values. Like legacy, an UPDATE whose WHERE clause has a subquery first
 collects the rowids it changes, so the subquery never sees a changed row; a
 subquery in SET runs as the loop reaches each row, and the row of
-`SET (a, b) = (SELECT ...)` is computed once per row. These still go to legacy:
+`SET (a, b) = (SELECT ...)` is computed once per row. An UPDATE that sets the rowid
+collects its rows first, checks that no other row has the new rowid (REPLACE
+deletes that row after the indexes are checked), rewrites every index entry,
+since each holds the rowid, and deletes and inserts the row under its new
+rowid. These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
-| A changed rowid, or a changed key of the index the loop reads | The same |
+| A changed key of the index the loop reads, a changed rowid with UPDATE ... FROM | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | Custom types, array columns, generated columns | Encoding, computed columns |
 

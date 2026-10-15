@@ -272,6 +272,46 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET d = (SELECT max(x.d) FROM u AS x WHERE x.a < u.a)"],
         &["UPDATE u SET d = (SELECT sum(x.d) FROM u AS x WHERE x.a <= u.a) WHERE a > 2"],
         &["UPDATE u SET b = (SELECT max(b) FROM u) + a"],
+        // A new rowid moves the row: every index entry changes, a taken rowid
+        // conflicts, and the rows are collected first.
+        &[
+            "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d CHECK (d IS NOT 'bad'))",
+            "CREATE INDEX u_c ON u(c)",
+            "CREATE TABLE n(x, y)",
+            "CREATE TABLE log(o, nw)",
+            "INSERT INTO u VALUES (1, 1, 'x', 1), (2, 2, 'y', 2), (3, 3, 'z', 3), (5, 5, 'p', 5)",
+            "INSERT INTO n(rowid, x, y) VALUES (1, 'a', 1), (2, 'b', 2)",
+            "UPDATE u SET a = a + 10",
+            "SELECT * FROM u ORDER BY a",
+            "UPDATE u SET a = 12 WHERE a = 11",
+            "UPDATE OR IGNORE u SET a = 12 WHERE a = 11",
+            "UPDATE OR REPLACE u SET a = 12 WHERE a = 11",
+            "SELECT * FROM u ORDER BY a",
+            "SELECT c, a FROM u INDEXED BY u_c ORDER BY c",
+            "UPDATE u SET rowid = 100, c = 'q' WHERE b = 3",
+            "UPDATE u SET a = a WHERE b = 5",
+            "UPDATE u SET a = NULL WHERE b = 5",
+            "UPDATE u SET a = 'abc' WHERE b = 5",
+            "UPDATE u SET a = '7' WHERE b = 5",
+            "SELECT * FROM u ORDER BY a",
+            "UPDATE n SET rowid = rowid + 1",
+            "SELECT rowid, * FROM n ORDER BY rowid",
+            "UPDATE n SET rowid = 3 WHERE x = 'a'",
+            "CREATE TRIGGER t AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (old.a, new.a); END",
+            "CREATE TRIGGER tb BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (old.rowid, new.rowid); END",
+            "UPDATE u SET a = a * 2 WHERE a < 50 RETURNING a, b, rowid",
+            "SELECT * FROM log",
+            "UPDATE u SET (a, c) = (SELECT 300, 'row') WHERE a = 200",
+            "UPDATE u SET a = 7, d = 'bad' WHERE a = 300",
+            "UPDATE OR IGNORE u SET a = a + 1, d = 'bad'",
+            "SELECT * FROM u ORDER BY a",
+            "PRAGMA integrity_check",
+        ],
+        // The rightmost of two assignments to the rowid wins.
+        &[
+            "UPDATE u SET a = 1, rowid = 20 WHERE a = 2",
+            "UPDATE u SET rowid = 7, a = 8 WHERE a = 20",
+        ],
         // Statements that still go through legacy.
         &[
             "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
@@ -704,6 +744,30 @@ const FK_SETUP: &[&str] = &[
 fn hir_foreign_keys_match_legacy() {
     for statements in [
         &["DELETE FROM p WHERE id = 5"][..],
+        // A new rowid changes a rowid parent key; a row may be its own parent
+        // under its new rowid.
+        &[
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, k)",
+            "CREATE TABLE c(x REFERENCES p(id))",
+            "CREATE TABLE s(id INTEGER PRIMARY KEY, up REFERENCES s(id))",
+            "CREATE TABLE d(x REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO c VALUES (1)",
+            "INSERT INTO s VALUES (1, NULL), (2, 1)",
+            "UPDATE p SET id = 10 WHERE id = 1",
+            "UPDATE p SET id = 20 WHERE id = 2",
+            "UPDATE p SET rowid = 30 WHERE id = 3",
+            "SELECT * FROM p ORDER BY id",
+            "UPDATE s SET id = 5 WHERE id = 1",
+            "UPDATE s SET id = 6, up = 6 WHERE id = 2",
+            "SELECT * FROM s ORDER BY id",
+            "BEGIN",
+            "INSERT INTO d VALUES (40)",
+            "UPDATE p SET id = 40 WHERE id = 20",
+            "COMMIT",
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM d",
+        ],
         // A child found by scanning `c`, and one found through `c_y`.
         &["DELETE FROM p WHERE id = 1"],
         &["DELETE FROM p WHERE id = 2"],
