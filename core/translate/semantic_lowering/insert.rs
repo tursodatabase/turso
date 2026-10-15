@@ -9,7 +9,7 @@
 
 use std::num::NonZeroUsize;
 
-use turso_parser::ast::{self, ResolveType, TriggerTime};
+use turso_parser::ast::{ResolveType, TriggerTime};
 
 use super::emit::{
     any_effective_replace, constraint_may_abort, format_unique_violation_desc,
@@ -44,26 +44,19 @@ pub(super) fn needs_legacy(
     plan: &HirPlan,
     insert: &hir::Insert,
     program: &ProgramBuilder,
+    mvcc: bool,
 ) -> Result<bool> {
     let document = &plan.document;
-    let defaults = match &insert.target_kind {
-        hir::InsertTargetKind::BTree {
-            autoincrement,
-            defaults,
-            ..
-        } => {
+    match &insert.target_kind {
+        hir::InsertTargetKind::BTree { autoincrement, .. } => {
             // AUTOINCREMENT under MVCC uses a hidden sequence, not lowered
-            // yet.
-            let mvcc_autoincrement = autoincrement.as_ref().is_some_and(|autoincrement| {
-                autoincrement.mvcc_sequence.is_some() || program.is_mvcc_enabled()
-            });
-            if mvcc_autoincrement {
+            // yet. Like legacy, outside MVCC that sequence is not used.
+            if mvcc && autoincrement.is_some() {
                 return Ok(true);
             }
-            defaults
         }
         hir::InsertTargetKind::Virtual => return Ok(true),
-    };
+    }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
     }
@@ -100,14 +93,7 @@ pub(super) fn needs_legacy(
             return Ok(true);
         }
     }
-    // A DEFAULT on an INTEGER PRIMARY KEY makes the rowid come from it.
-    Ok(defaults.iter().any(|default| {
-        table
-            .columns()
-            .get(default.column)
-            .is_some_and(Column::is_rowid_alias)
-            && !matches!(default.value, hir::Expr::Literal(ast::Literal::Null))
-    }))
+    Ok(false)
 }
 
 /// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
@@ -2057,6 +2043,14 @@ mod tests {
     }
 
     #[test]
+    fn autoincrement_needs_legacy_only_under_mvcc() {
+        let plan = analyze_plan(schema(), "INSERT INTO counted(b) VALUES (1)");
+        let insert = insert_root(&plan).unwrap();
+        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
+        assert!(needs_legacy(&plan, insert, &program(), true).unwrap());
+    }
+
+    #[test]
     fn insert_that_fires_foreign_key_actions_goes_through_hir() {
         let schema = || {
             let mut schema = schema();
@@ -2082,7 +2076,10 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            assert!(
+                !needs_legacy(&plan, insert, &program(), false).unwrap(),
+                "{sql}"
+            );
         }
     }
 
@@ -2090,7 +2087,10 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
+        assert!(
+            !needs_legacy(&plan, insert, &program, false).unwrap(),
+            "{sql}"
+        );
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),

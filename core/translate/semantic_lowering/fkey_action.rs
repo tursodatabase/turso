@@ -174,16 +174,14 @@ fn compile_action<'a>(
         }
         (hir::HirRoot::Update(_), HirRootPlan::Update(_)) => {
             let (update, access) = super::update::update_root(&plan)?;
-            if super::update::needs_legacy(&plan, update, access, &builder)? {
+            let mvcc = super::uses_mvcc(connection, &plan.document, update.target);
+            if super::update::needs_legacy(&plan, update, access, &builder, mvcc)? {
                 return Ok(None);
             }
             let Some(subprograms) = Subprograms::for_update(session, &builder, &plan, update)?
             else {
                 return Ok(None);
             };
-            let mvcc = connection
-                .mv_store_for_db(database_index(foreign_key)?)
-                .is_some();
             builder.prologue();
             builder.set_hir_plan(plan.clone());
             super::update::emit_update(

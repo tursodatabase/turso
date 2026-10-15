@@ -47,6 +47,7 @@ pub(super) fn needs_legacy(
     update: &hir::Update,
     access: &HirAccessPlan,
     program: &ProgramBuilder,
+    mvcc: bool,
 ) -> Result<bool> {
     let document = &plan.document;
     if !update.order_by.is_empty()
@@ -90,8 +91,7 @@ pub(super) fn needs_legacy(
     // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
     // hidden sequence, which is not lowered yet either.
     if sets_rowid > 1
-        || (sets_rowid == 1
-            && (update.from.is_some() || (table.has_autoincrement && program.is_mvcc_enabled())))
+        || (sets_rowid == 1 && (update.from.is_some() || (table.has_autoincrement && mvcc)))
     {
         return Ok(true);
     }
@@ -1903,7 +1903,7 @@ mod tests {
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
         assert!(
-            !needs_legacy(&plan, update, access, &program).unwrap(),
+            !needs_legacy(&plan, update, access, &program, false).unwrap(),
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
@@ -2077,7 +2077,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
             assert!(
-                !needs_legacy(&plan, update, access, &program()).unwrap(),
+                !needs_legacy(&plan, update, access, &program(), false).unwrap(),
                 "{sql}"
             );
         }
@@ -2093,7 +2093,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
             assert!(
-                needs_legacy(&plan, update, access, &program()).unwrap(),
+                needs_legacy(&plan, update, access, &program(), false).unwrap(),
                 "{sql}"
             );
         }

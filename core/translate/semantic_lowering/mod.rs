@@ -119,17 +119,13 @@ pub(crate) fn translate_update(
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
-    if update::needs_legacy(&plan, update, access, program)? {
+    let mvcc = uses_mvcc(connection, &plan.document, update.target);
+    if update::needs_legacy(&plan, update, access, program, mvcc)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
         return Ok(false);
     };
-    let mvcc = plan
-        .document
-        .source(update.target)
-        .and_then(|source| source.database)
-        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
     program.set_hir_plan(plan.clone());
     update::emit_update(
         program,
@@ -168,7 +164,8 @@ pub(crate) fn translate_insert(
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
-    if insert::needs_legacy(&plan, insert, program)? {
+    let mvcc = uses_mvcc(connection, &plan.document, insert.target);
+    if insert::needs_legacy(&plan, insert, program, mvcc)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
@@ -193,6 +190,18 @@ pub(crate) fn translate_insert(
 /// before it looks the table up. A protected system table or a materialized
 /// view cannot be written. A table that materialized views read still needs
 /// legacy, which keeps the views up to date.
+/// Whether the database of `target` keeps its rows in MVCC.
+pub(super) fn uses_mvcc(
+    connection: &Connection,
+    document: &HirDocument,
+    target: hir::SourceId,
+) -> bool {
+    document
+        .source(target)
+        .and_then(|source| source.database)
+        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some())
+}
+
 fn target_needs_legacy(
     schema: &Schema,
     connection: &Connection,

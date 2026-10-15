@@ -1415,6 +1415,34 @@ fn hir_upsert_moving_rows_match_sqlite() {
     }
 }
 
+/// Like SQLite, a DEFAULT on an INTEGER PRIMARY KEY is never used: a row
+/// that does not give the rowid gets a new one. Legacy uses the DEFAULT for
+/// DEFAULT VALUES.
+#[test]
+fn hir_rowid_default_matches_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE d1(id INTEGER PRIMARY KEY DEFAULT 5, v)",
+        "INSERT INTO d1(v) VALUES (1), (2)",
+        "INSERT INTO d1 DEFAULT VALUES",
+        "INSERT INTO d1 DEFAULT VALUES RETURNING id",
+        "INSERT INTO d1(v) SELECT 3",
+        "SELECT * FROM d1 ORDER BY id",
+        "CREATE TABLE d2(id INTEGER PRIMARY KEY AUTOINCREMENT DEFAULT 10, v)",
+        "INSERT INTO d2 DEFAULT VALUES",
+        "SELECT * FROM d2",
+        "SELECT * FROM sqlite_sequence",
+        "CREATE TABLE d3(id INTEGER PRIMARY KEY DEFAULT 'x', v)",
+        "INSERT INTO d3 DEFAULT VALUES",
+        "SELECT * FROM d3",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
 /// Legacy rejects it.
 #[test]

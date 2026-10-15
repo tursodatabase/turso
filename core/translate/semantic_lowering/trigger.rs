@@ -142,14 +142,16 @@ fn compile_trigger(
                 Some(Subprograms::default())
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                if super::insert::needs_legacy(&plan, insert, &builder)? {
+                let mvcc = super::uses_mvcc(connection, &plan.document, insert.target);
+                if super::insert::needs_legacy(&plan, insert, &builder, mvcc)? {
                     None
                 } else {
                     Subprograms::for_insert(session, &builder, &plan, insert)?
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                if super::update::needs_legacy(&plan, update, access, &builder)? {
+                let mvcc = super::uses_mvcc(connection, &plan.document, update.target);
+                if super::update::needs_legacy(&plan, update, access, &builder, mvcc)? {
                     None
                 } else {
                     Subprograms::for_update(session, &builder, &plan, update)?
@@ -238,11 +240,7 @@ fn compile_trigger(
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                let mvcc = plan
-                    .document
-                    .source(update.target)
-                    .and_then(|source| source.database)
-                    .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
+                let mvcc = super::uses_mvcc(connection, &plan.document, update.target);
                 super::update::emit_update(
                     &mut builder,
                     &plan,

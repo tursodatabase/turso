@@ -253,7 +253,7 @@ inserted. These still go to legacy:
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
-| AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
+| AUTOINCREMENT under MVCC | The hidden MVCC sequence |
 | WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
@@ -282,6 +282,13 @@ rowid, and is stored at once; a rowid from the statement raises the stored
 value before any constraint is checked, even if the row is then skipped;
 after the row and its triggers the stored value is raised to the row's
 rowid. An INSERT of several rows first adds the target's row with 0.
+Every AUTOINCREMENT table also has a hidden sequence for MVCC; like legacy,
+it is used only when the target's database runs MVCC, which still goes to
+legacy.
+
+Like SQLite, a DEFAULT on an INTEGER PRIMARY KEY is never used: a row that
+does not give the rowid gets a new one (legacy uses the DEFAULT for DEFAULT
+VALUES).
 
 A subquery in RETURNING whose own FROM clause names the target table runs
 again for each row, as in SQLite and legacy, so it sees the rows written so
