@@ -4,18 +4,19 @@ use crate::alloc::*;
 use turso_parser::ast::{self, SortOrder};
 
 use crate::{
-    Result, emit_explain,
+    emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
-        collate::{CollationSeq, get_collseq_from_expr_with_symbols},
+        collate::{get_collseq_from_expr_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
     },
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn, SorterOpenData, to_u32},
+        insn::{to_u32, IdxInsertFlags, Insn, SorterOpenData},
     },
+    Result,
 };
 
 use super::{

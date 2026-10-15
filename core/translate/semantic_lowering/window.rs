@@ -3446,8 +3446,8 @@ mod tests {
             "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-            .expect("window buffer plans");
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let check = window_frame_order_check(hir_window_frame_shape(&plan.window.frame), offsets)
@@ -3518,9 +3518,8 @@ mod tests {
             (offsets, program)
         }
 
-        let (offsets, program) = delay(
-            "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
-        );
+        let (offsets, program) =
+            delay("SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items");
         let WindowFrameOffsets::Both { start, end } = offsets else {
             panic!("bounded following frame has both offsets");
         };
@@ -3539,9 +3538,8 @@ mod tests {
         );
         assert!(range.insns.is_empty());
 
-        let (_, preceding) = delay(
-            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM items",
-        );
+        let (_, preceding) =
+            delay("SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM items");
         assert!(preceding.insns.is_empty());
     }
 
@@ -3647,8 +3645,8 @@ mod tests {
              ) FROM items",
         );
         let (query, block) = root_query(&document);
-        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
-            .expect("window buffer plans");
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
         let mut program = program();
         let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
         let WindowFrameOffsets::Both { start, end } = offsets else {

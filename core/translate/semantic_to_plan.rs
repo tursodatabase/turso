@@ -1167,10 +1167,7 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
-    fn grouping_target<'term>(
-        &self,
-        block: &'term hir::QueryBlock,
-    ) -> Option<HirOrderTarget<'term>>
+    fn grouping_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
     where
         'a: 'term,
     {
