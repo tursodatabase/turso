@@ -724,6 +724,131 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
     }
 }
 
+/// Regression for #9504: after switching an existing database with an
+/// AUTOINCREMENT table to MVCC, the sequence must continue instead of reusing
+/// id 1 and replacing that row, both right after the switch and after a reopen.
+/// Reopening without writes must not write to the log.
+#[test]
+fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    let posts = |conn: &Arc<turso_core::Connection>| -> Vec<(i64, String)> {
+        conn.exec_rows("SELECT id, title FROM posts ORDER BY id")
+    };
+    let row = |id: i64, title: &str| (id, title.to_string());
+
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
+            .unwrap();
+    }
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+        let other_conn = db.connect().unwrap();
+        other_conn
+            .execute("INSERT INTO posts (title) VALUES ('c')")
+            .unwrap();
+        assert_eq!(
+            posts(&other_conn),
+            vec![row(1, "a"), row(2, "b"), row(3, "c")]
+        );
+    }
+    let log_path = tmp_dir.path().join("test.db-log");
+    let log_size = || std::fs::metadata(&log_path).unwrap().len();
+    let log_size_before_reopen = log_size();
+    for _ in 0..2 {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        assert_eq!(posts(&conn).len(), 3);
+    }
+    assert_eq!(log_size(), log_size_before_reopen);
+    {
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            db_path.to_str().unwrap(),
+            OpenFlags::ReadOnly,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .expect("a read-only open must not need to write");
+        let conn = db.connect().unwrap();
+        assert_eq!(posts(&conn).len(), 3);
+    }
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('d')")
+            .unwrap();
+        assert_eq!(
+            posts(&conn),
+            vec![row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]
+        );
+        let sequence: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(sequence, vec![("posts".to_string(), 4)]);
+    }
+}
+
+/// A database switched to MVCC by a build that did not sync the
+/// AUTOINCREMENT watermarks gets them synced and committed on the next open.
+#[test]
+fn test_autoincrement_watermark_is_committed_when_opening_mvcc_database() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    mark_header_as_mvcc(&db_path);
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect().unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM posts");
+        assert_eq!(rows, vec![(2,)]);
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect().unwrap();
+    conn.execute("INSERT INTO posts (title) VALUES ('c')")
+        .unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ]
+    );
+}
+
+/// Set the header's read and write versions to 255 (MVCC), as a build that
+/// switched to MVCC without syncing the AUTOINCREMENT watermarks left them.
+/// With the `checksum` feature, page 1 ends in an 8-byte checksum of the rest
+/// of the page, so it is written again for the changed header.
+fn mark_header_as_mvcc(db_path: &Path) {
+    let mut bytes = std::fs::read(db_path).unwrap();
+    bytes[18] = 255;
+    bytes[19] = 255;
+    #[cfg(feature = "checksum")]
+    {
+        const PAGE_SIZE: usize = 4096;
+        const CHECKSUM_SIZE: usize = 8;
+        let checksum = twox_hash::XxHash3_64::oneshot(&bytes[..PAGE_SIZE - CHECKSUM_SIZE]);
+        bytes[PAGE_SIZE - CHECKSUM_SIZE..PAGE_SIZE].copy_from_slice(&checksum.to_le_bytes());
+    }
+    std::fs::write(db_path, bytes).unwrap();
+}
+
 /// Switching to MVCC inside a transaction is refused, as in SQLite. Before,
 /// the switch ran, and after COMMIT or ROLLBACK the database could not be
 /// opened again ("Missing MVCC metadata table while logical log state exists").
