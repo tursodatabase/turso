@@ -307,6 +307,17 @@ pub struct AddColumnData {
     pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
+/// Data for AlterColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AlterColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column_index: usize,
+    pub definition: turso_parser::ast::ColumnDefinition,
+    pub rename: bool,
+    pub rewritten_triggers: Vec<(usize, String, String)>,
+}
+
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct IntegrityCkData {
@@ -1904,11 +1915,7 @@ pub enum Insn {
         data: Box<AddColumnData>,
     },
     AlterColumn {
-        db: usize,
-        table: String,
-        column_index: usize,
-        definition: Box<turso_parser::ast::ColumnDefinition>,
-        rename: bool,
+        data: Box<AlterColumnData>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and

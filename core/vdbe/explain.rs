@@ -2467,14 +2467,17 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({}, {:?})", data.table, data.column),
             ),
-            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
+            Insn::AlterColumn { data } => (
                 "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
+                format!(
+                    "alter_column({}, {}, {:?}, {:?})",
+                    data.table, data.column_index, data.definition, data.rename
+                ),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
