@@ -7,6 +7,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
+        aggregation::numeric_aggregate_arg,
         collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
         group_by::is_orderby_agg_or_const,
         plan::Aggregate,
@@ -45,11 +46,16 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 /// returns the SortComparatorType if the type has a `<` operator with a known
 /// comparator. Returns None otherwise, which causes the sorter to use encoded
 /// blob ordering instead of silently wrong results.
+///
+/// MIN, MAX, SUM and AVG of a `numeric` column sort with the column's comparator.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
 ) -> Option<SortComparatorType> {
+    if let Some(arg) = numeric_aggregate_arg(expr, referenced_tables, schema) {
+        return custom_type_comparator(arg, referenced_tables, schema);
+    }
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
