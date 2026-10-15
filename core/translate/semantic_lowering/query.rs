@@ -1207,9 +1207,10 @@ fn hir_group_key_orders(
         }
         (expression, term.order, term.nulls)
     });
-    if terms.clone().all(|(expression, ..)| {
-        is_hir_aggregate_call(expression) || is_hir_constant(expression)
-    }) {
+    if terms
+        .clone()
+        .all(|(expression, ..)| is_hir_aggregate_call(expression) || is_hir_constant(expression))
+    {
         return vec![(first.order, first.nulls); grouping.keys.len()];
     }
     grouping
