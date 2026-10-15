@@ -228,13 +228,14 @@ subquery in SET runs as the loop reaches each row, and the row of
 collects its rows first, checks that no other row has the new rowid (REPLACE
 deletes that row after the indexes are checked), rewrites every index entry,
 since each holds the rowid, and deletes and inserts the row under its new
-rowid. These still go to legacy:
+rowid. UPDATE ... FROM stores the new rowid in its scratch table with the
+other new values. These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
-| A changed key of the index the loop reads, a changed rowid with UPDATE ... FROM | The same |
+| A changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | Custom types, array columns | Encoding |
 

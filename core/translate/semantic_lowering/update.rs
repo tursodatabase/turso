@@ -87,12 +87,10 @@ pub(super) fn needs_legacy(
         .count();
     let replaces = may_replace(update, source, &table, sets_rowid > 0);
     // Changing the rowid moves the row; legacy collects the rows first.
-    // Setting the rowid twice, or with UPDATE ... FROM, is not lowered yet.
-    // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
-    // hidden sequence, which is not lowered yet either.
-    if sets_rowid > 1
-        || (sets_rowid == 1 && (update.from.is_some() || (table.has_autoincrement && mvcc)))
-    {
+    // Setting the rowid twice is not lowered yet. Under MVCC, a new rowid
+    // of an AUTOINCREMENT table also advances its hidden sequence, which is
+    // not lowered yet either.
+    if sets_rowid > 1 || (sets_rowid == 1 && table.has_autoincrement && mvcc) {
         return Ok(true);
     }
     if update.from.is_some() {
@@ -359,7 +357,8 @@ pub(super) fn emit_update(
         Vec::new()
     };
     // UPDATE ... FROM computes the assigned values during the join, into a
-    // scratch table with one column per assignment.
+    // scratch table with one column per assigned column, then one for the
+    // new rowid when the UPDATE sets it.
     let scratch_columns = values
         .iter()
         .scan(0, |next, value| {
@@ -373,7 +372,8 @@ pub(super) fn emit_update(
         .from
         .as_ref()
         .map(|_| -> Result<CursorID> {
-            let width = scratch_columns.iter().flatten().count();
+            let width =
+                scratch_columns.iter().flatten().count() + usize::from(rowid_value.is_some());
             let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
                 0,
                 "update_from_scratch".to_string(),
@@ -722,7 +722,7 @@ fn emit_from_update(
     let (scratch, columns) = layout.scratch.ok_or_else(|| {
         LimboError::InternalError("HIR UPDATE ... FROM has no scratch table".into())
     })?;
-    let width = columns.iter().flatten().count();
+    let width = columns.iter().flatten().count() + usize::from(layout.rowid_value.is_some());
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: scratch,
         is_table: true,
@@ -731,6 +731,7 @@ fn emit_from_update(
         .values
         .iter()
         .filter_map(|value| *value)
+        .chain(layout.rowid_value)
         .collect::<Vec<_>>();
     let write = |program: &mut ProgramBuilder, _next: BranchOffset| -> Result<()> {
         let start = program.alloc_registers(width.max(1));
@@ -1390,13 +1391,23 @@ impl UpdateRow<'_, '_> {
         let table = self.target.table;
         let mut rows = RowValues::default();
         if let (Some(value), Some(new_rowid)) = (layout.rowid_value, self.new_rowid) {
-            value.emit(
-                program,
-                self.target.document,
-                new_rowid,
-                &mut rows,
-                super::expr::translate_expr,
-            )?;
+            match layout.scratch {
+                // UPDATE ... FROM computed it during the join, after the
+                // assigned columns.
+                Some((cursor, columns)) => program.emit_insn(Insn::Column {
+                    cursor_id: cursor,
+                    column: columns.iter().flatten().count(),
+                    dest: new_rowid,
+                    default: None,
+                }),
+                None => value.emit(
+                    program,
+                    self.target.document,
+                    new_rowid,
+                    &mut rows,
+                    super::expr::translate_expr,
+                )?,
+            }
             program.emit_insn(Insn::MustBeInt {
                 reg: new_rowid,
                 target_pc: None,
@@ -2051,6 +2062,41 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn update_from_that_sets_the_rowid_reads_it_from_the_scratch_table() {
+        let program = emit("UPDATE items SET id = o.id + 10 FROM items AS o WHERE o.id = items.id");
+        let scratch = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => Some(*cursor_id),
+                _ => None,
+            })
+            .unwrap();
+        // The join stores the new rowid; the row is then moved with it.
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let read = position(
+            &|insn| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == scratch),
+        );
+        assert!(read < position(&|insn| matches!(insn, Insn::MustBeInt { .. })));
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::Delete {
+                    is_part_of_update: true,
+                    ..
+                }
+            )),
+            1
+        );
     }
 
     #[test]

@@ -1424,6 +1424,41 @@ fn hir_upsert_moving_rows_match_sqlite() {
     }
 }
 
+/// UPDATE ... FROM that sets the rowid moves each joined row, with its
+/// index entries, as SQLite does.
+#[test]
+fn hir_update_from_moving_rows_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v, w UNIQUE)",
+        "CREATE INDEX tv ON t(v)",
+        "CREATE TABLE m(old, new, tag)",
+        "INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+        "INSERT INTO m VALUES (1, 100, 'x'), (2, 200, 'y')",
+        "UPDATE t SET id = m.new, v = v || m.tag FROM m WHERE m.old = t.id RETURNING id, v, w",
+        "SELECT id, v FROM t INDEXED BY tv ORDER BY v",
+        "UPDATE t SET rowid = m.old FROM m WHERE m.new = t.id",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET id = 3 FROM m WHERE m.old = t.id AND m.tag = 'x'",
+        "UPDATE OR REPLACE t SET id = 3 FROM m WHERE m.old = t.id AND m.tag = 'x'",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET (id, v) = (SELECT m.new + 1, m.tag) FROM m WHERE m.old = t.id",
+        "UPDATE t SET id = 'abc' FROM m WHERE m.new + 1 = t.id",
+        "SELECT * FROM t ORDER BY id",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (old.id || '->' || new.id); END",
+        "UPDATE t SET id = id + 1000 FROM (SELECT 1 AS k) WHERE k = 1",
+        "SELECT * FROM t ORDER BY id",
+        "SELECT * FROM log ORDER BY m",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// Like SQLite, a DEFAULT on an INTEGER PRIMARY KEY is never used: a row
 /// that does not give the rowid gets a new one. Legacy uses the DEFAULT for
 /// DEFAULT VALUES.
