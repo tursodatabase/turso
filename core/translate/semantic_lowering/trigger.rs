@@ -165,7 +165,7 @@ fn compile_trigger(
                 }
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                if super::delete::needs_legacy(delete, access, &builder)? {
+                if super::delete::needs_legacy(&plan.document, delete, access, &builder)? {
                     true
                 } else {
                     match delete_triggers(session, &builder, &plan, delete)? {

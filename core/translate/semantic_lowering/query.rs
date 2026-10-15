@@ -716,7 +716,7 @@ pub(crate) fn prepare_subquery(
     Ok(PreparedSubquery {
         query: query_id,
         destination: prepared.destination,
-        correlated: document.reads_outer_sources(query_id),
+        correlated: document.reads_outer_sources(query_id) || program.reruns_subquery(query_id),
     })
 }
 

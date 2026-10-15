@@ -32,7 +32,7 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
-use super::dml::{has_subquery, DmlTarget, ReturningBuffer};
+use super::dml::{DmlTarget, ReturningBuffer};
 use super::trigger::{CompiledTrigger, TriggerRow};
 
 /// Whether this INSERT uses something the HIR lowering does not handle yet.
@@ -44,16 +44,6 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    // Like SQLite, legacy runs a RETURNING subquery again for each row;
-    // HIR runs an uncorrelated one only once.
-    if insert.returning.as_ref().is_some_and(|returning| {
-        returning
-            .outputs
-            .iter()
-            .any(|output| has_subquery(&output.expr))
-    }) {
-        return Ok(true);
-    }
     // Like legacy, OR IGNORE drops the UPSERT clauses.
     if !insert.upserts.is_empty() && insert.conflict == Some(ResolveType::Ignore) {
         return Ok(true);
@@ -369,13 +359,7 @@ fn subquery_reads_table(
     let mut reads = false;
     expression.for_each(&mut |expression| {
         if let hir::Expr::Subquery(subquery) = expression {
-            let query = match subquery {
-                hir::SubqueryExpr::Scalar { query, .. }
-                | hir::SubqueryExpr::Row { query }
-                | hir::SubqueryExpr::Exists(query)
-                | hir::SubqueryExpr::In { query, .. } => *query,
-            };
-            reads |= document.query_reads_table(query, table);
+            reads |= document.query_reads_table(super::dml::subquery_query(subquery), table);
         }
     });
     reads
@@ -938,7 +922,7 @@ impl InsertRow<'_> {
             self.may_replace(),
         )?;
         if let Some(returning) = returning {
-            let start = returning.emit_values(program, document)?;
+            let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
         if !self.upserts.is_empty() {
@@ -1369,7 +1353,7 @@ impl InsertRow<'_> {
             },
         );
         if let Some(returning) = returning {
-            let start = returning.emit_values(program, document)?;
+            let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
         program.emit_insn(Insn::Goto {
@@ -1932,10 +1916,7 @@ mod tests {
 
     #[test]
     fn insert_that_needs_legacy_is_left_to_it() {
-        for sql in [
-            "INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
-            "INSERT INTO items VALUES (1, 'x') RETURNING (SELECT 1)",
-        ] {
+        for sql in ["INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING"] {
             let plan = analyze_plan(indexed_items_schema(), sql);
             let insert = insert_root(&plan).unwrap();
             assert!(needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");

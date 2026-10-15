@@ -79,7 +79,7 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
-    if delete::needs_legacy(delete, access, program)? {
+    if delete::needs_legacy(&plan.document, delete, access, program)? {
         return Ok(false);
     }
     // Triggers are compiled before anything is emitted, so one that needs

@@ -210,7 +210,7 @@ still go to legacy:
 | DELETE feature | What HIR needs first |
 |---|---|
 | ON DELETE CASCADE, SET NULL or SET DEFAULT on a table that references the target | Running the action on the child rows |
-| A subquery in RETURNING | RETURNING read from a copy of the deleted row |
+| A subquery in RETURNING, on a table with generated columns or custom types | A copy of the deleted row with those columns |
 | CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
@@ -229,7 +229,6 @@ subquery in SET runs as the loop reaches each row. These still go to legacy:
 | UPDATE feature | What HIR needs first |
 |---|---|
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
-| A subquery in RETURNING (SQLite runs it again for each row) | Running it for each row |
 | `SET (a, b) = (SELECT ...)` | Assigning one subquery row to several columns |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
@@ -251,7 +250,6 @@ inserted. These still go to legacy:
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
-| A subquery in RETURNING (SQLite runs it again for each row) | Running it for each row |
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
@@ -263,6 +261,12 @@ those that read a changed column; an UPSERT DO UPDATE checks all of them with
 ABORT. A NULL result passes, IGNORE skips the row, and REPLACE aborts. A
 failure reports the constraint's name, or its expression as the user wrote
 it. `PRAGMA ignore_check_constraints` turns them off.
+
+A subquery in RETURNING whose own FROM clause names the target table runs
+again for each row, as in SQLite and legacy, so it sees the rows written so
+far; any other runs once. DELETE then reads RETURNING from a copy of the row
+taken before the row and its index entries are deleted, so the subquery no
+longer sees the row.
 
 Triggers fired by these statements are compiled from HIR too
 (`semantic_lowering/trigger.rs`). Each trigger is analyzed as its own HIR

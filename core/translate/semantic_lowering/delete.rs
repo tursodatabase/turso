@@ -13,7 +13,7 @@ use turso_parser::ast::TriggerTime;
 use crate::{
     translate::{
         optimizer::HirBtreeOperation,
-        semantic::hir,
+        semantic::hir::{self, HirDocument},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirSourceAccess},
     },
     vdbe::{
@@ -38,6 +38,7 @@ use super::trigger::{CompiledTrigger, TriggerRow};
 /// It is checked before any bytecode is emitted, so legacy can still take
 /// the whole statement.
 pub(super) fn needs_legacy(
+    document: &HirDocument,
     delete: &hir::Delete,
     access: &HirAccessPlan,
     program: &ProgramBuilder,
@@ -45,15 +46,23 @@ pub(super) fn needs_legacy(
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
-    // A RETURNING subquery that reads the target must see the table after
-    // the row is deleted, but HIR reads RETURNING values before.
-    if delete.returning.as_ref().is_some_and(|returning| {
-        returning
-            .outputs
-            .iter()
-            .any(|output| has_subquery(&output.expr))
-    }) {
-        return Ok(true);
+    // RETURNING with a subquery reads a copy of the deleted row. The copy
+    // holds stored values only, so it is not built yet for generated
+    // columns or custom types.
+    if returning_has_subquery(delete) {
+        let source = document.source(delete.target).ok_or_else(|| {
+            LimboError::InternalError(format!("HIR DELETE target {} is missing", delete.target))
+        })?;
+        let generated = match &source.kind {
+            hir::SourceKind::Table(table) => table
+                .value()
+                .btree()
+                .is_some_and(|table| table.columns().iter().any(|column| column.is_generated())),
+            _ => false,
+        };
+        if generated || source.column_type_programs.iter().any(Option::is_some) {
+            return Ok(true);
+        }
     }
     match &delete.target_kind {
         hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
@@ -78,6 +87,16 @@ pub(super) fn needs_legacy(
         }
         _ => Ok(true),
     }
+}
+
+/// Whether a RETURNING value of the DELETE has a subquery.
+fn returning_has_subquery(delete: &hir::Delete) -> bool {
+    delete.returning.as_ref().is_some_and(|returning| {
+        returning
+            .outputs
+            .iter()
+            .any(|output| has_subquery(&output.expr))
+    })
 }
 
 /// Emit a DELETE that [`needs_legacy`] accepted. `delete` is the plan's
@@ -422,10 +441,28 @@ fn emit_delete_row(
             Ok((cursor, start, count, expressions))
         })
         .transpose()?;
-    // RETURNING reads the row before it is deleted. Without subqueries this
-    // gives the same values as legacy, which reads a copy of the row after.
+    // RETURNING reads the row before it is deleted, which gives the same
+    // values as legacy, which reads a copy of the row after. A subquery in
+    // RETURNING must not see the row any more, so then RETURNING reads a
+    // copy of the row once it and its index entries are gone.
+    let copy = returning
+        .as_ref()
+        .filter(|returning| {
+            returning
+                .outputs
+                .iter()
+                .any(|output| has_subquery(&output.expr))
+        })
+        .map(|_| {
+            let start = program.alloc_registers(table.columns().len());
+            for position in 0..table.columns().len() {
+                program.emit_column_or_rowid(table_cursor, position, start + position);
+            }
+            start
+        });
     let returning_row = returning
-        .map(|returning| returning.emit_values(program, document))
+        .filter(|_| copy.is_none())
+        .map(|returning| returning.emit_values(program, document, target.resolved_table()?))
         .transpose()?;
     for (expressions, cursor) in other_indexes {
         let skip = match &expressions.predicate {
@@ -472,6 +509,17 @@ fn emit_delete_row(
             raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
         });
     }
+    if let (Some(returning), Some(start)) = (returning, copy) {
+        program.bind_source(
+            source.id,
+            SourceBinding::Registers {
+                start,
+                rowid: Some(row.rowid),
+            },
+        );
+        let values = returning.emit_values(program, document, target.resolved_table()?)?;
+        returning.emit_buffer(program, values);
+    }
     Ok(())
 }
 
@@ -497,7 +545,7 @@ mod tests {
         let plan = Arc::new(plan);
         let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(delete, access, &program).unwrap());
+        assert!(!needs_legacy(&plan.document, delete, access, &program).unwrap());
         program.set_hir_plan(plan.clone());
         emit_delete(&mut program, &plan, delete, access, &[]).unwrap();
         program
@@ -565,13 +613,22 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_a_returning_subquery_stays_on_legacy() {
-        let plan = analyze_plan(
+    fn delete_with_a_returning_subquery_returns_after_the_row_is_gone() {
+        let program = emit(analyze_plan(
             indexed_items_schema(),
             "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
+        ));
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        assert!(
+            position(|insn| matches!(insn, Insn::Delete { .. }))
+                < position(|insn| matches!(insn, Insn::BeginSubrtn { .. }))
         );
-        let (delete, access) = root(&plan);
-        assert!(needs_legacy(delete, access, &program()).unwrap());
     }
 
     #[test]
@@ -602,7 +659,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (delete, access) = root(&plan);
             assert_eq!(
-                needs_legacy(delete, access, &program()).unwrap(),
+                needs_legacy(&plan.document, delete, access, &program()).unwrap(),
                 legacy,
                 "{sql}"
             );

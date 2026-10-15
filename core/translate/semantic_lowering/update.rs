@@ -63,16 +63,6 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // Like SQLite, legacy runs a RETURNING subquery again for each row;
-    // HIR runs an uncorrelated one only once.
-    if update.returning.as_ref().is_some_and(|returning| {
-        returning
-            .outputs
-            .iter()
-            .any(|output| has_subquery(&output.expr))
-    }) {
-        return Ok(true);
-    }
     let foreign_keys = match &update.target_kind {
         hir::UpdateTargetKind::BTree { foreign_keys, .. } => foreign_keys,
         hir::UpdateTargetKind::Virtual => return Ok(true),
@@ -1086,7 +1076,7 @@ impl UpdateRow<'_, '_> {
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
         if let Some(returning) = layout.returning {
-            let start = returning.emit_values(program, document)?;
+            let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
         // Like legacy, AFTER triggers fire after RETURNING has read the row,
@@ -1594,13 +1584,22 @@ mod tests {
     }
 
     #[test]
+    fn returning_subquery_that_reads_the_target_runs_for_each_row() {
+        let once = |sql| count(&emit(sql), |insn| matches!(insn, Insn::Once { .. }));
+        assert_eq!(
+            once("UPDATE items SET extra = 'y' RETURNING (SELECT count(*) FROM items)"),
+            0
+        );
+        assert_eq!(once("UPDATE items SET extra = 'y' RETURNING (SELECT 1)"), 1);
+    }
+
+    #[test]
     fn update_that_needs_legacy_is_left_to_it() {
         for sql in [
             "UPDATE items SET id = id + 1",
             "UPDATE items SET rowid = 5 WHERE id = 1",
             "UPDATE OR REPLACE items SET value = 1",
             "UPDATE items SET (value, extra) = (SELECT 1, 'x')",
-            "UPDATE items SET extra = 'y' RETURNING (SELECT 1)",
             // The loop reads the index whose key changes.
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
         ] {

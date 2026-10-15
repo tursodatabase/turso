@@ -366,6 +366,9 @@ pub struct ProgramBuilder {
     /// Plan of the HIR statement being lowered. Expression subqueries emit
     /// their bodies from it where the expression is evaluated.
     hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
+    /// Expression subqueries that HIR lowering makes run every time they are
+    /// reached, even when they read no outer row.
+    rerun_subqueries: Vec<QueryId>,
     /// Registers already holding the value of exact HIR expression nodes,
     /// keyed by node address, such as GROUP BY keys while a group is output.
     expression_registers: Vec<(usize, usize)>,
@@ -851,6 +854,7 @@ impl ProgramBuilder {
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
             hir_plan: None,
+            rerun_subqueries: Vec::new(),
             expression_registers: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
@@ -1110,6 +1114,16 @@ impl ProgramBuilder {
 
     pub(crate) fn subquery_binding(&self, query: QueryId) -> Option<SubqueryBinding> {
         self.subquery_bindings.get(&query).copied()
+    }
+
+    /// Make `query`, when emitted as an expression subquery, run every time
+    /// it is reached.
+    pub(crate) fn rerun_subquery(&mut self, query: QueryId) {
+        self.rerun_subqueries.push(query);
+    }
+
+    pub(crate) fn reruns_subquery(&self, query: QueryId) -> bool {
+        self.rerun_subqueries.contains(&query)
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).

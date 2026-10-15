@@ -421,7 +421,21 @@ impl<'a> ReturningBuffer<'a> {
         &self,
         program: &mut ProgramBuilder,
         document: &HirDocument,
+        target: &hir::ResolvedTable,
     ) -> Result<usize> {
+        // Like SQLite, a subquery in RETURNING whose FROM clause names the
+        // target table runs again for each row, so it sees the rows written
+        // so far; any other runs once.
+        for output in self.outputs {
+            output.expr.for_each(&mut |expression| {
+                if let hir::Expr::Subquery(subquery) = expression {
+                    let query = subquery_query(subquery);
+                    if document.query_reads_table_directly(query, target) {
+                        program.rerun_subquery(query);
+                    }
+                }
+            });
+        }
         let start = program.alloc_registers(self.outputs.len());
         for (position, output) in self.outputs.iter().enumerate() {
             super::expr::translate_expr_no_constant_opt(
@@ -538,6 +552,16 @@ pub(super) fn emit_check_constraints<'c>(
         program.preassign_label_to_next_insn(passed);
     }
     Ok(())
+}
+
+/// The query an expression subquery runs.
+pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
+    match subquery {
+        hir::SubqueryExpr::Scalar { query, .. }
+        | hir::SubqueryExpr::Row { query }
+        | hir::SubqueryExpr::Exists(query)
+        | hir::SubqueryExpr::In { query, .. } => *query,
+    }
 }
 
 /// Whether an expression contains a subquery.

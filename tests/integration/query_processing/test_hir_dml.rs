@@ -262,6 +262,10 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET d = d + 1 WHERE EXISTS (SELECT 1 FROM t WHERE t.a = u.a AND t.c = u.c)"],
         &["UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2"],
         &["UPDATE OR IGNORE u SET b = 2 WHERE a IN (SELECT a FROM t) RETURNING a, b"],
+        // A RETURNING subquery that reads the target runs again for each
+        // row.
+        &["UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
+           (SELECT count(*) FROM u AS x WHERE x.d = u.d)"],
         // Subqueries in SET read the table as the loop changes it, row by
         // row.
         &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
@@ -279,8 +283,6 @@ fn hir_update_matches_legacy() {
         &["UPDATE OR REPLACE u SET b = 1 WHERE a = 2"],
         &["UPDATE u SET b = b + 100 WHERE b > 2"],
         &["UPDATE u SET (c, d) = (SELECT 'm', a FROM u AS x WHERE x.a = u.a + 1) WHERE a > 4"],
-        &["UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
-           (SELECT count(*) FROM u AS x WHERE x.d = u.d)"],
         // UPDATE ... FROM: the join fills a scratch table first.
         &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
         &["UPDATE u SET c = t.c, d = t.d + u.d FROM t WHERE t.a = u.a RETURNING *"],
@@ -528,7 +530,9 @@ fn hir_insert_matches_legacy() {
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
         &["INSERT INTO t(b) VALUES (62)"],
-        &["INSERT INTO u(b) VALUES (69) RETURNING (SELECT count(*) FROM u)"],
+        // Like legacy, a RETURNING subquery that reads the target runs again
+        // for each row.
+        &["INSERT INTO u(b) VALUES (69), (70) RETURNING (SELECT count(*) FROM u)"],
         // Subqueries in VALUES. Rows that read the target are all computed
         // before any is inserted.
         &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
@@ -926,6 +930,55 @@ fn hir_insert_values_subqueries_match_sqlite() {
         assert_eq!(
             limbo_exec_rows(&conn, select),
             sqlite_exec_rows(&sqlite, select),
+            "{sql}"
+        );
+    }
+}
+
+/// Like SQLite, every subquery in RETURNING runs again for each row, so it
+/// sees the rows written so far.
+#[test]
+fn hir_returning_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d)",
+        "CREATE TABLE log(x)",
+        "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "INSERT INTO u VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', -1), (3, 3, 'z', 3), \
+         (4, 4, NULL, NULL), (5, 5, 'p', 5), (6, 6, 'q', 5) \
+         RETURNING a, (SELECT count(*) FROM u), (SELECT max(b) FROM u WHERE b < 4)",
+        "UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
+         (SELECT count(*) FROM u AS x WHERE x.d = u.d), (SELECT count(*) FROM log)",
+        "INSERT INTO u(b) VALUES (10), (11) RETURNING (SELECT group_concat(b) FROM u WHERE b > 5), \
+         (SELECT count(*) FROM (SELECT * FROM u))",
+        "UPDATE u SET c = 'k' WHERE a = 4 RETURNING EXISTS (SELECT 1 FROM u WHERE c = 'k'), \
+         (SELECT a FROM u WHERE c = 'k') IN (SELECT a FROM u)",
+        "INSERT INTO u(b) VALUES (12), (13) RETURNING \
+         (SELECT count(*) FROM log WHERE x IN (SELECT a FROM u)), \
+         (SELECT count(*) FROM log UNION ALL SELECT count(*) FROM u LIMIT 1 OFFSET 1), \
+         (WITH w AS (SELECT b FROM u) SELECT max(b) FROM w), \
+         (SELECT max(x.b) FROM u AS x WHERE x.b < u.b)",
+        "UPDATE u SET b = b + 100 WHERE a > 7 RETURNING b, (SELECT max(b) FROM u), \
+         (SELECT count(*) FROM log)",
+        "DELETE FROM u WHERE a < 3 RETURNING a, (SELECT count(*) FROM u), \
+         (SELECT group_concat(a) FROM u WHERE a < 5), (SELECT count(*) FROM log)",
+        "DELETE FROM u WHERE b > 10 RETURNING b, (SELECT max(b) FROM u), \
+         EXISTS (SELECT 1 FROM u AS x WHERE x.b = u.b)",
+        "SELECT * FROM u ORDER BY a",
+        "SELECT * FROM log",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
             "{sql}"
         );
     }
