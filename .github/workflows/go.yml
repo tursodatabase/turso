@@ -45,6 +45,10 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
@@ -53,6 +57,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -95,6 +100,9 @@ jobs:
   publish:
     name: Publish Go driver
     needs: test
+    # On pull requests this job only prints what it would publish, so skip
+    # it there.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

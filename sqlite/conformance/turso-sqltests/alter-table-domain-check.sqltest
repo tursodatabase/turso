@@ -55,3 +55,35 @@ test alter-add-column-chained-domain-check {
 }
 expect error {
 }
+
+test alter-column-to-domain-enforces-domain-check {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v2 pos;
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t VALUES (2, -1);
+}
+expect error {
+    CHECK constraint failed: pos_0
+}
+
+test alter-column-to-domain-enforces-domain-not-null {
+    CREATE DOMAIN nn AS integer NOT NULL;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v2 nn;
+    INSERT INTO t VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.v2
+}
+
+test alter-column-from-domain-drops-domain-check {
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v pos) STRICT;
+    ALTER TABLE t ALTER COLUMN v TO v2 integer;
+    INSERT INTO t VALUES (1, -1);
+    SELECT * FROM t;
+}
+expect {
+    1|-1
+}

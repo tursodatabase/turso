@@ -36,6 +36,13 @@ jobs:
         with:
           prefix-key: "v1-rust-ios"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The release profile uses thin LTO, meant for the packages published
+      # from tags. Pull requests only need to know the libraries build.
+      - name: Use a faster build profile on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
 
       - name: Build iOS libraries
         run: make ios-build
@@ -53,38 +60,62 @@ jobs:
             bindings/react-native/libs/ios/
           if-no-files-found: error
 
+  # One job per Android architecture, run in parallel; the publish job
+  # merges their outputs into libs/android.
   build-android:
-    name: Build Android libraries
+    name: Build Android libraries (${{ matrix.abi }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+          - target: x86_64-linux-android
+            abi: x86_64
+          - target: i686-linux-android
+            abi: x86
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-android"
+          key: ${{ matrix.target }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up Android NDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
-      - name: Build Android libraries
-        run: make android
+      # The release profile uses thin LTO, meant for the packages published
+      # from tags. Pull requests only need to know the libraries build.
+      - name: Use a faster build profile on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+
+      - name: Build Android library
+        run: make android-arch TARGET=${{ matrix.target }} ABI=${{ matrix.abi }}
         working-directory: ${{ env.working-directory }}
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: android-libs
+          name: android-libs-${{ matrix.abi }}
           path: |
             bindings/react-native/libs/android/
           if-no-files-found: error
@@ -222,10 +253,13 @@ jobs:
           name: ios-libs
           path: bindings/react-native/libs/ios/
 
+      # One artifact per architecture; each holds libs/android/<abi>/ plus the
+      # same two headers, so merging them rebuilds the full libs/android.
       - name: Download Android artifacts
         uses: actions/download-artifact@v4
         with:
-          name: android-libs
+          pattern: android-libs-*
+          merge-multiple: true
           path: bindings/react-native/libs/android/
 
       - name: Download TypeScript build

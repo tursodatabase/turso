@@ -1,5 +1,7 @@
 #[cfg(feature = "fs")]
 mod dynamic;
+mod function;
+mod vtab;
 mod vtab_xconnect;
 use crate::index_method::backing_btree::BackingBtreeIndexMethod;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -15,6 +17,9 @@ use crate::sync::Mutex;
 use crate::UringIO;
 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
 use crate::WindowsIOCP;
+pub(crate) use vtab::{
+    create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
+};
 
 use crate::{function::ExternalFunc, Connection, Database};
 use crate::{vtab::VirtualTable, SymbolTable};
@@ -64,7 +69,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
-        implementation: module,
+        implementation: ModuleImplementation::C(module),
     };
 
     unsafe {
@@ -94,7 +99,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Arc<VTabModuleImpl>,
+    pub(crate) implementation: ModuleImplementation,
 }
 
 pub(crate) unsafe fn register_scalar_function(
@@ -115,7 +120,7 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     context_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
-    if ctx.is_null() || name.is_null() || argc < -1 {
+    if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
     let c_str = unsafe { CStr::from_ptr(name) };
@@ -123,20 +128,23 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let function = match ExternalFunc::new_scalar(
+        name_str.clone(),
+        argc,
+        deterministic,
+        context,
+        callback,
+        context_destructor,
+        value_destructor,
+    ) {
+        Ok(function) => function,
+        Err(_) => return ResultCode::InvalidArgs,
+    };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_scalar(
-                name_str,
-                argc,
-                deterministic,
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-            )),
-        );
+        (*ext_ctx.syms)
+            .functions
+            .insert(name_str, Arc::new(function));
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
@@ -180,7 +188,7 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     aggregate_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
-    if ctx.is_null() || name.is_null() || args < -1 {
+    if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
     let c_str = unsafe { CStr::from_ptr(name) };
@@ -188,20 +196,23 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let function = match ExternalFunc::new_aggregate(
+        name_str.clone(),
+        args,
+        context,
+        (init_func, step_func, finalize_func),
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    ) {
+        Ok(function) => function,
+        Err(_) => return ResultCode::InvalidArgs,
+    };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_aggregate(
-                name_str,
-                args,
-                context,
-                (init_func, step_func, finalize_func),
-                context_destructor,
-                aggregate_destructor,
-                value_destructor,
-            )),
-        );
+        (*ext_ctx.syms)
+            .functions
+            .insert(name_str, Arc::new(function));
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }

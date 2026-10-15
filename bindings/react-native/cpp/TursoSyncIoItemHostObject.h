@@ -19,7 +19,8 @@ using namespace facebook;
  * This is a THIN wrapper - 1:1 mapping of SDK-KIT C API with NO logic.
  * All logic belongs in TypeScript or Rust, not here.
  */
-class TursoSyncIoItemHostObject : public jsi::HostObject {
+class TursoSyncIoItemHostObject : public jsi::HostObject,
+                                  public std::enable_shared_from_this<TursoSyncIoItemHostObject> {
 public:
     TursoSyncIoItemHostObject(turso_sync_io_item_t* item) : item_(item) {}
     ~TursoSyncIoItemHostObject();

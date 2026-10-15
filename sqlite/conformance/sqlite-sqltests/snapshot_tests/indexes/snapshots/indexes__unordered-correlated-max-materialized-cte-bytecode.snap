@@ -51,7 +51,7 @@ addr  opcode               p1  p2  p3  p4           p5  comment
   20      IfNot            14  42   0                0  if !r[14] goto 42
   21      Once             29   0   0                0  goto 29
   22      OpenAutoindex     3   0   0                0  cursor=3
-  23      Rewind            2  24   0                0  Rewind  ephemeral()
+  23      Rewind            2  29   0                0  Rewind  ephemeral()
   24        Column          2   0  15                0  r[15]=ephemeral().price
   25        RowId           2  16   0                0  r[16]=ephemeral().rowid
   26        MakeRecord     15   2  17                0  r[17]=mkrec(r[15..16]); for ephemeral_subquery_t7

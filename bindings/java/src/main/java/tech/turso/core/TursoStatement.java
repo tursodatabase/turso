@@ -19,10 +19,8 @@ public final class TursoStatement implements AutoCloseable {
   private static final Logger log = LoggerFactory.getLogger(TursoStatement.class);
 
   private final String sql;
-  private final long statementPointer;
+  private long statementPointer;
   private TursoResultSet resultSet;
-
-  private boolean closed;
 
   // TODO: what if the statement we ran was DDL, update queries and etc. Should we still create a
   // resultSet?
@@ -47,8 +45,8 @@ public final class TursoStatement implements AutoCloseable {
     return resultSet.hasLastStepReturnedRow();
   }
 
-  TursoStepResult step() throws SQLException {
-    final TursoStepResult result = step(this.statementPointer);
+  synchronized TursoStepResult step() throws SQLException {
+    final TursoStepResult result = step(openStatementPointer());
     if (result == null) {
       throw new SQLException("step() returned null, which is only returned when an error occurs");
     }
@@ -79,13 +77,13 @@ public final class TursoStatement implements AutoCloseable {
    * Closes the current statement and releases any resources associated with it. This method calls
    * the native `_close` method to perform the actual closing operation.
    */
-  public void close() throws SQLException {
-    if (closed) {
+  public synchronized void close() throws SQLException {
+    if (isClosed()) {
       return;
     }
     this.resultSet.close();
     _close(statementPointer);
-    closed = true;
+    statementPointer = 0;
   }
 
   private native void _close(long statementPointer);
@@ -97,8 +95,8 @@ public final class TursoStatement implements AutoCloseable {
    *
    * @throws SQLException if a database access error occurs while retrieving column names
    */
-  public void initializeColumnMetadata() throws SQLException {
-    final String[] columnNames = this.columns(statementPointer);
+  public synchronized void initializeColumnMetadata() throws SQLException {
+    final String[] columnNames = this.columns(openStatementPointer());
     if (columnNames != null) {
       this.resultSet.setColumnNames(columnNames);
     }
@@ -114,8 +112,8 @@ public final class TursoStatement implements AutoCloseable {
    * @return <a href="https://www.sqlite.org/c3ref/c_abort.html">Result Codes</a>
    * @throws SQLException If a database access error occurs.
    */
-  public int bindNull(int position) throws SQLException {
-    final int result = bindNull(statementPointer, position);
+  public synchronized int bindNull(int position) throws SQLException {
+    final int result = bindNull(openStatementPointer(), position);
     if (result != 0) {
       throw new SQLException("Exception while binding NULL value at position " + position);
     }
@@ -148,8 +146,8 @@ public final class TursoStatement implements AutoCloseable {
    * @return <a href="https://www.sqlite.org/c3ref/c_abort.html">Result Codes</a>
    * @throws SQLException If a database access error occurs.
    */
-  public int bindLong(int position, long value) throws SQLException {
-    final int result = bindLong(statementPointer, position, value);
+  public synchronized int bindLong(int position, long value) throws SQLException {
+    final int result = bindLong(openStatementPointer(), position, value);
     if (result != 0) {
       throw new SQLException("Exception while binding long value at position " + position);
     }
@@ -166,8 +164,8 @@ public final class TursoStatement implements AutoCloseable {
    * @return <a href="https://www.sqlite.org/c3ref/c_abort.html">Result Codes</a>
    * @throws SQLException If a database access error occurs.
    */
-  public int bindDouble(int position, double value) throws SQLException {
-    final int result = bindDouble(statementPointer, position, value);
+  public synchronized int bindDouble(int position, double value) throws SQLException {
+    final int result = bindDouble(openStatementPointer(), position, value);
     if (result != 0) {
       throw new SQLException("Exception while binding double value at position " + position);
     }
@@ -185,8 +183,8 @@ public final class TursoStatement implements AutoCloseable {
    * @return <a href="https://www.sqlite.org/c3ref/c_abort.html">Result Codes</a>
    * @throws SQLException If a database access error occurs.
    */
-  public int bindText(int position, String value) throws SQLException {
-    final int result = bindText(statementPointer, position, value);
+  public synchronized int bindText(int position, String value) throws SQLException {
+    final int result = bindText(openStatementPointer(), position, value);
     if (result != 0) {
       throw new SQLException("Exception while binding text value at position " + position);
     }
@@ -204,8 +202,8 @@ public final class TursoStatement implements AutoCloseable {
    * @return <a href="https://www.sqlite.org/c3ref/c_abort.html">Result Codes</a>
    * @throws SQLException If a database access error occurs.
    */
-  public int bindBlob(int position, byte[] value) throws SQLException {
-    final int result = bindBlob(statementPointer, position, value);
+  public synchronized int bindBlob(int position, byte[] value) throws SQLException {
+    final int result = bindBlob(openStatementPointer(), position, value);
     if (result != 0) {
       throw new SQLException("Exception while binding blob value at position " + position);
     }
@@ -246,8 +244,8 @@ public final class TursoStatement implements AutoCloseable {
    *
    * @throws SQLException If a database access error occurs
    */
-  public long totalChanges() throws SQLException {
-    final long result = totalChanges(statementPointer);
+  public synchronized long totalChanges() throws SQLException {
+    final long result = totalChanges(openStatementPointer());
     if (result == -1) {
       throw new SQLException("Exception while retrieving total number of changes");
     }
@@ -262,8 +260,8 @@ public final class TursoStatement implements AutoCloseable {
    *
    * @throws SQLException If a database access error occurs
    */
-  public long changes() throws SQLException {
-    final long result = changes(statementPointer);
+  public synchronized long changes() throws SQLException {
+    final long result = changes(openStatementPointer());
     if (result == -1) {
       throw new SQLException("Exception while retrieving number of changes");
     }
@@ -279,8 +277,8 @@ public final class TursoStatement implements AutoCloseable {
    *
    * @throws SQLException If a database access error occurs
    */
-  public int parameterCount() throws SQLException {
-    final int result = parameterCount(statementPointer);
+  public synchronized int parameterCount() throws SQLException {
+    final int result = parameterCount(openStatementPointer());
     if (result == -1) {
       throw new SQLException("Exception while retrieving parameter count");
     }
@@ -291,8 +289,8 @@ public final class TursoStatement implements AutoCloseable {
   private native int parameterCount(long statementPointer) throws SQLException;
 
   /** Resets this statement so it's ready for re-execution */
-  public void reset() throws SQLException {
-    final int result = reset(statementPointer);
+  public synchronized void reset() throws SQLException {
+    final int result = reset(openStatementPointer());
     if (result == -1) {
       throw new SQLException("Exception while resetting statement");
     }
@@ -306,8 +304,15 @@ public final class TursoStatement implements AutoCloseable {
    *
    * @return true if the statement is closed, false otherwise.
    */
-  public boolean isClosed() {
-    return closed;
+  public synchronized boolean isClosed() {
+    return statementPointer == 0;
+  }
+
+  private long openStatementPointer() throws SQLException {
+    if (isClosed()) {
+      throw new SQLException("statement is closed");
+    }
+    return statementPointer;
   }
 
   @Override

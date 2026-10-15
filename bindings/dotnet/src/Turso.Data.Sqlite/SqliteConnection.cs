@@ -170,7 +170,9 @@ public partial class SqliteConnection : DbConnection
         var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
         try
         {
-            _database = TursoBindings.OpenDatabase(filename);
+            _database = CanPool(_connectionOptions, filename, sharedMemoryPath)
+                ? SqliteDatabasePool.Connect(filename)
+                : TursoBindings.OpenDatabase(filename);
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;
@@ -224,7 +226,6 @@ public partial class SqliteConnection : DbConnection
                     }
                 }
 
-                FreeNativeFunctionContexts();
                 _managedConnection.Close();
             }
             finally
@@ -242,7 +243,6 @@ public partial class SqliteConnection : DbConnection
         var originalState = State;
         _database.Dispose();
         _database = null;
-        FreeNativeFunctionContexts();
         _dataSource = null;
         _readOnly = false;
         _recursiveTriggers = false;
@@ -320,13 +320,35 @@ public partial class SqliteConnection : DbConnection
         throw new ArgumentException(Properties.Resources.UnknownCollection(collectionName));
     }
 
-    public static void ClearAllPools()
-    {
-    }
+    /// <summary>
+    ///     Closes every pooled database that has no open connection. Databases still in use close
+    ///     when their last connection does.
+    /// </summary>
+    public static void ClearAllPools() => SqliteDatabasePool.ClearAll();
 
+    /// <summary>
+    ///     Closes the pooled database used by <paramref name="connection" /> once it has no open
+    ///     connection.
+    /// </summary>
     public static void ClearPool(SqliteConnection connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
+        var filename = connection._dataSource;
+        if (filename is null && connection._connectionOptions.IsLocal)
+        {
+            try
+            {
+                filename = NormalizeDataSource(connection._connectionOptions);
+            }
+            catch (SqliteException)
+            {
+                // A file that cannot be opened has nothing pooled.
+                return;
+            }
+        }
+
+        if (filename is not null && !IsMemoryLike(filename))
+            SqliteDatabasePool.Clear(filename);
     }
 
     public new virtual SqliteTransaction BeginTransaction()
@@ -544,7 +566,6 @@ public partial class SqliteConnection : DbConnection
                 var originalState = State;
                 try
                 {
-                    FreeNativeFunctionContexts();
                     _managedConnection.Dispose();
                 }
                 catch (Exception exception) when (failure is not null)
@@ -603,7 +624,6 @@ public partial class SqliteConnection : DbConnection
             var originalState = State;
             try
             {
-                FreeNativeFunctionContexts();
                 await ManagedConnection.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception exception) when (failure is not null)
@@ -907,7 +927,6 @@ public partial class SqliteConnection : DbConnection
     {
         _database?.Dispose();
         _database = null;
-        FreeNativeFunctionContexts();
         _dataSource = null;
         _readOnly = false;
         _sharedMemoryPath = null;
@@ -1141,6 +1160,14 @@ public partial class SqliteConnection : DbConnection
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    // Shared in-memory databases are temp files deleted when their last connection closes, so
+    // they must not outlive it in the pool.
+    private static bool CanPool(SqliteConnectionStringBuilder options, string filename, string? sharedMemoryPath)
+        => options.Pooling && sharedMemoryPath is null && !IsMemoryLike(filename);
+
+    private static bool IsMemoryLike(string filename)
+        => filename.StartsWith(":memory:", StringComparison.Ordinal);
 
     private static bool IsSharedMemory(SqliteConnectionStringBuilder options)
         => options.Mode == SqliteOpenMode.Memory && options.Cache == SqliteCacheMode.Shared && options.DataSource.Length > 0;

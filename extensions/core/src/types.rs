@@ -488,7 +488,7 @@ impl Value {
         }
     }
 
-    /// Creates a new blob Value from a Vec<u8>
+    /// Creates a new blob Value from a `Vec<u8>`
     pub fn from_blob(value: Vec<u8>) -> Self {
         let len = value.len();
         let boxed_data = value.into_boxed_slice();

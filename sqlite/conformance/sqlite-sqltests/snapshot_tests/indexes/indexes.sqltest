@@ -677,6 +677,14 @@ snapshot-eqp join-with-index {
     WHERE o.customer_id = 100;
 }
 
+@setup schema
+snapshot join-with-covering-index-bytecode {
+    SELECT o.id, o.order_date, i.quantity
+    FROM orders o
+    JOIN inventory i ON o.id = i.product_id
+    WHERE o.customer_id = 100;
+}
+
 # Subquery with indexed lookup
 @setup schema
 snapshot-eqp subquery-with-index {

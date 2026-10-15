@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 use bitmaps::Bitmap;
@@ -45,7 +46,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
-            .connect()
+            .connect(ConnectOpts::new())
             .expect("Failed to connect to aux DB for MVCC setup");
         aux_conn
             .execute("PRAGMA journal_mode = 'mvcc'")
@@ -1026,6 +1027,7 @@ mod tests {
                     constraints: vec![
                         ColumnConstraint::Unique(None),
                         ColumnConstraint::Generated {
+                            generated_always: false,
                             expr: Box::new(generated_expr),
                             typ: Some(ast::GeneratedColumnType::Virtual),
                         },
@@ -1308,7 +1310,7 @@ impl SimulatorEnv {
         // Re-enable MVCC mode if the profile says to use MVCC
         if self.profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1535,7 +1537,7 @@ impl SimulatorEnv {
         // Switch to MVCC mode if the profile says to use MVCC
         if profile.mvcc {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'mvcc'")
                 .expect("Failed to enable MVCC mode");
@@ -1588,7 +1590,7 @@ impl SimulatorEnv {
                     .db
                     .as_ref()
                     .expect("db to be Some")
-                    .connect()
+                    .connect(ConnectOpts::new())
                     .expect("Failed to connect to Limbo database");
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))

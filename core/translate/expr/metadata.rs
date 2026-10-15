@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -8,13 +9,15 @@ pub struct ConditionMetadata {
     pub jump_target_when_null: BranchOffset,
 }
 
+#[inline(never)]
 pub(super) fn translate_between_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    mut between_expr: ast::Expr,
+    between_expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let mut between_expr = between_expr.clone();
     let ast::Expr::Between {
         ref mut lhs,
         not,
@@ -256,6 +259,10 @@ macro_rules! translate_fixed_insn {
 /// - SELECT a/b FROM t with INDEX ON t(a/b) (avoid computing a/b for every row)
 /// - ORDER BY a+b when the index already stores a+b (preserves ordering)
 ///
+/// If an outer join can set the index cursor to a null row, the original
+/// expression is computed for that row instead, as in SQLite: an expression
+/// over NULL inputs does not always produce NULL.
+///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
 pub(super) fn try_emit_expression_index_value(
@@ -263,29 +270,61 @@ pub(super) fn try_emit_expression_index_value(
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
+    resolver: &Resolver,
 ) -> Result<bool> {
     let Some(referenced_tables) = referenced_tables else {
         return Ok(false);
     };
-    let Some((table_id, _)) = single_table_column_usage(expr) else {
-        return Ok(false);
-    };
-    let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_id) else {
-        return Ok(false);
-    };
-    let Some(index) = table_reference.op.index() else {
-        return Ok(false);
-    };
-    let normalized = normalize_expr_for_index_matching(expr, table_reference, referenced_tables);
-    let Some(expr_pos) = index.expression_to_index_pos(&normalized) else {
-        return Ok(false);
-    };
-    let Some(cursor_id) =
-        program.resolve_cursor_id_safe(&CursorKey::index(table_id, index.clone()))
+    let Some((table, index, expression_position)) =
+        selected_expression_index(expr, referenced_tables)
     else {
         return Ok(false);
     };
-    program.emit_column_or_rowid(cursor_id, expr_pos, target_register);
+    let normalized = normalize_expr_for_index_matching(expr, table, referenced_tables);
+    if !table
+        .expression_index_usages
+        .iter()
+        .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized))
+    {
+        return Ok(false);
+    }
+    let Some(index_cursor) =
+        program.resolve_cursor_id_safe(&CursorKey::index(table.internal_id, index.clone()))
+    else {
+        return Ok(false);
+    };
+    if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
+        program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+        return Ok(true);
+    }
+
+    let compute_expression = program.allocate_label();
+    let expression_done = program.allocate_label();
+    program.emit_insn(Insn::IfNullRow {
+        cursor_id: index_cursor,
+        target_pc: compute_expression,
+        dest: target_register,
+    });
+    program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+    program.emit_insn(Insn::Goto {
+        target_pc: expression_done,
+    });
+
+    program.preassign_label_to_next_insn(compute_expression);
+    let skipped_index_values = program.flags.skip_expression_index_values();
+    program.flags.set_skip_expression_index_values(true);
+    let result = translate_expr(
+        program,
+        Some(referenced_tables),
+        expr,
+        target_register,
+        resolver,
+    );
+    program
+        .flags
+        .set_skip_expression_index_values(skipped_index_values);
+    result?;
+    program.preassign_label_to_next_insn(expression_done);
     Ok(true)
 }
 

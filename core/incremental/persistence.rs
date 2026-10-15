@@ -314,12 +314,12 @@ mod tests {
     use crate::storage::pager::CreateBTreeFlags;
     use crate::sync::Arc;
     use crate::util::IOExt;
-    use crate::{Connection, Database, MemoryIO, SqliteDialect, IO};
+    use crate::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, IO};
 
     fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
         let _ = pager.io.block(|| pager.allocate_page1());
         let table_root = pager

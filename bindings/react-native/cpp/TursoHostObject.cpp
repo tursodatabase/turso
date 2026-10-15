@@ -1,4 +1,5 @@
 #include "TursoHostObject.h"
+#include "TursoArrayBuffer.h"
 #include "TursoDatabaseHostObject.h"
 #include "TursoSyncDatabaseHostObject.h"
 
@@ -612,7 +613,7 @@ namespace turso
                 std::string path = args[0].asString(rt).utf8(rt);
 
                 // Open file for reading
-                FILE* file = fopen(path.c_str(), "rb");
+                std::unique_ptr<FILE, int (*)(FILE*)> file(fopen(path.c_str(), "rb"), fclose);
                 if (!file)
                 {
                     // File not found - return null (caller will handle as empty)
@@ -620,30 +621,29 @@ namespace turso
                 }
 
                 // Get file size
-                fseek(file, 0, SEEK_END);
-                long size = ftell(file);
-                fseek(file, 0, SEEK_SET);
-
-                if (size <= 0)
+                if (fseek(file.get(), 0, SEEK_END) != 0)
                 {
-                    fclose(file);
-                    // Empty file - return empty ArrayBuffer
-                    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-                    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, 0).asObject(rt);
-                    return arrayBuffer;
+                    throw jsi::JSError(rt, "Failed to seek to end of file");
+                }
+                long size = ftell(file.get());
+                if (size < 0)
+                {
+                    throw jsi::JSError(rt, "Failed to get file size");
+                }
+                if (fseek(file.get(), 0, SEEK_SET) != 0)
+                {
+                    throw jsi::JSError(rt, "Failed to seek to start of file");
                 }
 
                 // Read file contents
-                jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-                jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(size)).asObject(rt);
-                jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-
-                size_t bytesRead = fread(buf.data(rt), 1, size, file);
-                fclose(file);
-
-                if (bytesRead != static_cast<size_t>(size))
+                jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, static_cast<uint64_t>(size));
+                if (size > 0)
                 {
-                    throw jsi::JSError(rt, "Failed to read complete file");
+                    size_t bytesRead = fread(arrayBuffer.data(rt), 1, arrayBuffer.size(rt), file.get());
+                    if (bytesRead != arrayBuffer.size(rt))
+                    {
+                        throw jsi::JSError(rt, "Failed to read complete file");
+                    }
                 }
 
                 return arrayBuffer;

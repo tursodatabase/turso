@@ -1,0 +1,97 @@
+@database :memory:
+
+# sqlite3_value_blob() is NULL for a zero-length blob, so substr() returns
+# NULL for it. A non-empty blob still returns X'' when the range is empty, and
+# an empty string still returns ''.
+
+test substr-empty-blob {
+    SELECT quote(substr(X'', 1, 10)), quote(substr(zeroblob(0), 1)), quote(substr(X'', 0, -1));
+}
+expect {
+    NULL|NULL|NULL
+}
+
+test substr-nonempty-blob-empty-range {
+    SELECT quote(substr(X'00', 2)), quote(substr(X'0102', 3, 1));
+}
+expect {
+    X''|X''
+}
+
+test substr-empty-text {
+    SELECT quote(substr('', 1, 10));
+}
+expect {
+    ''
+}
+
+# An expression index on substr() has to store the same key as SQLite.
+test substr-empty-blob-expression-index {
+    CREATE TABLE t(c);
+    CREATE INDEX i ON t(substr(c, 1, 10));
+    INSERT INTO t VALUES (zeroblob(0));
+    SELECT count(*) FROM t INDEXED BY i WHERE substr(c, 1, 10) IS NULL;
+}
+expect {
+    1
+}
+
+# The empty-blob check happens before the start and length arguments are
+# looked at, so their type and sign do not matter.
+test substr-empty-blob-non-integer-start {
+    SELECT quote(substr(X'', 1.5)), quote(substr(X'', '1')), quote(substr(X'', 'abc', 2)), quote(substr(X'', 1.0, 2.0)), quote(substr(X'', X'31'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL
+}
+
+test substr-empty-blob-negative-start {
+    SELECT quote(substr(X'', -1)), quote(substr(X'', -1, 5)), quote(substr(X'', -5, -5));
+}
+expect {
+    NULL|NULL|NULL
+}
+
+test substr-empty-blob-null-args {
+    SELECT quote(substr(X'', NULL)), quote(substr(X'', 1, NULL)), quote(substr(X'', NULL, NULL));
+}
+expect {
+    NULL|NULL|NULL
+}
+
+test substr-empty-blob-substring-alias {
+    SELECT quote(substring(X'', 1)), quote(substring(X'', 1, 10));
+}
+expect {
+    NULL|NULL
+}
+
+# A cast changes which branch is taken: an empty string cast to a blob is an
+# empty blob, and an empty blob cast to text is an empty string.
+test substr-empty-blob-cast {
+    SELECT typeof(substr(CAST('' AS BLOB), 1)), typeof(substr(CAST(X'' AS TEXT), 1));
+}
+expect {
+    null|text
+}
+
+# Non-empty blobs still coerce a non-integer start to an integer.
+test substr-nonempty-blob-non-integer-start {
+    SELECT quote(substr(X'0102', 1.5)), quote(substr(X'0102', '2')), quote(substr(X'0102', 'abc', 2)), quote(substr(X'0102', 2.0, 1.0)), quote(substr(X'0102', X'32'));
+}
+expect {
+    X'0102'|X'02'|X'01'|X'02'|X'02'
+}
+
+test substr-empty-blob-from-table {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, c);
+    INSERT INTO t2 VALUES (1, X''), (2, zeroblob(0)), (3, ''), (4, X'00'), (5, NULL);
+    SELECT id, quote(substr(c, 1, 10)) FROM t2 ORDER BY id;
+}
+expect {
+    1|NULL
+    2|NULL
+    3|''
+    4|X'00'
+    5|NULL
+}

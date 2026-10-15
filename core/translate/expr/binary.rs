@@ -31,6 +31,36 @@ pub(super) fn binary_expr_shared(
         return Ok(target_register);
     }
 
+    emit_row_valued_binary_expr(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        op,
+        lhs_arity,
+        target_register,
+        resolver,
+        emit_mode,
+    )
+}
+
+/// Row-valued comparisons are rare, so they get their own function that is
+/// never inlined, to keep their stack slots out of the frame of
+/// [binary_expr_shared()], which is on the stack at every level of a chain
+/// like `a + b + c`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn emit_row_valued_binary_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    lhs_arity: usize,
+    target_register: usize,
+    resolver: &Resolver,
+    emit_mode: BinaryEmitMode,
+) -> Result<usize> {
     if !supports_row_value_binary_comparison(op) {
         crate::bail_parse_error!("row value misused");
     }
@@ -56,6 +86,13 @@ pub(super) fn binary_expr_shared(
     if let BinaryEmitMode::Condition(metadata) = emit_mode {
         emit_cond_jump(program, metadata, target_register);
     }
+    let collation =
+        crate::translate::collate::get_explicit_collseq_from_expr(e1, Some(resolver.symbol_table))?
+            .or(crate::translate::collate::get_explicit_collseq_from_expr(
+                e2,
+                Some(resolver.symbol_table),
+            )?);
+    program.set_collation(collation.map(|collation| (collation, true)));
     Ok(target_register)
 }
 
@@ -100,9 +137,11 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
-        if op.is_comparison() {
-            program.reset_collation();
-        }
+        program.set_collation(
+            program
+                .curr_collation_ctx()
+                .filter(|(_, explicit)| *explicit),
+        );
         Ok(target_register)
     } else {
         let e1_reg = program.alloc_registers(2);
@@ -142,18 +181,6 @@ pub(super) fn emit_binary_expr_scalar(
                 _ => None,
             }
         };
-        // CONCAT is collation-opaque: its result compares BINARY unless one of
-        // its operands carries an explicit COLLATE, which hoists to the whole
-        // expression (left operand wins). An implicit column collation must
-        // NOT leak through, otherwise `(e || '') = 'a'` matches
-        // case-insensitively on a NOCASE column and a DELETE driven by that
-        // predicate removes rows it should keep. Arithmetic operators stay
-        // transparent and keep the merged collation.
-        let collation_ctx = if op == &ast::Operator::Concat {
-            collation_ctx.filter(|(_, from_collate)| *from_collate)
-        } else {
-            collation_ctx
-        };
         program.set_collation(collation_ctx);
 
         match emit_mode {
@@ -181,14 +208,7 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
-        // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators must propagate the collation to the parent
-        // expression (already filtered below) so that e.g.
-        //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
-            program.reset_collation();
-        }
+        program.set_collation(collation_ctx.filter(|(_, explicit)| *explicit));
         Ok(target_register)
     }
 }
@@ -436,48 +456,15 @@ pub(super) fn row_component_affinity_collation(
     ))
 }
 
-pub(super) fn explicit_collation(
-    expr: &Expr,
-    resolver: Option<&Resolver>,
-) -> Result<Option<CollationSeq>> {
-    let mut found = None;
-    walk_expr(expr, &mut |e| -> Result<WalkControl> {
-        if let Expr::Collate(_, seq) = e {
-            if found.is_none() {
-                let collation = match resolver {
-                    Some(resolver) => resolver.resolve_collation(seq.as_str()),
-                    None => CollationSeq::new(seq.as_str()),
-                }
-                .unwrap_or_default();
-                found = Some(collation);
-            }
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
-}
-
 pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
-    if let Some(tables) = referenced_tables {
-        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
-        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
-        if lhs_collation.is_some() {
-            return Ok(lhs_collation);
-        }
-        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
-    }
-
-    let lhs_collation = explicit_collation(lhs_expr, resolver)?;
-    if lhs_collation.is_some() {
-        return Ok(lhs_collation);
-    }
-    explicit_collation(rhs_expr, resolver)
+    let empty_tables = TableReferences::default();
+    let tables = referenced_tables.unwrap_or(&empty_tables);
+    resolve_comparison_collseq_with_resolver(lhs_expr, rhs_expr, tables, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]

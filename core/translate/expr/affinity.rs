@@ -61,12 +61,6 @@ pub(crate) fn get_expr_affinity(
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
-                        if col.affinity() == Affinity::None {
-                            return Affinity::None;
-                        }
-                        if let Some(btree) = table_ref.btree() {
-                            return col.affinity_with_strict(btree.is_strict);
-                        }
                         return col.affinity();
                     }
                 }
@@ -85,6 +79,15 @@ pub(crate) fn get_expr_affinity(
             get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
         }
         ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::MergedColumn(columns) => {
+            // A merged USING column takes the affinity of its first column, as
+            // that column would. With t1.a INTEGER, `a = 7` converts a text '7'
+            // from t2.a to a number before comparing.
+            let first_column = columns
+                .first()
+                .expect("a merged column must have at least two source columns");
+            get_expr_affinity(first_column, referenced_tables, resolver)
+        }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
         ast::Expr::Register(reg) => {
@@ -142,6 +145,7 @@ pub(crate) fn expr_data_type(
         }
         ast::Expr::FunctionCall { .. }
         | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::MergedColumn(_)
         | ast::Expr::Variable(_) => StorageClassMask::all(),
         ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }

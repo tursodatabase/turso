@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
-use crate::common::{ExecRows, TempDatabase};
+use crate::assertions::{AssertQueryPlan, PlanDetails};
+use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
 
-/// Return the text rows from `EXPLAIN QUERY PLAN`.
-fn explain(connection: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
-    let mut statement = connection.prepare(format!("EXPLAIN QUERY PLAN {sql}"))?;
-    let mut details = Vec::new();
-    statement.run_with_row_callback(|row| {
-        details.push(row.get::<String>(3)?);
-        Ok(())
-    })?;
-    Ok(details)
+/// Return the rows of `EXPLAIN QUERY PLAN`.
+fn explain(
+    connection: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    limbo_exec_rows(connection, &format!("EXPLAIN QUERY PLAN {sql}"))
 }
 
 /// Compute the same average once per key, not once per outer row.
@@ -29,22 +28,12 @@ fn correlated_average_uses_one_grouped_table() -> anyhow::Result<()> {
              FROM inner_rows i
              WHERE i.key1 = o.key1
          )",
-    )?;
+    );
 
-    assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("scalar_subquery")),
-        "expected a grouped subquery table, got {details:?}"
-    );
-    assert!(
-        details.iter().any(|detail| detail.contains("GROUP BY")),
-        "expected the subquery to group by its outer key, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no subquery call for each outer row, got {details:?}"
-    );
+    assert_that!(details)
+        .has_step_containing("scalar_subquery")
+        .has_step_containing("GROUP BY")
+        .has_no_step_containing("CORRELATED");
     Ok(())
 }
 
@@ -67,18 +56,11 @@ fn indexed_average_for_one_outer_row_stays_a_subquery() -> anyhow::Result<()> {
                FROM inner_rows i
                WHERE i.key1 = o.id
            )",
-    )?;
+    );
 
-    assert!(
-        details.iter().any(|detail| detail.contains("CORRELATED")),
-        "expected the indexed subquery to stay as written, got {details:?}"
-    );
-    assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("inner_rows_key1") && detail.contains("key1=?")),
-        "expected an indexed lookup for the correlated subquery, got {details:?}"
-    );
+    assert_that!(details)
+        .has_step_containing("CORRELATED")
+        .has_step_containing("inner_rows_key1 (key1=?)");
     Ok(())
 }
 
@@ -100,18 +82,11 @@ fn minimum_over_a_join_becomes_a_joined_table() -> anyhow::Result<()> {
              FROM partsupp ps2 JOIN supplier s2 ON s2.suppkey = ps2.suppkey
              WHERE ps2.partkey = ps.partkey AND s2.region = 1
          )",
-    )?;
+    );
 
-    assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("scalar_subquery")),
-        "expected the minimum-cost subquery to become a joined table, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no per-row minimum-cost subquery, got {details:?}"
-    );
+    assert_that!(details)
+        .has_step_containing("scalar_subquery")
+        .has_no_step_containing("CORRELATED");
     Ok(())
 }
 
@@ -133,17 +108,10 @@ fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
     ];
 
     for query in queries {
-        let details = explain(&connection, query)?;
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("scalar_subquery")),
-            "expected a grouped subquery table: {query}; got {details:?}"
-        );
-        assert!(
-            details.iter().all(|detail| !detail.contains("CORRELATED")),
-            "expected no subquery call for each outer row: {query}; got {details:?}"
-        );
+        assert_that!(explain(&connection, query))
+            .named(format!("query plan of {query}"))
+            .has_step_containing("scalar_subquery")
+            .has_no_step_containing("CORRELATED");
     }
     Ok(())
 }
@@ -162,18 +130,12 @@ fn correlated_in_uses_a_semi_join() -> anyhow::Result<()> {
          WHERE amount IN (
              SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1
          )",
-    )?;
+    );
 
-    assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("inner_rows") && detail.contains("key1=?")),
-        "expected the inner table to be searched by the outer key, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no per-row IN subquery, got {details:?}"
-    );
+    assert_that!(details.plan_details())
+        .named("query plan")
+        .any_satisfies(|step| step.contains("inner_rows") && step.contains("key1=?"));
+    assert_that!(details).has_no_step_containing("CORRELATED");
     Ok(())
 }
 
@@ -193,18 +155,11 @@ fn indexed_correlated_exists_uses_a_semi_join() -> anyhow::Result<()> {
              SELECT 1 FROM inner_rows i
              WHERE i.outer_id = o.id AND i.value > 10
          )",
-    )?;
+    );
 
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected EXISTS to use a semi-join, got {details:?}"
-    );
-    assert!(
-        details.iter().any(|detail| {
-            detail.contains("inner_rows_outer_id") && detail.contains("outer_id=?")
-        }),
-        "expected the semi-join to use the index on the linked column, got {details:?}"
-    );
+    assert_that!(details)
+        .has_no_step_containing("CORRELATED")
+        .has_step_containing("inner_rows_outer_id (outer_id=?)");
     Ok(())
 }
 
@@ -248,11 +203,9 @@ fn subqueries_that_cannot_be_rewritten_stay_correlated() -> anyhow::Result<()> {
     ];
 
     for query in queries {
-        let details = explain(&connection, query)?;
-        assert!(
-            details.iter().any(|detail| detail.contains("CORRELATED")),
-            "expected this query to stay correlated: {query}; got {details:?}"
-        );
+        assert_that!(explain(&connection, query))
+            .named(format!("query plan of {query}"))
+            .has_step_containing("CORRELATED");
     }
     Ok(())
 }
@@ -269,28 +222,27 @@ fn one_value_and_in_results_match_sqlite_on_nulls_and_repeated_keys() -> anyhow:
     connection
         .execute("INSERT INTO inner_rows VALUES (1,10),(1,10),(1,20),(2,6),(2,NULL),(NULL,NULL)")?;
 
-    let value_rows: Vec<(i64, f64, i64)> = connection.exec_rows(
+    assert_that!(limbo_exec_rows(
+        &connection,
         "SELECT id,
                 coalesce((SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1), -1.0),
                 (SELECT count(*) FROM inner_rows i WHERE i.key1 = o.key1)
          FROM outer_rows o ORDER BY id",
-    );
-    assert_eq!(
-        value_rows,
-        vec![
-            (1, 40.0 / 3.0, 3),
-            (2, 40.0 / 3.0, 3),
-            (3, 6.0, 2),
-            (4, -1.0, 0),
-            (5, -1.0, 0),
-        ]
-    );
+    ))
+    .is_equal_to(vec![
+        row![1, 40.0 / 3.0, 3],
+        row![2, 40.0 / 3.0, 3],
+        row![3, 6.0, 2],
+        row![4, -1.0, 0],
+        row![5, -1.0, 0],
+    ]);
 
-    let in_rows: Vec<(i64,)> = connection.exec_rows(
+    assert_that!(limbo_exec_rows(
+        &connection,
         "SELECT id FROM outer_rows o
          WHERE amount IN (SELECT i.amount FROM inner_rows i WHERE i.key1 = o.key1)
          ORDER BY id",
-    );
-    assert_eq!(in_rows, vec![(1,), (3,)]);
+    ))
+    .is_equal_to(vec![row![1], row![3]]);
     Ok(())
 }

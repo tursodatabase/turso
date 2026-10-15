@@ -374,7 +374,11 @@ impl SyncEngine {
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
-            remote_encryption_key: self.opts.remote_encryption_key.clone(),
+            remote_encryption_key: self
+                .opts
+                .remote_encryption_key
+                .clone()
+                .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,

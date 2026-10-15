@@ -572,11 +572,7 @@ where
 pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
     idx.columns
         .iter()
-        .map(|ic| {
-            table.columns()[ic.pos_in_table]
-                .affinity_with_strict(table.is_strict)
-                .aff_mask()
-        })
+        .map(|ic| table.columns()[ic.pos_in_table].affinity().aff_mask())
         .collect()
 }
 

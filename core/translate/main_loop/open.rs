@@ -6,9 +6,14 @@ use crate::translate::{
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
 
+/// Load the materialized subquery columns that the parent query uses.
+///
+/// SQLite reads these columns where expressions use them, so it never reads an
+/// unused column. A materialized nested join can also omit unused columns.
 fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    used_columns: &crate::translate::plan::ColumnUsedMask,
     cursor_id: CursorID,
     index: Option<&Index>,
 ) {
@@ -24,7 +29,7 @@ fn emit_materialized_subquery_result_columns(
         source_cols
     });
 
-    for col_idx in 0..from_clause_subquery.columns.len() {
+    for col_idx in used_columns.iter() {
         let source_col = index_to_table
             .as_ref()
             .map(|source_cols| {
@@ -92,7 +97,7 @@ impl OpenLoop {
             // and is set to true when a match is found for the OUTER JOIN.
             // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() {
+                if join_info.keeps_left_rows() {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.emit_insn(Insn::Integer {
                         value: 0,
@@ -105,427 +110,6 @@ impl OpenLoop {
                 table.resolve_cursors(program, mode.clone())?;
 
             match &table.op {
-                Operation::Scan(scan) => {
-                    match (scan, &table.table) {
-                        (Scan::BTreeTable { iter_dir, .. }, Table::BTree(_)) => {
-                            let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                                index_cursor_id.unwrap_or_else(|| {
-                                    table_cursor_id.expect(
-                                        "Either ephemeral or index or table cursor must be opened",
-                                    )
-                                })
-                            });
-                            if *iter_dir == IterationDirection::Backwards {
-                                program.emit_insn(Insn::Last {
-                                    cursor_id: iteration_cursor_id,
-                                    pc_if_empty: loop_end,
-                                });
-                            } else {
-                                program.emit_insn(Insn::Rewind {
-                                    cursor_id: iteration_cursor_id,
-                                    pc_if_empty: loop_end,
-                                });
-                            }
-                            program.preassign_label_to_next_insn(loop_start);
-                        }
-                        (
-                            Scan::VirtualTable {
-                                idx_num,
-                                idx_str,
-                                constraints,
-                            },
-                            Table::Virtual(_),
-                        ) => {
-                            let (start_reg, count, maybe_idx_str, maybe_idx_int) = {
-                                let args_needed = constraints.len();
-                                let start_reg = program.alloc_registers(args_needed);
-
-                                for (argv_index, expr) in constraints.iter().enumerate() {
-                                    let target_reg = start_reg + argv_index;
-                                    translate_expr(
-                                        program,
-                                        Some(table_references),
-                                        expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                    )?;
-                                }
-
-                                // If best_index provided an idx_str, translate it.
-                                let maybe_idx_str = if let Some(idx_str) = idx_str {
-                                    let reg = program.alloc_register();
-                                    program.emit_insn(Insn::String8 {
-                                        dest: reg,
-                                        value: idx_str.to_owned(),
-                                    });
-                                    Some(reg)
-                                } else {
-                                    None
-                                };
-                                (start_reg, args_needed, maybe_idx_str, Some(*idx_num))
-                            };
-
-                            // Emit VFilter with the computed arguments.
-                            program.emit_insn(Insn::VFilter {
-                                cursor_id: table_cursor_id
-                                    .expect("Virtual tables do not support covering indexes"),
-                                arg_count: count,
-                                args_reg: start_reg,
-                                idx_str: maybe_idx_str,
-                                idx_num: maybe_idx_int.unwrap_or(0) as usize,
-                                pc_if_empty: loop_end,
-                            });
-                            program.preassign_label_to_next_insn(loop_start);
-                        }
-                        (
-                            Scan::Subquery { iter_dir },
-                            Table::FromClauseSubquery(from_clause_subquery),
-                        ) => {
-                            match from_clause_subquery.plan.select_query_destination() {
-                                Some(QueryDestination::CoroutineYield {
-                                    yield_reg,
-                                    coroutine_implementation_start,
-                                }) => {
-                                    turso_assert_eq!(
-                                        *iter_dir,
-                                        IterationDirection::Forwards,
-                                        "coroutine-backed subqueries cannot scan backwards"
-                                    );
-                                    // Coroutine-based subquery execution
-                                    // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
-                                    program.emit_insn(Insn::InitCoroutine {
-                                        yield_reg: *yield_reg,
-                                        jump_on_definition: BranchOffset::Offset(0),
-                                        start_offset: *coroutine_implementation_start,
-                                    });
-                                    program.preassign_label_to_next_insn(loop_start);
-                                    // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
-                                    // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
-                                    // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
-                                    // which in this case is the end of the Yield-Goto loop in the parent query.
-                                    program.emit_insn(Insn::Yield {
-                                        yield_reg: *yield_reg,
-                                        end_offset: loop_end,
-                                        subtype_clear_start_reg: 0,
-                                        subtype_clear_count: 0,
-                                    });
-                                }
-                                Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
-                                    // Materialized CTE - scan the ephemeral table with Rewind/Next
-                                    if *iter_dir == IterationDirection::Backwards {
-                                        program.emit_insn(Insn::Last {
-                                            cursor_id: *cursor_id,
-                                            pc_if_empty: loop_end,
-                                        });
-                                    } else {
-                                        program.emit_insn(Insn::Rewind {
-                                            cursor_id: *cursor_id,
-                                            pc_if_empty: loop_end,
-                                        });
-                                    }
-                                    program.preassign_label_to_next_insn(loop_start);
-                                    emit_materialized_subquery_result_columns(
-                                        program,
-                                        from_clause_subquery,
-                                        *cursor_id,
-                                        None,
-                                    );
-                                }
-                                _ => {
-                                    unreachable!("Subquery table with unexpected query destination")
-                                }
-                            }
-                        }
-                        (Scan::RecursiveCteInput, Table::RecursiveCteInput(_)) => {
-                            program.preassign_label_to_next_insn(loop_start);
-                        }
-                        _ => unreachable!(
-                            "{:?} scan cannot be used with {:?} table",
-                            scan, table.table
-                        ),
-                    }
-                    if let Some(table_cursor_id) = table_cursor_id {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
-                        }
-                    }
-                }
-                Operation::Search(search) => {
-                    let materialized_subquery_storage = match (&table.table, search) {
-                        (
-                            Table::FromClauseSubquery(from_clause_subquery),
-                            Search::Seek {
-                                index: Some(index), ..
-                            },
-                        ) if index.ephemeral => {
-                            materialized_from_clause_subquery_storage(from_clause_subquery)
-                        }
-                        _ => None,
-                    };
-
-                    // Open the loop for the index search.
-                    // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
-                    match search {
-                        Search::RowidEq { cmp_expr } => {
-                            assert!(
-                                !matches!(table.table, Table::FromClauseSubquery(_)),
-                                "Subqueries do not support rowid seeks"
-                            );
-                            let src_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(table_references),
-                                cmp_expr,
-                                src_reg,
-                                &t_ctx.resolver,
-                            )?;
-                            program.emit_insn(Insn::SeekRowid {
-                                cursor_id: table_cursor_id
-                                    .expect("Search::RowidEq requires a table cursor"),
-                                src_reg,
-                                target_pc: next,
-                            });
-                        }
-                        Search::Seek {
-                            index, seek_def, ..
-                        } => {
-                            // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
-                            let mut bloom_filter = false;
-                            if let Some(index) = index {
-                                if index.ephemeral
-                                    && !matches!(
-                                        materialized_subquery_storage,
-                                        Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
-                                    )
-                                {
-                                    // Build auxiliary ephemeral indexes lazily from the row source,
-                                    // whether it is a base table or a table-backed materialized subquery.
-                                    let table_has_rowid = if let Table::BTree(btree) = &table.table
-                                    {
-                                        btree.has_rowid
-                                    } else {
-                                        matches!(&table.table, Table::FromClauseSubquery(_))
-                                    };
-                                    let num_seek_keys = seek_def.size(&seek_def.start);
-                                    let table_columns = if let Table::BTree(btree) = &table.table {
-                                        Some(btree.columns())
-                                    } else {
-                                        None
-                                    };
-                                    let AutoIndexResult {
-                                        use_bloom_filter, ..
-                                    } = emit_autoindex(
-                                        program,
-                                        AutoIndexBuild {
-                                            index,
-                                            table_cursor_id: table_cursor_id.expect(
-                                                "an ephemeral index must have a source table cursor",
-                                            ),
-                                            index_cursor_id: index_cursor_id.expect(
-                                                "an ephemeral index must have an index cursor",
-                                            ),
-                                            table_has_rowid,
-                                            num_seek_keys,
-                                            seek_def,
-                                            affinity_str: plan::synthesized_seek_affinity_str(
-                                                index, seek_def,
-                                            )
-                                            .as_ref(),
-                                            table_columns,
-                                            table_ref_id: table.internal_id,
-                                            table_references,
-                                            resolver: &t_ctx.resolver,
-                                        },
-                                    )?;
-                                    bloom_filter = use_bloom_filter;
-                                }
-                            }
-
-                            let seek_cursor_id = if materialized_subquery_storage.is_some() {
-                                index_cursor_id
-                                    .expect("materialized subquery must have index cursor")
-                            } else {
-                                temp_cursor_id.unwrap_or_else(|| {
-                                    index_cursor_id.unwrap_or_else(|| {
-                                        table_cursor_id.expect(
-                                        "Either ephemeral or index or table cursor must be opened",
-                                    )
-                                    })
-                                })
-                            };
-
-                            let max_registers = seek_def
-                                .size(&seek_def.start)
-                                .max(seek_def.size(&seek_def.end));
-                            let start_reg = program.alloc_registers(max_registers);
-                            SeekEmitter::new(
-                                program,
-                                table_references,
-                                seek_def,
-                                t_ctx,
-                                seek_cursor_id,
-                                start_reg,
-                                loop_end,
-                                index.as_ref(),
-                            )
-                            .emit(loop_start, bloom_filter)?;
-
-                            if let Some(materialized_subquery_storage) =
-                                materialized_subquery_storage
-                            {
-                                let index_cursor_id = index_cursor_id
-                                    .expect("materialized subquery seek requires index cursor");
-                                let Table::FromClauseSubquery(from_clause_subquery) = &table.table
-                                else {
-                                    unreachable!("materialized subquery seek requires subquery")
-                                };
-                                match materialized_subquery_storage {
-                                    MaterializedFromClauseSubqueryStorage::TableBacked => {
-                                        let table_cursor_id = table_cursor_id
-                                            .expect("materialized subquery must have table cursor");
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
-                                        emit_materialized_subquery_result_columns(
-                                            program,
-                                            from_clause_subquery,
-                                            table_cursor_id,
-                                            None,
-                                        );
-                                    }
-                                    // Expressions read direct index columns when they need them.
-                                    // Copying all columns here would only write unused registers.
-                                    MaterializedFromClauseSubqueryStorage::DirectIndex => {}
-                                }
-                            } else {
-                                // Only emit DeferredSeek for non-subquery tables
-                                if let Some(index_cursor_id) = index_cursor_id {
-                                    if let Some(table_cursor_id) = table_cursor_id {
-                                        // Don't do a btree table seek until it's actually necessary to read from the table.
-                                        program.emit_insn(Insn::DeferredSeek {
-                                            index_cursor_id,
-                                            table_cursor_id,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Search::InSeek { index, source } => {
-                            let is_rowid = index.is_none();
-                            let ephemeral_cursor_id = open_in_seek_source_cursor(
-                                program,
-                                table_references,
-                                &t_ctx.resolver,
-                                index.as_ref(),
-                                source,
-                            )?;
-
-                            program.emit_insn(Insn::NullRow {
-                                cursor_id: ephemeral_cursor_id,
-                            });
-                            program.emit_insn(Insn::Rewind {
-                                cursor_id: ephemeral_cursor_id,
-                                pc_if_empty: loop_end,
-                            });
-
-                            let outer_loop_start = program.allocate_label();
-                            program.preassign_label_to_next_insn(outer_loop_start);
-                            let seek_reg = program.alloc_register();
-                            // The emitted loop is:
-                            //   for each RHS key in the ephemeral cursor
-                            //     seek table/index to that key
-                            //     scan all matching rows for that key
-                            program.emit_insn(Insn::Column {
-                                cursor_id: ephemeral_cursor_id,
-                                column: 0,
-                                dest: seek_reg,
-                                default: None,
-                            });
-
-                            let next_val_label = program.allocate_label();
-                            program.emit_insn(Insn::IsNull {
-                                reg: seek_reg,
-                                target_pc: next_val_label,
-                            });
-
-                            if is_rowid {
-                                program.emit_insn(Insn::SeekRowid {
-                                    cursor_id: table_cursor_id
-                                        .expect("InSeek rowid requires table cursor"),
-                                    src_reg: seek_reg,
-                                    target_pc: next_val_label,
-                                });
-                            } else {
-                                let idx_cursor = index_cursor_id
-                                    .expect("InSeek with index requires index cursor");
-                                program.emit_insn(Insn::SeekGE {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                    is_index: true,
-                                    eq_only: false,
-                                    null_matching_mask: Default::default(),
-                                });
-                                program.preassign_label_to_next_insn(loop_start);
-                                program.emit_insn(Insn::IdxGT {
-                                    cursor_id: idx_cursor,
-                                    start_reg: seek_reg,
-                                    num_regs: 1,
-                                    target_pc: next_val_label,
-                                });
-                                if let Some(table_cursor_id) = table_cursor_id {
-                                    program.emit_insn(Insn::DeferredSeek {
-                                        index_cursor_id: idx_cursor,
-                                        table_cursor_id,
-                                    });
-                                }
-                            }
-
-                            // `close_loop` uses this metadata to stitch together the outer
-                            // ephemeral-value loop and the inner scan over matches for the
-                            // current value.
-                            t_ctx.meta_in_seeks[joined_table_index] = Some(InSeekMetadata {
-                                ephemeral_cursor_id,
-                                outer_loop_start,
-                                next_val_label,
-                            });
-                        }
-                    }
-                }
-                Operation::IndexMethodQuery(query) => {
-                    let start_reg = program.alloc_registers(query.arguments.len() + 1);
-                    program.emit_int(query.pattern_idx as i64, start_reg);
-                    for i in 0..query.arguments.len() {
-                        translate_expr(
-                            program,
-                            Some(table_references),
-                            &query.arguments[i],
-                            start_reg + 1 + i,
-                            &t_ctx.resolver,
-                        )?;
-                    }
-                    program.emit_insn(Insn::IndexMethodQuery {
-                        db: crate::MAIN_DB_ID,
-                        cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
-                        start_reg,
-                        count_reg: query.arguments.len() + 1,
-                        pc_if_empty: loop_end,
-                    });
-                    program.preassign_label_to_next_insn(loop_start);
-                    if let Some(table_cursor_id) = table_cursor_id {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
-                        }
-                    }
-                }
                 Operation::HashJoin(hash_join_op) => {
                     HashProbeSetupEmitter::new(
                         program,
@@ -543,32 +127,40 @@ impl OpenLoop {
                     )
                     .emit()?;
                 }
-                Operation::MultiIndexScan(multi_idx_op) => {
-                    emit_multi_index_scan_loop(
-                        program,
-                        t_ctx,
-                        table,
-                        table_references,
-                        multi_idx_op,
+                operation => emit_table_read_start(
+                    program,
+                    t_ctx,
+                    table_references,
+                    table,
+                    operation,
+                    joined_table_index,
+                    TableReadCursors {
+                        table_cursor_id,
+                        index_cursor_id,
+                        temp_cursor_id,
+                    },
+                    LoopLabels {
                         loop_start,
                         loop_end,
-                    )?;
-                }
+                        next,
+                    },
+                )?,
             }
 
-            let condition_fail_target = if let Operation::HashJoin(ref hj) = table.op {
-                t_ctx
-                    .hash_table_contexts
-                    .get(&hj.build_table_idx)
-                    .map(|ctx| ctx.labels.next)
-                    .expect("should have hash context for build table")
-            } else {
-                next
-            };
-            let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
-                hj.join_type,
-                HashJoinType::LeftOuter | HashJoinType::FullOuter
-            ));
+            let condition_fail_target =
+                if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                    right_join.return_label
+                } else if let Operation::HashJoin(ref hj) = table.op {
+                    t_ctx
+                        .hash_table_contexts
+                        .get(&hj.build_table_idx)
+                        .map(|ctx| ctx.labels.next)
+                        .expect("should have hash context for build table")
+                } else {
+                    next
+                };
+            let scans_unmatched_hash_rows = matches!(table.op, Operation::HashJoin(ref hj) if
+                hj.join_type.keeps_unmatched_build_rows());
 
             // Emit OUTER JOIN conditions (must run before setting match flags).
             LoopConditionEmitter::new(
@@ -584,10 +176,18 @@ impl OpenLoop {
             )
             .emit()?;
 
+            // Record the right row after its ON terms pass. Later WHERE terms
+            // must not change whether this row matched the join.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                let table_cursor_id = table_cursor_id
+                    .expect("a RIGHT or FULL JOIN must keep its right table cursor open");
+                emit_right_join_match(program, right_join, table_cursor_id);
+            }
+
             // Set the LEFT JOIN match flag. Skip outer hash join probes - they use
             // HashMarkMatched / check_outer instead.
             if let Some(join_info) = table.join_info.as_ref() {
-                if join_info.is_outer() && !is_outer_hj_probe {
+                if join_info.keeps_left_rows() && !scans_unmatched_hash_rows {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                     program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                     program.emit_insn(Insn::Integer {
@@ -621,6 +221,16 @@ impl OpenLoop {
                 }
             }
 
+            // Normal loop execution enters the row body inline. The unmatched
+            // right-row scan enters the same body with Gosub.
+            if let Some(right_join) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                program.emit_insn(Insn::BeginSubrtn {
+                    dest: right_join.return_reg,
+                    dest_end: None,
+                });
+                program.preassign_label_to_next_insn(right_join.body_label);
+            }
+
             // Emit non-OUTER JOIN conditions.
             let from_outer_join = false;
             LoopConditionEmitter::new(
@@ -641,25 +251,33 @@ impl OpenLoop {
             // label_body is resolved later in emit_loop, right before the body is emitted.
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_anti() {
-                    let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
-                        .as_ref()
-                        .expect("anti-join must have SemiAntiJoinMetadata");
-                    program.add_comment(program.offset(), "anti-join: match found, skip outer row");
-                    program.emit_insn(Insn::Goto {
-                        target_pc: sa_meta.label_next_outer,
-                    });
+                    if let Operation::HashJoin(hj) = &table.op {
+                        if hj.join_type != HashJoinType::LeftAnti {
+                            unreachable!("anti hash join must use left anti semantics");
+                        }
+                        let build_table = &table_references.joined_tables()[hj.build_table_idx];
+                        let hash_table_id: usize = build_table.internal_id.into();
+                        program.emit_insn(Insn::HashMarkMatched { hash_table_id });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: condition_fail_target,
+                        });
+                    } else {
+                        let sa_meta = t_ctx.meta_semi_anti_joins[joined_table_index]
+                            .as_ref()
+                            .expect("anti-join must have SemiAntiJoinMetadata");
+                        program.emit_insn(Insn::Goto {
+                            target_pc: sa_meta.label_next_outer,
+                        });
+                    }
                 }
             }
 
-            // Outer hash joins wrap inner loops in a Gosub subroutine so that
-            // unmatched-row emission paths can re-enter them (cursors get Rewind'd).
+            // Unmatched build rows use this subroutine to enter later loops.
             if let Operation::HashJoin(ref hj) = table.op {
-                if matches!(
-                    hj.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                ) {
+                if hj.join_type.keeps_unmatched_build_rows() {
                     let return_reg = program.alloc_register();
                     let gosub_label = program.allocate_label();
+                    let return_label = program.allocate_label();
                     let skip_label = program.allocate_label();
 
                     program.emit_insn(Insn::Gosub {
@@ -675,6 +293,7 @@ impl OpenLoop {
                     if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
                         hash_ctx.inner_loop_gosub_reg = Some(return_reg);
                         hash_ctx.labels.inner_loop_gosub = Some(gosub_label);
+                        hash_ctx.labels.inner_loop_return = Some(return_label);
                         hash_ctx.labels.inner_loop_skip = Some(skip_label);
                     }
                 }
@@ -698,4 +317,491 @@ impl OpenLoop {
 
         Ok(())
     }
+}
+
+/// The cursors one table read uses.
+#[derive(Clone, Copy)]
+pub(super) struct TableReadCursors {
+    pub table_cursor_id: Option<CursorID>,
+    pub index_cursor_id: Option<CursorID>,
+    /// A cursor that replaces the table or index cursor for the loop, such as
+    /// the prebuilt copy that an UPDATE scans.
+    pub temp_cursor_id: Option<CursorID>,
+}
+
+/// Start reading one table with `operation`: move to the first row, or jump
+/// to `loop_end` when there is none.
+///
+/// The main loop and the unmatched-row pass of a RIGHT or FULL JOIN both use
+/// this, so the two reads of a table emit the same code. A hash join starts
+/// its reads in [HashProbeSetupEmitter] instead.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_table_read_start(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    operation: &Operation,
+    joined_table_index: usize,
+    cursors: TableReadCursors,
+    labels: LoopLabels,
+) -> Result<()> {
+    let TableReadCursors {
+        table_cursor_id,
+        index_cursor_id,
+        temp_cursor_id,
+    } = cursors;
+    let LoopLabels {
+        loop_start,
+        loop_end,
+        next,
+    } = labels;
+    match operation {
+        Operation::Scan(scan) => {
+            match (scan, &table.table) {
+                (Scan::BTreeTable { iter_dir, .. }, Table::BTree(_)) => {
+                    let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                        index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id
+                                .expect("Either ephemeral or index or table cursor must be opened")
+                        })
+                    });
+                    if *iter_dir == IterationDirection::Backwards {
+                        program.emit_insn(Insn::Last {
+                            cursor_id: iteration_cursor_id,
+                            pc_if_empty: loop_end,
+                        });
+                    } else {
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id: iteration_cursor_id,
+                            pc_if_empty: loop_end,
+                        });
+                    }
+                    program.preassign_label_to_next_insn(loop_start);
+                }
+                (
+                    Scan::VirtualTable {
+                        idx_num,
+                        idx_str,
+                        constraints,
+                    },
+                    Table::Virtual(_),
+                ) => {
+                    emit_virtual_table_scan_start(
+                        program,
+                        table_references,
+                        &t_ctx.resolver,
+                        table_cursor_id.expect("Virtual tables do not support covering indexes"),
+                        *idx_num,
+                        idx_str.as_deref(),
+                        constraints,
+                        loop_start,
+                        loop_end,
+                    )?;
+                }
+                (Scan::Subquery { iter_dir }, Table::FromClauseSubquery(from_clause_subquery)) => {
+                    match from_clause_subquery.plan.select_query_destination() {
+                        Some(QueryDestination::CoroutineYield {
+                            yield_reg,
+                            coroutine_implementation_start,
+                        }) => {
+                            turso_assert_eq!(
+                                *iter_dir,
+                                IterationDirection::Forwards,
+                                "coroutine-backed subqueries cannot scan backwards"
+                            );
+                            // Coroutine-based subquery execution
+                            // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
+                            program.emit_insn(Insn::InitCoroutine {
+                                yield_reg: *yield_reg,
+                                jump_on_definition: BranchOffset::Offset(0),
+                                start_offset: *coroutine_implementation_start,
+                            });
+                            program.preassign_label_to_next_insn(loop_start);
+                            // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
+                            // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
+                            // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
+                            // which in this case is the end of the Yield-Goto loop in the parent query.
+                            program.emit_insn(Insn::Yield {
+                                yield_reg: *yield_reg,
+                                end_offset: loop_end,
+                                subtype_clear_start_reg: 0,
+                                subtype_clear_count: 0,
+                            });
+                        }
+                        Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
+                            // Materialized CTE - scan the ephemeral table with Rewind/Next
+                            if *iter_dir == IterationDirection::Backwards {
+                                program.emit_insn(Insn::Last {
+                                    cursor_id: *cursor_id,
+                                    pc_if_empty: loop_end,
+                                });
+                            } else {
+                                program.emit_insn(Insn::Rewind {
+                                    cursor_id: *cursor_id,
+                                    pc_if_empty: loop_end,
+                                });
+                            }
+                            program.preassign_label_to_next_insn(loop_start);
+                            emit_materialized_subquery_result_columns(
+                                program,
+                                from_clause_subquery,
+                                &table.col_used_mask,
+                                *cursor_id,
+                                None,
+                            );
+                        }
+                        _ => {
+                            unreachable!("Subquery table with unexpected query destination")
+                        }
+                    }
+                }
+                (Scan::RecursiveCteInput, Table::RecursiveCteInput(_)) => {
+                    program.preassign_label_to_next_insn(loop_start);
+                }
+                _ => unreachable!(
+                    "{:?} scan cannot be used with {:?} table",
+                    scan, table.table
+                ),
+            }
+            if let Some(table_cursor_id) = table_cursor_id {
+                if let Some(index_cursor_id) = index_cursor_id {
+                    program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                }
+            }
+        }
+        Operation::Search(search) => {
+            let materialized_subquery_storage = match (&table.table, search) {
+                (
+                    Table::FromClauseSubquery(from_clause_subquery),
+                    Search::Seek {
+                        index: Some(index), ..
+                    },
+                ) if index.ephemeral => {
+                    materialized_from_clause_subquery_storage(from_clause_subquery)
+                }
+                _ => None,
+            };
+
+            // Open the loop for the index search.
+            // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
+            match search {
+                Search::RowidEq { cmp_expr } => {
+                    assert!(
+                        !matches!(table.table, Table::FromClauseSubquery(_)),
+                        "Subqueries do not support rowid seeks"
+                    );
+                    let src_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        cmp_expr,
+                        src_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: table_cursor_id
+                            .expect("Search::RowidEq requires a table cursor"),
+                        src_reg,
+                        target_pc: next,
+                    });
+                }
+                Search::Seek {
+                    index, seek_def, ..
+                } => {
+                    // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
+                    let mut bloom_filter = false;
+                    if let Some(index) = index {
+                        if index.ephemeral
+                            && !matches!(
+                                materialized_subquery_storage,
+                                Some(MaterializedFromClauseSubqueryStorage::DirectIndex)
+                            )
+                        {
+                            // Build auxiliary ephemeral indexes lazily from the row source,
+                            // whether it is a base table or a table-backed materialized subquery.
+                            let table_has_rowid = if let Table::BTree(btree) = &table.table {
+                                btree.has_rowid
+                            } else {
+                                matches!(&table.table, Table::FromClauseSubquery(_))
+                            };
+                            let num_seek_keys = seek_def.size(&seek_def.start);
+                            let table_columns = if let Table::BTree(btree) = &table.table {
+                                Some(btree.columns())
+                            } else {
+                                None
+                            };
+                            let AutoIndexResult {
+                                use_bloom_filter, ..
+                            } = emit_autoindex(
+                                program,
+                                AutoIndexBuild {
+                                    index,
+                                    table_cursor_id: table_cursor_id.expect(
+                                        "an ephemeral index must have a source table cursor",
+                                    ),
+                                    index_cursor_id: index_cursor_id
+                                        .expect("an ephemeral index must have an index cursor"),
+                                    table_has_rowid,
+                                    num_seek_keys,
+                                    seek_def,
+                                    affinity_str: plan::synthesized_seek_affinity_str(
+                                        index, seek_def,
+                                    )
+                                    .as_ref(),
+                                    table_columns,
+                                    table_ref_id: table.internal_id,
+                                    table_references,
+                                    resolver: &t_ctx.resolver,
+                                },
+                            )?;
+                            bloom_filter = use_bloom_filter;
+                        }
+                    }
+
+                    let seek_cursor_id = if materialized_subquery_storage.is_some() {
+                        index_cursor_id.expect("materialized subquery must have index cursor")
+                    } else {
+                        temp_cursor_id.unwrap_or_else(|| {
+                            index_cursor_id.unwrap_or_else(|| {
+                                table_cursor_id.expect(
+                                    "Either ephemeral or index or table cursor must be opened",
+                                )
+                            })
+                        })
+                    };
+
+                    let max_registers = seek_def
+                        .size(&seek_def.start)
+                        .max(seek_def.size(&seek_def.end));
+                    let start_reg = program.alloc_registers(max_registers);
+                    SeekEmitter::new(
+                        program,
+                        table_references,
+                        seek_def,
+                        t_ctx,
+                        seek_cursor_id,
+                        start_reg,
+                        loop_end,
+                        index.as_ref(),
+                    )
+                    .emit(loop_start, bloom_filter)?;
+
+                    if let Some(materialized_subquery_storage) = materialized_subquery_storage {
+                        let index_cursor_id = index_cursor_id
+                            .expect("materialized subquery seek requires index cursor");
+                        let Table::FromClauseSubquery(from_clause_subquery) = &table.table else {
+                            unreachable!("materialized subquery seek requires subquery")
+                        };
+                        match materialized_subquery_storage {
+                            MaterializedFromClauseSubqueryStorage::TableBacked => {
+                                let table_cursor_id = table_cursor_id
+                                    .expect("materialized subquery must have table cursor");
+                                program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                                emit_materialized_subquery_result_columns(
+                                    program,
+                                    from_clause_subquery,
+                                    &table.col_used_mask,
+                                    table_cursor_id,
+                                    None,
+                                );
+                            }
+                            // Expressions read direct index columns when they need them.
+                            // Copying all columns here would only write unused registers.
+                            MaterializedFromClauseSubqueryStorage::DirectIndex => {}
+                        }
+                    } else {
+                        // Only emit DeferredSeek for non-subquery tables
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            if let Some(table_cursor_id) = table_cursor_id {
+                                // Don't do a btree table seek until it's actually necessary to read from the table.
+                                program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                            }
+                        }
+                    }
+                }
+                Search::InSeek { index, source } => {
+                    let meta = emit_in_seek_start(
+                        program,
+                        table_references,
+                        &t_ctx.resolver,
+                        index.as_ref(),
+                        source,
+                        table_cursor_id,
+                        index_cursor_id,
+                        loop_start,
+                        loop_end,
+                    )?;
+                    t_ctx.meta_in_seeks[joined_table_index] = Some(meta);
+                }
+            }
+        }
+        Operation::IndexMethodQuery(query) => {
+            let start_reg = program.alloc_registers(query.arguments.len() + 1);
+            program.emit_int(query.pattern_idx as i64, start_reg);
+            for i in 0..query.arguments.len() {
+                translate_expr(
+                    program,
+                    Some(table_references),
+                    &query.arguments[i],
+                    start_reg + 1 + i,
+                    &t_ctx.resolver,
+                )?;
+            }
+            program.emit_insn(Insn::IndexMethodQuery {
+                db: crate::MAIN_DB_ID,
+                cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
+                start_reg,
+                count_reg: query.arguments.len() + 1,
+                pc_if_empty: loop_end,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            if let Some(table_cursor_id) = table_cursor_id {
+                if let Some(index_cursor_id) = index_cursor_id {
+                    program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                }
+            }
+        }
+        Operation::MultiIndexScan(multi_idx_op) => {
+            emit_multi_index_scan_loop(
+                program,
+                t_ctx,
+                table,
+                table_references,
+                multi_idx_op,
+                loop_start,
+                loop_end,
+            )?;
+        }
+        Operation::HashJoin(_) => {
+            unreachable!("a hash join starts its reads in HashProbeSetupEmitter")
+        }
+    }
+    Ok(())
+}
+
+/// Record one matched right-side row in the exact set and its bloom filter.
+///
+/// The exact `Found` check avoids duplicate index inserts when several left rows
+/// match the same right row. The bloom filter only speeds up the later scan.
+fn emit_right_join_match(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+) {
+    emit_right_join_key(program, right_join, table_cursor_id, None);
+    let key_len = right_join.key_len();
+    let already_recorded = program.allocate_label();
+    program.emit_insn(Insn::Found {
+        cursor_id: right_join.matched_rows_cursor_id,
+        target_pc: already_recorded,
+        record_reg: right_join.key_start_reg,
+        num_regs: key_len,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(right_join.key_start_reg),
+        count: to_u32(key_len),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: right_join.matched_rows_cursor_id,
+        record_reg,
+        unpacked_start: Some(right_join.key_start_reg),
+        unpacked_count: Some(to_u32(key_len)),
+        flags: IdxInsertFlags::new(),
+    });
+    program.emit_insn(Insn::FilterAdd {
+        cursor_id: right_join.matched_rows_cursor_id,
+        key_reg: right_join.key_start_reg,
+        num_keys: key_len,
+    });
+    program.preassign_label_to_next_insn(already_recorded);
+}
+
+/// Read the current right-side row's key into the shared match-key registers.
+///
+/// SQLite uses the rowid as the identity of a matched right row, or the
+/// primary key for a WITHOUT ROWID table. A recursive pseudo-row has a NULL
+/// rowid and still follows the same exact-set lookup.
+pub(super) fn emit_right_join_key(
+    program: &mut ProgramBuilder,
+    right_join: &RightJoinMetadata,
+    table_cursor_id: CursorID,
+    index_cursor_id: Option<CursorID>,
+) {
+    if let Some(primary_key_columns) = &right_join.primary_key_columns {
+        turso_assert!(
+            index_cursor_id.is_none(),
+            "a WITHOUT ROWID table has no secondary index to drive its loop"
+        );
+        for (key_position, &column_position) in primary_key_columns.iter().enumerate() {
+            program.emit_column_or_rowid(
+                table_cursor_id,
+                column_position,
+                right_join.key_start_reg + key_position,
+            );
+        }
+    } else if let Some(index_cursor_id) = index_cursor_id {
+        // The index drives this loop, so its rowid identifies the current row.
+        // The table cursor does not move until `DeferredSeek` runs.
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: index_cursor_id,
+            dest: right_join.key_start_reg,
+        });
+    } else {
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: right_join.key_start_reg,
+        });
+    }
+}
+
+/// Emit the `VFilter` that starts a virtual-table loop.
+///
+/// The main loop and the unmatched-right read must use the argument order
+/// that `best_index` selected.
+#[allow(clippy::too_many_arguments)]
+fn emit_virtual_table_scan_start(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    table_cursor_id: CursorID,
+    idx_num: i32,
+    idx_str: Option<&str>,
+    constraints: &[Expr],
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+) -> Result<()> {
+    let start_reg = program.alloc_registers(constraints.len());
+    for (argument_index, expr) in constraints.iter().enumerate() {
+        translate_expr(
+            program,
+            Some(table_references),
+            expr,
+            start_reg + argument_index,
+            resolver,
+        )?;
+    }
+
+    let idx_str = idx_str.map(|value| {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: register,
+            value: value.to_owned(),
+        });
+        register
+    });
+    program.emit_insn(Insn::VFilter {
+        cursor_id: table_cursor_id,
+        arg_count: constraints.len(),
+        args_reg: start_reg,
+        idx_str,
+        idx_num: idx_num as usize,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    Ok(())
 }

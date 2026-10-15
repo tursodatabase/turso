@@ -614,7 +614,6 @@ proc file_control_reservebytes {args} { return "" }
 proc file_control_tempfilename {args} { return "" }
 proc file_control_external_reader {args} { return "" }
 proc file_control_data_version {args} { return 0 }
-proc load_static_extension {args} { return "" }
 proc register_echo_module {args} { return "" }
 proc register_tcl_module {args} { return "" }
 proc register_fs_module {args} { return "" }
@@ -781,8 +780,8 @@ proc md5 {str} {
   if {![catch {package require md5}]} {
     return [string tolower [::md5::md5 -hex $str]]
   }
-  set f [file tempfile]
-  set fd [open $f wb]
+  set fd [file tempfile f]
+  fconfigure $fd -translation binary
   puts -nonewline $fd $str
   close $fd
   set sum [lindex [exec md5sum $f] 0]

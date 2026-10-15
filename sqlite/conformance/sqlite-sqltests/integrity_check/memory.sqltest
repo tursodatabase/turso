@@ -239,3 +239,83 @@ test integrity-check-table-check-constraint-null-passes {
 expect {
     ok
 }
+
+# integrity_check must validate the declared types of STRICT table columns.
+# A healthy STRICT table reports "ok" for every storage class.
+@cross-check-integrity
+test integrity-check-strict-stored-types {
+    CREATE TABLE t11(i INT, n INTEGER, r REAL, tx TEXT, b BLOB, a ANY) STRICT;
+    INSERT INTO t11 VALUES(1, 2, 1.5, 'x', x'0102', 'any');
+    INSERT INTO t11 VALUES(NULL, NULL, NULL, NULL, NULL, NULL);
+    SELECT typeof(i),typeof(n),typeof(r),typeof(tx),typeof(b),typeof(a) FROM t11;
+    PRAGMA integrity_check;
+    PRAGMA quick_check;
+}
+expect {
+    integer|integer|real|text|blob|text
+    null|null|null|null|null|null
+    ok
+    ok
+}
+
+# A REAL column can hold a value with an integer storage class, because the
+# file format stores integral reals as integers. This must stay "ok".
+@cross-check-integrity
+test integrity-check-strict-real-holds-integer {
+    CREATE TABLE t12(r REAL NOT NULL) STRICT;
+    INSERT INTO t12 VALUES(42);
+    SELECT typeof(r), r FROM t12;
+    PRAGMA integrity_check;
+}
+expect {
+    real|42.0
+    ok
+}
+# JS Number drops the .0 suffix on whole floats
+expect @js {
+    real|42
+    ok
+}
+
+# Virtual generated columns get the affinity of their declared type before the
+# type check, so a TEXT base column that holds '42' is valid for an INT column.
+@cross-check-integrity
+test integrity-check-strict-virtual-generated-columns {
+    CREATE TABLE t13(a TEXT, b INT AS(a), c REAL AS(a), d ANY AS(a), e TEXT AS(a||'!')) STRICT;
+    INSERT INTO t13(a) VALUES('42');
+    SELECT typeof(b),typeof(c),typeof(d),typeof(e) FROM t13;
+    PRAGMA integrity_check;
+    PRAGMA quick_check;
+}
+expect {
+    integer|real|text|text
+    ok
+    ok
+}
+
+# NOT NULL and the STRICT type check apply to the same column together.
+@cross-check-integrity
+test integrity-check-strict-not-null-columns {
+    CREATE TABLE t14(id INTEGER PRIMARY KEY, b TEXT NOT NULL, c INT NOT NULL AS(length(b))) STRICT;
+    INSERT INTO t14(id,b) VALUES(1,'abc');
+    SELECT c FROM t14;
+    PRAGMA integrity_check;
+}
+expect {
+    3
+    ok
+}
+
+# Tables that are not STRICT keep no declared-type guarantee, so a TEXT value
+# in an INT column is not an integrity error.
+@cross-check-integrity
+test integrity-check-non-strict-type-mismatch-is-ok {
+    CREATE TABLE t15(a INT, b INTEGER NOT NULL);
+    INSERT INTO t15 VALUES('abc', 1);
+    SELECT typeof(a) FROM t15;
+    PRAGMA integrity_check;
+}
+expect {
+    text
+    ok
+}

@@ -16,34 +16,51 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Keeps file and line numbers in backtraces but drops the rest of the
+  # debug info, which makes the Rust cache entries smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   run-fuzz-tests:
+    name: run-fuzz-tests (part ${{ matrix.partition }}/2)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # nextest splits the fuzz tests between the two jobs; every test runs in
+    # exactly one of them.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
 
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
+    # run-fuzz-tests and run-long-fuzz-tests build the same things, so they
+    # share one cache entry. Only part 1 of this job saves it.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
+        shared-key: "fuzz-all-features"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
+    # Needed: nextest compiles every workspace package's test binaries
+    # before filtering, and one of them links the turso_sqlite3 library
+    # this step builds ("library not found: turso_sqlite3" without it).
     - name: Build
       run: cargo build --verbose --locked --all-features
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
         FUZZ_MULTIPLIER: "0.5"
-      run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests) | binary(pending_byte_tests)' --failure-output=final
+      run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests) | binary(pending_byte_tests)' --partition slice:${{ matrix.partition }}/2 --failure-output=final
 
   run-long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -57,13 +74,15 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
-        cache-on-failure: true
+        shared-key: "fuzz-all-features"
+        save-if: false
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
+    # Needed for the same reason as in run-fuzz-tests.
     - name: Build
       run: cargo build --verbose --locked --all-features
     - name: Run ignored long fuzz tests
@@ -80,24 +99,64 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
+    # Builds with --cfg shuttle, so it can't reuse the other jobs' cache.
     - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
-    - name: Build
-      run: cargo build --verbose --locked --all-features
     - name: Run ignored long tests
       env:
         RUST_BACKTRACE: 1
       run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
 
+  fts-stress-test:
+    name: FTS stress (${{ matrix.mode }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    # This job mostly runs the stress test rather than compiling it, so
+    # build with optimizations. The dev profile keeps debug assertions and
+    # overflow checks on at any opt-level, so the checks are the same.
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "2"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: wal
+            tx-mode: sqlite
+          - mode: mvcc
+            tx-mode: concurrent
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Run FTS stress test
+      env:
+        RUST_BACKTRACE: 1
+      run: >-
+        cargo run -p turso_stress --locked --
+        --fts --tx-mode ${{ matrix.tx-mode }}
+        --nr-threads 2 --nr-iterations 10000
+
   shuttle-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # Two shuttle tests ran ~8-9 min each unoptimized. With optimizations
+    # they run the same iterations with the same checks (the dev profile
+    # keeps debug assertions and overflow checks on at any opt-level).
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "2"
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
@@ -107,11 +166,17 @@ jobs:
       with:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Run shuttle mvcc tests
       env:
         RUST_BACKTRACE: "full"
         RUSTFLAGS: "--cfg=shuttle"
       run: cargo test -p turso_stress --locked --test shuttle_mvcc
+    - name: Run shuttle mvcc checkpoint tests
+      env:
+        RUST_BACKTRACE: "full"
+        RUSTFLAGS: "--cfg=shuttle"
+      run: cargo test -p turso_stress --locked --test shuttle_mvcc_checkpoint
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1
@@ -135,10 +200,14 @@ jobs:
       with:
         prefix-key: "v1-rust-fuzz"
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz@0.13.0
     - name: Build all libFuzzer targets
       run: cargo +nightly-2025-12-17 fuzz build --dev
+    # A failure here never fails the job, so on pull requests it only costs
+    # time. Run it on main and tags, where someone can look at the output.
     - name: Run scalar_func fuzzer
+      if: github.event_name != 'pull_request'
       continue-on-error: true
       run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300

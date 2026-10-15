@@ -1,4 +1,6 @@
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell};
 use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::types::Value as SqliteValue;
 use serial_test::serial;
 use std::{
@@ -10,7 +12,7 @@ use std::{
         Arc,
     },
 };
-use turso_core::{Connection, LimboError, StepResult};
+use turso_core::{ConnectOpts, Connection, LimboError, StepResult};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -19,6 +21,81 @@ use turso_ext::{
 
 static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[turso_macros::test(mvcc)]
+fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let context = Arc::new(std::sync::Mutex::new(7i64));
+    let first = db.connect_with_context(context.clone())?;
+    let first_clone = first.clone();
+    let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
+    let shared = db.connect_with_context(context.clone())?;
+    let plain = db.connect(ConnectOpts::new())?;
+
+    assert!(std::ptr::eq(
+        context.as_ref(),
+        first.context::<std::sync::Mutex<i64>>().unwrap()
+    ));
+    assert!(first.context::<i64>().is_none());
+    assert!(first.context::<std::sync::Mutex<u64>>().is_none());
+    assert!(plain.context::<std::sync::Mutex<i64>>().is_none());
+
+    *context.lock().unwrap() = 13;
+    for (conn, expected) in [(&first_clone, 13), (&second, 19), (&shared, 13)] {
+        assert_eq!(
+            *conn
+                .context::<std::sync::Mutex<i64>>()
+                .unwrap()
+                .lock()
+                .unwrap(),
+            expected
+        );
+    }
+    *second
+        .context::<std::sync::Mutex<i64>>()
+        .unwrap()
+        .lock()
+        .unwrap() = 23;
+    assert_eq!(*context.lock().unwrap(), 13);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn connection_context_lives_until_the_last_connection_owner_drops(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let context = Arc::new(ConnectionContextDropCounter(drops.clone()));
+    let weak = Arc::downgrade(&context);
+    let conn = tmp_db
+        .limbo_database()
+        .connect_with_context(context.clone())?;
+    let cloned_conn = conn.clone();
+    let mut statement = conn.prepare("SELECT 7")?;
+
+    drop(context);
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 0);
+    drop(conn);
+    assert!(weak.upgrade().is_some());
+    drop(cloned_conn);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(
+        statement.run_collect_rows()?,
+        vec![vec![turso_core::Value::from_i64(7)]]
+    );
+    drop(statement);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+    Ok(())
+}
+
+struct ConnectionContextDropCounter(Arc<AtomicUsize>);
+
+impl Drop for ConnectionContextDropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
 
 struct MultiplierState {
     multiplier: i64,
@@ -910,13 +987,13 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     }
     let binary_join_sql =
         "SELECT count(*) FROM left_values AS l JOIN right_values AS r ON l.value = r.value";
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {binary_join_sql}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1).is_some_and(|value| {
-            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
-        })
-    });
-    assert!(has_hash, "expected equivalent binary join to use hash join");
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN {binary_join_sql}")
+    ))
+    .named("opcodes of the binary join")
+    .column(1)
+    .contains_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     conn.execute("DELETE FROM right_values")?;
     for id in 0..100 {
@@ -925,26 +1002,16 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     }
     let join_sql = "SELECT count(*) FROM left_values AS l JOIN right_values AS r \
         ON l.value = r.value COLLATE dotnet_nocase";
-    let query_plan: Vec<(i64, i64, i64, String)> =
-        conn.exec_rows(&format!("EXPLAIN QUERY PLAN {join_sql}"));
-    assert!(
-        !query_plan
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("USING INDEX ephemeral_")),
-        "custom collations must not use a binary temporary index: {query_plan:?}"
-    );
-    let joined: Vec<(i64,)> = conn.exec_rows(join_sql);
-    assert_eq!(joined, vec![(1000,)]);
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1).is_some_and(|value| {
-            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
-        })
-    });
-    assert!(
-        !has_hash,
-        "custom collations must not use binary-hashed joins"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {join_sql}")
+    ))
+    .has_no_step_containing("USING INDEX ephemeral_");
+    assert_that!(limbo_exec_rows(&conn, join_sql)).is_equal_to(vec![row![1000]]);
+    assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}")))
+        .named("opcodes of the custom collation join")
+        .column(1)
+        .does_not_contain_any_of([Cell::from("HashBuild"), Cell::from("HashProbe")]);
 
     let other_conn = tmp_db.connect_limbo();
     other_conn.register_external_collation(
@@ -969,5 +1036,155 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     assert_eq!(rows, vec![("ok".to_string(),)]);
     other_conn.unregister_external_collation("dotnet_nocase");
 
+    Ok(())
+}
+
+static TRACKED_DOUBLE_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+static TRACKED_CALLS_AFTER_DESTROY: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackedState {
+    sum: i64,
+    destroyed: bool,
+}
+
+unsafe extern "C" fn tracked_init(_context: usize) -> *mut AggCtx {
+    let state = Box::into_raw(Box::new(TrackedState {
+        sum: 0,
+        destroyed: false,
+    }));
+    Box::into_raw(Box::new(AggCtx {
+        state: state as *mut c_void,
+    }))
+}
+
+unsafe fn tracked_state<'a>(aggregate_context: *mut AggCtx) -> &'a mut TrackedState {
+    let aggregate_context = unsafe { &mut *aggregate_context };
+    unsafe { &mut *(aggregate_context.state as *mut TrackedState) }
+}
+
+unsafe extern "C" fn tracked_step(
+    _context: usize,
+    aggregate_context: *mut AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let state = unsafe { tracked_state(aggregate_context) };
+    if state.destroyed {
+        TRACKED_CALLS_AFTER_DESTROY.fetch_add(1, AtomicOrdering::SeqCst);
+        return ExtValue::error_with_message("step on destroyed state".to_string());
+    }
+    if argc > 0 && !argv.is_null() {
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        state.sum += args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+    }
+    ExtValue::null()
+}
+
+unsafe extern "C" fn tracked_final_fails(
+    _context: usize,
+    aggregate_context: *mut AggCtx,
+) -> ExtValue {
+    let state = unsafe { tracked_state(aggregate_context) };
+    if state.destroyed {
+        TRACKED_CALLS_AFTER_DESTROY.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+    ExtValue::error_with_message("Final failed".to_string())
+}
+
+unsafe extern "C" fn tracked_destroy(aggregate_context: usize) {
+    let state = unsafe { tracked_state(aggregate_context as *mut AggCtx) };
+    if state.destroyed {
+        TRACKED_DOUBLE_DESTROYS.fetch_add(1, AtomicOrdering::SeqCst);
+        return;
+    }
+    state.destroyed = true;
+}
+
+fn step_until_error_or_done(stmt: &mut turso_core::Statement) -> Option<LimboError> {
+    loop {
+        match stmt.step() {
+            Ok(StepResult::IO) => stmt.get_pager().io.step().unwrap(),
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => return None,
+            Ok(other) => panic!("unexpected step result {other:?}"),
+            Err(err) => return Some(err),
+        }
+    }
+}
+
+#[turso_macros::test]
+#[serial]
+fn external_aggregate_finalize_error_destroys_state_once(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    TRACKED_DOUBLE_DESTROYS.store(0, AtomicOrdering::SeqCst);
+    TRACKED_CALLS_AFTER_DESTROY.store(0, AtomicOrdering::SeqCst);
+    let conn = tmp_db.connect_limbo();
+    register_context_aggregate(
+        &conn,
+        "final_fails",
+        1,
+        0,
+        tracked_init,
+        tracked_step,
+        tracked_final_fails,
+        None,
+        Some(tracked_destroy),
+        None,
+    )?;
+    conn.execute("CREATE TABLE data(value INTEGER)")?;
+    conn.execute("INSERT INTO data VALUES (1), (2)")?;
+
+    let mut stmt = conn.prepare("SELECT final_fails(value) FROM data")?;
+    let err = step_until_error_or_done(&mut stmt).expect("finalize error");
+    assert!(err.to_string().contains("Final failed"), "{err}");
+
+    for _ in 0..3 {
+        let err = step_until_error_or_done(&mut stmt).expect("finalize error on re-step");
+        assert!(err.to_string().contains("Final failed"), "{err}");
+    }
+
+    assert_eq!(TRACKED_DOUBLE_DESTROYS.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(TRACKED_CALLS_AFTER_DESTROY.load(AtomicOrdering::SeqCst), 0);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn external_aggregate_cannot_be_used_as_window_function(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let counters = Arc::new(CallbackCounters::default());
+    let conn = tmp_db.connect_limbo();
+    register_context_aggregate(
+        &conn,
+        "managed_sum",
+        1,
+        boxed_aggregate_context(counters.clone()),
+        managed_sum_init,
+        managed_sum_step,
+        managed_sum_final,
+        Some(drop_aggregate_context),
+        Some(drop_sum_state),
+        None,
+    )?;
+    conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)")?;
+    conn.execute("INSERT INTO data(value) VALUES (1), (2), (3)")?;
+
+    let err = conn
+        .prepare("SELECT managed_sum(value) OVER (ORDER BY id) FROM data")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "managed_sum() is an extension aggregate and cannot be used as a window function"
+        ),
+        "{err}"
+    );
+
+    let grouped: Vec<(i64,)> = conn.exec_rows("SELECT managed_sum(value) FROM data");
+    assert_eq!(grouped, vec![(6,)]);
     Ok(())
 }

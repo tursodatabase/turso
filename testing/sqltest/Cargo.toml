@@ -46,7 +46,7 @@ miette = { workspace = true, features = ["fancy"] }
 glob = "0.3"
 
 itertools = { workspace = true }
-chumsky = "0.12.0"
+chumsky = { workspace = true }
 
 # Database generation
 fake = { version = "4.4", features = ["derive", "rand_core"] }

@@ -29,7 +29,7 @@ use sealed::Sealed;
 ///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
 ///   by doing `(1, "foo")`.
-/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
+/// - For hetergeneous parameter lists of 16 or greater, the [`turso::params!`][crate::params!] is supported
 ///   by doing `turso::params![1, "foo"]`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
 ///   supported by doing `[1, 2, 3]`.
@@ -67,7 +67,7 @@ use sealed::Sealed;
 ///
 /// - For heterogeneous parameter lists of 16 or less items a tuple syntax is supported
 ///   by doing `((":key1", 1), (":key2", "foo"))`.
-/// - For heterogeneous parameter lists of 16 or greater, the [`turso::params!`] is supported
+/// - For heterogeneous parameter lists of 16 or greater, the [`turso::params!`][crate::params!] is supported
 ///   by doing `turso::named_params![":key1": 1, ":key2": "foo"]`.
 /// - For homogeneous parameter types (where they are all the same type), const arrays are
 ///   supported by doing `[(":key1", 1), (":key2", 2), (":key3", 3)]`.

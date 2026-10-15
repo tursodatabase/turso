@@ -2,8 +2,8 @@ use crate::sync::Arc;
 
 use crate::{
     index_method::{
-        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCursor,
-        IndexMethodDefinition, BACKING_BTREE_INDEX_METHOD_NAME,
+        BackingSchema, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
+        IndexMethodCursor, IndexMethodDefinition, BACKING_BTREE_INDEX_METHOD_NAME,
     },
     LimboError, Result,
 };
@@ -50,5 +50,9 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
         Err(LimboError::InternalError(
             "init is not supported for backing_btree index method".to_string(),
         ))
+    }
+
+    fn backing_schema(&self) -> BackingSchema {
+        BackingSchema::default()
     }
 }

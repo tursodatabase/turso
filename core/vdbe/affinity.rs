@@ -75,7 +75,6 @@ use crate::{
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
-    // Affinity = 0 is kept as a special value for custom types
     Blob = 1,
     Text = 2,
     Numeric = 3,
@@ -323,7 +322,7 @@ impl Affinity {
     /// is harmless.  A false positive, however, can result in the wrong
     /// answer.
     ///
-    /// reference https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000
+    /// reference <https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000>
     pub fn expr_needs_no_affinity_change(&self, expr: &Expr) -> bool {
         if matches!(self, Affinity::Blob | Affinity::None) {
             return true;

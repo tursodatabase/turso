@@ -1,0 +1,301 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html><head>
+  <title>TATP Test Suite - Using solidDB Accelerator library with TATP</title>
+
+
+  
+
+
+
+
+
+  
+  
+  <meta name="description" content="">
+
+
+  
+  
+  <meta name="keywords" content="">
+
+
+  
+  
+  <link rel="stylesheet" type="text/css" href="images/styles.css">
+
+
+  
+  
+  <link rel="stylesheet" type="text/css" href="images/position.css">
+</head><body leftmargin="0" topmargin="0" bgcolor="#dddcdb" link="#566782" marginheight="0" marginwidth="0" text="#4d4d4d" vlink="#566782">
+    
+<a name="top"></a>    
+    
+<table border="0" cellpadding="0" cellspacing="0" width="100%">
+
+
+
+
+      <tbody>
+        <tr>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+          <td valign="top" width="800"><a name="top"></a>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="3" width="18"><img src="images/nav_left.gif" alt="" border="0" height="73" width="18"></td>
+                  <td colspan="3" valign="top" width="764"><img src="images/logo_top.gif" alt="" border="0" height="10" width="764"></td>
+                  <td rowspan="3" width="18"><img src="images/nav_right.gif" alt="" border="0" height="73" width="18"></td>
+                </tr>
+                <tr>
+                  <td align="center" width="141"><img alt="TATP" src="images/tatp-logo.gif" height="63" width="141"></td>
+                  <td width="3"><img src="images/logo_right.gif" alt="" border="0" height="63" width="3"></td>
+                  <td bgcolor="#75b2dd" width="620">
+            <table border="0" cellpadding="0" cellspacing="0" width="570">
+
+                      <tbody><tr>
+                        <td width="30"><img src="images/clear.gif" alt="" border="0" height="1" width="20"></td>
+                        <td class="mission" align="right" width="510">Telecom Application Transaction Processing Benchmark<br>
+</td>
+                      </tr>
+                    </tbody>
+            </table>
+</td>
+                </tr>
+                <tr>
+                  <td colspan="3" bgcolor="#ffffff" valign="top" width="764"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">
+                    <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                      <tbody>
+                        <tr>
+                          <td height="150" valign="top">
+
+                            <table bgcolor="#c1def1" border="0" cellpadding="0" cellspacing="0" width="138">
+                              <tbody>
+                                <tr>
+                                  <td colspan="4"><img src="images/clear.gif" alt="" border="0" height="29" width="138"></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                <tr height="17">
+                                  <td width="10">&nbsp;</td>
+                                  <td colspan="3" class="note" valign="top"><a href="index.html"><b>Home</b></a></td>
+                                </tr>
+                                <tr>
+                                  <td colspan="4" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="1" width="138"></td>
+                                </tr>
+                                
+                              </tbody>
+                            </table>
+
+                          </td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#c1def1"><img src="images/clear.gif" alt="" border="0" height="20" width="138"></td>
+                        </tr>
+                        <tr>
+                          <td bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="138"></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="10"><img src="images/clear.gif" alt="" border="0" height="1" width="10"></td>
+                  <td bgcolor="#ffffff" valign="top" width="610">
+<br>
+
+<table border="0" cellpadding="2" cellspacing="0" width="100%">
+<tbody><tr>
+<td>
+                  
+
+                  <h1>Using solidDB Accelerator library (Linked Library Access) <br>
+                  with TATP</h1>
+
+
+                  <h2>CONTENTS</h2>
+
+                  <ul>
+<li><a href="#SEC01">General information</a></li>
+<li><a href="#SEC02">Using Solid Accelerator with UnixODBC</a></li>
+<li><a href="#SEC03">Linking and using Solid Accelerator directly</a></li>
+<li><a href="#SEC04">Avoiding extra database start</a></li>
+                  </ul>
+
+<h2><a name="SEC01"></a>General information</h2>
+     <p>solidDB
+Accelerator library (known also by the feature name of Linked Library
+Access) is a part of the solidDB product, that allows accessing a
+database from inside a client process, avoiding overhead and latencies
+of inter-process or network communication. Using the Accelerator
+library is especially
+efficient with solidDB memory-resident tables when transaction response
+times reach the minimum.</p>
+     <p>The information below is intended to describe how to run TATP benchmark with solidDB 
+Accelerator in Linux environment.</p>
+
+ 
+<h2><a name="SEC02"></a>Using solidDB Accelerator with UnixODBC</h2>
+     <p>UnixODBC
+Driver Manager allows using any available ODBC Data Source as
+configured at run-time. solidDB Accelerator can also be used that way
+because it exposes the same Application Programming Interface (API) as
+any ODBC driver. </p>
+	<p>The following configuration files must be set up to use solidDB Accelerator with UnixODBC:</p>
+		<ul>
+<li>odbcinst.ini</li>
+<li>odbc.ini (.odbc.ini)</li>
+<li>solid.ini</li>
+		</ul>
+	<h4>odbcinst.ini</h4>
+	<p class="padded">solidDB Accelerator must be registered in UnixODBC as a ODBC Driver in odbcinst.ini file. That file
+is usually system-wide and is located in /etc directory. The section similar to the following must be 
+added:
+
+</p><pre>[Solid Accelerator]<br>Driver=/opt/SolidDB/soliddb-6.3/bin/ssolidac63.so<br>Threading=0<br></pre>
+	
+	<h4>odbc.ini (.odbc.ini)</h4>
+      <p class="padded">
+	An ODBC Data Source must be created specifying solidDB Accelerator driver registered in the previous 
+step. The file used for the purpose is either system-wide /etc/odbc.ini or user-specific $HOME/.odbc.ini, 
+both having the same syntax. The example of modifications is provided below:
+      
+	</p><pre>[MyAcceleratorDB]<br>Driver=Solid Accelerator<br></pre>
+	
+	<p class="padded">In this example, the driver is named 'Solid Accelerator' and the absolute path to Accelerator
+shared library binary (ssolidac63.so) is specified.</p>
+	
+	<h4>solid.ini</h4>
+	<p class="padded">solid.ini
+in the described accelerator configuration contains both the client-side and
+server-side settings. The client configuration describes that the ODBC
+data source is Solid Accelerator and is given in
+[Data Sources] section and must use the reserved word 'localserver' as a data
+source string. The server-side configuration can be any valid solidDB
+server configuration.
+</p><p class="padded">
+We provide a simple example with memory-based tables and no logging
+below: </p>
+
+<pre>[Data Sources]<br>MyAcceleratorDB="localserver"<br><br>[General]<br>DefaultStoreIsMemory=Yes<br><br>[IndexFile]<br>FileSpec_1=solid.db 16000m<br><br>[Logging]<br>LogEnabled=no<br><br></pre>
+<a href="#top">Back to top</a>
+
+<h2><a name="SEC03"></a>Linking and using solidDB Accelerator directly</h2>
+
+<p>Instead of linking to unixODBC, TATP benchmark can be also linked to solidDB Accelerator library directly. 
+Direct linked binaries do not require installed ODBC Driver Manager and setting up ODBC configuration. Directly linked
+binaries also result in better performance because no intermediary layer like driver manager is involved.</p>
+<p>
+See Makefile for instructions on how to build TATP directly linked with solidDB Accelerator library.
+</p>
+
+<h4>Accessing solidDB Accelerator database from TATP test</h4>
+<p class="padded">No additional client settings are needed as compared to UnixODBC configuration. However,
+solid.ini file must still be used for solidDB server-side settings.
+</p><p class="padded">
+Local Accelerator database is accessed if 'localserver' is specified in the DDF file:</p>
+<pre>db_connect="DSN=localserver;UID=dba;PWD=dba"<br></pre>
+<a href="#top">Back to top</a>
+
+<h2><a name="SEC04"></a>Avoiding extra database start</h2>
+<p>By default, TATP connects to a test database several times. One
+connection is performed to apply the test load.  In addition to that,
+other connections are established for the control program to check 
+and update the database state.
+These additional steps are necessary if TATP runs for the first time on a not yet
+configured database, or checks whether the database population size have changed
+since the previous run. </p>
+<p>Additional database connections inflict database startup and may take time, especially if memory-based tables are used. 
+Those extra connections may be skipped if the test database is correctly initialized and populated, with
+the following configuration modifications: </p>
+<ul>
+<li>'TargetDBInit' parameter in tatp.ini must not exist (or be commented out) or should contain an empty value</li>
+<li>'populate' line must not exist (or be commented out) under [Test sequence] section in TDF file</li>
+</ul>
+<a href="#top">Back to top</a><br>
+&nbsp;<br>
+
+</td></tr>
+
+</tbody></table>
+
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="43"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138">&nbsp;</td>
+                  <td bgcolor="#ffffff" valign="top" width="10"><img src="images/clear.gif" alt="" border="0" height="1" width="10"></td>
+                  <td bgcolor="#ffffff" valign="top" width="610">&nbsp;<cite>Updated: 2009-03-27</cite></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="1" width="3"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td rowspan="2" background="images/nav2_left.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td bgcolor="#96938e" valign="top" width="138"><img src="images/clear.gif" alt="" border="0" height="25" width="138"></td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td align="center" bgcolor="#0072c6" width="617">
+                    <table border="0" cellpadding="0" cellspacing="0" width="550">
+                      <tbody>
+                        <tr>
+                          <td class="footer">
+                          <br>
+</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                  <td bgcolor="#ffffff" valign="top" width="3"><img src="images/clear.gif" alt="" border="0" height="25" width="3"></td>
+                  <td rowspan="2" background="images/nav2_right.gif" width="18"><img src="images/clear.gif" alt="" border="0" height="1" width="18"></td>
+                </tr>
+                <tr>
+                  <td colspan="5" bgcolor="#ffffff"><img src="images/clear.gif" alt="" border="0" height="3" width="764"></td>
+                </tr>
+              </tbody>
+            </table>
+            <table border="0" cellpadding="0" cellspacing="0" width="800">
+              <tbody>
+                <tr>
+                  <td width="21"><img src="images/footer_left.gif" alt="" border="0" height="24" width="21"></td>
+                  <td class="copyright" align="center" bgcolor="#96938e" width="758">March 2009<br>
+</td>
+                  <td width="21"><img src="images/footer_right.gif" alt="" border="0" height="24" width="21"></td>
+                </tr>
+                <tr>
+                  <td colspan="3"><img src="images/footer_bottom.gif" alt="" border="0" height="13" width="800"></td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+          <td width="50%"><img src="images/clear.gif" alt="" border="0" height="1" width="1"></td>
+        </tr>
+      </tbody>
+    
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+
+  </body></html>

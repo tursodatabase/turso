@@ -82,8 +82,8 @@ pub fn run(config: &Config) -> Run {
         .block_on(count_rows(&db));
 
     eprintln!(
-        "[turso] io backend {}, checkpoint mode {:?}",
-        config.io, config.checkpoint_mode
+        "[turso] io backend {}, checkpoint mode {:?}, group commit {}",
+        config.io, config.checkpoint_mode, config.group_commit
     );
 
     Run {
@@ -225,6 +225,9 @@ async fn setup(config: &Config) -> Database {
     let conn = db.connect().unwrap();
     if config.mode == TxnMode::Concurrent {
         conn.pragma_update("journal_mode", "mvcc").await.unwrap();
+        conn.pragma_update("mvcc_group_commit", config.group_commit)
+            .await
+            .unwrap();
         if let Some(threshold) = config.mvcc_checkpoint_threshold {
             conn.pragma_update("mvcc_checkpoint_threshold", threshold)
                 .await

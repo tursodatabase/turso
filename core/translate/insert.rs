@@ -1,10 +1,12 @@
 use crate::schema::ColumnLayout;
-use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
+use crate::translate::emitter::{
+    emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
+};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
         EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
@@ -285,6 +287,8 @@ pub fn translate_insert(
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),
@@ -339,6 +343,7 @@ pub fn translate_insert(
             identifier: normalize_ident(table_name.as_str()),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -642,15 +647,18 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
-    if ctx.table.is_strict {
-        // Pre-encode TypeCheck: validate input types match the custom type's
-        // declared value type BEFORE encoding. This catches type mismatches
-        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
-        // be silently converted by the encode expression.
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let maybe_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
+            check_generated: false,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
                 resolver.schema(),
@@ -661,13 +669,14 @@ pub fn translate_insert(
         // Encode values for columns with custom types.
         emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
-        // Post-encode TypeCheck: validate that encode produced the correct
-        // storage type (BASE).
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
-            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+            check_generated: false,
+            table_reference: Arc::clone(type_check_table),
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
@@ -777,7 +786,19 @@ pub fn translate_insert(
         }
     }
 
-    // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
+    // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
+    // then compute virtual columns, and then emit constraints+actions again for virtual columns
+    // only. For example, when running this:
+    //
+    //   CREATE TABLE t(a NOT NULL DEFAULT 5, b AS (a + 1) NOT NULL);
+    //   INSERT OR REPLACE INTO t(a) VALUES(NULL);
+    //
+    //  We need to do the following steps in order:
+    //    1. replace `a` with 5 (the NOT NULL REPLACE action)
+    //    2. compute `b`
+    //    3. check that `b` isn't null (the NOT NULL constraint)
+    emit_notnulls(program, &ctx, &insertion, resolver, false)?;
+
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
@@ -787,9 +808,22 @@ pub fn translate_insert(
             resolver,
             &btree_table,
         )?;
+
+        if let Some(type_check_table) = maybe_type_check_table {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: ctx.table.columns().len(),
+                //TODO here we could eventually type-check only virtual columns and the stored
+                // columns that have NOT NULL REPLACE.
+                check_generated: true,
+                table_reference: type_check_table,
+            });
+        }
+
+        emit_notnulls(program, &ctx, &insertion, resolver, true)?;
     }
 
-    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
+    // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
@@ -859,10 +893,6 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // NOT NULL default substitution must happen before index key registers are
-    // copied in preflight constraint checks. Otherwise the index entry gets NULL
-    // while the table row gets the default value, causing integrity_check failures.
-    emit_notnulls(program, &ctx, &insertion, resolver)?;
 
     // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
@@ -901,7 +931,6 @@ pub fn translate_insert(
         insertion.col_mappings.iter().map(|m| m.column),
         insertion.base_reg,
         insertion.record_register(),
-        ctx.table.is_strict,
     );
 
     if has_fks {
@@ -968,14 +997,6 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
-
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -1741,7 +1762,12 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: table_name_reg,
+        extra_amount: 0,
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
@@ -1773,11 +1799,12 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    virtual_columns: bool,
 ) -> Result<()> {
     for column_mapping in insertion
         .col_mappings
         .iter()
-        .filter(|column_mapping| column_mapping.column.notnull())
+        .filter(|m| m.column.notnull() && m.column.is_virtual_generated() == virtual_columns)
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {
@@ -2263,7 +2290,7 @@ fn init_source_emission<'a>(
                             .columns()
                             .iter()
                             .filter(|col| !col.hidden() && !col.is_generated())
-                            .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
+                            .map(|col| col.affinity().aff_mask())
                             .collect::<String>()
                     } else {
                         columns
@@ -2278,9 +2305,7 @@ fn init_source_emission<'a>(
                                 }
                                 table
                                     .get_column_by_name(&column_name)
-                                    .map(|(_, col)| {
-                                        col.affinity_with_strict(ctx.table.is_strict).aff_mask()
-                                    })
+                                    .map(|(_, col)| col.affinity().aff_mask())
                                     .ok_or_else(|| {
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
@@ -2401,13 +2426,8 @@ pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(
         schema::Type::Integer,
         None,
         ColDef {
-            primary_key: true,
-            rowid_alias: true,
-            notnull: true,
-            explicit_notnull: false,
-            hidden: false,
-            unique: false,
-            notnull_conflict_clause: None,
+            flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+            ..Default::default()
         },
     )
 });
@@ -2856,9 +2876,7 @@ fn emit_pk_uniqueness_check(
                 let col = insertion
                     .get_col_mapping_by_name(name)
                     .unwrap_or_else(|| panic!("primary key column missing from insertion: {name}"));
-                col.column
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask()
+                col.column.affinity().aff_mask()
             })
             .collect::<String>();
         for (i, (name, _)) in ctx.table.primary_key_columns.iter().enumerate() {
@@ -3095,9 +3113,7 @@ fn emit_unique_index_check(
             if ic.expr.is_some() {
                 Affinity::Blob.aff_mask()
             } else {
-                ctx.table.columns()[ic.pos_in_table]
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask()
+                ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
             }
         })
         .collect::<String>();
@@ -3418,7 +3434,7 @@ fn ensure_sequence_initialized(
         rhs: name_col_reg,
         target_pc: entry_exists_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
     });
 
     program.emit_insn(Insn::Next {
@@ -3841,34 +3857,28 @@ fn emit_replace_delete_conflicting_row(
         let index = resolver
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
-        let skip_delete_label = if index.where_clause.is_some() {
-            let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)?
-                .expect("index.where_clause was checked to be Some above");
+        let table_internal_id = table_references.joined_tables()[0].internal_id;
+        let skip_delete_label = emit_partial_index_where_old_image(
+            program,
+            resolver,
+            table_references,
+            main_cursor_id,
+            table_internal_id,
+            &index,
+        )?
+        .map(|where_reg| {
             let skip_label = program.allocate_label();
-            let reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &where_copy,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
             program.emit_insn(Insn::IfNot {
-                reg,
+                reg: where_reg,
                 jump_if_null: true,
                 target_pc: skip_label,
             });
-            Some(skip_label)
-        } else {
-            None
-        };
+            skip_label
+        });
 
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
 
-        let table_internal_id = table_references.joined_tables()[0].internal_id;
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             emit_index_column_value_old_image(
                 program,
@@ -3889,7 +3899,7 @@ fn emit_replace_delete_conflicting_row(
             start_reg,
             num_regs,
             cursor_id: *index_cursor_id,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
 
         if let Some(label) = skip_delete_label {
@@ -3906,7 +3916,6 @@ fn emit_replace_delete_conflicting_row(
                 table.columns(),
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
-                table.is_strict,
             ))
         } else {
             None
@@ -4194,9 +4203,7 @@ fn build_parent_key_image_for_insert(
                 let (_, col) = parent_table.get_column(name).ok_or_else(|| {
                     crate::LimboError::InternalError(format!("parent col {name} missing"))
                 })?;
-                Ok::<_, crate::LimboError>(
-                    col.affinity_with_strict(parent_table.is_strict).aff_mask(),
-                )
+                Ok::<_, crate::LimboError>(col.affinity().aff_mask())
             })
             .collect::<Result<String, _>>()?
     };

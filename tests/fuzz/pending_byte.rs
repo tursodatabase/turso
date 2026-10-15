@@ -53,6 +53,12 @@ pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
             let conn = db.connect_limbo();
             conn.execute("create table t(x);")?;
             conn.execute(&query)?;
+            // SQLite cannot open a file in MVCC mode. Switching back to WAL
+            // writes all rows into the database file, so the integrity
+            // check below still covers them.
+            if db.enable_mvcc {
+                conn.execute("PRAGMA journal_mode = 'wal'")?;
+            }
             conn.close()?;
         }
 

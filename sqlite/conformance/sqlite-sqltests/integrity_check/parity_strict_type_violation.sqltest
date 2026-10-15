@@ -1,0 +1,19 @@
+# The fixture holds a STRICT table whose TEXT column stores an integer.
+
+@database database/integrity_strict_type_violation.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-strict-type-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    non-TEXT value in t.b
+}
+
+test quick-check-strict-type-violation {
+    PRAGMA quick_check;
+}
+expect {
+    non-TEXT value in t.b
+}
