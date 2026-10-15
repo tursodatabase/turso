@@ -970,12 +970,21 @@ pub(crate) fn emit_planned_query_body(
     let block = &query.blocks[0];
     emit_hir_block_explain(program, document, block, &planned_query.blocks[0])?;
     let done = program.allocate_label();
-    let distinct = initialize_hir_distinct(program, block)?;
+    // EXISTS only checks whether a row comes out, so like legacy and SQLite
+    // its subquery drops DISTINCT and never evaluates ORDER BY. LIMIT and
+    // OFFSET stay and count plain rows.
+    let exists = matches!(destination, QueryDestination::ExistsSubqueryResult { .. });
+    let distinct = if exists {
+        None
+    } else {
+        initialize_hir_distinct(program, block)?
+    };
     // Without grouping, aggregates or windows, rows leave the loops in scan
     // order, so a scan that already follows ORDER BY needs no sorter.
     let scan_order_is_output_order =
         hir_grouping(block).is_none() && block.aggregate_count == 0 && block.windows.is_empty();
-    let sort_elided = scan_order_is_output_order && planned_query.blocks[0].order_sort_elided;
+    let sort_elided =
+        exists || (scan_order_is_output_order && planned_query.blocks[0].order_sort_elided);
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;

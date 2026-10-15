@@ -196,6 +196,10 @@ fn hir_expression_subqueries_match_legacy_rows() {
          WHERE EXISTS (SELECT 1 WHERE tags.item_id = items.id)) ORDER BY id",
         "SELECT id FROM items WHERE EXISTS \
          (SELECT 1 FROM (SELECT tag FROM tags WHERE tags.item_id = items.id)) ORDER BY id",
+        // EXISTS drops DISTINCT and never evaluates ORDER BY; OFFSET counts
+        // plain rows.
+        "SELECT EXISTS (SELECT extra FROM items ORDER BY abs(-9223372036854775807 - 1))",
+        "SELECT EXISTS (SELECT DISTINCT extra FROM items ORDER BY extra LIMIT 9 OFFSET 5)",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \
