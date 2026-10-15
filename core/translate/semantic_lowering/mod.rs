@@ -2,6 +2,7 @@
 
 mod delete;
 mod dml;
+mod emit;
 pub(super) mod expr;
 mod fkey;
 mod insert;

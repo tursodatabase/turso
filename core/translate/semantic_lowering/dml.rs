@@ -6,7 +6,7 @@ use crate::{
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
-        expr::{emit_returning_scan_back, ConditionMetadata, ReturningBufferCtx},
+        expr::ConditionMetadata,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, SourceId},
         semantic_to_plan::HirAccessPlan,
@@ -463,13 +463,33 @@ impl<'a> ReturningBuffer<'a> {
     pub(super) fn emit_rows(&self, program: &mut ProgramBuilder) {
         // Legacy checks foreign keys before returning any row.
         program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(
-            program,
-            &ReturningBufferCtx {
+        let done = program.allocate_label();
+        let next = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(next);
+        let count = self.outputs.len();
+        let start = program.alloc_registers(count);
+        for i in 0..count {
+            program.emit_insn(Insn::Column {
                 cursor_id: self.cursor,
-                num_columns: self.outputs.len(),
-            },
-        );
+                column: i,
+                dest: start + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::ResultRow {
+            start_reg: start,
+            count,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: self.cursor,
+            pc_if_next: next,
+            fullscan: false,
+        });
+        program.preassign_label_to_next_insn(done);
     }
 }
 

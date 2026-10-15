@@ -13,16 +13,16 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::RefAct;
 
+use super::emit::{
+    copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
+    emit_skip_if_any_null, index_probe, index_scan_match_any, open_read_index, open_read_table,
+    table_scan_match_any,
+};
 use crate::{
     schema::BTreeTable,
     sync::Arc,
     translate::{
         collate::CollationSeq,
-        fkeys::{
-            copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, table_scan_match_any,
-        },
         semantic::hir::{self, HirDocument, SourceId},
     },
     vdbe::{
@@ -161,7 +161,7 @@ fn emit_children_still_point_here(
         None => table_scan_match_any(
             program,
             &child_table,
-            &foreign_key.declaration.child_columns,
+            &foreign_key.child_positions,
             key,
             self_reference.then_some(rowid),
             database,
@@ -372,7 +372,7 @@ pub(super) fn emit_insert_parent_repairs(
             None => table_scan_match_any(
                 program,
                 &child_table,
-                &foreign_key.declaration.child_columns,
+                &foreign_key.child_positions,
                 key,
                 None,
                 database,
@@ -703,7 +703,7 @@ fn emit_child_probe(
         None => table_scan_match_any(
             program,
             &child_table,
-            &foreign_key.declaration.child_columns,
+            &foreign_key.child_positions,
             key,
             exclude,
             database,

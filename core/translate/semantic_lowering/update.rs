@@ -10,15 +10,14 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
+use super::emit::{any_effective_replace, constraint_may_abort, halt_desc_and_on_error};
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
-        insert::halt_desc_and_on_error,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
-        stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,

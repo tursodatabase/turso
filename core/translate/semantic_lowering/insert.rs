@@ -11,15 +11,17 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{self, ResolveType, TriggerTime};
 
+use super::emit::{
+    any_effective_replace, constraint_may_abort, format_unique_violation_desc,
+    halt_desc_and_on_error,
+};
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
-        insert::{format_unique_violation_desc, halt_desc_and_on_error},
         plan::QueryDestination,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::HirPlan,
-        stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,

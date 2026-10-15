@@ -303,6 +303,14 @@ UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index
 (with ABORT) before rewriting the indexes and the row, and returns the
 updated row to RETURNING. INSERT triggers do not fire for it.
 
+Semantic analysis matches each ON CONFLICT target against the HIR target
+source, as SQLite does: `rowid` or the bare INTEGER PRIMARY KEY column names
+the rowid; otherwise the first UNIQUE index whose key has the same terms, in
+any order, with the same collation and an equivalent WHERE clause for a
+partial index. Unlike legacy, `ON CONFLICT(rowid)` is accepted, an unknown
+column reports "no such column", and `a COLLATE x` on the INTEGER PRIMARY
+KEY does not name the rowid.
+
 INSERT ... SELECT runs the query as a coroutine that yields one row at a
 time into the same row code as VALUES. When the query reads the target table,
 or the INSERT fires triggers, the rows are first copied into an ephemeral
@@ -317,6 +325,15 @@ target is planned first, as legacy ends up ordering it, except when the FROM
 clause has a RIGHT or FULL JOIN, which must not NULL-extend the target. Like
 legacy, a FROM clause that names a table twice, or whose NATURAL/USING column
 is also exposed by two other tables, is rejected up front.
+
+HIR DML does not use legacy's `Resolver`, `TableReferences` or AST
+rewriting. Its settings (functions, dialect, custom types, double-quoted
+strings, search path) come from the connection through `HirSettings`, the
+checks that a target may be written run in `semantic_lowering`, and the
+small bytecode helpers it shares with legacy (foreign-key probes, UNIQUE
+error text, statement journal flags) are copied into
+`semantic_lowering/emit.rs`. It still shares plain types with HIR SELECT
+lowering, such as `ConditionMetadata` and `QueryDestination`.
 
 ### Non-lowering phase complete
 
