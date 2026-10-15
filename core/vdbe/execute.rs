@@ -13684,7 +13684,7 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
+            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
         }
     }
 
@@ -15733,7 +15733,7 @@ pub fn op_set_cookie(
         };
         // Header cookies are global metadata with no row-level conflict keys; they need
         // SQLite-style single-writer semantics (same policy as DDL in MVCC).
-        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
+        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -15816,12 +15816,15 @@ fn upgrade_mv_tx_to_exclusive(
     program: &Program,
     pager: &Arc<Pager>,
     mv_store: &MvStore,
+    db: usize,
     tx_id: TxID,
 ) -> Result<()> {
-    if mv_store.is_exclusive_tx(&tx_id) {
-        return Ok(());
+    if !mv_store.is_exclusive_tx(&tx_id) {
+        mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
     }
-    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
+    program
+        .connection
+        .set_mv_tx_for_db(db, Some((tx_id, TransactionMode::Write)));
     Ok(())
 }
 
