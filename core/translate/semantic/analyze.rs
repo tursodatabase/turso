@@ -525,7 +525,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
                 };
                 let mut scope = Scope::default();
-                scope.add_source(source, true);
+                scope.add_schema_source(source);
                 (scope, generated_syntax, default_syntax)
             };
 

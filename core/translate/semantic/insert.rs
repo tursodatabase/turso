@@ -398,7 +398,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 LimboError::InternalError(format!("missing write target source {target}"))
             })?;
             let mut scope = Scope::default();
-            scope.add_source(source, true);
+            scope.add_schema_source(source);
             scope
         };
         let policy = ExprPolicy::schema_expression().with_self_source(target);
@@ -439,7 +439,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 LimboError::InternalError(format!("missing DELETE target source {target}"))
             })?;
             let mut scope = Scope::default();
-            scope.add_source(source, true);
+            scope.add_schema_source(source);
             scope
         };
         let policy = ExprPolicy::schema_expression().with_self_source(target);
@@ -606,7 +606,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             LimboError::InternalError(format!("missing write target source {target}"))
         })?;
         let mut scope = Scope::default();
-        scope.add_source(source, true);
+        scope.add_schema_source(source);
         self.analyze_expr_with_expected_type(
             &syntax,
             &scope,
