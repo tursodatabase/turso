@@ -933,6 +933,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })
             .transpose()?;
         let aggregate_query = grouping.is_some() || functions.aggregate_count() > 0;
+        // Like legacy, an aggregate that appears only in ORDER BY is a misuse
+        // when the block reads a FROM clause; without one it makes the block
+        // an aggregate query of one row.
+        let order_by_allows_aggregates = aggregate_query || from.is_none();
         let order_by = order_by
             .map(|order_by| {
                 self.analyze_order_by(
@@ -940,7 +944,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &scope,
                     &outputs,
                     block_id,
-                    aggregate_query,
+                    order_by_allows_aggregates,
                     &mut functions,
                     policies,
                 )
