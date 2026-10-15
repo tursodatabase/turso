@@ -175,3 +175,51 @@ snapshot-eqp multi_index_and_eqp {
 snapshot multi_index_and {
     SELECT * FROM t WHERE a = 1 AND b = 2;
 }
+setup nocase_index_schema {
+    CREATE TABLE t(a TEXT, b TEXT);
+    CREATE INDEX i1 ON t(a COLLATE NOCASE);
+    CREATE INDEX i2 ON t(b);
+    INSERT INTO t VALUES ('B', 'x'), ('b', 'y');
+}
+
+@setup nocase_index_schema
+test multi-index-and-binary-comparison-skips-nocase-index {
+    SELECT a, b, a = 'b' FROM t WHERE a = 'b' AND b > 'a' ORDER BY b;
+}
+expect {
+    b|y|1
+}
+
+@setup nocase_index_schema
+test multi-index-and-nocase-comparison-uses-nocase-index {
+    SELECT a, b FROM t WHERE a = 'b' COLLATE NOCASE AND b > 'a' ORDER BY b;
+}
+expect {
+    B|x
+    b|y
+}
+
+@setup nocase_index_schema
+test multi-index-and-delete-binary-comparison-skips-nocase-index {
+    DELETE FROM t WHERE a = 'b' AND b > 'a';
+    SELECT a, b FROM t ORDER BY b;
+}
+expect {
+    B|x
+}
+
+setup nocase_column_binary_index_schema {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE INDEX i1 ON t(a COLLATE BINARY);
+    CREATE INDEX i2 ON t(b);
+    INSERT INTO t VALUES ('B', 'x'), ('b', 'y');
+}
+
+@setup nocase_column_binary_index_schema
+test multi-index-and-nocase-comparison-skips-binary-index {
+    SELECT a, b FROM t WHERE a = 'b' AND b > 'a' ORDER BY b;
+}
+expect {
+    B|x
+    b|y
+}
