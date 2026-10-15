@@ -3749,6 +3749,66 @@ mod nonblocking {
     use turso_core::{Clock, File, IOResult, MemoryYieldIO, OpenFlags, IO};
 
     #[test]
+    fn copy_to_stdout_defers_lookup_and_yields_between_rows() {
+        for mvcc in [false, true] {
+            let (io, conn) = open(mvcc);
+            let spec =
+                turso_pg_parser::copy::parse_copy_to_stdout("COPY exported (name, id) TO STDOUT")
+                    .unwrap()
+                    .unwrap();
+            io.allow_step.store(false, Ordering::SeqCst);
+            let mut copy = conn.prepare_copy_to_stdout(&spec).unwrap();
+            io.allow_step.store(true, Ordering::SeqCst);
+            conn.execute("CREATE TABLE exported (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO exported VALUES (7, 'first'), (19, 'second')").unwrap();
+            conn.inner().get_pager().clear_page_cache(false);
+            let mut rows = Vec::new();
+            let mut yields = 0;
+            loop {
+                io.allow_step.store(false, Ordering::SeqCst);
+                let result = copy.step();
+                io.allow_step.store(true, Ordering::SeqCst);
+                match result.unwrap() {
+                    StepResult::Row => rows.push(
+                        copy.row()
+                            .unwrap()
+                            .get_values()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    ),
+                    StepResult::Done => break,
+                    StepResult::IO | StepResult::Yield => {
+                        yields += 1;
+                        copy.take_io_completions()
+                            .unwrap()
+                            .wait(io.as_ref())
+                            .unwrap();
+                    }
+                    result => panic!("unexpected COPY result: {result:?}"),
+                }
+            }
+            assert!(yields > 0);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::build_text("first"), Value::from_i64(7)],
+                    vec![Value::build_text("second"), Value::from_i64(19)],
+                ]
+            );
+            conn.execute("INSERT INTO exported VALUES (31, 'third')")
+                .unwrap();
+            copy.reset().unwrap();
+            assert_eq!(
+                drive(&io, &mut copy).0,
+                vec![
+                    vec![Value::build_text("first"), Value::from_i64(7)],
+                    vec![Value::build_text("second"), Value::from_i64(19)],
+                    vec![Value::build_text("third"), Value::from_i64(31)],
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn preparing_does_not_execute_frontend_statements() {
         let (io, conn) = open(false);
         conn.execute("CREATE TABLE existing (id INTEGER)").unwrap();
