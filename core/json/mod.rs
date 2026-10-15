@@ -13,6 +13,7 @@ pub use crate::json::ops::{
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
+use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
@@ -804,11 +805,13 @@ fn json_path_from_db_value<'a>(
     Ok(Some(json_path_from_text(text, strict)?))
 }
 
-/// Like SQLite, a BLOB path is read as text.
+/// Like SQLite, a BLOB path is read as text, and the path ends at the first NUL.
 pub(crate) fn json_path_text(path: ValueRef<'_>) -> Option<Cow<'_, str>> {
     match path {
-        ValueRef::Text(t) => Some(Cow::Borrowed(t.as_str())),
-        ValueRef::Blob(b) => Some(String::from_utf8_lossy(b)),
+        ValueRef::Text(t) => Some(Cow::Borrowed(sqlite_text_prefix(t.as_str()))),
+        ValueRef::Blob(b) => Some(String::from_utf8_lossy(
+            &b[..first_nul(b).unwrap_or(b.len())],
+        )),
         _ => None,
     }
 }
