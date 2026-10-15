@@ -677,6 +677,20 @@ pub(super) fn emit_row_record(
     record
 }
 
+/// Whether an index key column is a virtual generated column of `table`.
+/// Its value is in the row's registers, computed with the column's
+/// affinity, so a new key copies it instead of computing it again.
+pub(super) fn is_virtual_key_column(
+    table: &BTreeTable,
+    column: &crate::schema::IndexColumn,
+) -> bool {
+    column.pos_in_table != EXPR_INDEX_SENTINEL
+        && table
+            .columns()
+            .get(column.pos_in_table)
+            .is_some_and(|column| column.is_virtual_generated())
+}
+
 /// Whether an expression contains a subquery.
 pub(super) fn has_subquery(expression: &hir::Expr) -> bool {
     let mut found = false;

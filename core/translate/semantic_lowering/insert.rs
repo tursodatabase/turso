@@ -719,6 +719,15 @@ impl InsertRow<'_> {
                 dest: self.rowid,
             });
             program.preassign_label_to_next_insn(known);
+            // Like legacy, a BEFORE trigger sees the virtual columns of NEW.
+            self.bind_new_row(program);
+            super::dml::emit_virtual_columns(
+                program,
+                document,
+                self.target.source.id,
+                table,
+                self.columns,
+            )?;
             for trigger in self
                 .triggers
                 .iter()
@@ -1130,10 +1139,31 @@ impl InsertRow<'_> {
             )?;
         }
 
-        let assigned = assignments
-            .iter()
-            .flat_map(|assignment| assignment.columns.iter().copied())
-            .collect::<Vec<_>>();
+        // Virtual generated columns that read a set column change too.
+        let assigned = super::update::with_generated_dependents(
+            table,
+            assignments
+                .iter()
+                .flat_map(|assignment| assignment.columns.iter().copied())
+                .collect(),
+        )?;
+        for column in &assigned {
+            let hir::TargetColumn::Column(position) = *column else {
+                continue;
+            };
+            let column = &table.columns()[position];
+            if column.is_virtual_generated() && column.notnull() {
+                program.emit_insn(Insn::HaltIfNull {
+                    target_reg: new_row + position,
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description: format!(
+                        "{}.{}",
+                        table.name,
+                        column.name.as_deref().unwrap_or_default()
+                    ),
+                });
+            }
+        }
         let assigned_positions = assigned
             .iter()
             .filter_map(|column| match column {
@@ -1218,13 +1248,15 @@ impl InsertRow<'_> {
             for (offset, (column, expression)) in index.columns.iter().zip(&new.columns).enumerate()
             {
                 match expression {
-                    Some(expression) => super::expr::translate_expr_no_constant_opt(
-                        program,
-                        document,
-                        expression,
-                        start + offset,
-                    )?,
-                    None => {
+                    Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
+                        super::expr::translate_expr_no_constant_opt(
+                            program,
+                            document,
+                            expression,
+                            start + offset,
+                        )?
+                    }
+                    _ => {
                         let from = if table.columns()[column.pos_in_table].is_rowid_alias() {
                             conflict
                         } else {
@@ -1648,12 +1680,12 @@ impl InsertRow<'_> {
         {
             let register = start + offset;
             match expression {
-                Some(expression) => {
+                Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
                     super::expr::translate_expr_no_constant_opt(
                         program, document, expression, register,
                     )?;
                 }
-                None => {
+                _ => {
                     let source = if table.columns()[column.pos_in_table].is_rowid_alias() {
                         self.rowid
                     } else {

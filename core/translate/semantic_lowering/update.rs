@@ -935,7 +935,7 @@ fn assigned_positions(
 
 /// `assigned` and the virtual generated columns that read one of them, which
 /// change with them.
-fn with_generated_dependents(
+pub(super) fn with_generated_dependents(
     table: &crate::schema::BTreeTable,
     mut assigned: Vec<hir::TargetColumn>,
 ) -> Result<Vec<hir::TargetColumn>> {
@@ -1029,11 +1029,13 @@ impl UpdateRow<'_, '_> {
     }
 
     /// Bind the NEW row to its registers and compute its virtual generated
-    /// columns there.
+    /// columns there. With `check_notnull`, a changed NOT NULL virtual
+    /// column is checked too, as legacy does.
     fn emit_virtual_columns(
         &self,
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
+        check_notnull: bool,
     ) -> Result<()> {
         program.bind_source(
             layout.new_source,
@@ -1042,13 +1044,25 @@ impl UpdateRow<'_, '_> {
                 rowid: Some(self.written_rowid()),
             },
         );
+        let table = self.target.table;
         super::dml::emit_virtual_columns(
             program,
             self.target.document,
             layout.new_source,
-            self.target.table,
+            table,
             self.start(),
-        )
+        )?;
+        if check_notnull {
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated()
+                    && column.notnull()
+                    && layout.assigned.contains(&position)
+                {
+                    self.emit_notnull_check(program, position, column)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rewrite the row the table cursor is on.
@@ -1080,7 +1094,7 @@ impl UpdateRow<'_, '_> {
         );
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before)?;
-        self.emit_virtual_columns(program, layout)?;
+        self.emit_virtual_columns(program, layout, !has_before)?;
         let new_row = TriggerRow {
             columns: self.start(),
             rowid: self.written_rowid(),
@@ -1138,7 +1152,7 @@ impl UpdateRow<'_, '_> {
         }
         if has_before {
             // The trigger may have changed the columns they read.
-            self.emit_virtual_columns(program, layout)?;
+            self.emit_virtual_columns(program, layout, true)?;
         }
         // Like legacy, a new rowid is checked first, unless REPLACE resolves
         // its conflict, which happens after the indexes are checked.
@@ -1460,10 +1474,12 @@ impl UpdateRow<'_, '_> {
         for (offset, (column, expression)) in index.columns.iter().zip(&new.columns).enumerate() {
             let register = start + offset;
             match expression {
-                Some(expression) => super::expr::translate_expr_no_constant_opt(
-                    program, document, expression, register,
-                )?,
-                None => {
+                Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, expression, register,
+                    )?
+                }
+                _ => {
                     let source = if table
                         .columns()
                         .get(column.pos_in_table)
