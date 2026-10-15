@@ -293,6 +293,9 @@ VALUES).
 A STRICT table checks the type of each stored column once the rowid is
 known; like SQLite, a virtual generated column is not checked.
 
+A hidden column, as legacy treats it, takes no position in VALUES without a
+column list and gets NULL rather than its DEFAULT.
+
 A subquery in RETURNING whose own FROM clause names the target table runs
 again for each row, as in SQLite and legacy, so it sees the rows written so
 far; any other runs once. DELETE then reads RETURNING from a copy of the row

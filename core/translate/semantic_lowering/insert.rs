@@ -75,7 +75,6 @@ pub(super) fn needs_legacy(
     // WITHOUT ROWID tables and custom types are not lowered yet.
     if !table.has_rowid
         || super::dml::strict_needs_legacy(&table)
-        || table.columns().iter().any(Column::hidden)
         || source.column_type_programs.iter().any(Option::is_some)
     {
         return Ok(true);
@@ -2077,6 +2076,32 @@ mod tests {
             .map(|column| column.ty_str.as_str())
             .collect::<Vec<_>>();
         assert_eq!(types, ["INT", "ANY", "TEXT"]);
+    }
+
+    #[test]
+    fn hidden_columns_take_no_value_and_no_default() {
+        let mut schema = schema();
+        let mut table =
+            crate::schema::BTreeTable::from_sql("CREATE TABLE hc(a, b DEFAULT 5, c)", 121).unwrap();
+        table.columns_mut()[1].set_hidden(true);
+        schema.add_btree_table(Arc::new(table)).unwrap();
+        let plan = analyze_plan(schema, "INSERT INTO hc VALUES (1, 2)");
+        let insert = insert_root(&plan).unwrap();
+        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
+        // Like legacy, the values go to `a` and `c`, and `b` stays NULL.
+        let targets = insert
+            .columns
+            .iter()
+            .map(|target| target.column)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [hir::TargetColumn::Column(0), hir::TargetColumn::Column(2)]
+        );
+        let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
+            panic!("hc is a B-tree table");
+        };
+        assert!(defaults.is_empty());
     }
 
     #[test]
