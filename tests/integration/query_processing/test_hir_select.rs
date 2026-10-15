@@ -182,6 +182,15 @@ fn hir_expression_subqueries_match_legacy_rows() {
         "SELECT extra, (SELECT count(*) FROM tags WHERE item_id = items.id) FROM items GROUP BY extra",
         "SELECT count(*), (SELECT items.value + 1) FROM items WHERE id = 3",
         "SELECT value + 1, count(*) FROM items GROUP BY value + 1 HAVING value + 1 > 11 ORDER BY value + 1",
+        // Outer reads in a nested query make the enclosing subquery
+        // correlated too, so it runs again for every outer row.
+        "SELECT id, (SELECT count(*) FROM (SELECT tag FROM tags WHERE tags.item_id <= items.id)) \
+         FROM items ORDER BY id",
+        "SELECT id, (SELECT (SELECT items.value + 1)) FROM items ORDER BY id",
+        "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM tags \
+         WHERE EXISTS (SELECT 1 WHERE tags.item_id = items.id)) ORDER BY id",
+        "SELECT id FROM items WHERE EXISTS \
+         (SELECT 1 FROM (SELECT tag FROM tags WHERE tags.item_id = items.id)) ORDER BY id",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \

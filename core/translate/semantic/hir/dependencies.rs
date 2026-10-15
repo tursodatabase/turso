@@ -60,6 +60,38 @@ impl HirDocument {
         counts.into_usage()
     }
 
+    /// Sources of enclosing queries that `query`, or any query it runs
+    /// (subqueries in its expressions, FROM subqueries and CTEs), reads. A
+    /// query that reads any must run again whenever the outer row changes,
+    /// even when its own expressions read no outer column.
+    pub(crate) fn outer_sources(&self, query: QueryId) -> Vec<SourceId> {
+        let mut pending = vec![query];
+        let mut nested = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if nested.insert(id) {
+                pending.extend(self.direct_query_dependencies(id));
+            }
+        }
+        let mut outer = nested
+            .iter()
+            .filter_map(|id| self.query(*id))
+            .flat_map(|query| query.captures.iter().copied())
+            .filter(|source| {
+                !matches!(
+                    self.source(*source).map(|source| source.owner),
+                    Some(SourceOwner::QueryBlock(block)) if nested.contains(&block.query)
+                )
+            })
+            .collect::<Vec<_>>();
+        outer.sort_unstable();
+        outer.dedup();
+        outer
+    }
+
+    pub(crate) fn reads_outer_sources(&self, query: QueryId) -> bool {
+        !self.outer_sources(query).is_empty()
+    }
+
     /// Return every query whose plan is needed directly by this query. This
     /// includes query-backed FROM sources and subqueries in expressions, but
     /// does not descend into those query definitions.
@@ -129,11 +161,8 @@ impl HirDocument {
                     | SubqueryExpr::In { query, .. }
                     | SubqueryExpr::Exists(query) => query,
                 };
-                let query = self
-                    .query(*query)
-                    .expect("validated HIR subquery reference must exist");
-                for source in &query.captures {
-                    visit(*source);
+                for source in self.outer_sources(*query) {
+                    visit(source);
                 }
             }
             _ => {}

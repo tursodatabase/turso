@@ -681,7 +681,7 @@ pub(crate) fn prepare_subquery(
     Ok(PreparedSubquery {
         query: query_id,
         destination: prepared.destination,
-        correlated: !query.captures.is_empty(),
+        correlated: document.reads_outer_sources(query_id),
     })
 }
 
@@ -4256,11 +4256,6 @@ fn validate_hir_materialized_query<'a>(
             "HIR materialized source {source_id} references missing query {query_id}"
         ))
     })?;
-    if !query.captures.is_empty() {
-        return Err(LimboError::InternalError(format!(
-            "HIR materialized source {source_id} is correlated"
-        )));
-    }
     if source.columns.len() != query.output.len() {
         return Err(LimboError::InternalError(format!(
             "HIR materialized source {source_id} width {} does not match query {query_id} width {}",
@@ -4279,13 +4274,18 @@ fn prepare_hir_materialized_loop<'a>(
 ) -> Result<PreparedHirMaterializedLoop<'a>> {
     let query_id = materialized_query.query();
     let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
+    // A subquery that reads outer columns runs inside the outer loop, so it
+    // is filled again, into a fresh table, every time this point is reached.
+    let correlated = plan.document.reads_outer_sources(query_id);
 
     let table = hir_materialized_table(source);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let materialized = program.allocate_label();
-    program.emit_insn(Insn::Once {
-        target_pc_when_reentered: materialized,
-    });
+    if !correlated {
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: materialized,
+        });
+    }
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
         is_table: true,
