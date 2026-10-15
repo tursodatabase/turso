@@ -28,6 +28,7 @@ use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
     DmlTarget, ReturningBuffer,
 };
+use super::fkey_action::CompiledAction;
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
     PreparedHirBtreeLoop,
@@ -64,13 +65,10 @@ pub(super) fn needs_legacy(
             return Ok(true);
         }
     }
-    match &delete.target_kind {
-        hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
-            if super::fkey::delete_needs_legacy(foreign_keys) {
-                return Ok(true);
-            }
-        }
-        hir::DeleteTargetKind::Virtual => return Ok(true),
+    // ON DELETE actions are compiled with the statement; one that needs
+    // legacy sends it there.
+    if matches!(delete.target_kind, hir::DeleteTargetKind::Virtual) {
+        return Ok(true);
     }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
@@ -107,6 +105,7 @@ pub(super) fn emit_delete(
     delete: &hir::Delete,
     access: &HirAccessPlan,
     triggers: &[CompiledTrigger],
+    actions: &[CompiledAction<'_>],
 ) -> Result<()> {
     let document = &plan.document;
     let [planned_loop] = access.loops.as_slice() else {
@@ -132,9 +131,9 @@ pub(super) fn emit_delete(
         ));
     };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?;
-    // Like legacy, a DELETE that fires triggers first collects its rowids,
-    // since a trigger can change the table.
-    let uses_rowset = uses_rowset(delete) || !triggers.is_empty();
+    // Like legacy, a DELETE that fires triggers or foreign-key actions
+    // first collects its rowids, since they can change the table.
+    let uses_rowset = uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty();
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
     // After collecting rowids, legacy treats the delete as a scan.
@@ -159,6 +158,7 @@ pub(super) fn emit_delete(
             foreign_keys,
             returning,
             triggers,
+            actions,
             done,
         )?;
     } else {
@@ -250,6 +250,7 @@ fn emit_scan_delete(
             table_cursor,
             rowid,
             foreign_keys,
+            actions: &[],
         },
         iteration,
         &other_indexes,
@@ -270,6 +271,7 @@ fn emit_rowset_delete(
     foreign_keys: &hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'_>>,
     triggers: &[CompiledTrigger],
+    actions: &[CompiledAction<'_>],
     done: BranchOffset,
 ) -> Result<()> {
     let document = target.document;
@@ -376,6 +378,7 @@ fn emit_rowset_delete(
             table_cursor,
             rowid,
             foreign_keys,
+            actions,
         },
         None,
         &indexes,
@@ -393,6 +396,8 @@ struct DeletedRow<'a> {
     /// The register holding the row's rowid.
     rowid: usize,
     foreign_keys: &'a hir::DmlForeignKeys,
+    /// The ON DELETE actions to run once the row is gone.
+    actions: &'a [CompiledAction<'a>],
 }
 
 /// Delete the row the table cursor is on: its foreign-key checks, its
@@ -432,6 +437,15 @@ fn emit_delete_row(
         database,
         None,
     )?;
+    // Like legacy, the parent key the actions need is read before the row
+    // is deleted, and the actions run once it is gone.
+    let action_keys = row
+        .actions
+        .iter()
+        .map(|action| {
+            super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
     // The key of the index the loop reads is taken before the row is
     // deleted and removed after it.
     let iteration_key = iteration
@@ -520,6 +534,9 @@ fn emit_delete_row(
         let values = returning.emit_values(program, document, target.resolved_table()?)?;
         returning.emit_buffer(program, values);
     }
+    for (action, key) in row.actions.iter().zip(action_keys) {
+        action.emit_fire(program, key, None)?;
+    }
     Ok(())
 }
 
@@ -547,7 +564,7 @@ mod tests {
         let mut program = program();
         assert!(!needs_legacy(&plan.document, delete, access, &program).unwrap());
         program.set_hir_plan(plan.clone());
-        emit_delete(&mut program, &plan, delete, access, &[]).unwrap();
+        emit_delete(&mut program, &plan, delete, access, &[], &[]).unwrap();
         program
     }
 
@@ -632,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_stays_on_legacy_only_for_foreign_key_actions() {
+    fn delete_with_foreign_keys_goes_through_hir() {
         let schema = || {
             let mut schema = Schema::new();
             for (sql, root_page) in [
@@ -653,7 +670,7 @@ mod tests {
         for (sql, legacy) in [
             ("DELETE FROM parent", false),
             ("DELETE FROM child", false),
-            ("DELETE FROM other", true),
+            ("DELETE FROM other", false),
             ("DELETE FROM cascade", false),
         ] {
             let plan = analyze_plan(schema(), sql);

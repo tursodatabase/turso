@@ -134,8 +134,11 @@ fn compile_trigger(
     }
     // Triggers that the body's own DML fires, per command.
     let mut nested = Vec::with_capacity(commands.len());
+    // Foreign-key actions that the body's own DML fires, per command.
+    let mut nested_actions = Vec::with_capacity(commands.len());
     for (command, command_plan) in root.commands.iter().zip(commands) {
         let mut command_triggers = Vec::new();
+        let mut command_actions = Vec::new();
         let needs_legacy = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
@@ -155,12 +158,16 @@ fn compile_trigger(
                 if super::update::needs_legacy(&plan, update, access, &builder)? {
                     true
                 } else {
-                    match update_triggers(session, &builder, &plan, update)? {
-                        Some(triggers) => {
+                    match (
+                        update_triggers(session, &builder, &plan, update)?,
+                        super::fkey_action::update_actions(session, &builder, &plan, update)?,
+                    ) {
+                        (Some(triggers), Some(actions)) => {
                             command_triggers = triggers;
+                            command_actions = actions;
                             false
                         }
-                        None => true,
+                        _ => true,
                     }
                 }
             }
@@ -168,12 +175,16 @@ fn compile_trigger(
                 if super::delete::needs_legacy(&plan.document, delete, access, &builder)? {
                     true
                 } else {
-                    match delete_triggers(session, &builder, &plan, delete)? {
-                        Some(triggers) => {
+                    match (
+                        delete_triggers(session, &builder, &plan, delete)?,
+                        super::fkey_action::delete_actions(session, &builder, delete)?,
+                    ) {
+                        (Some(triggers), Some(actions)) => {
                             command_triggers = triggers;
+                            command_actions = actions;
                             false
                         }
-                        None => true,
+                        _ => true,
                     }
                 }
             }
@@ -187,6 +198,7 @@ fn compile_trigger(
             return Ok(Compiled::NeedsLegacy);
         }
         nested.push(command_triggers);
+        nested_actions.push(command_actions);
     }
 
     builder.prologue();
@@ -231,8 +243,12 @@ fn compile_trigger(
         )?;
         builder.preassign_label_to_next_insn(passed);
     }
-    for ((command, command_plan), command_triggers) in
-        root.commands.iter().zip(commands).zip(&nested)
+    for (((command, command_plan), command_triggers), command_actions) in root
+        .commands
+        .iter()
+        .zip(commands)
+        .zip(&nested)
+        .zip(&nested_actions)
     {
         match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(query)) => {
@@ -268,11 +284,19 @@ fn compile_trigger(
                     command_triggers,
                     mvcc,
                     !connection.check_constraints_ignored(),
+                    command_actions,
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                super::delete::emit_delete(&mut builder, &plan, delete, access, command_triggers)?;
+                super::delete::emit_delete(
+                    &mut builder,
+                    &plan,
+                    delete,
+                    access,
+                    command_triggers,
+                    command_actions,
+                )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             _ => {

@@ -53,7 +53,10 @@ pub(super) fn update_needs_legacy(foreign_keys: &hir::DmlForeignKeys, assigned: 
 /// Whether an UPDATE that sets the columns at `assigned` may change the
 /// parent key. A rowid parent key is the INTEGER PRIMARY KEY column, which
 /// `assigned` lists when the UPDATE sets the rowid.
-fn parent_key_may_change(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
+pub(super) fn parent_key_may_change(
+    foreign_key: &hir::ResolvedForeignKey,
+    assigned: &[usize],
+) -> bool {
     foreign_key
         .parent_positions
         .iter()
@@ -91,6 +94,10 @@ pub(super) fn emit_delete_checks(
     replacement: Option<SourceId>,
 ) -> Result<()> {
     for foreign_key in &foreign_keys.incoming {
+        // An ON DELETE action changes the children instead.
+        if super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Delete) {
+            continue;
+        }
         let declaration = &foreign_key.declaration;
         let keeps_key = replacement
             .filter(|_| declaration.on_delete == RefAct::NoAction && !declaration.deferred);
@@ -417,13 +424,12 @@ pub(super) fn emit_update_checks<'a>(
 ) -> Result<Vec<PendingRepair<'a>>> {
     let mut pending = Vec::new();
     for foreign_key in &foreign_keys.incoming {
-        if !parent_key_may_change(foreign_key, assigned) {
+        // An ON UPDATE action changes the children instead.
+        if !parent_key_may_change(foreign_key, assigned)
+            || super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Update)
+        {
             continue;
         }
-        assert!(
-            is_check_only(foreign_key.declaration.on_update),
-            "an ON UPDATE action that changes rows must go to legacy"
-        );
         let width = foreign_key.parent_positions.len();
         let old_key = emit_parent_key(program, document, foreign_key, old)?;
         let new_key = emit_parent_key(program, document, foreign_key, new)?;
@@ -650,7 +656,7 @@ fn emit_new_parent_key_repairs(
 
 /// Jump to `same` when the two keys are equal, NULLs included, as legacy's
 /// parent-key change test does.
-fn emit_skip_if_same_key(
+pub(super) fn emit_skip_if_same_key(
     program: &mut ProgramBuilder,
     old_key: usize,
     new_key: usize,
@@ -749,7 +755,7 @@ fn emit_own_parent_check(
 
 /// Read the parent key of `row`, in the constraint's column order, into new
 /// registers and return the first.
-fn emit_parent_key(
+pub(super) fn emit_parent_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,

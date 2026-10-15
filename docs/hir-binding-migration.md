@@ -209,7 +209,6 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| ON DELETE CASCADE, SET NULL or SET DEFAULT on a table that references the target | Running the action on the child rows |
 | A subquery in RETURNING, on a table with generated columns or custom types | A copy of the deleted row with those columns |
 | CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
@@ -233,7 +232,7 @@ rowid. These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
-| Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
+| CDC, virtual tables, materialized views | As for DELETE |
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
 | A changed key of the index the loop reads, a changed rowid with UPDATE ... FROM | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
@@ -324,6 +323,22 @@ row may be its own parent. After a new row is written, children of a
 deferred or self-referencing constraint that point at its key take back
 their violations. With foreign keys off, DML carries no foreign-key metadata,
 so a child of a missing parent table can still be written.
+
+Foreign-key actions (ON DELETE and ON UPDATE CASCADE, SET NULL and SET
+DEFAULT) are compiled as legacy builds them (`semantic_lowering/fkey_action.rs`):
+each is the SQL statement it stands for on the child table, matching the
+child key against parameters (`DELETE FROM child WHERE c = ?1`, or an UPDATE
+that sets the child key to the new key, NULL or its DEFAULT). That statement
+is analyzed and lowered through HIR, with its own triggers and actions, into
+a subprogram; an action reached again while it is being compiled, as in a
+table that references itself, calls the program being built. A DELETE reads
+the parent key before the row is deleted and runs the actions after; an
+UPDATE runs them once the row is written, when the key changed, before
+RETURNING. A statement with actions collects its rows first, and the
+parent-side checks skip keys with an action. REPLACE and UPSERT that would
+fire an action still go to legacy. Where legacy differs from SQLite, HIR
+follows SQLite: a DELETE whose SET DEFAULT leaves a child without a parent
+fails.
 
 REPLACE is lowered for INSERT and UPDATE as legacy does it. The row the new
 row conflicts with is deleted inline, with its index entries and the

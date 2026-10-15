@@ -32,6 +32,7 @@ use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
     DmlTarget, ReturningBuffer,
 };
+use super::fkey_action::CompiledAction;
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
     PreparedHirBtreeLoop,
@@ -80,10 +81,6 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
-    // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
-    if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&table, &assigned)) {
-        return Ok(true);
-    }
     // REPLACE deletes the rows the new row conflicts with; an ON DELETE
     // action on them still needs legacy.
     let sets_rowid = assigned
@@ -178,6 +175,7 @@ pub(super) fn emit_update(
     triggers: &[CompiledTrigger],
     mvcc: bool,
     enforce_checks: bool,
+    actions: &[CompiledAction<'_>],
 ) -> Result<()> {
     let document = &plan.document;
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
@@ -422,6 +420,7 @@ pub(super) fn emit_update(
         returning,
         triggers,
         mvcc,
+        actions,
     };
     let done = program.allocate_label();
     // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
@@ -444,7 +443,11 @@ pub(super) fn emit_update(
             done,
         )?,
         Some((_, operation))
-            if triggers.is_empty() && !statement_replace && !where_subquery && !moves_rows =>
+            if triggers.is_empty()
+                && actions.is_empty()
+                && !statement_replace
+                && !where_subquery
+                && !moves_rows =>
         {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
@@ -541,6 +544,8 @@ struct UpdateRowLayout<'a> {
     returning: Option<ReturningBuffer<'a>>,
     triggers: &'a [CompiledTrigger],
     mvcc: bool,
+    /// The ON UPDATE actions to run once the row is written.
+    actions: &'a [CompiledAction<'a>],
 }
 
 /// Registers and conflict settings of an UPDATE's row, before the cursor
@@ -953,6 +958,23 @@ pub(super) fn with_generated_dependents(
     Ok(assigned)
 }
 
+/// The table positions an UPDATE changes: the columns it sets, the INTEGER
+/// PRIMARY KEY when it sets the rowid, and the virtual columns that read
+/// them.
+pub(super) fn changed_positions(plan: &HirPlan, update: &hir::Update) -> Result<Vec<usize>> {
+    let source = plan.document.source(update.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR UPDATE target {} is missing", update.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE target is not a table".into(),
+        ));
+    };
+    let table = table.value().require_btree()?;
+    let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
+    Ok(assigned_positions(&table, &assigned))
+}
+
 fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
     Ok(update
         .assignments
@@ -1198,6 +1220,14 @@ impl UpdateRow<'_, '_> {
             self.target.database,
             layout.replaces,
         )?;
+        // The parent key before the change, for the actions.
+        let action_keys = layout
+            .actions
+            .iter()
+            .map(|action| {
+                super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1272,6 +1302,36 @@ impl UpdateRow<'_, '_> {
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
+        // Like legacy and SQLite, the actions run once the row is written,
+        // for a parent key that changed, before RETURNING reads the row.
+        for (action, old_key) in layout.actions.iter().zip(action_keys) {
+            let new_key = super::fkey::emit_parent_key(
+                program,
+                document,
+                action.foreign_key,
+                layout.new_source,
+            )?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
+        }
+        if !layout.actions.is_empty() {
+            // An action may have written this table and moved the cursor.
+            let back = program.allocate_label();
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: self.table_cursor,
+                src_reg: self.written_rowid(),
+                target_pc: back,
+            });
+            program.preassign_label_to_next_insn(back);
+        }
         if let Some(returning) = layout.returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1813,7 +1873,7 @@ mod tests {
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, update, access, &[], false, true).unwrap();
+        emit_update(&mut program, &plan, update, access, &[], false, true, &[]).unwrap();
         program
     }
 

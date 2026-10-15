@@ -723,8 +723,8 @@ const FK_SETUP: &[&str] = &[
     "CREATE TABLE s(id INTEGER PRIMARY KEY, up INTEGER REFERENCES s(id))",
     "CREATE TABLE q(k TEXT UNIQUE, up INTEGER REFERENCES q(k))",
     "CREATE TABLE rk(k TEXT REFERENCES p(k) ON UPDATE RESTRICT)",
-    // ON UPDATE CASCADE still goes to legacy, on a parent of its own so the
-    // other UPDATEs of `p` stay on HIR.
+    // ON UPDATE CASCADE, on a parent of its own so the other UPDATEs of `p`
+    // check only.
     "CREATE TABLE p2(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
     "CREATE TABLE ck(k TEXT REFERENCES p2(k) ON UPDATE CASCADE)",
     "INSERT INTO p VALUES (1, 'one', 1, 1), (2, 'two', 2, 2), (3, 'three', 3, 3), \
@@ -1169,37 +1169,93 @@ fn hir_generated_columns_match_sqlite() {
         "SELECT * FROM g ORDER BY a",
         "PRAGMA integrity_check",
     ] {
-        if sql.starts_with("SELECT") || sql.starts_with("PRAGMA") {
-            assert_eq!(
-                limbo_exec_rows(&conn, sql),
-                sqlite_exec_rows(&sqlite, sql),
-                "{sql}"
-            );
-            continue;
-        }
-        let turso = limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string());
-        let reference = sqlite
-            .prepare(sql)
-            .and_then(|mut statement| {
-                let mut rows = statement.query(())?;
-                let mut values = Vec::new();
-                while let Some(row) = rows.next()? {
-                    let mut value = Vec::new();
-                    for i in 0..row.as_ref().column_count() {
-                        value.push(row.get::<_, rusqlite::types::Value>(i)?);
-                    }
-                    values.push(value);
-                }
-                Ok(values)
-            })
-            .map_err(|e| e.to_string());
-        match (&turso, &reference) {
-            (Ok(turso), Ok(reference)) => assert_eq!(turso, reference, "{sql}"),
-            (Err(turso), Err(reference)) => {
-                assert!(turso.contains(reference.as_str()), "{sql}: {turso} vs {reference}")
-            }
-            _ => panic!("{sql}: {turso:?} vs {reference:?}"),
-        }
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// Foreign-key actions: ON DELETE and ON UPDATE CASCADE, SET NULL and SET
+/// DEFAULT change the child rows, through triggers and through a table that
+/// references itself. HIR matches SQLite where legacy does not: a DELETE
+/// whose SET DEFAULT leaves a child pointing at a missing parent fails.
+#[test]
+fn hir_foreign_key_actions_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
+        "CREATE TABLE c1(x REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE, v)",
+        "CREATE TABLE c2(y TEXT DEFAULT 'two' REFERENCES p(k) ON DELETE SET DEFAULT ON UPDATE SET NULL)",
+        "CREATE TABLE c3(z REFERENCES p(id) ON DELETE SET NULL)",
+        "CREATE TABLE tree(id INTEGER PRIMARY KEY, up REFERENCES tree(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tc AFTER DELETE ON c1 BEGIN INSERT INTO log VALUES ('c1 ' || old.x); END",
+        "INSERT INTO p VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+        "INSERT INTO c1 VALUES (1, 'a'), (1, 'b'), (2, 'c'), (NULL, 'd')",
+        "INSERT INTO c2 VALUES ('one'), ('three'), (NULL)",
+        "INSERT INTO c3 VALUES (1), (3)",
+        "INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2), (4, 1), (5, NULL)",
+        "DELETE FROM p WHERE id = 1",
+        "SELECT * FROM c1 ORDER BY v",
+        "SELECT * FROM c2 ORDER BY y",
+        "SELECT * FROM c3 ORDER BY z",
+        "SELECT * FROM log",
+        "UPDATE p SET id = 20 WHERE id = 2",
+        "SELECT * FROM c1 ORDER BY v",
+        "UPDATE p SET k = 'tres' WHERE k = 'three'",
+        "SELECT * FROM c2 ORDER BY y",
+        "DELETE FROM tree WHERE id = 1",
+        "SELECT * FROM tree ORDER BY id",
+        "INSERT INTO tree VALUES (6, 5), (7, 6)",
+        "UPDATE tree SET id = 50 WHERE id = 5",
+        "SELECT * FROM tree ORDER BY id",
+        "DELETE FROM p WHERE id = 20 RETURNING id, (SELECT count(*) FROM c1)",
+        "SELECT * FROM c1 ORDER BY v",
+        "DELETE FROM p",
+        "SELECT * FROM c2 ORDER BY y",
+        "PRAGMA foreign_key_check",
+        // Two tables whose CASCADEs reach each other, a key of two columns
+        // whose SET DEFAULT points at a missing parent (legacy lets this
+        // last DELETE through), actions fired from a trigger, and a deferred
+        // SET NULL.
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, b_id REFERENCES b(id) ON DELETE CASCADE)",
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, a_id REFERENCES a(id) ON DELETE CASCADE)",
+        "INSERT INTO a VALUES (1, NULL), (2, NULL)",
+        "INSERT INTO b VALUES (10, 1), (20, 2)",
+        "UPDATE a SET b_id = 20 WHERE id = 1",
+        "DELETE FROM a WHERE id = 2",
+        "SELECT * FROM a ORDER BY id",
+        "SELECT * FROM b ORDER BY id",
+        "CREATE TABLE mp(x, y, PRIMARY KEY (x, y))",
+        "CREATE TABLE mc(u DEFAULT 9, w DEFAULT 9, FOREIGN KEY (u, w) REFERENCES mp(x, y) ON DELETE SET DEFAULT ON UPDATE CASCADE)",
+        "INSERT INTO mp VALUES (1, 1), (2, 2), (9, 9)",
+        "INSERT INTO mc VALUES (1, 1), (2, 2)",
+        "UPDATE mp SET y = 3 WHERE x = 2",
+        "SELECT * FROM mc ORDER BY u",
+        "DELETE FROM mp WHERE x = 1",
+        "SELECT * FROM mc ORDER BY u",
+        "DELETE FROM mp WHERE x = 9",
+        "SELECT * FROM mp ORDER BY x",
+        "CREATE TABLE tp(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE tc(p REFERENCES tp(id) ON DELETE CASCADE)",
+        "CREATE TABLE gone(id)",
+        "CREATE TRIGGER tg AFTER INSERT ON gone BEGIN DELETE FROM tp WHERE id = new.id; END",
+        "INSERT INTO tp VALUES (1), (2)",
+        "INSERT INTO tc VALUES (1), (2), (2)",
+        "INSERT INTO gone VALUES (2)",
+        "SELECT * FROM tc ORDER BY p",
+        "CREATE TABLE dp(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE dc(p REFERENCES dp(id) ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO dp VALUES (1)",
+        "INSERT INTO dc VALUES (1)",
+        "BEGIN",
+        "UPDATE dp SET id = 2",
+        "COMMIT",
+        "SELECT * FROM dc",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
     }
 }
 
@@ -1293,5 +1349,42 @@ fn hir_delete_errors_match_legacy() {
             "{sql}: SQLite {sqlite_error}"
         );
         assert!(hir_error.contains(message), "{sql}: HIR {hir_error}");
+    }
+}
+
+/// Run `sql` on Turso through HIR and on rusqlite's SQLite, and check that
+/// both return the same rows, or both fail with SQLite's message (in any
+/// case).
+fn assert_matches_sqlite(
+    db: &TempDatabase,
+    conn: &std::sync::Arc<turso_core::Connection>,
+    sqlite: &rusqlite::Connection,
+    sql: &str,
+) {
+    let turso = limbo_exec_rows_fallible(db, conn, sql).map_err(|e| e.to_string());
+    let reference = sqlite
+        .prepare(sql)
+        .and_then(|mut statement| {
+            let mut rows = statement.query(())?;
+            let mut values = Vec::new();
+            while let Some(row) = rows.next()? {
+                let mut value = Vec::new();
+                for i in 0..row.as_ref().column_count() {
+                    value.push(row.get::<_, rusqlite::types::Value>(i)?);
+                }
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .map_err(|e| e.to_string());
+    match (&turso, &reference) {
+        (Ok(turso), Ok(reference)) => assert_eq!(turso, reference, "{sql}"),
+        // Turso words some errors differently, e.g. "immediate foreign key
+        // constraint failed" for "FOREIGN KEY constraint failed".
+        (Err(turso), Err(reference)) => assert!(
+            turso.to_lowercase().contains(&reference.to_lowercase()),
+            "{sql}: {turso} vs {reference}"
+        ),
+        _ => panic!("{sql}: {turso:?} vs {reference:?}"),
     }
 }

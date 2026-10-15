@@ -6,6 +6,7 @@ mod dml;
 mod emit;
 pub(super) mod expr;
 mod fkey;
+mod fkey_action;
 mod insert;
 pub(super) mod query;
 mod trigger;
@@ -88,8 +89,11 @@ pub(crate) fn translate_delete(
     let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete)? else {
         return Ok(false);
     };
+    let Some(actions) = fkey_action::delete_actions(&session, program, delete)? else {
+        return Ok(false);
+    };
     program.set_hir_plan(plan.clone());
-    delete::emit_delete(program, &plan, delete, access, &triggers)?;
+    delete::emit_delete(program, &plan, delete, access, &triggers, &actions)?;
     if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -124,6 +128,9 @@ pub(crate) fn translate_update(
     let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
         return Ok(false);
     };
+    let Some(actions) = fkey_action::update_actions(&session, program, &plan, update)? else {
+        return Ok(false);
+    };
     let mvcc = plan
         .document
         .source(update.target)
@@ -138,6 +145,7 @@ pub(crate) fn translate_update(
         &triggers,
         mvcc,
         !connection.check_constraints_ignored(),
+        &actions,
     )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
@@ -219,6 +227,8 @@ pub(super) struct HirSession<'a> {
     dialect: Arc<dyn crate::dialect::Dialect>,
     custom_types_enabled: bool,
     dqs_dml: DoubleQuotedDml,
+    /// The foreign-key actions being compiled.
+    actions: fkey_action::ActionStack,
 }
 
 /// The settings a statement is analyzed with, taken from the connection
@@ -277,6 +287,7 @@ impl<'a> HirSession<'a> {
             dialect: settings.dialect.clone(),
             custom_types_enabled: settings.custom_types_enabled,
             dqs_dml: settings.dqs_dml,
+            actions: fkey_action::ActionStack::default(),
         })
     }
 
