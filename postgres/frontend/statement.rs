@@ -9,6 +9,7 @@ use turso_core::{
     Statement as CoreStatement, StepResult, Value,
 };
 use turso_parser::ast;
+use turso_pg_parser::copy::CopyToStdout;
 use turso_pg_parser::translator::{PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt};
 
 use crate::copy::parse_copy_text_format;
@@ -24,6 +25,10 @@ pub(crate) enum Plan {
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
     Copy(PgCopyFromStmt),
+    CopyTo {
+        spec: CopyToStdout,
+        options: PrepareOptions,
+    },
 }
 
 pub(crate) fn with_execution(
@@ -214,6 +219,18 @@ enum Operation {
         data: Arc<OnceLock<std::io::Result<Vec<u8>>>>,
         completion: Completion,
     },
+    CopyToSchemas {
+        spec: CopyToStdout,
+        search_path: Option<Vec<String>>,
+        query: Box<CoreStatement>,
+        schemas: Vec<String>,
+    },
+    CopyToTable {
+        spec: CopyToStdout,
+        schema: String,
+        query: Box<CoreStatement>,
+        table: Option<turso_core::schema::BTreeTable>,
+    },
 }
 
 enum Sql {
@@ -311,6 +328,24 @@ impl Operation {
                     spec: spec.clone(),
                     query: Box::new(conn.prepare_sqlite(sql)?),
                     columns: 0,
+                })
+            }
+            Plan::CopyTo { spec, options } => {
+                if let Some(schema) = &spec.schema {
+                    let schema = match schema.as_str() {
+                        "public" | "pg_catalog" | "information_schema" => "main",
+                        schema => schema,
+                    };
+                    return Self::copy_to_table(pg_conn, spec.clone(), schema.to_owned());
+                }
+                Ok(Self::CopyToSchemas {
+                    spec: spec.clone(),
+                    search_path: options.unqualified_database_search_path.clone(),
+                    query: Box::new(conn.prepare_sqlite(format!(
+                        "PRAGMA table_list({})",
+                        quote_identifier(&spec.table)
+                    ))?),
+                    schemas: Vec::new(),
                 })
             }
         }
@@ -528,8 +563,115 @@ impl Operation {
                         "INSERT INTO {table}{columns} VALUES {values}"
                     ))?)));
                 }
+                Self::CopyToSchemas {
+                    spec,
+                    search_path,
+                    query,
+                    schemas,
+                } => {
+                    if let IOResult::IO(io) = query.run_with_row_callback_nonblock(|row| {
+                        schemas.push(row.get::<String>(0)?);
+                        Ok(())
+                    })? {
+                        return Ok(IOResult::IO(io));
+                    }
+                    let schema = schemas.iter().find(|schema| schema.as_str() == "temp");
+                    let schema = schema.or_else(|| match search_path {
+                        Some(path) => path.iter().find_map(|name| {
+                            let name = if name == "public" { "main" } else { name };
+                            schemas
+                                .iter()
+                                .find(|schema| schema.eq_ignore_ascii_case(name))
+                        }),
+                        None => schemas.first(),
+                    });
+                    let schema = schema.ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "COPY table '{}' does not exist",
+                            spec.table
+                        ))
+                    })?;
+                    *self = Self::copy_to_table(pg_conn, spec.clone(), schema.clone())?;
+                }
+                Self::CopyToTable {
+                    spec,
+                    schema,
+                    query,
+                    table,
+                } => {
+                    if let IOResult::IO(io) = query.run_with_row_callback_nonblock(|row| {
+                        let kind = row.get::<String>(0)?;
+                        let root_page = row.get::<i64>(1)?;
+                        if kind != "table" || root_page == 0 {
+                            return Err(LimboError::ParseError(
+                                "COPY TO STDOUT requires a plain table".to_owned(),
+                            ));
+                        }
+                        *table = Some(
+                            conn.dialect()
+                                .parse_table_sql(&row.get::<String>(2)?, root_page)?,
+                        );
+                        Ok(())
+                    })? {
+                        return Ok(IOResult::IO(io));
+                    }
+                    let table = table.as_ref().ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "COPY table '{}' does not exist",
+                            spec.table
+                        ))
+                    })?;
+                    let columns = if spec.columns.is_empty() {
+                        table
+                            .columns()
+                            .iter()
+                            .filter(|column| !column.hidden() && !column.is_generated())
+                            .map(|column| column.name.as_ref().expect("table columns have names"))
+                            .collect::<Vec<_>>()
+                    } else {
+                        for name in &spec.columns {
+                            let (_, column) = table.get_column(name).ok_or_else(|| {
+                                LimboError::ParseError(format!(
+                                    "COPY column '{name}' does not exist"
+                                ))
+                            })?;
+                            column.ensure_not_generated("COPY", name)?;
+                        }
+                        spec.columns.iter().collect()
+                    };
+                    let columns = columns
+                        .into_iter()
+                        .map(|column| quote_identifier(column))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT {columns} FROM {}.{}",
+                        quote_identifier(schema),
+                        quote_identifier(&spec.table)
+                    );
+                    return Ok(IOResult::Done(Some(conn.prepare_sqlite(sql)?)));
+                }
             }
         }
+    }
+
+    fn copy_to_table(
+        pg_conn: &PgConnectionInner,
+        spec: CopyToStdout,
+        schema: String,
+    ) -> Result<Self> {
+        let sql = format!(
+            "SELECT type, rootpage, sql FROM {}.sqlite_schema \
+             WHERE type IN ('table', 'view') AND name = '{}'",
+            quote_identifier(&schema),
+            spec.table.to_ascii_lowercase().replace('\'', "''")
+        );
+        Ok(Self::CopyToTable {
+            spec,
+            schema,
+            query: Box::new(pg_conn.conn.prepare_sqlite(sql)?),
+            table: None,
+        })
     }
 
     fn batch(statements: VecDeque<Sql>) -> Self {
