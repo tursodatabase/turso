@@ -5,6 +5,46 @@ use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
 use turso_core::{ConnectOpts, LimboError, StepResult, Value};
 
+#[turso_macros::test(mvcc)]
+fn current_time_literals_refresh_on_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE t(d TEXT DEFAULT CURRENT_DATE,
+                        tm TEXT DEFAULT CURRENT_TIME,
+                        ts TEXT DEFAULT CURRENT_TIMESTAMP)",
+    )?;
+    let mut select = conn.prepare("SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP")?;
+    let mut insert = conn.prepare("INSERT INTO t DEFAULT VALUES")?;
+    let mut selected = Vec::new();
+
+    for run in 0..2 {
+        if run != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            select.reset()?;
+            insert.reset()?;
+        }
+        select.run_with_row_callback(|row| {
+            selected.push(row.get_values().cloned().collect::<Vec<_>>());
+            Ok(())
+        })?;
+        insert.run_ignore_rows()?;
+    }
+
+    assert_eq!(selected.len(), 2);
+    assert_ne!(selected[0][1], selected[1][1]);
+    assert_ne!(selected[0][2], selected[1][2]);
+    let inserted: Vec<(String, String, String)> = conn.exec_rows("SELECT d, tm, ts FROM t");
+    assert_eq!(inserted.len(), 2);
+    assert_ne!(inserted[0].1, inserted[1].1);
+    assert_ne!(inserted[0].2, inserted[1].2);
+    for (date, time, timestamp) in inserted {
+        assert_eq!(date.len(), 10);
+        assert_eq!(time.len(), 8);
+        assert_eq!(timestamp.len(), 19);
+    }
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();

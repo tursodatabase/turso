@@ -65,34 +65,22 @@ pub fn emit_literal(
             });
             Ok(target_register)
         }
-        ast::Literal::CurrentDate => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_date::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
-        }
-        ast::Literal::CurrentTime => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_time::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
-                    .to_string(),
-                dest: target_register,
-            });
-            Ok(target_register)
-        }
-        ast::Literal::CurrentTimestamp => {
-            program.emit_insn(
-                Insn::String8 {
-                    value: datetime::exec_datetime_full::<
-                        &[_; 0],
-                        std::slice::Iter<'_, Value>,
-                        &Value,
-                    >(&[])
-                    .to_string(),
-                    dest: target_register,
+        ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp => {
+            let func = match literal {
+                ast::Literal::CurrentDate => ScalarFunc::Date,
+                ast::Literal::CurrentTime => ScalarFunc::Time,
+                ast::Literal::CurrentTimestamp => ScalarFunc::DateTime,
+                _ => unreachable!("literal must specify the current date or time"),
+            };
+            emit_function_call(
+                program,
+                FuncCtx {
+                    func: Func::Scalar(func),
+                    arg_count: 0,
                 },
-            );
+                &[],
+                target_register,
+            )?;
             Ok(target_register)
         }
     }

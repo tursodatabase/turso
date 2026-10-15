@@ -1757,6 +1757,64 @@ expect {
     two
 }
 
+test partial-index-current-date-literal-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE CURRENT_DATE > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-date-nested-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE coalesce(CURRENT_DATE, '') > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-time-literal-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE CURRENT_TIME > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-time-nested-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE coalesce(CURRENT_TIME, '') > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-timestamp-literal-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE CURRENT_TIMESTAMP > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-timestamp-nested-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE coalesce(CURRENT_TIMESTAMP, '') > '';
+}
+expect error {
+    (non-deterministic functions prohibited in partial index WHERE clauses|cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX)
+}
+
+test partial-index-current-time-string-control {
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a) WHERE 'now' > '' AND lower('X') = 'x';
+    INSERT INTO t1 VALUES (1);
+    SELECT a FROM t1;
+}
+expect {
+    1
+}
+
 # UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is not in the
 # partial index p, so there is no p entry to delete.
 @cross-check-integrity
