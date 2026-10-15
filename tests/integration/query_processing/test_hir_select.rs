@@ -382,7 +382,11 @@ fn hir_errors_match_legacy() {
         "SELECT x.y FROM items",
         "SELECT nosuch FROM items",
     ] {
-        let legacy_error = legacy.prepare(sql).err().expect("legacy rejects").to_string();
+        let legacy_error = legacy
+            .prepare(sql)
+            .err()
+            .expect("legacy rejects")
+            .to_string();
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
     }
