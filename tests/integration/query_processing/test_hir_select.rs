@@ -108,6 +108,7 @@ fn hir_window_select_matches_legacy_rows() {
     for sql in [
         "SELECT id, sum(value) OVER (PARTITION BY extra ORDER BY id) FROM items",
         "SELECT id, row_number() OVER () FROM items",
+        "SELECT id, row_number(*) OVER (ORDER BY id), rank(*) OVER (ORDER BY extra) FROM items",
         "SELECT id, rank() OVER (ORDER BY value DESC NULLS FIRST) FROM items ORDER BY id LIMIT 4",
         "SELECT id, sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM items",
         "SELECT id, sum(value) OVER (ORDER BY value RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM items",
