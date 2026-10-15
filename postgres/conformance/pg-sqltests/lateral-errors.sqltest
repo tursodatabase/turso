@@ -280,9 +280,6 @@ test lateral-before-a-table-name-is-a-syntax-error {
 expect error {
     syntax error at or near ";"
 }
-expect @tursopg error {
-    Invalid statement: syntax error at end of input
-}
 
 @setup data
 test lateral-without-a-subquery-is-a-syntax-error {
@@ -290,9 +287,6 @@ test lateral-without-a-subquery-is-a-syntax-error {
 }
 expect error {
     syntax error at or near ";"
-}
-expect @tursopg error {
-    Invalid statement: syntax error at end of input
 }
 
 @setup data
