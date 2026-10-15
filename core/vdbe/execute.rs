@@ -18533,10 +18533,11 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 value,
                 Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
             ),
-            Affinity::Real => matches!(
-                value,
-                Value::Numeric(Numeric::Float(_)) | Value::Null | Value::Blob(_)
-            ),
+            Affinity::Real => match value {
+                Value::Numeric(Numeric::Float(f)) => *f != 0.0,
+                Value::Null | Value::Blob(_) => true,
+                _ => false,
+            },
         };
         if settled {
             return true;
@@ -18627,7 +18628,14 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                     *value = Value::from_f64(*i as f64);
                     return true;
                 }
-                Value::Numeric(Numeric::Float(_)) | Value::Null => {
+                Value::Numeric(Numeric::Float(f)) => {
+                    // SQLite stores a whole-number real as an integer, so -0.0 is read back as 0.0
+                    if *f == 0.0 {
+                        *value = Value::from_f64(0.0);
+                    }
+                    return true;
+                }
+                Value::Null => {
                     return true;
                 }
                 Value::Text(t) => {
