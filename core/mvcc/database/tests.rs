@@ -9146,6 +9146,68 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
     );
 }
 
+/// A transaction that begins after a DROP INDEX has taken its commit timestamp, but before
+/// the new schema cookie is published, would see the commit's row changes with the old schema.
+/// Here the old schema still has the index while the snapshot has no rows left in the table.
+#[test]
+fn test_integrity_check_in_middle_commit_of_drop_index_and_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn_a.execute("CREATE INDEX i ON t(c)").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    conn_a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut integrity_check = conn_b.prepare("PRAGMA integrity_check").unwrap();
+
+    conn_a.execute("BEGIN").unwrap();
+    conn_a.execute("DROP INDEX i").unwrap();
+    conn_a.execute("DELETE FROM t").unwrap();
+    let store = db.get_mvcc_store();
+    let tx_a = conn_a.get_mv_tx_id().unwrap();
+    let prepared = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn_a.set_yield_injector(Some(prepared.clone()));
+    let mut commit = conn_a.prepare("COMMIT").unwrap();
+    while !prepared.is_empty() {
+        assert!(matches!(
+            commit.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+    }
+    conn_a.set_yield_injector(None);
+    assert!(matches!(
+        store.txs.get(&tx_a).unwrap().value().state.load(),
+        TransactionState::Preparing(_)
+    ));
+
+    let first_row = loop {
+        match integrity_check.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {}
+            StepResult::Busy => break None,
+            StepResult::Row => break Some(integrity_check.row().unwrap().get_value(0).clone()),
+            other => panic!("unexpected step result {other:?}"),
+        }
+    };
+    assert_eq!(
+        first_row, None,
+        "integrity_check began during the DROP INDEX commit"
+    );
+
+    commit.run_ignore_rows().unwrap();
+    drop(commit);
+
+    integrity_check.reset().unwrap();
+    assert_eq!(
+        integrity_check.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
 #[test]
 #[ignore]
 fn test_concurrent_writes() {
