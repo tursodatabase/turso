@@ -1168,6 +1168,15 @@ fn hir_generated_columns_match_sqlite() {
         "DELETE FROM g WHERE c > 10",
         "SELECT * FROM g ORDER BY a",
         "PRAGMA integrity_check",
+        // A STRICT table checks the types of its stored columns only.
+        "CREATE TABLE sg(a INT PRIMARY KEY, b INT AS (a || 'x'), c TEXT UNIQUE, d ANY AS (a * 2)) STRICT",
+        "INSERT INTO sg(a, c) VALUES (1, 'q'), ('2', 3)",
+        "INSERT INTO sg(a, c) VALUES ('x', 'r')",
+        "UPDATE sg SET a = '7' WHERE a = 1",
+        "UPDATE sg SET a = 'zz' WHERE a = 2",
+        "INSERT INTO sg(a, c) VALUES (11, 'q') ON CONFLICT(c) DO UPDATE SET a = excluded.a, c = 12",
+        "INSERT INTO sg(a, c) VALUES (13, '12') ON CONFLICT(c) DO UPDATE SET a = 'bad'",
+        "SELECT a, typeof(a), b, typeof(b), c, typeof(c), d FROM sg ORDER BY a",
     ] {
         assert_matches_sqlite(&db, &conn, &sqlite, sql);
     }

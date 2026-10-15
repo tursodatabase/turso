@@ -236,7 +236,7 @@ rowid. These still go to legacy:
 | A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
 | A changed key of the index the loop reads, a changed rowid with UPDATE ... FROM | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
-| Custom types, array columns, STRICT tables with generated columns | Encoding, type checks without virtual columns |
+| Custom types, array columns | Encoding |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -254,7 +254,7 @@ inserted. These still go to legacy:
 |---|---|
 | CDC, virtual tables, materialized views | As for DELETE |
 | AUTOINCREMENT under MVCC | The hidden MVCC sequence |
-| WITHOUT ROWID tables, custom types, array columns, STRICT tables with generated columns | Their lowering |
+| WITHOUT ROWID tables, custom types, array columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -289,6 +289,9 @@ legacy.
 Like SQLite, a DEFAULT on an INTEGER PRIMARY KEY is never used: a row that
 does not give the rowid gets a new one (legacy uses the DEFAULT for DEFAULT
 VALUES).
+
+A STRICT table checks the type of each stored column once the rowid is
+known; like SQLite, a virtual generated column is not checked.
 
 A subquery in RETURNING whose own FROM clause names the target table runs
 again for each row, as in SQLite and legacy, so it sees the rows written so

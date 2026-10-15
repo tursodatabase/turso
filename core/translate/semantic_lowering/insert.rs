@@ -2043,6 +2043,43 @@ mod tests {
     }
 
     #[test]
+    fn strict_table_with_virtual_columns_checks_only_stored_columns() {
+        let mut schema = schema();
+        schema
+            .add_btree_table(Arc::new(
+                crate::schema::BTreeTable::from_sql(
+                    "CREATE TABLE sv(a INT, b INT AS (a || 'x'), c TEXT) STRICT",
+                    120,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let plan = Arc::new(analyze_plan(schema, "INSERT INTO sv(a, c) VALUES (1, 'q')"));
+        let insert = insert_root(&plan).unwrap();
+        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
+        let mut program = program();
+        program.set_hir_plan(plan.clone());
+        let subprograms = Subprograms::default();
+        emit_insert(&mut program, &plan, insert, &subprograms, true).unwrap();
+        let checked = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::TypeCheck {
+                    table_reference, ..
+                } => Some(table_reference.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let types = checked
+            .columns()
+            .iter()
+            .map(|column| column.ty_str.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["INT", "ANY", "TEXT"]);
+    }
+
+    #[test]
     fn autoincrement_needs_legacy_only_under_mvcc() {
         let plan = analyze_plan(schema(), "INSERT INTO counted(b) VALUES (1)");
         let insert = insert_root(&plan).unwrap();

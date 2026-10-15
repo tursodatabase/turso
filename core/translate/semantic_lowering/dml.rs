@@ -682,16 +682,13 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
 /// Whether the target is a STRICT table HIR does not lower yet: one with a
 /// custom type or array column, whose type check needs the resolved types.
 pub(super) fn strict_needs_legacy(table: &BTreeTable) -> bool {
-    // The type check of a STRICT table with virtual columns skips them,
-    // which is not lowered yet.
     table.is_strict
-        && (table.has_virtual_columns()
-            || table.columns().iter().any(|column| {
-                column.is_array()
-                    || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-                        .iter()
-                        .any(|name| column.ty_str.eq_ignore_ascii_case(name))
-            }))
+        && table.columns().iter().any(|column| {
+            column.is_array()
+                || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+                    .iter()
+                    .any(|name| column.ty_str.eq_ignore_ascii_case(name))
+        })
 }
 
 /// STRICT: check each value of the row in `start..` against its column's
@@ -702,11 +699,23 @@ pub(super) fn emit_strict_type_check(
     table: &Arc<BTreeTable>,
     start: usize,
 ) {
+    // Like SQLite, a virtual column is not checked: it is checked as ANY.
+    let table_reference = if table.has_virtual_columns() {
+        let mut checked = (**table).clone();
+        for column in checked.columns_mut().iter_mut() {
+            if column.is_virtual_generated() {
+                column.ty_str = "ANY".to_string();
+            }
+        }
+        Arc::new(checked)
+    } else {
+        table.clone()
+    };
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: table.columns().len(),
         check_generated: true,
-        table_reference: table.clone(),
+        table_reference,
     });
 }
 
