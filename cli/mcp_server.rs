@@ -81,6 +81,7 @@ impl StmtClass {
             | Stmt::CreateVirtualTable(_)
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
+            | Stmt::CreateRole { .. }
             | Stmt::CreateSequence { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
@@ -93,6 +94,7 @@ impl StmtClass {
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
             | Stmt::Commit { .. }
+            | Stmt::SetRole { .. }
             | Stmt::Detach { .. }
             | Stmt::Pragma { .. }
             | Stmt::Reindex { .. }
@@ -532,10 +534,12 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
-                    Ok(c) => c,
-                    Err(e) => return format!("Failed to connect to database '{path}': {e}"),
-                },
+                Ok((_io, db)) => {
+                    match db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser)) {
+                        Ok(c) => c,
+                        Err(e) => return format!("Failed to connect to database '{path}': {e}"),
+                    }
+                }
                 Err(e) => return format!("Failed to open database '{path}': {e}"),
             }
         };

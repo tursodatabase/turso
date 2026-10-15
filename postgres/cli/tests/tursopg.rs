@@ -417,13 +417,59 @@ fn d_upper_t_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn role_without_privileges_cannot_read_storage_through_debug_functions() {
+    for query in [
+        "SELECT count(*) FROM btree_dump('t');",
+        "SELECT count(*) FROM sqlite_dbpage;",
+    ] {
+        let input = format!(
+            "CREATE TABLE t (x text);\n\
+             INSERT INTO t VALUES ('secret');\n\
+             CREATE ROLE alice;\n\
+             SET ROLE alice;\n\
+             {query}\n"
+        );
+        let output = stdout(&run_tursopg(input.as_bytes()));
+        assert!(
+            output.contains("permission denied for function"),
+            "{query} should be denied, got: {output}"
+        );
+    }
+}
+
+#[test]
+fn role_without_privileges_cannot_load_extensions() {
+    let output = stdout(&run_tursopg(
+        b"CREATE ROLE alice;\n\
+          SET ROLE alice;\n\
+          SELECT load_extension('/nonexistent/extension.so');\n",
+    ));
+    assert!(
+        output.contains("permission denied for function load_extension"),
+        "{output}"
+    );
+}
+
+#[test]
+fn role_without_privileges_can_use_table_valued_functions() {
+    let output = run_tursopg(
+        b"CREATE ROLE alice;\n\
+          SET ROLE alice;\n\
+          SELECT count(*) FROM generate_series(1, 3);\n\
+          SELECT count(*) FROM json_each('[1, 2]');\n",
+    );
+    let output = stdout(&output);
+    assert!(!output.contains("Error"), "{output}");
+}
+
+#[test]
 fn du_lists_roles() {
     let output = run_tursopg(b"\\du\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("turso"),
-        "\\du should list 'turso', got: {out}"
+        out.contains("postgres"),
+        "\\du should list 'postgres', got: {out}"
     );
 }
 
@@ -953,6 +999,10 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_on(":memory:")
+}
+
+fn start_tursopg_server_on(database: &str) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -961,7 +1011,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(database)
             .arg("--server")
             .arg(&addr)
             .stdout(Stdio::piped())
@@ -1321,6 +1371,54 @@ fn wire_load_extension_is_disabled() {
             "wire listener must not reach the filesystem open: {text}"
         );
     });
+}
+
+#[test]
+fn wire_schema_created_by_one_client_is_visible_to_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("shared-schemas.db");
+    let (mut server, port) = start_tursopg_server_on(database.to_str().unwrap());
+    let mut creator = PgTestClient::connect(port);
+    let mut reader = PgTestClient::connect(port);
+    let mut restricted = PgTestClient::connect(port);
+    creator.query_command_tags("CREATE ROLE alice");
+    restricted.query_command_tags("SET ROLE alice");
+
+    creator.query_command_tags("CREATE SCHEMA shared");
+    creator.query_command_tags("CREATE TABLE shared.t (x INT)");
+    creator.query_command_tags("INSERT INTO shared.t VALUES (1)");
+    assert_eq!(
+        reader.query_single_text("SELECT count(*) FROM shared.t"),
+        "1"
+    );
+    assert_eq!(restricted.query_single_text("SELECT 1"), "1");
+
+    creator.query_command_tags("DROP SCHEMA shared CASCADE");
+    reader.send_query("SELECT count(*) FROM shared.t");
+    let response = String::from_utf8_lossy(&reader.read_until_ready()).to_string();
+    assert!(response.contains("shared"), "{response}");
+    assert_eq!(reader.query_single_text("SELECT 1"), "1");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
+fn wire_set_role_changes_only_the_role_of_its_own_client() {
+    let (mut server, port) = start_tursopg_server();
+    let mut alice = PgTestClient::connect(port);
+    let mut other = PgTestClient::connect(port);
+
+    alice.query_command_tags("CREATE ROLE alice");
+    alice.query_command_tags("SET ROLE alice");
+    assert_eq!(alice.query_single_text("SELECT current_user"), "alice");
+    assert_eq!(other.query_single_text("SELECT current_user"), "postgres");
+
+    other.query_command_tags("RESET ROLE");
+    assert_eq!(alice.query_single_text("SELECT current_user"), "alice");
+
+    server.kill().ok();
+    server.wait().ok();
 }
 
 #[test]

@@ -28,7 +28,9 @@ struct BenchDb {
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -320,7 +322,9 @@ impl HugeMultiWriteHarness {
         // CPU-bound index-probe path the eq-only seek bound affects.
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         // Keep everything in MvStore so the measurement reflects the in-memory
         // index path rather than checkpoint I/O.
@@ -336,7 +340,9 @@ impl HugeMultiWriteHarness {
             .unwrap();
 
         let ghost = (pending > 0).then(|| {
-            let ghost = db.connect(ConnectOpts::new()).unwrap();
+            let ghost = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             ghost.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             ghost.execute("BEGIN CONCURRENT").unwrap();
             ghost.execute(ghost_insert_sql(pending, placement)).unwrap();

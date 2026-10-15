@@ -26,11 +26,20 @@ static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = tmp_db.limbo_database();
     let context = Arc::new(std::sync::Mutex::new(7i64));
-    let first = db.connect_with_context(context.clone())?;
+    let first = db.connect_with_context(
+        turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        context.clone(),
+    )?;
     let first_clone = first.clone();
-    let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
-    let shared = db.connect_with_context(context.clone())?;
-    let plain = db.connect(ConnectOpts::new())?;
+    let second = db.connect_with_context(
+        turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        Arc::new(std::sync::Mutex::new(19i64)),
+    )?;
+    let shared = db.connect_with_context(
+        turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        context.clone(),
+    )?;
+    let plain = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     assert!(std::ptr::eq(
         context.as_ref(),
@@ -67,9 +76,10 @@ fn connection_context_lives_until_the_last_connection_owner_drops(
     let drops = Arc::new(AtomicUsize::new(0));
     let context = Arc::new(ConnectionContextDropCounter(drops.clone()));
     let weak = Arc::downgrade(&context);
-    let conn = tmp_db
-        .limbo_database()
-        .connect_with_context(context.clone())?;
+    let conn = tmp_db.limbo_database().connect_with_context(
+        turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        context.clone(),
+    )?;
     let cloned_conn = conn.clone();
     let mut statement = conn.prepare("SELECT 7")?;
 

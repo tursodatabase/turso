@@ -70,8 +70,12 @@ fn setup(park: usize) -> Setup {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let a = db.connect(ConnectOpts::new()).unwrap();
-    let b = db.connect(ConnectOpts::new()).unwrap();
+    let a = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let b = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     exec(&a, "BEGIN").unwrap();
@@ -175,8 +179,12 @@ fn setup_hidden_root_reuse(park: usize) -> Setup {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let a = db.connect(ConnectOpts::new()).unwrap();
-    let b = db.connect(ConnectOpts::new()).unwrap();
+    let a = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let b = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     exec(&a, "CREATE TABLE hidden(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
@@ -254,8 +262,12 @@ fn total_commit_io_pumps_hidden_root_reuse() -> usize {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let a = db.connect(ConnectOpts::new()).unwrap();
-    let b = db.connect(ConnectOpts::new()).unwrap();
+    let a = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    let b = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
     exec(&a, "CREATE TABLE hidden(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
@@ -315,8 +327,12 @@ fn wal_stale_publish_backfill_hides_committed_rows() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let a = db.connect(ConnectOpts::new()).unwrap();
-        let b = db.connect(ConnectOpts::new()).unwrap();
+        let a = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
+        let b = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
         exec(&a, "BEGIN").unwrap();
@@ -419,7 +435,9 @@ fn wal_stale_publish_backfill_hides_committed_rows() {
 
             let db2 = Database::open_file(io, "publish-backfill-race.db", Arc::new(SqliteDialect))
                 .unwrap();
-            let c = db2.connect(ConnectOpts::new()).unwrap();
+            let c = db2
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             let mut stmt = c.prepare("PRAGMA integrity_check").unwrap();
             let mut msgs = Vec::new();
             loop {
@@ -498,7 +516,9 @@ fn wal_stale_publish_backfill_can_point_table_at_restarted_index_root() {
             continue;
         }
 
-        let schema_writer = s.db.connect(ConnectOpts::new()).unwrap();
+        let schema_writer =
+            s.db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
         let mut stale_schema_stmt = schema_writer
             .prepare("CREATE TABLE stale_keep(id INTEGER PRIMARY KEY, v INTEGER)")
             .unwrap();
@@ -565,7 +585,9 @@ fn wal_stale_publish_backfill_can_point_table_at_restarted_index_root() {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let c = db2.connect(ConnectOpts::new()).unwrap();
+        let c = db2
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         if exec_ints(
             &c,
             "SELECT count(*) FROM sqlite_schema WHERE name = 'hidden'",

@@ -33,6 +33,15 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    /// The names of the built-in superuser and `public` roles, as this
+    /// dialect's users see them.
+    fn builtin_role_names(&self) -> crate::security::roles::BuiltinRoleNames {
+        crate::security::roles::BuiltinRoleNames {
+            superuser: "superuser",
+            public: "public",
+        }
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
@@ -172,6 +181,15 @@ pub trait Dialect: Send + Sync + 'static {
     /// `c`. PostgreSQL stops there and reports that the column does not
     /// exist.
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ... ADD COLUMN` with a default that is not a
+    /// constant fills the column of the existing rows with the default.
+    ///
+    /// SQLite allows such a default only when the table is empty.
+    /// PostgreSQL evaluates the default for every existing row.
+    fn add_column_fills_existing_rows(&self) -> bool {
         false
     }
 }
@@ -440,7 +458,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         {
             let db = open_db(&io, "dialect-load.db", Arc::new(SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
             conn.close().unwrap();
         }
@@ -453,7 +473,9 @@ mod tests {
 
         // DDL reparses the schema via the ParseSchema opcode, again through
         // the dialect.
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let before = dialect.parse_calls.load(Ordering::SeqCst);
         conn.execute("CREATE TABLE u (y INTEGER)").unwrap();
         assert!(dialect.parse_calls.load(Ordering::SeqCst) > before);
@@ -469,7 +491,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let dialect = Arc::new(TestDialect::default());
         let db = open_db(&io, "dialect-reprepare.db", dialect.clone()).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let mut stmt = conn.prepare("test: SELECT 42").unwrap();
         conn.set_full_column_names(true);
@@ -488,7 +512,9 @@ mod tests {
     fn query_runner_reports_invalid_utf8_once() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "query-runner-invalid-utf8.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let mut runner = conn.query_runner(b"SELECT 1;\xff");
 
         let Some(Err(crate::LimboError::ParseError(message))) = runner.next() else {
@@ -503,7 +529,9 @@ mod tests {
     fn query_runner_reports_parse_error_once() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "query-runner-parse-error.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let mut runner = conn.query_runner(b"SELECT * FROM");
 
         assert!(runner.next().is_some_and(|result| result.is_err()));
@@ -523,8 +551,12 @@ mod tests {
                 .unwrap()
         };
 
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(
             query_catalog(&conn1),
             vec![vec![crate::Value::Numeric(
@@ -562,7 +594,9 @@ mod tests {
             Arc::new(TestDialect::default()),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let error = conn.execute("DROP TABLE test_catalog").unwrap_err();
         assert!(
@@ -572,7 +606,9 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        let new_conn = db.connect(ConnectOpts::new()).unwrap();
+        let new_conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         for catalog_conn in [&conn, &new_conn] {
             let rows = catalog_conn
                 .prepare("SELECT value FROM test_catalog")
@@ -592,14 +628,18 @@ mod tests {
 
         {
             let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.execute("PRAGMA journal_mode = mvcc").unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
             conn.close().unwrap();
         }
 
         let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let rows = conn
             .prepare("SELECT value FROM test_catalog")
             .unwrap()
@@ -620,7 +660,9 @@ mod tests {
         .unwrap();
 
         for temp_store in ["MEMORY", "FILE"] {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
             conn.execute("CREATE TEMP TABLE t (x INTEGER)").unwrap();
@@ -640,7 +682,9 @@ mod tests {
         {
             let dialect = Arc::new(TestDialect::default());
             let db = open_db(&io, "dialect-store.db", dialect).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
 
             // A frontend prepares its translated AST while supplying the
             // original statement text.
@@ -676,7 +720,9 @@ mod tests {
         let dialect = Arc::new(TestDialect::default());
         let db = open_db(&io, "dialect-store.db", dialect.clone()).unwrap();
         assert!(dialect.parse_calls.load(Ordering::SeqCst) >= 1);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         let rows = conn
             .prepare("SELECT x FROM t")
@@ -746,7 +792,9 @@ mod tests {
     fn dialect_scalar_function_resolves_and_executes() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-funcs.db", Arc::new(TestDialect::default())).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         // Dialect-provided scalar executes through exec_scalar_function.
         let rows = conn
@@ -790,7 +838,9 @@ mod tests {
             Arc::new(TestDialect::default()),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE lhs (id INTEGER)").unwrap();
         conn.execute("CREATE TABLE rhs (id INTEGER, value INTEGER)")
@@ -814,7 +864,9 @@ mod tests {
     fn dialect_owns_the_function_surface() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-nofuncs.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         // Function-free SQL works, including DDL (whose internal helper
         // statements resolve with SQLite semantics regardless of dialect).
@@ -834,7 +886,9 @@ mod tests {
     fn cdc_generated_functions_bypass_the_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-cdc.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("PRAGMA capture_data_changes_conn('full')")
@@ -874,7 +928,9 @@ mod tests {
     fn alter_table_rewrites_dialect_formatted_sql() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-alter-table.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("ALTER TABLE t RENAME TO u").unwrap();
@@ -897,7 +953,9 @@ mod tests {
     fn alter_table_rename_column_decodes_dialect_formatted_sql() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-alter-column.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("ALTER TABLE t RENAME COLUMN x TO y").unwrap();
@@ -982,7 +1040,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -995,7 +1055,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let output_conn = output_db.connect(ConnectOpts::new()).unwrap();
+        let output_conn = output_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let schema_rows = output_conn
             .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
             .unwrap()
@@ -1033,7 +1095,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS aux",
             attached_path.display()
@@ -1051,7 +1115,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let output_conn = output_db.connect(ConnectOpts::new()).unwrap();
+        let output_conn = output_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(
             output_conn
                 .prepare("SELECT x FROM t")
@@ -1077,7 +1143,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO t VALUES (42)").unwrap();
 

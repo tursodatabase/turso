@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -25,24 +26,30 @@ use pgwire::messages::data::DataRow;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
+type Connect = dyn Fn() -> anyhow::Result<Connection> + Send + Sync;
+
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    connect: Arc<Connect>,
+    schemas: Arc<SharedSchemas>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoPgServer {
+    /// Every client gets its own connection from `connect`, so session
+    /// state such as the current role is not shared between clients.
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        connect: impl Fn() -> anyhow::Result<Connection> + Send + Sync + 'static,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            connect: Arc::new(connect),
+            schemas: Arc::new(SharedSchemas::default()),
             interrupt_count,
         }
     }
@@ -60,24 +67,33 @@ impl TursoPgServer {
             self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let conn = match (self.connect)() {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    error!("Error opening a connection for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: Arc::new(Mutex::new(conn.clone())),
+                                    schemas: self.schemas.clone(),
+                                    db_file: self.db_file.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = conn.close() {
+                                    error!("Error closing the connection for {}: {}", addr, e);
                                 }
                             });
                         }
@@ -104,11 +120,18 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
+    schemas: Arc<SharedSchemas>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl TursoPgHandler {
+    fn prepare(&self, conn: &PgConnection, sql: &str) -> PgWireResult<turso_core::Statement> {
+        self.schemas
+            .prepare(conn, sql)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))
+    }
+
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
     /// Uses simple string matching to detect DROP SCHEMA statements.
     fn cleanup_dropped_schema_file(&self, query: &str) {
@@ -154,6 +177,46 @@ impl TursoPgHandler {
     }
 }
 
+/// The schemas of the server, by name, with the database file of each. A
+/// schema is a database file attached to a connection, and every client has
+/// its own connection, so a schema that one client creates or drops is
+/// attached or detached on the connection of every other client before its
+/// next statement.
+#[derive(Default)]
+struct SharedSchemas {
+    schemas: Mutex<Option<BTreeMap<String, String>>>,
+}
+
+impl SharedSchemas {
+    fn prepare(&self, conn: &PgConnection, sql: &str) -> turso_pg::Result<turso_core::Statement> {
+        let mut schemas = self.schemas.lock().unwrap();
+        let attached = attached_schemas(conn);
+        let schemas = schemas.get_or_insert_with(|| attached.clone());
+        for (name, path) in &attached {
+            if schemas.get(name) != Some(path) {
+                conn.inner().detach(name)?;
+            }
+        }
+        for (name, path) in schemas.iter() {
+            if attached.get(name) != Some(path) {
+                conn.inner().attach(path, name)?;
+            }
+        }
+        let stmt = conn.prepare(sql);
+        *schemas = attached_schemas(conn);
+        stmt
+    }
+}
+
+fn attached_schemas(conn: &PgConnection) -> BTreeMap<String, String> {
+    conn.inner()
+        .list_all_databases()
+        .into_iter()
+        .filter(|(_, name, _)| name != "main" && name != "temp")
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
 }
@@ -182,14 +245,13 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let statements = split_statements(query).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+        })?;
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let mut stmt = self.prepare(&conn, sql)?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -226,9 +288,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let mut stmt = self.prepare(&conn, query)?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -253,9 +313,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = self.prepare(&conn, &target.statement)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -276,9 +334,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = self.prepare(&conn, &portal.statement.statement)?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -402,7 +458,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -411,7 +467,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -646,7 +702,7 @@ fn is_pg_non_query(sql: &str) -> bool {
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
+    let upper = join_leading_words(query).to_uppercase();
     if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
@@ -659,6 +715,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE ROLE") {
+        Tag::new("CREATE ROLE")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -692,6 +750,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -705,6 +765,75 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     } else {
         Tag::new("OK")
     }
+}
+
+fn join_leading_words(query: &str) -> String {
+    let mut joined = String::new();
+    let mut rest = skip_whitespace_and_comments(query);
+    let mut separated = false;
+    loop {
+        let len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if len == 0 {
+            break;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(&rest[..len]);
+        let after_word = &rest[len..];
+        rest = skip_whitespace_and_comments(after_word);
+        separated = rest.len() != after_word.len();
+        if !separated {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        if separated && !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(rest.trim_end());
+    }
+    joined
+}
+
+fn skip_whitespace_and_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment
+                .split_once(['\n', '\r'])
+                .map_or("", |(_, rest)| rest);
+        } else if sql.starts_with("/*") {
+            sql = skip_nested_block_comment(sql);
+        } else {
+            return sql;
+        }
+    }
+}
+
+fn skip_nested_block_comment(sql: &str) -> &str {
+    let mut depth = 0;
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"/*" => {
+                depth += 1;
+                i += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return &sql[i..];
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    ""
 }
 
 /// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
@@ -766,6 +895,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_tag_ignores_comments_and_line_breaks_between_keywords() {
+        for (query, tag) in [
+            (
+                "-- a comment\nINSERT INTO t VALUES (1)",
+                Tag::new("INSERT").with_oid(0).with_rows(1),
+            ),
+            (
+                "/* a /* nested */ comment */ UPDATE t SET x = 1",
+                Tag::new("UPDATE").with_rows(1),
+            ),
+            ("CREATE\nVIEW v AS SELECT 1", Tag::new("CREATE VIEW")),
+            ("DROP /* a comment */ INDEX i", Tag::new("DROP INDEX")),
+            (
+                "CREATE TABLE public.t AS SELECT 1",
+                Tag::new("SELECT").with_rows(1),
+            ),
+            (
+                "CREATE TABLE t AS SELECT 1 AS x -- a comment\r WITH NO DATA",
+                Tag::new("CREATE TABLE AS"),
+            ),
+        ] {
+            assert_eq!(command_tag(query, 1), tag, "{query}");
+        }
+    }
+
+    #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
@@ -807,6 +962,16 @@ mod tests {
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn create_role_has_its_own_command_tag() {
+        assert_eq!(command_tag("CREATE ROLE alice", 0), Tag::new("CREATE ROLE"));
+    }
+
+    #[test]
+    fn reset_has_its_own_command_tag() {
+        assert_eq!(command_tag("RESET ROLE", 0), Tag::new("RESET"));
     }
 
     #[test]

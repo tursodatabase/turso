@@ -1215,7 +1215,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
-            let conn = main_db.connect(ConnectOpts::new())?;
+            let conn = main_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
             conn.wal_auto_actions_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
@@ -1365,7 +1365,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
         };
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.wal_auto_actions_disable();
         Ok(conn)
     }
@@ -4528,7 +4528,9 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+        let remote_conn = remote_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
@@ -4648,9 +4650,13 @@ mod tests {
                 .map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
                 })?;
-                let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
-                })?;
+                let verify_conn = verify_db
+                    .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "test verify connect failed: {error}"
+                        ))
+                    })?;
                 let mut value_stmt = verify_conn
                     .prepare("SELECT value FROM items WHERE id = 1")
                     .unwrap();
@@ -4734,7 +4740,9 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+        let remote_conn = remote_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         assert!(remote_conn.mvcc_enabled());
         remote_conn
@@ -4876,9 +4884,13 @@ mod tests {
                 .map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
                 })?;
-                let verify_conn = verify_db.connect(ConnectOpts::new()).map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
-                })?;
+                let verify_conn = verify_db
+                    .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "test verify connect failed: {error}"
+                        ))
+                    })?;
                 assert!(verify_conn.mvcc_enabled());
                 let mut stmt = verify_conn.prepare("SELECT COUNT(*) FROM items")?;
                 let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
@@ -4911,7 +4923,9 @@ mod tests {
         let remote_db =
             turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+        let remote_conn = remote_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
@@ -5086,7 +5100,9 @@ mod tests {
         let foreign_db =
             turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
                 .unwrap();
-        let foreign_conn = foreign_db.connect(ConnectOpts::new()).unwrap();
+        let foreign_conn = foreign_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         foreign_conn
             .execute("CREATE TABLE orphaned(id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -5160,7 +5176,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+        let remote_conn = remote_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();

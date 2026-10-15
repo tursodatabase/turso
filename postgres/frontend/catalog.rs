@@ -6,11 +6,13 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
-    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
+    schema::{BTreeTable, Index, Schema, Table, TURSO_INTERNAL_PREFIX},
+    security::roles::{BuiltinRoleNames, Role, RoleId},
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement,
+    Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{self, RefAct};
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
@@ -31,6 +33,13 @@ pub struct PostgresDialect;
 impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn builtin_role_names(&self) -> BuiltinRoleNames {
+        BuiltinRoleNames {
+            superuser: "postgres",
+            public: "public",
+        }
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -165,6 +174,10 @@ impl Dialect for PostgresDialect {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
+
+    fn add_column_fills_existing_rows(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -184,6 +197,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
         .filter(|(name, table)| {
             // Skip system tables
             if name.starts_with("sqlite_")
+                || name.starts_with(TURSO_INTERNAL_PREFIX)
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
@@ -609,9 +623,39 @@ impl SnapshotRows for PgAttributeTable {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser, and `public` has OID 0, as in
+/// PostgreSQL's access control lists.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    match id {
+        RoleId::SUPERUSER => SUPERUSER_OID,
+        RoleId::PUBLIC => 0,
+        _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// Returns the roles that PostgreSQL lists in `pg_roles`. PostgreSQL has no
+/// row for `public`.
+pub(crate) fn listed_roles(conn: &Connection) -> Vec<Role> {
+    conn.role_catalog()
+        .iter()
+        .filter(|role| role.id != RoleId::PUBLIC)
+        .cloned()
+        .collect()
+}
+
+fn superuser_name(conn: &Connection) -> String {
+    conn.role_catalog()
+        .get(RoleId::SUPERUSER)
+        .expect("the role catalog always has the superuser")
+        .name
+        .clone()
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 struct PgRolesTable;
 
@@ -635,25 +679,32 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        listed_roles(conn).iter().map(role_row).collect()
     }
+}
+
+/// `CREATE ROLE` creates roles that cannot log in, so only the built-in
+/// superuser can.
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    let can_login = role.id == RoleId::SUPERUSER;
+    let bypasses_rls = role.superuser || role.ignores_row_policies;
+    vec![
+        Value::from_i64(role_oid(role.id)),   // oid
+        Value::build_text(role.name.clone()), // rolname
+        superuser.clone(),                    // rolsuper
+        Value::from_i64(1),                   // rolinherit
+        superuser.clone(),                    // rolcreaterole
+        superuser.clone(),                    // rolcreatedb
+        Value::from_i64(can_login as i64),    // rolcanlogin
+        superuser,                            // rolreplication
+        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
+        Value::Null,                          // rolpassword (never exposed)
+        Value::Null,                          // rolvaliduntil
+        Value::from_i64(bypasses_rls as i64), // rolbypassrls
+        Value::Null,                          // rolconfig
+    ]
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -914,6 +965,10 @@ impl VirtualTableModule for EmptyPgCatalogTable {
 impl VirtualTable for EmptyPgCatalogTable {
     type Cursor = EmptyPgCatalogCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(EmptyPgCatalogCursor)
     }
@@ -987,11 +1042,12 @@ impl SnapshotRows for PgTablesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
+        let owner = superuser_name(conn);
         for (table_name, _) in user_tables_sorted(&schema) {
             rows.push(vec![
                 Value::Text("public".into()),           // schemaname
                 Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
+                Value::Text(owner.clone().into()),      // tableowner
                 Value::Null,                            // tablespace
                 Value::from_i64(0),                     // hasindexes
                 Value::from_i64(0),                     // hasrules
@@ -1874,7 +1930,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::build_text(render_expr(&chk.expr)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -1922,10 +1978,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                 // oid
+                        Value::from_i64(table_oid),                   // adrelid
+                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
+                        Value::build_text(render_expr(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -1968,21 +2024,26 @@ impl SnapshotRows for PgSequencesTable {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = conn
-                    .get_sequence_currval(&seq_name)
-                    .unwrap_or(seq.start_value);
+                let last_value = if conn.current_role_is_superuser() {
+                    Value::from_i64(
+                        conn.get_sequence_currval(&seq_name)
+                            .unwrap_or(seq.start_value),
+                    )
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
-                    Value::from_i64(i64::from(seq.cycle)), // cycle
+                    Value::build_text("public"),             // schemaname
+                    Value::build_text(seq_name),             // sequencename
+                    Value::build_text(superuser_name(conn)), // sequenceowner
+                    Value::build_text("bigint"),             // data_type
+                    Value::from_i64(seq.start_value),        // start_value
+                    Value::from_i64(seq.min_value),          // min_value
+                    Value::from_i64(seq.max_value),          // max_value
+                    Value::from_i64(seq.increment_by),       // increment_by
+                    Value::from_i64(i64::from(seq.cycle)),   // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    last_value,         // last_value
                 ]);
             }
         }
@@ -2838,6 +2899,10 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     type Cursor = SnapshotCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
@@ -3045,6 +3110,10 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
 
 impl VirtualTable for PgInputErrorInfoTable {
     type Cursor = PgInputErrorInfoCursor;
+
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgInputErrorInfoCursor::new())
@@ -3270,6 +3339,10 @@ impl VirtualTableCursor for PgGetTableDefCursor {
 impl VirtualTable for PgGetTableDefTable {
     type Cursor = PgGetTableDefCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgGetTableDefCursor::new(conn))
     }
@@ -3383,13 +3456,39 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
+                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
             }
             constraint_oid += 1;
         }
     }
 
     None
+}
+
+fn render_expr(expr: &ast::Expr) -> String {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if args.is_empty() {
+                if let Some(keyword) = role_keyword(name.as_str()) {
+                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("rewriting role functions does not fail");
+    expr.to_string()
+}
+
+fn role_keyword(function_name: &str) -> Option<&'static str> {
+    if function_name.eq_ignore_ascii_case("current_user") {
+        Some("CURRENT_USER")
+    } else if function_name.eq_ignore_ascii_case("session_user") {
+        Some("SESSION_USER")
+    } else {
+        None
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
@@ -3490,7 +3589,9 @@ mod tests {
                 crate::DatabaseOpts::new(),
             )
             .unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             if mvcc {
                 conn.pragma_update("journal_mode", "'mvcc'").unwrap();
             }
@@ -3525,7 +3626,9 @@ mod tests {
                 .prepare("SELECT relname FROM pg_class WHERE relname = 'second_connection'")
                 .unwrap();
             assert!(tables.run_collect_rows().unwrap().is_empty());
-            let other = db.connect(ConnectOpts::new()).unwrap();
+            let other = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             other
                 .execute("CREATE TABLE second_connection (v INT)")
                 .unwrap();
@@ -3576,7 +3679,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let mut expected = Vec::new();
         for i in 0..12 {
             let name = format!("catalog_{i:02}");
@@ -3729,7 +3834,9 @@ mod tests {
                     opts,
                 )
                 .unwrap();
-                let conn = db.connect(ConnectOpts::new()).unwrap();
+                let conn = db
+                    .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                    .unwrap();
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
@@ -3751,7 +3858,9 @@ mod tests {
                 opts,
             )
             .unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             check_columns(&conn);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
@@ -3804,7 +3913,9 @@ mod tests {
             opts,
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
             .unwrap();
         conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
@@ -3834,7 +3945,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             attached
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
                 .unwrap()
@@ -3843,7 +3954,9 @@ mod tests {
             vec![vec![Value::from_i64(3)]]
         );
         for temp_store in ["MEMORY", "FILE"] {
-            let temp_conn = db.connect(ConnectOpts::new()).unwrap();
+            let temp_conn = db
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+                .unwrap();
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
@@ -3874,7 +3987,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM catalog_names")
                 .unwrap()
@@ -3945,7 +4058,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Create test tables in SQLite mode (default)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -4006,7 +4121,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Create a test table with known columns
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
@@ -4072,7 +4189,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER)")
@@ -4112,7 +4231,9 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");
@@ -4155,7 +4276,9 @@ mod tests {
         .unwrap();
 
         // SQLite-mode connection: sqlite_master sees the user table.
-        let sqlite_conn = db.connect(ConnectOpts::new()).unwrap();
+        let sqlite_conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         sqlite_conn
             .execute("CREATE TABLE users (id INTEGER, name TEXT)")
             .unwrap();
@@ -4213,7 +4336,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Create multiple tables
         conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
@@ -4285,7 +4410,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Create test tables
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -4334,7 +4461,9 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();

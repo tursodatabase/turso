@@ -22,17 +22,20 @@ pub struct PostgresBackend {
 impl PostgresBackend {
     /// Connects to the server at `dsn`.
     ///
-    /// The role in the DSN must be able to create databases.
+    /// The role in the DSN must be able to create databases. The tests of
+    /// roles expect it to be the bootstrap superuser `postgres`, as the
+    /// clients of tursopg are.
     pub async fn connect(dsn: &str, timeout: Duration) -> Result<Self, BackendError> {
         let params =
             ConnParams::parse(dsn).map_err(|e| BackendError::NotAvailable(e.to_string()))?;
         let role = params.user.clone();
-        let server = PostgresServer {
+        let mut server = PostgresServer {
             params,
             database_prefix: format!("sqltest_{:08x}", rand::random::<u32>()),
             next_database: AtomicUsize::new(0),
             admin_statements: Semaphore::new(MAX_ADMIN_STATEMENTS),
             idle_admin_conns: Mutex::new(Vec::new()),
+            roles_before_the_run: HashSet::new(),
             timeout,
         };
         let rows = server
@@ -47,10 +50,43 @@ impl PostgresBackend {
                 "role {role} cannot create databases: ALTER ROLE {role} CREATEDB"
             )));
         }
+        server.roles_before_the_run = server
+            .role_names()
+            .await
+            .map_err(|e| BackendError::NotAvailable(format!("cannot use {dsn}: {e}")))?;
         Ok(Self {
             server: Arc::new(server),
             timeout,
         })
+    }
+
+    /// Returns what drops the roles that the tests create. Roles belong to
+    /// the whole server, not to the databases of the tests, so without it a
+    /// later run on the same server fails to create them again. A role is
+    /// dropped only after the run, because the tests that run in parallel
+    /// may still use the roles they created.
+    pub fn role_cleanup(&self) -> PostgresRoleCleanup {
+        PostgresRoleCleanup {
+            server: Arc::clone(&self.server),
+        }
+    }
+}
+
+/// Drops the roles that did not exist on the server when the run started.
+pub struct PostgresRoleCleanup {
+    server: Arc<PostgresServer>,
+}
+
+impl PostgresRoleCleanup {
+    pub async fn drop_roles_created_by_the_run(self) -> Result<(), String> {
+        for name in self.server.role_names().await? {
+            if !self.server.roles_before_the_run.contains(&name) {
+                self.server
+                    .run_admin_query(&format!("DROP ROLE \"{}\"", name.replace('"', "\"\"")))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -133,6 +169,8 @@ struct PostgresServer {
     next_database: AtomicUsize,
     admin_statements: Semaphore,
     idle_admin_conns: Mutex<Vec<PgConn>>,
+    /// The roles on the server when the run started.
+    roles_before_the_run: HashSet<String>,
     timeout: Duration,
 }
 
@@ -151,6 +189,11 @@ impl PostgresServer {
         self.run_admin_query(&format!("DROP DATABASE {name} WITH (FORCE)"))
             .await?;
         Ok(())
+    }
+
+    async fn role_names(&self) -> Result<HashSet<String>, String> {
+        let rows = self.run_admin_query("SELECT rolname FROM pg_roles").await?;
+        Ok(rows.into_iter().map(|mut row| row.remove(0)).collect())
     }
 
     /// Runs `sql` on the maintenance database of the server and returns the

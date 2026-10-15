@@ -908,7 +908,9 @@ fn test_db_share_same_file() {
             .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
-    let conn1 = db1.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db1
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
@@ -933,7 +935,9 @@ fn test_db_share_same_file() {
             .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
-    let conn2 = db2.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db2
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();

@@ -1648,7 +1648,7 @@ impl DbspCompiler {
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let internal_conn = db.connect(ConnectOpts::new())?;
+        let internal_conn = db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
@@ -2585,7 +2585,9 @@ mod tests {
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let pager = conn.pager.load().clone();
 
         let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
@@ -6186,7 +6188,9 @@ mod tests {
         fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             let pager = conn.pager.load().clone();
             let _ = pager.io.block(|| pager.allocate_page1());
             let root = pager

@@ -632,7 +632,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let turso_conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let turso_conn = turso_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let schema = SchemaBuilder::new()
@@ -692,7 +694,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let turso_conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let turso_conn = turso_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let schema = SchemaBuilder::new()
             .table(Table::new(
@@ -746,7 +750,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let conn = turso_db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         for sql in [
             "CREATE TABLE outer_rows(id INTEGER, key1 INTEGER, amount INTEGER)",
             "CREATE TABLE inner_rows(key1 INTEGER, amount INTEGER)",

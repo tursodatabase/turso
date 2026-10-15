@@ -13,7 +13,7 @@ use super::{
     update::translate_update_for_schema_change,
 };
 use crate::{
-    error::SQLITE_CONSTRAINT_CHECK,
+    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL},
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
@@ -1494,10 +1494,13 @@ pub fn translate_alter_table(
                 let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
                     default_requires_empty_table(default) || !is_strict_constant_default(default)
                 });
+                let fills_existing_rows = needs_nondeterministic_check
+                    && !needs_notnull_check
+                    && connection.dialect().add_column_fills_existing_rows();
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
-                } else if needs_nondeterministic_check {
+                } else if needs_nondeterministic_check && !fills_existing_rows {
                     (true, "Cannot add a column with non-constant default")
                 } else {
                     (false, "")
@@ -1532,16 +1535,27 @@ pub fn translate_alter_table(
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
 
-                emit_add_column_check_validation(
-                    program,
-                    &btree,
-                    &original_btree,
-                    &new_column_name,
-                    &column,
-                    &constraints,
-                    resolver,
-                    database_id,
-                )?;
+                if fills_existing_rows {
+                    emit_fill_added_column(
+                        program,
+                        &original_btree,
+                        &btree,
+                        resolver,
+                        connection,
+                        database_id,
+                    )?;
+                } else {
+                    emit_add_column_check_validation(
+                        program,
+                        &btree,
+                        &original_btree,
+                        &new_column_name,
+                        &column,
+                        &constraints,
+                        resolver,
+                        database_id,
+                    )?;
+                }
             }
 
             translate_update_for_schema_change(
@@ -2378,6 +2392,168 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+fn emit_fill_added_column(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    altered_btree: &BTreeTable,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+) -> Result<()> {
+    let altered_btree = Arc::new(altered_btree.clone());
+    let added_column_index = altered_btree.columns().len() - 1;
+    let added_column = &altered_btree.columns()[added_column_index];
+    let default_expr = added_column
+        .default
+        .as_deref()
+        .expect("a column filled with its default has a default");
+    let layout = ColumnLayout::from_btree(&altered_btree)?;
+    let non_virtual_column_count = layout.num_non_virtual_cols();
+    let affinity_str = non_virtual_affinity_str(&altered_btree);
+    let mut added_column_mask = ColumnMask::default();
+    added_column_mask.set(added_column_index)?;
+    let added_column_name = normalize_ident(
+        added_column
+            .name
+            .as_deref()
+            .expect("an added column has a name"),
+    );
+    let added_column_checks: Vec<CheckConstraint> = altered_btree
+        .check_constraints
+        .iter()
+        .filter(|check| crate::util::check_expr_references_column(&check.expr, &added_column_name))
+        .cloned()
+        .collect();
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(original_btree.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(cursor_id, |program, rowid| -> Result<()> {
+        let start = program.alloc_registers_and_init_w_null(non_virtual_column_count);
+        for (column_index, column) in original_btree.columns().iter().enumerate() {
+            if column.is_virtual_generated() {
+                continue;
+            }
+            program.emit_column_or_rowid(
+                cursor_id,
+                column_index,
+                layout.to_register(start, column_index),
+            );
+        }
+        let default_reg = program.alloc_register();
+        translate_expr(program, None, default_expr, default_reg, resolver)?;
+        let added_column_reg = layout.to_register(start, added_column_index);
+        program.emit_insn(Insn::Copy {
+            src_reg: default_reg,
+            dst_reg: added_column_reg,
+            extra_amount: 0,
+        });
+
+        if added_column.notnull() {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: added_column_reg,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: format!(
+                    "{}.{}",
+                    altered_btree.name,
+                    added_column.name.as_deref().unwrap_or_default()
+                ),
+            });
+        }
+
+        if altered_btree.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: non_virtual_column_count,
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &altered_btree,
+                    resolver.schema(),
+                    Some(&added_column_mask),
+                )?,
+            });
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                altered_btree.columns(),
+                start,
+                Some(&added_column_mask),
+                &altered_btree.name,
+                &layout,
+            )?;
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: non_virtual_column_count,
+                check_generated: false,
+                table_reference: BTreeTable::type_check_table_ref(
+                    &altered_btree,
+                    resolver.schema(),
+                ),
+            });
+        }
+
+        if !added_column_checks.is_empty() {
+            let mut check_resolver = resolver.fork();
+            let skip_row_label = program.allocate_label();
+            emit_check_constraints(
+                program,
+                &added_column_checks,
+                &mut check_resolver,
+                &altered_btree.name,
+                rowid,
+                altered_btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        col.name.as_deref().map(|name| {
+                            if col.is_rowid_alias() {
+                                (name, rowid)
+                            } else {
+                                (name, layout.to_register(start, idx))
+                            }
+                        })
+                    }),
+                connection,
+                ast::ResolveType::Abort,
+                skip_row_label,
+                None,
+            )?;
+            program.preassign_label_to_next_insn(skip_row_label);
+        }
+
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(start),
+            count: to_u32(non_virtual_column_count),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: Some(affinity_str.clone()),
+        });
+
+        if database_uses_mvcc(connection, database_id) {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: altered_btree.name.clone(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg: record,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: altered_btree.name.clone(),
+        });
+        Ok(())
+    })
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
