@@ -2621,3 +2621,66 @@ test date-blob-that-is-not-utf8 {
 expect {
     null
 }
+
+test date-text-stops-at-nul {
+    SELECT date('2024-01-01' || char(0) || 'x');
+}
+expect {
+    2024-01-01
+}
+
+test time-blob-stops-at-nul {
+    SELECT time(X'3700'), time(X'3700FF');
+}
+expect {
+    12:00:00|12:00:00
+}
+
+test julianday-text-stops-at-nul {
+    SELECT julianday('2024-01-01' || char(0));
+}
+expect {
+    2460310.5
+}
+
+test date-modifier-stops-at-nul {
+    SELECT date('2024-01-01', '+1 day' || char(0) || 'x'), date('2024-01-01', X'2B312064617900');
+}
+expect {
+    2024-01-02|2024-01-02
+}
+
+test strftime-format-stops-at-nul {
+    SELECT hex(strftime('%Y' || char(0) || '%m', '2024-05-01'));
+}
+expect {
+    32303234
+}
+
+test strftime-time-value-and-modifier-stop-at-nul {
+    SELECT strftime('%Y-%m-%d', '2024-05-01' || char(0) || 'x', '+1 year' || char(0));
+}
+expect {
+    2025-05-01
+}
+
+test timediff-stops-at-nul {
+    SELECT timediff('2024-01-02' || char(0) || 'x', X'323032342D30312D303100');
+}
+expect {
+    +0000-00-01 00:00:00.000
+}
+
+test unixepoch-datetime-stop-at-nul {
+    SELECT unixepoch('2024-01-01' || char(0)), datetime('2024-01-01 10:00' || char(0) || 'zz');
+}
+expect {
+    1704067200|2024-01-01 10:00:00
+}
+
+test where-time-of-blob-with-nul {
+    SELECT count(*) FROM (SELECT X'3700' AS c) WHERE time(c);
+}
+expect {
+    1
+}
