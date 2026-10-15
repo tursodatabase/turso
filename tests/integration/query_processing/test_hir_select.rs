@@ -216,6 +216,13 @@ fn hir_expression_subqueries_match_legacy_rows() {
         // is false and the recursion stops.
         "WITH RECURSIVE c(x) AS (SELECT value FROM items WHERE id = 1 UNION ALL \
          SELECT '2' FROM c WHERE x < 3 LIMIT 10) SELECT count(*) FROM c",
+        // In a recursive step, the CTE's current row is NULL on the
+        // NULL-extended side of a LEFT JOIN and in a RIGHT JOIN's unmatched
+        // rows.
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT c.x + 1 FROM items \
+         LEFT JOIN c ON items.id = 1 WHERE c.x < 3) SELECT * FROM c",
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT tags.item_id FROM c \
+         RIGHT JOIN tags ON tags.item_id = c.x + 2 WHERE c.x < 3 LIMIT 4) SELECT x FROM c",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \

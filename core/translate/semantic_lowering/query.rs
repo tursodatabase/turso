@@ -2497,6 +2497,19 @@ struct HirLeftJoin {
     null_extends: bool,
     metadata: LeftJoinMetadata,
     null_cursors: Vec<CursorID>,
+    /// Register-backed sources on the NULL-extended side, such as a
+    /// recursive CTE's current row. They read private registers, filled
+    /// from the shared row when their loop starts and set to NULL for the
+    /// unmatched row, so the shared row stays intact for later outer rows.
+    null_registers: Vec<HirNullRegisters>,
+}
+
+#[derive(Clone, Copy)]
+struct HirNullRegisters {
+    loop_index: usize,
+    input: usize,
+    private: usize,
+    width: usize,
 }
 
 /// A RIGHT or FULL join. Its right source records each row that matched a
@@ -3244,6 +3257,7 @@ impl HirLoopNest<'_, '_> {
                     null_extends: left_join.null_extends,
                     metadata: LeftJoinMetadata::new(program),
                     null_cursors: left_join.null_cursors.clone(),
+                    null_registers: left_join.null_registers.clone(),
                 })
                 .collect::<Vec<_>>();
             &pass_left_joins
@@ -3270,6 +3284,17 @@ impl HirLoopNest<'_, '_> {
                 &self.prepared_loops[loop_index],
                 left_join,
             )?;
+            for registers in left_joins
+                .iter()
+                .flat_map(|left_join| &left_join.null_registers)
+                .filter(|registers| registers.loop_index == loop_index && registers.width > 0)
+            {
+                program.emit_insn(Insn::Copy {
+                    src_reg: registers.input,
+                    dst_reg: registers.private,
+                    extra_amount: registers.width - 1,
+                });
+            }
             for left_join in left_joins
                 .iter()
                 .filter(|left_join| left_join.last_loop == loop_index)
@@ -3358,10 +3383,31 @@ impl HirLoopNest<'_, '_> {
         right_outer: &HirRightOuterJoin,
     ) -> Result<()> {
         let right = right_outer.loop_index;
+        // Register-backed left sources, such as a recursive CTE's current
+        // row, read NULL registers for this pass only: the pass emits its
+        // own copy of the rest of the block.
+        let mut register_bindings = Vec::new();
         for prepared in &self.prepared_loops[..right] {
             match prepared {
                 PreparedHirLoop::BTree(_) | PreparedHirLoop::Materialized(_) => {}
-                PreparedHirLoop::Virtual(_) | PreparedHirLoop::Registers(_) => {
+                PreparedHirLoop::Registers(registers) => {
+                    let width = registers.source.columns.len().max(1);
+                    let nulls = program.alloc_registers(width);
+                    program.emit_insn(Insn::Null {
+                        dest: nulls,
+                        dest_end: (width > 1).then_some(nulls + width - 1),
+                    });
+                    let original = program.source_binding(registers.source.id).cloned();
+                    program.bind_source(
+                        registers.source.id,
+                        SourceBinding::Registers {
+                            start: nulls,
+                            rowid: None,
+                        },
+                    );
+                    register_bindings.push((registers.source.id, original));
+                }
+                PreparedHirLoop::Virtual(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -3467,6 +3513,11 @@ impl HirLoopNest<'_, '_> {
         program.preassign_label_to_next_insn(done);
         if let Some(original) = original {
             program.bind_source(right_outer.source, original);
+        }
+        for (source, original) in register_bindings {
+            if let Some(original) = original {
+                program.bind_source(source, original);
+            }
         }
         Ok(())
     }
@@ -3738,12 +3789,41 @@ fn prepare_hir_left_joins(
                 )));
             }
             let mut null_cursors = Vec::new();
-            for prepared in &prepared_loops[first_loop..=last_loop] {
+            let mut null_registers = Vec::new();
+            for (offset, prepared) in prepared_loops[first_loop..=last_loop].iter().enumerate() {
                 if let Some(cursor) = prepared.cursor() {
                     null_cursors.push(cursor);
                 }
                 if let Some(table_cursor) = prepared.table_cursor() {
                     null_cursors.push(table_cursor);
+                }
+                if let PreparedHirLoop::Registers(registers) = prepared {
+                    if !*null_extends {
+                        continue;
+                    }
+                    let Some(&SourceBinding::Registers { start, rowid: None }) =
+                        program.source_binding(registers.source.id)
+                    else {
+                        return Err(LimboError::InternalError(format!(
+                            "HIR register source {} has no plain row binding",
+                            registers.source.id
+                        )));
+                    };
+                    let width = registers.source.columns.len();
+                    let private = program.alloc_registers(width.max(1));
+                    program.bind_source(
+                        registers.source.id,
+                        SourceBinding::Registers {
+                            start: private,
+                            rowid: None,
+                        },
+                    );
+                    null_registers.push(HirNullRegisters {
+                        loop_index: first_loop + offset,
+                        input: start,
+                        private,
+                        width,
+                    });
                 }
             }
             Ok(HirLeftJoin {
@@ -3753,6 +3833,7 @@ fn prepare_hir_left_joins(
                 null_extends: *null_extends,
                 metadata: LeftJoinMetadata::new(program),
                 null_cursors,
+                null_registers,
             })
         })
         .collect()
@@ -5020,6 +5101,16 @@ fn close_hir_btree_loop(
         let finished = left_join.metadata.begin_unmatched_row(program);
         for cursor in &left_join.null_cursors {
             program.emit_insn(Insn::NullRow { cursor_id: *cursor });
+        }
+        for registers in left_join
+            .null_registers
+            .iter()
+            .filter(|registers| registers.width > 0)
+        {
+            program.emit_insn(Insn::Null {
+                dest: registers.private,
+                dest_end: (registers.width > 1).then_some(registers.private + registers.width - 1),
+            });
         }
         left_join.metadata.finish_unmatched_row(program, finished);
     }
