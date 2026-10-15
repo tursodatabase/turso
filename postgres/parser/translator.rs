@@ -167,6 +167,7 @@ impl PostgreSQLTranslator {
             NodeRef::UpdateStmt(update) => self.translate_update(update)?,
             NodeRef::DeleteStmt(delete) => self.translate_delete(delete)?,
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
+            NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
@@ -209,6 +210,49 @@ impl PostgreSQLTranslator {
             stmt: self.translate_node(query.to_ref())?,
             format: ast::EqpFormat::Text,
         })
+    }
+
+    fn translate_lock_stub(
+        &self,
+        lock: &pg_query::protobuf::LockStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        if lock.mode != 1 || lock.nowait {
+            return Err(ParseError::ParseError(
+                "only LOCK IN ACCESS SHARE MODE without NOWAIT is supported".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        None,
+                    )],
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(ast::Limit {
+                expr: Box::new(ast::Expr::FunctionCall {
+                    name: ast::Name::from_string("pg_lock_access_share"),
+                    distinctness: None,
+                    args: vec![],
+                    order_by: vec![],
+                    within_group: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                }),
+                offset: None,
+            }),
+        }))
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.

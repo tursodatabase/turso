@@ -77,6 +77,7 @@ scalar_functions! {
     CurrentSchema(FunctionArity::Exact(0), true),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
+    PgLockAccessShare(FunctionArity::Exact(0), false),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -126,6 +127,15 @@ impl ScalarCall for PgScalarFunction {
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
                 Value::build_text("t")
+            }
+            Self::PgLockAccessShare => {
+                if connection.get_auto_commit() {
+                    return Err(LimboError::InvalidArgument(
+                        "LOCK TABLE can only be used in transaction blocks".to_string(),
+                    )
+                    .into());
+                }
+                Value::from_i64(0)
             }
             Self::Now
             | Self::ClockTimestamp
