@@ -1766,9 +1766,7 @@ where
         let control = func(e)?;
         if matches!(control, WalkControl::Continue) {
             match e {
-                ast::Expr::Subquery(select)
-                | ast::Expr::ArraySubquery(select)
-                | ast::Expr::Exists(select) => {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
                     walk_select_expressions_inner(select, func)?;
                 }
                 ast::Expr::InSelect { rhs, .. } => {
@@ -1888,9 +1886,7 @@ pub fn validate_select_for_views(
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
-            ast::Expr::Subquery(subquery_select)
-            | ast::Expr::ArraySubquery(subquery_select)
-            | ast::Expr::Exists(subquery_select) => {
+            ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
                 validate_no_cross_db_references(subquery_select, view_db_name)?;
             }
             ast::Expr::InSelect { rhs, .. } => {
@@ -2542,9 +2538,7 @@ fn rename_identifiers_scoped_inner(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                ast::Expr::Subquery(select)
-                | ast::Expr::ArraySubquery(select)
-                | ast::Expr::Exists(select) => {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
                     let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
                     rewrite_select_column_refs_scoped(
                         select,
@@ -3290,9 +3284,7 @@ mod rename_column_view {
                 *changed = true;
             }
             match e {
-                ast::Expr::Subquery(select)
-                | ast::Expr::ArraySubquery(select)
-                | ast::Expr::Exists(select) => {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
                     if rewrite_view_select_for_column_rename(
                         select,
                         ctx,
@@ -3659,9 +3651,7 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                         *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
                     }
                 }
-                ast::Expr::Exists(select)
-                | ast::Expr::Subquery(select)
-                | ast::Expr::ArraySubquery(select) => {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
                     rewrite_select_table_refs(select, from, to);
                 }
                 ast::Expr::InSelect { rhs, .. } => {
@@ -4146,7 +4136,7 @@ fn rename_result_identifiers_scoped(
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
-                ast::Expr::Subquery(select) | ast::Expr::ArraySubquery(select) => {
+                ast::Expr::Subquery(select) => {
                     let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
                     rewrite_select_column_refs_scoped(
                         select,
@@ -4350,9 +4340,7 @@ fn expr_still_references_renamed_column(
         }
 
         match e {
-            ast::Expr::Subquery(select)
-            | ast::Expr::ArraySubquery(select)
-            | ast::Expr::Exists(select) => {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
                 let mut quals = visible_target_qualifiers.to_vec();
                 found = select_still_references_renamed_column(
                     select,

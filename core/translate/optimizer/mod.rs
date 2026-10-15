@@ -665,9 +665,6 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
         for subquery in subqueries {
             match &subquery.query_type {
                 SubqueryType::Exists { .. } => {}
-                SubqueryType::Array { result_reg, .. } => {
-                    resources.register_ranges.insert((*result_reg, 1));
-                }
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
@@ -1640,7 +1637,6 @@ fn build_update_write_set_plan(
     let write_set_select = SelectPlan {
         table_references: write_set_tables,
         result_columns,
-        decode_result_casts: false,
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,     // N/A
         order_by: vec![],   // N/A
@@ -4044,7 +4040,6 @@ impl Optimizable for ast::Expr {
             Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
-            Expr::ArraySubquery(..) => true,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
             Expr::Register(..) => false, // Register values can be null
@@ -4139,7 +4134,7 @@ impl Optimizable for ast::Expr {
             // contain Qualified nodes.
             Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
-            Expr::Subquery(_) | Expr::ArraySubquery(_) => false,
+            Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
             Expr::Register(_) => false,

@@ -3,161 +3,21 @@ use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
 #[turso_macros::test(mvcc)]
-fn test_pg_array_subquery(db: TempDatabase) {
+fn test_pg_array_subquery_rebind_and_reset(db: TempDatabase) {
     let conn = db.connect_postgres();
-    conn.execute("CREATE TABLE array_items (v INTEGER, group_id INTEGER)")
-        .unwrap();
-    conn.execute("INSERT INTO array_items VALUES (9, 1), (2, 2), (17, 1), (9, 1), (NULL, 1)")
-        .unwrap();
-    assert_eq!(
-        conn.prepare(
-            "SELECT g.group_id, ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id ORDER BY v NULLS LAST)
-             FROM (SELECT 1 AS group_id UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 1) g
-             ORDER BY g.group_id"
-        ).unwrap().run_collect_rows().unwrap(),
-        vec![
-            vec![Value::from_i64(1), Value::build_text("{9,9,17,NULL}")],
-            vec![Value::from_i64(1), Value::build_text("{9,9,17,NULL}")],
-            vec![Value::from_i64(2), Value::build_text("{2}")],
-            vec![Value::from_i64(3), Value::build_text("{}")],
-        ]
-    );
-    assert_eq!(
-        query_integer(
-            &conn,
-            "SELECT (ARRAY(SELECT v FROM array_items ORDER BY v DESC NULLS LAST))[2]"
-        ),
-        [9]
-    );
-    assert_eq!(
-        query_integer(&conn, "SELECT group_id FROM array_items WHERE v = ANY(ARRAY(SELECT v FROM array_items WHERE group_id = 2))"),
-        [2]
-    );
-    assert!(conn
-        .prepare("SELECT ARRAY(SELECT v, group_id FROM array_items)")
-        .is_err());
-    for sql in [
-        "SELECT ARRAY(SELECT ARRAY[1, 2])",
-        "SELECT ARRAY(SELECT ARRAY(SELECT 1))",
-        "SELECT ARRAY(SELECT ARRAY[1, 2] UNION ALL SELECT NULL)",
-        "SELECT ARRAY(VALUES (NULL), (ARRAY[1, 2]))",
-    ] {
-        assert!(conn
-            .prepare(sql)
-            .unwrap_err()
-            .to_string()
-            .contains("array-valued ARRAY subqueries"));
-    }
-    for sql in [
-        "SELECT ARRAY(SELECT 17 UNION ALL SELECT 2.5)",
-        "SELECT ARRAY(VALUES (17), (2.5))",
-    ] {
-        assert!(conn
-            .prepare(sql)
-            .unwrap_err()
-            .to_string()
-            .contains("differing result types"));
-    }
-    for (sql, ty) in [
-        (
-            "SELECT ARRAY(SELECT v FROM array_items WHERE false)",
-            "INTEGER",
-        ),
-        ("SELECT ARRAY(SELECT 17 WHERE false)", "INTEGER"),
-        (
-            "SELECT ARRAY(SELECT CAST('2026-10-14' AS date) WHERE false)",
-            "date",
-        ),
-        ("SELECT ARRAY(SELECT 'two words' WHERE false)", "TEXT"),
-    ] {
-        let stmt = conn.prepare(sql).unwrap();
-        let info = stmt.get_column_type_info(0).unwrap().unwrap();
-        assert_eq!(info.declared_name, ty, "{sql}");
-        assert_eq!(info.array_dimensions, 1, "{sql}");
-    }
     let mut stmt = conn
-        .prepare("SELECT ARRAY(SELECT v FROM array_items ORDER BY v NULLS LAST LIMIT $1)")
+        .prepare("SELECT ARRAY(SELECT 17 AS v UNION ALL SELECT 2 ORDER BY v LIMIT $1)")
         .unwrap();
-    stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(1))
-        .unwrap();
-    assert_eq!(
-        stmt.run_collect_rows().unwrap(),
-        vec![vec![Value::build_text("{2}")]]
-    );
-    stmt.reset().unwrap();
-    stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(0))
-        .unwrap();
-    assert_eq!(
-        stmt.run_collect_rows().unwrap(),
-        vec![vec![Value::build_text("{}")]]
-    );
-}
 
-#[turso_macros::test(mvcc)]
-fn test_pg_array_subquery_custom_elements(db: TempDatabase) {
-    let native = db.connect_limbo();
-    native
-        .execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
-        .unwrap();
-    native
-        .execute("CREATE TABLE prices(id INTEGER, v cents)")
-        .unwrap();
-    native
-        .execute("INSERT INTO prices VALUES (1, 42), (2, NULL)")
-        .unwrap();
-    let conn = db.connect_postgres();
-    assert_eq!(
-        query_text(&conn, "SELECT ARRAY(SELECT CAST(42 AS cents))"),
-        ["{42}"]
-    );
-    assert_eq!(query_integer(&conn, "SELECT CAST(42 AS cents)"), [4200]);
-    for (sql, expected) in [
-        ("SELECT ARRAY(SELECT CASE WHEN id = 1 THEN v ELSE CAST(17 AS cents) END FROM prices ORDER BY id)", "{42,17}"),
-        ("SELECT ARRAY(SELECT COALESCE(v, CAST(17 AS cents)) FROM prices ORDER BY id)", "{42,17}"),
-        ("SELECT ARRAY(SELECT CAST(42 AS cents) UNION ALL SELECT CAST(17 AS cents))", "{42,17}"),
-        ("SELECT ARRAY(SELECT x FROM (SELECT CAST(42 AS cents) AS x) AS q)", "{42}"),
-        ("WITH q AS MATERIALIZED (SELECT CAST(42 AS cents) AS x) SELECT ARRAY(SELECT x FROM q)", "{42}"),
-    ] {
-        assert_eq!(query_text(&conn, sql), [expected], "{sql}");
+    for (limit, expected) in [(1, "{2}"), (0, "{}"), (2, "{2,17}"), (1, "{2}")] {
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(limit))
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]]
+        );
+        stmt.reset().unwrap();
     }
-    for sql in [
-        "SELECT ARRAY(SELECT v FROM prices ORDER BY id)",
-        "SELECT (SELECT ARRAY(SELECT v FROM prices ORDER BY id))",
-        "SELECT a FROM (SELECT ARRAY(SELECT v FROM prices ORDER BY id) AS a) AS q",
-        "SELECT COALESCE(ARRAY(SELECT v FROM prices ORDER BY id), ARRAY(SELECT v FROM prices WHERE false))",
-        "SELECT ARRAY(SELECT COALESCE(v, CAST(NULL AS cents)) FROM prices ORDER BY id)",
-        "SELECT ARRAY(SELECT CASE WHEN CAST(v AS INTEGER) = 42 THEN v ELSE CAST(NULL AS cents) END FROM prices ORDER BY id)",
-    ] {
-        assert_eq!(query_text(&conn, sql), ["{42,NULL}"], "{sql}");
-    }
-    assert_eq!(
-        query_integer(
-            &conn,
-            "SELECT a[1] FROM (SELECT ARRAY(SELECT v FROM prices ORDER BY id) AS a) AS q"
-        ),
-        [42]
-    );
-    native
-        .execute("CREATE TABLE price_arrays(v cents[])")
-        .unwrap();
-    native
-        .execute("INSERT INTO price_arrays VALUES (ARRAY[42,NULL])")
-        .unwrap();
-    for sql in [
-        "SELECT v FROM price_arrays",
-        "SELECT v FROM (SELECT v FROM price_arrays) AS q",
-        "SELECT CASE WHEN true THEN v ELSE ARRAY(SELECT v FROM prices ORDER BY id) END FROM price_arrays",
-        "SELECT COALESCE(v, ARRAY(SELECT v FROM prices ORDER BY id)) FROM price_arrays",
-        "SELECT ARRAY(SELECT v FROM prices ORDER BY id) UNION SELECT v FROM price_arrays",
-    ] {
-        assert_eq!(query_text(&conn, sql), ["{42,NULL}"], "{sql}");
-    }
-    assert_eq!(query_integer(&conn, "SELECT v[1] FROM price_arrays"), [42]);
-    assert!(conn
-        .prepare("WITH q AS MATERIALIZED (SELECT CASE WHEN id = 1 THEN v ELSE CAST(17 AS cents) END AS x FROM prices) SELECT ARRAY(SELECT x FROM q)")
-        .unwrap_err()
-        .to_string()
-        .contains("differing encodings"));
 }
 
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {

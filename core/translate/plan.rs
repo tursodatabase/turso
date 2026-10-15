@@ -688,9 +688,6 @@ pub enum QueryDestination {
         /// The register that holds the result of the EXISTS subquery.
         result_reg: usize,
     },
-    ArraySubqueryResult {
-        result_reg: usize,
-    },
     /// The results of a subquery that is neither 'EXISTS' nor 'IN' are stored in a range of registers.
     RowValueSubqueryResult {
         /// The start register of the range that holds the result of the subquery.
@@ -823,7 +820,6 @@ pub struct SelectPlan {
     pub join_order: Vec<JoinOrderMember>,
     /// the columns inside SELECT ... FROM
     pub result_columns: Vec<ResultSetColumn>,
-    pub decode_result_casts: bool,
     /// where clause split into a vec at 'AND' boundaries. all join conditions also get shoved in here,
     /// and we keep track of which join they came from (mainly for OUTER JOIN processing)
     pub where_clause: Vec<WhereTerm>,
@@ -3086,12 +3082,6 @@ pub(super) fn query_output_columns(
         let result_expr = &result_columns[column_index].expr;
         if super::expr::expr_is_array(result_expr, Some(table_references)) {
             column.set_array_dimensions(1);
-            if let Some(ty) =
-                crate::statement::infer_expression_type(result_expr, Some(table_references))
-            {
-                column.ty_str = ty.name;
-                column.set_array_dimensions(ty.array_dimensions);
-            }
         }
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
     }

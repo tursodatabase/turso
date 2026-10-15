@@ -160,14 +160,9 @@ fn translate_expr_by_kind(
         ast::Expr::Binary(..) => {
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::Case { .. } => translate_case_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-            false,
-        ),
+        ast::Expr::Case { .. } => {
+            translate_case_expr(program, referenced_tables, expr, target_register, resolver)
+        }
         ast::Expr::Cast { .. } => {
             translate_cast_expr(program, referenced_tables, expr, target_register, resolver)
         }
@@ -189,7 +184,6 @@ fn translate_expr_by_kind(
             expr,
             target_register,
             resolver,
-            false,
         ),
         ast::Expr::FunctionCallStar { .. } => translate_function_call_star_expr(
             program,
@@ -246,7 +240,7 @@ fn translate_expr_by_kind(
         ast::Expr::Raise(..) => {
             translate_raise_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::Subquery(_) | ast::Expr::ArraySubquery(_) => {
+        ast::Expr::Subquery(_) => {
             crate::bail_parse_error!("Subquery is not supported in this position")
         }
         ast::Expr::Unary(..) => {
@@ -300,24 +294,15 @@ fn copy_cached_expr_reg(
                                     reg: target_register,
                                     target_pc: skip_label,
                                 });
-                                if col.is_array() {
-                                    emit_array_element_decode(
-                                        program,
-                                        target_register,
-                                        col,
-                                        resolver,
-                                    )?;
-                                } else {
-                                    emit_type_expr(
-                                        program,
-                                        decode_expr,
-                                        target_register,
-                                        target_register,
-                                        col,
-                                        type_def,
-                                        resolver,
-                                    )?;
-                                }
+                                emit_type_expr(
+                                    program,
+                                    decode_expr,
+                                    target_register,
+                                    target_register,
+                                    col,
+                                    type_def,
+                                    resolver,
+                                )?;
                                 program.preassign_label_to_next_insn(skip_label);
                             }
                         }
@@ -371,7 +356,7 @@ fn translate_subquery_result_expr(
         unreachable!("translate_subquery_result_expr expects Expr::SubqueryResult");
     };
     match query_type {
-        SubqueryType::Exists { result_reg } | SubqueryType::Array { result_reg, .. } => {
+        SubqueryType::Exists { result_reg } => {
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg,
                 dst_reg: target_register,
@@ -663,7 +648,6 @@ fn translate_case_expr(
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
-    decode_result: bool,
 ) -> Result<usize> {
     let ast::Expr::Case {
         base,
@@ -723,13 +707,13 @@ fn translate_case_expr(
             }),
         };
         // THEN...
-        translate_result_expr(
+        translate_expr_no_constant_opt(
             program,
             referenced_tables,
             then_expr,
             target_register,
             resolver,
-            decode_result,
+            NoConstantOptReason::RegisterReuse,
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: return_label,
@@ -741,13 +725,13 @@ fn translate_case_expr(
     }
     match else_expr {
         Some(expr) => {
-            translate_result_expr(
+            translate_expr_no_constant_opt(
                 program,
                 referenced_tables,
                 expr,
                 target_register,
                 resolver,
-                decode_result,
+                NoConstantOptReason::RegisterReuse,
             )?;
         }
         // If ELSE isn't specified, it means ELSE null.
@@ -894,7 +878,6 @@ fn translate_function_call_expr(
     expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
-    decode_result: bool,
 ) -> Result<usize> {
     let ast::Expr::FunctionCall {
         name,
@@ -918,32 +901,6 @@ fn translate_function_call_expr(
         func: func_type.unwrap(),
         arg_count: args_count,
     };
-
-    if decode_result
-        && matches!(
-            func_ctx.func,
-            Func::Scalar(
-                ScalarFunc::Min
-                    | ScalarFunc::Max
-                    | ScalarFunc::Nullif
-                    | ScalarFunc::Likely
-                    | ScalarFunc::Unlikely
-                    | ScalarFunc::Likelihood
-            )
-        )
-    {
-        let regs = program.alloc_registers(args_count);
-        for (i, arg) in args.iter().enumerate() {
-            translate_result_expr(program, referenced_tables, arg, regs + i, resolver, true)?;
-        }
-        emit_function_call(
-            program,
-            func_ctx,
-            &(regs..regs + args_count).collect::<Vec<_>>(),
-            target_register,
-        )?;
-        return Ok(target_register);
-    }
 
     match &func_ctx.func {
         Func::Agg(_) => {
@@ -1268,13 +1225,13 @@ fn translate_function_call_expr(
                     // whenever a not null check succeeds, we jump to the end of the series
                     let label_coalesce_end = program.allocate_label();
                     for (index, arg) in args.iter().enumerate() {
-                        let reg = translate_result_expr(
+                        let reg = translate_expr_no_constant_opt(
                             program,
                             referenced_tables,
                             arg,
                             target_register,
                             resolver,
-                            decode_result,
+                            NoConstantOptReason::RegisterReuse,
                         )?;
                         if index < args.len() - 1 {
                             program.emit_insn(Insn::NotNull {
@@ -1359,13 +1316,13 @@ fn translate_function_call_expr(
                     }
 
                     let temp_reg = program.alloc_register();
-                    translate_result_expr(
+                    translate_expr_no_constant_opt(
                         program,
                         referenced_tables,
                         &args[0],
                         temp_reg,
                         resolver,
-                        decode_result,
+                        NoConstantOptReason::RegisterReuse,
                     )?;
                     let before_copy_label = program.allocate_label();
                     program.emit_insn(Insn::NotNull {
@@ -1373,13 +1330,13 @@ fn translate_function_call_expr(
                         target_pc: before_copy_label,
                     });
 
-                    translate_result_expr(
+                    translate_expr_no_constant_opt(
                         program,
                         referenced_tables,
                         &args[1],
                         temp_reg,
                         resolver,
-                        decode_result,
+                        NoConstantOptReason::RegisterReuse,
                     )?;
                     program.preassign_label_to_next_insn(before_copy_label);
                     program.emit_insn(Insn::Copy {
@@ -1416,13 +1373,13 @@ fn translate_function_call_expr(
                             jump_if_null: true,
                         });
 
-                        translate_result_expr(
+                        translate_expr_no_constant_opt(
                             program,
                             referenced_tables,
                             value_expr,
                             target_register,
                             resolver,
-                            decode_result,
+                            NoConstantOptReason::RegisterReuse,
                         )?;
                         program.emit_insn(Insn::Goto {
                             target_pc: iif_end_label,
@@ -1432,13 +1389,13 @@ fn translate_function_call_expr(
                     }
 
                     if args.len() % 2 != 0 {
-                        translate_result_expr(
+                        translate_expr_no_constant_opt(
                             program,
                             referenced_tables,
                             args.last().unwrap(),
                             target_register,
                             resolver,
-                            decode_result,
+                            NoConstantOptReason::RegisterReuse,
                         )?;
                     } else {
                         program.emit_insn(Insn::Null {
@@ -3528,253 +3485,4 @@ fn translate_merged_column(
     program.preassign_label_to_next_insn(end_label);
     program.set_collation(first_collation);
     Ok(target_register)
-}
-
-pub(crate) fn translate_result_expr(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    expr: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-    decode_result: bool,
-) -> Result<usize> {
-    if !decode_result {
-        return translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        );
-    }
-    let next_span_idx = program.constant_spans_next_idx();
-    let result = match expr {
-        ast::Expr::Case { .. } => translate_case_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register,
-            resolver,
-            true,
-        ),
-        ast::Expr::FunctionCall { name, args, .. }
-            if matches!(
-                resolver.resolve_function(name.as_str(), args.len())?,
-                Some(Func::Scalar(
-                    ScalarFunc::Coalesce
-                        | ScalarFunc::IfNull
-                        | ScalarFunc::Iif
-                        | ScalarFunc::Min
-                        | ScalarFunc::Max
-                        | ScalarFunc::Nullif
-                        | ScalarFunc::Likely
-                        | ScalarFunc::Unlikely
-                        | ScalarFunc::Likelihood
-                ))
-            ) =>
-        {
-            translate_function_call_expr(
-                program,
-                referenced_tables,
-                expr,
-                target_register,
-                resolver,
-                true,
-            )
-        }
-        ast::Expr::Parenthesized(args) if args.len() == 1 => translate_result_expr(
-            program,
-            referenced_tables,
-            &args[0],
-            target_register,
-            resolver,
-            true,
-        ),
-        ast::Expr::Collate(inner, collation) => {
-            translate_result_expr(
-                program,
-                referenced_tables,
-                inner,
-                target_register,
-                resolver,
-                true,
-            )?;
-            program.set_collation(Some((
-                resolver.resolve_collation(collation.as_str())?,
-                true,
-            )));
-            Ok(target_register)
-        }
-        _ => {
-            translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            if custom_result_is_encoded(expr, referenced_tables, resolver)? == Some(true) {
-                let ty = crate::statement::infer_expression_type(expr, referenced_tables)
-                    .expect("an encoded custom result must have a type");
-                if let Some(resolved) = resolver.schema().resolve_type_unchecked(&ty.name)? {
-                    let mut column = Column::new(
-                        None,
-                        ty.name.clone(),
-                        None,
-                        None,
-                        Type::Null,
-                        None,
-                        ColDef::default(),
-                    );
-                    column.ty_params = match &ty.size {
-                        Some(ast::TypeSize::MaxSize(one)) => vec![one.clone()],
-                        Some(ast::TypeSize::TypeSize(one, two)) => vec![one.clone(), two.clone()],
-                        None => Vec::new(),
-                    };
-                    if resolved.is_domain()
-                        || resolved.leaf().user_params().count() == 0
-                        || resolved.leaf().user_params().count() == column.ty_params.len()
-                    {
-                        emit_user_facing_column_value(
-                            program,
-                            target_register,
-                            target_register,
-                            &column,
-                            true,
-                            resolver,
-                        )?;
-                    }
-                }
-            }
-            Ok(target_register)
-        }
-    };
-    program.constant_spans_invalidate_after(next_span_idx);
-    result
-}
-
-fn custom_result_is_encoded(
-    expr: &ast::Expr,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Result<Option<bool>> {
-    match expr {
-        ast::Expr::Literal(ast::Literal::Null) => Ok(None),
-        ast::Expr::Cast {
-            type_name: Some(ty),
-            ..
-        } => {
-            let Some(resolved) = resolver.schema().resolve_type_unchecked(&ty.name)? else {
-                return Ok(Some(false));
-            };
-            let params = match ty.size {
-                Some(ast::TypeSize::MaxSize(_)) => 1,
-                Some(ast::TypeSize::TypeSize(_, _)) => 2,
-                None => 0,
-            };
-            Ok(Some(
-                resolved.is_domain()
-                    || resolved.leaf().user_params().count() == 0
-                    || resolved.leaf().user_params().count() == params,
-            ))
-        }
-        ast::Expr::Column { table, column, .. } => {
-            let (_, table) = tables
-                .and_then(|tables| tables.find_table_by_internal_id(*table))
-                .expect("result column must have a table");
-            let Table::FromClauseSubquery(subquery) = table else {
-                return Ok(Some(false));
-            };
-            let selects = match subquery.plan.as_ref() {
-                super::super::plan::Plan::Select(select) => {
-                    either::Left(std::iter::once(select.as_ref()))
-                }
-                super::super::plan::Plan::CompoundSelect {
-                    left, right_most, ..
-                } => either::Right(
-                    left.iter()
-                        .map(|(select, _)| select)
-                        .chain(std::iter::once(right_most.as_ref())),
-                ),
-                _ => return Ok(Some(false)),
-            };
-            let mut encoded = None;
-            for select in selects {
-                let expressions = if select.values.is_empty() {
-                    either::Left(std::iter::once(&select.result_columns[*column].expr))
-                } else {
-                    either::Right(select.values.iter().map(|row| &row[*column]))
-                };
-                for expr in expressions {
-                    let next = if select.decode_result_casts {
-                        Some(false)
-                    } else {
-                        custom_result_is_encoded(expr, Some(&select.table_references), resolver)?
-                    };
-                    if let Some(next) = next {
-                        if encoded.is_some_and(|encoded| encoded != next) {
-                            crate::bail_parse_error!("ARRAY subqueries cannot collect custom type results with differing encodings");
-                        }
-                        encoded = Some(next);
-                    }
-                }
-            }
-            Ok(encoded)
-        }
-        ast::Expr::Parenthesized(args) if args.len() == 1 => {
-            custom_result_is_encoded(&args[0], tables, resolver)
-        }
-        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            custom_result_is_encoded(inner, tables, resolver)
-        }
-        ast::Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => common_result_encoding(
-            when_then_pairs
-                .iter()
-                .map(|(_, then)| then.as_ref())
-                .chain(else_expr.iter().map(|expr| expr.as_ref())),
-            tables,
-            resolver,
-        ),
-        ast::Expr::FunctionCall { name, args, .. } => {
-            match resolver.resolve_function(name.as_str(), args.len())? {
-                Some(Func::Scalar(
-                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Min | ScalarFunc::Max,
-                )) => common_result_encoding(args.iter().map(|arg| arg.as_ref()), tables, resolver),
-                Some(Func::Scalar(
-                    ScalarFunc::Nullif
-                    | ScalarFunc::Likely
-                    | ScalarFunc::Unlikely
-                    | ScalarFunc::Likelihood,
-                )) => custom_result_is_encoded(&args[0], tables, resolver),
-                Some(Func::Scalar(ScalarFunc::Iif)) => common_result_encoding(
-                    args.iter()
-                        .enumerate()
-                        .filter(|(i, _)| i % 2 != 0 || *i == args.len() - 1)
-                        .map(|(_, arg)| arg.as_ref()),
-                    tables,
-                    resolver,
-                ),
-                _ => Ok(Some(false)),
-            }
-        }
-        _ => Ok(Some(false)),
-    }
-}
-
-fn common_result_encoding<'a>(
-    expressions: impl Iterator<Item = &'a ast::Expr>,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Result<Option<bool>> {
-    let mut encoded = None;
-    for expr in expressions {
-        if let Some(next) = custom_result_is_encoded(expr, tables, resolver)? {
-            if encoded.is_some_and(|encoded| encoded != next) {
-                crate::bail_parse_error!(
-                    "ARRAY subqueries cannot collect custom type results with differing encodings"
-                );
-            }
-            encoded = Some(next);
-        }
-    }
-    Ok(encoded)
 }

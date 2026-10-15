@@ -359,10 +359,7 @@ fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
         let _ = walk_expr(&pred.expr, &mut |e| {
             if matches!(
                 e,
-                Expr::Subquery(_)
-                    | Expr::ArraySubquery(_)
-                    | Expr::InSelect { .. }
-                    | Expr::Exists(_)
+                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
             ) {
                 found = true;
             }
@@ -432,7 +429,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
 
     let rowset_plan = SelectPlan {
         table_references: plan.table_references.clone(),
-        decode_result_casts: false,
         result_columns: vec![ResultSetColumn {
             expr: Expr::RowId {
                 database: None,

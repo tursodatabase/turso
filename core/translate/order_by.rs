@@ -21,8 +21,8 @@ use crate::{
 
 use super::{
     emitter::TranslateCtx,
-    expr::{translate_expr, translate_result_expr},
-    plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
+    expr::translate_expr,
+    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -424,32 +424,35 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if type_def.decode().is_some() {
-                        super::expr::emit_user_facing_column_value(
+                    if let Some(decode_expr) = type_def.decode() {
+                        let skip_label = program.allocate_label();
+                        program.emit_insn(Insn::IsNull {
+                            reg,
+                            target_pc: skip_label,
+                        });
+                        super::expr::emit_type_expr(
                             program,
+                            decode_expr,
                             reg,
                             reg,
                             col,
-                            true,
+                            &type_def,
                             &t_ctx.resolver,
                         )?;
+                        program.preassign_label_to_next_insn(skip_label);
                     }
                 }
             }
         }
 
         // Decode array blobs to JSON text for display, after extracting from sorter
-        if matches!(
-            plan.query_destination,
-            QueryDestination::ResultRows | QueryDestination::RowValueSubqueryResult { .. }
-        ) {
-            super::result_row::emit_array_decode_for_results(
-                program,
-                result_columns,
-                &plan.table_references,
-                start_reg,
-            )?;
-        }
+        super::result_row::emit_array_decode_for_results(
+            program,
+            result_columns,
+            &plan.table_references,
+            start_reg,
+            &t_ctx.resolver,
+        )?;
 
         emit_result_row_and_limit(
             program,
@@ -534,24 +537,13 @@ impl EmitOrderBy {
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(true);
                 }
-                let result = if plan.decode_result_casts && !is_custom {
-                    translate_result_expr(
-                        program,
-                        Some(&plan.table_references),
-                        expr,
-                        key_reg,
-                        resolver,
-                        true,
-                    )
-                } else {
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        expr,
-                        key_reg,
-                        resolver,
-                    )
-                };
+                let result = translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    expr,
+                    key_reg,
+                    resolver,
+                );
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(false);
                 }
@@ -617,24 +609,13 @@ impl EmitOrderBy {
             {
                 continue;
             }
-            if plan.decode_result_casts {
-                translate_result_expr(
-                    program,
-                    Some(&plan.table_references),
-                    &rc.expr,
-                    cur_reg,
-                    resolver,
-                    true,
-                )?;
-            } else {
-                translate_expr(
-                    program,
-                    Some(&plan.table_references),
-                    &rc.expr,
-                    cur_reg,
-                    resolver,
-                )?;
-            }
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                cur_reg,
+                resolver,
+            )?;
             cur_reg += 1;
         }
 

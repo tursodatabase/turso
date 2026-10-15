@@ -143,11 +143,6 @@ pub(crate) fn expr_data_type(
         ast::Expr::Binary(_, ast::Operator::Concat, _) => {
             StorageClassMask::TEXT | StorageClassMask::BLOB
         }
-        ast::Expr::ArraySubquery(_)
-        | ast::Expr::SubqueryResult {
-            query_type: ast::SubqueryType::Array { .. },
-            ..
-        } => StorageClassMask::from_blob(),
         ast::Expr::FunctionCall { .. }
         | ast::Expr::FunctionCallStar { .. }
         | ast::Expr::MergedColumn(_)

@@ -792,16 +792,6 @@ fn assign_new_subquery_output(
                 QueryDestination::ExistsSubqueryResult { result_reg },
             )
         }
-        SubqueryType::Array { element_type, .. } => {
-            let result_reg = program.alloc_register();
-            (
-                SubqueryType::Array {
-                    result_reg,
-                    element_type: element_type.clone(),
-                },
-                QueryDestination::ArraySubqueryResult { result_reg },
-            )
-        }
         SubqueryType::RowValue { num_regs, .. } => {
             let result_reg_start = program.alloc_registers(*num_regs);
             (
@@ -843,7 +833,9 @@ fn assign_new_subquery_output(
             )
         }
     };
-    crate::translate::compound_select::set_select_plan_destination(plan, &destination);
+    *plan
+        .select_query_destination_mut()
+        .expect("a subquery must have a query destination") = destination;
     subquery.query_type = query_type.clone();
     query_type
 }

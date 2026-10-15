@@ -2022,14 +2022,6 @@ impl<'a> Parser<'a> {
 
                 eat_assert!(self, TK_LP);
                 let tok = self.peek_no_eof()?;
-                if name.eq_ignore_ascii_case(b"array")
-                    && matches!(tok.token_type, TK_SELECT | TK_WITH | TK_VALUES)
-                {
-                    let select = self.parse_select()?;
-                    eat_expect!(self, TK_RP);
-                    self.last_expr_height += 1;
-                    return Ok(Box::new(Expr::ArraySubquery(Box::new(select))));
-                }
                 match tok.token_type {
                     TK_STAR => {
                         eat_assert!(self, TK_STAR);

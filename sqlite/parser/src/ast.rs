@@ -594,7 +594,6 @@ pub enum Expr {
     Raise(ResolveType, Option<Box<Expr>>),
     /// Subquery expression
     Subquery(Box<Select>),
-    ArraySubquery(Box<Select>),
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
@@ -707,10 +706,6 @@ impl Variable {
 pub enum SubqueryType {
     /// EXISTS subquery; result is stored in a single register.
     Exists { result_reg: usize },
-    Array {
-        result_reg: usize,
-        element_type: Option<String>,
-    },
     /// Row value subquery; result is stored in a range of registers.
     /// Example: x = (SELECT ...) or (x, y) = (SELECT ...)
     RowValue {

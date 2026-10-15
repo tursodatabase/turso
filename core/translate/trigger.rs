@@ -355,9 +355,7 @@ impl CrossDbCheckCtx<'_> {
         crate::translate::expr::walk_expr(expr, &mut |e| -> Result<WalkControl> {
             match e {
                 // walk_expr doesn't descend into subqueries, so handle them here
-                ast::Expr::Exists(select)
-                | ast::Expr::Subquery(select)
-                | ast::Expr::ArraySubquery(select) => {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
                     self.check_select(select)?;
                 }
                 ast::Expr::InSelect { rhs, .. } => {

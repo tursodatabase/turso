@@ -1943,7 +1943,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
             e,
-            Expr::Subquery(_) | Expr::ArraySubquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
         ) {
             found_subquery = true;
             return Ok(WalkControl::SkipChildren);

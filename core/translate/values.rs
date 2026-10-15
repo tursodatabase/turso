@@ -1,5 +1,5 @@
 use crate::translate::emitter::TranslateCtx;
-use crate::translate::expr::translate_result_expr;
+use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::{
     emit_columns_to_destination, emit_offset, emit_result_row_and_limit,
@@ -34,8 +34,7 @@ pub fn emit_values(
             });
             result_reg
         }
-        QueryDestination::RowValueSubqueryResult { .. }
-        | QueryDestination::ArraySubqueryResult { .. } => {
+        QueryDestination::RowValueSubqueryResult { .. } => {
             emit_toplevel_values(program, plan, t_ctx)?
         }
         QueryDestination::RowSet { .. } => {
@@ -65,13 +64,13 @@ fn emit_values_when_single_row(
         reg
     };
     for (i, v) in first_row.iter().enumerate() {
-        translate_result_expr(
+        translate_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
             v,
             start_reg + i,
             &t_ctx.resolver,
-            plan.decode_result_casts,
+            NoConstantOptReason::RegisterReuse,
         )?;
     }
     emit_values_to_destination(program, plan, t_ctx, start_reg, row_len, end_label)?;
@@ -155,13 +154,13 @@ fn emit_values_in_subquery(
     };
     for value in &plan.values {
         for (i, v) in value.iter().enumerate() {
-            translate_result_expr(
+            translate_expr_no_constant_opt(
                 program,
                 Some(&plan.table_references),
                 v,
                 start_reg + i,
                 &t_ctx.resolver,
-                plan.decode_result_casts,
+                NoConstantOptReason::RegisterReuse,
             )?;
         }
         program.emit_insn(Insn::Yield {
@@ -219,8 +218,7 @@ fn emit_values_to_destination(
                 dest: *result_reg,
             });
         }
-        QueryDestination::RowValueSubqueryResult { .. }
-        | QueryDestination::ArraySubqueryResult { .. } => {
+        QueryDestination::RowValueSubqueryResult { .. } => {
             emit_result_row_and_limit(program, plan, start_reg, t_ctx.limit_ctx, Some(end_label))?;
         }
         QueryDestination::RowSet { .. } => {

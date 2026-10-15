@@ -389,14 +389,9 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
+    // Array columns: pass through raw record blob. ArrayDecode is emitted
+    // at display time (ResultRow) so that functions/subscripts see raw blobs.
     if column.is_array() {
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-        emit_array_element_decode(program, dest_reg, column, resolver)?;
-        program.preassign_label_to_next_insn(skip_label);
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {

@@ -359,7 +359,7 @@ fn translate_leaf_condition_expr(
             SubqueryType::Exists { result_reg } => {
                 emit_cond_jump(program, condition_metadata, *result_reg);
             }
-            SubqueryType::In { .. } | SubqueryType::Array { .. } => {
+            SubqueryType::In { .. } => {
                 let result_reg = program.alloc_register();
                 translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
                 emit_cond_jump(program, condition_metadata, result_reg);
@@ -395,7 +395,7 @@ fn translate_leaf_condition_expr(
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS in WHERE clause is not supported");
         }
-        ast::Expr::Subquery(_) | ast::Expr::ArraySubquery(_) => {
+        ast::Expr::Subquery(_) => {
             crate::bail_parse_error!("Subquery in WHERE clause is not supported");
         }
         ast::Expr::InSelect { .. } => {

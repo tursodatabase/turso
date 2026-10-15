@@ -81,7 +81,9 @@ use walk::*;
 pub(crate) use affinity::{
     comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
 };
-pub(crate) use arrays::{emit_custom_type_decode_columns, emit_custom_type_encode_columns};
+pub(crate) use arrays::{
+    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+};
 pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
@@ -99,7 +101,6 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
-pub(crate) use translator::translate_result_expr;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };

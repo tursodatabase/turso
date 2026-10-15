@@ -784,11 +784,6 @@ pub(super) fn emit_binary_insn(
 /// Check if an expression is known to produce an array value.
 pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
     match expr {
-        Expr::ArraySubquery(_)
-        | Expr::SubqueryResult {
-            query_type: ast::SubqueryType::Array { .. },
-            ..
-        } => true,
         Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
                 tables

@@ -150,7 +150,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Qualified(..) => 1,
         Expr::FieldAccess { .. } => 1,
         Expr::Raise(..) => 1,
-        Expr::Subquery(_) | Expr::ArraySubquery(_) => {
+        Expr::Subquery(_) => {
             crate::bail_parse_error!("Scalar subquery is not supported in this context")
         }
         Expr::Unary(_, expr) => {
@@ -164,7 +164,6 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::SubqueryResult { query_type, .. } => match query_type {
             SubqueryType::Exists { .. } => 1,
             SubqueryType::In { .. } => 1,
-            SubqueryType::Array { .. } => 1,
             SubqueryType::RowValue { num_regs, .. } => *num_regs,
         },
         Expr::Default => 1,

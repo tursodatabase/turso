@@ -349,6 +349,43 @@ expect {
     {29}
 }
 
+test array-subquery-nested-cte-and-generated-name-conflicts {
+    WITH "_TURSO_ARRAY_ROWS" AS (SELECT 29 AS v),
+         _turso_array_rows_ AS (SELECT 17 AS v)
+    SELECT ARRAY(
+        WITH chosen AS (
+            SELECT v FROM "_TURSO_ARRAY_ROWS"
+            UNION ALL SELECT v FROM _turso_array_rows_
+        )
+        SELECT v FROM chosen ORDER BY v
+    ), ARRAY(SELECT v FROM _turso_array_rows_);
+}
+expect {
+    {17,29}|{17}
+}
+
+@setup array_items
+test array-subquery-correlated-repeated-and-empty-results {
+    SELECT g.group_id,
+           ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id
+                 ORDER BY v DESC NULLS LAST LIMIT 2)
+    FROM (SELECT 1 AS group_id UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 1) g;
+}
+expect {
+    1|{17,9}
+    2|{2}
+    3|{}
+    1|{17,9}
+}
+
+test array-subquery-projection-alias-keeps-order-by-meaning {
+    SELECT ARRAY(SELECT 9 AS _turso_array_value UNION ALL SELECT 17
+                 ORDER BY _turso_array_value DESC LIMIT 1);
+}
+expect {
+    {17}
+}
+
 @setup array_items
 test array-subquery-grouped-aggregate {
     SELECT ARRAY(SELECT SUM(v) FROM array_items GROUP BY group_id ORDER BY group_id);

@@ -77,9 +77,7 @@ where
                     ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
                         stack.push(WalkItem::Expr(expr));
                     }
-                    ast::Expr::Exists(_select)
-                    | ast::Expr::Subquery(_select)
-                    | ast::Expr::ArraySubquery(_select) => {
+                    ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
                         // TODO: Walk through select statements if needed
                     }
                     ast::Expr::FunctionCall {
@@ -414,7 +412,7 @@ where
                     ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
                         stack.push(WalkItem::Expr(expr));
                     }
-                    ast::Expr::Exists(_) | ast::Expr::Subquery(_) | ast::Expr::ArraySubquery(_) => {
+                    ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
                         // TODO: Walk through select statements if needed
                     }
                     ast::Expr::FunctionCall {

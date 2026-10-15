@@ -648,10 +648,7 @@ fn emit_percentile_fraction_check(
             Expr::Column { table, .. } => {
                 matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
             }
-            Expr::Subquery(_)
-            | Expr::ArraySubquery(_)
-            | Expr::Exists(_)
-            | Expr::SubqueryResult { .. } => true,
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,
             _ => false,
         };
         if invalid {

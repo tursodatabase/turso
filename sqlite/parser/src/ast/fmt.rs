@@ -1128,12 +1128,6 @@ impl ToTokens for Expr {
                 query.to_tokens(s, context)?;
                 s.append(TK_RP, None)
             }
-            Self::ArraySubquery(query) => {
-                s.append(TK_ID, Some("ARRAY"))?;
-                s.append(TK_LP, None)?;
-                query.to_tokens(s, context)?;
-                s.append(TK_RP, None)
-            }
             Self::Unary(op, sub_expr) => {
                 op.to_tokens(s, context)?;
                 sub_expr.to_tokens(s, context)

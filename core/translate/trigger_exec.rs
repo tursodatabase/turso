@@ -411,7 +411,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
     match e {
-        Expr::Exists(select) | Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+        Expr::Exists(select) | Expr::Subquery(select) => {
             rewrite_expressions_in_select_for_subprogram(select, ctx)?;
             return Ok(());
         }
@@ -1324,7 +1324,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
             }
             return Ok(());
         }
-        Expr::Exists(select) | Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+        Expr::Exists(select) | Expr::Subquery(select) => {
             rewrite_expressions_in_select_for_when_clause(select, table, ctx)?;
             return Ok(());
         }

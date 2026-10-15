@@ -311,7 +311,7 @@ impl RecursiveRefCounter<'_> {
         let mut count = 0;
         let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
             match node {
-                Expr::Exists(select) | Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+                Expr::Exists(select) | Expr::Subquery(select) => {
                     count += self.count_select(select, scope);
                     Ok(WalkControl::SkipChildren)
                 }
@@ -476,7 +476,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
 fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
-            Expr::Exists(select) | Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+            Expr::Exists(select) | Expr::Subquery(select) => {
                 collect_from_clause_table_refs(select, out);
                 Ok(WalkControl::SkipChildren)
             }

@@ -374,7 +374,6 @@ fn prepare_one_select_plan(
                     .collect(),
                 table_references,
                 result_columns,
-                decode_result_casts: false,
                 where_clause: where_predicates,
                 group_by: None,
                 order_by: vec![],
@@ -846,7 +845,6 @@ fn prepare_one_select_plan(
                 join_order: vec![],
                 table_references,
                 result_columns,
-                decode_result_casts: false,
                 where_clause: vec![],
                 group_by: None,
                 order_by: vec![],
@@ -1475,10 +1473,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut stack = vec![expr];
     while let Some(node) = stack.pop() {
         match node {
-            Expr::Subquery(_)
-            | Expr::ArraySubquery(_)
-            | Expr::InSelect { .. }
-            | Expr::Exists(_) => return true,
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) => return true,
             Expr::Between {
                 lhs, start, end, ..
             } => {
