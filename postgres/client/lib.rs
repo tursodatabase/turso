@@ -2,9 +2,9 @@
 
 //! Minimal synchronous PostgreSQL wire-protocol client.
 //!
-//! This crate exists for Turso's test tooling: the sqltest runner's `pg`
-//! backend and the upstream regression-test runner both drive `tursopg`
-//! (or a real PostgreSQL server) over the simple query protocol. It speaks
+//! This crate exists for Turso's test tooling: the sqltest runner's `tursopg`
+//! and `postgres` backends and the upstream regression-test runner drive
+//! `tursopg` or a real PostgreSQL server over the simple query protocol. It speaks
 //! protocol 3.0 over TCP, handles the startup handshake with optional
 //! cleartext password authentication, and decodes the backend messages the
 //! simple query protocol produces. Values are returned in the text format

@@ -980,6 +980,40 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// Returns whether a domain in the column's type chain has NOT NULL, and the
+    /// domain CHECK constraints with `value` rewritten to the column name.
+    pub fn column_domain_constraints(
+        &self,
+        column: &Column,
+    ) -> Result<(bool, Vec<CheckConstraint>)> {
+        let mut not_null = false;
+        let mut checks = vec![];
+        let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
+            return Ok((not_null, checks));
+        };
+        if !resolved.is_domain() {
+            return Ok((not_null, checks));
+        }
+        let col_name = column.name.as_deref().unwrap_or("").to_string();
+        for td in &resolved.chain {
+            not_null |= td.not_null;
+            for (i, dc) in td.domain_checks.iter().enumerate() {
+                let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                let name = dc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", td.name, i));
+                checks.try_push(CheckConstraint {
+                    name: Some(name),
+                    expr: *rewritten,
+                    source: None,
+                    column: Some(col_name.clone()),
+                })?;
+            }
+        }
+        Ok((not_null, checks))
+    }
+
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_name.to_lowercase());
     }
@@ -1064,7 +1098,9 @@ impl Schema {
     /// used by both initial database open and schema reparse.
     pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql)?;
+            self.add_type_from_sql(sql).map_err(|e| {
+                crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
+            })?;
         }
         self.resolve_all_custom_type_affinities()?;
         Ok(())
@@ -3516,42 +3552,13 @@ impl BTreeTable {
         if !self.is_strict {
             return Ok(());
         }
-        // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = vec![];
-        let mut notnull_cols = vec![];
-
-        for (col_idx, col) in self.columns.iter().enumerate() {
-            let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
-                continue;
-            };
-            if !resolved.is_domain() {
-                continue;
+        for col in self.columns.iter_mut() {
+            let (not_null, checks) = schema.column_domain_constraints(col)?;
+            if not_null {
+                col.set_notnull(true);
             }
-            let col_name = col.name.as_deref().unwrap_or("").to_string();
-            for td in &resolved.chain {
-                if td.not_null {
-                    notnull_cols.try_push(col_idx)?;
-                }
-                for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
-                    let name = dc
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.try_push(CheckConstraint {
-                        name: Some(name),
-                        expr: *rewritten,
-                        source: None,
-                        column: Some(col_name.clone()),
-                    })?;
-                }
-            }
+            self.check_constraints.try_extend(checks)?;
         }
-
-        for col_idx in notnull_cols {
-            self.columns[col_idx].set_notnull(true);
-        }
-        self.check_constraints.try_extend(new_checks)?;
         Ok(())
     }
 
@@ -3619,7 +3626,10 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
-        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        let needs_pk_inline = self.primary_key_columns.len() == 1
+            && self
+                .primary_key_constraint_collation(&self.primary_key_columns[0].0)
+                .is_none();
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -3674,21 +3684,7 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let Some(collation) = column.collation_opt() {
-                match collation {
-                    CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
-                    CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
-                    CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
-                    CollationSeq::Locale(_) => {
-                        sql.push_str(" COLLATE ");
-                        sql.push_str(&quote_ident(&collation.name()));
-                    }
-                    CollationSeq::Unset | CollationSeq::Custom(_) => {
-                        // Unset should not be reachable -- ignore it
-                        // Custom collation is not allowed in schema definitions
-                    }
-                };
-            }
+            push_collation(&mut sql, column.collation_opt());
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
                 if column.generated_always {
@@ -3722,6 +3718,7 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
+                push_collation(&mut sql, self.primary_key_constraint_collation(&col.0));
                 if col.1 == SortOrder::Desc {
                     sql.push_str(" DESC");
                 }
@@ -3812,6 +3809,10 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&unique_column.name));
+                push_collation(&mut sql, unique_column.collation);
+                if unique_column.sort_order == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
             push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
@@ -3854,6 +3855,19 @@ impl BTreeTable {
             .map_or(self.rowid_alias_conflict_clause, |unique_set| {
                 unique_set.conflict_clause
             })
+    }
+
+    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<CollationSeq> {
+        self.unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .and_then(|unique_set| {
+                unique_set
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+            })
+            .and_then(|column| column.collation)
     }
 
     fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
@@ -4054,6 +4068,25 @@ fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType
         ResolveType::Ignore => " ON CONFLICT IGNORE",
         ResolveType::Replace => " ON CONFLICT REPLACE",
     });
+}
+
+fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
+    let Some(collation) = collation else {
+        return;
+    };
+    match collation {
+        CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+        CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+        CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+        CollationSeq::Locale(_) => {
+            sql.push_str(" COLLATE ");
+            sql.push_str(&quote_ident(&collation.name()));
+        }
+        CollationSeq::Unset | CollationSeq::Custom(_) => {
+            // Unset should not be reachable -- ignore it
+            // Custom collation is not allowed in schema definitions
+        }
+    };
 }
 
 /// Topologically sorted generated columns, yielding `(column_index, &Column)`.

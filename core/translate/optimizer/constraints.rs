@@ -1748,7 +1748,7 @@ pub(super) fn partial_index_predicate_terms(
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
 }
 
-pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
+pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
     let index = index?;
     index.where_clause.as_ref()?;
     Some(index.as_ref())

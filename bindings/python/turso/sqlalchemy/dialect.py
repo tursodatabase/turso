@@ -170,6 +170,7 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
         self.turso = turso_module
         self.paramstyle = "qmark"
         self._init_dbapi_attributes()
+        self.has_stop = False
 
     def _init_dbapi_attributes(self) -> None:
         """Populate DBAPI-shaped module attributes expected by SQLAlchemy.
@@ -311,6 +312,9 @@ class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
         if cls._is_url_file_db(url):
             return pool.AsyncAdaptedQueuePool
         return pool.StaticPool
+
+    def do_terminate(self, dbapi_connection):
+        dbapi_connection.close()
 
 
 class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):

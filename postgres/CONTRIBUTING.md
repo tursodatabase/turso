@@ -6,13 +6,17 @@ queries through the `turso_core` engine. The goal is to behave like a real
 PostgreSQL server, so most of the work is closing the gap between what real
 PostgreSQL does and what the front-end does today.
 
-Two things keep that work honest:
+Three things keep that work honest:
 
 - **[`COMPAT.md`](COMPAT.md)** — feature-by-feature compatibility status, and
   where Turso intentionally diverges from PostgreSQL.
 - **[`conformance/upstream/`](conformance/upstream/)** — regression tests
   imported verbatim from the PostgreSQL source tree, run against the front-end
   so divergence can't sneak in unnoticed.
+- **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
+  that CI runs against the front-end and against a real PostgreSQL server
+  (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
+  behavior have `@skip-if postgres "reason"`.
 
 ## Verification workflow
 
@@ -21,7 +25,8 @@ When changing the parser, translator, or query behavior:
 1. Check the relevant page of the PostgreSQL documentation.
 2. Confirm the behavior against a real PostgreSQL server.
 3. Encode the observed behavior in a test — an upstream regression script that
-   now passes, or a Rust test (see below) — so it can't regress.
+   now passes, a `.sqltest` in `conformance/pg-sqltests/`, or a Rust test (see
+   below) — so it can't regress.
 
 If Turso intentionally diverges from PostgreSQL, document that in
 [`COMPAT.md`](COMPAT.md). Pay particular attention to clauses that parse but

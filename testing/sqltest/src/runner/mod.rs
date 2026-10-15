@@ -470,6 +470,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 None => true, // Unconditional skip
                 Some(SkipCondition::Mvcc) => options.mvcc,
                 Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
+                Some(SkipCondition::Postgres) => options.backend_type == Backend::Postgres,
             };
             if should_skip {
                 return TestResult {
@@ -1470,5 +1471,98 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.skipped, 1);
         assert!(!summary.is_success());
+    }
+
+    #[tokio::test]
+    async fn skip_if_postgres_skips_only_on_the_postgres_backend() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@skip-if postgres "EXPLAIN shows the Turso query plan"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#,
+        )
+        .unwrap();
+
+        for backend_type in Backend::ALL.iter().copied() {
+            let options = RunOptions {
+                file_path: PathBuf::from("skip.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type,
+                backend_is_sqlite: false,
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+            };
+            let backend = Arc::new(OneRowBackend { backend_type });
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            match backend_type {
+                Backend::Postgres => assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Skipped { reason } if reason == "EXPLAIN shows the Turso query plan"
+                    ),
+                    "{:?}",
+                    result.outcome
+                ),
+                _ => assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{backend_type}: {:?}",
+                    result.outcome
+                ),
+            }
+        }
+    }
+
+    /// A backend whose every query returns the single row `1`.
+    struct OneRowBackend {
+        backend_type: Backend,
+    }
+
+    #[async_trait]
+    impl SqlBackend for OneRowBackend {
+        fn name(&self) -> &str {
+            "one-row"
+        }
+
+        fn backend_type(&self) -> Backend {
+            self.backend_type
+        }
+
+        fn capabilities(&self) -> HashSet<Capability> {
+            HashSet::new()
+        }
+
+        async fn create_database(
+            &self,
+            _config: &DatabaseConfig,
+        ) -> Result<Box<dyn crate::backends::DatabaseInstance>, BackendError> {
+            Ok(Box::new(OneRowDatabase))
+        }
+    }
+
+    struct OneRowDatabase;
+
+    #[async_trait]
+    impl crate::backends::DatabaseInstance for OneRowDatabase {
+        async fn execute(&mut self, _sql: &str) -> Result<QueryResult, BackendError> {
+            Ok(QueryResult::success(vec![vec!["1".to_string()]]))
+        }
+
+        async fn close(
+            self: Box<Self>,
+        ) -> Result<crate::backends::DatabaseFileHandle, BackendError> {
+            Ok(crate::backends::DatabaseFileHandle::none())
+        }
     }
 }

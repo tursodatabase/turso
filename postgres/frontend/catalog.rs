@@ -14,6 +14,13 @@ use turso_parser::ast::RefAct;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
+/// PostgreSQL uses OID zero when no object is referenced.
+const PG_INVALID_OID: i64 = 0;
+/// pg_depend uses column zero for a whole object; table columns are numbered from one.
+const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
+/// Catalog BOOLEAN values are stored as integers; one means true.
+const CATALOG_BOOLEAN_TRUE: i64 = 1;
+
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -246,6 +253,14 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
     }
 }
 
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum RelationKind {
+    #[strum(serialize = "r")]
+    Table,
+    #[strum(serialize = "i")]
+    Index,
+}
+
 /// Virtual table implementation for pg_catalog.pg_class
 /// Maps SQLite's sqlite_master to PostgreSQL's pg_class system table
 #[derive(Debug)]
@@ -289,6 +304,8 @@ impl SnapshotRows for PgClassTable {
             relpartbound TEXT,
             tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
@@ -299,6 +316,7 @@ impl SnapshotRows for PgClassTable {
 
         let tables = user_tables_sorted(&schema);
         let num_tables = tables.len() as i64;
+        let relkind: &'static str = RelationKind::Table.into();
 
         for (i, (table_name, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
@@ -331,7 +349,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(relhasindex),              // relhasindex
                 Value::from_i64(0),                        // relisshared
                 Value::Text("p".into()),                   // relpersistence (permanent)
-                Value::Text("r".into()),                   // relkind (regular table)
+                Value::build_text(relkind),                // relkind (regular table)
                 Value::from_i64(relnatts),                 // relnatts
                 Value::from_i64(relchecks),                // relchecks
                 Value::from_i64(0),                        // relhasrules
@@ -353,6 +371,7 @@ impl SnapshotRows for PgClassTable {
 
         // Add index rows (relkind='i')
         let mut index_oid = USER_TABLE_OID_START + num_tables;
+        let relkind: &'static str = RelationKind::Index.into();
         for (table_name, _) in &tables {
             for idx in schema.get_indices(table_name) {
                 if idx.ephemeral {
@@ -376,7 +395,7 @@ impl SnapshotRows for PgClassTable {
                     Value::from_i64(0),                   // relhasindex
                     Value::from_i64(0),                   // relisshared
                     Value::Text("p".into()),              // relpersistence
-                    Value::Text("i".into()),              // relkind (index)
+                    Value::build_text(relkind),           // relkind (index)
                     Value::from_i64(indnatts),            // relnatts
                     Value::from_i64(0),                   // relchecks
                     Value::from_i64(0),                   // relhasrules
@@ -415,6 +434,8 @@ impl SnapshotRows for PgNamespaceTable {
             nspacl TEXT,
             tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
@@ -455,6 +476,43 @@ impl SnapshotRows for PgNamespaceTable {
             oid += 1;
         }
         rows
+    }
+}
+
+/// Virtual table implementation for information_schema.schemata
+#[derive(Debug)]
+struct SchemataTable;
+
+impl SnapshotRows for SchemataTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_information_schema_schemata (
+            catalog_name TEXT,
+            schema_name TEXT,
+            schema_owner TEXT,
+            default_character_set_catalog TEXT,
+            default_character_set_schema TEXT,
+            default_character_set_name TEXT,
+            sql_path TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 5;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let db_name = db_name_from_path(conn.db_file_path());
+        PgNamespaceTable::load_rows(conn)
+            .into_iter()
+            .map(|namespace| {
+                vec![
+                    Value::build_text(db_name.clone()),
+                    namespace[1].clone(),
+                    Value::build_text("turso"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]
+            })
+            .collect()
     }
 }
 
@@ -658,9 +716,9 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),               // oid
                 Value::build_text(entry.name),      // proname
-                Value::from_i64(2200),              // pronamespace (public)
+                Value::from_i64(11),                // pronamespace (pg_catalog)
                 Value::from_i64(10),                // proowner
-                Value::from_i64(14),                // prolang (SQL)
+                Value::from_i64(12),                // prolang (internal)
                 Value::from_f64(1.0),               // procost
                 Value::from_f64(0.0),               // prorows
                 Value::from_i64(0),                 // provariadic
@@ -697,7 +755,7 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),       // oid
                 Value::build_text(name),    // proname
-                Value::from_i64(2200),      // pronamespace (public)
+                Value::from_i64(11),        // pronamespace (pg_catalog)
                 Value::from_i64(10),        // proowner
                 Value::from_i64(13),        // prolang (C)
                 Value::from_f64(1.0),       // procost
@@ -806,6 +864,8 @@ impl SnapshotRows for PgAmTable {
             amtype TEXT,
             tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_am, which lists table and index access methods.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
@@ -1521,6 +1581,18 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum ConstraintKind {
+    #[strum(serialize = "p")]
+    PrimaryKey,
+    #[strum(serialize = "u")]
+    Unique,
+    #[strum(serialize = "f")]
+    ForeignKey,
+    #[strum(serialize = "c")]
+    Check,
+}
+
 const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
@@ -1528,6 +1600,9 @@ struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
+    /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
+    /// unique constraints, foreign keys and checks.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
@@ -1577,11 +1652,12 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let contype: &'static str = ConstraintKind::PrimaryKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
                     Value::from_i64(2200),
-                    Value::build_text("p"),
+                    Value::build_text(contype),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(1),
@@ -1609,7 +1685,11 @@ impl SnapshotRows for PgConstraintTable {
 
             // PK / UNIQUE constraints from unique_sets
             for us in &btree.unique_sets {
-                let contype = if us.is_primary_key { "p" } else { "u" };
+                let contype = if us.is_primary_key {
+                    ConstraintKind::PrimaryKey
+                } else {
+                    ConstraintKind::Unique
+                };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
                     format!("{table_name}_pkey")
@@ -1650,6 +1730,7 @@ impl SnapshotRows for PgConstraintTable {
                         .unwrap_or(0)
                 };
 
+                let contype: &'static str = contype.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
@@ -1715,11 +1796,12 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
+                let contype: &'static str = ConstraintKind::ForeignKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),                   // oid
                     Value::build_text(conname),                        // conname
                     Value::from_i64(2200),                             // connamespace
-                    Value::build_text("f"),                            // contype
+                    Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
                     Value::from_i64(1),                                // convalidated
@@ -1762,11 +1844,12 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .unwrap_or_default();
 
+                let contype: &'static str = ConstraintKind::Check.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
                     Value::from_i64(2200),           // connamespace
-                    Value::build_text("c"),          // contype
+                    Value::build_text(contype),      // contype
                     Value::from_i64(0),              // condeferrable
                     Value::from_i64(0),              // condeferred
                     Value::from_i64(1),              // convalidated
@@ -1812,6 +1895,8 @@ struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
+    /// Fixed PostgreSQL OID of pg_attrdef, which describes column default expressions.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
     const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
@@ -1952,6 +2037,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgIndexesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_information_schema_schemata",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<SchemataTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_get_tabledef",
         VTabKind::TableValuedFunction,
         CatalogModule {
@@ -2073,7 +2163,232 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
     );
+    options = options.native_module(
+        "pg_depend",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgDependTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_tablespace",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_tablespace (
+                oid INTEGER, spcname TEXT, spcowner INTEGER, spcacl TEXT[], spcoptions TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_init_privs",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_init_privs (
+                objoid INTEGER, classoid INTEGER, objsubid INTEGER, privtype TEXT,
+                initprivs TEXT[], tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_cast",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_cast (
+                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_transform",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_transform (
+                oid INTEGER, trftype INTEGER, trflang INTEGER, trffromsql INTEGER,
+                trftosql INTEGER, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_language",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgLanguageTable>(PhantomData),
+    );
+    for (name, create_sql) in [
+        (
+            "pg_operator",
+            "CREATE TABLE pg_operator (
+            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opclass",
+            "CREATE TABLE pg_opclass (
+            oid INTEGER, opcmethod INTEGER, opcname TEXT, opcnamespace INTEGER,
+            opcowner INTEGER, opcfamily INTEGER, opcintype INTEGER, opcdefault BOOLEAN,
+            opckeytype INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opfamily",
+            "CREATE TABLE pg_opfamily (
+            oid INTEGER, opfmethod INTEGER, opfname TEXT, opfnamespace INTEGER,
+            opfowner INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_parser",
+            "CREATE TABLE pg_ts_parser (
+            oid INTEGER, prsname TEXT, prsnamespace INTEGER, prsstart INTEGER,
+            prstoken INTEGER, prsend INTEGER, prsheadline INTEGER, prslextype INTEGER,
+            tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_template",
+            "CREATE TABLE pg_ts_template (
+            oid INTEGER, tmplname TEXT, tmplnamespace INTEGER, tmplinit INTEGER,
+            tmpllexize INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_dict",
+            "CREATE TABLE pg_ts_dict (
+            oid INTEGER, dictname TEXT, dictnamespace INTEGER, dictowner INTEGER,
+            dicttemplate INTEGER, dictinitoption TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_config",
+            "CREATE TABLE pg_ts_config (
+            oid INTEGER, cfgname TEXT, cfgnamespace INTEGER, cfgowner INTEGER,
+            cfgparser INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_data_wrapper",
+            "CREATE TABLE pg_foreign_data_wrapper (
+            oid INTEGER, fdwname TEXT, fdwowner INTEGER, fdwhandler INTEGER,
+            fdwvalidator INTEGER, fdwacl TEXT[], fdwoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_server",
+            "CREATE TABLE pg_foreign_server (
+            oid INTEGER, srvname TEXT, srvowner INTEGER, srvfdw INTEGER, srvtype TEXT,
+            srvversion TEXT, srvacl TEXT[], srvoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_default_acl",
+            "CREATE TABLE pg_default_acl (
+            oid INTEGER, defaclrole INTEGER, defaclnamespace INTEGER, defaclobjtype TEXT,
+            defaclacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_conversion",
+            "CREATE TABLE pg_conversion (
+            oid INTEGER, conname TEXT, connamespace INTEGER, conowner INTEGER,
+            conforencoding INTEGER, contoencoding INTEGER, conproc INTEGER,
+            condefault BOOLEAN, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_range",
+            "CREATE TABLE pg_range (
+            rngtypid INTEGER, rngsubtype INTEGER, rngmultitypid INTEGER,
+            rngcollation INTEGER, rngsubopc INTEGER, rngcanonical INTEGER,
+            rngsubdiff INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_event_trigger",
+            "CREATE TABLE pg_event_trigger (
+            oid INTEGER, evtname TEXT, evtevent TEXT, evtowner INTEGER, evtfoid INTEGER,
+            evtenabled TEXT, evttags TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_subscription",
+            "CREATE TABLE pg_subscription (
+            oid INTEGER, subdbid INTEGER, subskiplsn TEXT, subname TEXT, subowner INTEGER,
+            subenabled BOOLEAN, subbinary BOOLEAN, substream TEXT, subtwophasestate TEXT,
+            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN,
+            subconninfo TEXT, subslotname TEXT, subsynccommit TEXT, subpublications TEXT[],
+            suborigin TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_largeobject_metadata",
+            "CREATE TABLE pg_largeobject_metadata (
+            oid INTEGER, lomowner INTEGER, lomacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amop",
+            "CREATE TABLE pg_amop (
+            oid INTEGER, amopfamily INTEGER, amoplefttype INTEGER, amoprighttype INTEGER,
+            amopstrategy INTEGER, amoppurpose TEXT, amopopr INTEGER, amopmethod INTEGER,
+            amopsortfamily INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amproc",
+            "CREATE TABLE pg_amproc (
+            oid INTEGER, amprocfamily INTEGER, amproclefttype INTEGER, amprocrighttype INTEGER,
+            amprocnum INTEGER, amproc INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+    ] {
+        options = options.native_module(
+            name,
+            VTabKind::TableValuedFunction,
+            EmptyPgCatalogTable {
+                create_sql: create_sql.to_owned(),
+            },
+        );
+    }
     options
+}
+
+#[derive(Debug)]
+struct PgLanguageTable;
+
+impl SnapshotRows for PgLanguageTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_language (
+        oid INTEGER, lanname TEXT, lanowner INTEGER, lanispl BOOLEAN,
+        lanpltrusted BOOLEAN, lanplcallfoid INTEGER, laninline INTEGER,
+        lanvalidator INTEGER, lanacl TEXT[], tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2612);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        [(12, "internal"), (13, "c")]
+            .into_iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::build_text(name),
+                    Value::from_i64(10),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::Null,
+                ]
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -2133,6 +2448,362 @@ impl SnapshotRows for PgSettingsTable {
             Value::Null,
             Value::from_i64(0),
         ]]
+    }
+}
+
+#[derive(strum::IntoStaticStr)]
+enum DependencyKind {
+    #[strum(serialize = "n")]
+    Normal,
+    #[strum(serialize = "a")]
+    Auto,
+    #[strum(serialize = "i")]
+    Internal,
+}
+
+struct ObjectAddress {
+    catalog_oid: i64,
+    object_oid: i64,
+    column_number: i64,
+}
+
+struct RelationRow<'a> {
+    oid: i64,
+    name: &'a str,
+    namespace_oid: i64,
+    access_method_oid: i64,
+    kind: RelationKind,
+}
+
+struct ConstraintRow<'a> {
+    oid: i64,
+    kind: ConstraintKind,
+    table_oid: i64,
+    referenced_table_oid: i64,
+    column_numbers: Option<&'a str>,
+    referenced_column_numbers: Option<&'a str>,
+}
+
+struct IndexRow<'a> {
+    oid: i64,
+    table_oid: i64,
+    is_unique: bool,
+    column_numbers: Option<&'a str>,
+}
+
+struct ColumnDefaultRow {
+    oid: i64,
+    table_oid: i64,
+    column_number: i64,
+}
+
+#[derive(Debug)]
+struct PgDependTable;
+
+impl SnapshotRows for PgDependTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_depend (
+        classid INTEGER, objid INTEGER, objsubid INTEGER,
+        refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT,
+        tableoid INTEGER HIDDEN
+    )";
+    /// Fixed PostgreSQL OID of pg_depend, which records dependencies between objects.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2608);
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        let constraint_rows = PgConstraintTable::load_rows(conn);
+        let constraints = constraint_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(ConstraintRow::from_row);
+        let index_rows = PgIndexTable::load_rows(conn);
+        let indexes = index_rows.iter().map(Vec::as_slice).map(IndexRow::from_row);
+        let relation_rows = PgClassTable::load_rows(conn);
+        let relations = relation_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(RelationRow::from_row);
+
+        // Report each table's normal dependencies on its schema and access method.
+        for relation in relations.clone() {
+            if !matches!(relation.kind, RelationKind::Table) {
+                continue;
+            }
+            rows.push(dependency_row(
+                ObjectAddress::whole::<PgClassTable>(relation.oid),
+                ObjectAddress::whole::<PgNamespaceTable>(relation.namespace_oid),
+                DependencyKind::Normal,
+            ));
+            if relation.access_method_oid != PG_INVALID_OID {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(relation.oid),
+                    ObjectAddress::whole::<PgAmTable>(relation.access_method_oid),
+                    DependencyKind::Normal,
+                ));
+            }
+        }
+
+        // Match automatic indexes to PK/UNIQUE constraints for internal dependencies.
+        // Other indexes have automatic dependencies on their indexed columns.
+        for index in indexes.clone() {
+            let columns = catalog_column_numbers(index.column_numbers);
+            let automatic = relations.clone().any(|relation| {
+                relation.oid == index.oid
+                    && relation
+                        .name
+                        .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+            });
+            let constraint = if automatic {
+                constraints.clone().find(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                    ) && constraint.table_oid == index.table_oid
+                        && catalog_column_numbers(constraint.column_numbers) == columns
+                })
+            } else {
+                None
+            };
+            if let Some(constraint) = constraint {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(index.oid),
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                    DependencyKind::Internal,
+                ));
+            } else {
+                // Emit one automatic dependency row per indexed column.
+                for column_number in columns {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
+                        ObjectAddress::column(index.table_oid, column_number),
+                        DependencyKind::Auto,
+                    ));
+                }
+            }
+        }
+
+        // Report constraints' dependencies on local columns and foreign-key references.
+        for constraint in constraints {
+            // Use automatic dependencies for local columns, or the whole table if none are listed.
+            for column_number in catalog_column_numbers(constraint.column_numbers) {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                    ObjectAddress::column(constraint.table_oid, column_number),
+                    DependencyKind::Auto,
+                ));
+            }
+            if constraint.referenced_table_oid != PG_INVALID_OID {
+                let referenced_columns =
+                    catalog_column_numbers(constraint.referenced_column_numbers);
+                // Foreign keys have normal dependencies on their referenced columns.
+                for &column_number in &referenced_columns {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::column(constraint.referenced_table_oid, column_number),
+                        DependencyKind::Normal,
+                    ));
+                }
+                // Also report a normal dependency on a matching unique index for the referenced key.
+                if let Some(index) = indexes.clone().find(|index| {
+                    index.table_oid == constraint.referenced_table_oid
+                        && index.is_unique
+                        && catalog_column_numbers(index.column_numbers) == referenced_columns
+                }) {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
+                        DependencyKind::Normal,
+                    ));
+                }
+            }
+        }
+
+        let default_rows = PgAttrdefTable::load_rows(conn);
+        let defaults = default_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(ColumnDefaultRow::from_row);
+        // Default expressions automatically depend on the column that owns them.
+        for default in defaults {
+            rows.push(dependency_row(
+                ObjectAddress::whole::<PgAttrdefTable>(default.oid),
+                ObjectAddress::column(default.table_oid, default.column_number),
+                DependencyKind::Auto,
+            ));
+        }
+        rows
+    }
+}
+
+fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
+    match text {
+        None => vec![WHOLE_OBJECT_COLUMN_NUMBER],
+        Some(text) => {
+            let mut columns: Vec<i64> = text
+                .split_ascii_whitespace()
+                .map(|column| column.parse().expect("catalog column numbers are integers"))
+                .collect();
+            if columns.is_empty() {
+                columns.push(WHOLE_OBJECT_COLUMN_NUMBER);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            columns
+        }
+    }
+}
+
+fn dependency_row(
+    dependent: ObjectAddress,
+    referenced: ObjectAddress,
+    kind: DependencyKind,
+) -> Vec<Value> {
+    let kind: &'static str = kind.into();
+    vec![
+        Value::from_i64(dependent.catalog_oid),
+        Value::from_i64(dependent.object_oid),
+        Value::from_i64(dependent.column_number),
+        Value::from_i64(referenced.catalog_oid),
+        Value::from_i64(referenced.object_oid),
+        Value::from_i64(referenced.column_number),
+        Value::build_text(kind),
+    ]
+}
+
+impl ObjectAddress {
+    const fn whole<T: SnapshotRows>(object_oid: i64) -> Self {
+        Self {
+            catalog_oid: T::TABLE_OID.expect("dependency catalogs have OIDs"),
+            object_oid,
+            column_number: WHOLE_OBJECT_COLUMN_NUMBER,
+        }
+    }
+
+    const fn column(table_oid: i64, column_number: i64) -> Self {
+        Self {
+            column_number,
+            ..Self::whole::<PgClassTable>(table_oid)
+        }
+    }
+}
+
+impl<'a> RelationRow<'a> {
+    // Zero-based positions in PgClassTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const NAME_COLUMN: usize = 1;
+    const NAMESPACE_OID_COLUMN: usize = 2;
+    const ACCESS_METHOD_OID_COLUMN: usize = 6;
+    const KIND_COLUMN: usize = 16;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            name: row[Self::NAME_COLUMN]
+                .to_text()
+                .expect("catalog relation names are text"),
+            namespace_oid: row[Self::NAMESPACE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            access_method_oid: row[Self::ACCESS_METHOD_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog relation kinds are text")
+                .parse()
+                .expect("catalog relation kinds are valid"),
+        }
+    }
+}
+
+impl<'a> ConstraintRow<'a> {
+    // Zero-based positions in PgConstraintTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const KIND_COLUMN: usize = 3;
+    const TABLE_OID_COLUMN: usize = 7;
+    const REFERENCED_TABLE_OID_COLUMN: usize = 11;
+    const COLUMN_NUMBERS_COLUMN: usize = 18;
+    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 19;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog constraint kinds are text")
+                .parse()
+                .expect("catalog constraint kinds are valid"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            referenced_table_oid: row[Self::REFERENCED_TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+            referenced_column_numbers: catalog_column_text(
+                &row[Self::REFERENCED_COLUMN_NUMBERS_COLUMN],
+            ),
+        }
+    }
+}
+
+impl<'a> IndexRow<'a> {
+    // Zero-based positions in PgIndexTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const IS_UNIQUE_COLUMN: usize = 4;
+    const COLUMN_NUMBERS_COLUMN: usize = 14;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            is_unique: row[Self::IS_UNIQUE_COLUMN]
+                .as_int()
+                .expect("catalog index uniqueness is an integer")
+                == CATALOG_BOOLEAN_TRUE,
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+        }
+    }
+}
+
+impl ColumnDefaultRow {
+    // Zero-based positions in PgAttrdefTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const COLUMN_NUMBER_COLUMN: usize = 2;
+
+    fn from_row(row: &[Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_number: row[Self::COLUMN_NUMBER_COLUMN]
+                .as_int()
+                .expect("catalog column numbers are integers"),
+        }
+    }
+}
+
+fn catalog_column_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str()),
+        _ => unreachable!("catalog column lists are text or null"),
     }
 }
 

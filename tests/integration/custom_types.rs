@@ -2,6 +2,7 @@
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
     use asserting::prelude::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -137,6 +138,78 @@ mod tests {
 
             conn.close().unwrap();
         }
+    }
+
+    #[test]
+    fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_bad_type_sql.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TYPE zz BASE text ENCODE upper(value) DECODE lower(value)")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a cents, b zz) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (5, 'Hi')").unwrap();
+
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+                 WHERE name = 'cents'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let result = turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        );
+        let Err(err) = result else {
+            panic!("open must fail when a stored type does not parse");
+        };
+        assert!(
+            err.to_string().contains("malformed database schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_reparse_fails_when_stored_custom_type_does_not_parse() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t(a cents) STRICT").unwrap();
+
+        conn.start_nested();
+        let stmt = conn.prepare(
+            "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+             WHERE name = 'cents'",
+        );
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+
+        assert_that!(conn.execute("VACUUM"))
+            .err()
+            .display_string()
+            .contains("malformed database schema");
     }
 
     /// After reopening, schema changes (CREATE TABLE) that use a previously

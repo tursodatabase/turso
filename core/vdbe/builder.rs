@@ -2253,6 +2253,9 @@ impl ProgramBuilder {
 
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        if matches!(affinity, Affinity::Blob | Affinity::None) {
+            return;
+        }
         self.emit_insn(Insn::Affinity {
             start_reg: register,
             count: NonZeroUsize::MIN,

@@ -57,3 +57,13 @@ test search-path-public-resolves-to-main {
 expect {
     0|from public
 }
+
+test public-schema-qualified-column-reference {
+    DROP TABLE IF EXISTS demo;
+    CREATE TABLE demo (id int, label text);
+    INSERT INTO demo VALUES (0, 'a'), (1, 'b');
+    SELECT public.demo.label FROM public.demo WHERE public.demo.id > 0;
+}
+expect {
+    b
+}

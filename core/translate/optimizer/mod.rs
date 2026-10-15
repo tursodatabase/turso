@@ -3793,7 +3793,7 @@ fn mark_seek_constraints_consumed(
     }
 }
 
-fn mark_partial_index_predicate_terms_consumed(
+pub(crate) fn mark_partial_index_predicate_terms_consumed(
     index: &Index,
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],

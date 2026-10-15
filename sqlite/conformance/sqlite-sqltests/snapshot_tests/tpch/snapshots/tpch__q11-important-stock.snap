@@ -106,9 +106,9 @@ addr  opcode                         p1   p2   p3  p4                           
   50            HashGraceAdvPart      3    0   52                                               0  hash_table_id=3
   51            Goto                  0   43    0                                               0
   52            Integer               0   19    0                                               0  r[19]=0
-  53            SorterOpen            4    1    0  k(1,-B)                                      0  cursor=4
+  53            SorterOpen            4    1    0  k(1,-Binary)                                 0  cursor=4
   54            Null                  0   34    0                                               0  r[34]=NULL
-  55            SorterOpen            5    3    0  k(1,-B)                                      0  cursor=5
+  55            SorterOpen            5    3    0  k(1,-Binary)                                 0  cursor=5
   56            Integer               0   31    0                                               0  r[31]=0; clear group by abort flag
   57            Null                  0   32    0                                               0  r[32]=NULL; initialize group by comparison registers to NULL
   58            Gosub                39  236    0                                               0  ; go to clear accumulator subroutine

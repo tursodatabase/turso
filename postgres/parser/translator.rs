@@ -36,18 +36,25 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = self.map_table_name(&range_var.relname);
+        let is_schemata = range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && range_var.relname.eq_ignore_ascii_case("schemata");
+        let mapped_name = if is_schemata {
+            "pg_information_schema_schemata".to_string()
+        } else {
+            self.map_table_name(&range_var.relname)
+        };
         let name = ast::Name::from_string(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let schema = match range_var.schemaname.to_ascii_lowercase().as_str() {
-            "pg_catalog" | "public" | "information_schema" => Some("main"),
-            "" if is_catalog_table_name(name.as_str()) => Some("main"),
-            "" => None,
-            _ => Some(range_var.schemaname.as_str()),
+        let schema = if range_var.schemaname.is_empty() {
+            is_catalog_table_name(name.as_str()).then_some("main")
+        } else {
+            Some(map_schema_name(&range_var.schemaname))
         };
         let mut qn = match schema {
             Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
@@ -1792,10 +1799,14 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         let qualified_name = self.qualified_name_from_range_var(range_var);
-        let alias = range_var
-            .alias
-            .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        let alias = match &range_var.alias {
+            Some(a) => Some(a.aliasname.clone()),
+            None if qualified_name.name.as_str() != range_var.relname => {
+                Some(range_var.relname.clone())
+            }
+            None => None,
+        }
+        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -2156,9 +2167,10 @@ impl PostgreSQLTranslator {
                                 }
                                 match parts.len() {
                                     3 => {
-                                        // schema.table.column
+                                        // schema.table.column. The table name is not mapped:
+                                        // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(parts[0].clone()),
+                                            ast::Name::from_string(map_schema_name(&parts[0])),
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
@@ -4037,6 +4049,14 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     )
 }
 
+/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+fn map_schema_name(schema: &str) -> &str {
+    match schema.to_ascii_lowercase().as_str() {
+        "pg_catalog" | "public" | "information_schema" => "main",
+        _ => schema,
+    }
+}
+
 pub fn is_catalog_table_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -4067,6 +4087,29 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_get_tabledef"
             | "pg_settings"
             | "pg_extension"
+            | "pg_depend"
+            | "pg_tablespace"
+            | "pg_init_privs"
+            | "pg_cast"
+            | "pg_transform"
+            | "pg_language"
+            | "pg_operator"
+            | "pg_opclass"
+            | "pg_opfamily"
+            | "pg_ts_parser"
+            | "pg_ts_template"
+            | "pg_ts_dict"
+            | "pg_ts_config"
+            | "pg_foreign_data_wrapper"
+            | "pg_foreign_server"
+            | "pg_default_acl"
+            | "pg_conversion"
+            | "pg_range"
+            | "pg_event_trigger"
+            | "pg_subscription"
+            | "pg_largeobject_metadata"
+            | "pg_amop"
+            | "pg_amproc"
             | "pg_tables"
             | "pg_indexes"
     )
@@ -4076,32 +4119,37 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
-/// A cast keeps the name of the expression it casts, and falls back to the
-/// name of the outermost target type, so `1::int::text` is named `text`.
+/// Casts and CASE pass through the name of the expression they wrap, and only
+/// when that expression has no name are they named after the outermost target
+/// type or `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    expression_name(node).or_else(|| cast_or_case_name(node))
+}
+
+fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    let last_string = |names: &[pg_query::protobuf::Node]| {
-        names
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .next_back()
-    };
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => last_string(&func_call.funcname),
-        Some(Node::ColumnRef(col_ref)) => last_string(&col_ref.fields),
-        Some(Node::TypeCast(type_cast)) => {
-            let mut arg = type_cast.arg.as_deref()?;
-            while let Some(Node::TypeCast(inner)) = &arg.node {
-                arg = inner.arg.as_deref()?;
+    let name = match &node.node {
+        Some(Node::FuncCall(func_call)) => return last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
+        Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CoalesceExpr(_)) => "coalesce",
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
             }
-            derived_column_name(arg).or_else(|| last_string(&type_cast.type_name.as_ref()?.names))
+        }
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
+        {
+            "nullif"
         }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
-            let name = match Op::try_from(svf.op) {
+            match Op::try_from(svf.op) {
                 Ok(Op::SvfopCurrentDate) => "current_date",
                 Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
                 Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
@@ -4114,11 +4162,30 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
                 Ok(Op::SvfopCurrentCatalog) => "current_catalog",
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
-            };
-            Some(name.to_string())
+            }
         }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
+        Some(Node::CaseExpr(_)) => Some("case".to_string()),
         _ => None,
     }
+}
+
+fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// Extract a string value from a DefElem's arg.

@@ -2459,6 +2459,7 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
+            rewrite_between_exprs(&mut expr.expr)?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2466,7 +2467,6 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
-            rewrite_between_exprs(&mut expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -2712,6 +2712,45 @@ pub fn table_mask_from_expr(
     })?;
 
     Ok(mask)
+}
+
+pub fn expr_reads_an_outer_query(
+    top_level_expr: &Expr,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let is_outer_query_table = |table_id: &TableInternalId| {
+        table_references
+            .find_outer_query_ref_by_internal_id(*table_id)
+            .is_some()
+    };
+    let mut reads_an_outer_query = false;
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                reads_an_outer_query |= is_outer_query_table(table);
+            }
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                reads_an_outer_query |= match &subquery.state {
+                    SubqueryState::Unevaluated { plan } => plan.as_ref().is_some_and(|plan| {
+                        plan.used_outer_query_ref_ids()
+                            .iter()
+                            .any(is_outer_query_table)
+                    }),
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        outer_ref_ids.iter().any(is_outer_query_table)
+                    }
+                };
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads_an_outer_query)
 }
 
 /// Determines the earliest loop where an expression can be safely evaluated.
