@@ -733,9 +733,11 @@ pub fn translate_aggregation_step(
     Ok(dest)
 }
 
-/// Returns the argument of an aggregate whose result has the argument's custom
-/// type: MIN/MAX of any column, and SUM/AVG of a `numeric` column.
-pub(crate) fn aggregate_arg_with_column_type<'a>(
+/// Returns the argument of MIN, MAX, SUM or AVG of a `numeric` column. These
+/// return numeric text, so they compare and sort with the column type's
+/// operators. Other custom types are left out because their operators expect
+/// encoded values, and these aggregates return decoded ones.
+pub(crate) fn numeric_aggregate_arg<'a>(
     expr: &'a ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
@@ -747,8 +749,7 @@ pub(crate) fn aggregate_arg_with_column_type<'a>(
         return None;
     };
     match Func::resolve_function(name.as_str(), 1) {
-        Ok(Some(Func::Agg(AggFunc::Min | AggFunc::Max))) => Some(arg),
-        Ok(Some(Func::Agg(AggFunc::Sum | AggFunc::Avg)))
+        Ok(Some(Func::Agg(AggFunc::Min | AggFunc::Max | AggFunc::Sum | AggFunc::Avg)))
             if is_numeric_column(arg, referenced_tables, schema) =>
         {
             Some(arg)

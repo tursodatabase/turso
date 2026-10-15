@@ -958,6 +958,30 @@ expect {
     a|109.00
 }
 
+@requires strict "uses STRICT tables"
+test max-of-encoded-type-compares-decoded-value {
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '=' instr;
+    CREATE TABLE t1(g INTEGER, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'abc'), (1, 'abd'), (2, 'abc');
+    SELECT g, max(val) = 'abd' FROM t1 GROUP BY g HAVING max(val) = 'abd';
+}
+expect {
+    1|1
+}
+
+@requires strict "uses STRICT tables"
+test order-by-max-of-encoded-type {
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+    CREATE TABLE t1(g INTEGER, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'ab'), (2, 'ba'), (3, 'ca');
+    SELECT g, max(val) AS m FROM t1 GROUP BY g ORDER BY m;
+}
+expect {
+    1|ab
+    2|ba
+    3|ca
+}
+
 # GROUP BY decodes values for grouping, so ORDER BY in this context
 # sorts on decoded values: apple < banana < cherry.
 @requires strict "uses STRICT tables"
