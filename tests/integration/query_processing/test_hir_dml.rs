@@ -2,7 +2,7 @@
 //! legacy planner does. Each case runs on two fresh databases, one per
 //! planner, and compares what is left behind.
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 
 const SETUP: &[&str] = &[
     "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c TEXT, d REAL, g AS (b * 2) VIRTUAL)",
@@ -422,6 +422,23 @@ fn hir_insert_matches_legacy() {
              ON CONFLICT(k) DO UPDATE SET v = v + excluded.v, n = n + 1",
             "SELECT * FROM kv ORDER BY k",
         ],
+        // The ON CONFLICT target picks the UNIQUE index with the same key
+        // terms, in any order, with the same collation and WHERE clause.
+        &[
+            "CREATE TABLE m(x, y, z TEXT COLLATE nocase, w, UNIQUE(x, y))",
+            "CREATE UNIQUE INDEX m_z ON m(z)",
+            "CREATE UNIQUE INDEX m_w ON m(abs(w)) WHERE w > 0",
+            "INSERT INTO m VALUES (1, 1, 'a', 1), (1, 2, 'b', 2)",
+            "INSERT INTO m VALUES (1, 2, 'c', 3) ON CONFLICT(y, x) DO UPDATE SET z = 'yx'",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z) DO UPDATE SET w = 10",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z COLLATE NOCASE) DO UPDATE SET w = 11",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z COLLATE binary) DO NOTHING",
+            "INSERT INTO m VALUES (8, 8, 'q', -11) ON CONFLICT(abs(w)) WHERE w > 0 DO UPDATE SET x = 0",
+            "INSERT INTO m VALUES (8, 8, 'q', 11) ON CONFLICT(abs(w)) DO NOTHING",
+            "INSERT INTO m VALUES (8, 8, 'q', 11) ON CONFLICT(abs(w)) WHERE w > 0 DO UPDATE SET x = 0",
+            "INSERT INTO m VALUES (8, 8, 'q', 12) ON CONFLICT(x) DO NOTHING",
+            "SELECT * FROM m ORDER BY rowid",
+        ],
         // REPLACE deletes the rows the new row conflicts with.
         &["INSERT OR REPLACE INTO u VALUES (1, 10, 'r', 1)"],
         &["INSERT OR REPLACE INTO u VALUES (10, 2, 'r', 1)"],
@@ -776,6 +793,36 @@ fn hir_delete_binds_parameters_like_legacy() {
     assert_eq!(run(true), run(false));
 }
 
+/// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
+/// Legacy rejects it.
+#[test]
+fn hir_upsert_on_rowid_matches_sqlite() {
+    let statements = [
+        "CREATE TABLE a1(x INTEGER PRIMARY KEY, y)",
+        "CREATE TABLE a2(x, y)",
+        "INSERT INTO a1 VALUES (1, 1)",
+        "INSERT INTO a2(rowid, x, y) VALUES (1, 1, 1)",
+        "INSERT INTO a1 VALUES (1, 2) ON CONFLICT(rowid) DO UPDATE SET y = 10",
+        "INSERT INTO a2(rowid, x, y) VALUES (1, 1, 2) ON CONFLICT(rowid) DO UPDATE SET y = 20",
+        "INSERT INTO a2(rowid, x, y) VALUES (2, 1, 2) ON CONFLICT(_rowid_) DO NOTHING",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in statements {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in ["SELECT * FROM a1", "SELECT rowid, * FROM a2 ORDER BY rowid"] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn hir_delete_errors_match_legacy() {
     let db = TempDatabase::new_empty();
@@ -797,6 +844,8 @@ fn hir_delete_errors_match_legacy() {
         "DELETE FROM t RETURNING t.*",
         "UPDATE sqlite_schema SET name = 'x'",
         "INSERT INTO sqlite_master VALUES (1, 2, 3, 4, 5)",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT(b) DO NOTHING",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT(a NULLS FIRST) DO NOTHING",
     ] {
         let legacy_error = legacy
             .prepare(sql)
@@ -805,5 +854,34 @@ fn hir_delete_errors_match_legacy() {
             .to_string();
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
+    }
+    // Legacy differs from SQLite on these: it reports a missing constraint
+    // for an unknown column and accepts COLLATE on the INTEGER PRIMARY KEY.
+    // HIR follows SQLite.
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)", ())
+        .unwrap();
+    for (sql, message) in [
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(nosuch) DO NOTHING",
+            "no such column: nosuch",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(a COLLATE nocase) DO NOTHING",
+            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+        ),
+    ] {
+        let sqlite_error = sqlite
+            .prepare(sql)
+            .err()
+            .expect("SQLite rejects")
+            .to_string();
+        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
+        assert!(
+            sqlite_error.contains(message),
+            "{sql}: SQLite {sqlite_error}"
+        );
+        assert!(hir_error.contains(message), "{sql}: HIR {hir_error}");
     }
 }

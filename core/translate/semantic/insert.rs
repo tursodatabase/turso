@@ -707,7 +707,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 .index
                 .as_ref()
                 .map(|conflict| {
-                    crate::translate::index::reject_explicit_nulls(&conflict.targets)?;
+                    // Like SQLite, a conflict target cannot name NULLS FIRST
+                    // or NULLS LAST.
+                    if let Some(nulls) = conflict.targets.iter().find_map(|term| term.nulls) {
+                        crate::bail_parse_error!("unsupported use of {}", nulls);
+                    }
                     let terms = conflict
                         .targets
                         .iter()
@@ -729,33 +733,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .as_deref()
                         .map(|predicate| self.analyze_expr(predicate, &scope, policy))
                         .transpose()?;
-                    let matched_index = match crate::translate::upsert::resolve_upsert_target(
-                        self.context().schema(table.database().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "UPSERT target has no owning database".to_string(),
-                            )
-                        })?)?,
-                        table.value(),
-                        upsert,
-                    )? {
-                        crate::translate::upsert::ResolvedUpsertTarget::PrimaryKey => None,
-                        crate::translate::upsert::ResolvedUpsertTarget::Index(index) => {
-                            let id = self.catalog_object_id(
-                                table.database(),
-                                CatalogObjectKind::Index,
-                                normalize_ident(&index.name),
-                            );
-                            Some(hir::CatalogObject::new(
-                                id,
-                                self.context().snapshot(),
-                                table.database(),
-                                index,
-                            ))
-                        }
-                        crate::translate::upsert::ResolvedUpsertTarget::CatchAll => {
-                            unreachable!("a present conflict target is not catch-all")
-                        }
-                    };
+                    let matched_index =
+                        self.match_conflict_target(target, table, &terms, predicate.as_ref())?;
                     Ok::<_, LimboError>(hir::ConflictTarget {
                         terms,
                         predicate,
@@ -777,6 +756,106 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             syntax = upsert.next.as_deref();
         }
         Ok((upserts, excluded_source))
+    }
+
+    /// The constraint an ON CONFLICT target names, matched as SQLite does:
+    /// `None` for the rowid, named by `rowid` or the INTEGER PRIMARY KEY column
+    /// without COLLATE, otherwise the
+    /// first UNIQUE index whose key has exactly the target's terms, in any
+    /// order. A column term matches a plain key column, an expression term
+    /// an equivalent expression column, and a COLLATE on a term must be the
+    /// key column's collation. A partial index also needs an equivalent
+    /// target WHERE clause.
+    fn match_conflict_target(
+        &self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+        terms: &[hir::ConflictTerm],
+        predicate: Option<&hir::Expr>,
+    ) -> Result<Option<hir::ResolvedIndex>> {
+        // Strip COLLATE, keeping the outermost collation.
+        fn unwrap(
+            term: &hir::ConflictTerm,
+        ) -> (&hir::Expr, Option<crate::translate::collate::CollationSeq>) {
+            let mut expression = &term.expr;
+            let mut collation = term.collation.as_ref().map(|collation| *collation.value());
+            while let hir::Expr::Collate {
+                expr,
+                collation: inner,
+            } = expression
+            {
+                collation.get_or_insert(*inner.value());
+                expression = expr;
+            }
+            (expression, collation)
+        }
+        let target_column = |expression: &hir::Expr| match expression {
+            hir::Expr::Column(column) if column.source == target => Some(column.column),
+            _ => None,
+        };
+        let columns = table.value().columns();
+        if let [term] = terms {
+            // SQLite takes the rowid only from a bare term, without COLLATE:
+            // `rowid` or the INTEGER PRIMARY KEY column.
+            let names_rowid = match &term.expr {
+                hir::Expr::RowId(source) => *source == target,
+                expression => target_column(expression)
+                    .is_some_and(|column| columns.get(column).is_some_and(|c| c.is_rowid_alias())),
+            };
+            if names_rowid {
+                return Ok(None);
+            }
+        }
+        let source = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing INSERT target source {target}"))
+        })?;
+        for expressions in &source.index_expressions {
+            let index = expressions.index.value();
+            let predicate_matches = match (&expressions.predicate, predicate) {
+                (Some(index_predicate), Some(predicate)) => index_predicate.equivalent(predicate),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if !index.unique || !predicate_matches || terms.len() != index.columns.len() {
+                continue;
+            }
+            let key_collation = |position: usize| {
+                let key_column = &index.columns[position];
+                key_column.collation.unwrap_or_else(|| {
+                    columns
+                        .get(key_column.pos_in_table)
+                        .map(|column| column.collation())
+                        .unwrap_or_default()
+                })
+            };
+            let mut matched = vec![false; index.columns.len()];
+            let all_match = terms.iter().all(|term| {
+                let (expression, collation) = unwrap(term);
+                let found = (0..index.columns.len()).find(|&position| {
+                    if matched[position] {
+                        return false;
+                    }
+                    let same_key = match (target_column(expression), &expressions.columns[position])
+                    {
+                        (Some(column), None) => index.columns[position].pos_in_table == column,
+                        (None, Some(key)) => key.equivalent(expression),
+                        _ => false,
+                    };
+                    same_key
+                        && collation.is_none_or(|collation| collation == key_collation(position))
+                });
+                if let Some(position) = found {
+                    matched[position] = true;
+                }
+                found.is_some()
+            });
+            if all_match {
+                return Ok(Some(expressions.index.clone()));
+            }
+        }
+        crate::bail_parse_error!(
+            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+        )
     }
 
     fn analyze_upsert_action(
