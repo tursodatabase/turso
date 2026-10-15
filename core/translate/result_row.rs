@@ -16,7 +16,10 @@ use super::{
         emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
         walk_expr, NoConstantOptReason, WalkControl,
     },
-    plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
+    plan::{
+        Distinctness, EphemeralRowidMode, QueryDestination, ResultSetColumn, SelectPlan,
+        TableReferences,
+    },
 };
 
 /// Emits the bytecode for:
@@ -119,7 +122,15 @@ pub fn emit_select_result(
     // Emit ArrayDecode for result columns that produce array blobs.
     // Array values are stored as record-format blobs internally; decode
     // them to JSON text for user-facing display.
-    if !skip_column_eval {
+    if !skip_column_eval
+        && !matches!(
+            plan.query_destination,
+            QueryDestination::EphemeralTable {
+                rowid_mode: EphemeralRowidMode::FromResultColumns,
+                ..
+            }
+        )
+    {
         emit_array_decode_for_results(
             program,
             &plan.result_columns,

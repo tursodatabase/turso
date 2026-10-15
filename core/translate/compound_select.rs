@@ -208,7 +208,7 @@ pub fn emit_program_for_compound_select(
             right_most,
             &limit_owned,
             &offset_owned,
-            &right_most_ctx.resolver,
+            resolver,
             limit_ctx,
             offset_reg,
             reg_result_cols_start,
@@ -281,7 +281,7 @@ fn emit_compound_select(
     }
     let mut right_most_ctx = Box::new(TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_outer_column_cache(&right_most.table_references),
         right_most.table_references.joined_tables().len(),
         false,
     ));
