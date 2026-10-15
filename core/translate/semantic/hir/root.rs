@@ -81,6 +81,9 @@ pub struct Insert {
     pub conflict: Option<ResolveType>,
     pub upserts: Vec<Upsert>,
     pub excluded_source: Option<SourceId>,
+    /// The row an ON CONFLICT DO UPDATE writes, bound like UPDATE's NEW row,
+    /// with the target's index metadata.
+    pub upsert_new_source: Option<SourceId>,
     pub returning: Option<Returning>,
 }
 

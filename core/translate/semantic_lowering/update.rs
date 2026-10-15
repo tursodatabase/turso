@@ -590,7 +590,7 @@ fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
 }
 
 /// Whether an index's key or WHERE term reads a column the UPDATE assigns.
-fn index_reads_assigned_column(
+pub(super) fn index_reads_assigned_column(
     target: hir::SourceId,
     index: &hir::IndexExpressions,
     assigned: &[hir::TargetColumn],

@@ -437,6 +437,19 @@ impl<'document> HirValidator<'document> {
             self.visit_source(excluded, Some(SourceOwner::Root))?;
             self.require_pseudo_source(excluded, PseudoSource::Excluded)?;
         }
+        if let Some(new_source) = insert.upsert_new_source {
+            self.visit_source(new_source, Some(SourceOwner::Root))?;
+            self.require_pseudo_source(new_source, PseudoSource::New)?;
+            self.require_complete_row_image(new_source)?;
+            self.require_complete_index_metadata(new_source)?;
+            self.require(
+                insert
+                    .upserts
+                    .iter()
+                    .any(|upsert| matches!(upsert.action, UpsertAction::Update { .. })),
+                "INSERT has an UPSERT NEW row without a DO UPDATE",
+            )?;
+        }
         self.visit_optional_returning(insert.returning.as_ref())
     }
 

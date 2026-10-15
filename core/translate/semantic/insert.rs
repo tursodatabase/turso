@@ -216,6 +216,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let returning =
             self.analyze_dml_returning_with_policies(returning, target, expressions.policies)?;
+        let upsert_new_source = if !virtual_target
+            && upserts
+                .iter()
+                .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }))
+        {
+            let new_source = self.create_update_new_source(target, table)?;
+            self.analyze_btree_write_metadata(new_source, table)?;
+            Some(new_source)
+        } else {
+            None
+        };
         let target_kind = if virtual_target {
             hir::InsertTargetKind::Virtual
         } else {
@@ -236,6 +247,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             conflict,
             upserts,
             excluded_source,
+            upsert_new_source,
             returning,
         }))
     }

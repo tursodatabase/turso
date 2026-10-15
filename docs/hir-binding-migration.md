@@ -246,7 +246,8 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 | CDC, virtual tables, materialized views | As for DELETE |
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | INSERT ... SELECT and any subquery | Reading the source query, with a temp table when it reads the target |
-| UPSERT | Conflict actions |
+| UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
+| OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
 | WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
 
@@ -291,6 +292,16 @@ NULL ON CONFLICT REPLACE stores the column's DEFAULT, resolved in semantic
 analysis. UPDATE OR REPLACE first collects its rowids; after deleting the
 other row an UPDATE seeks back to its own. A REPLACE that would fire an ON
 DELETE action still goes to legacy.
+
+UPSERT is lowered as legacy does it. The constraints an ON CONFLICT clause
+names are checked first, in clause order; a conflict on one goes to the first
+clause naming it, or to a final catch-all clause, and any other conflict stops
+the statement (an UPSERT also turns REPLACE off). DO NOTHING skips the row. DO
+UPDATE seeks to the conflicting row, reads it through the target and the new
+values through `excluded`, builds the new row in registers bound to the
+UPSERT's NEW-row source, checks foreign keys and every changed UNIQUE index
+(with ABORT) before rewriting the indexes and the row, and returns the
+updated row to RETURNING. INSERT triggers do not fire for it.
 
 ### Non-lowering phase complete
 

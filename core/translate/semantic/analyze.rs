@@ -394,6 +394,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     source: insert.target,
                     column,
                 }));
+                // The row an UPSERT DO UPDATE writes is a full row image too.
+                if let Some(source) = insert.upsert_new_source {
+                    pending.extend((0..width).map(|column| ColumnRef { source, column }));
+                }
                 pending.extend(foreign_keys.incoming.iter().flat_map(|foreign_key| {
                     foreign_key
                         .child_positions

@@ -354,6 +354,38 @@ fn hir_insert_matches_legacy() {
         &["INSERT OR FAIL INTO u(b) VALUES (43), (1), (44)"],
         &["INSERT OR ROLLBACK INTO u(b) VALUES (45), (1)"],
         &["INSERT OR ABORT INTO u(b) VALUES (46), (1)"],
+        // UPSERT: the clause naming a conflict decides what happens.
+        &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT DO NOTHING"],
+        &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT(a) DO UPDATE SET c = excluded.c || c, d = d + 1"],
+        &["INSERT INTO u(b, c) VALUES (2, 'q') ON CONFLICT(b) DO UPDATE SET c = 'up' WHERE d > 0 RETURNING *"],
+        &["INSERT INTO u(b, c) VALUES (2, 'q') ON CONFLICT(b) DO UPDATE SET c = 'up' WHERE d < 0 RETURNING *"],
+        &[
+            "INSERT INTO u(b, c) VALUES (2, 'q'), (3, 'r'), (60, 's') \
+             ON CONFLICT(b) DO UPDATE SET b = excluded.b + 100 RETURNING a, b",
+        ],
+        &["INSERT INTO u VALUES (1, 2, 'x', 1) ON CONFLICT(a) DO UPDATE SET c = 'z'"],
+        &["INSERT INTO u VALUES (9, 2, 'x', 1) ON CONFLICT(a) DO NOTHING"],
+        &[
+            "INSERT INTO u VALUES (1, 2, 'x', 1) ON CONFLICT(b) DO UPDATE SET c = 'b' \
+             ON CONFLICT DO NOTHING",
+        ],
+        &["INSERT INTO u VALUES (1, 9, 'x', 1) ON CONFLICT(a) DO UPDATE SET b = 2"],
+        &["INSERT INTO u VALUES (1, 9, 'x', 1) ON CONFLICT(a) DO UPDATE SET b = NULL"],
+        &["INSERT INTO u VALUES (20, 20, 'p', 5) ON CONFLICT DO UPDATE SET d = 6, c = 'pp'"],
+        &["INSERT INTO u VALUES (1, 1, 'x', 1) ON CONFLICT DO UPDATE SET c = 'same' RETURNING *"],
+        &["INSERT OR REPLACE INTO u VALUES (1, 2, 'x', 1) ON CONFLICT(a) DO UPDATE SET c = 'r'"],
+        &["INSERT OR FAIL INTO u VALUES (30, 30, 'x', 1), (31, 2, 'y', 1) ON CONFLICT(a) DO NOTHING"],
+        &[
+            "CREATE TRIGGER ai AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u VALUES (1, 70, 'x', 1), (71, 71, 'y', 1) ON CONFLICT DO UPDATE SET d = 0",
+        ],
+        &[
+            "CREATE TABLE kv(k TEXT PRIMARY KEY, v INTEGER, n INTEGER DEFAULT 0)",
+            "INSERT INTO kv VALUES ('a', 1, 0)",
+            "INSERT INTO kv(k, v) VALUES ('a', 5), ('b', 6), ('a', 7) \
+             ON CONFLICT(k) DO UPDATE SET v = v + excluded.v, n = n + 1",
+            "SELECT * FROM kv ORDER BY k",
+        ],
         // REPLACE deletes the rows the new row conflicts with.
         &["INSERT OR REPLACE INTO u VALUES (1, 10, 'r', 1)"],
         &["INSERT OR REPLACE INTO u VALUES (10, 2, 'r', 1)"],
@@ -539,6 +571,12 @@ fn hir_foreign_keys_match_legacy() {
         &["INSERT INTO q VALUES (1, '1')"],
         &["INSERT INTO q VALUES ('1', 1)"],
         &["INSERT INTO q VALUES ('x', 'y')"],
+        // UPSERT DO UPDATE checks foreign keys like UPDATE.
+        &["INSERT INTO p VALUES (2, 'two', 2, 2) ON CONFLICT(id) DO UPDATE SET k = 'TWO'"],
+        &["INSERT INTO p VALUES (5, 'x', 5, 5) ON CONFLICT(id) DO UPDATE SET k = 'FIVE'"],
+        &["INSERT INTO s VALUES (3, 3) ON CONFLICT(id) DO UPDATE SET up = 9"],
+        &["INSERT INTO s VALUES (3, 3) ON CONFLICT(id) DO UPDATE SET up = excluded.up"],
+        &["INSERT INTO p2 VALUES (1, 'x') ON CONFLICT(id) DO UPDATE SET k = 'ONE'"],
         // REPLACE checks the foreign keys of the row it deletes.
         &["INSERT OR REPLACE INTO p VALUES (1, 'one', 1, 1)"],
         &["INSERT OR REPLACE INTO p VALUES (1, 'uno', 1, 1)"],

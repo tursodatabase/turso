@@ -23,7 +23,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{ProgramBuilder, SourceBinding},
-        insn::{to_u32, IdxInsertFlags, InsertFlags, Insn},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset, CursorID,
     },
     CaptureDataChangesExt, LimboError, Result,
@@ -57,7 +57,8 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    if !insert.upserts.is_empty() || insert.excluded_source.is_some() {
+    // Like legacy, OR IGNORE drops the UPSERT clauses.
+    if !insert.upserts.is_empty() && insert.conflict == Some(ResolveType::Ignore) {
         return Ok(true);
     }
     let (defaults, foreign_keys) = match &insert.target_kind {
@@ -100,6 +101,29 @@ pub(super) fn needs_legacy(
         || source.column_type_programs.iter().any(Option::is_some)
     {
         return Ok(true);
+    }
+    for upsert in &insert.upserts {
+        let hir::UpsertAction::Update { assignments, .. } = &upsert.action else {
+            continue;
+        };
+        // A DO UPDATE that moves the row, or changes a parent key with an ON
+        // UPDATE action, still needs legacy.
+        let mut assigned = Vec::new();
+        for assignment in assignments {
+            for column in &assignment.columns {
+                match column {
+                    hir::TargetColumn::Column(column)
+                        if !table.columns()[*column].is_rowid_alias() =>
+                    {
+                        assigned.push(*column)
+                    }
+                    _ => return Ok(true),
+                }
+            }
+        }
+        if super::fkey::update_needs_legacy(foreign_keys, &assigned) {
+            return Ok(true);
+        }
     }
     // REPLACE deletes the conflicting row; an ON DELETE action on it still
     // needs legacy.
@@ -196,13 +220,21 @@ pub(super) fn emit_insert(
         table.rowid_alias_conflict_clause,
         indexes.iter().map(|index| index.index.value().on_conflict),
     );
-    if !several_rows && triggers.is_empty() && !any_replace {
+    // An UPSERT may rewrite an existing row, and its DO UPDATE always
+    // checks with ABORT.
+    let has_upsert = !insert.upserts.is_empty();
+    let has_do_update = insert
+        .upserts
+        .iter()
+        .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }));
+    if !several_rows && triggers.is_empty() && !any_replace && !has_upsert {
         program.set_multi_write(false);
     }
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
     program.set_may_abort(
         !triggers.is_empty()
             || has_foreign_keys
+            || has_do_update
             || constraint_may_abort(
                 has_statement_conflict,
                 or_conflict,
@@ -233,6 +265,10 @@ pub(super) fn emit_insert(
         triggers,
         foreign_keys,
         replace_defaults,
+        upserts: &insert.upserts,
+        excluded: insert.excluded_source,
+        upsert_new: insert.upsert_new_source,
+        conflict_rowid: program.alloc_register(),
     };
     let done = program.allocate_label();
     match rows {
@@ -345,6 +381,11 @@ struct InsertRow<'a> {
     triggers: &'a [CompiledTrigger],
     foreign_keys: &'a hir::DmlForeignKeys,
     replace_defaults: &'a [hir::ResolvedDefault],
+    upserts: &'a [hir::Upsert],
+    excluded: Option<hir::SourceId>,
+    upsert_new: Option<hir::SourceId>,
+    /// The rowid of the row an UPSERT conflicts with.
+    conflict_rowid: usize,
 }
 
 impl InsertRow<'_> {
@@ -505,25 +546,73 @@ impl InsertRow<'_> {
         // Index expressions, partial-index WHERE terms and RETURNING read
         // the new row.
         self.bind_new_row(program);
-        // Like legacy, an INTEGER PRIMARY KEY whose own conflict clause is
-        // REPLACE is checked after the indexes, so that a FAIL or IGNORE on
-        // an index acts before any row is deleted.
-        let rowid_last = !self.has_statement_conflict
+        // Like legacy, the constraints an UPSERT names are checked first, in
+        // the UPSERT's order, then the rowid and the indexes.
+        let arms = self
+            .upserts
+            .iter()
+            .map(|_| program.allocate_label())
+            .collect::<Vec<_>>();
+        let mut constraints = rowid_value
+            .map(|_| Constraint::RowId)
+            .into_iter()
+            .chain((0..index_cursors.len()).map(Constraint::Index))
+            .map(|constraint| (constraint, self.upsert_for(constraint, index_cursors)))
+            .collect::<Vec<_>>();
+        constraints.sort_by_key(|(_, upsert)| upsert.unwrap_or(usize::MAX));
+        // An INTEGER PRIMARY KEY whose own conflict clause is REPLACE is
+        // checked last, so that a FAIL or IGNORE on an index acts before any
+        // row is deleted.
+        if !self.has_statement_conflict
             && table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
-            && rowid_value.is_some()
-            && !index_cursors.is_empty();
-        if rowid_value.is_some() && !rowid_last {
-            self.emit_rowid_check(program, index_cursors, row_done)?;
+            && constraints.len() > 1
+            && !constraints
+                .iter()
+                .any(|(constraint, upsert)| *constraint == Constraint::RowId && upsert.is_some())
+        {
+            if let Some(position) = constraints
+                .iter()
+                .position(|(constraint, _)| *constraint == Constraint::RowId)
+            {
+                let rowid = constraints.remove(position);
+                constraints.push(rowid);
+            }
         }
+        let catch_all = self
+            .upserts
+            .last()
+            .filter(|upsert| upsert.target.is_none())
+            .map(|_| self.upserts.len() - 1);
         // Check every index before writing any of them. Under REPLACE, an
         // index is written as soon as it is checked, as in legacy.
-        let mut keys = Vec::with_capacity(index_cursors.len());
-        for (index, cursor) in index_cursors {
-            keys.push(self.emit_index_key(program, index, *cursor, index_cursors, row_done)?);
+        let mut keys = (0..index_cursors.len()).map(|_| None).collect::<Vec<_>>();
+        for (constraint, upsert) in constraints {
+            let route = upsert.or(catch_all).map(|upsert| (upsert, arms[upsert]));
+            match constraint {
+                Constraint::RowId => {
+                    self.emit_rowid_check(program, index_cursors, route, row_done)?
+                }
+                Constraint::Index(position) => {
+                    let (index, cursor) = index_cursors[position];
+                    keys[position] = Some(self.emit_index_key(
+                        program,
+                        index,
+                        cursor,
+                        index_cursors,
+                        route,
+                        row_done,
+                    )?);
+                }
+            }
         }
-        if rowid_last {
-            self.emit_rowid_check(program, index_cursors, row_done)?;
-        }
+        let keys = keys
+            .into_iter()
+            .map(|key| {
+                key.ok_or_else(|| {
+                    LimboError::InternalError("HIR INSERT skipped an index key".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
@@ -621,7 +710,451 @@ impl InsertRow<'_> {
             let start = returning.emit_values(program, document)?;
             returning.emit_buffer(program, start);
         }
+        if !self.upserts.is_empty() {
+            program.emit_insn(Insn::Goto {
+                target_pc: row_done,
+            });
+            for (upsert, arm) in self.upserts.iter().zip(arms) {
+                program.preassign_label_to_next_insn(arm);
+                match &upsert.action {
+                    hir::UpsertAction::Nothing => program.emit_insn(Insn::Goto {
+                        target_pc: row_done,
+                    }),
+                    hir::UpsertAction::Update {
+                        assignments,
+                        predicate,
+                    } => self.emit_do_update(
+                        program,
+                        assignments,
+                        predicate.as_ref(),
+                        index_cursors,
+                        returning,
+                        row_done,
+                    )?,
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The DO UPDATE arm of an UPSERT, entered with the conflicting row's
+    /// rowid in `conflict_rowid`: like legacy, rewrite that row from its
+    /// current values and `excluded`, checking every UNIQUE constraint with
+    /// ABORT, then go to the next row.
+    fn emit_do_update(
+        &self,
+        program: &mut ProgramBuilder,
+        assignments: &[hir::Assignment],
+        predicate: Option<&hir::Expr>,
+        index_cursors: &[(&hir::IndexExpressions, CursorID)],
+        returning: Option<ReturningBuffer<'_>>,
+        row_done: BranchOffset,
+    ) -> Result<()> {
+        let DmlTarget {
+            document,
+            source,
+            table,
+            database,
+        } = *self.target;
+        let (Some(excluded), Some(new_source)) = (self.excluded, self.upsert_new) else {
+            return Err(LimboError::InternalError(
+                "HIR UPSERT DO UPDATE has no EXCLUDED or NEW row".into(),
+            ));
+        };
+        let new_source = document.source(new_source).ok_or_else(|| {
+            LimboError::InternalError(format!("HIR UPSERT NEW row {new_source} is missing"))
+        })?;
+        let conflict = self.conflict_rowid;
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.table_cursor,
+            src_reg: conflict,
+            target_pc: row_done,
+        });
+        // The target reads the conflicting row; `excluded` reads the row
+        // that was not inserted.
+        program.bind_source(
+            source.id,
+            SourceBinding::BTree {
+                scan_cursor: self.table_cursor,
+                table_cursor: None,
+            },
+        );
+        program.bind_source(
+            excluded,
+            SourceBinding::Registers {
+                start: self.columns,
+                rowid: Some(self.rowid),
+            },
+        );
+        if let Some(predicate) = predicate {
+            let register = program.alloc_register();
+            super::expr::translate_expr_no_constant_opt(program, document, predicate, register)?;
+            program.emit_insn(Insn::IfNot {
+                reg: register,
+                target_pc: row_done,
+                jump_if_null: true,
+            });
+        }
+
+        let columns = table.columns().len();
+        let mut values = vec![None; columns];
+        for assignment in assignments {
+            let [hir::TargetColumn::Column(column)] = assignment.columns.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "HIR UPSERT assignment does not set exactly one column".into(),
+                ));
+            };
+            values[*column] = Some(&assignment.value);
+        }
+        let new_row = program.alloc_registers(columns);
+        for (position, (column, value)) in table.columns().iter().zip(&values).enumerate() {
+            let register = new_row + position;
+            match value {
+                Some(value) => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, value, register,
+                    )?;
+                    if column.notnull() && !column.is_rowid_alias() {
+                        program.emit_insn(Insn::HaltIfNull {
+                            target_reg: register,
+                            err_code: SQLITE_CONSTRAINT_NOTNULL,
+                            description: format!(
+                                "{}.{}",
+                                table.name,
+                                column.name.as_deref().unwrap_or_default()
+                            ),
+                        });
+                    }
+                }
+                // Like the stored record, an INTEGER PRIMARY KEY column is
+                // NULL; reads of it use the rowid.
+                None if column.is_rowid_alias() => program.emit_null(register, None),
+                None => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: source.id,
+                            column: position,
+                        }),
+                        register,
+                    )?;
+                }
+            }
+        }
+        let affinities = table
+            .columns()
+            .iter()
+            .map(|column| column.affinity())
+            .collect::<Vec<_>>();
+        if affinities
+            .iter()
+            .any(|affinity| *affinity != Affinity::Blob)
+        {
+            if let Some(count) = NonZeroUsize::new(columns) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: new_row,
+                    count,
+                    affinities: affinities
+                        .iter()
+                        .map(|affinity| affinity.aff_mask())
+                        .collect(),
+                });
+            }
+        }
+        program.bind_source(
+            new_source.id,
+            SourceBinding::Registers {
+                start: new_row,
+                rowid: Some(conflict),
+            },
+        );
+
+        let assigned = assignments
+            .iter()
+            .flat_map(|assignment| assignment.columns.iter().copied())
+            .collect::<Vec<_>>();
+        let assigned_positions = assigned
+            .iter()
+            .filter_map(|column| match column {
+                hir::TargetColumn::Column(column) => Some(*column),
+                hir::TargetColumn::RowId => None,
+            })
+            .collect::<Vec<_>>();
+        let pending_repairs = super::fkey::emit_update_checks(
+            program,
+            document,
+            self.foreign_keys,
+            source.id,
+            new_source.id,
+            conflict,
+            &assigned_positions,
+            database,
+            false,
+        )?;
+
+        // Like legacy, every UNIQUE constraint is checked against the new
+        // row before any index changes.
+        struct Rebuild<'x> {
+            cursor: CursorID,
+            old: &'x hir::IndexExpressions,
+            old_in_index: Option<usize>,
+            new_in_index: Option<usize>,
+            start: usize,
+            count: usize,
+            record: usize,
+        }
+        let mut rebuilds = Vec::new();
+        for (old, cursor) in index_cursors {
+            if !super::update::index_reads_assigned_column(source.id, old, &assigned) {
+                continue;
+            }
+            let index = old.index.value();
+            let new = new_source
+                .index_expressions
+                .iter()
+                .find(|new| new.index == old.index)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR UPSERT NEW row does not list index {}",
+                        index.name
+                    ))
+                })?;
+            let old_in_index = old
+                .predicate
+                .as_ref()
+                .map(|predicate| -> Result<usize> {
+                    let register = program.alloc_register();
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, predicate, register,
+                    )?;
+                    Ok(register)
+                })
+                .transpose()?;
+            let new_in_index = new
+                .predicate
+                .as_ref()
+                .map(|predicate| -> Result<usize> {
+                    let register = program.alloc_register();
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, predicate, register,
+                    )?;
+                    Ok(register)
+                })
+                .transpose()?;
+            // A new key outside a partial index is never written, so it
+            // cannot conflict.
+            let checked = program.allocate_label();
+            if let Some(new_in_index) = new_in_index {
+                program.emit_insn(Insn::IfNot {
+                    reg: new_in_index,
+                    target_pc: checked,
+                    jump_if_null: true,
+                });
+            }
+            let width = index.columns.len();
+            let start = program.alloc_registers(width + 1);
+            for (offset, (column, expression)) in index.columns.iter().zip(&new.columns).enumerate()
+            {
+                match expression {
+                    Some(expression) => super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        expression,
+                        start + offset,
+                    )?,
+                    None => {
+                        let from = if table.columns()[column.pos_in_table].is_rowid_alias() {
+                            conflict
+                        } else {
+                            new_row + column.pos_in_table
+                        };
+                        program.emit_insn(Insn::Copy {
+                            src_reg: from,
+                            dst_reg: start + offset,
+                            extra_amount: 0,
+                        });
+                        start + offset
+                    }
+                };
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: conflict,
+                dst_reg: start + width,
+                extra_amount: 0,
+            });
+            let record = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(start),
+                count: to_u32(width + 1),
+                dest_reg: to_u32(record),
+                index_name: Some(index.name.clone()),
+                affinity_str: None,
+            });
+            if index.unique {
+                if let Some(count) = NonZeroUsize::new(width) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: start,
+                        count,
+                        affinities: index
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                if column.pos_in_table == EXPR_INDEX_SENTINEL {
+                                    Affinity::Blob.aff_mask()
+                                } else {
+                                    table.columns()[column.pos_in_table]
+                                        .affinity_with_strict(table.is_strict)
+                                        .aff_mask()
+                                }
+                            })
+                            .collect(),
+                    });
+                }
+                program.emit_insn(Insn::NoConflict {
+                    cursor_id: *cursor,
+                    target_pc: checked,
+                    record_reg: start,
+                    num_regs: width,
+                });
+                // The entry found may be this row's own.
+                let found = program.alloc_register();
+                program.emit_insn(Insn::IdxRowId {
+                    cursor_id: *cursor,
+                    dest: found,
+                });
+                program.emit_insn(Insn::Eq {
+                    lhs: conflict,
+                    rhs: found,
+                    target_pc: checked,
+                    flags: CmpInsFlags::default(),
+                    collation: program.curr_collation(),
+                });
+                // Legacy reports this as a PRIMARY KEY failure.
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description: format_unique_violation_desc(&table.name, index),
+                    on_error: None,
+                    description_reg: None,
+                });
+            }
+            program.preassign_label_to_next_insn(checked);
+            rebuilds.push(Rebuild {
+                cursor: *cursor,
+                old,
+                old_in_index,
+                new_in_index,
+                start,
+                count: width + 1,
+                record,
+            });
+        }
+        for rebuild in &rebuilds {
+            let skip_delete = rebuild.old_in_index.map(|old_in_index| {
+                let skip = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: old_in_index,
+                    target_pc: skip,
+                    jump_if_null: true,
+                });
+                skip
+            });
+            let (start, count) = super::dml::emit_index_key(
+                program,
+                document,
+                source,
+                table,
+                self.table_cursor,
+                rebuild.old,
+            )?;
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: start,
+                num_regs: count,
+                cursor_id: rebuild.cursor,
+                raise_error_if_no_matching_entry: false,
+            });
+            if let Some(skip) = skip_delete {
+                program.preassign_label_to_next_insn(skip);
+            }
+            let skip_insert = rebuild.new_in_index.map(|new_in_index| {
+                let skip = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: new_in_index,
+                    target_pc: skip,
+                    jump_if_null: true,
+                });
+                skip
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: rebuild.cursor,
+                record_reg: rebuild.record,
+                unpacked_start: Some(rebuild.start),
+                unpacked_count: Some(to_u32(rebuild.count)),
+                flags: IdxInsertFlags::new().nchange(true),
+            });
+            if let Some(skip) = skip_insert {
+                program.preassign_label_to_next_insn(skip);
+            }
+        }
+
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(new_row),
+            count: to_u32(columns),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+                    .collect(),
+            ),
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.table_cursor,
+            key_reg: conflict,
+            record_reg: record,
+            flag: InsertFlags::new().skip_last_rowid(),
+            table_name: table.name.clone(),
+        });
+        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        // RETURNING reads the row as written.
+        program.bind_source(
+            source.id,
+            SourceBinding::Registers {
+                start: new_row,
+                rowid: Some(conflict),
+            },
+        );
+        if let Some(returning) = returning {
+            let start = returning.emit_values(program, document)?;
+            returning.emit_buffer(program, start);
+        }
+        program.emit_insn(Insn::Goto {
+            target_pc: row_done,
+        });
+        Ok(())
+    }
+
+    /// The first UPSERT whose conflict target names `constraint`.
+    fn upsert_for(
+        &self,
+        constraint: Constraint,
+        index_cursors: &[(&hir::IndexExpressions, CursorID)],
+    ) -> Option<usize> {
+        self.upserts.iter().position(|upsert| {
+            let Some(target) = &upsert.target else {
+                return false;
+            };
+            match (constraint, &target.matched_index) {
+                (Constraint::RowId, None) => true,
+                (Constraint::Index(position), Some(index)) => {
+                    index_cursors[position].0.index == *index
+                }
+                _ => false,
+            }
+        })
     }
 
     fn conflict(&self, declared: Option<ResolveType>) -> ResolveType {
@@ -633,8 +1166,12 @@ impl InsertRow<'_> {
     }
 
     /// Whether some constraint of the row resolves conflicts with REPLACE.
+    /// Like legacy, an UPSERT turns REPLACE off.
     fn may_replace(&self) -> bool {
         let table = self.target.table;
+        if !self.upserts.is_empty() {
+            return false;
+        }
         if self.has_statement_conflict {
             return self.or_conflict == ResolveType::Replace;
         }
@@ -762,6 +1299,7 @@ impl InsertRow<'_> {
         &self,
         program: &mut ProgramBuilder,
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
+        route: Option<(usize, BranchOffset)>,
         row_done: BranchOffset,
     ) -> Result<()> {
         let table = self.target.table;
@@ -771,11 +1309,22 @@ impl InsertRow<'_> {
             rowid_reg: self.rowid,
             target_pc: unique,
         });
-        match self.conflict(table.rowid_alias_conflict_clause) {
+        let conflict = self.conflict(table.rowid_alias_conflict_clause);
+        match conflict {
+            // An UPSERT for this conflict takes over the row.
+            _ if route.is_some() => {
+                let (_, arm) = route.expect("route was checked");
+                program.emit_insn(Insn::Copy {
+                    src_reg: self.rowid,
+                    dst_reg: self.conflict_rowid,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::Goto { target_pc: arm });
+            }
             ResolveType::Ignore => program.emit_insn(Insn::Goto {
                 target_pc: row_done,
             }),
-            ResolveType::Replace => {
+            ResolveType::Replace if self.upserts.is_empty() => {
                 let conflict = program.alloc_register();
                 program.emit_insn(Insn::Copy {
                     src_reg: self.rowid,
@@ -814,6 +1363,7 @@ impl InsertRow<'_> {
         expressions: &hir::IndexExpressions,
         cursor: CursorID,
         index_cursors: &[(&hir::IndexExpressions, CursorID)],
+        route: Option<(usize, BranchOffset)>,
         row_done: BranchOffset,
     ) -> Result<IndexKey> {
         let document = self.target.document;
@@ -900,10 +1450,28 @@ impl InsertRow<'_> {
                 num_regs: columns,
             });
             match conflict {
-                ResolveType::Ignore => program.emit_insn(Insn::Goto {
+                // An UPSERT for this conflict takes over the row.
+                _ if route.is_some() => {
+                    let (upsert, arm) = route.expect("route was checked");
+                    match self.upserts[upsert].action {
+                        hir::UpsertAction::Nothing => program.emit_insn(Insn::Goto {
+                            target_pc: row_done,
+                        }),
+                        hir::UpsertAction::Update { .. } => {
+                            program.emit_insn(Insn::IdxRowId {
+                                cursor_id: cursor,
+                                dest: self.conflict_rowid,
+                            });
+                            program.emit_insn(Insn::Goto { target_pc: arm });
+                        }
+                    }
+                }
+                // Like legacy, with an UPSERT any other conflict stops the
+                // statement.
+                ResolveType::Ignore if self.upserts.is_empty() => program.emit_insn(Insn::Goto {
                     target_pc: row_done,
                 }),
-                ResolveType::Replace => {
+                ResolveType::Replace if self.upserts.is_empty() => {
                     let conflicting = program.alloc_register();
                     program.emit_insn(Insn::IdxRowId {
                         cursor_id: cursor,
@@ -931,7 +1499,7 @@ impl InsertRow<'_> {
             start,
             count: columns + 1,
             in_index,
-            written: conflict == ResolveType::Replace,
+            written: conflict == ResolveType::Replace && self.upserts.is_empty(),
         };
         if key.written {
             if let Some(in_index) = in_index {
@@ -946,6 +1514,14 @@ impl InsertRow<'_> {
         program.preassign_label_to_next_insn(outside);
         Ok(key)
     }
+}
+
+/// A constraint the new row is checked against: its rowid, or the index at
+/// a position of the target's index list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Constraint {
+    RowId,
+    Index(usize),
 }
 
 /// A new index key built before any index is written.
@@ -1027,7 +1603,7 @@ mod tests {
     fn insert_that_needs_legacy_is_left_to_it() {
         for sql in [
             "INSERT INTO items SELECT value, extra FROM items",
-            "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
+            "INSERT OR IGNORE INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",
             "INSERT INTO items VALUES ((SELECT 1), 'x')",
         ] {
             let plan = analyze_plan(indexed_items_schema(), sql);

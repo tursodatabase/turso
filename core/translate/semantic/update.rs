@@ -163,7 +163,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })
     }
 
-    fn create_update_new_source(
+    pub(super) fn create_update_new_source(
         &mut self,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
