@@ -2161,10 +2161,7 @@ impl<'document> HirValidator<'document> {
                 )?;
                 previous = Some(constraint.catalog_position);
                 let catalog = &table.check_constraints[constraint.catalog_position];
-                let expected = catalog
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| catalog.expr.to_string());
+                let expected = catalog.error_description();
                 self.require(
                     constraint.description == expected,
                     format!("source {} CHECK descriptions are out of order", source.id),

@@ -439,6 +439,38 @@ fn hir_insert_matches_legacy() {
             "INSERT INTO m VALUES (8, 8, 'q', 12) ON CONFLICT(x) DO NOTHING",
             "SELECT * FROM m ORDER BY rowid",
         ],
+        // CHECK constraints: IGNORE skips the row, REPLACE still aborts, an
+        // UPSERT checks with ABORT, and an UPDATE checks only the
+        // constraints that read a changed column.
+        &[
+            "CREATE TABLE ck(a INTEGER PRIMARY KEY, b INT CHECK (b > 0), c TEXT, d, \
+             CONSTRAINT named CHECK (length(c) < 4), CHECK ( \"d\" IS NOT 'bad' ))",
+            "INSERT INTO ck VALUES (1, 1, 'x', 0)",
+            "INSERT INTO ck VALUES (2, 0, 'x', 0)",
+            "INSERT INTO ck VALUES (3, 1, 'xxxxx', 0)",
+            "INSERT INTO ck VALUES (4, 1, 'x', 'bad')",
+            "INSERT INTO ck VALUES (5, NULL, NULL, NULL)",
+            "INSERT OR IGNORE INTO ck VALUES (6, -1, 'x', 0), (7, 7, 'x', 0)",
+            "INSERT OR REPLACE INTO ck VALUES (1, -1, 'x', 0)",
+            "INSERT INTO ck VALUES (1, 2, 'y', 0) ON CONFLICT(a) DO UPDATE SET b = -excluded.b",
+            "INSERT INTO ck VALUES (1, 2, 'y', 0) ON CONFLICT(a) DO UPDATE SET c = 'zz'",
+            "UPDATE ck SET b = 0 WHERE a = 1",
+            "UPDATE ck SET c = 'long' WHERE a = 1",
+            "UPDATE OR IGNORE ck SET b = b - 1",
+            "PRAGMA ignore_check_constraints = 1",
+            "INSERT INTO ck VALUES (8, -8, 'xxxxxx', 'bad')",
+            "UPDATE ck SET b = -9 WHERE a = 7",
+            "PRAGMA ignore_check_constraints = 0",
+            "UPDATE ck SET c = c WHERE a = 8",
+            "UPDATE ck SET d = 1 WHERE a = 8",
+            "CREATE TABLE ckr(x INTEGER PRIMARY KEY CHECK (x < 100), y CHECK (y <> x))",
+            "INSERT INTO ckr VALUES (5, 6)",
+            "INSERT INTO ckr VALUES (500, 6)",
+            "INSERT INTO ckr(y) VALUES (1)",
+            "UPDATE ckr SET y = 5",
+            "SELECT * FROM ck ORDER BY a",
+            "SELECT * FROM ckr ORDER BY x",
+        ],
         // REPLACE deletes the rows the new row conflicts with.
         &["INSERT OR REPLACE INTO u VALUES (1, 10, 'r', 1)"],
         &["INSERT OR REPLACE INTO u VALUES (10, 2, 'r', 1)"],

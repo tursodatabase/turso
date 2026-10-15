@@ -129,7 +129,15 @@ pub(crate) fn translate_update(
         .and_then(|source| source.database)
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
     program.set_hir_plan(plan.clone());
-    update::emit_update(program, &plan, update, access, &triggers, mvcc)?;
+    update::emit_update(
+        program,
+        &plan,
+        update,
+        access,
+        &triggers,
+        mvcc,
+        !connection.check_constraints_ignored(),
+    )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -165,7 +173,13 @@ pub(crate) fn translate_insert(
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
-    insert::emit_insert(program, &plan, insert, &triggers)?;
+    insert::emit_insert(
+        program,
+        &plan,
+        insert,
+        &triggers,
+        !connection.check_constraints_ignored(),
+    )?;
     if let Some(returning) = &insert.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;

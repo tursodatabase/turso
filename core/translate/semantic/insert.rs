@@ -409,10 +409,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             check_constraints.push(hir::CheckConstraint {
                 catalog_position,
                 expression: self.analyze_expr(&constraint.expr, &scope, policy)?,
-                description: constraint
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| constraint.expr.to_string()),
+                description: constraint.error_description(),
             });
         }
 

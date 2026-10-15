@@ -89,10 +89,9 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // STRICT type checks, custom types, generated columns, and CHECK
-    // constraints are not lowered yet.
+    // STRICT type checks, custom types and generated columns are not
+    // lowered yet.
     if table.is_strict
-        || !table.check_constraints.is_empty()
         || table.columns().iter().any(Column::is_generated)
         || source.column_type_programs.iter().any(Option::is_some)
     {
@@ -181,6 +180,7 @@ pub(super) fn emit_update(
     access: &HirAccessPlan,
     triggers: &[CompiledTrigger],
     mvcc: bool,
+    enforce_checks: bool,
 ) -> Result<()> {
     let document = &plan.document;
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
@@ -300,7 +300,7 @@ pub(super) fn emit_update(
                     (index.on_conflict, index.unique)
                 }),
                 has_notnull,
-                false,
+                !table.check_constraints.is_empty(),
                 has_unique,
             ),
     );
@@ -326,6 +326,29 @@ pub(super) fn emit_update(
     };
 
     let assigned = assigned_positions(&assigned);
+    // Like SQLite, only the CHECK constraints that read a changed column
+    // run. They read the new row.
+    let checks = if enforce_checks {
+        let constraints = new_source.check_constraints.as_deref().ok_or_else(|| {
+            LimboError::InternalError("HIR UPDATE new row has no CHECK constraints".into())
+        })?;
+        constraints
+            .iter()
+            .filter(|constraint| {
+                let mut reads_changed = false;
+                constraint.expression.for_each(&mut |expression| {
+                    reads_changed |= matches!(
+                        expression,
+                        hir::Expr::Column(hir::ColumnRef { source, column })
+                            if *source == new_source.id && assigned.contains(column)
+                    );
+                });
+                reads_changed
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // UPDATE ... FROM computes the assigned values during the join, into a
     // scratch table with one column per assignment.
     let scratch_columns = values
@@ -377,6 +400,7 @@ pub(super) fn emit_update(
         replaces,
         assigned: &assigned,
         changed_indexes: &changed_indexes,
+        checks: &checks,
         new_source: new_source.id,
         foreign_keys,
         returning,
@@ -425,6 +449,8 @@ struct UpdateRowLayout<'a> {
     assigned: &'a [usize],
     /// The indexes the UPDATE changes, with their OLD- and NEW-row expressions.
     changed_indexes: &'a [(&'a hir::IndexExpressions, &'a hir::IndexExpressions)],
+    /// The CHECK constraints the new row must pass.
+    checks: &'a [&'a hir::CheckConstraint],
     new_source: hir::SourceId,
     foreign_keys: &'a hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'a>>,
@@ -945,6 +971,15 @@ impl UpdateRow<'_, '_> {
                 rowid: Some(self.rowid),
             },
         );
+        // Like legacy, CHECK constraints run after NOT NULL and before any
+        // index is checked.
+        super::dml::emit_check_constraints(
+            program,
+            document,
+            layout.checks.iter().copied(),
+            self.or_conflict,
+            self.skip_row,
+        )?;
 
         // Like legacy, check every changed index before changing any of them:
         // build the new keys and check UNIQUE, then delete the old entries,
@@ -1419,6 +1454,15 @@ mod tests {
             ))
             .unwrap();
         schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
+                    4,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        schema
             .add_index(Arc::new(Index {
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
@@ -1452,7 +1496,7 @@ mod tests {
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, update, access, &[], false).unwrap();
+        emit_update(&mut program, &plan, update, access, &[], false, true).unwrap();
         program
     }
 
@@ -1500,6 +1544,20 @@ mod tests {
             count(&program, |insn| matches!(insn, Insn::Insert { .. })),
             1
         );
+    }
+
+    #[test]
+    fn update_checks_only_the_check_constraints_that_read_a_changed_column() {
+        fn is_check_halt(insn: &Insn) -> bool {
+            matches!(
+                insn,
+                Insn::Halt { err_code, .. } if *err_code == crate::error::SQLITE_CONSTRAINT_CHECK
+            )
+        }
+        let program = emit("UPDATE checked SET a = 1");
+        assert_eq!(count(&program, is_check_halt), 1);
+        let program = emit("UPDATE checked SET a = 1, b = 2");
+        assert_eq!(count(&program, is_check_halt), 2);
     }
 
     #[test]

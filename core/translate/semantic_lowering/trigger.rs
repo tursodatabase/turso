@@ -245,7 +245,13 @@ fn compile_trigger(
                 )?;
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                super::insert::emit_insert(&mut builder, &plan, insert, command_triggers)?;
+                super::insert::emit_insert(
+                    &mut builder,
+                    &plan,
+                    insert,
+                    command_triggers,
+                    !connection.check_constraints_ignored(),
+                )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
@@ -261,6 +267,7 @@ fn compile_trigger(
                     access,
                     command_triggers,
                     mvcc,
+                    !connection.check_constraints_ignored(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }

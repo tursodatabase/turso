@@ -232,8 +232,8 @@ pub struct CheckConstraint {
     pub catalog_position: usize,
     /// CHECK expression instantiated for one exact source occurrence.
     pub expression: Expr,
-    /// Constraint name, or the stored expression rendered against its table
-    /// columns when the constraint is unnamed.
+    /// What a failure reports: the constraint's name, or its expression's
+    /// text as the user wrote it.
     pub description: String,
 }
 

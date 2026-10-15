@@ -230,7 +230,7 @@ new values. These still go to legacy:
 | A subquery in SET, WHERE or RETURNING | Reading it at the points legacy does |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
-| STRICT tables, custom types, generated columns, CHECK constraints | Type checks, encoding, computed columns, CHECK lowering |
+| STRICT tables, custom types, generated columns | Type checks, encoding, computed columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -249,7 +249,14 @@ partial-index WHERE terms and RETURNING. These still go to legacy:
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
 | AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
-| WITHOUT ROWID and STRICT tables, custom types, generated columns, CHECK constraints | Their lowering |
+| WITHOUT ROWID and STRICT tables, custom types, generated columns | Their lowering |
+
+CHECK constraints are checked as in legacy: an INSERT checks all of them once
+the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
+those that read a changed column; an UPSERT DO UPDATE checks all of them with
+ABORT. A NULL result passes, IGNORE skips the row, and REPLACE aborts. A
+failure reports the constraint's name, or its expression as the user wrote
+it. `PRAGMA ignore_check_constraints` turns them off.
 
 Triggers fired by these statements are compiled from HIR too
 (`semantic_lowering/trigger.rs`). Each trigger is analyzed as its own HIR

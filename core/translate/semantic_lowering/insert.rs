@@ -95,11 +95,10 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // WITHOUT ROWID tables, STRICT type checks, custom types, generated
-    // columns, and CHECK constraints are not lowered yet.
+    // WITHOUT ROWID tables, STRICT type checks, custom types and generated
+    // columns are not lowered yet.
     if !table.has_rowid
         || table.is_strict
-        || !table.check_constraints.is_empty()
         || table.columns().iter().any(Column::is_generated)
         || table.columns().iter().any(Column::hidden)
         || source.column_type_programs.iter().any(Option::is_some)
@@ -155,12 +154,14 @@ pub(super) fn needs_legacy(
 }
 
 /// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
-/// root or one command of a trigger in it.
+/// root or one command of a trigger in it. `enforce_checks` is false under
+/// `PRAGMA ignore_check_constraints`.
 pub(super) fn emit_insert(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
     triggers: &[CompiledTrigger],
+    enforce_checks: bool,
 ) -> Result<()> {
     let document = &plan.document;
     let hir::InsertTargetKind::BTree {
@@ -247,7 +248,7 @@ pub(super) fn emit_insert(
                     .columns()
                     .iter()
                     .any(|column| column.notnull() && !column.is_rowid_alias()),
-                false,
+                !table.check_constraints.is_empty(),
                 rowid_value.is_some() || !indexes.is_empty(),
             ),
     );
@@ -269,6 +270,7 @@ pub(super) fn emit_insert(
         excluded: insert.excluded_source,
         upsert_new: insert.upsert_new_source,
         conflict_rowid: program.alloc_register(),
+        enforce_checks,
     };
     let done = program.allocate_label();
     match rows {
@@ -561,6 +563,8 @@ struct InsertRow<'a> {
     upsert_new: Option<hir::SourceId>,
     /// The rowid of the row an UPSERT conflicts with.
     conflict_rowid: usize,
+    /// False under `PRAGMA ignore_check_constraints`.
+    enforce_checks: bool,
 }
 
 impl InsertRow<'_> {
@@ -713,14 +717,25 @@ impl InsertRow<'_> {
         });
         program.preassign_label_to_next_insn(ready);
 
+        // CHECK constraints, index expressions, partial-index WHERE terms
+        // and RETURNING read the new row.
+        self.bind_new_row(program);
+        // Like legacy, CHECK constraints run once the rowid is known, before
+        // NOT NULL.
+        if self.enforce_checks {
+            super::dml::emit_check_constraints(
+                program,
+                document,
+                self.check_constraints(self.target.source.id)?,
+                self.or_conflict,
+                row_done,
+            )?;
+        }
         for (position, column) in table.columns().iter().enumerate() {
             if column.notnull() && !column.is_rowid_alias() {
                 self.emit_notnull_check(program, position, column, row_done)?;
             }
         }
-        // Index expressions, partial-index WHERE terms and RETURNING read
-        // the new row.
-        self.bind_new_row(program);
         // Like legacy, the constraints an UPSERT names are checked first, in
         // the UPSERT's order, then the rowid and the indexes.
         let arms = self
@@ -1044,6 +1059,16 @@ impl InsertRow<'_> {
                 rowid: Some(conflict),
             },
         );
+        // Like legacy, every CHECK constraint is checked with ABORT.
+        if self.enforce_checks {
+            super::dml::emit_check_constraints(
+                program,
+                document,
+                self.check_constraints(new_source.id)?,
+                ResolveType::Abort,
+                row_done,
+            )?;
+        }
 
         let assigned = assignments
             .iter()
@@ -1357,6 +1382,19 @@ impl InsertRow<'_> {
                 .index_expressions
                 .iter()
                 .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+    }
+
+    /// The CHECK constraints analysis froze for `source`.
+    fn check_constraints(&self, source: hir::SourceId) -> Result<&[hir::CheckConstraint]> {
+        self.target
+            .document
+            .source(source)
+            .and_then(|source| source.check_constraints.as_deref())
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR INSERT source {source} has no CHECK constraints"
+                ))
+            })
     }
 
     fn bind_new_row(&self, program: &mut ProgramBuilder) {
@@ -1717,13 +1755,29 @@ mod tests {
         translate::semantic_lowering::query::tests::{analyze_plan, indexed_items_schema, program},
     };
 
+    /// `indexed_items_schema` with `checked(id INTEGER PRIMARY KEY, a
+    /// CHECK (a > 0), b CHECK (b > 0))`.
+    fn schema() -> crate::schema::Schema {
+        let mut schema = indexed_items_schema();
+        schema
+            .add_btree_table(Arc::new(
+                crate::schema::BTreeTable::from_sql(
+                    "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
+                    100,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        schema
+    }
+
     fn emit(sql: &str) -> ProgramBuilder {
-        let plan = Arc::new(analyze_plan(indexed_items_schema(), sql));
+        let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
         assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan, insert, &[]).unwrap();
+        emit_insert(&mut program, &plan, insert, &[], true).unwrap();
         program
     }
 
@@ -1753,6 +1807,18 @@ mod tests {
         assert_eq!(
             count(&program, |insn| matches!(insn, Insn::InitCoroutine { .. })),
             0
+        );
+    }
+
+    #[test]
+    fn insert_checks_every_check_constraint() {
+        let program = emit("INSERT INTO checked(a) VALUES (1)");
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::Halt { err_code, .. } if *err_code == crate::error::SQLITE_CONSTRAINT_CHECK
+            )),
+            2
         );
     }
 

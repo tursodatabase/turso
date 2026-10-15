@@ -3,6 +3,7 @@
 use turso_parser::ast;
 
 use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
@@ -491,6 +492,52 @@ impl<'a> ReturningBuffer<'a> {
         });
         program.preassign_label_to_next_insn(done);
     }
+}
+
+/// Check each CHECK constraint against the new row, which the constraint's
+/// source must be bound to. Like SQLite, a NULL result passes. A failure
+/// skips the row under IGNORE and stops the statement otherwise; REPLACE
+/// does not apply to CHECK.
+pub(super) fn emit_check_constraints<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    for constraint in constraints {
+        let result = program.alloc_register();
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &constraint.expression,
+            result,
+        )?;
+        let passed = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: result,
+            target_pc: passed,
+        });
+        program.emit_insn(Insn::If {
+            reg: result,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        if or_conflict == ast::ResolveType::Ignore {
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row,
+            });
+        } else {
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: constraint.description.clone(),
+                on_error: None,
+                description_reg: None,
+            });
+        }
+        program.preassign_label_to_next_insn(passed);
+    }
+    Ok(())
 }
 
 /// Whether an expression contains a subquery.
