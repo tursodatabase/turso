@@ -1,6 +1,4 @@
 # Runtime coverage for SET search_path in the PostgreSQL frontend.
-# Schema databases are file-backed, so schema tables are dropped before each
-# create to keep repeated test runs independent of old sidecar files.
 
 @database :memory:
 
@@ -9,11 +7,9 @@ test search-path-first-schema-wins {
     CREATE TABLE demo (id int, label text);
     INSERT INTO demo VALUES (0, 'from public');
     CREATE SCHEMA IF NOT EXISTS sp_fw_a;
-    DROP TABLE IF EXISTS sp_fw_a.demo;
     CREATE TABLE sp_fw_a.demo (id int, label text);
     INSERT INTO sp_fw_a.demo VALUES (1, 'from a');
     CREATE SCHEMA IF NOT EXISTS sp_fw_b;
-    DROP TABLE IF EXISTS sp_fw_b.demo;
     CREATE TABLE sp_fw_b.demo (id int, label text);
     INSERT INTO sp_fw_b.demo VALUES (2, 'from b');
     SET search_path TO sp_fw_b, sp_fw_a;
@@ -28,7 +24,6 @@ test search-path-single-schema {
     CREATE TABLE demo (id int, label text);
     INSERT INTO demo VALUES (0, 'from public');
     CREATE SCHEMA IF NOT EXISTS sp_ss_a;
-    DROP TABLE IF EXISTS sp_ss_a.demo;
     CREATE TABLE sp_ss_a.demo (id int, label text);
     INSERT INTO sp_ss_a.demo VALUES (1, 'from a');
     SET search_path TO sp_ss_a;

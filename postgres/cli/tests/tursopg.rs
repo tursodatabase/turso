@@ -1544,10 +1544,10 @@ fn wire_multi_column_select_classifies_each() {
     });
 }
 
-/// Verify that a schema created in one tursopg session is accessible in a
-/// subsequent session opened against the same file.
+/// A schema created in one tursopg session is stored in the database file
+/// itself, so a later session on the same file sees it.
 #[test]
-fn schema_sidecar_reattaches_on_reopen() {
+fn schema_persists_on_reopen() {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1556,7 +1556,7 @@ fn schema_sidecar_reattaches_on_reopen() {
     std::fs::create_dir(&test_dir).expect("failed to create temp test directory");
 
     let db_path = test_dir.join("main.db");
-    let schema_name = "persist_sidecar";
+    let schema_name = "persist_schema";
 
     let first_sql = format!(
         "CREATE SCHEMA {schema_name};\n\
@@ -1571,6 +1571,13 @@ fn schema_sidecar_reattaches_on_reopen() {
         stdout(&out1)
     );
 
+    let files: Vec<_> = std::fs::read_dir(&test_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| !name.starts_with("main.db"))
+        .collect();
+    assert!(files.is_empty(), "schema created files: {files:?}");
+
     let second_sql = format!("SELECT id, label FROM {schema_name}.demo;\n");
     let out2 = run_tursopg_with_db(&db_path, second_sql.as_bytes());
 
@@ -1580,7 +1587,7 @@ fn schema_sidecar_reattaches_on_reopen() {
     assert_eq!(
         out2.status.code(),
         Some(0),
-        "second run failed, schema sidecar not reattached on reopen: {out}"
+        "second run failed, schema not found on reopen: {out}"
     );
     assert!(
         out.contains("persisted"),

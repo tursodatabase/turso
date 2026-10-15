@@ -120,10 +120,10 @@ impl Dialect for PostgresDialect {
         };
 
         // Unqualified statements replay as the original PostgreSQL DDL. A
-        // schema-qualified statement targets an attached database the replay
-        // destination does not have, so re-render the translated AST without
-        // the qualifier; the canonical text round-trips through the SQLite
-        // fallback in `Dialect::parse`.
+        // statement that names a schema translates to a table name qualified
+        // by a database, which the replay destination may not have, so
+        // re-render the translated AST without the qualifier; the canonical
+        // text round-trips through the SQLite fallback in `Dialect::parse`.
         if tbl_name.db_name.take().is_none() {
             return Ok(raw_sql.to_string());
         }
@@ -182,20 +182,20 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
         .tables
         .iter()
         .filter(|(name, table)| {
-            // Skip system tables
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
             // Skip virtual tables and subqueries
-            matches!(table.as_ref(), Table::BTree(_))
+            !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
         })
         .collect();
     tables.sort_by_key(|(name, _)| *name);
     tables
+}
+
+/// Whether `name` is a table that the engine or this frontend owns, rather
+/// than the user.
+pub(crate) fn is_system_table_name(name: &str) -> bool {
+    ["sqlite_", "pg_", "pragma_", "json_", "__turso_internal_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Map a SQLite type string to a PostgreSQL type OID.
@@ -440,9 +440,9 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
         // PostgreSQL standard namespaces
-        let mut rows = vec![
+        let rows = vec![
             vec![
                 Value::from_i64(11),              // oid
                 Value::Text("pg_catalog".into()), // nspname
@@ -462,18 +462,20 @@ impl SnapshotRows for PgNamespaceTable {
                 Value::Null,                              // nspacl
             ],
         ];
+        rows
+    }
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
-        let schema_names = conn.attached_database_names();
-        let mut oid = 16384i64;
-        for name in schema_names {
+    const NEEDS_SCHEMAS: bool = true;
+
+    fn load_rows_with_schemas(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
+        let mut rows = Self::load_rows(conn);
+        for schema in schemas {
             rows.push(vec![
-                Value::from_i64(oid),
-                Value::build_text(name),
+                Value::from_i64(schema.oid),
+                Value::build_text(schema.name.clone()),
                 Value::from_i64(10), // nspowner (bootstrap superuser)
                 Value::Null,         // nspacl
             ]);
-            oid += 1;
         }
         rows
     }
@@ -498,8 +500,14 @@ impl SnapshotRows for SchemataTable {
     const ESTIMATED_ROWS: u32 = 5;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        Self::load_rows_with_schemas(conn, &[])
+    }
+
+    const NEEDS_SCHEMAS: bool = true;
+
+    fn load_rows_with_schemas(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
-        PgNamespaceTable::load_rows(conn)
+        PgNamespaceTable::load_rows_with_schemas(conn, schemas)
             .into_iter()
             .map(|namespace| {
                 vec![
@@ -2814,6 +2822,21 @@ trait SnapshotRows: Debug + Send + Sync + 'static {
     const ESTIMATED_ROWS: u32;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>>;
+
+    /// Whether the rows depend on the schemas other than public. The cursor
+    /// then reads them from the schema table and calls
+    /// [`Self::load_rows_with_schemas`] instead of [`Self::load_rows`].
+    const NEEDS_SCHEMAS: bool = false;
+
+    fn load_rows_with_schemas(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
+        Self::load_rows(conn)
+    }
+}
+
+/// A schema other than public, as listed in the schema table.
+struct Namespace {
+    oid: i64,
+    name: String,
 }
 
 #[derive(Debug)]
@@ -2841,7 +2864,10 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
-            load_rows: T::load_rows,
+            load_rows: T::load_rows_with_schemas,
+            needs_schemas: T::NEEDS_SCHEMAS,
+            schemas_statement: None,
+            schemas: Vec::new(),
             table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
@@ -2874,10 +2900,56 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 
 struct SnapshotCursor {
     conn: Arc<Connection>,
-    load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    load_rows: fn(&Connection, &[Namespace]) -> Vec<Vec<Value>>,
+    needs_schemas: bool,
+    /// Reads the schema table, when the rows need the schemas. It runs
+    /// across `filter` calls that return IO.
+    schemas_statement: Option<Statement>,
+    schemas: Vec<Namespace>,
     table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
+}
+
+impl SnapshotCursor {
+    /// Reads the schemas other than public into `self.schemas`.
+    fn read_schemas(&mut self) -> turso_core::types::IOResultOr<()> {
+        if self.schemas_statement.is_none() {
+            self.schemas.clear();
+            if self
+                .conn
+                .current_schema()
+                .get_table(crate::session::SCHEMAS_TABLE)
+                .is_none()
+            {
+                return Ok(IOResult::Done(()));
+            }
+            self.schemas_statement = Some(self.conn.prepare_internal(format!(
+                "SELECT oid, nspname FROM {} ORDER BY nspname",
+                crate::session::SCHEMAS_TABLE
+            ))?);
+        }
+        let schemas = &mut self.schemas;
+        let statement = self
+            .schemas_statement
+            .as_mut()
+            .expect("the schema table is being read");
+        if let IOResult::IO(completions) = statement.run_with_row_callback_nonblock(|row| {
+            if let (Value::Numeric(turso_core::Numeric::Integer(oid)), Value::Text(name)) =
+                (row.get_value(0), row.get_value(1))
+            {
+                schemas.push(Namespace {
+                    oid: *oid,
+                    name: name.as_str().to_string(),
+                });
+            }
+            Ok(())
+        })? {
+            return Ok(IOResult::IO(completions));
+        }
+        self.schemas_statement = None;
+        Ok(IOResult::Done(()))
+    }
 }
 
 impl VirtualTableCursor for SnapshotCursor {
@@ -2910,8 +2982,13 @@ impl VirtualTableCursor for SnapshotCursor {
         _idx_str: Option<&str>,
         _idx_num: i32,
     ) -> turso_core::types::IOResultOr<bool> {
+        if self.needs_schemas {
+            if let IOResult::IO(completions) = self.read_schemas()? {
+                return Ok(IOResult::IO(completions));
+            }
+        }
         self.current_row = 0;
-        self.rows = (self.load_rows)(&self.conn);
+        self.rows = (self.load_rows)(&self.conn, &self.schemas);
         Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
@@ -3790,11 +3867,10 @@ mod tests {
     #[test]
     fn catalogs_available_in_secondary_databases() {
         let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
+        let second_path = dir.path().join("second.db");
         let output_path = dir.path().join("vacuum.db");
         let io = Arc::new(PlatformIO::new().unwrap());
         let opts = crate::DatabaseOpts::new()
-            .with_attach(true)
             .with_vacuum(true)
             .with_views(true);
         let db = crate::session::open_database_with_io(
@@ -3805,35 +3881,15 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
-        conn.execute("CREATE TABLE aux.counts (n INT)").unwrap();
-        assert_eq!(
-            conn.prepare("SELECT COUNT(*) FROM aux.pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(4)]]
-        );
-        conn.execute("CREATE TRIGGER aux.catalog_check AFTER INSERT ON data BEGIN INSERT INTO counts SELECT COUNT(*) FROM pg_namespace; END").unwrap();
-        conn.execute("INSERT INTO aux.data VALUES (5)").unwrap();
-        assert_eq!(
-            conn.prepare("SELECT n FROM aux.counts")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(4)]]
-        );
-        let attached = crate::session::open_database_with_io(
+        let second = crate::session::open_database_with_io(
             io.clone(),
-            attached_path.to_str().unwrap(),
+            second_path.to_str().unwrap(),
             crate::OpenFlags::default(),
             opts,
         )
         .unwrap();
         assert_eq!(
-            attached
+            second
                 .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
