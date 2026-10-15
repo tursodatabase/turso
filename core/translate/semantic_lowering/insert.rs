@@ -34,6 +34,7 @@ use crate::{
 
 use super::autoincrement::Sequence;
 use super::dml::{DmlTarget, ReturningBuffer};
+use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
 
 /// Whether this INSERT uses something the HIR lowering does not handle yet.
@@ -49,7 +50,6 @@ pub(super) fn needs_legacy(
         hir::InsertTargetKind::BTree {
             autoincrement,
             defaults,
-            triggers,
             foreign_keys,
             ..
         } => {
@@ -107,21 +107,6 @@ pub(super) fn needs_legacy(
             return Ok(true);
         }
     }
-    // REPLACE deletes the conflicting row; an ON DELETE action on it still
-    // needs legacy.
-    let may_replace = match insert.conflict {
-        Some(conflict) => conflict == ResolveType::Replace,
-        None => {
-            table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
-                || source
-                    .index_expressions
-                    .iter()
-                    .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
-        }
-    };
-    if may_replace && super::fkey::delete_needs_legacy(foreign_keys) {
-        return Ok(true);
-    }
     // A DEFAULT on an INTEGER PRIMARY KEY makes the rowid come from it.
     Ok(defaults.iter().any(|default| {
         table
@@ -141,6 +126,7 @@ pub(super) fn emit_insert(
     insert: &hir::Insert,
     triggers: &[CompiledTrigger],
     upsert_triggers: &[CompiledTrigger],
+    replace_actions: &[CompiledAction<'_>],
     enforce_checks: bool,
 ) -> Result<()> {
     let document = &plan.document;
@@ -269,6 +255,7 @@ pub(super) fn emit_insert(
         enforce_checks,
         sequence: sequence.as_ref(),
         upsert_triggers,
+        replace_actions,
     };
     let done = program.allocate_label();
     match rows {
@@ -378,6 +365,46 @@ fn subquery_reads_table(
         }
     });
     reads
+}
+
+/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
+/// means one needs legacy.
+pub(super) fn replace_actions<'a>(
+    session: &super::HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    insert: &'a hir::Insert,
+) -> Result<Option<Vec<CompiledAction<'a>>>> {
+    let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let source = plan.document.source(insert.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR INSERT target {} is missing", insert.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let table = table.value().require_btree()?;
+    let may_replace = match insert.conflict {
+        Some(conflict) => conflict == ResolveType::Replace,
+        None => {
+            table.rowid_alias_conflict_clause == Some(ResolveType::Replace)
+                || source
+                    .index_expressions
+                    .iter()
+                    .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+        }
+    };
+    if !may_replace {
+        return Ok(Some(Vec::new()));
+    }
+    super::fkey_action::compile_actions(
+        session,
+        parent,
+        foreign_keys,
+        super::fkey_action::ParentChange::Delete,
+        &[],
+    )
 }
 
 pub(super) fn insert_root(plan: &HirPlan) -> Result<&hir::Insert> {
@@ -609,6 +636,8 @@ struct InsertRow<'a> {
     sequence: Option<&'a Sequence>,
     /// The UPDATE triggers an UPSERT's DO UPDATE fires.
     upsert_triggers: &'a [CompiledTrigger],
+    /// The ON DELETE actions of a row REPLACE deletes.
+    replace_actions: &'a [CompiledAction<'a>],
 }
 
 impl InsertRow<'_> {
@@ -1679,6 +1708,7 @@ impl InsertRow<'_> {
             self.foreign_keys,
             conflict,
             None,
+            self.replace_actions,
         )?;
         self.bind_new_row(program);
         Ok(())
@@ -1988,13 +2018,42 @@ mod tests {
         schema
     }
 
+    #[test]
+    fn replace_that_fires_foreign_key_actions_goes_through_hir() {
+        let schema = || {
+            let mut schema = schema();
+            for (sql, root) in [
+                ("CREATE TABLE parent(id INTEGER PRIMARY KEY, k UNIQUE)", 110),
+                (
+                    "CREATE TABLE child(x REFERENCES parent(id) ON DELETE CASCADE)",
+                    111,
+                ),
+            ] {
+                schema
+                    .add_btree_table(Arc::new(
+                        crate::schema::BTreeTable::from_sql(sql, root).unwrap(),
+                    ))
+                    .unwrap();
+            }
+            schema
+        };
+        for sql in [
+            "INSERT OR REPLACE INTO parent VALUES (1, 'a')",
+            "REPLACE INTO parent VALUES (1, 'a')",
+        ] {
+            let plan = analyze_plan(schema(), sql);
+            let insert = insert_root(&plan).unwrap();
+            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+        }
+    }
+
     fn emit(sql: &str) -> ProgramBuilder {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
         assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan, insert, &[], &[], true).unwrap();
+        emit_insert(&mut program, &plan, insert, &[], &[], &[], true).unwrap();
         program
     }
 

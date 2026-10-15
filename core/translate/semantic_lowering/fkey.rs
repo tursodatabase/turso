@@ -33,14 +33,6 @@ use crate::{
     LimboError, Result,
 };
 
-/// Whether a parent-side action needs legacy: HIR lowers only the checks.
-pub(super) fn delete_needs_legacy(foreign_keys: &hir::DmlForeignKeys) -> bool {
-    foreign_keys
-        .incoming
-        .iter()
-        .any(|foreign_key| !is_check_only(foreign_key.declaration.on_delete))
-}
-
 /// Whether an UPDATE that sets the columns at `assigned` changes a parent
 /// key whose ON UPDATE action is not a plain check.
 pub(super) fn update_needs_legacy(foreign_keys: &hir::DmlForeignKeys, assigned: &[usize]) -> bool {

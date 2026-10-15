@@ -333,8 +333,8 @@ table that references itself, calls the program being built. A DELETE reads
 the parent key before the row is deleted and runs the actions after; an
 UPDATE runs them once the row is written, when the key changed, before
 RETURNING. A statement with actions collects its rows first, and the
-parent-side checks skip keys with an action. REPLACE and UPSERT that would
-fire an action still go to legacy. Where legacy differs from SQLite, HIR
+parent-side checks skip keys with an action. An UPSERT that would fire an
+action still goes to legacy. Where legacy differs from SQLite, HIR
 follows SQLite: a DELETE whose SET DEFAULT leaves a child without a parent
 fails.
 
@@ -345,8 +345,8 @@ an index whose conflict resolves to REPLACE as soon as it is checked, and an
 INTEGER PRIMARY KEY with its own ON CONFLICT REPLACE after the indexes. NOT
 NULL ON CONFLICT REPLACE stores the column's DEFAULT, resolved in semantic
 analysis. UPDATE OR REPLACE first collects its rowids; after deleting the
-other row an UPDATE seeks back to its own. A REPLACE that would fire an ON
-DELETE action still goes to legacy.
+other row an UPDATE seeks back to its own. The deleted row's ON DELETE
+actions read its parent key before the delete and run right after it.
 
 UPSERT is lowered as legacy does it. The constraints an ON CONFLICT clause
 names are checked first, in clause order; a conflict on one goes to the first

@@ -131,6 +131,9 @@ pub(crate) fn translate_update(
     let Some(actions) = fkey_action::update_actions(&session, program, &plan, update)? else {
         return Ok(false);
     };
+    let Some(replace_actions) = update::replace_actions(&session, program, &plan, update)? else {
+        return Ok(false);
+    };
     let mvcc = plan
         .document
         .source(update.target)
@@ -146,6 +149,7 @@ pub(crate) fn translate_update(
         mvcc,
         !connection.check_constraints_ignored(),
         &actions,
+        &replace_actions,
     )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
@@ -186,12 +190,16 @@ pub(crate) fn translate_insert(
     else {
         return Ok(false);
     };
+    let Some(replace_actions) = insert::replace_actions(&session, program, &plan, insert)? else {
+        return Ok(false);
+    };
     insert::emit_insert(
         program,
         &plan,
         insert,
         &triggers,
         &upsert_triggers,
+        &replace_actions,
         !connection.check_constraints_ignored(),
     )?;
     if let Some(returning) = &insert.returning {

@@ -187,6 +187,11 @@ fn compile_action<'a>(
             let Some(actions) = update_actions(session, &builder, &plan, update)? else {
                 return Ok(None);
             };
+            let Some(replace_actions) =
+                super::update::replace_actions(session, &builder, &plan, update)?
+            else {
+                return Ok(None);
+            };
             let mvcc = connection
                 .mv_store_for_db(database_index(foreign_key)?)
                 .is_some();
@@ -201,6 +206,7 @@ fn compile_action<'a>(
                 mvcc,
                 !connection.check_constraints_ignored(),
                 &actions,
+                &replace_actions,
             )?;
         }
         _ => {

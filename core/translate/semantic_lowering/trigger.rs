@@ -138,10 +138,13 @@ fn compile_trigger(
     let mut nested_actions = Vec::with_capacity(commands.len());
     // UPDATE triggers that an INSERT's UPSERT fires, per command.
     let mut nested_upsert = Vec::with_capacity(commands.len());
+    // ON DELETE actions of the rows REPLACE deletes, per command.
+    let mut nested_replace = Vec::with_capacity(commands.len());
     for (command, command_plan) in root.commands.iter().zip(commands) {
         let mut command_triggers = Vec::new();
         let mut command_actions = Vec::new();
         let mut command_upsert = Vec::new();
+        let mut command_replace = Vec::new();
         let needs_legacy = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
@@ -151,10 +154,12 @@ fn compile_trigger(
                     match (
                         insert_triggers(session, &builder, &plan, insert)?,
                         upsert_update_triggers(session, &builder, &plan, insert)?,
+                        super::insert::replace_actions(session, &builder, &plan, insert)?,
                     ) {
-                        (Some(triggers), Some(upsert)) => {
+                        (Some(triggers), Some(upsert), Some(replace)) => {
                             command_triggers = triggers;
                             command_upsert = upsert;
+                            command_replace = replace;
                             false
                         }
                         _ => true,
@@ -168,10 +173,12 @@ fn compile_trigger(
                     match (
                         update_triggers(session, &builder, &plan, update)?,
                         super::fkey_action::update_actions(session, &builder, &plan, update)?,
+                        super::update::replace_actions(session, &builder, &plan, update)?,
                     ) {
-                        (Some(triggers), Some(actions)) => {
+                        (Some(triggers), Some(actions), Some(replace)) => {
                             command_triggers = triggers;
                             command_actions = actions;
+                            command_replace = replace;
                             false
                         }
                         _ => true,
@@ -207,6 +214,7 @@ fn compile_trigger(
         nested.push(command_triggers);
         nested_actions.push(command_actions);
         nested_upsert.push(command_upsert);
+        nested_replace.push(command_replace);
     }
 
     builder.prologue();
@@ -251,13 +259,17 @@ fn compile_trigger(
         )?;
         builder.preassign_label_to_next_insn(passed);
     }
-    for ((((command, command_plan), command_triggers), command_actions), command_upsert) in root
+    for (
+        ((((command, command_plan), command_triggers), command_actions), command_upsert),
+        command_replace,
+    ) in root
         .commands
         .iter()
         .zip(commands)
         .zip(&nested)
         .zip(&nested_actions)
         .zip(&nested_upsert)
+        .zip(&nested_replace)
     {
         match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(query)) => {
@@ -276,6 +288,7 @@ fn compile_trigger(
                     insert,
                     command_triggers,
                     command_upsert,
+                    command_replace,
                     !connection.check_constraints_ignored(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
@@ -295,6 +308,7 @@ fn compile_trigger(
                     mvcc,
                     !connection.check_constraints_ignored(),
                     command_actions,
+                    command_replace,
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }

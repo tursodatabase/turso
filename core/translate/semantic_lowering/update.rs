@@ -55,10 +55,9 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    let foreign_keys = match &update.target_kind {
-        hir::UpdateTargetKind::BTree { foreign_keys, .. } => foreign_keys,
-        hir::UpdateTargetKind::Virtual => return Ok(true),
-    };
+    if matches!(update.target_kind, hir::UpdateTargetKind::Virtual) {
+        return Ok(true);
+    }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
     }
@@ -81,16 +80,11 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
-    // REPLACE deletes the rows the new row conflicts with; an ON DELETE
-    // action on them still needs legacy.
     let sets_rowid = assigned
         .iter()
         .filter(|column| is_rowid_target(&table, column))
         .count();
     let replaces = may_replace(update, source, &table, sets_rowid > 0);
-    if replaces && super::fkey::delete_needs_legacy(foreign_keys) {
-        return Ok(true);
-    }
     // Changing the rowid moves the row; legacy collects the rows first.
     // Setting the rowid twice, or with UPDATE ... FROM, is not lowered yet.
     // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
@@ -167,6 +161,7 @@ pub(super) fn needs_legacy(
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
 /// root or one command of a trigger in it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_update(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
@@ -176,6 +171,7 @@ pub(super) fn emit_update(
     mvcc: bool,
     enforce_checks: bool,
     actions: &[CompiledAction<'_>],
+    replace_actions: &[CompiledAction<'_>],
 ) -> Result<()> {
     let document = &plan.document;
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
@@ -334,7 +330,7 @@ pub(super) fn emit_update(
         has_statement_conflict,
     };
 
-    let assigned = assigned_positions(&table, &assigned);
+    let assigned = assigned_positions(table, &assigned);
     // Like SQLite, only the CHECK constraints that read a changed column
     // run. They read the new row.
     let checks = if enforce_checks {
@@ -421,6 +417,7 @@ pub(super) fn emit_update(
         triggers,
         mvcc,
         actions,
+        replace_actions,
     };
     let done = program.allocate_label();
     // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
@@ -546,6 +543,8 @@ struct UpdateRowLayout<'a> {
     mvcc: bool,
     /// The ON UPDATE actions to run once the row is written.
     actions: &'a [CompiledAction<'a>],
+    /// The ON DELETE actions of a row REPLACE deletes.
+    replace_actions: &'a [CompiledAction<'a>],
 }
 
 /// Registers and conflict settings of an UPDATE's row, before the cursor
@@ -956,6 +955,39 @@ pub(super) fn with_generated_dependents(
         }
     }
     Ok(assigned)
+}
+
+/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
+/// means one needs legacy.
+pub(super) fn replace_actions<'a>(
+    session: &super::HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    update: &'a hir::Update,
+) -> Result<Option<Vec<CompiledAction<'a>>>> {
+    let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let source = plan.document.source(update.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR UPDATE target {} is missing", update.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let table = table.value().require_btree()?;
+    let sets_rowid = assigned_columns(update)?
+        .iter()
+        .any(|column| is_rowid_target(&table, column));
+    if !may_replace(update, source, &table, sets_rowid) {
+        return Ok(Some(Vec::new()));
+    }
+    super::fkey_action::compile_actions(
+        session,
+        parent,
+        foreign_keys,
+        super::fkey_action::ParentChange::Delete,
+        &[],
+    )
 }
 
 /// The table positions an UPDATE changes: the columns it sets, the INTEGER
@@ -1706,6 +1738,7 @@ impl UpdateRow<'_, '_> {
             layout.foreign_keys,
             new_rowid,
             Some(layout.new_source),
+            layout.replace_actions,
         )?;
         program.preassign_label_to_next_insn(free);
         program.emit_insn(Insn::NotExists {
@@ -1775,6 +1808,7 @@ impl UpdateRow<'_, '_> {
                     layout.foreign_keys,
                     found,
                     Some(layout.new_source),
+                    layout.replace_actions,
                 )?;
                 let back = program.allocate_label();
                 program.emit_insn(Insn::SeekRowid {
@@ -1873,7 +1907,18 @@ mod tests {
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, update, access, &[], false, true, &[]).unwrap();
+        emit_update(
+            &mut program,
+            &plan,
+            update,
+            access,
+            &[],
+            false,
+            true,
+            &[],
+            &[],
+        )
+        .unwrap();
         program
     }
 
@@ -2005,6 +2050,36 @@ mod tests {
             assert_eq!(
                 count(&program, |insn| matches!(insn, Insn::IdxInsert { .. })),
                 1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_or_replace_that_fires_foreign_key_actions_goes_through_hir() {
+        let schema = || {
+            let mut schema = schema();
+            for (sql, root_page) in [
+                ("CREATE TABLE parent(id INTEGER PRIMARY KEY, k UNIQUE)", 10),
+                (
+                    "CREATE TABLE child(x REFERENCES parent(k) ON DELETE SET NULL)",
+                    11,
+                ),
+            ] {
+                schema
+                    .add_btree_table(Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()))
+                    .unwrap();
+            }
+            schema
+        };
+        for sql in [
+            "UPDATE OR REPLACE parent SET k = 'a'",
+            "UPDATE OR REPLACE parent SET id = 1",
+        ] {
+            let plan = analyze_plan(schema(), sql);
+            let (update, access) = update_root(&plan).unwrap();
+            assert!(
+                !needs_legacy(&plan, update, access, &program()).unwrap(),
                 "{sql}"
             );
         }

@@ -255,6 +255,7 @@ pub(super) fn emit_index_key(
 ///
 /// `replacement` is the row an UPDATE writes in its place: an immediate NO
 /// ACTION parent key it keeps cannot leave a child without its parent.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_replace_delete(
     program: &mut ProgramBuilder,
     target: &DmlTarget<'_>,
@@ -263,6 +264,7 @@ pub(super) fn emit_replace_delete(
     foreign_keys: &hir::DmlForeignKeys,
     conflict: usize,
     replacement: Option<SourceId>,
+    actions: &[super::fkey_action::CompiledAction<'_>],
 ) -> Result<()> {
     let DmlTarget {
         document,
@@ -293,6 +295,14 @@ pub(super) fn emit_replace_delete(
         database,
         replacement,
     )?;
+    // Like legacy, the ON DELETE actions of the deleted row run once it is
+    // gone.
+    let action_keys = actions
+        .iter()
+        .map(|action| {
+            super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
     for (expressions, cursor) in indexes {
         let skip = match &expressions.predicate {
             Some(predicate) => {
@@ -327,6 +337,9 @@ pub(super) fn emit_replace_delete(
         table_name: table.name.clone(),
         is_part_of_update: true,
     });
+    for (action, key) in actions.iter().zip(action_keys) {
+        action.emit_fire(program, key, None)?;
+    }
     program.preassign_label_to_next_insn(missing);
     Ok(())
 }
