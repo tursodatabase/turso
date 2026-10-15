@@ -32,6 +32,7 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
+use super::autoincrement::Sequence;
 use super::dml::{DmlTarget, ReturningBuffer};
 use super::trigger::{CompiledTrigger, TriggerRow};
 
@@ -56,7 +57,12 @@ pub(super) fn needs_legacy(
             foreign_keys,
             ..
         } => {
-            if autoincrement.is_some() || !triggers.upsert_update.is_empty() {
+            // AUTOINCREMENT under MVCC uses a hidden sequence, not lowered
+            // yet.
+            let mvcc_autoincrement = autoincrement.as_ref().is_some_and(|autoincrement| {
+                autoincrement.mvcc_sequence.is_some() || program.is_mvcc_enabled()
+            });
+            if mvcc_autoincrement || !triggers.upsert_update.is_empty() {
                 return Ok(true);
             }
             (defaults, foreign_keys)
@@ -151,6 +157,7 @@ pub(super) fn emit_insert(
         defaults,
         replace_defaults,
         foreign_keys,
+        autoincrement,
         ..
     } = &insert.target_kind
     else {
@@ -236,6 +243,21 @@ pub(super) fn emit_insert(
             ),
     );
 
+    let sequence = autoincrement
+        .as_ref()
+        .map(|autoincrement| -> Result<Sequence> {
+            Ok(Sequence {
+                table: autoincrement.sqlite_sequence.value().require_btree()?,
+                database: target.database,
+                name: table.name.clone(),
+            })
+        })
+        .transpose()?;
+    if several_rows {
+        if let Some(sequence) = &sequence {
+            sequence.ensure_row(program);
+        }
+    }
     let returning = ReturningBuffer::open(program, table, insert.returning.as_ref());
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = target.open_indexes_for_write(program, None)?;
@@ -254,6 +276,7 @@ pub(super) fn emit_insert(
         upsert_new: insert.upsert_new_source,
         conflict_rowid: program.alloc_register(),
         enforce_checks,
+        sequence: sequence.as_ref(),
     };
     let done = program.allocate_label();
     match rows {
@@ -590,6 +613,8 @@ struct InsertRow<'a> {
     conflict_rowid: usize,
     /// False under `PRAGMA ignore_check_constraints`.
     enforce_checks: bool,
+    /// AUTOINCREMENT: the target's `sqlite_sequence` row.
+    sequence: Option<&'a Sequence>,
 }
 
 impl InsertRow<'_> {
@@ -606,6 +631,7 @@ impl InsertRow<'_> {
     ) -> Result<()> {
         let document = self.target.document;
         let table = self.target.table;
+        let sequence = self.sequence.map(|sequence| sequence.open(program));
         let emit_value = |program: &mut ProgramBuilder, position: usize, register: usize| {
             match values {
                 RowValues::Expressions(values) => {
@@ -735,12 +761,18 @@ impl InsertRow<'_> {
             program.emit_insn(Insn::Goto { target_pc: ready });
         }
         program.preassign_label_to_next_insn(generate);
-        program.emit_insn(Insn::NewRowid {
-            cursor: self.table_cursor,
-            rowid_reg: self.rowid,
-            prev_largest_reg: 0,
-        });
+        match &sequence {
+            Some(sequence) => sequence.emit_new_rowid(program, self.table_cursor, self.rowid),
+            None => program.emit_insn(Insn::NewRowid {
+                cursor: self.table_cursor,
+                rowid_reg: self.rowid,
+                prev_largest_reg: 0,
+            }),
+        }
         program.preassign_label_to_next_insn(ready);
+        if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
+            sequence.emit_given_rowid(program, self.rowid);
+        }
 
         // CHECK constraints, index expressions, partial-index WHERE terms
         // and RETURNING read the new row.
@@ -921,6 +953,9 @@ impl InsertRow<'_> {
             self.target.database,
             self.may_replace(),
         )?;
+        if let Some(sequence) = &sequence {
+            sequence.emit_close(program, self.rowid);
+        }
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1781,18 +1816,27 @@ mod tests {
     };
 
     /// `indexed_items_schema` with `checked(id INTEGER PRIMARY KEY, a
-    /// CHECK (a > 0), b CHECK (b > 0))`.
+    /// CHECK (a > 0), b CHECK (b > 0))` and `counted(id INTEGER PRIMARY KEY
+    /// AUTOINCREMENT, b)`.
     fn schema() -> crate::schema::Schema {
         let mut schema = indexed_items_schema();
-        schema
-            .add_btree_table(Arc::new(
-                crate::schema::BTreeTable::from_sql(
-                    "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
-                    100,
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        for (sql, root) in [
+            (
+                "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
+                100,
+            ),
+            (
+                "CREATE TABLE counted(id INTEGER PRIMARY KEY AUTOINCREMENT, b)",
+                101,
+            ),
+            ("CREATE TABLE sqlite_sequence(name, seq)", 102),
+        ] {
+            schema
+                .add_btree_table(Arc::new(
+                    crate::schema::BTreeTable::from_sql(sql, root).unwrap(),
+                ))
+                .unwrap();
+        }
         schema
     }
 
@@ -1845,6 +1889,32 @@ mod tests {
             )),
             2
         );
+    }
+
+    #[test]
+    fn autoincrement_keeps_the_largest_rowid_in_sqlite_sequence() {
+        let writes_sequence = |program: &ProgramBuilder| {
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| {
+                    matches!(insn, Insn::Insert { table_name, .. } if table_name == "sqlite_sequence")
+                })
+                .count()
+        };
+        let program = emit("INSERT INTO counted(b) VALUES (1)");
+        // Generating the rowid reads the table's largest rowid.
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::NewRowid { prev_largest_reg, .. } if *prev_largest_reg != 0
+            )),
+            1
+        );
+        assert!(writes_sequence(&program) > 0);
+        // A rowid from the statement raises the sequence too.
+        let given = emit("INSERT INTO counted VALUES (5, 1)");
+        assert!(writes_sequence(&given) > writes_sequence(&program));
     }
 
     #[test]

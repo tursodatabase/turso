@@ -230,6 +230,7 @@ subquery in SET runs as the loop reaches each row. These still go to legacy:
 |---|---|
 | Enforced foreign keys, CDC, virtual tables, materialized views | As for DELETE |
 | `SET (a, b) = (SELECT ...)` | Assigning one subquery row to several columns |
+| A subquery in RETURNING of UPDATE ... FROM | One copy of a CTE that FROM and RETURNING both read |
 | A changed rowid, or a changed key of the index the loop reads | The same |
 | ON CONFLICT REPLACE on an index, when the loop reads an index | Deleting rows in place, as legacy does |
 | STRICT tables, custom types, generated columns | Type checks, encoding, computed columns |
@@ -252,7 +253,7 @@ inserted. These still go to legacy:
 | Trigger bodies of UPSERT DO UPDATE | UPSERT lowering |
 | UPSERT DO UPDATE that sets the INTEGER PRIMARY KEY, or fires UPDATE triggers | Moving the row; compiling those triggers |
 | OR IGNORE with an UPSERT (legacy drops the UPSERT) | The same rule |
-| AUTOINCREMENT, a DEFAULT on an INTEGER PRIMARY KEY | Sequence updates, rowid from the default |
+| AUTOINCREMENT under MVCC, a DEFAULT on an INTEGER PRIMARY KEY | The hidden MVCC sequence, rowid from the default |
 | WITHOUT ROWID and STRICT tables, custom types, generated columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
@@ -261,6 +262,14 @@ those that read a changed column; an UPSERT DO UPDATE checks all of them with
 ABORT. A NULL result passes, IGNORE skips the row, and REPLACE aborts. A
 failure reports the constraint's name, or its expression as the user wrote
 it. `PRAGMA ignore_check_constraints` turns them off.
+
+AUTOINCREMENT is lowered as legacy does it (`semantic_lowering/autoincrement.rs`).
+Each row opens `sqlite_sequence` and reads the target's row; a generated
+rowid is one more than the larger of that value and the table's largest
+rowid, and is stored at once; a rowid from the statement raises the stored
+value before any constraint is checked, even if the row is then skipped;
+after the row and its triggers the stored value is raised to the row's
+rowid. An INSERT of several rows first adds the target's row with 0.
 
 A subquery in RETURNING whose own FROM clause names the target table runs
 again for each row, as in SQLite and legacy, so it sees the rows written so

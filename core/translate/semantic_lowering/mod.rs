@@ -1,5 +1,6 @@
 //! Bytecode lowering from resolved semantic HIR.
 
+mod autoincrement;
 mod delete;
 mod dml;
 mod emit;
