@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod js;
-pub mod pg;
+pub mod pg_connection;
+pub mod postgres;
 pub mod rust;
+pub mod tursopg;
 
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
