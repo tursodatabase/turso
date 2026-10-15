@@ -145,25 +145,24 @@ subquery emits the same shell when its loop opens.
 
 `scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
 one process per file, and groups failures by cause. The first run on
-2026-10-14 passed 13602 conformance tests and failed 568. After the fixes
-above, a run passed 13808 and failed 363, before views were supported (43
-failures named views). With views and RIGHT and FULL joins, a run passed 13941
-and failed 230. Legacy passes all of them. Known gaps, largest first:
+2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-15 a run
+passed 14119 and failed 52; legacy passes all of them. What is left:
 
 | Gap | Failing tests | Example |
 |---|---|---|
-| Wrong results and EXPLAIN QUERY PLAN differences (see below) | ~90 | `explain-query-plan-json`, `unnest-correlated` |
-| Correlated derived and CTE sources | 4 | `subquery-correlated-from-clause-nested` |
+| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
+| Aggregates of outer columns inside subqueries (`count(outer.x)` belongs to the outer query) | 4 | `aggregate-of-outer-column` |
+| ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
 | Recursive CTE in FROM is materialized, so outer LIMIT cannot stop an infinite one (hangs) | 1 file | `recursive-cte-outer-limit-short-circuits-infinite-sequence` |
+| Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
+| A named window whose definition uses an aggregate, with GROUP BY | 1 | `named-window-with-group-by` |
+| `nth_value` with LIMIT stops before an invalid later argument | 1 | `nth-value-limit-stops-before-late-invalid-n` |
+| `cte.y` for a CTE not in FROM, under ORDER BY EXISTS, reports no such table | 1 | `cte-unreferenced-qualified-column-orderby-exists` |
+| Bare column next to several aggregates in HAVING with generated columns | 1 | `gencol_having_multiple_aggregates` |
+| Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
 
-Wrong results seen so far: row order of ORDER BY, GROUP BY, and window ties
-where legacy reads an index in order instead of sorting; aggregates of outer
-columns inside subqueries (`count(outer.x)` belongs to the outer query);
-nested correlated EXISTS; DISTINCT with OFFSET inside EXISTS; REAL affinity of
-index seek literals; compound subquery affinity; `avg` of large integers;
-three-level outer references; array display; temp schema rows. `SELECT a FROM
-t HAVING max(a) > 0` returns the row's value where legacy returns NULL (SQLite
-rejects it).
+`SELECT a FROM t HAVING max(a) > 0` returns the row's value where legacy
+returns NULL (SQLite rejects it).
 
 RIGHT and FULL joins use SQLite's nested-loop method instead of legacy's hash
 join. The right loop records each matched rowid in an ephemeral table, and
