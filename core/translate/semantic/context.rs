@@ -282,14 +282,17 @@ impl<'catalog> SemanticContext<'catalog> {
                     normalize_ident(database.as_str())
                 ))
             })?,
-            None => self
-                .unqualified_database_search_path
-                .iter()
-                .copied()
-                .find(|database| {
-                    self.database_schemas
-                        .get(database)
-                        .is_some_and(|schema| schema.get_table(&table_name).is_some())
+            None => schema_table_database(&table_name)
+                .filter(|database| self.unqualified_database_search_path.contains(database))
+                .or_else(|| {
+                    self.unqualified_database_search_path
+                        .iter()
+                        .copied()
+                        .find(|database| {
+                            self.database_schemas
+                                .get(database)
+                                .is_some_and(|schema| schema.get_table(&table_name).is_some())
+                        })
                 })
                 .ok_or_else(|| no_such_table(name))?,
         };
@@ -345,4 +348,22 @@ fn no_such_table(name: &turso_parser::ast::QualifiedName) -> LimboError {
         "no such table: {}",
         crate::util::table_name_for_error(name)
     ))
+}
+
+/// Like legacy and SQLite, an unqualified `sqlite_schema` or `sqlite_master`
+/// is main's schema table even when a temp schema exists, and
+/// `sqlite_temp_schema` or `sqlite_temp_master` is temp's.
+fn schema_table_database(table_name: &str) -> Option<DatabaseId> {
+    use crate::schema::{
+        SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME,
+        TEMP_SCHEMA_TABLE_NAME_ALT,
+    };
+    let is = |name: &str| table_name.eq_ignore_ascii_case(name);
+    if is(TEMP_SCHEMA_TABLE_NAME) || is(TEMP_SCHEMA_TABLE_NAME_ALT) {
+        Some(DatabaseId::new(crate::TEMP_DB_ID))
+    } else if is(SCHEMA_TABLE_NAME) || is(SCHEMA_TABLE_NAME_ALT) {
+        Some(DatabaseId::new(crate::MAIN_DB_ID))
+    } else {
+        None
+    }
 }

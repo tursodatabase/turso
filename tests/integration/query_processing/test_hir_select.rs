@@ -394,6 +394,27 @@ fn hir_grouping_over_an_expression_index_matches_legacy() {
 }
 
 #[test]
+fn hir_unqualified_sqlite_master_is_the_main_schema() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for conn in [&legacy, &hir] {
+        conn.execute("CREATE TEMP TABLE temp_only(x)").unwrap();
+    }
+    for sql in [
+        "SELECT count(*) FROM sqlite_master WHERE name = 'temp_only'",
+        "SELECT count(*) FROM sqlite_schema WHERE name = 'items'",
+        "SELECT count(*) FROM temp.sqlite_master WHERE name = 'temp_only'",
+        "SELECT count(*) FROM sqlite_temp_master WHERE name = 'temp_only'",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+#[test]
 fn hir_errors_match_legacy() {
     let db = setup();
     let [legacy, hir] = connections(&db);
