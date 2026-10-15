@@ -8,11 +8,13 @@
 //! subquery, CDC, or a virtual table still go through legacy; see
 //! [`needs_legacy`].
 
+use turso_parser::ast::TriggerTime;
+
 use crate::{
     translate::{
         optimizer::HirBtreeOperation,
-        semantic::hir::{self, HirRoot},
-        semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
+        semantic::hir,
+        semantic_to_plan::{HirAccessPlan, HirPlan, HirSourceAccess},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
@@ -23,57 +25,39 @@ use crate::{
 };
 
 use super::dml::{
-    emit_access_predicates, emit_index_key, operation_index, touches_at_most_one_row, DmlTarget,
-    ReturningBuffer,
+    emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
+    DmlTarget, ReturningBuffer,
 };
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
     PreparedHirBtreeLoop,
 };
+use super::trigger::{CompiledTrigger, TriggerRow};
 
 /// Whether this DELETE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
 /// the whole statement.
 pub(super) fn needs_legacy(
-    plan: &HirPlan,
+    delete: &hir::Delete,
+    access: &HirAccessPlan,
     foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
-    let document = &plan.document;
-    let HirRoot::Delete(delete) = &document.root else {
-        return Err(LimboError::InternalError(
-            "HIR DELETE analysis did not produce a DELETE root".into(),
-        ));
-    };
-    let HirRootPlan::Delete(access) = &plan.root else {
-        return Err(LimboError::InternalError(
-            "HIR DELETE plan has no DELETE access plan".into(),
-        ));
-    };
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
     // A RETURNING subquery that reads the target must see the table after
     // the row is deleted, but HIR reads RETURNING values before.
     if delete.returning.as_ref().is_some_and(|returning| {
-        returning.outputs.iter().any(|output| {
-            let mut has_subquery = false;
-            output.expr.for_each(&mut |expression| {
-                has_subquery |= matches!(expression, hir::Expr::Subquery(_));
-            });
-            has_subquery
-        })
+        returning
+            .outputs
+            .iter()
+            .any(|output| has_subquery(&output.expr))
     }) {
         return Ok(true);
     }
     match &delete.target_kind {
-        hir::DeleteTargetKind::BTree {
-            triggers,
-            foreign_keys,
-        } => {
-            if !triggers.is_empty() {
-                return Ok(true);
-            }
+        hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
             if foreign_keys_enabled
                 && (!foreign_keys.outgoing.is_empty() || !foreign_keys.incoming.is_empty())
             {
@@ -99,19 +83,16 @@ pub(super) fn needs_legacy(
     }
 }
 
-/// Emit a DELETE that [`needs_legacy`] accepted.
-pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Result<()> {
+/// Emit a DELETE that [`needs_legacy`] accepted. `delete` is the plan's
+/// root or one command of a trigger in it.
+pub(super) fn emit_delete(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    delete: &hir::Delete,
+    access: &HirAccessPlan,
+    triggers: &[CompiledTrigger],
+) -> Result<()> {
     let document = &plan.document;
-    let HirRoot::Delete(delete) = &document.root else {
-        return Err(LimboError::InternalError(
-            "HIR DELETE analysis did not produce a DELETE root".into(),
-        ));
-    };
-    let HirRootPlan::Delete(access) = &plan.root else {
-        return Err(LimboError::InternalError(
-            "HIR DELETE plan has no DELETE access plan".into(),
-        ));
-    };
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR DELETE plan has {} loops for one target",
@@ -130,13 +111,16 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
         ));
     };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?;
+    // Like legacy, a DELETE that fires triggers first collects its rowids,
+    // since a trigger can change the table.
+    let uses_rowset = uses_rowset(delete) || !triggers.is_empty();
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
     // After collecting rowids, legacy treats the delete as a scan.
-    if !uses_rowset(plan) && touches_at_most_one_row(operation) {
+    if !uses_rowset && touches_at_most_one_row(operation) {
         program.set_multi_write(false);
     }
-    program.set_may_abort(false);
+    program.set_may_abort(!triggers.is_empty());
 
     program.emit_source_explain(
         target.source.id,
@@ -144,8 +128,8 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
     );
     let returning = ReturningBuffer::open(program, target.table, delete.returning.as_ref());
     let done = program.allocate_label();
-    if uses_rowset(plan) {
-        emit_rowset_delete(program, plan, &target, access, returning, done)?;
+    if uses_rowset {
+        emit_rowset_delete(program, plan, &target, access, returning, triggers, done)?;
     } else {
         emit_scan_delete(program, &target, access, operation, returning, done)?;
     }
@@ -159,8 +143,8 @@ pub(super) fn emit_delete(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
 /// Whether the DELETE first collects the rowids of the rows to delete, then
 /// deletes them. Like legacy, a WHERE clause with a subquery does this, so
 /// the subquery never reads a table that is changing under it.
-fn uses_rowset(plan: &HirPlan) -> bool {
-    !plan.document.queries.is_empty()
+fn uses_rowset(delete: &hir::Delete) -> bool {
+    delete.predicate.as_ref().is_some_and(has_subquery)
 }
 
 /// Delete each row as the loop reaches it.
@@ -239,6 +223,7 @@ fn emit_rowset_delete(
     target: &DmlTarget<'_>,
     access: &HirAccessPlan,
     returning: Option<ReturningBuffer<'_>>,
+    triggers: &[CompiledTrigger],
     done: BranchOffset,
 ) -> Result<()> {
     let document = target.document;
@@ -290,7 +275,56 @@ fn emit_rowset_delete(
         rowid_reg: rowid,
         target_pc: next,
     });
+    let columns = target.table.columns().len();
+    let old = (!triggers.is_empty())
+        .then(|| -> Result<TriggerRow> {
+            // The OLD row the triggers read, as a query would read it.
+            program.bind_source(
+                target.source.id,
+                SourceBinding::BTree {
+                    scan_cursor: table_cursor,
+                    table_cursor: None,
+                },
+            );
+            let start = program.alloc_registers(columns);
+            for column in 0..columns {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &hir::Expr::Column(hir::ColumnRef {
+                        source: target.source.id,
+                        column,
+                    }),
+                    start + column,
+                )?;
+            }
+            Ok(TriggerRow {
+                columns: start,
+                rowid,
+            })
+        })
+        .transpose()?;
+    let fire = |program: &mut ProgramBuilder, time: TriggerTime| -> Result<()> {
+        for trigger in triggers.iter().filter(|trigger| trigger.time == time) {
+            // RAISE(IGNORE) skips the rest of this row.
+            trigger.emit_fire(program, old, None, columns, next)?;
+        }
+        Ok(())
+    };
+    fire(program, TriggerTime::Before)?;
+    if triggers
+        .iter()
+        .any(|trigger| trigger.time == TriggerTime::Before)
+    {
+        // A BEFORE trigger may have deleted or moved the row.
+        program.emit_insn(Insn::NotExists {
+            cursor: table_cursor,
+            rowid_reg: rowid,
+            target_pc: next,
+        });
+    }
     emit_delete_row(program, target, table_cursor, None, &indexes, returning)?;
+    fire(program, TriggerTime::After)?;
     program.emit_insn(Insn::Goto { target_pc: next });
     Ok(())
 }
@@ -386,19 +420,28 @@ fn emit_delete_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::semantic_to_plan::HirRootPlan;
     use crate::{
         schema::{BTreeTable, Schema},
         sync::Arc,
         translate::semantic_lowering::query::tests::{analyze_plan, indexed_items_schema, program},
     };
 
+    fn root(plan: &HirPlan) -> (&hir::Delete, &HirAccessPlan) {
+        match (&plan.document.root, &plan.root) {
+            (hir::HirRoot::Delete(delete), HirRootPlan::Delete(access)) => (delete, access),
+            _ => panic!("DELETE plan has a DELETE root"),
+        }
+    }
+
     /// Lower a DELETE that HIR accepts, as `translate_delete` does.
     fn emit(plan: HirPlan) -> ProgramBuilder {
         let plan = Arc::new(plan);
+        let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(&plan, true, &program).unwrap());
+        assert!(!needs_legacy(delete, access, true, &program).unwrap());
         program.set_hir_plan(plan.clone());
-        emit_delete(&mut program, &plan).unwrap();
+        emit_delete(&mut program, &plan, delete, access, &[]).unwrap();
         program
     }
 
@@ -469,7 +512,8 @@ mod tests {
             indexed_items_schema(),
             "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
         );
-        assert!(needs_legacy(&plan, false, &program()).unwrap());
+        let (delete, access) = root(&plan);
+        assert!(needs_legacy(delete, access, false, &program()).unwrap());
     }
 
     #[test]
@@ -488,8 +532,15 @@ mod tests {
         };
         for sql in ["DELETE FROM parent", "DELETE FROM child"] {
             let plan = analyze_plan(schema(), sql);
-            assert!(needs_legacy(&plan, true, &program()).unwrap(), "{sql}");
-            assert!(!needs_legacy(&plan, false, &program()).unwrap(), "{sql}");
+            let (delete, access) = root(&plan);
+            assert!(
+                needs_legacy(delete, access, true, &program()).unwrap(),
+                "{sql}"
+            );
+            assert!(
+                !needs_legacy(delete, access, false, &program()).unwrap(),
+                "{sql}"
+            );
         }
     }
 }

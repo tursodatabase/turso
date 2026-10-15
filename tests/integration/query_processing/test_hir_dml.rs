@@ -100,16 +100,53 @@ fn hir_delete_matches_legacy() {
         &["DELETE FROM t WHERE c NOT IN (SELECT c FROM t WHERE b > 4 AND c IS NOT NULL)"],
         &["DELETE FROM t WHERE a IN (SELECT a FROM t ORDER BY a DESC LIMIT 2) RETURNING a, g"],
         &["WITH m AS (SELECT max(a) AS v FROM t) DELETE FROM t WHERE a = (SELECT v FROM m)"],
-        // Statements that still go through legacy.
-        &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
+        // Triggers run from HIR-compiled subprograms.
         &[
             "CREATE TRIGGER tr AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a); END",
             "DELETE FROM t WHERE b = 2",
         ],
-        // A temp trigger also fires for a main table.
+        &[
+            "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (old.g); END",
+            "CREATE TRIGGER ad AFTER DELETE ON t WHEN old.b > 2 BEGIN \
+             INSERT INTO log VALUES ((SELECT count(*) FROM t)); SELECT 1; \
+             UPDATE u SET d = old.a WHERE a = 1; END",
+            "DELETE FROM t WHERE b > 1 RETURNING a",
+        ],
+        &[
+            "CREATE TRIGGER ig BEFORE DELETE ON t WHEN old.a = 3 BEGIN SELECT RAISE(IGNORE); END",
+            "DELETE FROM t",
+        ],
+        &[
+            "CREATE TRIGGER ab BEFORE DELETE ON t WHEN old.a = 3 BEGIN SELECT RAISE(ABORT, 'no'); END",
+            "DELETE FROM t",
+        ],
+        // A trigger whose body deletes from its own table does not fire
+        // itself again.
+        &[
+            "CREATE TRIGGER chain AFTER DELETE ON t BEGIN \
+             DELETE FROM t WHERE a = old.a + 1; INSERT INTO log VALUES (old.a); END",
+            "DELETE FROM t WHERE a = 1",
+        ],
+        // A temp trigger also fires for a main table, and before the table's
+        // own triggers.
         &[
             "CREATE TEMP TRIGGER tr AFTER DELETE ON main.t BEGIN \
              INSERT INTO log VALUES (old.a); END",
+            "DELETE FROM t WHERE b = 2",
+        ],
+        &[
+            "CREATE TRIGGER m1 AFTER DELETE ON t BEGIN INSERT INTO log VALUES (1); END",
+            "CREATE TRIGGER m2 AFTER DELETE ON t BEGIN INSERT INTO log VALUES (2); END",
+            "CREATE TEMP TRIGGER t1 AFTER DELETE ON main.t BEGIN INSERT INTO log VALUES (3); END",
+            "CREATE TEMP TRIGGER t2 AFTER DELETE ON main.t BEGIN INSERT INTO log VALUES (4); END",
+            "DELETE FROM t WHERE a = 1",
+            "SELECT rowid, a FROM log ORDER BY rowid",
+        ],
+        // Statements that still go through legacy.
+        &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
+        &[
+            "CREATE TRIGGER lg AFTER INSERT ON log BEGIN DELETE FROM u WHERE a = new.a; END",
+            "CREATE TRIGGER tr AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a); END",
             "DELETE FROM t WHERE b = 2",
         ],
         &[

@@ -16,7 +16,7 @@ use crate::{
     translate::{
         insert::halt_desc_and_on_error,
         semantic::hir::{self, HirRoot},
-        semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
         stmt_journal::constraint_may_abort,
     },
     vdbe::{
@@ -29,8 +29,8 @@ use crate::{
 };
 
 use super::dml::{
-    emit_access_predicates, emit_index_key, operation_index, touches_at_most_one_row, DmlTarget,
-    ReturningBuffer,
+    emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
+    DmlTarget, ReturningBuffer,
 };
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, start_hir_btree_loop, PreparedHirBtreeLoop,
@@ -41,11 +41,12 @@ use super::query::{
 /// the whole statement.
 pub(super) fn needs_legacy(
     plan: &HirPlan,
+    update: &hir::Update,
+    access: &HirAccessPlan,
     foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    let (update, access) = update_root(plan)?;
     if update.from.is_some()
         || !update.order_by.is_empty()
         || update.limit.is_some()
@@ -56,7 +57,18 @@ pub(super) fn needs_legacy(
     }
     // Subqueries: legacy collects the rows to change first when the WHERE
     // clause has one, and reads SET and RETURNING subqueries at set points.
-    if !document.queries.is_empty() {
+    if update.predicate.as_ref().is_some_and(has_subquery)
+        || update
+            .assignments
+            .iter()
+            .any(|assignment| has_subquery(&assignment.value))
+        || update.returning.as_ref().is_some_and(|returning| {
+            returning
+                .outputs
+                .iter()
+                .any(|output| has_subquery(&output.expr))
+        })
+    {
         return Ok(true);
     }
     match &update.target_kind {
@@ -162,10 +174,16 @@ pub(super) fn needs_legacy(
     ))
 }
 
-/// Emit an UPDATE that [`needs_legacy`] accepted.
-pub(super) fn emit_update(program: &mut ProgramBuilder, plan: &HirPlan, mvcc: bool) -> Result<()> {
+/// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
+/// root or one command of a trigger in it.
+pub(super) fn emit_update(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    update: &hir::Update,
+    access: &HirAccessPlan,
+    mvcc: bool,
+) -> Result<()> {
     let document = &plan.document;
-    let (update, access) = update_root(plan)?;
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR UPDATE plan has {} loops for one target",
@@ -439,12 +457,7 @@ pub(super) fn emit_update(program: &mut ProgramBuilder, plan: &HirPlan, mvcc: bo
     Ok(())
 }
 
-fn update_root(
-    plan: &HirPlan,
-) -> Result<(
-    &hir::Update,
-    &crate::translate::semantic_to_plan::HirAccessPlan,
-)> {
+pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPlan)> {
     let HirRoot::Update(update) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR UPDATE analysis did not produce an UPDATE root".into(),
@@ -824,9 +837,13 @@ mod tests {
     fn emit(sql: &str) -> ProgramBuilder {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
-        assert!(!needs_legacy(&plan, true, &program).unwrap(), "{sql}");
+        let (update, access) = update_root(&plan).unwrap();
+        assert!(
+            !needs_legacy(&plan, update, access, true, &program).unwrap(),
+            "{sql}"
+        );
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, false).unwrap();
+        emit_update(&mut program, &plan, update, access, false).unwrap();
         program
     }
 
@@ -889,7 +906,11 @@ mod tests {
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
         ] {
             let plan = analyze_plan(schema(), sql);
-            assert!(needs_legacy(&plan, false, &program()).unwrap(), "{sql}");
+            let (update, access) = update_root(&plan).unwrap();
+            assert!(
+                needs_legacy(&plan, update, access, false, &program()).unwrap(),
+                "{sql}"
+            );
         }
     }
 }

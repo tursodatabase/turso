@@ -29,20 +29,32 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
-use super::dml::{DmlTarget, ReturningBuffer};
+use super::dml::{has_subquery, DmlTarget, ReturningBuffer};
 
 /// Whether this INSERT uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
 /// the whole statement.
 pub(super) fn needs_legacy(
     plan: &HirPlan,
+    insert: &hir::Insert,
     foreign_keys_enabled: bool,
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    let insert = insert_root(plan)?;
     // INSERT ... SELECT and subqueries.
-    if !document.queries.is_empty() {
+    let values_have_subquery = match &insert.source {
+        hir::InsertSource::Query(_) => true,
+        hir::InsertSource::DefaultValues => false,
+        hir::InsertSource::Values(rows) => rows.iter().flatten().any(has_subquery),
+    };
+    if values_have_subquery
+        || insert.returning.as_ref().is_some_and(|returning| {
+            returning
+                .outputs
+                .iter()
+                .any(|output| has_subquery(&output.expr))
+        })
+    {
         return Ok(true);
     }
     if !insert.upserts.is_empty()
@@ -124,10 +136,14 @@ pub(super) fn needs_legacy(
     }))
 }
 
-/// Emit an INSERT that [`needs_legacy`] accepted.
-pub(super) fn emit_insert(program: &mut ProgramBuilder, plan: &HirPlan) -> Result<()> {
+/// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
+/// root or one command of a trigger in it.
+pub(super) fn emit_insert(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+) -> Result<()> {
     let document = &plan.document;
-    let insert = insert_root(plan)?;
     let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
         return Err(LimboError::InternalError(
             "HIR INSERT target is not a B-tree table".into(),
@@ -281,7 +297,7 @@ pub(super) fn emit_insert(program: &mut ProgramBuilder, plan: &HirPlan) -> Resul
     Ok(())
 }
 
-fn insert_root(plan: &HirPlan) -> Result<&hir::Insert> {
+pub(super) fn insert_root(plan: &HirPlan) -> Result<&hir::Insert> {
     let HirRoot::Insert(insert) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR INSERT analysis did not produce an INSERT root".into(),
@@ -695,9 +711,13 @@ mod tests {
     fn emit(sql: &str) -> ProgramBuilder {
         let plan = Arc::new(analyze_plan(indexed_items_schema(), sql));
         let mut program = program();
-        assert!(!needs_legacy(&plan, true, &program).unwrap(), "{sql}");
+        let insert = insert_root(&plan).unwrap();
+        assert!(
+            !needs_legacy(&plan, insert, true, &program).unwrap(),
+            "{sql}"
+        );
         program.set_hir_plan(plan.clone());
-        emit_insert(&mut program, &plan).unwrap();
+        emit_insert(&mut program, &plan, insert).unwrap();
         program
     }
 
@@ -757,7 +777,11 @@ mod tests {
             "INSERT INTO items VALUES ((SELECT 1), 'x')",
         ] {
             let plan = analyze_plan(indexed_items_schema(), sql);
-            assert!(needs_legacy(&plan, false, &program()).unwrap(), "{sql}");
+            let insert = insert_root(&plan).unwrap();
+            assert!(
+                needs_legacy(&plan, insert, false, &program()).unwrap(),
+                "{sql}"
+            );
         }
     }
 }

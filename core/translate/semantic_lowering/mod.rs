@@ -5,6 +5,7 @@ mod dml;
 pub(super) mod expr;
 mod insert;
 pub(super) mod query;
+mod trigger;
 mod update;
 mod window;
 
@@ -24,7 +25,7 @@ use crate::{
             hir::{self, HirDocument, HirRoot, OutputNameKind},
             SemanticOptions, SemanticRootInput,
         },
-        semantic_to_plan::HirPlan,
+        semantic_to_plan::{HirPlan, HirRootPlan},
     },
     vdbe::{affinity::Affinity, builder::ProgramBuilder},
     Connection, LimboError, Result,
@@ -61,17 +62,25 @@ pub(crate) fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
-    if delete::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+    let session = HirSession::new(schema, resolver, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
+    let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
+    else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE analysis did not produce a DELETE root".into(),
+        ));
+    };
+    if delete::needs_legacy(delete, access, connection.foreign_keys_enabled(), program)? {
         return Ok(false);
     }
+    // Triggers are compiled before anything is emitted, so one that needs
+    // legacy still leaves the whole statement to legacy.
+    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete, None)? else {
+        return Ok(false);
+    };
     program.set_hir_plan(plan.clone());
-    delete::emit_delete(program, &plan)?;
-    if let HirRoot::Delete(hir::Delete {
-        returning: Some(returning),
-        ..
-    }) = &plan.document.root
-    {
+    delete::emit_delete(program, &plan, delete, access, &triggers)?;
+    if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
@@ -89,21 +98,23 @@ pub(crate) fn translate_update(
     connection: &Arc<Connection>,
 ) -> Result<bool> {
     let plan = analyze_and_plan(statement, schema, resolver, connection)?;
-    if update::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+    let (update, access) = update::update_root(&plan)?;
+    if update::needs_legacy(
+        &plan,
+        update,
+        access,
+        connection.foreign_keys_enabled(),
+        program,
+    )? {
         return Ok(false);
     }
-    let HirRoot::Update(update) = &plan.document.root else {
-        return Err(LimboError::InternalError(
-            "HIR UPDATE analysis did not produce an UPDATE root".into(),
-        ));
-    };
     let mvcc = plan
         .document
         .source(update.target)
         .and_then(|source| source.database)
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
     program.set_hir_plan(plan.clone());
-    update::emit_update(program, &plan, mvcc)?;
+    update::emit_update(program, &plan, update, access, mvcc)?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -122,20 +133,79 @@ pub(crate) fn translate_insert(
     connection: &Arc<Connection>,
 ) -> Result<bool> {
     let plan = analyze_and_plan(statement, schema, resolver, connection)?;
-    if insert::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+    let insert = insert::insert_root(&plan)?;
+    if insert::needs_legacy(&plan, insert, connection.foreign_keys_enabled(), program)? {
         return Ok(false);
     }
     program.set_hir_plan(plan.clone());
-    insert::emit_insert(program, &plan)?;
-    if let HirRoot::Insert(hir::Insert {
-        returning: Some(returning),
-        ..
-    }) = &plan.document.root
-    {
+    insert::emit_insert(program, &plan, insert)?;
+    if let Some(returning) = &insert.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
     Ok(true)
+}
+
+/// What every HIR document of one statement is analyzed and planned with:
+/// the statement itself and each trigger it fires.
+pub(super) struct HirSession<'a> {
+    pub(super) schema: &'a Arc<Schema>,
+    pub(super) connection: &'a Arc<Connection>,
+    catalog: SemanticCatalog,
+    symbols: &'a crate::SymbolTable,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+    custom_types_enabled: bool,
+    dqs_dml: DoubleQuotedDml,
+}
+
+impl<'a> HirSession<'a> {
+    fn new(
+        schema: &'a Arc<Schema>,
+        resolver: &'a Resolver,
+        connection: &'a Arc<Connection>,
+    ) -> Result<Self> {
+        let catalog = SemanticCatalog::capture(
+            schema.clone(),
+            connection.database_schemas(),
+            &connection.temp.database,
+            connection.attached_databases(),
+            resolver.custom_types_enabled(),
+            resolver.dialect.as_ref(),
+            resolver.unqualified_database_search_path().as_deref(),
+        )?;
+        Ok(Self {
+            schema,
+            connection,
+            catalog,
+            symbols: resolver.symbol_table,
+            dialect: resolver.dialect.clone(),
+            custom_types_enabled: resolver.custom_types_enabled(),
+            dqs_dml: if resolver.dqs_dml.is_enabled() {
+                DoubleQuotedDml::Enabled
+            } else {
+                DoubleQuotedDml::Disabled
+            },
+        })
+    }
+
+    /// Analyze `input` into HIR and choose its access paths.
+    pub(super) fn plan(&self, input: SemanticRootInput<'_>) -> Result<Arc<HirPlan>> {
+        let document = analyze_root(
+            &self.catalog,
+            self.symbols,
+            SemanticOptions {
+                dialect: self.dialect.clone(),
+                custom_types_enabled: self.custom_types_enabled,
+                dqs_dml: self.dqs_dml,
+            },
+            input,
+        )?;
+        Ok(Arc::new(HirPlan::build(
+            Arc::new(document),
+            self.schema,
+            cost_model_params(),
+        )?))
+    }
 }
 
 /// Analyze one statement into HIR and choose its access paths.
@@ -145,34 +215,7 @@ fn analyze_and_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<Arc<HirPlan>> {
-    let catalog = SemanticCatalog::capture(
-        schema.clone(),
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        resolver.custom_types_enabled(),
-        resolver.dialect.as_ref(),
-        resolver.unqualified_database_search_path().as_deref(),
-    )?;
-    let document = analyze_root(
-        &catalog,
-        resolver.symbol_table,
-        SemanticOptions {
-            dialect: resolver.dialect.clone(),
-            custom_types_enabled: resolver.custom_types_enabled(),
-            dqs_dml: if resolver.dqs_dml.is_enabled() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
-        },
-        SemanticRootInput::Statement(statement),
-    )?;
-    Ok(Arc::new(HirPlan::build(
-        Arc::new(document),
-        schema,
-        cost_model_params(),
-    )?))
+    HirSession::new(schema, resolver, connection)?.plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It

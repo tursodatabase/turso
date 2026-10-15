@@ -378,3 +378,12 @@ impl<'a> ReturningBuffer<'a> {
         );
     }
 }
+
+/// Whether an expression contains a subquery.
+pub(super) fn has_subquery(expression: &hir::Expr) -> bool {
+    let mut found = false;
+    expression.for_each(&mut |expression| {
+        found |= matches!(expression, hir::Expr::Subquery(_));
+    });
+    found
+}
