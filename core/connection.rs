@@ -401,6 +401,11 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// Set by BEGIN CONCURRENT and cleared by every other BEGIN. While the
+    /// explicit transaction has not materialized its MVCC transaction yet,
+    /// the first statement reads this to materialize it in concurrent mode.
+    /// Only meaningful while `auto_commit` is false; every BEGIN rewrites it.
+    pub(crate) explicit_tx_is_concurrent: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only

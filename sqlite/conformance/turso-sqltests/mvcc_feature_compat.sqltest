@@ -166,3 +166,35 @@ expect {
     mvcc
     0|6
 }
+
+# BEGIN CONCURRENT is deferred: BEGIN itself opens nothing, an empty
+# transaction commits cleanly, and a nested BEGIN gets the standard error.
+
+test mvcc-begin-concurrent-idle-commit {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN CONCURRENT;
+    COMMIT;
+    SELECT 1;
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-begin-concurrent-after-begin-errors {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN;
+    BEGIN CONCURRENT;
+}
+expect error {
+    cannot start a transaction within a transaction
+}
+
+test mvcc-begin-after-begin-concurrent-errors {
+    PRAGMA journal_mode = 'mvcc';
+    BEGIN CONCURRENT;
+    BEGIN;
+}
+expect error {
+    cannot start a transaction within a transaction
+}
