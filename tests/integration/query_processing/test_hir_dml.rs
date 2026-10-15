@@ -142,6 +142,22 @@ fn hir_delete_matches_legacy() {
             "DELETE FROM t WHERE a = 1",
             "SELECT rowid, a FROM log ORDER BY rowid",
         ],
+        // OLD.x compares without the column's affinity, so the REAL 7.0
+        // is not equal to the text '7'. OLD.a reads the rowid, which keeps
+        // INTEGER affinity.
+        &[
+            "CREATE TRIGGER aff BEFORE DELETE ON t WHEN old.d = '7' OR old.a = '1' BEGIN \
+             INSERT INTO log VALUES (old.a); END",
+            "DELETE FROM t",
+        ],
+        // A trigger on a TEMP table finds an unqualified main table.
+        &[
+            "CREATE TEMP TABLE tt(x)",
+            "INSERT INTO tt VALUES (2), (5)",
+            "CREATE TRIGGER tt_d AFTER DELETE ON temp.tt BEGIN \
+             DELETE FROM t WHERE a = old.x; INSERT INTO log VALUES (old.x); END",
+            "DELETE FROM tt WHERE x = 2",
+        ],
         // Statements that still go through legacy.
         &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
         &[

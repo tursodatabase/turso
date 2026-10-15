@@ -112,6 +112,10 @@ fn compile_trigger(
     let definition = trigger.value();
     let plan = session.plan(SemanticRootInput::TriggerProgram {
         database: hir::DatabaseId::new(database),
+        // Triggers stored in the temp schema (TEMP triggers, and triggers on
+        // TEMP tables) look up their command tables by the normal rules.
+        command_database: (!definition.temporary && database != crate::TEMP_DB_ID)
+            .then(|| hir::DatabaseId::new(database)),
         table_name: &table.name,
         event: definition.event.clone(),
         predicate: definition.when_clause.as_ref(),

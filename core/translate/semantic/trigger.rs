@@ -42,7 +42,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         input: TriggerProgramInput<'ast>,
     ) -> Result<hir::HirRoot> {
-        let database = input.context.database;
+        let database = input.command_database;
         let (environment, scope) = self.create_trigger_environment(input.context)?;
         let predicate = input
             .predicate
@@ -103,7 +103,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         context: TriggerAnalysis,
         insert: TriggerInsert<'ast>,
     ) -> Result<hir::HirRoot> {
-        let database = context.database;
+        let database = Some(context.database);
         let (environment, scope) = self.create_trigger_environment(context)?;
         let command = self.analyze_trigger_insert_in(database, &environment, &scope, insert)?;
         Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
@@ -117,7 +117,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         context: TriggerAnalysis,
         update: TriggerUpdate<'ast>,
     ) -> Result<hir::HirRoot> {
-        let database = context.database;
+        let database = Some(context.database);
         let (environment, scope) = self.create_trigger_environment(context)?;
         let command = self.analyze_trigger_update_in(database, &environment, &scope, update)?;
         Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
@@ -131,7 +131,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         context: TriggerAnalysis,
         delete: TriggerDelete<'ast>,
     ) -> Result<hir::HirRoot> {
-        let database = context.database;
+        let database = Some(context.database);
         let (environment, scope) = self.create_trigger_environment(context)?;
         let command = self.analyze_trigger_delete_in(database, &environment, &scope, delete)?;
         Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
@@ -166,16 +166,36 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(hir::TriggerCommand::Select(query))
     }
 
+    /// Resolve the table an INSERT, UPDATE or DELETE inside a trigger writes.
+    /// `database` is the trigger's own database. TEMP triggers pass `None`
+    /// and use the normal temp-then-main lookup, like SQLite.
+    fn analyze_trigger_target(
+        &mut self,
+        table: &ast::Name,
+        database: Option<hir::DatabaseId>,
+    ) -> Result<hir::SourceId> {
+        match database {
+            Some(database) => {
+                self.analyze_base_table_source_in_database(table, database, SourceOwner::Root)
+            }
+            None => self.analyze_base_table_source(
+                &ast::QualifiedName::single(table.clone()),
+                None,
+                None,
+                SourceOwner::Root,
+            ),
+        }
+    }
+
     fn analyze_trigger_insert_in(
         &mut self,
-        database: hir::DatabaseId,
+        database: Option<hir::DatabaseId>,
         environment: &hir::TriggerEnvironment,
         scope: &Scope,
         insert: TriggerInsert<'ast>,
     ) -> Result<hir::TriggerCommand> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
-        let target =
-            self.analyze_base_table_source_in_database(insert.table, database, SourceOwner::Root)?;
+        let target = self.analyze_trigger_target(insert.table, database)?;
         let root = self.analyze_insert_target(
             None,
             insert.conflict_override.or(insert.command_conflict),
@@ -199,14 +219,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
     fn analyze_trigger_update_in(
         &mut self,
-        database: hir::DatabaseId,
+        database: Option<hir::DatabaseId>,
         environment: &hir::TriggerEnvironment,
         scope: &Scope,
         update: TriggerUpdate<'ast>,
     ) -> Result<hir::TriggerCommand> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
-        let target =
-            self.analyze_base_table_source_in_database(update.table, database, SourceOwner::Root)?;
+        let target = self.analyze_trigger_target(update.table, database)?;
         let root = self.analyze_update_target(
             target,
             UpdateBodySyntax {
@@ -229,14 +248,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
     fn analyze_trigger_delete_in(
         &mut self,
-        database: hir::DatabaseId,
+        database: Option<hir::DatabaseId>,
         environment: &hir::TriggerEnvironment,
         scope: &Scope,
         delete: TriggerDelete<'ast>,
     ) -> Result<hir::TriggerCommand> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
-        let target =
-            self.analyze_base_table_source_in_database(delete.table, database, SourceOwner::Root)?;
+        let target = self.analyze_trigger_target(delete.table, database)?;
         let root = self.analyze_delete_target(
             target,
             delete.predicate,
@@ -254,7 +272,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
     fn analyze_trigger_command_in(
         &mut self,
-        database: hir::DatabaseId,
+        database: Option<hir::DatabaseId>,
         environment: &hir::TriggerEnvironment,
         scope: &Scope,
         command: &'ast ast::TriggerCmd,
@@ -403,7 +421,18 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     kind: row.pseudo_source(),
                     table: table.clone(),
                 },
-                columns: columns.to_vec(),
+                // SQLite gives OLD.x and NEW.x no comparison affinity in
+                // trigger programs, so `OLD.a = 10` on a TEXT column holding
+                // '10' is false. A rowid alias reads the rowid and keeps
+                // INTEGER affinity. Collation still comes from the column.
+                columns: columns
+                    .iter()
+                    .cloned()
+                    .map(|mut column| {
+                        column.has_affinity &= column.rowid_alias;
+                        column
+                    })
+                    .collect(),
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; columns.len()],
                 column_type_programs: column_type_programs.to_vec(),
