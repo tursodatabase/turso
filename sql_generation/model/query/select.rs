@@ -227,7 +227,11 @@ impl FromClause {
                 SelectTable::Table(table) => {
                     ast::SelectTable::Table(table_qualified_name(table), None, None)
                 }
-                SelectTable::Select(select) => ast::SelectTable::Select(select.to_sql_ast(), None),
+                SelectTable::Select(select) => ast::SelectTable::Select {
+                    select: select.to_sql_ast(),
+                    alias: None,
+                    lateral: false,
+                },
             }),
             joins: self
                 .joins
