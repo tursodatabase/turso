@@ -212,6 +212,10 @@ fn hir_expression_subqueries_match_legacy_rows() {
         // A recursive CTE that reads an outer column runs again per outer row.
         "SELECT id, (WITH RECURSIVE c(x) AS (SELECT items.id UNION ALL SELECT x + 1 FROM c \
          WHERE x < 4) SELECT count(*) FROM c) FROM items ORDER BY id",
+        // A recursive CTE's reference to itself has no affinity, so '2' < 3
+        // is false and the recursion stops.
+        "WITH RECURSIVE c(x) AS (SELECT value FROM items WHERE id = 1 UNION ALL \
+         SELECT '2' FROM c WHERE x < 3 LIMIT 10) SELECT count(*) FROM c",
         // The index on `value` does not cover `items` here: the subquery reads
         // `items.extra`.
         "SELECT value FROM items WHERE value > 15 \

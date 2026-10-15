@@ -602,13 +602,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             CteResolution::RecursiveInput { cte, columns } => (cte, true, columns),
         };
+        // Like SQLite, a recursive CTE's reference to itself has no
+        // affinity; a read from outside keeps the anchor query's.
         let columns = cte_columns
             .iter()
             .map(|column| hir::SourceColumn {
                 name: column.name.clone(),
                 type_fact: column.type_fact.clone(),
-                affinity: column.affinity,
-                has_affinity: column.has_affinity,
+                affinity: if recursive {
+                    Affinity::Blob
+                } else {
+                    column.affinity
+                },
+                has_affinity: column.has_affinity && !recursive,
                 collation: column.collation.clone(),
                 hidden: false,
                 rowid_alias: false,
