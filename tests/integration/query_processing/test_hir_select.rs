@@ -70,6 +70,10 @@ fn hir_select_matches_legacy_rows_and_columns() {
         "SELECT extra AS e, count(*) FROM items GROUP BY e ORDER BY e",
         "SELECT extra, sum(value) FILTER (WHERE value > 15) AS s FROM items GROUP BY extra HAVING s > 0",
         "SELECT extra AS e, count(*) FROM items GROUP BY 1 ORDER BY 1",
+        // Groups are sorted in the ORDER BY direction, so ties come out like
+        // legacy and SQLite.
+        "SELECT extra, count(*) FROM items GROUP BY extra ORDER BY count(*) DESC",
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY value DESC",
         "SELECT json_valid('{a:1}', 6), json_valid('{}')",
         // Blocks without FROM run GROUP BY and HAVING over their one row.
         "SELECT 1 GROUP BY 1 HAVING count(*) FILTER (WHERE 1 IN (SELECT 1)) = 1",

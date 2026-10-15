@@ -1184,6 +1184,74 @@ fn emit_hir_grouped_aggregate<'a>(
     emit_hir_group_result(program, &plan.document, query, block, output, &runtime)
 }
 
+/// The direction to sort each GROUP BY key in, like legacy and SQLite, so
+/// ORDER BY ties come out in the same order. When every ORDER BY term is an
+/// aggregate or a constant, all keys follow the first term's direction.
+/// Otherwise a key follows the ORDER BY term equal to it, or sorts
+/// ascending.
+fn hir_group_key_orders(
+    document: &HirDocument,
+    query: &hir::Query,
+    grouping: &hir::Grouping,
+) -> Vec<(SortOrder, Option<turso_parser::ast::NullsOrder>)> {
+    let Some(first) = query.order_by.first() else {
+        return vec![(SortOrder::Asc, None); grouping.keys.len()];
+    };
+    let terms = query.order_by.iter().map(|term| {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(output) = expression {
+            match document.output(*output) {
+                Some(output) => expression = &output.expr,
+                None => break,
+            }
+        }
+        (expression, term.order, term.nulls)
+    });
+    if terms.clone().all(|(expression, ..)| {
+        is_hir_aggregate_call(expression) || is_hir_constant(expression)
+    }) {
+        return vec![(first.order, first.nulls); grouping.keys.len()];
+    }
+    grouping
+        .keys
+        .iter()
+        .map(|key| {
+            terms
+                .clone()
+                .find(|(expression, ..)| expression.equivalent(key))
+                .map_or((SortOrder::Asc, None), |(_, order, nulls)| (order, nulls))
+        })
+        .collect()
+}
+
+fn is_hir_aggregate_call(expression: &hir::Expr) -> bool {
+    matches!(
+        expression,
+        hir::Expr::Function(call)
+            if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
+    )
+}
+
+/// Whether the expression reads no row and always gives the same value.
+fn is_hir_constant(expression: &hir::Expr) -> bool {
+    let mut constant = true;
+    expression.for_each(&mut |expression| match expression {
+        hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::MergedColumn(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Subquery(_) => constant = false,
+        hir::Expr::Function(call)
+            if !matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                || !crate::function::Deterministic::is_deterministic(call.function.value()) =>
+        {
+            constant = false
+        }
+        _ => {}
+    });
+    constant
+}
+
 fn initialize_hir_group_runtime<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
@@ -1279,14 +1347,14 @@ fn initialize_hir_group_runtime<'a>(
     let rows = if block_plan.group_sort_elided {
         HirGroupRows::InputOrdered
     } else {
-        let order_collations_nulls = grouping
-            .key_collations
-            .iter()
-            .map(|collation| {
+        let order_collations_nulls = hir_group_key_orders(&plan.document, query, grouping)
+            .into_iter()
+            .zip(&grouping.key_collations)
+            .map(|((order, nulls), collation)| {
                 (
-                    SortOrder::Asc,
+                    order,
                     collation.as_ref().map(|collation| *collation.value()),
-                    None,
+                    nulls,
                 )
             })
             .collect();
