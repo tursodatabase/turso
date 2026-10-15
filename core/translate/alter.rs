@@ -1973,6 +1973,16 @@ pub fn translate_alter_table(
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_type_affinities(resolver.schema());
                 table.prepare_generated_columns()?;
+                let column_names: Vec<&str> = table
+                    .columns()
+                    .iter()
+                    .filter_map(|c| c.name.as_deref())
+                    .collect();
+                for constraint in &definition.constraints {
+                    if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
+                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                    }
+                }
                 Some(table)
             } else {
                 None
