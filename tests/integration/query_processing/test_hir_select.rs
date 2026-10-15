@@ -89,6 +89,9 @@ fn hir_select_matches_legacy_rows_and_columns() {
          SELECT s.id, s.tag FROM s ORDER BY 1, 2",
         "SELECT d.id FROM (SELECT items.rowid FROM items) AS d WHERE d.id < 3 ORDER BY 1",
         "SELECT * FROM (SELECT i.value FROM items i WHERE i.id < 3) ORDER BY 1",
+        // A subquery column computed from a literal has no affinity, so 2
+        // stays an integer.
+        "SELECT x, typeof(x) FROM (SELECT 1.5 AS x UNION ALL SELECT 2)",
         // A compound ORDER BY term matches an output expression of any arm.
         "SELECT a.id FROM items a UNION ALL SELECT b.value FROM items b ORDER BY b.value",
         "SELECT value + 1 FROM items UNION SELECT id FROM tags, items ORDER BY value + 1",

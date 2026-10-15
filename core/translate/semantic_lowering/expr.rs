@@ -3196,7 +3196,10 @@ impl ExprLowerer<'_, '_, '_> {
                     self.program
                         .emit_column_or_rowid(read.cursor, read.column, target);
                 }
-                if apply_storage_affinity {
+                // A REAL column gives back integral values as REAL. A
+                // subquery column without affinity, such as one computed
+                // from a literal, gives values back as they were stored.
+                if apply_storage_affinity && column.has_affinity {
                     let Some(storage) = column.type_fact.storage else {
                         return Ok(());
                     };
