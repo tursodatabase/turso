@@ -1433,6 +1433,34 @@ test strftime-error-null {
 expect {
 }
 
+test strftime-modifiers-out-of-range {
+    SELECT quote(strftime('%Y-%m-%d', 0, '-1 day')),
+           quote(strftime('%Y', 1, 'start of year')),
+           quote(strftime('%d', 5373484, '+1 day')),
+           quote(strftime('x', 0, '-1 day')),
+           quote(strftime('x', 5373484, '+1 day')),
+           quote(strftime('', 0, '-1 day'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test strftime-modifiers-out-of-range-where {
+    WITH t1(a, b) AS (VALUES (0, '-1 day'), (5373484, '+1 day'))
+    SELECT count(*) FROM t1 WHERE strftime('%Y', a, b) IS NOT NULL;
+}
+expect {
+    0
+}
+
+test strftime-modifiers-valid-boundaries {
+    SELECT strftime('%Y-%m-%d %H:%M:%f', 1, '-1 day'),
+           strftime('%Y-%m-%d %H:%M:%f', '9999-12-31 23:59:58.999', '+1 second');
+}
+expect {
+    -4713-11-24 12:00:00.000|9999-12-31 23:59:59.999
+}
+
 test strftime-day {
     SELECT strftime('%d', '2025-01-23T13:10:30.567');
 }
