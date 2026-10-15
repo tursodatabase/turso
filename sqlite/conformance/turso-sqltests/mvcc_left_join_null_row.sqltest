@@ -14,3 +14,19 @@ test mvcc-left-join-null-row {
 expect {
     1|
 }
+
+# A virtual generated column on the null-extended side must read as NULL
+# with MVCC cursors too.
+test mvcc-left-join-null-row-generated-column {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES (1);
+    SELECT x, a, g, typeof(g) FROM l LEFT JOIN r ON false;
+    SELECT x FROM l LEFT JOIN r ON false WHERE g IS NULL;
+}
+expect {
+    mvcc
+    1|||null
+    1
+}
