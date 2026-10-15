@@ -265,6 +265,24 @@ expect error {
 }
 
 @requires custom_types "uses CREATE DOMAIN"
+test domain-drop-quoted-table-dep-fail {
+    CREATE DOMAIN "drop d" AS integer;
+    CREATE TABLE t1(x "drop d") STRICT;
+    DROP DOMAIN "drop d";
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-drop-quoted-dependent-fail {
+    CREATE DOMAIN "drop base" AS integer;
+    CREATE DOMAIN drop_child AS "drop base";
+    DROP DOMAIN "drop base";
+}
+expect error {
+}
+
+@requires custom_types "uses CREATE DOMAIN"
 test domain-drop-table-dep-ok {
     CREATE DOMAIN drop_d AS integer;
     CREATE TABLE t1(x drop_d) STRICT;
