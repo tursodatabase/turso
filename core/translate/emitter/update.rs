@@ -790,6 +790,9 @@ fn emit_replace_delete<'a>(
 /// This is invoked once for every UPDATE, but will be invoked again if there are
 /// any BEFORE UPDATE triggers that fired, because the triggers may have modified the row,
 /// in which case the previously read values are stale.
+///
+/// Returns whether an unchanged column was read from the table cursor. That read
+/// happens for every row, so it finishes any pending DeferredSeek.
 #[allow(clippy::too_many_arguments)]
 fn emit_update_column_values<'a>(
     program: &mut ProgramBuilder,
@@ -800,8 +803,9 @@ fn emit_update_column_values<'a>(
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let or_conflict = program.resolve_type;
+    let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
         .find(|set_clause| set_clause.column_index == ROWID_SENTINEL)
@@ -1006,6 +1010,7 @@ fn emit_update_column_values<'a>(
                             .filter(|_| column_idx_in_index.is_some())
                             .map(|(_, id)| *id)
                             .unwrap_or(column_ctx.target_table_cursor_id);
+                        table_column_was_read |= cursor_id == column_ctx.target_table_cursor_id;
                         program.emit_column_or_rowid(
                             cursor_id,
                             column_idx_in_index.unwrap_or(idx),
@@ -1030,7 +1035,7 @@ fn emit_update_column_values<'a>(
             }
         }
     }
-    Ok(())
+    Ok(table_column_was_read)
 }
 
 /// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
@@ -1098,7 +1103,6 @@ fn emit_update_insns<'a>(
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
-    let update_body_start = program.insns.len();
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
     let or_conflict = program.resolve_type;
@@ -1344,7 +1348,7 @@ fn emit_update_insns<'a>(
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
-    emit_update_column_values(
+    let table_column_was_read = emit_update_column_values(
         program,
         table_references,
         set_clauses,
@@ -2344,16 +2348,9 @@ fn emit_update_insns<'a>(
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
             let needs_delete = not_exists_check_required
                 || connection.mv_store_for_db(update_database_id).is_some();
-            // A table-column read finishes DeferredSeek. SQLite emits FinishSeek
-            // only when no such read appears before the table write.
-            let table_column_was_read =
-                program.insns[update_body_start..].iter().any(|(insn, _)| {
-                    matches!(
-                        insn,
-                        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. }
-                            if *cursor_id == target_table_cursor_id
-                    )
-                });
+            // Like SQLite, only an unchanged-column read for the new record counts:
+            // other table-column reads, such as the old value for a partial index,
+            // can sit in a branch that some rows skip.
             if target_table.op.index().is_some() && !table_column_was_read {
                 program.emit_insn(Insn::FinishSeek {
                     cursor_id: target_table_cursor_id,
