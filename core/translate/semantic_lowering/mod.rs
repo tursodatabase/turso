@@ -16,7 +16,6 @@ use crate::{
     schema::{Schema, Type},
     sync::Arc,
     translate::{
-        emitter::Resolver,
         optimizer::cost_model_params,
         plan::QueryDestination,
         semantic::{
@@ -37,11 +36,11 @@ use crate::{
 pub(crate) fn translate_select(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    let plan = analyze_and_plan(statement, schema, settings, connection)?;
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
@@ -59,11 +58,19 @@ pub(crate) fn translate_select(
 pub(crate) fn translate_delete(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
+    let ast::Stmt::Delete { tbl_name, .. } = statement else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, tbl_name)? {
+        return Ok(false);
+    }
+    let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
     else {
@@ -94,11 +101,19 @@ pub(crate) fn translate_delete(
 pub(crate) fn translate_update(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
+    let ast::Stmt::Update(syntax) = statement else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, &syntax.tbl_name)? {
+        return Ok(false);
+    }
+    let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
     if update::needs_legacy(&plan, update, access, program)? {
@@ -127,11 +142,19 @@ pub(crate) fn translate_update(
 pub(crate) fn translate_insert(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
+    let ast::Stmt::Insert { tbl_name, .. } = statement else {
+        return Err(LimboError::InternalError(
+            "HIR INSERT got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, tbl_name)? {
+        return Ok(false);
+    }
+    let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
     if insert::needs_legacy(&plan, insert, program)? {
@@ -149,6 +172,27 @@ pub(crate) fn translate_insert(
     Ok(true)
 }
 
+/// Checks of a DML target that legacy makes by name, in the main schema,
+/// before it looks the table up. A protected system table or a materialized
+/// view cannot be written. A table that materialized views read still needs
+/// legacy, which keeps the views up to date.
+fn target_needs_legacy(
+    schema: &Schema,
+    connection: &Connection,
+    name: &ast::QualifiedName,
+) -> Result<bool> {
+    let table_name = crate::util::normalize_ident(name.name.as_str());
+    if !connection.is_mvcc_bootstrap_connection() && !crate::schema::allow_user_dml(&table_name) {
+        crate::bail_parse_error!("table {table_name} may not be modified");
+    }
+    if schema.is_materialized_view(&table_name) {
+        crate::bail_parse_error!("cannot modify materialized view {table_name}");
+    }
+    Ok(!schema
+        .get_dependent_materialized_views(&table_name)
+        .is_empty())
+}
+
 /// What every HIR document of one statement is analyzed and planned with:
 /// the statement itself and each trigger it fires.
 pub(super) struct HirSession<'a> {
@@ -161,10 +205,43 @@ pub(super) struct HirSession<'a> {
     dqs_dml: DoubleQuotedDml,
 }
 
+/// The settings a statement is analyzed with, taken from the connection
+/// and the prepare call rather than from legacy's resolver.
+pub(crate) struct HirSettings<'a> {
+    symbols: &'a crate::SymbolTable,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+    custom_types_enabled: bool,
+    dqs_dml: DoubleQuotedDml,
+    /// The databases an unqualified name is looked up in, when the prepare
+    /// call sets them.
+    search_path: Option<&'a [String]>,
+}
+
+impl<'a> HirSettings<'a> {
+    pub(crate) fn new(
+        connection: &Connection,
+        symbols: &'a crate::SymbolTable,
+        dialect: Arc<dyn crate::dialect::Dialect>,
+        search_path: Option<&'a [String]>,
+    ) -> Self {
+        Self {
+            symbols,
+            dialect,
+            custom_types_enabled: connection.experimental_custom_types_enabled(),
+            dqs_dml: if connection.get_dqs_dml() {
+                DoubleQuotedDml::Enabled
+            } else {
+                DoubleQuotedDml::Disabled
+            },
+            search_path,
+        }
+    }
+}
+
 impl<'a> HirSession<'a> {
     fn new(
         schema: &'a Arc<Schema>,
-        resolver: &'a Resolver,
+        settings: &HirSettings<'a>,
         connection: &'a Arc<Connection>,
     ) -> Result<Self> {
         let catalog = SemanticCatalog::capture(
@@ -172,22 +249,18 @@ impl<'a> HirSession<'a> {
             connection.database_schemas(),
             &connection.temp.database,
             connection.attached_databases(),
-            resolver.custom_types_enabled(),
-            resolver.dialect.as_ref(),
-            resolver.unqualified_database_search_path().as_deref(),
+            settings.custom_types_enabled,
+            settings.dialect.as_ref(),
+            settings.search_path,
         )?;
         Ok(Self {
             schema,
             connection,
             catalog,
-            symbols: resolver.symbol_table,
-            dialect: resolver.dialect.clone(),
-            custom_types_enabled: resolver.custom_types_enabled(),
-            dqs_dml: if resolver.dqs_dml.is_enabled() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
+            symbols: settings.symbols,
+            dialect: settings.dialect.clone(),
+            custom_types_enabled: settings.custom_types_enabled,
+            dqs_dml: settings.dqs_dml,
         })
     }
 
@@ -216,10 +289,10 @@ impl<'a> HirSession<'a> {
 fn analyze_and_plan(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     connection: &Arc<Connection>,
 ) -> Result<Arc<HirPlan>> {
-    HirSession::new(schema, resolver, connection)?.plan(SemanticRootInput::Statement(statement))
+    HirSession::new(schema, settings, connection)?.plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It

@@ -795,11 +795,13 @@ fn hir_delete_errors_match_legacy() {
         "DELETE FROM sqlite_schema",
         "DELETE FROM t INDEXED BY nosuch",
         "DELETE FROM t RETURNING t.*",
+        "UPDATE sqlite_schema SET name = 'x'",
+        "INSERT INTO sqlite_master VALUES (1, 2, 3, 4, 5)",
     ] {
         let legacy_error = legacy
             .prepare(sql)
             .err()
-            .expect("legacy rejects")
+            .unwrap_or_else(|| panic!("legacy rejects {sql}"))
             .to_string();
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
