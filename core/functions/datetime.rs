@@ -1333,7 +1333,7 @@ where
     }
 
     p.compute_jd();
-    if p.is_error {
+    if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
         return Value::Null;
     }
 
