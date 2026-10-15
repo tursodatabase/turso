@@ -1521,12 +1521,7 @@ fn emit_hir_group_input(
                 continue;
             }
             HirGroupInput::RowId { source, .. } => {
-                super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::RowId(*source),
-                    target,
-                )?;
+                super::expr::translate_expr(program, document, &hir::Expr::RowId(*source), target)?;
                 continue;
             }
         };
@@ -2412,14 +2407,14 @@ enum HirLoopAdvance {
     Virtual,
 }
 
-struct PreparedHirBtreeLoop<'a> {
-    source: &'a hir::Source,
-    operation: &'a HirBtreeOperation,
-    index: Option<&'a Arc<Index>>,
-    cursor: CursorID,
-    table_cursor: Option<CursorID>,
-    autoindex_source_cursor: Option<CursorID>,
-    table_has_rowid: bool,
+pub(super) struct PreparedHirBtreeLoop<'a> {
+    pub(super) source: &'a hir::Source,
+    pub(super) operation: &'a HirBtreeOperation,
+    pub(super) index: Option<&'a Arc<Index>>,
+    pub(super) cursor: CursorID,
+    pub(super) table_cursor: Option<CursorID>,
+    pub(super) autoindex_source_cursor: Option<CursorID>,
+    pub(super) table_has_rowid: bool,
 }
 
 struct PreparedHirMaterializedLoop<'a> {
@@ -2489,11 +2484,11 @@ impl PreparedHirLoop<'_> {
     }
 }
 
-struct HirBtreeLoop {
+pub(super) struct HirBtreeLoop {
     cursor: Option<CursorID>,
     loop_start: BranchOffset,
     /// Reject the current row, then run this loop's advance operation.
-    next: BranchOffset,
+    pub(super) next: BranchOffset,
     /// This access produced no row, so skip its advance operation.
     exhausted: BranchOffset,
     advance: HirLoopAdvance,
@@ -2502,7 +2497,7 @@ struct HirBtreeLoop {
 
 /// An outer join's ON predicates, evaluated once its right side is positioned.
 /// LEFT and FULL joins also NULL-extend that side when no row matched.
-struct HirLeftJoin {
+pub(super) struct HirLeftJoin {
     owner: SourceId,
     first_loop: usize,
     last_loop: usize,
@@ -3876,16 +3871,17 @@ fn emit_hir_block_explain(
         return Ok(());
     };
     for planned_loop in &block_plan.loops {
-        let detail = hir_loop_explain(document, from, planned_loop)?;
+        let detail = hir_loop_explain(document, Some(from), planned_loop)?;
         program.emit_source_explain(planned_loop.source, detail);
     }
     Ok(())
 }
 
 /// The EXPLAIN QUERY PLAN row of one planned loop, worded like legacy's.
-fn hir_loop_explain(
+/// A DML target loop has no FROM clause.
+pub(super) fn hir_loop_explain(
     document: &HirDocument,
-    from: &hir::From,
+    from: Option<&hir::From>,
     planned_loop: &HirPlannedLoop,
 ) -> Result<EqpDetail> {
     let source = document.source(planned_loop.source).ok_or_else(|| {
@@ -3911,8 +3907,8 @@ fn hir_loop_explain(
             EqpTable { name, alias }
         }
     };
-    let join = hir_loop_explain_join(document, from, source.id);
-    let exec = if hir_loop_streams(document, from, planned_loop) {
+    let join = from.and_then(|from| hir_loop_explain_join(document, from, source.id));
+    let exec = if from.is_some_and(|from| hir_loop_streams(document, from, planned_loop)) {
         EqpSubqueryExec::Coroutine
     } else {
         EqpSubqueryExec::Materialized
@@ -5029,7 +5025,7 @@ fn start_hir_virtual_loop(
     })
 }
 
-fn start_hir_btree_loop(
+pub(super) fn start_hir_btree_loop(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     prepared: &PreparedHirBtreeLoop<'_>,
@@ -5200,7 +5196,7 @@ fn emit_ready_predicates(
     Ok(())
 }
 
-fn predicate_loop(
+pub(super) fn predicate_loop(
     program: &ProgramBuilder,
     document: &HirDocument,
     expression: &hir::Expr,
@@ -5225,7 +5221,7 @@ fn predicate_loop(
     Ok(eval_at)
 }
 
-fn close_hir_btree_loop(
+pub(super) fn close_hir_btree_loop(
     program: &mut ProgramBuilder,
     hir_loop: &HirBtreeLoop,
     left_joins: &[HirLeftJoin],
@@ -6475,7 +6471,7 @@ fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> Destinat
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         dialect::SqliteDialect,
@@ -6495,7 +6491,7 @@ mod tests {
     };
     use turso_parser::parser::Parser;
 
-    fn program() -> ProgramBuilder {
+    pub(in crate::translate::semantic_lowering) fn program() -> ProgramBuilder {
         program_with_mode(QueryMode::Normal)
     }
 
@@ -6545,13 +6541,16 @@ mod tests {
         analyze_sql_with_schema(schema, sql).0
     }
 
-    fn analyze_plan(schema: Schema, sql: &str) -> HirPlan {
+    pub(in crate::translate::semantic_lowering) fn analyze_plan(
+        schema: Schema,
+        sql: &str,
+    ) -> HirPlan {
         let (document, schema) = analyze_sql_with_schema(schema, sql);
         HirPlan::build(Arc::new(document), &schema, &CostModelParams::default())
             .expect("HIR query plans")
     }
 
-    fn indexed_items_schema() -> Schema {
+    pub(in crate::translate::semantic_lowering) fn indexed_items_schema() -> Schema {
         let mut schema = Schema::new();
         schema
             .add_btree_table(Arc::new(
@@ -6889,10 +6888,7 @@ mod tests {
             .enumerate()
             .find_map(|(index, (insn, _))| match insn {
                 Insn::AggStep { data }
-                    if matches!(
-                        &data.func,
-                        AccumulatorFunc::Agg(AggFunc::PercentileCont)
-                    ) =>
+                    if matches!(&data.func, AccumulatorFunc::Agg(AggFunc::PercentileCont)) =>
                 {
                     Some((index, data.delimiter))
                 }
@@ -7082,7 +7078,10 @@ mod tests {
 
     #[test]
     fn planned_group_by_without_aggregates_still_emits_one_row_per_group() {
-        let plan = analyze_plan(indexed_items_schema(), "SELECT extra FROM items GROUP BY extra");
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT extra FROM items GROUP BY extra",
+        );
         let query = root_query(&plan.document);
         let mut program = program();
         emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
@@ -7149,12 +7148,14 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::HashDistinct { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .filter(|(insn, _)| matches!(insn, Insn::HashClear { .. }))
-            .count()
-            >= 2);
+        assert!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::HashClear { .. }))
+                .count()
+                >= 2
+        );
     }
 
     #[test]

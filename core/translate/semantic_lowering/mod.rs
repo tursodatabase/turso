@@ -1,5 +1,6 @@
 //! Bytecode lowering from resolved semantic HIR.
 
+mod delete;
 pub(super) mod expr;
 pub(super) mod query;
 mod window;
@@ -35,6 +36,44 @@ pub(crate) fn translate_select(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    let HirRoot::Query(root) = &plan.document.root else {
+        return Err(LimboError::InternalError(
+            "HIR SELECT analysis did not produce a query root".into(),
+        ));
+    };
+    program.set_hir_plan(plan.clone());
+    query::emit_planned_query_body(program, &plan, root.query, &QueryDestination::ResultRows)?;
+    program.resolved_result_columns = resolved_result_columns(&plan.document, root.query)?;
+    Ok(())
+}
+
+/// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
+/// nothing emitted, when the statement uses something only legacy lowers
+/// today; the caller then hands it to legacy.
+pub(crate) fn translate_delete(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<bool> {
+    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    if delete::needs_legacy(&plan, connection.foreign_keys_enabled(), program)? {
+        return Ok(false);
+    }
+    program.set_hir_plan(plan.clone());
+    delete::emit_delete(program, &plan)?;
+    Ok(true)
+}
+
+/// Analyze one statement into HIR and choose its access paths.
+fn analyze_and_plan(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<Arc<HirPlan>> {
     let catalog = SemanticCatalog::capture(
         schema.clone(),
         connection.database_schemas(),
@@ -58,20 +97,11 @@ pub(crate) fn translate_select(
         },
         SemanticRootInput::Statement(statement),
     )?;
-    let plan = Arc::new(HirPlan::build(
+    Ok(Arc::new(HirPlan::build(
         Arc::new(document),
         schema,
         cost_model_params(),
-    )?);
-    let HirRoot::Query(root) = &plan.document.root else {
-        return Err(LimboError::InternalError(
-            "HIR SELECT analysis did not produce a query root".into(),
-        ));
-    };
-    program.set_hir_plan(plan.clone());
-    query::emit_planned_query_body(program, &plan, root.query, &QueryDestination::ResultRows)?;
-    program.resolved_result_columns = resolved_result_columns(&plan.document, root.query)?;
-    Ok(())
+    )?))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It

@@ -126,10 +126,33 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     && matches!(trigger.event, ast::TriggerEvent::Delete)
             })
             .cloned()
+            .map(|trigger| (database, trigger))
             .collect::<Vec<_>>();
+        // Like legacy, a temp trigger can fire for a table in another
+        // database: either the trigger names that database, or it names no
+        // database and temp has no table of that name.
+        let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
+        let mut temp_triggers = Vec::new();
+        if database != temp {
+            if let Ok(temp_schema) = self.context().schema(temp) {
+                temp_triggers = temp_schema
+                    .get_triggers_for_table(table.value().get_name())
+                    .filter(|trigger| {
+                        matches!(trigger.event, ast::TriggerEvent::Delete)
+                            && match trigger.target_database_id {
+                                Some(target) => target == database.index(),
+                                None => temp_schema.get_table(&trigger.table_name).is_none(),
+                            }
+                    })
+                    .cloned()
+                    .map(|trigger| (temp, trigger))
+                    .collect();
+            }
+        }
         Ok(triggers
             .into_iter()
-            .map(|trigger| self.freeze_trigger(database, trigger))
+            .chain(temp_triggers)
+            .map(|(database, trigger)| self.freeze_trigger(database, trigger))
             .collect())
     }
 }
