@@ -130,16 +130,22 @@ yet. The switch happens when the statement completes, so an interrupted `SET
 ROLE` changes nothing. `SET ROLE` is refused inside a transaction block,
 because rolling back would not restore the previous role. Changing the role
 makes prepared statements prepare again. A query that is already returning rows
-finishes under the role it started with, as in PostgreSQL.
+is not checked again, as in PostgreSQL. The checks that run while a statement
+runs, such as those of `currval()`, use the role that is current at that time,
+and `current_user` returns it.
 
 ## Privilege checks
 
 Privileges are checked when a statement is prepared, against the current role
 at that time. A superuser passes every check. Because changing the role makes
-prepared statements prepare again, a statement always runs with the privileges
-of the role that is current when it starts. Statements that the engine prepares
-for itself, for example to reload the schema, are checked the same way as
-statements from the client.
+prepared statements prepare again, a statement is always checked against the
+role that is current when it starts. Statements that the engine prepares for
+itself, for example to reload the schema, are checked the same way as
+statements from the client, except the ones that read metadata that only the
+engine sees: sequence descriptors and watermarks, and the table statistics in
+`sqlite_stat1`. They are prepared with the privileges of a superuser and are
+never handed to the client. The change records that change data capture writes
+are the engine's own too, so writing them is not checked.
 
 A denial is data, not a message: the action that was denied, the object it was
 denied on, and whether the role lacked a privilege or was not the owner. Each
