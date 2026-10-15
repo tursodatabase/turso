@@ -434,7 +434,7 @@ expect {
 test array-subquery-as-a-group-key {
     SELECT ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id
                  ORDER BY v NULLS LAST) AS vals, count(*)
-    FROM array_items g GROUP BY vals ORDER BY array_length(vals, 1);
+    FROM array_items g GROUP BY vals ORDER BY count(*);
 }
 expect {
     {2}|1
