@@ -1958,11 +1958,15 @@ fn append_predicates(
     expression: &hir::Expr,
     from_outer_join: Option<SourceId>,
 ) {
-    predicates.extend(expression.conjuncts().map(|expression| HirWhereTerm {
-        expr: expression.clone(),
-        from_outer_join,
-        consumed: false,
-    }));
+    predicates.extend(
+        crate::translate::plan::hir_planning_conjuncts(expression)
+            .into_iter()
+            .map(|expr| HirWhereTerm {
+                expr,
+                from_outer_join,
+                consumed: false,
+            }),
+    );
 }
 
 fn using_equality(column: &hir::UsingColumn) -> hir::Expr {

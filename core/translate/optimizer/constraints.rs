@@ -847,7 +847,7 @@ fn hir_partial_index_predicate_terms(
     let can_use_query_term =
         |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
     let mut matched_terms = SmallVec::new();
-    for index_conjunct in predicate.conjuncts() {
+    for index_conjunct in &crate::translate::plan::hir_planning_conjuncts(predicate) {
         let (term_position, _) = query_where_clause
             .iter()
             .enumerate()

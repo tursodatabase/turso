@@ -323,6 +323,44 @@ impl PredicateExpr for crate::translate::semantic::hir::Expr {
     }
 }
 
+/// The conjuncts of an HIR predicate for planning. Like legacy and SQLite,
+/// `x BETWEEN a AND b` on a column becomes `x >= a` and `x <= b`, so each
+/// bound can drive an index seek and be consumed on its own.
+pub(crate) fn hir_planning_conjuncts(
+    expression: &crate::translate::semantic::hir::Expr,
+) -> Vec<crate::translate::semantic::hir::Expr> {
+    use crate::translate::semantic::hir::Expr;
+    let mut conjuncts = Vec::new();
+    for conjunct in expression.conjuncts() {
+        match conjunct {
+            Expr::Between {
+                expr,
+                negated: false,
+                start,
+                end,
+                start_comparison,
+                end_comparison,
+            } if matches!(expr.as_ref(), Expr::Column(_) | Expr::RowId(_)) => {
+                for (operator, bound, comparison) in [
+                    (ast::Operator::GreaterEquals, start, start_comparison),
+                    (ast::Operator::LessEquals, end, end_comparison),
+                ] {
+                    conjuncts.push(Expr::Binary {
+                        lhs: expr.clone(),
+                        operator,
+                        rhs: bound.clone(),
+                        array_concat: false,
+                        custom: None,
+                        comparison: Some(comparison.clone()),
+                    });
+                }
+            }
+            conjunct => conjuncts.push(conjunct.clone()),
+        }
+    }
+    conjuncts
+}
+
 impl From<ast::Expr> for PredicateTerm<ast::Expr, TableInternalId> {
     fn from(expr: ast::Expr) -> Self {
         Self {

@@ -801,3 +801,32 @@ fn hir_count_star_counts_without_a_loop() {
         vec![vec![rusqlite::types::Value::Integer(4)]]
     );
 }
+
+#[test]
+fn hir_between_on_a_column_seeks_an_index_range() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    // Like legacy and SQLite, each bound of BETWEEN can drive the seek.
+    let sql = "SELECT id FROM items WHERE value BETWEEN 15 AND 35 ORDER BY id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail))
+                if detail == "SEARCH items USING COVERING INDEX items_value (value>=? AND value<=?)"
+        )),
+        "{plan:?}"
+    );
+    for sql in [
+        sql,
+        "SELECT id FROM items WHERE value NOT BETWEEN 15 AND 35 ORDER BY id",
+        "SELECT id FROM items WHERE value + 0 BETWEEN 15 AND 35 ORDER BY id",
+        "SELECT id FROM items WHERE 20 BETWEEN value AND value + 10 ORDER BY id",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
