@@ -636,19 +636,26 @@ impl<'a> HirPlanContext<'a> {
                     cost: plan.cost,
                 })
         };
+        // A correlated subquery runs once per row of the outer tables it
+        // reads, so like SQLite it may build an automatic index once and
+        // seek it on every run. Its estimates stay per run.
+        let runs = self.correlated_runs(query, schema, params);
         let blocks = query
             .blocks
             .iter()
             .map(|block| {
-                self.plan_query_block(
+                let mut plan = self.plan_query_block(
                     block,
                     block_order_by,
                     block_limit,
-                    1.0,
+                    runs,
                     schema,
                     params,
                     &query_estimate,
-                )
+                )?;
+                plan.output_cardinality /= runs;
+                plan.cost = Cost(plan.cost.0 / runs);
+                Ok(plan)
             })
             .collect::<Result<Vec<_>>>()?;
         let estimate = query_estimate_from_blocks(query, &blocks, params);
@@ -660,6 +667,26 @@ impl<'a> HirPlanContext<'a> {
         });
         active.remove(&query_id);
         Ok(estimate)
+    }
+
+    /// How many times a query runs: once, or for a correlated subquery,
+    /// about once per row of the largest outer table it reads.
+    fn correlated_runs(
+        &self,
+        query: &hir::Query,
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> f64 {
+        query
+            .captures
+            .iter()
+            .filter_map(|source| match &self.definition(*source).kind {
+                hir::SourceKind::Table(table) => {
+                    Some(*base_row_estimate(schema, table.value(), params))
+                }
+                _ => None,
+            })
+            .fold(1.0, f64::max)
     }
 
     /// Build planner source metadata without resolving names, allocating a

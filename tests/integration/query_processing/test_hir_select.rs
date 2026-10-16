@@ -708,3 +708,48 @@ fn hir_seek_keys_from_a_null_row_skip_the_seek() {
         ]
     );
 }
+
+#[test]
+fn hir_correlated_subqueries_seek_an_automatic_index() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "CREATE TABLE i(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "INSERT INTO o WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500) \
+         SELECT x, x % 200, x FROM n",
+        "INSERT INTO i WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500) \
+         SELECT x, x % 300, x FROM n",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    // Like SQLite and legacy, the subquery runs once per outer row, so it
+    // builds an index on i(k) once and seeks it on every run instead of
+    // scanning i each time.
+    for (sql, expected) in [
+        (
+            "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)",
+            500,
+        ),
+        (
+            "SELECT count(*) FROM o WHERE o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)",
+            200,
+        ),
+    ] {
+        let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.iter().any(|row| matches!(
+                row.get(3),
+                Some(rusqlite::types::Value::Text(detail))
+                    if detail.starts_with("SEARCH i USING COVERING INDEX ephemeral")
+            )),
+            "{sql}: {plan:?}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            vec![vec![rusqlite::types::Value::Integer(expected)]],
+            "{sql}"
+        );
+    }
+}

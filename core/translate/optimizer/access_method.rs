@@ -964,9 +964,12 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
             ..
         } if constraint_refs.is_empty()
     );
+    // A temporary index pays off when its seeks run many times: after other
+    // tables in a join, or in a correlated subquery that runs once per outer
+    // row. It is built once either way.
     if source.allows_alternative_access()
         && uses_full_table_scan
-        && !lhs_mask.is_empty()
+        && (!lhs_mask.is_empty() || input_cardinality > 1.0)
         && !source.is_full_outer_join()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
