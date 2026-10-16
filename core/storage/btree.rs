@@ -203,12 +203,12 @@ struct DestroyInfo {
 #[derive(Debug)]
 enum DeleteState {
     Start,
-    LoadPage,
-    FindCell,
-    DeterminePostBalancingSeekKey {
-        cell_idx: usize,
-        cell: BTreeCell,
-        original_child_pointer: Option<u32>,
+    DeterminePostBalancingSeekKey,
+    LoadPage {
+        post_balancing_seek_key: Option<CursorContext>,
+    },
+    FindCell {
+        post_balancing_seek_key: Option<CursorContext>,
     },
     ClearOverflowPages {
         cell_idx: usize,
@@ -6940,9 +6940,9 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     /// Delete state machine flow:
     /// 1. Start -> check if the rowid to be delete is present in the page or not. If not we early return
-    /// 2. LoadPage -> load the page.
-    /// 3. FindCell -> find the cell to be deleted in the page.
-    /// 4. DeterminePostBalancingSeekKey -> if the deletion will cause balancing, determine the key to seek to after balancing.
+    /// 2. DeterminePostBalancingSeekKey -> determine the key to seek to after balancing.
+    /// 3. LoadPage -> load the page.
+    /// 4. FindCell -> find the cell to be deleted in the page.
     /// 5. ClearOverflowPages -> Clear the overflow pages if there are any before dropping the cell, then if we are in a leaf page we just drop the cell in place.
     /// if we are in interior page, we need to rotate keys in order to replace current cell (InteriorNodeReplacement).
     /// 6. InteriorNodeReplacement -> we copy the left subtree leaf node into the deleted interior node's place.
@@ -6987,14 +6987,55 @@ impl CursorTrait for BTreeCursor {
                         return Ok(IOResult::Done(()));
                     }
 
-                    self.state = CursorState::Delete(DeleteState::LoadPage);
+                    self.state = CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey);
                 }
 
-                DeleteState::LoadPage => {
-                    self.state = CursorState::Delete(DeleteState::FindCell);
+                DeleteState::DeterminePostBalancingSeekKey => {
+                    let page = self.stack.top_ref();
+                    let cell_idx = self.stack.current_cell_index() as usize;
+                    if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)? {
+                        self.state = CursorState::Delete(DeleteState::LoadPage {
+                            post_balancing_seek_key: None,
+                        });
+                        continue;
+                    }
+                    let target_key = if page.is_index()? {
+                        let record = match return_if_io!(self.record()) {
+                            Some(record) => record.clone(),
+                            None => unreachable!("there should've been a record"),
+                        };
+                        CursorContext {
+                            key: CursorContextKey::IndexKeyRowId(
+                                ImmutableRecordRef::from_owned_record(record),
+                            ),
+                            seek_op: SeekOp::GE { eq_only: true },
+                        }
+                    } else {
+                        let Some(rowid) = return_if_io!(self.rowid()) else {
+                            panic!("cursor should be pointing to a record with a rowid");
+                        };
+                        CursorContext {
+                            key: CursorContextKey::TableRowId(rowid),
+                            seek_op: SeekOp::GE { eq_only: true },
+                        }
+                    };
+
+                    self.state = CursorState::Delete(DeleteState::LoadPage {
+                        post_balancing_seek_key: Some(target_key),
+                    });
                 }
 
-                DeleteState::FindCell => {
+                DeleteState::LoadPage {
+                    post_balancing_seek_key,
+                } => {
+                    self.state = CursorState::Delete(DeleteState::FindCell {
+                        post_balancing_seek_key: post_balancing_seek_key.take(),
+                    });
+                }
+
+                DeleteState::FindCell {
+                    post_balancing_seek_key,
+                } => {
                     let page = self.stack.top_ref();
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let contents = page.get_contents();
@@ -7020,54 +7061,11 @@ impl CursorTrait for BTreeCursor {
                         _ => None,
                     };
 
-                    self.state = CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey {
-                        cell_idx,
-                        cell,
-                        original_child_pointer,
-                    });
-                }
-
-                DeleteState::DeterminePostBalancingSeekKey { cell_idx, .. } => {
-                    let cell_idx = *cell_idx;
-                    let page = self.stack.top_ref();
-                    let target_key =
-                        if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)?
-                        {
-                            None
-                        } else if page.is_index()? {
-                            let record = match return_if_io!(self.record()) {
-                                Some(record) => record.clone(),
-                                None => unreachable!("there should've been a record"),
-                            };
-                            Some(CursorContext {
-                                key: CursorContextKey::IndexKeyRowId(
-                                    ImmutableRecordRef::from_owned_record(record),
-                                ),
-                                seek_op: SeekOp::GE { eq_only: true },
-                            })
-                        } else {
-                            let Some(rowid) = return_if_io!(self.rowid()) else {
-                                panic!("cursor should be pointing to a record with a rowid");
-                            };
-                            Some(CursorContext {
-                                key: CursorContextKey::TableRowId(rowid),
-                                seek_op: SeekOp::GE { eq_only: true },
-                            })
-                        };
-
-                    let CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey {
-                        cell_idx,
-                        cell,
-                        original_child_pointer,
-                    }) = std::mem::replace(&mut self.state, CursorState::None)
-                    else {
-                        unreachable!("expected determine post balancing seek key state");
-                    };
                     self.state = CursorState::Delete(DeleteState::ClearOverflowPages {
                         cell_idx,
                         cell,
                         original_child_pointer,
-                        post_balancing_seek_key: target_key,
+                        post_balancing_seek_key: post_balancing_seek_key.take(),
                     });
                 }
 
