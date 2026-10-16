@@ -1221,7 +1221,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// matches the arm's output with the same expression: `ORDER BY t1.b`
     /// matches `SELECT t1.b FROM t1`. A term that does not resolve in the arm
     /// does not match it.
-    fn compound_order_by_arm_match(
+    pub(super) fn compound_order_by_arm_match(
         &mut self,
         term: &'ast ast::Expr,
         block: &QueryBlock,

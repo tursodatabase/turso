@@ -799,7 +799,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         };
         let comparison_collations = recursive_comparison_collations(self, seed, &arms)?;
-        let queue_order = self.analyze_recursive_order_by(&syntax.select.order_by, seed, &arms)?;
+        let queue_order = self.analyze_recursive_order_by(
+            &syntax.select.order_by,
+            seed,
+            &arms,
+            context.policies(),
+        )?;
         let limit = syntax
             .select
             .limit
@@ -831,22 +836,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast [ast::SortedColumn],
         seed: super::hir::QueryId,
         arms: &[RecursiveArm],
+        policies: super::expr::ExprPolicies,
     ) -> Result<Vec<RecursiveOrderTerm>> {
         let positions = {
-            let seed = self.query(seed).ok_or_else(|| {
-                LimboError::InternalError(format!("missing recursive seed {seed}"))
-            })?;
-            let arm_queries = arms
-                .iter()
-                .map(|arm| {
-                    self.query(arm.query).ok_or_else(|| {
-                        LimboError::InternalError(format!("missing recursive arm {}", arm.query))
-                    })
+            let blocks = std::iter::once(seed)
+                .chain(arms.iter().map(|arm| arm.query))
+                .map(|query| {
+                    self.query(query)
+                        .map(|query| query.blocks.clone())
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!("missing recursive arm {query}"))
+                        })
                 })
-                .collect::<Result<Vec<_>>>()?;
-            let output_arms = std::iter::once(seed)
-                .chain(arm_queries)
-                .flat_map(|query| query.blocks.iter().map(|block| block.outputs.as_slice()))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let output_arms = blocks
+                .iter()
+                .map(|block| block.outputs.as_slice())
                 .collect::<Vec<_>>();
             syntax
                 .iter()
@@ -855,7 +863,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     super::analyze::compound_order_by_position(
                         &term.expr,
                         &output_arms,
-                        &mut |_, _| Ok(None),
+                        // Like a compound SELECT's ORDER BY, a term may match
+                        // an arm's output expression, resolved in that arm's
+                        // FROM clause.
+                        &mut |arm, term| {
+                            let block = &blocks[arm];
+                            let mut scope = super::scope::Scope::default();
+                            if let Some(from) = &block.from {
+                                for source in std::iter::once(from.first)
+                                    .chain(from.joins.iter().map(|join| join.right))
+                                {
+                                    if let Some(source) = self.source(source) {
+                                        scope.add_source(source, true);
+                                    }
+                                }
+                            }
+                            self.compound_order_by_arm_match(term, block, &scope, policies)
+                        },
                         index + 1,
                     )
                 })

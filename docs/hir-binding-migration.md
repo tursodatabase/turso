@@ -157,7 +157,6 @@ passes all of them. What is left:
 |---|---|---|
 | EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
 | ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
-| Compound ORDER BY expression inside a recursive CTE | 1 | `recursive-cte-order-qualified-expression` |
 | Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
 | A named window whose definition uses an aggregate, with GROUP BY | 1 | `named-window-with-group-by` |
 | `nth_value` with LIMIT stops before an invalid later argument | 1 | `nth-value-limit-stops-before-late-invalid-n` |
