@@ -3564,12 +3564,10 @@ impl Pager {
         if is_write {
             self.clear_savepoints()
                 .expect("clear_savepoints should not fail for attached DB");
-            // Clear dirty pages and page cache before releasing the write lock
-            self.clear_page_cache(true);
-            self.dirty_pages.write().clear();
+            wal.rollback(None);
+            self.discard_uncommitted_pages();
             self.reset_internal_states();
             self.set_schema_cookie(None);
-            wal.rollback(None);
             wal.end_write_tx();
         } else {
             self.cleanup_read_tx();
@@ -4859,6 +4857,16 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[aristo::intent(
+        "The cached page is updated only from a frame past the end of the WAL, because a frame already in the WAL can be older than the cached page.",
+        verify = "full",
+        id = "wal_insert_frame_updates_cache_only_from_new_frames"
+    )]
+    #[aristo::intent(
+        "A cached page updated from a frame is marked with that frame's number, so rollback can drop it.",
+        verify = "full",
+        id = "wal_insert_frame_marks_cached_page_with_frame_number"
+    )]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
@@ -4867,6 +4875,7 @@ impl Pager {
             ));
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
+        let frame_is_new = frame_no > wal.get_max_frame();
 
         wal.write_frame_raw(
             self.buffer_pool.clone(),
@@ -4876,13 +4885,19 @@ impl Pager {
             raw_page,
             self.get_sync_type(),
         )?;
-        if let Some(page) = self.cache_get(header.page_number as usize)? {
+        let cached_page = if frame_is_new {
+            self.cache_get(header.page_number as usize)?
+        } else {
+            None
+        };
+        if let Some(page) = cached_page {
             let content = page.get_contents();
             content.as_ptr().copy_from_slice(raw_page);
             turso_assert!(
                 page.get().id() == header.page_number as usize,
                 "page has unexpected id"
             );
+            page.set_wal_tag(frame_no, wal.checkpoint_epoch());
         }
         if header.page_number == 1 {
             let db_size = self.io.block(|| {
@@ -6089,17 +6104,10 @@ impl Pager {
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
         if is_write {
-            let clear_dirty = true;
-            // The page cache only needs to be cleared if we are rolling back a write transaction.
-            // If a read transaction rolls back, and the next read transaction detects that the
-            // database has changed in between (see db_changed() in wal.rs), then the page cache
-            // will be cleared. Since the read transaction itself has not modified anything, it can proceed
-            // with its cached pages in case the database has NOT changed in between.
-            //
-            // Even in the case of a write transaction, clearing the entire page cache is overkill,
-            // since we only need to clear the dirty pages that were modified by the write transaction.
-            self.clear_page_cache(clear_dirty);
-            self.dirty_pages.write().clear();
+            if let Some(wal) = self.wal.as_ref() {
+                wal.rollback(None);
+            }
+            self.discard_uncommitted_pages();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -6112,11 +6120,24 @@ impl Pager {
         if schema_did_change {
             *connection.schema.write() = connection.db.clone_schema();
         }
-        if is_write {
-            if let Some(wal) = self.wal.as_ref() {
-                wal.rollback(None);
-            }
-        }
+    }
+
+    /// pagerRollbackWal (pager.c): drop only the pages the transaction
+    /// changed and keep the rest of the cache. Must run after the WAL is
+    /// rolled back, so that its max frame is the last committed frame.
+    #[aristo::intent(
+        "The WAL is rolled back before this runs, so the WAL's max frame is the last committed frame.",
+        verify = "full",
+        id = "wal_rollback_runs_before_cache_discard"
+    )]
+    fn discard_uncommitted_pages(&self) {
+        self.invalidate_all_cursors();
+        let committed_max_frame = self.wal.as_ref().map_or(0, |wal| wal.get_max_frame());
+        let mut dirty_pages = self.dirty_pages.write();
+        self.page_cache
+            .write()
+            .discard_uncommitted_pages(&dirty_pages, committed_max_frame);
+        dirty_pages.clear();
     }
 
     fn reset_internal_states(&self) {
@@ -6719,6 +6740,128 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id(), 1);
+    }
+
+    #[test]
+    fn rollback_keeps_pages_the_transaction_did_not_change() {
+        let (db, conn) = open_memory_database("rollback-keeps-unchanged-pages.db");
+        conn.execute("CREATE TABLE changed(x)").unwrap();
+        conn.execute("CREATE TABLE unchanged(x)").unwrap();
+        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
+        conn.execute("INSERT INTO unchanged VALUES (1)").unwrap();
+        let changed_root = root_page(&conn, "changed");
+        let unchanged_root = root_page(&conn, "unchanged");
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
+        let pager = conn.pager.load();
+        let cached_unchanged_root = pager.cache_get(unchanged_root).unwrap().unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO changed VALUES (2)").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+
+        assert!(!pager
+            .page_cache
+            .write()
+            .contains_key(&PageCacheKey::new(changed_root)));
+        let unchanged_root_after_rollback = pager.cache_get(unchanged_root).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &cached_unchanged_root,
+            &unchanged_root_after_rollback
+        ));
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM changed"), 1);
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
+        drop(db);
+    }
+
+    #[test]
+    fn rollback_drops_pages_spilled_to_the_wal() {
+        let (db, conn) = open_memory_database("rollback-drops-spilled-pages.db");
+        conn.execute("PRAGMA cache_size = 200").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 500)")
+            .unwrap();
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let committed_max_frame = wal.get_max_frame();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET x = randomblob(1000)").unwrap();
+        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 1000)")
+            .unwrap();
+        assert!(
+            wal.get_max_frame() > committed_max_frame,
+            "the transaction must spill pages to the WAL"
+        );
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 1500);
+        conn.execute("ROLLBACK").unwrap();
+
+        assert_eq!(wal.get_max_frame(), committed_max_frame);
+        let mut cache = pager.page_cache.write();
+        for key in cache.keys() {
+            let page = cache.peek(&key, false).unwrap();
+            assert!(!page.is_dirty());
+            assert!(!page.has_wal_tag() || page.wal_tag_pair().0 <= committed_max_frame);
+        }
+        drop(cache);
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
+        let mut integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
+        assert_eq!(
+            integrity_check.run_collect_rows().unwrap(),
+            vec![vec![crate::Value::build_text("ok")]]
+        );
+        drop(db);
+    }
+
+    #[test]
+    fn rollback_drops_pinned_pages_that_are_not_loaded() {
+        let (db, conn) = open_memory_database("rollback-drops-pinned-unloaded-pages.db");
+        conn.execute("CREATE TABLE changed(x)").unwrap();
+        conn.execute("CREATE TABLE unloaded(x)").unwrap();
+        conn.execute("INSERT INTO unloaded VALUES (1)").unwrap();
+        let unloaded_root = root_page(&conn, "unloaded");
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
+        let pager = conn.pager.load();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
+        let page = pager.cache_get(unloaded_root).unwrap().unwrap();
+        page.pin();
+        page.clear_loaded();
+        conn.execute("ROLLBACK").unwrap();
+
+        assert!(!pager
+            .page_cache
+            .write()
+            .contains_key(&PageCacheKey::new(unloaded_root)));
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
+        drop(db);
+    }
+
+    fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = crate::Database::open_file(io, path, Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        (db, conn)
+    }
+
+    fn root_page(conn: &Arc<crate::Connection>, table: &str) -> usize {
+        query_i64(
+            conn,
+            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{table}'"),
+        ) as usize
+    }
+
+    fn query_i64(conn: &Arc<crate::Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        match rows.as_slice() {
+            [row] => match row.as_slice() {
+                [crate::Value::Numeric(crate::Numeric::Integer(value))] => *value,
+                other => panic!("expected one integer, got {other:?}"),
+            },
+            other => panic!("expected one row, got {other:?}"),
+        }
     }
 }
 
