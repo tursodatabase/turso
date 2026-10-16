@@ -133,9 +133,11 @@ and the same alias, `full_column_names`, and `short_column_names` rules as
 legacy. Two known differences are legacy artifacts: legacy reports its internal
 window subquery as the table of every output of a window query, and BLOB as
 the declared type of expressions such as `count(*)` there. HIR reports the real
-table and no declared type, like SQLite. `get_column_type_info` and
-`get_column_inferred_type` report the resolved affinity for expression outputs
-instead of legacy's AST-shape rules.
+table and no declared type, like SQLite. `get_column_type_info` infers
+the type of a computed output by legacy's rules (literals, arithmetic
+widening, comparisons and `||`); `get_column_inferred_type` reports the
+resolved affinity for expression outputs instead of legacy's AST-shape
+rules.
 
 Expression subqueries (scalar, row, EXISTS, IN) run where their expression is
 evaluated, the way SQLite codes subselects: the statement plan is installed in

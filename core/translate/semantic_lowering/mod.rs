@@ -341,6 +341,9 @@ pub(crate) struct ResolvedResultColumn {
     pub(crate) name_is_alias: bool,
     pub(crate) value: ResolvedResultValue,
     pub(crate) affinity: Affinity,
+    /// The type name `Statement::get_column_type_info` reports for a
+    /// computed value, inferred as legacy does.
+    pub(crate) primitive: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,9 +396,102 @@ fn resolved_output_columns(
                 ),
                 value: resolved_result_value(document, &output.expr)?,
                 affinity: output.affinity,
+                primitive: expression_primitive(document, &output.expr),
             })
         })
         .collect()
+}
+
+/// The type name of a computed value, by legacy's rules: a literal has its
+/// own type; arithmetic over two INTEGERs is INTEGER, over INTEGERs and REALs
+/// REAL, and NUMERIC otherwise; comparisons, logic and bitwise operators give
+/// INTEGER; `||` gives TEXT; anything else reports its affinity.
+fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
+    use ast::{Operator, UnaryOperator};
+    let arithmetic = |lhs: Option<&'static str>, rhs: Option<&'static str>| match (lhs, rhs) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
+        _ => "NUMERIC",
+    };
+    match expression {
+        hir::Expr::Literal(literal) => {
+            match crate::translate::alter::literal_default_value(literal)
+                .ok()?
+                .value_type()
+            {
+                crate::types::ValueType::Integer => Some("INTEGER"),
+                crate::types::ValueType::Float => Some("REAL"),
+                crate::types::ValueType::Text => Some("TEXT"),
+                _ => None,
+            }
+        }
+        hir::Expr::Collate { expr, .. } => expression_primitive(document, expr),
+        hir::Expr::Unary { operator, expr } => match operator {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Negative => Some(arithmetic(
+                Some("INTEGER"),
+                expression_primitive(document, expr),
+            )),
+            UnaryOperator::Positive => expression_primitive(document, expr),
+        },
+        hir::Expr::Binary {
+            lhs, operator, rhs, ..
+        } => match operator {
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulus => Some(arithmetic(
+                expression_primitive(document, lhs),
+                expression_primitive(document, rhs),
+            )),
+            Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseNot
+            | Operator::LeftShift
+            | Operator::RightShift
+            | Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot
+            | Operator::And
+            | Operator::Or
+            | Operator::ArrayContains
+            | Operator::ArrayOverlap => Some("INTEGER"),
+            Operator::Concat => Some("TEXT"),
+            Operator::ArrowRight | Operator::ArrowRightShift => None,
+        },
+        hir::Expr::RowId(_) => Some("INTEGER"),
+        _ => match expression_affinity(document, expression) {
+            Affinity::Integer => Some("INTEGER"),
+            Affinity::Real => Some("REAL"),
+            Affinity::Text => Some("TEXT"),
+            Affinity::Numeric => Some("NUMERIC"),
+            Affinity::Blob | Affinity::None => None,
+        },
+    }
+}
+
+/// The affinity legacy gives an operand: a column's or CAST's own, and
+/// none for other expressions.
+fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affinity {
+    match expression {
+        hir::Expr::Column(reference) => document
+            .source(reference.source)
+            .and_then(|source| source.columns.get(reference.column))
+            .map_or(Affinity::Blob, |column| column.affinity),
+        hir::Expr::RowId(_) => Affinity::Integer,
+        hir::Expr::Output(id) => document
+            .output(*id)
+            .map_or(Affinity::Blob, |output| output.affinity),
+        hir::Expr::Cast { target, .. } => target.affinity,
+        hir::Expr::Collate { expr, .. } => expression_affinity(document, expr),
+        _ => Affinity::Blob,
+    }
 }
 
 fn resolved_result_value(

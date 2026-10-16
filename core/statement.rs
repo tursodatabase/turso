@@ -1427,7 +1427,7 @@ impl Statement {
     /// resolved affinity.
     fn resolved_column_type_info(&self, column: &ResolvedResultColumn) -> Option<ColumnTypeInfo> {
         let ResolvedResultValue::Column(source) = &column.value else {
-            return affinity_to_primitive(column.affinity).map(|name| ColumnTypeInfo {
+            return column.primitive.map(|name| ColumnTypeInfo {
                 declared_name: name.to_string(),
                 array_dimensions: 0,
                 base_type: None,
