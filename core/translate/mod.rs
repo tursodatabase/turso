@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
+pub(crate) mod hir_index_method;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;

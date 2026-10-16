@@ -1023,7 +1023,12 @@ pub(crate) fn emit_planned_query_body(
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;
-    let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
+    // An index method may apply LIMIT and OFFSET while it scans.
+    let limit = query
+        .limit
+        .as_ref()
+        .filter(|_| !planned_query.blocks[0].limit_applied);
+    let limit = initialize_limit(program, document, limit, done)?;
     let output = if let Some(sorter) = sorter.as_ref() {
         HirRowOutput {
             target: HirRowTarget::Sorter(sorter),
@@ -2481,6 +2486,19 @@ struct PreparedHirVirtualLoop<'a> {
     cursor: CursorID,
 }
 
+/// A scan through a query pattern of an index method, such as FTS: the
+/// index returns rowids, and the values of the pattern's result columns.
+struct PreparedHirIndexMethodLoop<'a> {
+    source: &'a hir::Source,
+    access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
+    index_cursor: CursorID,
+    table_cursor: CursorID,
+    database: usize,
+    /// Expressions of the query block the index returns, each with the
+    /// index column that holds it.
+    covered: Vec<(&'a hir::Expr, usize)>,
+}
+
 struct PreparedHirRegistersLoop<'a> {
     source: &'a hir::Source,
 }
@@ -2511,6 +2529,7 @@ impl HirMaterializedQuery {
 enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Virtual(PreparedHirVirtualLoop<'a>),
+    IndexMethod(PreparedHirIndexMethodLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
     Coroutine(PreparedHirCoroutineLoop<'a>),
@@ -2521,6 +2540,7 @@ impl PreparedHirLoop<'_> {
         match self {
             Self::BTree(prepared) => Some(prepared.cursor),
             Self::Virtual(prepared) => Some(prepared.cursor),
+            Self::IndexMethod(prepared) => Some(prepared.index_cursor),
             Self::Materialized(prepared) => Some(prepared.cursor),
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -2530,6 +2550,7 @@ impl PreparedHirLoop<'_> {
         match self {
             Self::BTree(prepared) => prepared.table_cursor,
             Self::Virtual(_) => None,
+            Self::IndexMethod(prepared) => Some(prepared.table_cursor),
             Self::Materialized(_) => None,
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -3495,7 +3516,9 @@ impl HirLoopNest<'_, '_> {
                     );
                     register_bindings.push((registers.source.id, original));
                 }
-                PreparedHirLoop::Virtual(_) | PreparedHirLoop::Coroutine(_) => {
+                PreparedHirLoop::Virtual(_)
+                | PreparedHirLoop::IndexMethod(_)
+                | PreparedHirLoop::Coroutine(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -3652,6 +3675,7 @@ fn prepare_hir_right_outer_join(
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
         PreparedHirLoop::Virtual(_)
+        | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::Registers(_)
         | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
@@ -4059,6 +4083,14 @@ pub(super) fn hir_loop_explain(
                 ),
             }
         }
+        HirSourceAccess::IndexMethod(access) => EqpDetail::IndexMethod {
+            method: access
+                .index
+                .index_method
+                .as_ref()
+                .map(|method| method.definition().method_name.to_string())
+                .unwrap_or_default(),
+        },
         HirSourceAccess::Virtual(_) => EqpDetail::Scan {
             table,
             index: None,
@@ -4256,6 +4288,9 @@ fn prepare_hir_loop_unexplained<'a>(
         HirSourceAccess::Virtual(operation) => Ok(PreparedHirLoop::Virtual(
             prepare_hir_virtual_loop(program, &plan.document, planned_loop.source, operation)?,
         )),
+        HirSourceAccess::IndexMethod(access) => Ok(PreparedHirLoop::IndexMethod(
+            prepare_hir_index_method_loop(program, plan, planned_loop.source, access)?,
+        )),
         HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
             prepare_hir_materialized_loop(
                 program,
@@ -4359,6 +4394,161 @@ fn prepare_hir_virtual_loop<'a>(
         source,
         operation,
         cursor,
+    })
+}
+
+fn prepare_hir_index_method_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
+) -> Result<PreparedHirIndexMethodLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop references missing source {source_id}"
+        ))
+    })?;
+    let table = match &source.kind {
+        hir::SourceKind::Table(table) => table.value().btree(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} is not a B-tree table"
+        ))
+    })?;
+    let database = source.database.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} has no database"
+        ))
+    })?;
+    let database_snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} references missing database {database:?}"
+        ))
+    })?;
+    program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let index_cursor = program.alloc_cursor_index(None, &access.index)?;
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor,
+        root_page: table.root_page,
+        db: database.index(),
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: index_cursor,
+        root_page: access.index.root_page,
+        db: database.index(),
+    });
+    // Columns are read from the table, which follows the index's rowids.
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    // The expressions of this block that the index returns: its outputs,
+    // its query's ORDER BY and the WHERE terms left to check.
+    let hir::SourceOwner::QueryBlock(block_id) = source.owner else {
+        return Err(LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} is not owned by a query block"
+        )));
+    };
+    let block = document.query_block(block_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query block {block_id:?} is missing"))
+    })?;
+    let query = document.query(block_id.query).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query {} is missing", block_id.query))
+    })?;
+    let predicates = plan
+        .planned_query(block_id.query)
+        .and_then(|planned| {
+            planned
+                .blocks
+                .iter()
+                .find(|planned| planned.block == block_id)
+        })
+        .map(|planned| planned.predicates.as_slice())
+        .unwrap_or_default();
+    let mut covered = Vec::new();
+    let mut visit = |root: &'a hir::Expr| {
+        let mut pending = vec![root];
+        while let Some(expression) = pending.pop() {
+            if let Some((_, column)) = access
+                .covered
+                .iter()
+                .find(|(covered, _)| covered.equivalent(expression))
+            {
+                covered.push((expression, *column));
+                continue;
+            }
+            pending.extend((0..).map_while(|position| expression.child(position)));
+        }
+    };
+    for output in &block.outputs {
+        visit(&output.expr);
+    }
+    for term in &query.order_by {
+        visit(&term.expr);
+    }
+    for term in predicates.iter().filter(|term| !term.consumed) {
+        visit(&term.expr);
+    }
+    Ok(PreparedHirIndexMethodLoop {
+        source,
+        access,
+        index_cursor,
+        table_cursor,
+        database: database.index(),
+        covered,
+    })
+}
+
+fn start_hir_index_method_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirIndexMethodLoop<'_>,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    // The pattern's number, then the values of its placeholders.
+    let arguments = &prepared.access.arguments;
+    let start = program.alloc_registers(arguments.len() + 1);
+    program.emit_int(prepared.access.pattern as i64, start);
+    for (position, argument) in arguments.iter().enumerate() {
+        super::expr::translate_expr(program, document, argument, start + 1 + position)?;
+    }
+    program.emit_insn(Insn::IndexMethodQuery {
+        db: prepared.database,
+        cursor_id: prepared.index_cursor,
+        start_reg: start,
+        count_reg: arguments.len() + 1,
+        pc_if_empty: exhausted,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::DeferredSeek {
+        index_cursor_id: prepared.index_cursor,
+        table_cursor_id: prepared.table_cursor,
+    });
+    for (expression, column) in &prepared.covered {
+        let register = program.alloc_register();
+        program.emit_column_or_rowid(prepared.index_cursor, *column, register);
+        program.bind_expression_register(expression, register);
+    }
+    Ok(HirBtreeLoop {
+        cursor: Some(prepared.index_cursor),
+        loop_start,
+        next,
+        exhausted,
+        advance: HirLoopAdvance::Cursor {
+            direction: IterationDirection::Forwards,
+            fullscan: false,
+        },
+        left_join,
     })
 }
 
@@ -4991,6 +5181,9 @@ fn start_hir_loop(
         }
         PreparedHirLoop::Virtual(prepared) => {
             start_hir_virtual_loop(program, document, prepared, left_join)
+        }
+        PreparedHirLoop::IndexMethod(prepared) => {
+            start_hir_index_method_loop(program, document, prepared, left_join)
         }
         PreparedHirLoop::Registers(prepared) => {
             if !matches!(

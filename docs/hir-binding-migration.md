@@ -193,6 +193,25 @@ as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
 stop an endless recursive CTE. HIR still materializes them in blocks with an
 outer join, where legacy can stream some of them.
 
+A block that reads only one table, without GROUP BY or an index hint, is
+matched against the query patterns of the table's index methods, such as
+FTS (`hir_index_method.rs`), as legacy's fast path does. A pattern is SQL
+like `SELECT fts_score(title, body, ?1) AS score FROM docs WHERE
+fts_match(title, body, ?1) ORDER BY score DESC LIMIT ?`; it matches when the
+block's WHERE term, ORDER BY and LIMIT have its shape, each `?` standing for
+an expression of the query. The loop then runs `IndexMethodQuery` with those
+expressions and reads the table through `DeferredSeek`, and every expression
+of the block that a pattern column stands for, such as `fts_score(...)`, is
+read from the index cursor. Without the index `fts_score` is always 0. A
+pattern with ORDER BY or LIMIT is used only when the index applies every
+WHERE term and rows leave the scan as output (no aggregate, DISTINCT or
+window). Where legacy differs, HIR is right: FTS columns may come in any
+order in a result column too (legacy reads 0 for the score then), the same
+`?1` must stand for the same expression in every place, and a query OFFSET
+the pattern lacks keeps the pattern from applying LIMIT (legacy drops the
+OFFSET). Not done yet: legacy also considers index methods for a table in a
+join, and for DELETE and UPDATE scans.
+
 ### DML through HIR
 
 DELETE from a B-tree table is lowered from HIR
