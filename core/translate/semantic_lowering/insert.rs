@@ -79,19 +79,6 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    for upsert in &insert.upserts {
-        let hir::UpsertAction::Update { assignments, .. } = &upsert.action else {
-            continue;
-        };
-        // `SET rowid = ...` still needs legacy.
-        if assignments
-            .iter()
-            .flat_map(|assignment| &assignment.columns)
-            .any(|column| matches!(column, hir::TargetColumn::RowId))
-        {
-            return Ok(true);
-        }
-    }
     Ok(false)
 }
 
@@ -1096,15 +1083,19 @@ impl InsertRow<'_> {
         // A DO UPDATE that sets the INTEGER PRIMARY KEY moves the row.
         let mut rowid_value = None;
         for assignment in assignments {
-            let [hir::TargetColumn::Column(column)] = assignment.columns.as_slice() else {
-                return Err(LimboError::InternalError(
-                    "HIR UPSERT assignment does not set exactly one column".into(),
-                ));
-            };
-            if table.columns()[*column].is_rowid_alias() {
-                rowid_value = Some(&assignment.value);
-            } else {
-                values[*column] = Some(&assignment.value);
+            match assignment.columns.as_slice() {
+                [hir::TargetColumn::RowId] => rowid_value = Some(&assignment.value),
+                [hir::TargetColumn::Column(column)]
+                    if table.columns()[*column].is_rowid_alias() =>
+                {
+                    rowid_value = Some(&assignment.value)
+                }
+                [hir::TargetColumn::Column(column)] => values[*column] = Some(&assignment.value),
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "HIR UPSERT assignment does not set exactly one column".into(),
+                    ))
+                }
             }
         }
         let new_rowid = rowid_value
@@ -2311,16 +2302,24 @@ mod tests {
 
     #[test]
     fn upsert_that_sets_the_rowid_moves_the_row() {
-        let program = emit("INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5");
-        assert_eq!(
-            count(&program, |insn| matches!(
-                insn,
-                Insn::Delete {
-                    is_part_of_update: true,
-                    ..
-                }
-            )),
-            1
-        );
+        for sql in [
+            "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET id = 5",
+            "INSERT INTO counted VALUES (1, 'x') ON CONFLICT DO UPDATE SET rowid = 5",
+            // `items` has no INTEGER PRIMARY KEY.
+            "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO UPDATE SET oid = 5",
+        ] {
+            let program = emit(sql);
+            assert_eq!(
+                count(&program, |insn| matches!(
+                    insn,
+                    Insn::Delete {
+                        is_part_of_update: true,
+                        ..
+                    }
+                )),
+                1,
+                "{sql}"
+            );
+        }
     }
 }

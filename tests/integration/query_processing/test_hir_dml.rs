@@ -1419,6 +1419,22 @@ fn hir_upsert_moving_rows_match_sqlite() {
         "SELECT c, a FROM um INDEXED BY um_c ORDER BY c",
         "SELECT * FROM umlog",
         "PRAGMA integrity_check",
+        // `rowid` names the rowid, on a table without an INTEGER PRIMARY KEY
+        // too, unless the table has a column of that name. Legacy rejects it.
+        "INSERT INTO um VALUES (3, 70, 'z') ON CONFLICT(b) DO UPDATE SET rowid = 30 RETURNING *",
+        "CREATE TABLE un(v UNIQUE, w)",
+        "CREATE INDEX un_w ON un(w)",
+        "INSERT INTO un VALUES ('a', 1), ('b', 3)",
+        "INSERT INTO un VALUES ('a', 2) ON CONFLICT(v) DO UPDATE SET oid = 9, w = excluded.w RETURNING rowid, *",
+        "INSERT INTO un VALUES ('b', 4) ON CONFLICT(v) DO UPDATE SET _rowid_ = 9",
+        "INSERT INTO un VALUES ('b', 4) ON CONFLICT(v) DO UPDATE SET rowid = 'x'",
+        "SELECT rowid, * FROM un ORDER BY rowid",
+        "SELECT w FROM un INDEXED BY un_w ORDER BY w",
+        "CREATE TABLE ur(rowid, v UNIQUE)",
+        "INSERT INTO ur VALUES (1, 'a')",
+        "INSERT INTO ur VALUES (2, 'a') ON CONFLICT(v) DO UPDATE SET rowid = 50",
+        "SELECT _rowid_, * FROM ur",
+        "PRAGMA integrity_check",
     ] {
         assert_matches_sqlite(&db, &conn, &sqlite, sql);
     }

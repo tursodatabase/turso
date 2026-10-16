@@ -382,7 +382,10 @@ once the new row passed its CHECK constraints, AFTER once RETURNING has read
 the row, as in SQLite (legacy fires them before RETURNING). A DO UPDATE that
 sets the INTEGER PRIMARY KEY moves the row as UPDATE does: the new rowid must
 be free (checked with ABORT before the indexes), every index entry is
-rewritten, and the row is deleted and inserted under its new rowid. The ON
+rewritten, and the row is deleted and inserted under its new rowid. As in
+SQLite, `rowid`, `oid` and `_rowid_` name the rowid there unless the table
+has a column of that name, also on a table without an INTEGER PRIMARY KEY
+(legacy rejects them). The ON
 UPDATE actions of a parent key it changes run once the row is written,
 before RETURNING.
 

@@ -916,12 +916,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
             };
             for (name, value) in set.col_names.iter().zip(values) {
-                let normalized = normalize_ident(name.as_str());
-                let Some((column, definition)) = table.value().get_column_by_name(&normalized)
-                else {
-                    crate::bail_parse_error!("no such column: {}", name);
-                };
-                definition.ensure_not_generated("UPDATE", name.as_str())?;
+                let column = resolve_upsert_target(table.value(), name)?;
                 if expression_contains_subquery(value) {
                     crate::bail_parse_error!("Subquery is not supported in this position");
                 }
@@ -929,19 +924,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     value,
                     &scope,
                     policy,
-                    self.write_target_type(
-                        target,
-                        table.value(),
-                        hir::TargetColumn::Column(column),
-                    )?,
+                    self.write_target_type(target, table.value(), column)?,
                 )?;
                 match assignments
                     .iter_mut()
-                    .find(|assignment| assignment.columns == [hir::TargetColumn::Column(column)])
+                    .find(|assignment| assignment.columns == [column])
                 {
                     Some(existing) => existing.value = value,
                     None => assignments.push(hir::Assignment {
-                        columns: vec![hir::TargetColumn::Column(column)],
+                        columns: vec![column],
                         value,
                     }),
                 }
@@ -1017,6 +1008,29 @@ fn is_simple_values(select: &ast::Select) -> bool {
         && select.body.compounds.is_empty()
         && select.order_by.is_empty()
         && select.limit.is_none()
+}
+
+/// The column a DO UPDATE assignment sets. Like SQLite, `rowid`, `oid` and
+/// `_rowid_` name the rowid unless the table has a column of that name; the
+/// rowid is the INTEGER PRIMARY KEY column when the table has one.
+fn resolve_upsert_target(table: &Table, name: &ast::Name) -> Result<hir::TargetColumn> {
+    let normalized = normalize_ident(name.as_str());
+    if let Some((column, definition)) = table.get_column_by_name(&normalized) {
+        definition.ensure_not_generated("UPDATE", name.as_str())?;
+        return Ok(hir::TargetColumn::Column(column));
+    }
+    if table.btree().is_some_and(|btree| btree.has_rowid)
+        && ["rowid", "_rowid_", "oid"]
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&normalized))
+    {
+        return Ok(table
+            .columns()
+            .iter()
+            .position(|column| column.is_rowid_alias())
+            .map_or(hir::TargetColumn::RowId, hir::TargetColumn::Column));
+    }
+    crate::bail_parse_error!("no such column: {}", name)
 }
 
 fn resolve_insert_targets(table: &Table, names: &[ast::Name]) -> Result<Vec<hir::InsertTarget>> {
