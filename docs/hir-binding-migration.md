@@ -256,6 +256,9 @@ and gives UPSERT DO UPDATE the new row as its before image. The `ALTER
 TABLE` rewrite of `sqlite_schema`, which records its own statement, still
 goes to legacy.
 
+Writes to a virtual table record no change data. Legacy records none
+either, but writes a COMMIT row after each UPDATE and DELETE of one.
+
 A table with materialized views is written like any other: the VM updates
 the views as rows are inserted and deleted. Only views built by another
 DBSP version, which legacy reports as an error, still go to legacy.
@@ -265,7 +268,7 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| CDC of a virtual table, `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
+| `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
 UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`).
@@ -294,7 +297,7 @@ derived table again for each row). These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
-| CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
+| `sqlite_dbpage` | As for DELETE |
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
 | Arrays of a custom type | Decoding and encoding their elements on every write path |
@@ -314,7 +317,7 @@ inserted. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
-| CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
+| `sqlite_dbpage` | As for DELETE |
 | Arrays of a custom type | Decoding and encoding their elements on every write path |
 | A custom-typed virtual column | Decoding computed columns |
 

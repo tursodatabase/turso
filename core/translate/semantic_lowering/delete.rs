@@ -21,7 +21,7 @@ use crate::{
         insn::{Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    CaptureDataChangesExt, LimboError, Result,
+    LimboError, Result,
 };
 
 use super::dml::{
@@ -43,15 +43,13 @@ pub(super) fn needs_legacy(
     document: &HirDocument,
     delete: &hir::Delete,
     access: &HirAccessPlan,
-    program: &ProgramBuilder,
 ) -> Result<bool> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
-    // Change data capture of a virtual table is not lowered yet.
+    // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, delete.target)? {
-        return Ok(program.capture_data_changes_info().table().is_some()
-            || super::dml::virtual_needs_legacy(&table));
+        return Ok(super::dml::virtual_needs_legacy(&table));
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -621,7 +619,7 @@ mod tests {
         let plan = Arc::new(plan);
         let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(&plan.document, delete, access, &program).unwrap());
+        assert!(!needs_legacy(&plan.document, delete, access).unwrap());
         program.set_hir_plan(plan.clone());
         emit_delete(&mut program, &plan, delete, access, &Subprograms::default()).unwrap();
         program
@@ -778,7 +776,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (delete, access) = root(&plan);
             assert_eq!(
-                needs_legacy(&plan.document, delete, access, &program()).unwrap(),
+                needs_legacy(&plan.document, delete, access).unwrap(),
                 legacy,
                 "{sql}"
             );

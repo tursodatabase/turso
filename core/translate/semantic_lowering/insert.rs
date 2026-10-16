@@ -47,10 +47,9 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    // Change data capture of a virtual table is not lowered yet.
+    // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, insert.target)? {
-        return Ok(program.capture_data_changes_info().table().is_some()
-            || super::dml::virtual_needs_legacy(&table));
+        return Ok(super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(

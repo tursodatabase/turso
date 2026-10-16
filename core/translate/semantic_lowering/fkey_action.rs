@@ -161,7 +161,7 @@ fn compile_action<'a>(
     );
     match (&plan.document.root, &plan.root) {
         (hir::HirRoot::Delete(delete), HirRootPlan::Delete(access)) => {
-            if super::delete::needs_legacy(&plan.document, delete, access, &builder)? {
+            if super::delete::needs_legacy(&plan.document, delete, access)? {
                 return Ok(None);
             }
             let Some(subprograms) = Subprograms::for_delete(session, &builder, &plan, delete)?
@@ -174,7 +174,7 @@ fn compile_action<'a>(
         }
         (hir::HirRoot::Update(_), HirRootPlan::Update(_)) => {
             let (update, access) = super::update::update_root(&plan)?;
-            if super::update::needs_legacy(&plan, update, access, &builder)? {
+            if super::update::needs_legacy(&plan, update, access)? {
                 return Ok(None);
             }
             let Some(subprograms) = Subprograms::for_update(session, &builder, &plan, update)?

@@ -84,7 +84,7 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
-    if delete::needs_legacy(&plan.document, delete, access, program)? {
+    if delete::needs_legacy(&plan.document, delete, access)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_delete(&session, program, &plan, delete)? else {
@@ -121,7 +121,7 @@ pub(crate) fn translate_update(
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
     let mvcc = uses_mvcc(connection, &plan.document, update.target);
-    if update::needs_legacy(&plan, update, access, program)? {
+    if update::needs_legacy(&plan, update, access)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {

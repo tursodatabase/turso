@@ -583,6 +583,17 @@ def test_kv_hir():
             lambda res: "UPDATE RETURNING is not available on virtual tables" in res,
             "UPDATE ... RETURNING fails as in SQLite",
         )
+        # Writes to a virtual table record no change data. Legacy records
+        # none either, but writes a COMMIT row after UPDATE and DELETE.
+        turso.run_test_fn("PRAGMA capture_data_changes_conn('full');", lambda res: True)
+        turso.run_test_fn("insert into t values ('p', 'q');", null)
+        turso.run_test_fn("update t set value = 'r' where key = 'p';", null)
+        turso.run_test_fn("delete from t where key = 'p';", null)
+        turso.run_test_fn(
+            "select count(*) from turso_cdc;",
+            lambda res: res == "0",
+            "writes to a virtual table record no change data",
+        )
         turso.quit()
     finally:
         del os.environ["TURSO_EXPERIMENTAL_HIR"]

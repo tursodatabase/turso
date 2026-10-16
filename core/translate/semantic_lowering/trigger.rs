@@ -150,14 +150,14 @@ fn compile_trigger(
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                if super::update::needs_legacy(&plan, update, access, &builder)? {
+                if super::update::needs_legacy(&plan, update, access)? {
                     None
                 } else {
                     Subprograms::for_update(session, &builder, &plan, update)?
                 }
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                if super::delete::needs_legacy(&plan.document, delete, access, &builder)? {
+                if super::delete::needs_legacy(&plan.document, delete, access)? {
                     None
                 } else {
                     Subprograms::for_delete(session, &builder, &plan, delete)?

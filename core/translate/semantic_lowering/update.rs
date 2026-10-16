@@ -25,7 +25,7 @@ use crate::{
         insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    CaptureDataChangesExt, LimboError, Result,
+    LimboError, Result,
 };
 
 use super::autoincrement::Sequence;
@@ -48,7 +48,6 @@ pub(super) fn needs_legacy(
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
-    program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
     if !update.order_by.is_empty()
@@ -57,11 +56,9 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // Change data capture of a virtual table is not lowered yet.
+    // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, update.target)? {
-        return Ok(update.from.is_some()
-            || program.capture_data_changes_info().table().is_some()
-            || super::dml::virtual_needs_legacy(&table));
+        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -2230,10 +2227,7 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema, sql));
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
-        assert!(
-            !needs_legacy(&plan, update, access, &program).unwrap(),
-            "{sql}"
-        );
+        assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
         emit_update(
             &mut program,
@@ -2441,10 +2435,7 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
-            assert!(
-                !needs_legacy(&plan, update, access, &program()).unwrap(),
-                "{sql}"
-            );
+            assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
         }
     }
 
