@@ -3920,10 +3920,11 @@ fn emit_replace_delete_conflicting_row(
         let before_record_reg = if cdc_has_before {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 table.columns(),
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
-            ))
+            )?)
         } else {
             None
         };
