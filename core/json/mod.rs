@@ -2164,4 +2164,44 @@ mod tests {
         let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
         assert!(!is_jsonb_blob(invalid_utf8_key));
     }
+
+    #[test]
+    fn test_get_json_pretty_empty_container_stays_on_one_line() {
+        // SQLite's json_pretty() only breaks a line after an opening bracket
+        // that has members behind it; an empty object or array is printed
+        // inline, at any indentation.
+        let cases: &[(&str, &str, &str)] = &[
+            ("{}", "    ", "{}"),
+            ("[]", "    ", "[]"),
+            (
+                r#"{"a":[],"b":{}}"#,
+                "    ",
+                "{\n    \"a\": [],\n    \"b\": {}\n}",
+            ),
+            ("[[],1,{}]", "    ", "[\n    [],\n    1,\n    {}\n]"),
+            (
+                r#"{"a":{"b":{},"c":[1,{"d":[]}]}}"#,
+                "    ",
+                "{\n    \"a\": {\n        \"b\": {},\n        \"c\": [\n            1,\n            {\n                \"d\": []\n            }\n        ]\n    }\n}",
+            ),
+            (
+                r#"{"a":{"b":{}}}"#,
+                "  ",
+                "{\n  \"a\": {\n    \"b\": {}\n  }\n}",
+            ),
+            ("[[]]", "\t", "[\n\t[]\n]"),
+        ];
+        for (input, indent, expected) in cases {
+            let value = Value::build_text(*input);
+            let result = get_json(&value, Some(indent)).unwrap();
+            let Value::Text(text) = result else {
+                panic!("Expected Value::Text");
+            };
+            assert_eq!(text.as_str(), *expected, "json_pretty({input}, {indent:?})");
+        }
+        // json() is not affected: it never split a container at all.
+        let value = Value::build_text(r#"{"a":[],"b":{}}"#);
+        let result = get_json(&value, None).unwrap();
+        assert_eq!(result.to_text().unwrap(), r#"{"a":[],"b":{}}"#);
+    }
 }
