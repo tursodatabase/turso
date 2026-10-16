@@ -1992,3 +1992,43 @@ fn assert_matches_sqlite(
         _ => panic!("{sql}: {turso:?} vs {reference:?}"),
     }
 }
+
+/// INSERT, UPDATE and DELETE through HIR keep an FTS index, which has no
+/// B-tree of its own, up to date, as legacy does.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn hir_dml_writes_fts_indexes() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)",
+        "CREATE INDEX docs_fts ON docs USING fts(body)",
+        "CREATE TABLE src(v INTEGER)",
+        "CREATE TRIGGER tr AFTER INSERT ON src BEGIN \
+         INSERT INTO docs VALUES (new.v, 'fromtrigger'); END",
+        "INSERT INTO docs VALUES (1, 'apple'), (2, 'banana'), (3, 'apple pie')",
+        "INSERT INTO src VALUES (4)",
+        "UPDATE docs SET body = 'cherry' WHERE id = 3",
+        "DELETE FROM docs WHERE id = 1",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let matching = |word: &str| {
+        limbo_exec_rows(
+            &conn,
+            &format!("SELECT id FROM docs WHERE fts_match(body, '{word}') ORDER BY id"),
+        )
+    };
+    let ids = |ids: &[i64]| {
+        ids.iter()
+            .map(|id| vec![rusqlite::types::Value::Integer(*id)])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(matching("apple"), ids(&[]));
+    assert_eq!(matching("banana"), ids(&[2]));
+    assert_eq!(matching("cherry"), ids(&[3]));
+    assert_eq!(matching("fromtrigger"), ids(&[4]));
+}

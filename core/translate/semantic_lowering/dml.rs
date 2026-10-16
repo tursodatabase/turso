@@ -241,8 +241,9 @@ impl<'a> DmlTarget<'a> {
             if skip.is_some_and(|skip| skip.name == index.name) {
                 continue;
             }
-            let cursor =
-                program.alloc_cursor_id(CursorType::BTreeIndex(expressions.index.handle()));
+            // An index method without a B-tree of its own (such as FTS) gets
+            // its own kind of cursor, as in legacy.
+            let cursor = program.alloc_cursor_index(None, &expressions.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
