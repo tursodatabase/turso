@@ -5,7 +5,7 @@ use super::{
         apply_hir_selected_btree_access, apply_hir_selected_virtual_access, base_row_estimate,
         constraints::{hir_constraints_for_source, HirConstraintSource, HirTableConstraints},
         cost::{Cost, RowCountEstimate},
-        join::compute_hir_greedy_join_order,
+        join::compute_hir_join_order,
         order::{
             hir_plan_satisfies_order_target, ColumnOrder, ColumnTarget, EliminatesSortBy,
             HirOrderTarget, OrderTarget, OrderTargetPurpose,
@@ -1604,7 +1604,7 @@ impl<'a> HirPlanContext<'a> {
             );
         }
         let mut access_methods = Vec::new();
-        let result = compute_hir_greedy_join_order(
+        let result = compute_hir_join_order(
             self.document,
             &input.sources,
             &input.groups,
@@ -1621,9 +1621,19 @@ impl<'a> HirPlanContext<'a> {
             or_union,
         )?;
 
-        let Some(result) = result else {
+        let Some(mut result) = result else {
             return Ok(None);
         };
+        // Like legacy, prefer a plan that returns rows in the order target's
+        // order when the sort it saves costs more than the difference.
+        if let Some(ordered) = result.best_ordered_plan.take() {
+            const SORT_COST_PER_ROW_MULTIPLIER: f64 = 0.001;
+            let sorting_penalty =
+                Cost(result.best_plan.output_cardinality * SORT_COST_PER_ROW_MULTIPLIER);
+            if result.best_plan.cost + sorting_penalty > ordered.cost {
+                result.best_plan = ordered;
+            }
+        }
         // Whether the chosen loops already return rows in the order the
         // GROUP BY or ORDER BY target asks for, so its sort can be skipped.
         let sort_elided = |by: EliminatesSortBy| -> Result<bool> {
