@@ -98,6 +98,9 @@ enum Commands {
         /// create and drop databases.
         #[arg(long)]
         postgres_dsn: Option<String>,
+        /// Stop at the first failed test or error
+        #[arg(long)]
+        fail_fast: bool,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -168,6 +171,7 @@ async fn main() -> ExitCode {
             snapshot_filter,
             cross_check_binary,
             postgres_dsn,
+            fail_fast,
         } => {
             run_tests(
                 paths,
@@ -184,6 +188,7 @@ async fn main() -> ExitCode {
                 snapshot_filter,
                 cross_check_binary,
                 postgres_dsn,
+                fail_fast,
             )
             .await
         }
@@ -241,6 +246,7 @@ async fn run_tests(
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
     postgres_dsn: Option<String>,
+    fail_fast: bool,
 ) -> ExitCode {
     match (&postgres_dsn, backend_type.as_str()) {
         (None, "postgres") => {
@@ -347,7 +353,8 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
-        .with_snapshot_update_mode(snapshot_mode);
+        .with_snapshot_update_mode(snapshot_mode)
+        .with_fail_fast(fail_fast);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }
