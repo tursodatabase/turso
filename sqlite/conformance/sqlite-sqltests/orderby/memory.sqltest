@@ -140,6 +140,115 @@ expect {
     1
 }
 
+# A window function or aggregate in an ORDER BY term removed by the rowid
+# truncation or by duplicate removal must not be planned. min/max with a
+# moving frame failed with "table not found" when such a term was a copy of a
+# result column whose window ORDER BY or PARTITION BY is nondeterministic.
+@cross-check-integrity
+test orderby_rowid_truncation_window_min_max {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT rowid, max(c0) OVER (ORDER BY strftime(NULL) ROWS CURRENT ROW) FROM t0 ORDER BY 1, 2;
+    SELECT rowid, min(c0) OVER (ORDER BY strftime(NULL) ROWS CURRENT ROW) FROM t0 ORDER BY 1, 2;
+    SELECT rowid, max(c0) OVER (ORDER BY random() ROWS CURRENT ROW) FROM t0 ORDER BY 1, 2;
+    SELECT rowid, max(c0) OVER (PARTITION BY changes() ORDER BY strftime(NULL) RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM t0 ORDER BY 1, 2;
+    SELECT rowid, max(c0) OVER (ORDER BY strftime(NULL) ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t0 ORDER BY rowid, 2 DESC;
+    SELECT rowid FROM t0 ORDER BY rowid, max(c0) OVER (ORDER BY c0 ROWS CURRENT ROW);
+    SELECT rowid, max(c0) OVER (ORDER BY random() ROWS CURRENT ROW) FROM t0 ORDER BY 2, 2;
+}
+expect {
+    1|1
+    2|2
+    1|1
+    2|2
+    1|1
+    2|2
+    1|2
+    2|2
+    1|1
+    2|2
+    1
+    2
+    1|1
+    2|2
+}
+
+@cross-check-integrity
+test orderby_rowid_truncation_window_min_max_integer_primary_key {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, c0);
+    INSERT INTO t1 VALUES(1,1),(2,2);
+    SELECT id, max(c0) OVER (ORDER BY strftime(NULL) ROWS CURRENT ROW) FROM t1 ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|2
+}
+
+@cross-check-integrity
+test orderby_rowid_truncation_skips_aggregate_misuse {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    SELECT a FROM t ORDER BY rowid, min(a);
+}
+expect {
+    1
+    2
+}
+
+test orderby_rowid_truncation_still_checks_window_name {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0 FROM t0 ORDER BY rowid, max(c0) OVER nosuch;
+}
+expect error {
+    no such window: nosuch
+}
+
+test orderby_rowid_truncation_still_checks_distinct_window_function {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0 FROM t0 ORDER BY rowid, count(DISTINCT c0) OVER ();
+}
+expect error {
+    DISTINCT is not supported for window functions
+}
+
+test orderby_rowid_truncation_checks_aggregate_misuse_with_window_in_select {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0, max(c0) OVER () FROM t0 ORDER BY rowid, sum(c0);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test orderby_rowid_truncation_checks_aggregate_misuse_next_to_window {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0, max(c0) OVER () FROM t0 ORDER BY rowid, sum(c0) + max(c0) OVER ();
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test orderby_rowid_truncation_checks_aggregate_misuse_with_window_in_cut_term {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0 FROM t0 ORDER BY rowid, min(c0) OVER (), sum(c0);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test orderby_rowid_truncation_checks_aggregate_inside_window_function {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES(1),(2);
+    SELECT c0 FROM t0 ORDER BY rowid, max(max(c0)) OVER ();
+}
+expect error {
+    misuse of aggregate: max()
+}
+
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
 # Fixes select1-4.9.2 in sqlite/conformance/upstream/all.test.
