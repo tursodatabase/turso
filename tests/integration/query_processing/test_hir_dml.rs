@@ -1424,6 +1424,35 @@ fn hir_upsert_moving_rows_match_sqlite() {
     }
 }
 
+/// RETURNING subqueries of UPDATE ... FROM: a correlated one runs per row,
+/// any other once, as in SQLite. Legacy runs one that reads the target
+/// through a derived table again for each row.
+#[test]
+fn hir_update_from_returning_subqueries_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE s(id INTEGER PRIMARY KEY, bump INTEGER)",
+        "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
+        "INSERT INTO s VALUES(1,1),(2,2),(3,3)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t WHEN NEW.id = 1 BEGIN UPDATE s SET bump = bump + 100 WHERE id = 2; END",
+        "UPDATE t SET v = s.bump FROM s WHERE t.id = s.id RETURNING id, v, (SELECT sum(bump) FROM s), (SELECT bump FROM s WHERE s.id = t.id)",
+        "UPDATE t SET v = s.bump + 1 FROM s WHERE t.id = s.id RETURNING id, (SELECT max(v) FROM t)",
+        "UPDATE t SET v = s.bump + 2 FROM s WHERE t.id = s.id RETURNING id, (SELECT count(*) FROM t AS x WHERE x.v > 5)",
+        "UPDATE t SET v = v + 1 FROM (SELECT 1) RETURNING id, (SELECT group_concat(v) FROM (SELECT v FROM t ORDER BY id))",
+        "UPDATE t SET v = v + 1 FROM (SELECT 1) RETURNING id, EXISTS (SELECT 1 FROM s WHERE bump > 200), id IN (SELECT id FROM s WHERE bump > 50)",
+        "UPDATE t SET v = 1 WHERE id < 3 RETURNING id, (SELECT max(v) FROM t), (SELECT group_concat(v) FROM (SELECT v FROM t ORDER BY id))",
+        // A CTE that FROM and RETURNING both read.
+        "WITH c(total) AS (SELECT sum(bump) FROM s) UPDATE t SET v = 0 FROM c WHERE t.id > 0 RETURNING id, v, (SELECT total FROM c)",
+        "WITH c(id, bump) AS (SELECT id, bump FROM s) UPDATE t SET v = src.bump FROM c AS src WHERE t.id = src.id RETURNING id, (SELECT bump FROM c WHERE c.id = t.id)",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// UPDATE ... FROM that sets the rowid moves each joined row, with its
 /// index entries, as SQLite does.
 #[test]

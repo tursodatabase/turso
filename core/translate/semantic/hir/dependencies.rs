@@ -134,6 +134,22 @@ impl HirDocument {
 
     /// Whether `query`, or any query it runs, reads `table`.
     pub(crate) fn query_reads_table(&self, query: QueryId, table: &ResolvedTable) -> bool {
+        self.query_reads_source(
+            query,
+            |kind| matches!(kind, SourceKind::Table(source_table) if source_table == table),
+        )
+    }
+
+    /// Whether `query`, or any query it runs, reads a CTE.
+    pub(crate) fn query_reads_cte(&self, query: QueryId) -> bool {
+        self.query_reads_source(query, |kind| {
+            matches!(kind, SourceKind::Cte(_) | SourceKind::RecursiveInput(_))
+        })
+    }
+
+    /// Whether `query`, or any query it runs, has a FROM source of a kind
+    /// `matches` accepts.
+    fn query_reads_source(&self, query: QueryId, matches: impl Fn(&SourceKind) -> bool) -> bool {
         let mut pending = vec![query];
         let mut seen = HashSet::default();
         while let Some(query) = pending.pop() {
@@ -144,9 +160,7 @@ impl HirDocument {
             let mut reads = false;
             visit_query_parts(self, definition, &mut |part| {
                 if let QueryPart::Source(source) = part {
-                    if let SourceKind::Table(source_table) = &source.kind {
-                        reads |= source_table == table;
-                    }
+                    reads |= matches(&source.kind);
                 }
             });
             if reads {

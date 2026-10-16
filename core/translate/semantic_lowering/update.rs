@@ -95,13 +95,18 @@ pub(super) fn needs_legacy(
     }
     if update.from.is_some() {
         // A RETURNING subquery may read a CTE the FROM clause reads too.
-        // SQLite reads it once, before any row changes, but HIR would read
-        // it again after triggers ran.
+        // SQLite may keep one copy of it, read before any row changes, but
+        // HIR would read it again after triggers ran.
         if update.returning.as_ref().is_some_and(|returning| {
-            returning
-                .outputs
-                .iter()
-                .any(|output| has_subquery(&output.expr))
+            returning.outputs.iter().any(|output| {
+                let mut reads_cte = false;
+                output.expr.for_each(&mut |expression| {
+                    if let hir::Expr::Subquery(subquery) = expression {
+                        reads_cte |= document.query_reads_cte(super::dml::subquery_query(subquery));
+                    }
+                });
+                reads_cte
+            })
         }) {
             return Ok(true);
         }
