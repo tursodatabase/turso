@@ -38,3 +38,6 @@ jobs:
     
     - name: Build
       run: npm run build
+
+    - name: Test protocol behavior
+      run: npx ava integration-tests/protocol.test.mjs
