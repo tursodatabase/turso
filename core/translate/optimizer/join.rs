@@ -1,4 +1,4 @@
-use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
+use crate::{alloc::TryReserveError, turso_assert, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -1940,7 +1940,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     };
     let layout = HirFromLayout::new(sources, groups);
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
-    let first_position = find_best_hir_starting_source(
+    let starting_sources = hir_starting_sources_by_score(
         document,
         sources,
         constraints,
@@ -1954,23 +1954,40 @@ pub(crate) fn compute_hir_greedy_join_order(
 
     let mut remaining: TableMask = (0..sources.len()).try_collect()?;
     let mut joined_mask = TableMask::default();
-    let first = hir_join_step(
-        document,
-        sources,
-        &layout,
-        constraints,
-        where_clause,
-        &predicate_work,
-        base_table_rows,
-        source_costs,
-        order_target,
-        first_position,
-        &joined_mask,
-        initial_input_cardinality,
-        schema,
-        analyze_stats,
-        params,
-    )?;
+    // A table function whose arguments read another table cannot start
+    // the join, so the best starting table its virtual table accepts wins.
+    let mut first = None;
+    for &position in &starting_sources {
+        first = hir_join_step(
+            document,
+            sources,
+            &layout,
+            constraints,
+            where_clause,
+            &predicate_work,
+            base_table_rows,
+            source_costs,
+            order_target,
+            position,
+            &joined_mask,
+            initial_input_cardinality,
+            schema,
+            analyze_stats,
+            params,
+        )?;
+        if first.is_some() {
+            break;
+        }
+    }
+    let first = first.ok_or_else(|| {
+        let name = starting_sources
+            .first()
+            .and_then(|position| sources[*position].btree())
+            .map_or("", |source| source.table.get_name());
+        LimboError::PlanningError(format!(
+            "virtual table {name} rejected the available constraints"
+        ))
+    })?;
     let first_position = first.source_position;
     let mut first_mask = TableMask::default();
     first_mask.set(first_position)?;
@@ -2026,7 +2043,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 continue;
             }
 
-            let step = hir_join_step(
+            let Some(step) = hir_join_step(
                 document,
                 sources,
                 &layout,
@@ -2042,7 +2059,10 @@ pub(crate) fn compute_hir_greedy_join_order(
                 schema,
                 analyze_stats,
                 params,
-            )?;
+            )?
+            else {
+                continue;
+            };
             let position = step.source_position;
             let mut method = step.access_method;
             if !connected {
@@ -2114,7 +2134,7 @@ fn hir_join_step(
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<HirJoinStep> {
+) -> Result<Option<HirJoinStep>> {
     let source = &sources[source_position];
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(source_position)?;
@@ -2149,21 +2169,23 @@ fn hir_join_step(
                 base_row_count,
                 params,
             )?,
-            Table::Virtual(vtab) => find_best_hir_access_method_for_vtab(
-                vtab,
-                &constraints[source_position].constraints,
-                source_position,
-                lhs_mask,
-                input_cardinality,
-                base_row_count,
-                params,
-            )?
-            .ok_or_else(|| {
-                LimboError::PlanningError(format!(
-                    "virtual table {} rejected the available constraints",
-                    source.table.get_name()
-                ))
-            })?,
+            Table::Virtual(vtab) => {
+                // The virtual table cannot be read after these tables, for
+                // example when an argument it needs reads a later table.
+                let Some(method) = find_best_hir_access_method_for_vtab(
+                    vtab,
+                    &constraints[source_position].constraints,
+                    source_position,
+                    lhs_mask,
+                    input_cardinality,
+                    base_row_count,
+                    params,
+                )?
+                else {
+                    return Ok(None);
+                };
+                method
+            }
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "HIR catalog source {} is not a table",
@@ -2202,10 +2224,10 @@ fn hir_join_step(
     };
     add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
 
-    Ok(HirJoinStep {
+    Ok(Some(HirJoinStep {
         source_position,
         access_method,
-    })
+    }))
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
@@ -2259,7 +2281,9 @@ where
     Ok(best.expect("no valid starting table").0)
 }
 
-fn find_best_hir_starting_source(
+/// The tables that may start the join, best first, scored like
+/// [find_best_starting_source].
+fn hir_starting_sources_by_score(
     document: &HirDocument,
     sources: &[HirPlanSource],
     constraints: &[HirTableConstraints],
@@ -2269,7 +2293,7 @@ fn find_best_hir_starting_source(
     boundaries: &HirJoinBoundaries<'_>,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<usize> {
+) -> Result<Vec<usize>> {
     let multipliers = compute_indexed_seek_benefits_optional(
         sources.len(),
         constraints,
@@ -2289,7 +2313,7 @@ fn find_best_hir_starting_source(
     )?;
 
     let empty = TableMask::default();
-    let mut best: Option<(usize, f64)> = None;
+    let mut candidates: Vec<(usize, f64)> = Vec::new();
     for position in 0..sources.len() {
         if !boundaries.allows_candidate(position, &empty) {
             continue;
@@ -2301,12 +2325,15 @@ fn find_best_hir_starting_source(
         let score = source_work
             * build_self_constraint_selectivity(&constraints[position], position)
             * multipliers[position];
-        if best.is_none_or(|(_, best_score)| score < best_score) {
-            best = Some((position, score));
-        }
+        candidates.push((position, score));
     }
-
-    Ok(best.expect("no valid starting HIR source").0)
+    // Stable, so equal scores keep FROM order as before.
+    candidates.sort_by(|(_, left), (_, right)| left.total_cmp(right));
+    turso_assert!(!candidates.is_empty(), "no valid starting HIR source");
+    Ok(candidates
+        .into_iter()
+        .map(|(position, _)| position)
+        .collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -3227,7 +3254,8 @@ mod tests {
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
-        )?;
+        )?
+        .expect("a B-tree source always has a join step");
 
         assert_eq!(step.source_position, 1);
         assert_eq!(
