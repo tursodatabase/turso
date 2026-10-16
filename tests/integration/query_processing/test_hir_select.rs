@@ -574,3 +574,81 @@ fn hir_errors_match_legacy() {
         .to_string();
     assert_eq!(error, "Parse error: no such column: x.y");
 }
+
+#[test]
+fn hir_min_and_max_stop_at_the_first_value_an_index_returns() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE t(x, y)",
+        "CREATE INDEX t_x ON t(x)",
+        "INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (7, 0), (5, 9)",
+        "CREATE TABLE u(a, b)",
+        "CREATE INDEX u_a ON u(a NULLS LAST)",
+        "CREATE INDEX u_b ON u(b DESC NULLS FIRST)",
+        "INSERT INTO u VALUES (NULL, NULL), (2, 8), (9, 1), (4, NULL)",
+        "CREATE TABLE empty(x)",
+        "CREATE INDEX empty_x ON empty(x)",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT min(x) FROM t",
+            vec![vec![rusqlite::types::Value::Integer(1)]],
+        ),
+        (
+            "SELECT max(x) FROM t",
+            vec![vec![rusqlite::types::Value::Integer(7)]],
+        ),
+        (
+            "SELECT max(x) FROM t WHERE y > 1",
+            vec![vec![rusqlite::types::Value::Integer(5)]],
+        ),
+        (
+            "SELECT min(x) FROM t WHERE x > 2",
+            vec![vec![rusqlite::types::Value::Integer(3)]],
+        ),
+        // NULLs sort at the end of these indexes, so the first non-NULL
+        // value is not the first row the scan reads. Legacy returns NULL
+        // for both MAX queries.
+        (
+            "SELECT min(a) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(2)]],
+        ),
+        (
+            "SELECT max(a) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(9)]],
+        ),
+        (
+            "SELECT max(b) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(8)]],
+        ),
+        (
+            "SELECT min(b) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(1)]],
+        ),
+        (
+            "SELECT max(x) FROM empty",
+            vec![vec![rusqlite::types::Value::Null]],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+
+    // The scan ends at the first non-NULL value instead of reading every
+    // row of the index.
+    let opcodes = limbo_exec_rows(&hir, "EXPLAIN SELECT max(x) FROM t")
+        .into_iter()
+        .filter_map(|row| match row.get(1) {
+            Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let step = opcodes
+        .iter()
+        .position(|opcode| opcode == "AggStep")
+        .expect("MAX steps its aggregate");
+    assert_eq!(opcodes[step + 1], "Goto", "{opcodes:?}");
+}

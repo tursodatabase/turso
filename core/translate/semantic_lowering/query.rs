@@ -352,7 +352,10 @@ struct HirAggregateState<'a> {
 enum HirLoopBody<'a> {
     /// Send the block's outputs to a query output.
     Rows(&'a HirRowOutput<'a>, &'a [hir::Output]),
-    UngroupedAggregate(&'a HirAggregateState<'a>),
+    /// Step the block's aggregates. With a label, the block is a MIN or MAX
+    /// whose loop reads its argument in order, so the first non-NULL
+    /// argument ends the scan at that label.
+    UngroupedAggregate(&'a HirAggregateState<'a>, Option<BranchOffset>),
     Group(&'a HirGroupRuntime<'a>),
     /// Run DML code for each joined row; it continues at the given label to
     /// reject the row. It may be emitted more than once.
@@ -1262,13 +1265,19 @@ fn emit_hir_ungrouped_aggregate(
     block_done: BranchOffset,
 ) -> Result<()> {
     let state = initialize_hir_aggregates(program, &plan.document, query, block)?;
+    let first_value_done = block_plan
+        .min_max_first_value
+        .then(|| program.allocate_label());
     emit_btree_loops(
         program,
         plan,
         block,
         block_plan,
-        HirLoopBody::UngroupedAggregate(&state),
+        HirLoopBody::UngroupedAggregate(&state, first_value_done),
     )?;
+    if let Some(done) = first_value_done {
+        program.preassign_label_to_next_insn(done);
+    }
     emit_hir_aggregate_result(program, &plan.document, block, output, block_done, &state)
 }
 
@@ -3333,8 +3342,8 @@ fn emit_btree_loops(
     };
     match (&body, grouping) {
         (HirLoopBody::Rows(..), None) if block.aggregate_count == 0 => {}
-        (HirLoopBody::UngroupedAggregate(_), None) if block.aggregate_count != 0 => {}
-        (HirLoopBody::UngroupedAggregate(_), Some(grouping)) if grouping.keys.is_empty() => {}
+        (HirLoopBody::UngroupedAggregate(..), None) if block.aggregate_count != 0 => {}
+        (HirLoopBody::UngroupedAggregate(..), Some(grouping)) if grouping.keys.is_empty() => {}
         (HirLoopBody::Group(_), Some(grouping)) if !grouping.keys.is_empty() => {}
         _ => {
             return Err(LimboError::InternalError(format!(
@@ -3413,9 +3422,9 @@ fn emit_join_loops(
             prepare_hir_loop(program, plan, planned_loop, streams)
         })
         .collect::<Result<Vec<_>>>()?;
-    let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(_))
+    let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(..))
         .then(|| {
-            let HirLoopBody::UngroupedAggregate(state) = &body else {
+            let HirLoopBody::UngroupedAggregate(state, _) = &body else {
                 unreachable!()
             };
             initialize_hir_aggregate_captures(program, document, loops_plan.loops, state)
@@ -3590,12 +3599,33 @@ impl HirLoopNest<'_, '_> {
                 )?;
             }
             HirLoopBody::Dml(body) => body(program, innermost_next)?,
-            HirLoopBody::UngroupedAggregate(state) => {
+            HirLoopBody::UngroupedAggregate(state, first_value_done) => {
+                if first_value_done.is_some() {
+                    let [aggregate] = state.aggregates.as_slice() else {
+                        return Err(LimboError::InternalError(
+                            "MIN/MAX scan has more than one aggregate".to_string(),
+                        ));
+                    };
+                    let [argument] = aggregate.call.arguments.expressions() else {
+                        return Err(LimboError::InternalError(
+                            "MIN/MAX scan aggregate has more than one argument".to_string(),
+                        ));
+                    };
+                    let value = program.alloc_register();
+                    super::expr::translate_expr(program, self.document, argument, value)?;
+                    program.emit_insn(Insn::IsNull {
+                        reg: value,
+                        target_pc: innermost_next,
+                    });
+                }
                 let (first_row, captures) = self
                     .aggregate_captures
                     .expect("aggregate loop initializes first-row captures");
                 emit_hir_aggregate_capture(program, self.document, *first_row, captures)?;
                 emit_hir_aggregate_steps(program, self.document, state)?;
+                if let Some(done) = first_value_done {
+                    program.emit_insn(Insn::Goto { target_pc: *done });
+                }
             }
             HirLoopBody::Group(runtime) => {
                 emit_hir_group_input(program, self.document, runtime)?;

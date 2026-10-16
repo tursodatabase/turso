@@ -26,6 +26,61 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+/// For a block that is `SELECT min(x) FROM t` or `SELECT max(x) FROM t`
+/// with nothing else, the order that puts the answer first: x ascending for
+/// MIN and descending for MAX. Like legacy and SQLite, a scan in that order
+/// stops at the first non-NULL x.
+fn simple_min_max_term(
+    block: &hir::QueryBlock,
+    input: &HirQueryBlockPlanInput,
+) -> Option<hir::OrderTerm> {
+    let [output] = block.outputs.as_slice() else {
+        return None;
+    };
+    let hir::Expr::Function(call) = &output.expr else {
+        return None;
+    };
+    let order = match call.function.value() {
+        crate::function::Func::Agg(crate::function::AggFunc::Min) => {
+            turso_parser::ast::SortOrder::Asc
+        }
+        crate::function::Func::Agg(crate::function::AggFunc::Max) => {
+            turso_parser::ast::SortOrder::Desc
+        }
+        _ => return None,
+    };
+    let hir::FunctionArguments::Expressions {
+        values,
+        facts,
+        distinctness: None,
+        order_by,
+    } = &call.arguments
+    else {
+        return None;
+    };
+    let ([argument], [fact]) = (values.as_slice(), facts.as_slice()) else {
+        return None;
+    };
+    let single_btree = matches!(input.sources.as_slice(), [HirPlanSource::BTree(_)]);
+    (matches!(
+        call.evaluation,
+        hir::FunctionEvaluation::Aggregate { filter: None, .. }
+    ) && order_by.is_empty()
+        && block.aggregate_count == 1
+        && matches!(
+            &block.body,
+            hir::QueryBlockBody::Select { grouping: None, .. }
+        )
+        && single_btree)
+        .then(|| hir::OrderTerm {
+            expr: argument.clone(),
+            order,
+            nulls: None,
+            type_fact: fact.type_fact.clone(),
+            collation: fact.collation.clone(),
+        })
+}
+
 /// Whether a block is `SELECT count(*) FROM t` with nothing else, which
 /// SQLite answers without a loop over the table.
 fn is_simple_count(
@@ -189,6 +244,9 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) order_sort_elided: bool,
     /// An index method applies LIMIT and OFFSET while it scans.
     pub(crate) limit_applied: bool,
+    /// The block is `SELECT min(x)` or `SELECT max(x)` and the loop reads x
+    /// in that aggregate's order, so the first non-NULL x is the answer.
+    pub(crate) min_max_first_value: bool,
     /// LEFT JOINs run as inner joins, because a WHERE term rejects the NULL
     /// row they would add.
     pub(crate) inner_joins: Vec<SourceId>,
@@ -207,6 +265,8 @@ pub(crate) struct HirAccessPlan {
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order.
     pub(crate) order_sort_elided: bool,
+    /// The loops return rows in the order of a MIN or MAX target.
+    pub(crate) min_max_first_value: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -1102,6 +1162,7 @@ impl<'a> HirPlanContext<'a> {
                 group_sort_elided: false,
                 order_sort_elided: false,
                 limit_applied: false,
+                min_max_first_value: false,
                 inner_joins: Vec::new(),
                 output_cardinality,
                 cost: Cost(0.0),
@@ -1131,7 +1192,12 @@ impl<'a> HirPlanContext<'a> {
         )? {
             return Ok(plan);
         }
-        let order_target = if order_by.is_empty() {
+        let min_max_terms = simple_min_max_term(block, &input)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let order_target = if !min_max_terms.is_empty() {
+            self.order_target(&min_max_terms, OrderTargetPurpose::Extremum)
+        } else if order_by.is_empty() {
             self.grouping_target(block)
         } else {
             self.order_target(
@@ -1165,6 +1231,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: access.group_sort_elided,
             order_sort_elided: access.order_sort_elided,
             limit_applied: false,
+            min_max_first_value: access.min_max_first_value,
             inner_joins,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
@@ -1241,6 +1308,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: false,
             order_sort_elided: matched.applies_order_by,
             limit_applied: matched.applies_limit,
+            min_max_first_value: false,
             inner_joins: Vec::new(),
             output_cardinality: 1.0,
             cost: Cost(1.0),
@@ -1349,6 +1417,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: false,
             order_sort_elided: false,
             limit_applied: false,
+            min_max_first_value: false,
             inner_joins: Vec::new(),
             output_cardinality: access.output_cardinality,
             cost: access.cost,
@@ -1481,6 +1550,17 @@ impl<'a> HirPlanContext<'a> {
         };
         let group_sort_elided = sort_elided(EliminatesSortBy::Group)?;
         let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
+        let min_max_first_value = match order_target {
+            Some(target) if target.is_extremum() => hir_plan_satisfies_order_target(
+                &result.best_plan,
+                &access_methods,
+                &input.sources,
+                self.document,
+                target,
+                schema,
+            )?,
+            _ => false,
+        };
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
         let mut read_out_of_order = false;
@@ -1625,6 +1705,7 @@ impl<'a> HirPlanContext<'a> {
             predicates: input.predicates,
             group_sort_elided: group_sort_elided && !read_out_of_order,
             order_sort_elided: order_sort_elided && !read_out_of_order,
+            min_max_first_value: min_max_first_value && !read_out_of_order,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
