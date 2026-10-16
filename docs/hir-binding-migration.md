@@ -298,7 +298,7 @@ derived table again for each row). These still go to legacy:
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
-| Array columns | Their lowering |
+| Arrays of a custom type | Decoding and encoding their elements on every write path |
 | A custom-typed virtual column | Decoding computed columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
@@ -316,7 +316,7 @@ inserted. These still go to legacy:
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
-| Array columns | Their lowering |
+| Arrays of a custom type | Decoding and encoding their elements on every write path |
 | A custom-typed virtual column | Decoding computed columns |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
@@ -382,6 +382,14 @@ they were checked with the CLI backend, statement block by block against
 legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so
 aggregates decode them once, and BETWEEN on a custom type is `x >= a AND
 x <= b` with the type's operators, as in legacy.
+
+An array column of a built-in element type is written as legacy writes it:
+checked as ANY, parsed with `ArrayEncode` against its element type (only
+that the elements are arrays, for the outer array of a multi-dimensional
+one) and checked as a BLOB; UPDATE re-encodes only the arrays it sets, and
+`SET a[i] = v` is `ArraySetElement`. In an UPSERT, `excluded.a || a` joins
+the arrays, where legacy joins their text. An output reading an array column
+of a custom type decodes each element for display, as legacy does.
 
 INSERT into a WITHOUT ROWID table is lowered too. As in legacy, only the
 primary key is checked (`NoConflict` on the table) and the record holds the

@@ -1575,6 +1575,16 @@ fn hir_custom_type_writes_match_legacy() {
         "SELECT * FROM log",
         "INSERT INTO p VALUES (2, 'x') ON CONFLICT DO UPDATE SET id = 5",
         "SELECT * FROM c",
+        "CREATE TABLE arr(id INTEGER PRIMARY KEY, tags TEXT[] NOT NULL, grid INTEGER[][]) STRICT",
+        "INSERT INTO arr VALUES (1, '{a,b}', '{{1,2},{3}}'), (2, ARRAY['c'], NULL) RETURNING *",
+        "INSERT INTO arr VALUES (3, 'not an array', NULL)",
+        "INSERT INTO arr VALUES (4, NULL, NULL)",
+        "UPDATE arr SET tags[1] = 'z' WHERE id = 1 RETURNING tags",
+        "UPDATE arr SET grid = '{{9}}' WHERE id = 2",
+        // Legacy decodes arrays to text here, so `excluded.tags || tags`
+        // would join text where HIR joins arrays.
+        "INSERT INTO arr VALUES (2, '{d}', NULL) ON CONFLICT DO UPDATE SET tags = excluded.tags",
+        "SELECT id, tags, grid, tags[2] FROM arr ORDER BY id",
         "DELETE FROM p WHERE id = 1",
         "SELECT count(*) FROM c",
     ];

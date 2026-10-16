@@ -817,17 +817,23 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
 /// Whether the target is a STRICT table HIR does not lower yet: one with an
 /// array column, or a type name that is neither built in nor custom.
 pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
+    let builtin = |name: &str| {
+        ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+            .iter()
+            .any(|builtin| name.eq_ignore_ascii_case(builtin))
+    };
     table.is_strict
         && table
             .columns()
             .iter()
             .enumerate()
             .any(|(position, column)| {
-                column.is_array()
-                    || (custom_chain(source, position).is_none()
-                        && !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-                            .iter()
-                            .any(|name| column.ty_str.eq_ignore_ascii_case(name)))
+                if column.is_array() {
+                    // An array of a custom type is not lowered yet.
+                    !builtin(&column.ty_str)
+                } else {
+                    custom_chain(source, position).is_none() && !builtin(&column.ty_str)
+                }
             })
 }
 
@@ -873,6 +879,10 @@ fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedTy
 /// Whether a column of the target has a custom type.
 pub(super) fn has_custom_types(source: &hir::Source) -> bool {
     source.column_type_programs.iter().any(Option::is_some)
+        || source
+            .columns
+            .iter()
+            .any(|column| column.type_fact.is_array())
 }
 
 /// STRICT with custom types, as legacy does it: check each value in
@@ -898,6 +908,13 @@ pub(super) fn emit_custom_type_writes(
                 }
                 continue;
             }
+            // Like legacy, an array is given as text or a blob, and is
+            // stored as a record blob.
+            if column.is_array() {
+                column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
+                column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                continue;
+            }
             let Some(chain) = custom_chain(source, position) else {
                 continue;
             };
@@ -917,6 +934,39 @@ pub(super) fn emit_custom_type_writes(
         check_generated: true,
         table_reference: check_table(true),
     });
+    // Like legacy, an array is parsed and its elements checked against the
+    // element type, then stored as a record blob. Only the outer array of a
+    // multi-dimensional one checks nothing but that its elements are arrays.
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.is_array() || column.is_virtual_generated() || !written(position) {
+            continue;
+        }
+        let register = start + position;
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: register,
+            target_pc: skip,
+        });
+        let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
+        program.emit_insn(Insn::ArrayEncode {
+            data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                reg: register,
+                element_affinity: if any {
+                    crate::vdbe::affinity::Affinity::Blob
+                } else {
+                    crate::vdbe::affinity::Affinity::affinity(&column.ty_str)
+                },
+                element_type: if any {
+                    "ANY".into()
+                } else {
+                    column.ty_str.to_uppercase().into()
+                },
+                table_name: table.name.as_str().into(),
+                col_name: column.name.as_deref().unwrap_or("").into(),
+            }),
+        });
+        program.preassign_label_to_next_insn(skip);
+    }
     for (position, programs) in source.column_type_programs.iter().enumerate() {
         let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
             continue;

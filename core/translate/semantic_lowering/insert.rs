@@ -2723,6 +2723,48 @@ mod tests {
     }
 
     #[test]
+    fn array_values_are_encoded_as_records() {
+        let mut schema = schema();
+        schema
+            .add_btree_table(Arc::new(
+                crate::schema::BTreeTable::from_sql(
+                    "CREATE TABLE tagged(id INTEGER PRIMARY KEY, tags TEXT[], grid INTEGER[][]) STRICT",
+                    150,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let plan = Arc::new(analyze_plan(
+            schema,
+            "INSERT INTO tagged VALUES (1, '{a,b}', NULL)",
+        ));
+        let insert = insert_root(&plan).unwrap();
+        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        let mut program = program();
+        program.set_hir_plan(plan.clone());
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &Subprograms::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        // Each array is parsed and stored as a record blob; only the outer
+        // array of `grid` is checked for array elements.
+        let encodes = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::ArrayEncode { data } => Some(data.element_type.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(encodes, ["TEXT", "ANY"]);
+    }
+
+    #[test]
     fn upsert_goes_through_hir() {
         for sql in [
             "INSERT INTO items VALUES (1, 'x') ON CONFLICT DO NOTHING",

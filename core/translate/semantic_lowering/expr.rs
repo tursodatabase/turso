@@ -1622,6 +1622,23 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                 };
                 registers.arguments + child_index
             }
+            // `SET a[i] = v` writes the array, the index and the value to
+            // consecutive registers.
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::ArraySetElement)
+                    ) =>
+            {
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Function(self.program.alloc_registers(3));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("array element registers were allocated")
+                };
+                start + child_index
+            }
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
@@ -2659,6 +2676,32 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     src_reg: registers.result,
                     dst_reg: target,
                     extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::ArraySetElement)
+                    ) =>
+            {
+                let ExprRegisters::Function(start) = context.registers else {
+                    return Err(LimboError::InternalError(
+                        "array element assignment has no argument registers".to_string(),
+                    ));
+                };
+                if children.len() != 3 {
+                    return Err(LimboError::InternalError(format!(
+                        "array element assignment has {} arguments",
+                        children.len()
+                    )));
+                }
+                self.program.emit_insn(Insn::ArraySetElement {
+                    array_reg: start,
+                    index_reg: start + 1,
+                    value_reg: start + 2,
+                    dest: target,
                 });
                 Ok(target)
             }

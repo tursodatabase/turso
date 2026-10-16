@@ -2465,6 +2465,33 @@ mod tests {
     }
 
     #[test]
+    fn update_of_an_array_element_rewrites_the_array() {
+        let mut schema = schema();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE tagged(id INTEGER PRIMARY KEY, tags TEXT[], other TEXT[]) STRICT",
+                    150,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE tagged SET tags[1] = 'x'");
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::ArraySetElement { .. }
+            )),
+            1
+        );
+        // Only the array the UPDATE sets is encoded again.
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::ArrayEncode { .. })),
+            1
+        );
+    }
+
+    #[test]
     fn update_encodes_only_the_custom_typed_columns_it_sets() {
         let mut schema = schema();
         schema
