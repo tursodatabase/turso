@@ -15,7 +15,7 @@ pub enum NoConstantOptReason {
     ///    datetime('now')), so hoisting would produce incorrect results.
     ///
     /// 2. Even if the encode function were deterministic, the encode is
-    ///    applied in-place to the target register inside the update loop.
+    ///    applied in-place to the target register inside the row loop.
     ///    If the original value were hoisted (evaluated once before the
     ///    loop), the second iteration would read the already-encoded value
     ///    from the register and encode it again, causing progressive
