@@ -514,6 +514,22 @@ expect {
 }
 
 @setup data
+@setup log
+test rename-column-read-unqualified-by-a-lateral-next-to-a-subquery-in-a-trigger {
+    CREATE TRIGGER tr1 AFTER INSERT ON t4 BEGIN INSERT INTO log SELECT s.a, s.c FROM t1, LATERAL (SELECT a AS y) AS l, (SELECT a, c FROM t2) AS s WHERE l.y = s.a AND s.a = NEW.a; END;
+    ALTER TABLE t1 RENAME COLUMN a TO k;
+    DELETE FROM t4 WHERE a = 2;
+    INSERT INTO t4 VALUES (2, 0);
+    SELECT a, c FROM log ORDER BY 1, 2;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'tr1' AND sql LIKE '%SELECT k AS y%' AND sql LIKE '%SELECT a, c FROM t2%';
+}
+expect {
+    2|20
+    2|30
+    1
+}
+
+@setup data
 test update-from-lateral-cannot-read-the-target-table {
     UPDATE t4 SET v = s.x FROM LATERAL (SELECT t4.a * 2 AS x) AS s;
 }
