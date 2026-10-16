@@ -3510,7 +3510,60 @@ impl ExprLowerer<'_, '_, '_> {
         let null_next_label = self.program.allocate_label();
         let no_null_label = if negated { include_label } else { skip_label };
 
-        if negated {
+        if registers.width == 1 {
+            // A value the subquery does not hold makes IN NULL instead of
+            // false when the subquery holds a NULL. NULLs sort first in its
+            // index, so the first entry tells, instead of a scan for every
+            // row.
+            let not_found_label = self.program.allocate_label();
+            if negated {
+                self.program.emit_insn(Insn::Found {
+                    cursor_id: cursor,
+                    target_pc: skip_label,
+                    record_reg: registers.lhs,
+                    num_regs: 1,
+                });
+            } else {
+                self.program.emit_insn(Insn::NotFound {
+                    cursor_id: cursor,
+                    target_pc: not_found_label,
+                    record_reg: registers.lhs,
+                    num_regs: 1,
+                });
+                self.program.emit_insn(Insn::Goto {
+                    target_pc: include_label,
+                });
+            }
+            self.program.preassign_label_to_next_insn(not_found_label);
+            self.program.emit_insn(Insn::Rewind {
+                cursor_id: cursor,
+                pc_if_empty: no_null_label,
+            });
+            let first = self.program.alloc_register();
+            self.program.emit_insn(Insn::Column {
+                cursor_id: cursor,
+                column: 0,
+                dest: first,
+                default: None,
+            });
+            self.program.emit_insn(Insn::IsNull {
+                reg: first,
+                target_pc: null_result_label,
+            });
+            self.program.emit_insn(Insn::Goto {
+                target_pc: no_null_label,
+            });
+            // A NULL value makes IN NULL unless the subquery is empty.
+            self.program
+                .preassign_label_to_next_insn(registers.null_rewind_label);
+            self.program.emit_insn(Insn::Rewind {
+                cursor_id: cursor,
+                pc_if_empty: no_null_label,
+            });
+            self.program.emit_insn(Insn::Goto {
+                target_pc: null_result_label,
+            });
+        } else if negated {
             self.program.emit_insn(Insn::Found {
                 cursor_id: cursor,
                 target_pc: skip_label,
@@ -3529,41 +3582,46 @@ impl ExprLowerer<'_, '_, '_> {
             });
         }
 
-        self.program
-            .preassign_label_to_next_insn(registers.null_rewind_label);
-        self.program.emit_insn(Insn::Rewind {
-            cursor_id: cursor,
-            pc_if_empty: no_null_label,
-        });
-        self.program.preassign_label_to_next_insn(null_loop_label);
-        let column = self.program.alloc_register();
-        for (index, component) in comparison.components.iter().enumerate() {
-            self.program.emit_insn(Insn::Column {
+        if registers.width > 1 {
+            // A row value the subquery does not hold makes IN NULL when some
+            // subquery row compares as NULL in every column it does not
+            // differ in, so each row is checked.
+            self.program
+                .preassign_label_to_next_insn(registers.null_rewind_label);
+            self.program.emit_insn(Insn::Rewind {
                 cursor_id: cursor,
-                column: index,
-                dest: column,
-                default: None,
+                pc_if_empty: no_null_label,
             });
-            self.program.emit_insn(Insn::Ne {
-                lhs: registers.lhs + index,
-                rhs: column,
-                target_pc: null_next_label,
-                flags: comparison_flags(component),
-                collation: comparison_collation(component),
+            self.program.preassign_label_to_next_insn(null_loop_label);
+            let column = self.program.alloc_register();
+            for (index, component) in comparison.components.iter().enumerate() {
+                self.program.emit_insn(Insn::Column {
+                    cursor_id: cursor,
+                    column: index,
+                    dest: column,
+                    default: None,
+                });
+                self.program.emit_insn(Insn::Ne {
+                    lhs: registers.lhs + index,
+                    rhs: column,
+                    target_pc: null_next_label,
+                    flags: comparison_flags(component),
+                    collation: comparison_collation(component),
+                });
+            }
+            self.program.emit_insn(Insn::Goto {
+                target_pc: null_result_label,
+            });
+            self.program.preassign_label_to_next_insn(null_next_label);
+            self.program.emit_insn(Insn::Next {
+                cursor_id: cursor,
+                pc_if_next: null_loop_label,
+                fullscan: false,
+            });
+            self.program.emit_insn(Insn::Goto {
+                target_pc: no_null_label,
             });
         }
-        self.program.emit_insn(Insn::Goto {
-            target_pc: null_result_label,
-        });
-        self.program.preassign_label_to_next_insn(null_next_label);
-        self.program.emit_insn(Insn::Next {
-            cursor_id: cursor,
-            pc_if_next: null_loop_label,
-            fullscan: false,
-        });
-        self.program.emit_insn(Insn::Goto {
-            target_pc: no_null_label,
-        });
 
         let done_label = self.program.allocate_label();
         self.program.preassign_label_to_next_insn(include_label);

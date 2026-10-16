@@ -883,3 +883,66 @@ fn hir_conditions_jump_on_comparisons_like_legacy() {
         );
     }
 }
+
+#[test]
+fn hir_not_in_checks_the_subquery_for_null_once() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE a(x)",
+        "CREATE TABLE b(y)",
+        "CREATE TABLE c(z)",
+        "CREATE TABLE e(w)",
+        "INSERT INTO a VALUES (1), (2), (NULL), (4)",
+        "INSERT INTO b VALUES (2), (NULL), (3)",
+        "INSERT INTO c VALUES (2), (3)",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    use rusqlite::types::Value::{Integer, Null};
+    // A value the subquery lacks is NULL when the subquery holds a NULL,
+    // false or true otherwise; a NULL value is NULL unless it is empty.
+    for (sql, expected) in [
+        (
+            "SELECT x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY rowid",
+            vec![
+                vec![Null, Null],
+                vec![Integer(1), Integer(0)],
+                vec![Null, Null],
+                vec![Null, Null],
+            ],
+        ),
+        (
+            "SELECT x IN (SELECT z FROM c), x NOT IN (SELECT z FROM c) FROM a ORDER BY rowid",
+            vec![
+                vec![Integer(0), Integer(1)],
+                vec![Integer(1), Integer(0)],
+                vec![Null, Null],
+                vec![Integer(0), Integer(1)],
+            ],
+        ),
+        (
+            "SELECT x IN (SELECT w FROM e), x NOT IN (SELECT w FROM e) FROM a ORDER BY rowid",
+            vec![vec![Integer(0), Integer(1)]; 4],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+
+    // The NULL check reads one index entry instead of looping over the
+    // subquery's rows for every outer row.
+    let program = limbo_exec_rows(
+        &hir,
+        "EXPLAIN SELECT count(*) FROM a WHERE x NOT IN (SELECT z FROM c)",
+    )
+    .into_iter()
+    .filter_map(|row| match row.get(1) {
+        Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+        _ => None,
+    })
+    .collect::<Vec<_>>();
+    let nexts = program.iter().filter(|opcode| *opcode == "Next").count();
+    // One Next for the scan of a and one for building the subquery index.
+    assert_eq!(nexts, 2, "{program:?}");
+}
