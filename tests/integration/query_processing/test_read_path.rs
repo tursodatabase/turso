@@ -156,9 +156,7 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
 }
 
 #[turso_macros::test]
-fn test_right_join_on_without_rowid_table_with_secondary_index(
-    _tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
+fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let temp_dir = TempDir::new()?;
     let db_path = temp_dir.path().join("without_rowid_index.db");
     let queries = [
@@ -169,6 +167,10 @@ fn test_right_join_on_without_rowid_table_with_secondary_index(
         "SELECT count(*) FROM t2 RIGHT JOIN t3 ON NULL",
         "SELECT NULL FROM t2 FULL JOIN t3 ON NULL",
         "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t2.c0 = t3.c0",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t3.c1 = t2.c0 + 1",
+        "SELECT c0, c1 FROM t3 ORDER BY c1",
+        "SELECT c0 FROM t3 WHERE c1 = 4",
+        "SELECT t2.c0, t3.c0 FROM t2 JOIN t3 ON t3.c1 = t2.c0 + 1 ORDER BY t2.c0",
     ];
 
     let sqlite_rows = {
@@ -196,6 +198,11 @@ fn test_right_join_on_without_rowid_table_with_secondary_index(
     for (query, sqlite_rows) in queries.iter().zip(sqlite_rows) {
         assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
     }
+
+    assert_that!(conn.prepare("SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4"))
+        .err()
+        .display_string()
+        .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
 
     Ok(())
 }

@@ -103,6 +103,7 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
+            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
                 let indexes = resolver.with_schema(jt.database_id, |schema| {
                     schema.indexes.get(jt.table.get_name()).cloned()
@@ -2339,6 +2340,12 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
+                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
+                    crate::bail_parse_error!(
+                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
+                        idx_name
+                    );
+                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
@@ -2833,13 +2840,9 @@ fn plan_unmatched_right_rows(
             params,
         )?
         .swap_remove(table_index);
-        // A matched WITHOUT ROWID row is identified by its primary key, which
-        // Turso reads from the table cursor, never from a secondary index.
-        if table.btree().is_some_and(|btree| !btree.has_rowid) {
-            keep_index_hint_candidates(&mut constraints_for_unmatched_rows.candidates, None);
-        } else if let Some(indexed) = &table.indexed {
-            // The main plan already checked the INDEXED BY index. The unmatched-row
-            // read follows the same hint, as in SQLite.
+        // The main plan already checked the INDEXED BY index. The unmatched-row
+        // read follows the same hint, as in SQLite.
+        if let Some(indexed) = &table.indexed {
             let forced_index = match indexed {
                 ast::Indexed::IndexedBy(name) => Some(
                     available_indexes
