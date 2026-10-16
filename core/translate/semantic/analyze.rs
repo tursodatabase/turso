@@ -3109,7 +3109,10 @@ mod tests {
              JOIN (SELECT outer_items.id AS captured) AS derived",
         )
         .expect_err("FROM subquery cannot capture the outer source scope");
-        assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: outer_items.id"
+        );
     }
 
     #[test]
@@ -3899,7 +3902,7 @@ mod tests {
             ),
             (
                 "SELECT (SELECT 1 LIMIT outer_items.id) FROM items AS outer_items",
-                "Parse error: no such table: outer_items",
+                "Parse error: no such column: outer_items.id",
             ),
             (
                 "SELECT id FROM items LIMIT sum(1)",
@@ -4820,7 +4823,10 @@ mod tests {
              ) FROM items AS outer_items",
         )
         .expect_err("CTE cannot see sibling sources from its owning SELECT");
-        assert_eq!(error.to_string(), "Parse error: no such table: local_items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: local_items.id"
+        );
     }
 
     #[test]
@@ -5131,7 +5137,10 @@ mod tests {
             "SELECT items.value FROM (items JOIN categories USING (id)) AS grouped",
         )
         .expect_err("group alias hides inner table qualifiers");
-        assert_eq!(error.to_string(), "Parse error: no such table: items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: items.value"
+        );
     }
 
     #[test]
@@ -7102,7 +7111,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT guarded.id))",
-                "Parse error: no such table: guarded",
+                "Parse error: no such column: guarded.id",
             ),
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT 1, 2))",
@@ -11078,7 +11087,7 @@ mod tests {
             "UPDATE writable AS old SET value = 'changed' RETURNING old.value",
         )
         .expect_err("UPDATE alias is hidden from RETURNING");
-        assert_eq!(alias.to_string(), "Parse error: no such table: old");
+        assert_eq!(alias.to_string(), "Parse error: no such column: old.value");
     }
 
     #[test]
@@ -11272,7 +11281,7 @@ mod tests {
              JOIN writable AS right_side ON target.id = right_side.id",
         )
         .expect_err("JOIN constraints cannot see the UPDATE target");
-        assert_eq!(error.to_string(), "Parse error: no such table: target");
+        assert_eq!(error.to_string(), "Parse error: no such column: target.id");
     }
 
     #[test]
@@ -11338,7 +11347,10 @@ mod tests {
              FROM writable AS source RETURNING source.value",
         )
         .expect_err("RETURNING cannot see UPDATE FROM sources");
-        assert_eq!(returning.to_string(), "Parse error: no such table: source");
+        assert_eq!(
+            returning.to_string(),
+            "Parse error: no such column: source.value"
+        );
     }
 
     #[test]
@@ -11683,7 +11695,7 @@ mod tests {
         .expect_err("DELETE alias hides the original table name");
         assert_eq!(
             hidden_name.to_string(),
-            "Parse error: no such table: writable"
+            "Parse error: no such column: writable.value"
         );
     }
 

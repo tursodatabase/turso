@@ -32,9 +32,6 @@ pub(crate) struct ExprPolicy {
     raise: RaisePolicy,
     self_source: Option<hir::SourceId>,
     policies: ExprPolicies,
-    /// Report `x.y` with no table `x` as "no such column: x.y", as legacy
-    /// does in a single VALUES row and in UPSERT.
-    unknown_table_as_column: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +87,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -103,7 +99,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -116,7 +111,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -129,7 +123,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -146,7 +139,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -159,7 +151,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -172,7 +163,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -185,21 +175,11 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
     pub(super) const fn returning(dqs_dml: DoubleQuotedDml) -> Self {
         Self::insert_values(dqs_dml)
-    }
-
-    pub(super) const fn upsert_update(dqs_dml: DoubleQuotedDml) -> Self {
-        Self::insert_values(dqs_dml).with_unknown_table_as_column()
-    }
-
-    pub(crate) const fn with_unknown_table_as_column(mut self) -> Self {
-        self.unknown_table_as_column = true;
-        self
     }
 
     pub(super) const fn update(dqs_dml: DoubleQuotedDml) -> Self {
@@ -220,7 +200,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(DoubleQuotedDml::Disabled),
-            unknown_table_as_column: false,
         }
     }
 
@@ -290,10 +269,6 @@ impl ExprPolicies {
 
     pub(super) fn returning(self) -> ExprPolicy {
         self.apply(ExprPolicy::returning(self.dqs_dml))
-    }
-
-    pub(super) fn upsert_update(self) -> ExprPolicy {
-        self.apply(ExprPolicy::upsert_update(self.dqs_dml))
     }
 
     pub(super) fn update(self) -> ExprPolicy {
@@ -2311,14 +2286,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         return self.build_field_access(base, column.as_str());
                     }
                 }
-                if policy.unknown_table_as_column {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}",
-                        table.as_str(),
-                        column.as_str()
-                    );
-                }
-                crate::bail_parse_error!("no such table: {}", table.as_str());
+                crate::bail_parse_error!("no such column: {}.{}", table.as_str(), column.as_str());
             }
             ast::Expr::DoublyQualified(database, table, column) => {
                 expect_no_expr_children(children)?;
@@ -4880,7 +4848,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_errors_keep_table_and_column_distinction() {
+    fn qualified_names_report_the_missing_column_as_sqlite_does() {
         let source = source();
         let mut scope = Scope::default();
         scope.add_source(&source, true);
@@ -4893,7 +4861,7 @@ mod tests {
         .expect_err("unknown qualifier fails");
         assert_eq!(
             missing_table.to_string(),
-            "Parse error: no such table: absent"
+            "Parse error: no such column: absent.value"
         );
 
         let missing_column = analyze_expression(
