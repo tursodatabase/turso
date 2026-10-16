@@ -873,7 +873,7 @@ fn format_float_scientific(v: f64, precision: usize) -> String {
                 if negative { "-" } else { "" },
                 first,
                 rest,
-                if exp.is_positive() { "+" } else { "-" },
+                if exp >= 0 { "+" } else { "-" },
                 exp.abs(),
                 width = if exp.abs() > 99 { 3 } else { 2 }
             )

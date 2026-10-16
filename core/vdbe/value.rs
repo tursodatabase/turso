@@ -2334,6 +2334,10 @@ mod tests {
         let expected = Value::build_text("'hello''''world'");
         assert_eq!(input.exec_quote(), expected);
 
+        let input = Value::from_f64(std::f64::consts::PI);
+        let expected = Value::build_text("3.141592653589793116e+00");
+        assert_eq!(input.exec_quote(), expected);
+
         let input = Value::from_f64(
             crate::numeric::str_to_f64("2.042747795102219097e+05")
                 .map(f64::from)
