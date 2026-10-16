@@ -149,20 +149,40 @@ subquery emits the same shell when its loop opens.
 
 `scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
 one process per file, and groups failures by cause. The first run on
-2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-15 a run
-passed 14236 and failed 53, with every file running to the end; legacy
-passes all of them. What is left:
+2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-16 a run
+failed 29, with every file running to the end; legacy passes all of them.
+What is left:
 
 | Gap | Failing tests | Example |
 |---|---|---|
-| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
-| ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
-| Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
-| A named window whose definition uses an aggregate, with GROUP BY | 1 | `named-window-with-group-by` |
-| `nth_value` with LIMIT stops before an invalid later argument | 1 | `nth-value-limit-stops-before-late-invalid-n` |
-| `cte.y` for a CTE not in FROM, under ORDER BY EXISTS, reports no such table | 1 | `cte-unreferenced-qualified-column-orderby-exists` |
-| Bare column next to several aggregates in HAVING with generated columns | 1 | `gencol_having_multiple_aggregates` |
+| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | 28 | `explain-query-plan-json`, `unnest-correlated` |
 | Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
+
+Fixed since the 2026-10-15 run, each following SQLite:
+
+- An unknown table in `x.y` reports "no such column: x.y" everywhere, where
+  legacy says "no such table: x" except in one ORDER BY case.
+- The ORDER BY of an aggregate query without GROUP BY, and ORDER BY terms
+  after a first term that is the rowid of the only table, are dropped. Their
+  names are still resolved, on a copy of the analyzer state that is then
+  restored, but row value widths SQLite checks only while generating code
+  are not checked, except in window calls, which SQLite moves out first.
+- Named windows keep their syntax and are analyzed where a window function
+  uses them, so they may read the block's aggregates; one no function uses
+  is never analyzed.
+- The ORDER BY sorter is skipped when the outermost window already returns
+  rows in that order, so LIMIT stops before later window rows are computed.
+- Grouped rows keep the columns a virtual generated column is computed
+  from.
+- A join step a virtual table rejects (a table function whose argument reads
+  a later table) is skipped instead of failing the query.
+- `INDEXED BY` a partial index the query cannot use fails with "no query
+  solution", except in a plain `SELECT count(*) FROM t`.
+- A WHERE term equal to a partial index's predicate does not keep the index
+  from covering the query.
+- `SELECT min(x)` or `max(x)` over one table reads an index on x in the
+  aggregate's order and stops at the first non-NULL value. Legacy returns
+  NULL for MAX over an index that sorts NULLs last.
 
 Like SQLite, an aggregate written in a subquery whose arguments read only
 columns of the block the subquery is in (`SELECT (SELECT count(t.a)) FROM
