@@ -4512,6 +4512,95 @@ pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
 }
 
 /// Apply bound schema calls to a value already stored in `target`.
+/// Like legacy's per-element loop for arrays of a custom type: apply
+/// `calls` to each element of the array blob in `register`, then rebuild it.
+/// As in legacy, an array with more elements than the loop's register block
+/// fails the statement.
+pub(crate) fn translate_schema_calls_on_elements(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    calls: &[hir::BoundSchemaCall],
+    register: usize,
+) -> Result<()> {
+    const MAX_ELEMENTS: usize = 1024;
+    let length = program.alloc_register();
+    let index = program.alloc_register();
+    let element = program.alloc_register();
+    let elements = program.alloc_registers(MAX_ELEMENTS);
+    program.emit_insn(Insn::ArrayLength {
+        reg: register,
+        dest: length,
+    });
+    let limit = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: MAX_ELEMENTS as i64,
+        dest: limit,
+    });
+    let fits = program.allocate_label();
+    program.emit_insn(Insn::Le {
+        lhs: length,
+        rhs: limit,
+        target_pc: fits,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_CONSTRAINT,
+        description: format!(
+            "array exceeds maximum element count for custom type transform ({MAX_ELEMENTS})"
+        ),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(fits);
+    // ArrayElement counts from 1; the register block from 0.
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: index,
+    });
+    let offset = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: offset,
+    });
+    let next = program.offset();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::Gt {
+        lhs: index,
+        rhs: length,
+        target_pc: done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::ArrayElement {
+        array_reg: register,
+        index_reg: index,
+        dest: element,
+    });
+    translate_schema_calls_in_place(program, document, calls, element)?;
+    program.emit_insn(Insn::RegCopyOffset {
+        src: element,
+        base: elements,
+        offset_reg: offset,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: index,
+        value: 1,
+    });
+    program.emit_insn(Insn::AddImm {
+        register: offset,
+        value: 1,
+    });
+    program.emit_insn(Insn::Goto { target_pc: next });
+    program.preassign_label_to_next_insn(done);
+    program.emit_insn(Insn::MakeArrayDynamic {
+        start_reg: elements,
+        count_reg: length,
+        dest: register,
+    });
+    Ok(())
+}
+
 pub(crate) fn translate_schema_calls_in_place(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,

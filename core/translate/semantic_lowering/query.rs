@@ -5912,7 +5912,7 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, document, output_definitions, outputs);
+    emit_array_results(program, document, output_definitions, outputs)?;
     emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -6160,7 +6160,7 @@ fn emit_query_row_with_inputs<'expr>(
     }
 
     if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
-        emit_array_results(program, document, outputs, start);
+        emit_array_results(program, document, outputs, start)?;
     }
 
     if let Some(distinct) = output.distinct {
@@ -6694,7 +6694,7 @@ pub(super) fn emit_array_results(
     document: &HirDocument,
     outputs: &[hir::Output],
     start: usize,
-) {
+) -> Result<()> {
     for (position, output) in outputs.iter().enumerate() {
         if !output.type_fact.is_array() && !hir_expr_passes_array(document, &output.expr) {
             continue;
@@ -6705,9 +6705,36 @@ pub(super) fn emit_array_results(
             reg: register,
             target_pc: skip,
         });
+        // Like legacy, an array column of a custom type has its elements
+        // decoded for display.
+        if let Some(decode) = array_column_decode(document, &output.expr) {
+            super::expr::translate_schema_calls_on_elements(program, document, decode, register)?;
+        }
         program.emit_insn(Insn::ArrayDecode { reg: register });
         program.preassign_label_to_next_insn(skip);
     }
+    Ok(())
+}
+
+/// The element decode programs of an array column of a custom type that
+/// `expression` reads directly.
+fn array_column_decode<'a>(
+    document: &'a HirDocument,
+    expression: &hir::Expr,
+) -> Option<&'a [hir::BoundSchemaCall]> {
+    let hir::Expr::Column(reference) = expression else {
+        return None;
+    };
+    let source = document.source(reference.source)?;
+    if !source.columns.get(reference.column)?.type_fact.is_array() {
+        return None;
+    }
+    source
+        .column_type_programs
+        .get(reference.column)?
+        .as_ref()
+        .map(|programs| programs.decode.as_slice())
+        .filter(|decode| !decode.is_empty())
 }
 
 /// Like legacy, an expression that can pass an array value through is

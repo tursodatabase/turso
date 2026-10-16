@@ -670,7 +670,7 @@ impl<'a> ReturningBuffer<'a> {
                 start + position,
             )?;
         }
-        emit_array_results(program, document, self.outputs, start);
+        emit_array_results(program, document, self.outputs, start)?;
         Ok(start)
     }
 

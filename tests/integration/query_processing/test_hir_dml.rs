@@ -1651,8 +1651,9 @@ fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
 }
 
 /// Queries over custom-typed columns: GROUP BY keeps the grouped columns as
-/// stored so aggregates decode them once, and BETWEEN uses the type's own
-/// comparison operators, as legacy does.
+/// stored so aggregates decode them once, BETWEEN uses the type's own
+/// comparison operators, and an array of a custom type has its elements
+/// decoded for display, as legacy does.
 #[test]
 fn hir_custom_type_queries_match_legacy() {
     let statements = [
@@ -1662,6 +1663,11 @@ fn hir_custom_type_queries_match_legacy() {
         "SELECT grp, sum(val) FILTER (WHERE flag = 1) AS s FROM t GROUP BY grp HAVING s > 0",
         "SELECT id, val FROM t WHERE val BETWEEN 9 AND 50 ORDER BY id",
         "SELECT id FROM t WHERE val NOT BETWEEN 9 AND 50 ORDER BY id",
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, c cents[]) STRICT",
+        "INSERT INTO a VALUES (1, '{1,2,3}'), (2, ARRAY[7])",
+        "SELECT id, c FROM a ORDER BY id",
+        "SELECT c FROM a ORDER BY id DESC",
     ];
     let run = |hir: bool| {
         let db = TempDatabase::builder()
