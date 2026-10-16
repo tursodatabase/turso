@@ -4,7 +4,7 @@ use crate::storage::page_cache::CacheError;
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
-    #[error("Corrupt database: {0}")]
+    #[error("database disk image is malformed")]
     Corrupt(String),
     #[error("File is not a database")]
     NotADB,
