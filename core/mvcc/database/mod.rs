@@ -25,6 +25,7 @@ use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
@@ -99,6 +100,32 @@ pub(crate) enum CheckpointReadLockState {
 impl CheckpointReadLockState {
     fn is_held(self) -> bool {
         matches!(self, Self::Held)
+    }
+}
+
+/// What an ending transaction does for the other root statements of its
+/// connection that still read through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuccessorTx {
+    /// No other statement reads through it, or the caller restores the
+    /// transaction those statements use (sequence inner transactions,
+    /// connection close, internal transactions).
+    NotNeeded,
+    /// Start a read-only successor transaction for them, like SQLite keeps a
+    /// read transaction open in btreeEndTransaction while other statements
+    /// are active. `caller_counted` is whether the statement ending the
+    /// transaction is still counted in `Connection::n_active_root_statements`.
+    ForOtherStatements { caller_counted: bool },
+}
+
+impl SuccessorTx {
+    fn caller_released(self) -> Self {
+        match self {
+            Self::ForOtherStatements { .. } => Self::ForOtherStatements {
+                caller_counted: false,
+            },
+            Self::NotNeeded => Self::NotNeeded,
+        }
     }
 }
 
@@ -1043,6 +1070,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// True when this transaction holds `blocking_checkpoint_lock` in read mode
     /// (truncate / flag-off path only). Passive `begin_tx` does not pin the lock.
     holds_blocking_checkpoint_read: AtomicBool,
+    /// Successor transaction for statements that outlived COMMIT or ROLLBACK;
+    /// the last running root statement closes it.
+    closed_by_last_statement: AtomicBool,
     /// `MvStore::schema_generation` captured at `begin_tx` (passive root publication gate).
     schema_generation_at_begin: u64,
     /// This transaction's frozen WAL read mark `(checkpoint_seq, max_frame)`, captured when it
@@ -1080,6 +1110,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
+            closed_by_last_statement: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
         }
     }
@@ -1673,6 +1704,7 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     /// Threaded through so that `finish_committed_tx` can clear the matching
     /// connection-level mv_tx slot atomically with `remove_tx`.
     db_id: usize,
+    successor: SuccessorTx,
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
@@ -1741,6 +1773,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: CommitState<Clock, A>,
         tx_id: TxID,
@@ -1749,6 +1782,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
+        successor: SuccessorTx,
     ) -> Result<Self> {
         let pager = connection.get_pager_from_database_index(&db_id)?;
         let sync_mode = connection.get_sync_mode_for_database(db_id)?;
@@ -1791,6 +1825,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             mvcc_store,
             connection,
             db_id,
+            successor,
             commit_coordinator,
             pager,
             header,
@@ -1854,6 +1889,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                                 batch.writing.tx_id,
                                 None,
                                 self.db_id,
+                                SuccessorTx::NotNeeded,
                             );
                         }
                     } else {
@@ -1884,6 +1920,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    self.successor.caller_released(),
                 );
             }
         }
@@ -3326,7 +3363,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    mvcc_store.finish_committed_tx(
+                        self.tx_id,
+                        &self.connection,
+                        self.db_id,
+                        self.successor,
+                    );
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3400,7 +3442,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.unlock_pager_commit_lock();
                     }
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    mvcc_store.finish_committed_tx(
+                        self.tx_id,
+                        &self.connection,
+                        self.db_id,
+                        self.successor,
+                    );
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3733,7 +3780,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                mvcc_store.finish_committed_tx(
+                    self.tx_id,
+                    &self.connection,
+                    self.db_id,
+                    self.successor,
+                );
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
@@ -6920,8 +6972,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Use this anywhere the commit state machine would otherwise call
     /// `remove_tx` directly. Other call sites that don't have a connection
     /// context (e.g. tests poking internal state) keep using `remove_tx`.
-    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
-        conn.set_mv_tx_for_db(db_id, None);
+    pub fn finish_committed_tx(
+        &self,
+        tx_id: TxID,
+        conn: &Connection,
+        db_id: usize,
+        successor: SuccessorTx,
+    ) {
+        let successor_tx = self.begin_successor_tx_for_other_statements(conn, db_id, successor);
+        conn.set_mv_tx_for_db(
+            db_id,
+            successor_tx.map(|tx_id| (tx_id, TransactionMode::Read)),
+        );
         self.remove_tx(tx_id);
     }
 
@@ -7046,6 +7108,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
+        successor: SuccessorTx,
     ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
@@ -7055,6 +7118,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             db_id,
             self.commit_coordinator.clone(),
             self.global_header.clone(),
+            successor,
         )?);
         let state_machine = StateMachine::new(state);
         Ok(state_machine)
@@ -7079,8 +7143,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// * `tx_id` - The ID of the transaction to abort.
     /// * `db` - The database index this transaction belongs to.
-    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection, db: usize) {
-        self.rollback_tx_inner(tx_id, Some(connection), db);
+    pub fn rollback_tx(
+        &self,
+        tx_id: TxID,
+        _pager: Arc<Pager>,
+        connection: &Connection,
+        db: usize,
+        successor: SuccessorTx,
+    ) {
+        self.rollback_tx_inner(tx_id, Some(connection), db, successor);
     }
 
     #[aristo::intent(
@@ -7090,7 +7161,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         verify = "test",
         id = "rollback_transfers_frozen_write_set"
     )]
-    fn rollback_tx_inner(&self, tx_id: TxID, connection: Option<&Connection>, db: usize) {
+    fn rollback_tx_inner(
+        &self,
+        tx_id: TxID,
+        connection: Option<&Connection>,
+        db: usize,
+        successor: SuccessorTx,
+    ) {
         let tx_unlocked = self
             .txs
             .get(&tx_id)
@@ -7187,7 +7264,85 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // already completed its register_commit_dependency call (it runs under the
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
+        if let Some(connection) = connection {
+            let successor_tx =
+                self.begin_successor_tx_for_other_statements(connection, db, successor);
+            connection
+                .set_mv_tx_for_db(db, successor_tx.map(|tx_id| (tx_id, TransactionMode::Read)));
+        }
         crate::without_allocation_faults!(self.remove_tx(tx_id));
+    }
+
+    /// SQLite keeps a read transaction open for statements that are still
+    /// running when another statement ends the transaction
+    /// (btreeEndTransaction). Here they get a successor read transaction on
+    /// the same pager read mark, started before the ending transaction leaves
+    /// `txs` so neither the garbage-collection low-water mark nor the
+    /// checkpoint lock moves under their cursors. The cursors move to it on
+    /// their next use (`MvccLazyCursor::follow_connection_tx`) and the last
+    /// running root statement closes it (`ProgramState::can_autocommit_now`).
+    /// Only the main database gets one; a cursor on an attached database that
+    /// outlives its transaction fails with an error instead.
+    fn begin_successor_tx_for_other_statements(
+        &self,
+        connection: &Connection,
+        db_id: usize,
+        successor: SuccessorTx,
+    ) -> Option<TxID> {
+        let SuccessorTx::ForOtherStatements { caller_counted } = successor else {
+            return None;
+        };
+        connection
+            .mv_tx_successor_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let other_statements =
+            connection.n_active_root_statements.load(Ordering::SeqCst) - i32::from(caller_counted);
+        if other_statements <= 0 || db_id != crate::MAIN_DB_ID {
+            return None;
+        }
+        match self.begin_successor_read_tx(connection, db_id) {
+            Ok(tx_id) => {
+                tracing::debug!(
+                    "begin_successor_tx(tx_id={tx_id}) for {other_statements} running statement(s)"
+                );
+                Some(tx_id)
+            }
+            Err(err) => {
+                tracing::warn!("no successor transaction for the statements still running: {err}");
+                None
+            }
+        }
+    }
+
+    fn begin_successor_read_tx(&self, connection: &Connection, db_id: usize) -> Result<TxID> {
+        let pager = connection.get_pager_from_database_index(&db_id)?;
+        let checkpoint_read_guard =
+            self.try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin()?;
+        if !pager.holds_read_lock() {
+            if let Err(err) = pager.begin_read_tx() {
+                self.release_unadopted_checkpoint_read_guard(checkpoint_read_guard);
+                return Err(err);
+            }
+        }
+        pager.mvcc_refresh_if_db_changed();
+        let tx_id = self.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+            pager,
+            None,
+            checkpoint_read_guard,
+        )?;
+        self.txs
+            .get(&tx_id)
+            .expect("successor transaction was published just above")
+            .value()
+            .closed_by_last_statement
+            .store(true, Ordering::Release);
+        Ok(tx_id)
+    }
+
+    pub(crate) fn tx_is_closed_by_last_statement(&self, tx_id: TxID) -> bool {
+        self.txs
+            .get(&tx_id)
+            .is_some_and(|tx| tx.value().closed_by_last_statement.load(Ordering::Acquire))
     }
 
     /// Removes the slots of a table or index created by a transaction that rolled back.
@@ -7237,7 +7392,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        successor: SuccessorTx,
+    ) {
         let tx_state = self.txs.get(&tx_id).map(|tx| {
             let tx = tx.value();
             match tx.state.load() {
@@ -7256,7 +7417,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                     return;
                 }
-                self.rollback_tx_inner(tx_id, Some(connection), db_id);
+                self.rollback_tx_inner(tx_id, Some(connection), db_id, successor);
             }
             Some(TransactionState::Committed(end_ts)) => {
                 // The dropped statement may have been interrupted mid
@@ -7274,7 +7435,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.release_exclusive_tx(&tx_id);
                 }
                 crate::without_allocation_faults!(
-                    self.finish_committed_tx(tx_id, connection, db_id)
+                    self.finish_committed_tx(tx_id, connection, db_id, successor)
                 );
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {

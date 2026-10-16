@@ -8,7 +8,7 @@ use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
-    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
+    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, SuccessorTx, TxID,
 };
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
@@ -1437,6 +1437,7 @@ pub fn op_open_read(
                 Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store.clone(),
                     &program.connection,
+                    *db,
                     tx_id,
                     *root_page,
                     mv_cursor_type,
@@ -3884,13 +3885,21 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            &program.connection,
+                            MAIN_DB_ID,
+                            SuccessorTx::ForOtherStatements {
+                                caller_counted: true,
+                            },
+                        );
                     }
-                    pager.end_read_tx();
+                    program.connection.finish_main_mvcc_tx(pager);
                 } else {
                     pager.rollback_tx(&program.connection);
+                    program.connection.set_tx_state(TransactionState::None);
                 }
-                program.connection.set_tx_state(TransactionState::None);
                 return Err(LimboError::ForeignKeyConstraint(
                     "FOREIGN KEY constraint failed".to_string(),
                 )
@@ -5323,9 +5332,16 @@ pub fn op_auto_commit(
             TxOp::Rollback => {
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = conn.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            &conn,
+                            MAIN_DB_ID,
+                            SuccessorTx::ForOtherStatements {
+                                caller_counted: true,
+                            },
+                        );
                     }
-                    pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
                 } else {
                     pager.rollback_tx(&conn);
@@ -5334,7 +5350,11 @@ pub fn op_auto_commit(
                 conn.rollback_temp_schema();
                 vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
-                conn.set_tx_state(TransactionState::None);
+                if mv_store.is_some() {
+                    conn.finish_main_mvcc_tx(pager);
+                } else {
+                    conn.set_tx_state(TransactionState::None);
+                }
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
             }
@@ -13723,6 +13743,7 @@ pub fn op_open_write(
                 Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
                     mv_store,
                     &program.connection,
+                    *db,
                     tx_id,
                     root_page,
                     mv_cursor_type,
@@ -14922,7 +14943,8 @@ pub fn op_sequence_commit_inner_tx(
                 .into());
             }
         };
-        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+        state.sequence_inner_commit =
+            Some(mv_store.commit_tx(inner_tx_id, &conn, *db, SuccessorTx::NotNeeded)?);
     }
 
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
@@ -14949,7 +14971,13 @@ pub fn op_sequence_commit_inner_tx(
             // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(
+                        inner_tx_id,
+                        pager.clone(),
+                        &conn,
+                        *db,
+                        SuccessorTx::NotNeeded,
+                    );
                 }
             }
             state.sequence_inner_tx_pending = None;
@@ -14987,7 +15015,13 @@ pub fn op_sequence_commit_inner_tx(
             state.sequence_inner_commit = None;
             if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
                 if mv_store.is_tx_rollbackable(inner_tx_id) {
-                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                    mv_store.rollback_tx(
+                        inner_tx_id,
+                        pager.clone(),
+                        &conn,
+                        *db,
+                        SuccessorTx::NotNeeded,
+                    );
                 }
             }
             state.sequence_inner_tx_pending = None;
@@ -16320,6 +16354,7 @@ pub fn op_open_dup(
                     OpenedBTree::Mvcc(Box::new(MvCursor::new(
                         mv_store,
                         &program.connection,
+                        MAIN_DB_ID,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
