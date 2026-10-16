@@ -85,7 +85,6 @@ pub(super) fn needs_legacy(
         .iter()
         .filter(|column| is_rowid_target(&table, column))
         .count();
-    let replaces = may_replace(update, source, &table, sets_rowid > 0);
     // Changing the rowid moves the row; legacy collects the rows first.
     // Setting the rowid twice is not lowered yet. Under MVCC, a new rowid
     // of an AUTOINCREMENT table also advances its hidden sequence, which is
@@ -135,31 +134,8 @@ pub(super) fn needs_legacy(
     let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
         return Ok(true);
     };
-    let Some(iteration_index) = operation_index(operation) else {
-        return Ok(false);
-    };
-    // A REPLACE declared on an index deletes rows while the loop reads an
-    // index; legacy does that in place.
-    if iteration_index.ephemeral || (replaces && update.conflict.is_none()) {
-        return Ok(true);
-    }
-    // Changing the index the loop reads could visit a row again; legacy
-    // collects the rows first.
-    let Some(iteration) = source
-        .index_expressions
-        .iter()
-        .find(|index| index.index.value().name == iteration_index.name)
-    else {
-        return Err(LimboError::InternalError(format!(
-            "HIR UPDATE target does not list index {}",
-            iteration_index.name
-        )));
-    };
-    Ok(index_reads_assigned_column(
-        update.target,
-        iteration,
-        &assigned,
-    ))
+    // A loop over an index built for this statement is not lowered yet.
+    Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
 }
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
@@ -430,9 +406,18 @@ pub(super) fn emit_update(
     // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
     let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
-    // Like legacy, an UPDATE that moves rows collects them first, so the
-    // loop never reaches a moved row again.
-    let moves_rows = rowid_value.is_some();
+    // Like legacy, an UPDATE that moves rows, changes the key of the index
+    // its loop reads, or may REPLACE rows while reading an index collects
+    // its rows first, so the loop never reaches a changed row again.
+    let moves_rows = rowid_value.is_some()
+        || single_loop
+            .and_then(|(_, operation)| operation_index(operation))
+            .is_some_and(|index| {
+                replaces
+                    || changed_indexes
+                        .iter()
+                        .any(|(old, _)| old.index.value().name == index.name)
+            });
     match single_loop {
         None => emit_from_update(
             program,
@@ -2135,16 +2120,16 @@ mod tests {
     }
 
     #[test]
-    fn update_that_needs_legacy_is_left_to_it() {
+    fn update_through_a_changing_index_collects_its_rows_first() {
         for sql in [
             "UPDATE OR REPLACE items SET value = 1",
             // The loop reads the index whose key changes.
             "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
         ] {
-            let plan = analyze_plan(schema(), sql);
-            let (update, access) = update_root(&plan).unwrap();
-            assert!(
-                needs_legacy(&plan, update, access, &program(), false).unwrap(),
+            let program = emit(sql);
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+                1,
                 "{sql}"
             );
         }

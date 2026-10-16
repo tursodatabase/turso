@@ -1424,6 +1424,37 @@ fn hir_upsert_moving_rows_match_sqlite() {
     }
 }
 
+/// An UPDATE that changes the key of the index its loop reads, or that may
+/// REPLACE rows while reading an index, collects its rows first, as SQLite
+/// does. Legacy loses a row when a constraint-level REPLACE runs during an
+/// index loop.
+#[test]
+fn hir_update_through_a_changing_index_matches_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
+        "CREATE INDEX ta ON t(a)",
+        "CREATE INDEX tb ON t(b)",
+        "INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'w'), (5, 5, 50, 'v')",
+        "UPDATE t INDEXED BY ta SET a = a + 1 WHERE a > 1",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET a = a * 10 WHERE a > 3 RETURNING id, a",
+        "UPDATE t INDEXED BY tb SET c = 'x' WHERE b > 25",
+        "SELECT * FROM t ORDER BY id",
+        "INSERT INTO t VALUES (6, 6, 60, 'q'), (7, 7, 70, 'r'), (8, 8, 80, 's')",
+        "UPDATE t INDEXED BY tb SET c = 'q', b = b + 1 WHERE b >= 60",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t INDEXED BY ta SET a = 100 - a WHERE a BETWEEN 1 AND 70",
+        "SELECT * FROM t ORDER BY id",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
 /// RETURNING subqueries of UPDATE ... FROM: a correlated one runs per row,
 /// any other once, as in SQLite. Legacy runs one that reads the target
 /// through a derived table again for each row.
