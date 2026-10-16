@@ -145,6 +145,12 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
     /// Views whose stored SELECT is being analyzed, to reject circular views.
     pub(super) views_in_progress: Vec<String>,
+    /// How many aggregates each query block has. A subquery's aggregate of
+    /// the enclosing block's columns is counted in that block.
+    pub(super) aggregate_counts: HashMap<QueryBlockId, usize>,
+    /// For each subquery being analyzed, the block of the expression it is
+    /// in, when that expression may hold aggregates.
+    pub(super) aggregate_hosts: Vec<Option<QueryBlockId>>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -187,12 +193,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
             views_in_progress: Vec::new(),
+            aggregate_counts: HashMap::default(),
+            aggregate_hosts: Vec::new(),
             _catalog_outlives_ast: std::marker::PhantomData,
         }
     }
 
     pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
         self.context
+    }
+
+    pub(super) fn allocate_aggregate(&mut self, block: QueryBlockId) -> super::hir::AggregateId {
+        let count = self.aggregate_counts.entry(block).or_default();
+        let id = super::hir::AggregateId::new(block, *count);
+        *count += 1;
+        id
+    }
+
+    pub(super) fn aggregate_count(&self, block: QueryBlockId) -> usize {
+        self.aggregate_counts.get(&block).copied().unwrap_or(0)
     }
 
     pub(super) fn reserve_query(&mut self) -> QueryId {
@@ -936,7 +955,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )
             })
             .transpose()?;
-        let aggregate_query = grouping.is_some() || functions.aggregate_count() > 0;
+        let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
         // Like legacy, an aggregate that appears only in ORDER BY is a misuse
         // when the block reads a FROM clause; without one it makes the block
         // an aggregate query of one row.
@@ -955,7 +974,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })
             .transpose()?
             .unwrap_or_default();
-        let aggregate_count = functions.aggregate_count();
+        let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
@@ -1034,7 +1053,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .into_iter()
             .map(|row| row.into_iter().map(|resolved| resolved.expr).collect())
             .collect();
-        let aggregate_count = functions.aggregate_count();
+        let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
@@ -1094,7 +1113,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         // Aggregates that appear only in ORDER BY are analyzed later and do
         // not count, as in legacy planning.
-        if syntax.exprs.is_empty() && having.is_some() && functions.aggregate_count() == 0 {
+        if syntax.exprs.is_empty()
+            && having.is_some()
+            && self.aggregate_count(functions.block()) == 0
+        {
             crate::bail_parse_error!("HAVING clause on a non-aggregate query");
         }
         Ok(super::hir::Grouping {

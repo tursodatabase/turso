@@ -2809,7 +2809,12 @@ impl<'expr> hir::ExprVisitor<'expr> for HirAggregateCollector<'expr> {
         let hir::FunctionEvaluation::Aggregate { id, .. } = call.evaluation else {
             return Ok(());
         };
-        if id.block != self.block || id.index >= self.aggregates.len() {
+        // A subquery's aggregate of the enclosing block's columns belongs
+        // to that block, which collects it.
+        if id.block != self.block {
+            return Ok(());
+        }
+        if id.index >= self.aggregates.len() {
             return Err(LimboError::InternalError(format!(
                 "HIR aggregate {id:?} is outside query block {:?}",
                 self.block
@@ -2825,6 +2830,7 @@ impl<'expr> hir::ExprVisitor<'expr> for HirAggregateCollector<'expr> {
 }
 
 fn collect_hir_aggregates<'a>(
+    document: &'a HirDocument,
     query: &'a hir::Query,
     block: &'a hir::QueryBlock,
 ) -> Result<Vec<&'a hir::FunctionCall>> {
@@ -2833,6 +2839,38 @@ fn collect_hir_aggregates<'a>(
         aggregates: (0..block.aggregate_count).map(|_| None).collect(),
     };
     let mut collect = |expression: &'a hir::Expr| expression.walk((), &mut collector);
+    // Like SQLite, an aggregate of this block's columns may be written in a
+    // subquery of the block.
+    for subquery in document
+        .queries
+        .iter()
+        .filter(|subquery| subquery.parent == Some(query.id))
+    {
+        for subquery_block in &subquery.blocks {
+            for output in &subquery_block.outputs {
+                collect(&output.expr)?;
+            }
+            if let hir::QueryBlockBody::Select {
+                filter, grouping, ..
+            } = &subquery_block.body
+            {
+                if let Some(filter) = filter {
+                    collect(filter)?;
+                }
+                if let Some(grouping) = grouping {
+                    for key in &grouping.keys {
+                        collect(key)?;
+                    }
+                    if let Some(having) = &grouping.having {
+                        collect(having)?;
+                    }
+                }
+            }
+        }
+        for term in &subquery.order_by {
+            collect(&term.expr)?;
+        }
+    }
     for output in &block.outputs {
         collect(&output.expr)?;
     }
@@ -2901,7 +2939,7 @@ fn initialize_hir_aggregates<'a>(
     query: &'a hir::Query,
     block: &'a hir::QueryBlock,
 ) -> Result<HirAggregateState<'a>> {
-    let calls = collect_hir_aggregates(query, block)?;
+    let calls = collect_hir_aggregates(document, query, block)?;
     let mut aggregates = Vec::with_capacity(calls.len());
     for (index, call) in calls.into_iter().enumerate() {
         let hir::FunctionEvaluation::Aggregate { id, .. } = call.evaluation else {

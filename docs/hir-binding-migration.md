@@ -156,7 +156,6 @@ passes all of them. What is left:
 | Gap | Failing tests | Example |
 |---|---|---|
 | EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | ~38 | `explain-query-plan-json`, `unnest-correlated`, `partial_idx: plan-*` |
-| Aggregates of outer columns inside subqueries (`count(outer.x)` belongs to the outer query) | 4 | `aggregate-of-outer-column` |
 | ORDER BY terms SQLite drops before checking them (one-row aggregates, terms after a rowid term), so their IN subqueries' widths are never checked | 4 | `orderby_rowid_truncation` |
 | Compound ORDER BY expression inside a recursive CTE | 1 | `recursive-cte-order-qualified-expression` |
 | Virtual table join order | 2 | `pragma-vtab-reversed-join-order` |
@@ -165,6 +164,14 @@ passes all of them. What is left:
 | `cte.y` for a CTE not in FROM, under ORDER BY EXISTS, reports no such table | 1 | `cte-unreferenced-qualified-column-orderby-exists` |
 | Bare column next to several aggregates in HAVING with generated columns | 1 | `gencol_having_multiple_aggregates` |
 | Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
+
+Like SQLite, an aggregate written in a subquery whose arguments read only
+columns of the block the subquery is in (`SELECT (SELECT count(t.a)) FROM
+t`) belongs to that block, which then runs as an aggregate query; analysis
+counts each block's aggregates on the analyzer so a subquery can add one to
+its enclosing block, and lowering collects them from the block's
+subqueries. Only the directly enclosing block is considered, and only where
+its expression may hold aggregates (not WHERE).
 
 `SELECT a FROM t HAVING max(a) > 0` returns the row's value where legacy
 returns NULL (SQLite rejects it).

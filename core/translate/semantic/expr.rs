@@ -348,7 +348,6 @@ struct ExprOperand {
 
 pub(super) struct QueryFunctionState {
     block: hir::QueryBlockId,
-    aggregate_count: usize,
     window_function_count: usize,
     named_windows: Vec<NamedFunctionWindow>,
     windows: Vec<hir::ResolvedWindow>,
@@ -360,7 +359,6 @@ impl QueryFunctionState {
     pub(super) const fn new(block: hir::QueryBlockId) -> Self {
         Self {
             block,
-            aggregate_count: 0,
             window_function_count: 0,
             named_windows: Vec::new(),
             windows: Vec::new(),
@@ -368,14 +366,8 @@ impl QueryFunctionState {
         }
     }
 
-    fn allocate_aggregate(&mut self) -> hir::AggregateId {
-        let id = hir::AggregateId::new(self.block, self.aggregate_count);
-        self.aggregate_count += 1;
-        id
-    }
-
-    pub(super) const fn aggregate_count(&self) -> usize {
-        self.aggregate_count
+    pub(super) const fn block(&self) -> hir::QueryBlockId {
+        self.block
     }
 
     fn allocate_window(&mut self) -> hir::WindowFunctionId {
@@ -496,7 +488,8 @@ enum FunctionBinding {
 }
 
 struct AggregateBinding {
-    id: hir::AggregateId,
+    /// The block whose expression holds the call.
+    block: hir::QueryBlockId,
 }
 
 struct WindowBinding {
@@ -1599,13 +1592,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ast::Expr::Subquery(_)
                 | ast::Expr::Exists(_)
                 | ast::Expr::InSelect { .. }
-                | ast::Expr::InTable { .. } => self.build_subquery_expr(
-                    frame.syntax,
-                    frame.resolved_children,
-                    scope,
-                    owner,
-                    policy.policies,
-                )?,
+                | ast::Expr::InTable { .. } => {
+                    // An aggregate in the subquery of only this block's
+                    // columns belongs to this block, where aggregates are
+                    // allowed here.
+                    let host = match (&functions, policy.aggregates) {
+                        (FunctionContext::Query(state), AggregatePolicy::Allow) => {
+                            Some(state.block)
+                        }
+                        _ => None,
+                    };
+                    self.aggregate_hosts.push(host);
+                    let value = self.build_subquery_expr(
+                        frame.syntax,
+                        frame.resolved_children,
+                        scope,
+                        owner,
+                        policy.policies,
+                    );
+                    self.aggregate_hosts.pop();
+                    value?
+                }
                 _ => FrameValue::Scalar(self.build_expr_from_frames(
                     frame.syntax,
                     frame.resolved_children,
@@ -1619,6 +1626,57 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Some(parent) => parent.resolved_children.push(resolved),
                 None => return resolved.into_scalar(),
             }
+        }
+    }
+
+    /// The block an aggregate call belongs to. Like SQLite, a call in a
+    /// subquery whose arguments read only columns of the enclosing block
+    /// is an aggregate of that block, which then runs as an aggregate query;
+    /// otherwise it belongs to `block`, the block it is written in.
+    fn aggregate_owner(
+        &self,
+        block: hir::QueryBlockId,
+        input: &FunctionInput,
+        filter: Option<&ResolvedScopeExpr>,
+    ) -> hir::QueryBlockId {
+        let Some(Some(host)) = self.aggregate_hosts.last().copied() else {
+            return block;
+        };
+        if host == block {
+            return block;
+        }
+        let mut reads_host = false;
+        let mut reads_other = false;
+        let mut visit = |expression: &hir::Expr| {
+            expression.for_each(&mut |expression| {
+                let source = match expression {
+                    hir::Expr::Column(column) => column.source,
+                    hir::Expr::RowId(source) => *source,
+                    hir::Expr::Subquery(_) => {
+                        reads_other = true;
+                        return;
+                    }
+                    _ => return,
+                };
+                match self.source(source).map(|source| source.owner) {
+                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == host => reads_host = true,
+                    _ => reads_other = true,
+                }
+            });
+        };
+        for value in input.facts() {
+            visit(&value.expr);
+        }
+        for term in input.order_terms() {
+            visit(&term.value.expr);
+        }
+        if let Some(filter) = filter {
+            visit(&filter.expr);
+        }
+        if reads_host && !reads_other {
+            host
+        } else {
+            block
         }
     }
 
@@ -2951,10 +3009,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         let evaluation = match binding {
             FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
-            FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate {
-                id: binding.id,
-                filter: filter.map(|filter| Box::new(filter.expr)),
-            },
+            FunctionBinding::Aggregate(binding) => {
+                let block = self.aggregate_owner(binding.block, &input, filter.as_ref());
+                hir::FunctionEvaluation::Aggregate {
+                    id: self.allocate_aggregate(block),
+                    filter: filter.map(|filter| Box::new(filter.expr)),
+                }
+            }
             FunctionBinding::Window(binding) => hir::FunctionEvaluation::Window {
                 id: binding.id,
                 window: match functions {
@@ -4186,7 +4247,7 @@ fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<
             crate::bail_parse_error!("misuse of aggregate function {}()", function)
         }
         FunctionContext::Query(state) => Ok(FunctionBinding::Aggregate(AggregateBinding {
-            id: state.allocate_aggregate(),
+            block: state.block,
         })),
     }
 }
