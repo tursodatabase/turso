@@ -470,11 +470,13 @@ pub(crate) fn emit_autoindex<E>(
     program.emit_insn(Insn::OpenAutoindex {
         cursor_id: index_cursor_id,
     });
-    // Rewind source table
+    // Rewind source table. An empty table must skip the loop body: reading
+    // its unpositioned cursor would add an all-NULL entry that `IS NULL`
+    // seeks then match.
     let label_ephemeral_build_loop_start = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: table_cursor_id,
-        pc_if_empty: label_ephemeral_build_loop_start,
+        pc_if_empty: label_ephemeral_build_end,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
     // Emit all columns from source table that are needed in the ephemeral index.
