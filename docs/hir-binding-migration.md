@@ -232,7 +232,8 @@ rowid. An UPDATE that changes the key of the index its loop reads, or
 that may REPLACE rows while reading an index, also collects its rows first,
 as SQLite does (legacy loses a row when a constraint's REPLACE runs during
 such a loop). UPDATE ... FROM stores the new rowid in its scratch table with the
-other new values. A RETURNING subquery of UPDATE ... FROM that is not correlated
+other new values. Like SQLite, when the rowid is set twice, as `id` and
+`rowid`, the last assignment wins. A RETURNING subquery of UPDATE ... FROM that is not correlated
 runs once, as in SQLite (legacy runs one that reads the target through a
 derived table again for each row). These still go to legacy:
 

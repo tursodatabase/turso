@@ -85,11 +85,9 @@ pub(super) fn needs_legacy(
         .iter()
         .filter(|column| is_rowid_target(&table, column))
         .count();
-    // Changing the rowid moves the row; legacy collects the rows first.
-    // Setting the rowid twice is not lowered yet. Under MVCC, a new rowid
-    // of an AUTOINCREMENT table also advances its hidden sequence, which is
-    // not lowered yet either.
-    if sets_rowid > 1 || (sets_rowid == 1 && table.has_autoincrement && mvcc) {
+    // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
+    // hidden sequence, which is not lowered yet.
+    if sets_rowid > 0 && table.has_autoincrement && mvcc {
         return Ok(true);
     }
     if update.from.is_some() {
@@ -2025,6 +2023,8 @@ mod tests {
         for sql in [
             "UPDATE items SET id = id + 1",
             "UPDATE items SET rowid = 5 WHERE id = 1",
+            // Like SQLite, the last of two rowid assignments wins.
+            "UPDATE items SET id = 4, rowid = 5 WHERE id = 1",
         ] {
             let program = emit(sql);
             // The rows are collected first, and the row is deleted and
