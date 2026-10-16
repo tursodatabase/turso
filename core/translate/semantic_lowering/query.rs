@@ -2472,6 +2472,9 @@ pub(super) struct PreparedHirBtreeLoop<'a> {
     pub(super) table_cursor: Option<CursorID>,
     pub(super) autoindex_source_cursor: Option<CursorID>,
     pub(super) table_has_rowid: bool,
+    /// Expressions of the query block an index without a table cursor
+    /// supplies, each with the index column holding it.
+    pub(super) index_keys: Vec<(&'a hir::Expr, usize)>,
 }
 
 struct PreparedHirMaterializedLoop<'a> {
@@ -4449,53 +4452,14 @@ fn prepare_hir_index_method_loop<'a>(
             table_cursor: None,
         },
     );
-    // The expressions of this block that the index returns: its outputs,
-    // its query's ORDER BY and the WHERE terms left to check.
-    let hir::SourceOwner::QueryBlock(block_id) = source.owner else {
-        return Err(LimboError::InternalError(format!(
-            "HIR index-method loop source {source_id} is not owned by a query block"
-        )));
-    };
-    let block = document.query_block(block_id).ok_or_else(|| {
-        LimboError::InternalError(format!("HIR query block {block_id:?} is missing"))
+    // The expressions of this block that the index returns.
+    let covered = find_block_subexpressions(plan, source, |expression| {
+        access
+            .covered
+            .iter()
+            .find(|(covered, _)| covered.equivalent(expression))
+            .map(|(_, column)| *column)
     })?;
-    let query = document.query(block_id.query).ok_or_else(|| {
-        LimboError::InternalError(format!("HIR query {} is missing", block_id.query))
-    })?;
-    let predicates = plan
-        .planned_query(block_id.query)
-        .and_then(|planned| {
-            planned
-                .blocks
-                .iter()
-                .find(|planned| planned.block == block_id)
-        })
-        .map(|planned| planned.predicates.as_slice())
-        .unwrap_or_default();
-    let mut covered = Vec::new();
-    let mut visit = |root: &'a hir::Expr| {
-        let mut pending = vec![root];
-        while let Some(expression) = pending.pop() {
-            if let Some((_, column)) = access
-                .covered
-                .iter()
-                .find(|(covered, _)| covered.equivalent(expression))
-            {
-                covered.push((expression, *column));
-                continue;
-            }
-            pending.extend((0..).map_while(|position| expression.child(position)));
-        }
-    };
-    for output in &block.outputs {
-        visit(&output.expr);
-    }
-    for term in &query.order_by {
-        visit(&term.expr);
-    }
-    for term in predicates.iter().filter(|term| !term.consumed) {
-        visit(&term.expr);
-    }
     Ok(PreparedHirIndexMethodLoop {
         source,
         access,
@@ -4504,6 +4468,69 @@ fn prepare_hir_index_method_loop<'a>(
         database: database.index(),
         covered,
     })
+}
+
+/// Every expression the query block owning `source` evaluates per row: its
+/// outputs, grouping keys and HAVING, its query's ORDER BY, and the WHERE
+/// terms its plan left to check.
+fn hir_block_expressions<'a>(
+    plan: &'a HirPlan,
+    source: &hir::Source,
+) -> Result<Vec<&'a hir::Expr>> {
+    let document = &plan.document;
+    let hir::SourceOwner::QueryBlock(block_id) = source.owner else {
+        return Ok(Vec::new());
+    };
+    let block = document.query_block(block_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query block {block_id:?} is missing"))
+    })?;
+    let query = document.query(block_id.query).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query {} is missing", block_id.query))
+    })?;
+    let mut roots = block
+        .outputs
+        .iter()
+        .map(|output| &output.expr)
+        .collect::<Vec<_>>();
+    if let Some(grouping) = hir_grouping(block) {
+        roots.extend(&grouping.keys);
+        roots.extend(&grouping.having);
+    }
+    roots.extend(query.order_by.iter().map(|term| &term.expr));
+    if let Some(planned) = plan.planned_query(block_id.query).and_then(|planned| {
+        planned
+            .blocks
+            .iter()
+            .find(|planned| planned.block == block_id)
+    }) {
+        roots.extend(
+            planned
+                .predicates
+                .iter()
+                .filter(|term| !term.consumed)
+                .map(|term| &term.expr),
+        );
+    }
+    Ok(roots)
+}
+
+/// The largest parts of the block's expressions for which `matches` names a
+/// column of a cursor, with that column.
+fn find_block_subexpressions<'a>(
+    plan: &'a HirPlan,
+    source: &hir::Source,
+    matches: impl Fn(&hir::Expr) -> Option<usize>,
+) -> Result<Vec<(&'a hir::Expr, usize)>> {
+    let mut found = Vec::new();
+    let mut pending = hir_block_expressions(plan, source)?;
+    while let Some(expression) = pending.pop() {
+        if let Some(column) = matches(expression) {
+            found.push((expression, column));
+            continue;
+        }
+        pending.extend((0..).map_while(|position| expression.child(position)));
+    }
+    Ok(found)
 }
 
 fn start_hir_index_method_loop(
@@ -5049,6 +5076,27 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         });
     }
 
+    // An index read without its table supplies the expressions it keys,
+    // such as `a + b` for an index on `t(a + b)`.
+    let index_keys = match index {
+        Some(index) if table_cursor.is_none() && !index.ephemeral => {
+            match source
+                .index_expressions
+                .iter()
+                .find(|expressions| expressions.index.value().name == index.name)
+            {
+                Some(expressions) if expressions.columns.iter().any(Option::is_some) => {
+                    find_block_subexpressions(plan, source, |expression| {
+                        expressions.columns.iter().position(|key| {
+                            key.as_ref().is_some_and(|key| key.equivalent(expression))
+                        })
+                    })?
+                }
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
     Ok(PreparedHirBtreeLoop {
         source,
         operation,
@@ -5057,6 +5105,7 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         table_cursor,
         autoindex_source_cursor,
         table_has_rowid: table.has_rowid,
+        index_keys,
     })
 }
 
@@ -5379,6 +5428,11 @@ pub(super) fn start_hir_btree_loop(
                 table_cursor_id: table_cursor,
             });
         }
+    }
+    for (expression, column) in &prepared.index_keys {
+        let register = program.alloc_register();
+        program.emit_column_or_rowid(prepared.cursor, *column, register);
+        program.bind_expression_register(expression, register);
     }
     Ok(HirBtreeLoop {
         cursor: Some(prepared.cursor),

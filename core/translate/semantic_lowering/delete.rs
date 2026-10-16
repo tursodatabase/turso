@@ -232,6 +232,7 @@ fn emit_scan_delete(
         table_cursor: lookup_cursor,
         autoindex_source_cursor: None,
         table_has_rowid: target.table.has_rowid,
+        index_keys: Vec::new(),
     };
     emit_access_predicates(program, document, access, None, done)?;
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
