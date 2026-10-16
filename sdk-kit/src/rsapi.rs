@@ -1324,6 +1324,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            last_step_busy: false,
         }))
     }
 
@@ -1352,6 +1353,7 @@ impl TursoConnection {
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
+                    last_step_busy: false,
                 }));
             }
         }
@@ -1382,6 +1384,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            last_step_busy: false,
         }))
     }
 
@@ -1411,6 +1414,7 @@ impl TursoConnection {
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
+                        last_step_busy: false,
                     }),
                     position,
                 )))
@@ -1536,6 +1540,13 @@ pub struct TursoStatement {
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
+    /// Set when the most recent `step`/`execute` call returned `Busy`. The
+    /// underlying statement is left in a "running" execution state on Busy
+    /// (so an explicit retry can resume it), but `finalize` must not mistake
+    /// that for a statement mid-result-set: resuming it here would silently
+    /// perform (and, for an autocommit statement, commit) writes the caller
+    /// was already told had failed.
+    last_step_busy: bool,
 }
 
 impl Drop for TursoStatement {
@@ -1643,8 +1654,10 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        step_inner(stmt, self.async_io, waker)
-            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
+        let result = step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error));
+        self.last_step_busy = matches!(result, Err(TursoError::Busy(_)));
+        result
     }
 
     /// execute statement to completion
@@ -1662,8 +1675,10 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)
-                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
+            let result = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error));
+            self.last_step_busy = matches!(result, Err(TursoError::Busy(_)));
+            let status = result?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1768,10 +1783,20 @@ impl TursoStatement {
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
-            while stmt.execution_state().is_running() {
-                let status = step_inner(stmt, self.async_io, waker)?;
-                if status == TursoStatusCode::Io {
-                    return Ok(status);
+            // A Busy result leaves the statement in a "running" execution
+            // state, same as a partially-consumed result set, so the caller
+            // can retry by stepping again. But the caller has already been
+            // told this attempt failed; resuming it here instead would
+            // silently execute (and, for an autocommit statement, commit)
+            // that write once the contention clears. Only run the remaining
+            // steps when the statement is running for a legitimate reason,
+            // e.g. an INSERT ... RETURNING whose rows were never fully drained.
+            if !self.last_step_busy {
+                while stmt.execution_state().is_running() {
+                    let status = step_inner(stmt, self.async_io, waker)?;
+                    if status == TursoStatusCode::Io {
+                        return Ok(status);
+                    }
                 }
             }
         }
@@ -1826,8 +1851,8 @@ mod tests {
     use super::{c, CApiPageCodec};
     use crate::{
         rsapi::{
-            OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
-            FINALIZED_ERR,
+            OpenFlags, TursoConnection, TursoDatabase, TursoDatabaseConfig, TursoError,
+            TursoStatusCode, FINALIZED_ERR,
         },
         IoBackend,
     };
@@ -1867,6 +1892,87 @@ mod tests {
             page_codec: None,
             open_flags: OpenFlags::default(),
         }
+    }
+
+    fn open_synchronously(db: &TursoDatabase) {
+        loop {
+            match db.open().unwrap() {
+                turso_core::IOResult::Done(()) => return,
+                turso_core::IOResult::IO(io) => io.wait(db.io().unwrap().as_ref()).unwrap(),
+            }
+        }
+    }
+
+    fn exec_to_completion(conn: &TursoConnection, sql: &str) {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        stmt.execute(None).unwrap();
+        stmt.finalize(None).unwrap();
+    }
+
+    fn scalar_count(conn: &TursoConnection, sql: &str) -> i64 {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        let value = loop {
+            match stmt.step(None).unwrap() {
+                TursoStatusCode::Row => break stmt.row_value(0).unwrap(),
+                other => panic!("expected a row for {sql}, got {other:?}"),
+            }
+        };
+        stmt.finalize(None).unwrap();
+        value.as_int().expect("expected an integer scalar")
+    }
+
+    /// Regression test for the sdk-kit bug where `TursoStatement::finalize`
+    /// resumed a statement that had previously returned `Busy`, silently
+    /// executing (and, since the statement is autocommit, committing) a
+    /// write the caller had already been told had failed.
+    #[test]
+    fn finalize_does_not_resume_a_write_that_returned_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("finalize-busy.db");
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        open_synchronously(&db);
+
+        let conn1 = db.connect().unwrap();
+        let conn2 = db.connect().unwrap();
+
+        exec_to_completion(&conn1, "CREATE TABLE t(x INTEGER)");
+        exec_to_completion(&conn1, "BEGIN IMMEDIATE");
+        exec_to_completion(&conn1, "INSERT INTO t VALUES (1)");
+
+        // conn2's autocommit write can't acquire the write lock while conn1
+        // holds it, and the default busy timeout (0) means it fails
+        // immediately instead of retrying.
+        let mut busy_stmt = conn2.prepare_single("INSERT INTO t VALUES (2)").unwrap();
+        let err = busy_stmt.execute(None).unwrap_err();
+        assert!(
+            matches!(err, TursoError::Busy(_)),
+            "expected Busy, got {err:?}"
+        );
+
+        // The lock only clears after the caller has already been told this
+        // write failed.
+        exec_to_completion(&conn1, "COMMIT");
+
+        // A driver that finalizes every statement, including ones whose call
+        // already failed (e.g. Go's database/sql), must not have that
+        // finalize silently perform the write it already reported as failed.
+        busy_stmt.finalize(None).unwrap();
+
+        assert_eq!(
+            scalar_count(&conn1, "SELECT COUNT(*) FROM t WHERE x = 2"),
+            0,
+            "finalize resumed and committed a write that had returned Busy"
+        );
     }
 
     #[test]
