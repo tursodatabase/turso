@@ -2077,7 +2077,7 @@ expect {
     real|9.22337203685478e+18
 }
 expect @js {
-    real|9223372036854780000
+    real|9223372036854776000
 }
 
 test cast-max-i64-text-to-numeric {
@@ -2094,7 +2094,7 @@ expect {
     -9.22337203685478e+18
 }
 expect @js {
-    -9223372036854780000
+    -9223372036854776000
 }
 
 test cast-null-to-any {

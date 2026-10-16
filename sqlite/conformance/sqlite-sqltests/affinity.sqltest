@@ -868,3 +868,31 @@ expect {
     1
     1
 }
+
+@cross-check-integrity
+test affinity-text-to-real-stops-at-sqlite-significand-limit {
+    CREATE TABLE r(v TEXT, x REAL);
+    INSERT INTO r VALUES ('1844674407370955160.3e-141', '1844674407370955160.3e-141');
+    INSERT INTO r VALUES ('18446744073709551613e-232', '18446744073709551613e-232');
+    INSERT INTO r VALUES ('18446744073709551609', '18446744073709551609');
+    SELECT printf('%!.20e', x), printf('%!.20e', CAST(v AS REAL)), printf('%!.20e', CAST(v AS NUMERIC)), x = CAST(v AS REAL), sum(v) = CAST(v AS REAL) FROM r GROUP BY rowid ORDER BY rowid;
+}
+expect {
+    1.844674407370954903e-123|1.844674407370954903e-123|1.844674407370954903e-123|1|1
+    1.844674407370955208e-213|1.844674407370955208e-213|1.844674407370955208e-213|1|1
+    1.844674407370955162e+19|1.844674407370955162e+19|1.844674407370955162e+19|1|1
+}
+
+@cross-check-integrity
+test affinity-text-to-real-exponent-above-1000-offset-by-digits {
+    CREATE TABLE r(v TEXT, x REAL, n NUMERIC);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '0.' || replace(printf('%1000s', ''), ' ', '0') || '1e1001' AS s);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '1' || replace(printf('%1500s', ''), ' ', '0') || 'e-1700' AS s);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '0.' || replace(printf('%9999s', ''), ' ', '0') || '7e10002' AS s);
+    SELECT CAST(v AS NUMERIC), CAST(v AS REAL), v + 0, sum(v), x, n, x = CAST(v AS REAL) FROM r GROUP BY rowid ORDER BY rowid;
+}
+expect {
+    1|1.0|1.0|1.0|1.0|1|1
+    1.0e-200|1.0e-200|1.0e-200|1.0e-200|1.0e-200|1.0e-200|1
+    700|700.0|700.0|700.0|700.0|700|1
+}

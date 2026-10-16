@@ -421,7 +421,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         has_digits = true;
         let digit = (bytes[pos] - b'0') as u64;
 
-        if significand <= (u64::MAX - 9) / 10 {
+        if significand < (u64::MAX - 9) / 10 {
             significand = significand * 10 + digit;
         } else {
             // Skip overflow digits but adjust exponent
@@ -443,7 +443,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
             has_digits = true;
             let digit = (bytes[pos] - b'0') as u64;
 
-            if significand <= (u64::MAX - 9) / 10 {
+            if significand < (u64::MAX - 9) / 10 {
                 significand = significand * 10 + digit;
                 decimal_adjust -= 1;
             }
