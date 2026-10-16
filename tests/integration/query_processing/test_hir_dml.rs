@@ -1477,6 +1477,50 @@ fn hir_update_through_a_changing_index_matches_sqlite() {
     }
 }
 
+/// DML on a table with a materialized view goes through HIR, and the view
+/// follows each change. The UPDATE is one legacy gets wrong (it loses a row
+/// when a constraint's REPLACE runs during an index loop), so the table is
+/// checked against SQLite too.
+#[test]
+fn hir_dml_keeps_materialized_views_up_to_date() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
+        "CREATE INDEX tb ON t(b)",
+        "INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'w')",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, a, c FROM t WHERE a > 1")
+        .unwrap();
+    for sql in [
+        "UPDATE t INDEXED BY tb SET c = 'x' WHERE b > 25",
+        "INSERT INTO t VALUES (5, 5, 50, 'v') ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (5, 6, 60, 'q') ON CONFLICT(id) DO UPDATE SET a = excluded.a",
+        "UPDATE t SET id = id + 10 WHERE a > 4",
+        "DELETE FROM t WHERE a = 2",
+        "REPLACE INTO t VALUES (20, 7, 70, 'x')",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+        let rows = "SELECT * FROM t ORDER BY id";
+        assert_eq!(
+            limbo_exec_rows(&conn, rows),
+            sqlite_exec_rows(&sqlite, rows),
+            "{sql}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT * FROM v ORDER BY id"),
+            limbo_exec_rows(&conn, "SELECT id, a, c FROM t WHERE a > 1 ORDER BY id"),
+            "{sql}"
+        );
+    }
+}
+
 /// RETURNING subqueries of UPDATE ... FROM: a correlated one runs per row,
 /// any other once, as in SQLite. Legacy runs one that reads the target
 /// through a derived table again for each row.

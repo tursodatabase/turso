@@ -214,9 +214,9 @@ fn target_needs_legacy(
     if schema.is_materialized_view(&table_name) {
         crate::bail_parse_error!("cannot modify materialized view {table_name}");
     }
-    Ok(!schema
-        .get_dependent_materialized_views(&table_name)
-        .is_empty())
+    // The VM keeps dependent materialized views up to date as rows are
+    // written; legacy reports views built by another DBSP version.
+    Ok(schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()))
 }
 
 /// What every HIR document of one statement is analyzed and planned with:
