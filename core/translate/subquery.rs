@@ -11,7 +11,7 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, custom_type_with_different_params};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -1002,6 +1002,7 @@ fn get_subquery_parser<'a>(
                 // NotFound/Found probe comparisons.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                let mut custom_type_eq_funcs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
                     let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
                     affinity_chars.push(
@@ -1014,8 +1015,32 @@ fn get_subquery_parser<'a>(
                         .aff_mask(),
                     );
                     lhs_collations.push(get_collseq_from_expr(lhs_expr, referenced_tables)?);
+                    // A compound SELECT can mix values of other types into the
+                    // column, so only a plain SELECT uses the custom type's `=`.
+                    custom_type_eq_funcs.push(
+                        matches!(plan, Plan::Select(_))
+                            .then(|| {
+                                custom_type_with_different_params(
+                                    lhs_expr,
+                                    referenced_tables,
+                                    &result_columns[i].expr,
+                                    table_references,
+                                    resolver.schema(),
+                                )
+                            })
+                            .flatten()
+                            .and_then(|type_def| {
+                                type_def
+                                    .operators()
+                                    .iter()
+                                    .find(|op| op.op == "=")?
+                                    .func_name
+                                    .clone()
+                            }),
+                    );
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
+                let custom_type_eq_funcs: Arc<[Option<String>]> = custom_type_eq_funcs.into();
 
                 let columns = result_columns
                     .iter()
@@ -1063,6 +1088,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str.clone(),
+                        custom_type_eq_funcs: custom_type_eq_funcs.clone(),
                     },
                 };
 
@@ -1072,6 +1098,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str,
+                        custom_type_eq_funcs,
                     },
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),

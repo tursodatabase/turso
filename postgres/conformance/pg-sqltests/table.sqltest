@@ -95,6 +95,39 @@ expect {
     ops|carol
 }
 
+test table-numeric-equal-across-scales {
+    CREATE TABLE a (x numeric(10,2));
+    CREATE TABLE b (y numeric(10,3));
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b);
+    SELECT x, (SELECT count(*) FROM b WHERE b.y = a.x) FROM a ORDER BY x;
+}
+expect {
+    1
+    1
+    1.00|1
+    2.00|0
+}
+
+test table-numeric-join-keeps-other-scale {
+    CREATE TABLE a (x numeric(10,2));
+    CREATE TABLE b (y numeric(10,1));
+    INSERT INTO a VALUES (1.20), (1.25);
+    INSERT INTO b VALUES (1.2);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
 # ---------------------------------------------------------------------------
 # CREATE TABLE AS / SELECT INTO
 # ---------------------------------------------------------------------------

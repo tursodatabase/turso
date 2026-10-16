@@ -133,9 +133,9 @@ use crate::translate::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
-        walk_expr_mut, WalkControl,
+        custom_type_with_different_params, expr_contains_nondeterministic_scalar_function,
+        expr_references_any_subquery, expr_references_subquery_id, expression_can_fail_on_input,
+        get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
@@ -573,7 +573,7 @@ fn try_rewrite_single_value_aggregate(
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
             return Ok(None);
         };
-        if !column_pair_compares_the_same(&pair, &inner_plan.table_references)? {
+        if !column_pair_compares_the_same(&pair, &inner_plan.table_references, resolver)? {
             return Ok(None);
         }
         pairs.push(pair);
@@ -1140,8 +1140,24 @@ fn read_column_pair(
 /// number `1` and the text `'1'` in two groups, while a numeric outer key joins
 /// to both. Either case would return the outer row twice. Use the grouped form
 /// only when both columns use the same number/text conversion rule and the same
-/// text order.
-fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) -> Result<bool> {
+/// text order. Grouping also compares values byte for byte, so it cannot be
+/// used for columns whose equal values can have different bytes.
+fn column_pair_compares_the_same(
+    pair: &ColumnPair,
+    tables: &TableReferences,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    if custom_type_with_different_params(
+        &pair.inner,
+        tables,
+        &pair.outer,
+        tables,
+        resolver.schema(),
+    )
+    .is_some()
+    {
+        return Ok(false);
+    }
     if get_expr_affinity(&pair.inner, Some(tables), None)
         != get_expr_affinity(&pair.outer, Some(tables), None)
     {

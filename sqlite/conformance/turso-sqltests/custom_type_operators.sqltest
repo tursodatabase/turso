@@ -808,3 +808,123 @@ expect {
     1
     3
 }
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-join-different-scale {
+    -- numeric_eq says 1.00 = 1.000, so the join must match these rows.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT a.x = b.y FROM a, b ORDER BY a.x;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.y ORDER BY a.x;
+}
+expect {
+    1
+    0
+    1
+    1.00|1.000
+    2.00|
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-different-scale {
+    -- IN compares with numeric_eq and still returns NULL when it finds
+    -- no match but the subquery has a NULL.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1, 1), (2, 2), (3, NULL);
+    INSERT INTO b VALUES (1);
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+    INSERT INTO b VALUES (NULL);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+}
+expect {
+    1
+    1|1|0
+    2|0|1
+    3||
+    1|1|0
+    2||
+    3||
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-different-scale {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2), k INTEGER) STRICT;
+    CREATE TABLE b(y numeric(10,3), k INTEGER) STRICT;
+    INSERT INTO a VALUES (1, 1, 5), (2, 1, 6), (3, 1, 7);
+    INSERT INTO b VALUES (1, 5), (NULL, 6);
+    SELECT id, (x, k) IN (SELECT y, k FROM b), (x, k) NOT IN (SELECT y, k FROM b)
+    FROM a ORDER BY id;
+}
+expect {
+    1|1|0
+    2||
+    3|0|1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-correlated-subquery-different-scale {
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (1);
+    SELECT x, (SELECT count(*) FROM b WHERE b.y = a.x) FROM a ORDER BY x;
+}
+expect {
+    1.00|2
+    2.00|0
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-join-search-keeps-other-scale {
+    -- An index search must not encode 1.25 at scale 1, which gives 1.2.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,1)) STRICT;
+    INSERT INTO a VALUES (1.20), (1.25);
+    INSERT INTO b VALUES (1.2);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+    CREATE INDEX b_y ON b(y);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-keeps-column-collations {
+    -- Each column uses its own collation: m is BINARY, n is NOCASE, and an
+    -- explicit COLLATE on either side applies to its column only.
+    CREATE TABLE a(x numeric(10,2), n text COLLATE NOCASE, m text) STRICT;
+    CREATE TABLE b(y numeric(10,3), n text, m text) STRICT;
+    INSERT INTO a VALUES (1, 'abc', 'q');
+    INSERT INTO b VALUES (1, 'ABC', 'Q');
+    SELECT (m, x, n) IN (SELECT m, y, n FROM b) FROM a;
+    SELECT (x, n) IN (SELECT y, n FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, n) IN (SELECT m, y, n FROM b) FROM a;
+    SELECT (x, m) IN (SELECT y, m COLLATE NOCASE FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, m) IN (SELECT m, y, m FROM b) FROM a;
+}
+expect {
+    0
+    1
+    1
+    1
+    0
+}

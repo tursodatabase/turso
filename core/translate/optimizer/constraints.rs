@@ -1,6 +1,6 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, custom_type_with_different_params};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -796,6 +796,21 @@ pub fn constraints_from_where_clause(
                 // is still a truth test (see [truth_test_rhs]).
                 if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
                     && truth_test_rhs(rhs).is_some()
+                {
+                    continue;
+                }
+                // An index search encodes the search value with the parameters
+                // of the indexed column, which can change a value of the same
+                // custom type with other parameters (see
+                // [custom_type_with_different_params]).
+                if custom_type_with_different_params(
+                    lhs,
+                    table_references,
+                    rhs,
+                    table_references,
+                    schema,
+                )
+                .is_some()
                 {
                     continue;
                 }

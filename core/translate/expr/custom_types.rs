@@ -128,7 +128,7 @@ pub(super) struct ExprCustomTypeInfo {
 pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    schema: &Schema,
 ) -> Option<ExprCustomTypeInfo> {
     if let ast::Expr::Column {
         table: table_ref_id,
@@ -140,9 +140,7 @@ pub(super) fn expr_custom_type_info(
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
         let type_name = &col.ty_str;
-        let type_def = resolver
-            .schema()
-            .get_type_def(type_name, table.is_strict())?;
+        let type_def = schema.get_type_def(type_name, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
             column: col.clone(),
@@ -231,8 +229,8 @@ pub(super) fn find_custom_type_operator(
     resolver: &Resolver,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
-    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
+    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver.schema());
+    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver.schema());
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -311,6 +309,26 @@ pub(super) fn find_custom_type_operator(
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
     }
+}
+
+/// Return the type when `lhs` and `rhs` are columns of the same custom type
+/// declared with different parameters, such as `numeric(10,2)` and
+/// `numeric(10,3)`. Their values are encoded and decoded with different
+/// parameters, so equal values can have different bytes (`1.00` and `1.000`),
+/// and encoding one column's value with the other column's parameters can
+/// change it (`1.25` becomes `1.2`).
+pub(crate) fn custom_type_with_different_params(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<Arc<TypeDef>> {
+    let lhs_info = expr_custom_type_info(lhs, Some(lhs_tables), schema)?;
+    let rhs_info = expr_custom_type_info(rhs, Some(rhs_tables), schema)?;
+    (lhs_info.type_name == rhs_info.type_name
+        && lhs_info.column.ty_params != rhs_info.column.ty_params)
+        .then_some(lhs_info.type_def)
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
