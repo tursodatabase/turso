@@ -38,7 +38,8 @@ use crate::{
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
         semantic_to_plan::{
-            BtreeTableLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan, HirSourceAccess,
+            BtreeTableLookup, HirHashLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan,
+            HirSourceAccess,
         },
         window::{
             WindowBufferInput, WindowBufferRuntime, WindowFrameOffsets, WindowFrameTracking,
@@ -2857,6 +2858,15 @@ enum HirLoopAdvance {
     Virtual,
     /// Go back to the loop's start, which reads the next row itself.
     Restart,
+    /// Find the next row with the same hash key.
+    Hash {
+        hash_table: usize,
+        rowid: usize,
+        payload: usize,
+        columns: usize,
+        waiting_pass: usize,
+        waiting_next: BranchOffset,
+    },
 }
 
 pub(super) struct PreparedHirBtreeLoop<'a> {
@@ -2939,6 +2949,34 @@ enum PreparedHirLoop<'a> {
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
     Coroutine(PreparedHirCoroutineLoop<'a>),
+    Hash(PreparedHirHashLoop<'a>),
+}
+
+/// A hash lookup's cursor, registers and labels, chosen before any loop
+/// starts. See [HirSourceAccess::Hash].
+struct PreparedHirHashLoop<'a> {
+    source: &'a hir::Source,
+    lookup: &'a HirHashLookup,
+    table: Arc<BTreeTable>,
+    database: usize,
+    /// Reads the whole table once to build the hash table.
+    build_cursor: CursorID,
+    hash_table: usize,
+    /// One register per column of the table; the hash table keeps the
+    /// columns in `columns` and leaves the others NULL.
+    payload: usize,
+    columns: Vec<usize>,
+    /// The rowid of the row a lookup found.
+    rowid: usize,
+    build_keys: usize,
+    probe_keys: usize,
+    /// The rowid of the previous loop's row, kept with a lookup that has to
+    /// wait for rows the hash table moved to disk.
+    probe_rowid: usize,
+    /// 1 while the waiting lookups run after the previous loop ends.
+    waiting_pass: usize,
+    /// Where the waiting pass looks for the next match.
+    waiting_next: BranchOffset,
 }
 
 impl PreparedHirLoop<'_> {
@@ -2949,7 +2987,7 @@ impl PreparedHirLoop<'_> {
             Self::IndexMethod(prepared) => Some(prepared.index_cursor),
             Self::OrUnion(prepared) => Some(prepared.table_cursor),
             Self::Materialized(prepared) => Some(prepared.cursor),
-            Self::Registers(_) | Self::Coroutine(_) => None,
+            Self::Registers(_) | Self::Coroutine(_) | Self::Hash(_) => None,
         }
     }
 
@@ -2960,7 +2998,7 @@ impl PreparedHirLoop<'_> {
             Self::IndexMethod(prepared) => Some(prepared.table_cursor),
             Self::OrUnion(_) => None,
             Self::Materialized(_) => None,
-            Self::Registers(_) | Self::Coroutine(_) => None,
+            Self::Registers(_) | Self::Coroutine(_) | Self::Hash(_) => None,
         }
     }
 }
@@ -3776,6 +3814,9 @@ fn emit_join_loops(
         nest.emit_unmatched_right_rows(program, right_outer)?;
     }
     program.preassign_label_to_next_insn(block_done);
+    // A hash table is not closed here: the block may run again, as a FROM
+    // subquery does for each outer row, and the table is built only once.
+    // Statement reset frees it.
     if let Some((_, captures)) = aggregate_captures {
         bind_hir_aggregate_captures(program, &captures);
     }
@@ -3840,12 +3881,27 @@ impl HirLoopNest<'_, '_> {
                     "HIR loop {loop_index} starts overlapping LEFT JOIN boundaries"
                 )));
             }
-            let hir_loop = start_hir_loop(
-                program,
-                self.document,
-                &self.prepared_loops[loop_index],
-                left_join,
-            )?;
+            let hir_loop = match &self.prepared_loops[loop_index] {
+                PreparedHirLoop::Hash(prepared) => {
+                    let previous_cursor = loop_index
+                        .checked_sub(1)
+                        .filter(|previous| *previous >= first)
+                        .and_then(|previous| self.prepared_loops[previous].cursor())
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "HIR hash lookup has no table loop before it".into(),
+                            )
+                        })?;
+                    start_hir_hash_loop(
+                        program,
+                        self.document,
+                        prepared,
+                        previous_cursor,
+                        left_join,
+                    )?
+                }
+                prepared => start_hir_loop(program, self.document, prepared, left_join)?,
+            };
             for registers in left_joins
                 .iter()
                 .flat_map(|left_join| &left_join.null_registers)
@@ -3950,8 +4006,18 @@ impl HirLoopNest<'_, '_> {
             }
         }
 
-        for hir_loop in loops.iter().rev() {
+        for (position, hir_loop) in loops.iter().enumerate().rev() {
             close_hir_btree_loop(program, hir_loop, left_joins);
+            // A hash lookup's waiting rows run after the loop before it.
+            if let (Some(PreparedHirLoop::Hash(prepared)), Some(hash_loop)) = (
+                self.prepared_loops.get(first + position + 1),
+                loops.get(position + 1),
+            ) {
+                let previous_cursor = self.prepared_loops[first + position]
+                    .cursor()
+                    .expect("a hash lookup follows a table loop");
+                emit_hir_hash_waiting_lookups(program, prepared, hash_loop, previous_cursor);
+            }
         }
         Ok(())
     }
@@ -3994,7 +4060,8 @@ impl HirLoopNest<'_, '_> {
                 }
                 PreparedHirLoop::Virtual(_)
                 | PreparedHirLoop::IndexMethod(_)
-                | PreparedHirLoop::Coroutine(_) => {
+                | PreparedHirLoop::Coroutine(_)
+                | PreparedHirLoop::Hash(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -4154,7 +4221,8 @@ fn prepare_hir_right_outer_join(
         | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::OrUnion(_)
         | PreparedHirLoop::Registers(_)
-        | PreparedHirLoop::Coroutine(_) => {
+        | PreparedHirLoop::Coroutine(_)
+        | PreparedHirLoop::Hash(_) => {
             return Err(LimboError::InternalError(format!(
                 "HIR RIGHT or FULL JOIN source {source} has no rowids"
             )));
@@ -4560,6 +4628,11 @@ pub(super) fn hir_loop_explain(
                 ),
             }
         }
+        HirSourceAccess::Hash(_) => EqpDetail::HashJoin {
+            table,
+            join,
+            subquery: None,
+        },
         HirSourceAccess::OrUnion(union) => EqpDetail::MultiIndex {
             table,
             union: true,
@@ -4826,7 +4899,352 @@ fn prepare_hir_loop_unexplained<'a>(
         HirSourceAccess::RecursiveInput { cte } => Ok(PreparedHirLoop::Registers(
             prepare_hir_recursive_input_loop(program, &plan.document, planned_loop.source, *cte)?,
         )),
+        HirSourceAccess::Hash(lookup) => Ok(PreparedHirLoop::Hash(prepare_hir_hash_loop(
+            program,
+            plan,
+            planned_loop.source,
+            lookup,
+        )?)),
     }
+}
+
+fn prepare_hir_hash_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    lookup: &'a HirHashLookup,
+) -> Result<PreparedHirHashLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR hash lookup references missing source {source_id}"
+        ))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Err(LimboError::InternalError(format!(
+            "HIR hash lookup source {source_id} is not a table"
+        )));
+    };
+    let Table::BTree(table) = table.value() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR hash lookup source {source_id} is not a B-tree table"
+        )));
+    };
+    let database = source.database.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR hash lookup source {source_id} has no database"
+        ))
+    })?;
+    let snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR hash lookup source {source_id} references missing database {database:?}"
+        ))
+    })?;
+    program.begin_read_on_database(database.index(), snapshot.schema_version)?;
+
+    // Keep every column the statement reads, and the columns a virtual
+    // generated column among them is computed from.
+    let hir::SourceOwner::QueryBlock(block) = source.owner else {
+        return Err(LimboError::InternalError(format!(
+            "HIR hash lookup source {source_id} is not owned by a query block"
+        )));
+    };
+    let mut columns = lookup.columns.clone();
+    for usage in document.source_column_usage(block.query) {
+        if usage.reference.source == source_id && !columns.contains(&usage.reference.column) {
+            columns.push(usage.reference.column);
+        }
+    }
+    let mut position = 0;
+    while let Some(column) = columns.get(position).copied() {
+        position += 1;
+        if let Some(hir::ColumnReadExpression::Planned(expression)) =
+            source.generated_expressions.get(column)
+        {
+            expression.for_each(&mut |expression| {
+                if let hir::Expr::Column(dependency) = expression {
+                    if dependency.source == source_id && !columns.contains(&dependency.column) {
+                        columns.push(dependency.column);
+                    }
+                }
+            });
+        }
+    }
+    columns.sort_unstable();
+
+    let payload = program.alloc_registers(source.columns.len().max(1));
+    let rowid = program.alloc_register();
+    program.bind_source(
+        source_id,
+        SourceBinding::Registers {
+            start: payload,
+            rowid: Some(rowid),
+        },
+    );
+    Ok(PreparedHirHashLoop {
+        source,
+        lookup,
+        table: table.clone(),
+        database: database.index(),
+        build_cursor: program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
+        hash_table: program.alloc_hash_table_id(),
+        payload,
+        columns,
+        rowid,
+        build_keys: program.alloc_registers(lookup.keys.len()),
+        probe_keys: program.alloc_registers(lookup.keys.len()),
+        probe_rowid: program.alloc_register(),
+        waiting_pass: program.alloc_register(),
+        waiting_next: program.allocate_label(),
+    })
+}
+
+/// Build the hash table the first time the loop is reached, then look up
+/// the current values from the earlier loops. `previous_cursor` reads the
+/// previous loop's table, whose rowid a waiting lookup keeps.
+fn start_hir_hash_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirHashLoop<'_>,
+    previous_cursor: CursorID,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    if left_join.is_some() {
+        return Err(LimboError::InternalError(
+            "HIR hash lookup cannot NULL-extend an outer join".into(),
+        ));
+    }
+    let keys = &prepared.lookup.keys;
+    let affinities = keys
+        .iter()
+        .map(|key| key.affinity.aff_mask())
+        .collect::<String>();
+    let key_count = std::num::NonZeroUsize::new(keys.len())
+        .ok_or_else(|| LimboError::InternalError("HIR hash lookup has no keys".into()))?;
+    let column_count = prepared.source.columns.len().max(1);
+
+    let built = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: built,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: prepared.build_cursor,
+        root_page: prepared.table.root_page,
+        db: prepared.database,
+    });
+    program.bind_source(
+        prepared.source.id,
+        SourceBinding::BTree {
+            scan_cursor: prepared.build_cursor,
+            table_cursor: None,
+        },
+    );
+    program.emit_insn(Insn::Null {
+        dest: prepared.payload,
+        dest_end: (column_count > 1).then_some(prepared.payload + column_count - 1),
+    });
+    let build_loop = program.allocate_label();
+    let build_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: prepared.build_cursor,
+        pc_if_empty: build_end,
+    });
+    program.preassign_label_to_next_insn(build_loop);
+    for (position, key) in keys.iter().enumerate() {
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef {
+                source: prepared.source.id,
+                column: key.column,
+            }),
+            prepared.build_keys + position,
+        )?;
+    }
+    program.emit_insn(Insn::Affinity {
+        start_reg: prepared.build_keys,
+        count: key_count,
+        affinities: affinities.clone(),
+    });
+    for column in &prepared.columns {
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef {
+                source: prepared.source.id,
+                column: *column,
+            }),
+            prepared.payload + column,
+        )?;
+    }
+    program.emit_insn(Insn::HashBuild {
+        data: Box::new(crate::vdbe::insn::HashBuildData {
+            cursor_id: prepared.build_cursor,
+            key_start_reg: prepared.build_keys,
+            num_keys: keys.len(),
+            hash_table_id: prepared.hash_table,
+            mem_budget: crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+            collations: keys
+                .iter()
+                .map(|key| key.collation.unwrap_or(CollationSeq::Binary))
+                .collect(),
+            payload_start_reg: Some(prepared.payload),
+            num_payload: column_count,
+            track_matched: false,
+        }),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: prepared.build_cursor,
+        pc_if_next: build_loop,
+        fullscan: true,
+    });
+    program.preassign_label_to_next_insn(build_end);
+    program.emit_insn(Insn::HashBuildFinalize {
+        hash_table_id: prepared.hash_table,
+    });
+    program.preassign_label_to_next_insn(built);
+    program.bind_source(
+        prepared.source.id,
+        SourceBinding::Registers {
+            start: prepared.payload,
+            rowid: Some(prepared.rowid),
+        },
+    );
+
+    for (position, key) in keys.iter().enumerate() {
+        super::expr::translate_expr(
+            program,
+            document,
+            &key.value,
+            prepared.probe_keys + position,
+        )?;
+    }
+    program.emit_insn(Insn::Affinity {
+        start_reg: prepared.probe_keys,
+        count: key_count,
+        affinities,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: previous_cursor,
+        dest: prepared.probe_rowid,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: prepared.waiting_pass,
+    });
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    program.emit_insn(Insn::HashProbe {
+        hash_table_id: to_u32(prepared.hash_table),
+        key_start_reg: to_u32(prepared.probe_keys),
+        num_keys: to_u32(keys.len()),
+        dest_reg: to_u32(prepared.rowid),
+        target_pc: exhausted,
+        payload_dest_reg: Some(to_u32(prepared.payload)),
+        num_payload: to_u32(column_count),
+        probe_rowid_reg: Some(to_u32(prepared.probe_rowid)),
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    Ok(HirBtreeLoop {
+        cursor: None,
+        loop_start,
+        next,
+        exhausted,
+        advance: HirLoopAdvance::Hash {
+            hash_table: prepared.hash_table,
+            rowid: prepared.rowid,
+            payload: prepared.payload,
+            columns: column_count,
+            waiting_pass: prepared.waiting_pass,
+            waiting_next: prepared.waiting_next,
+        },
+        left_join,
+    })
+}
+
+/// After the loop before a hash lookup ends, run the lookups that waited for
+/// rows the hash table moved to disk, one disk partition at a time. Each
+/// goes back to its row of the previous loop by rowid and joins the shared
+/// loop body at the lookup's first match. Nothing runs when the hash table
+/// stayed in memory.
+fn emit_hir_hash_waiting_lookups(
+    program: &mut ProgramBuilder,
+    prepared: &PreparedHirHashLoop<'_>,
+    hash_loop: &HirBtreeLoop,
+    previous_cursor: CursorID,
+) {
+    let hash_table = to_u32(prepared.hash_table);
+    let column_count = prepared.source.columns.len().max(1);
+    let done = program.allocate_label();
+    let partition = program.allocate_label();
+    let next_lookup = program.allocate_label();
+    let partition_done = program.allocate_label();
+    let finished = program.allocate_label();
+    program.emit_insn(Insn::HashGraceInit {
+        hash_table_id: hash_table,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: prepared.waiting_pass,
+    });
+    program.preassign_label_to_next_insn(partition);
+    program.emit_insn(Insn::HashGraceLoadPartition {
+        hash_table_id: hash_table,
+        target_pc: finished,
+    });
+    program.preassign_label_to_next_insn(next_lookup);
+    program.emit_insn(Insn::HashGraceNextProbe {
+        hash_table_id: hash_table,
+        key_start_reg: to_u32(prepared.probe_keys),
+        num_keys: to_u32(prepared.lookup.keys.len()),
+        probe_rowid_dest: to_u32(prepared.probe_rowid),
+        target_pc: partition_done,
+    });
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: previous_cursor,
+        src_reg: prepared.probe_rowid,
+        target_pc: next_lookup,
+    });
+    program.emit_insn(Insn::HashProbe {
+        hash_table_id: hash_table,
+        key_start_reg: to_u32(prepared.probe_keys),
+        num_keys: to_u32(prepared.lookup.keys.len()),
+        dest_reg: to_u32(prepared.rowid),
+        target_pc: next_lookup,
+        payload_dest_reg: Some(to_u32(prepared.payload)),
+        num_payload: to_u32(column_count),
+        probe_rowid_reg: None,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: hash_loop.loop_start,
+    });
+    program.preassign_label_to_next_insn(prepared.waiting_next);
+    program.emit_insn(Insn::HashNext {
+        hash_table_id: prepared.hash_table,
+        dest_reg: prepared.rowid,
+        target_pc: next_lookup,
+        payload_dest_reg: Some(prepared.payload),
+        num_payload: column_count,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: hash_loop.loop_start,
+    });
+    program.preassign_label_to_next_insn(partition_done);
+    program.emit_insn(Insn::HashGraceAdvancePartition {
+        hash_table_id: hash_table,
+        target_pc: finished,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: partition,
+    });
+    program.preassign_label_to_next_insn(finished);
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: prepared.waiting_pass,
+    });
+    program.preassign_label_to_next_insn(done);
 }
 
 fn prepare_hir_recursive_input_loop<'a>(
@@ -5864,6 +6282,9 @@ fn start_hir_loop(
                 left_join,
             })
         }
+        PreparedHirLoop::Hash(_) => Err(LimboError::InternalError(
+            "HIR hash lookup starts only inside its block's loops".into(),
+        )),
         PreparedHirLoop::Virtual(prepared) => {
             start_hir_virtual_loop(program, document, prepared, left_join)
         }
@@ -6231,6 +6652,32 @@ pub(super) fn close_hir_btree_loop(
                 .expect("virtual advance has a physical cursor"),
             pc_if_next: hir_loop.loop_start,
         }),
+        HirLoopAdvance::Hash {
+            hash_table,
+            rowid,
+            payload,
+            columns,
+            waiting_pass,
+            waiting_next,
+        } => {
+            // The waiting pass shares this body but finds its next match
+            // and its next waiting lookup on its own.
+            program.emit_insn(Insn::IfPos {
+                reg: *waiting_pass,
+                target_pc: *waiting_next,
+                decrement_by: 0,
+            });
+            program.emit_insn(Insn::HashNext {
+                hash_table_id: *hash_table,
+                dest_reg: *rowid,
+                target_pc: hir_loop.exhausted,
+                payload_dest_reg: Some(*payload),
+                num_payload: *columns,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: hir_loop.loop_start,
+            });
+        }
     }
     program.preassign_label_to_next_insn(hir_loop.exhausted);
     if let Some(left_join) = hir_loop.left_join.map(|index| &left_joins[index]) {
@@ -10411,13 +10858,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn planned_inner_join_builds_and_probes_automatic_index() {
+    fn planned_left_join_builds_and_probes_automatic_index() {
+        // An outer join keeps the automatic index; an inner join would look
+        // its rows up in a hash table instead.
         let plan = analyze_plan(
             automatic_join_schema(),
             "SELECT l.value, r.extra \
              FROM left_items AS l NOT INDEXED \
-             CROSS JOIN right_items AS r \
-             WHERE r.value = l.value",
+             LEFT JOIN right_items AS r ON r.value = l.value",
         );
         let query = root_query(&plan.document);
         let block_plan = &plan
@@ -10488,6 +10936,52 @@ pub(super) mod tests {
             table_cursor.is_none(),
             "payload makes the automatic index covering"
         );
+    }
+
+    #[test]
+    fn planned_inner_join_looks_rows_up_in_a_hash_table() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             CROSS JOIN right_items AS r \
+             WHERE r.value = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let HirSourceAccess::Hash(lookup) = &block_plan.loops[1].access else {
+            panic!("the inner join's second table uses a hash lookup");
+        };
+        assert_eq!(lookup.keys.len(), 1);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("hash join emits");
+
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let build = position(&|insn| matches!(insn, Insn::HashBuild { .. }));
+        let probe = position(&|insn| matches!(insn, Insn::HashProbe { .. }));
+        let waiting = position(&|insn| matches!(insn, Insn::HashGraceInit { .. }));
+        assert!(build < probe && probe < waiting);
+        // The block may run again with the table built once, so it is not
+        // closed.
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::HashClose { .. })));
+        assert!(matches!(
+            program.source_binding(block_plan.loops[1].source),
+            Some(SourceBinding::Registers { rowid: Some(_), .. })
+        ));
     }
 
     #[test]

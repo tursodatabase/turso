@@ -1032,3 +1032,63 @@ fn hir_correlated_in_probe_and_cached_aggregates_match_sqlite() {
         );
     }
 }
+
+/// An equality join on columns no index covers looks rows up in a hash table
+/// instead of an automatic index, as legacy's hash join does. The tables are
+/// large enough that a debug build's hash table spills to disk, so the
+/// lookups that wait for spilled rows run too, and every row still matches
+/// SQLite.
+#[test]
+fn hir_equality_joins_without_an_index_use_a_hash_table() {
+    const SCHEMA: &str = "
+        CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT, v INT);
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1500)
+            INSERT INTO a SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 40 END,
+                substr('pppppppppppppppppppppppppppppppppppppppp', 1, i % 40) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1200)
+            INSERT INTO b SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 50 END,
+                substr('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq', 1, i % 50), i % 17 FROM s;
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
+        "SELECT a.k, count(*), sum(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.k ORDER BY a.k",
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
+    ] {
+        let opcodes = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for opcode in ["HashBuild", "HashProbe", "HashGraceInit"] {
+            assert!(
+                opcodes.iter().any(|candidate| candidate == opcode),
+                "expected {opcode} for {sql}: {opcodes:?}"
+            );
+        }
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+}

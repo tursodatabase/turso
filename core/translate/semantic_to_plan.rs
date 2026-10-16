@@ -69,6 +69,17 @@ fn query_ignores_row_order(query: &hir::Query) -> bool {
     ignores_order
 }
 
+/// Whether an expression reads a column or rowid of some table. A hash
+/// table only pays off for keys from another table; an index on a constant
+/// key is built and searched once anyway.
+fn reads_a_row(expression: &hir::Expr) -> bool {
+    let mut reads = false;
+    expression.for_each(&mut |expression| {
+        reads |= matches!(expression, hir::Expr::Column(_) | hir::Expr::RowId(_));
+    });
+    reads
+}
+
 /// Whether evaluating `expression` could return an error for some input,
 /// as legacy's `expression_can_fail_on_input` decides. Function calls,
 /// LIKE, RAISE, JSON and array operators, custom types, casts and nested
@@ -430,6 +441,10 @@ pub(crate) enum HirSourceAccess {
     IndexMethod(crate::translate::hir_index_method::HirIndexMethodAccess),
     /// One seek per branch of an OR term, reading each row once.
     OrUnion(crate::translate::optimizer::HirOrUnion),
+    /// Rows found through a hash table built once from the whole table,
+    /// keyed by the columns that equal values from earlier loops. It replaces
+    /// an automatic index, as legacy's hash join does.
+    Hash(HirHashLookup),
     Derived {
         query: QueryId,
     },
@@ -444,6 +459,22 @@ pub(crate) enum HirSourceAccess {
     RecursiveInput {
         cte: hir::CteId,
     },
+}
+
+/// How a hash lookup finds a table's rows. See [HirSourceAccess::Hash].
+pub(crate) struct HirHashLookup {
+    pub(crate) keys: Vec<HirHashKey>,
+    /// Columns of the table the query reads, kept with each row.
+    pub(crate) columns: Vec<usize>,
+}
+
+/// One equality between a column of the hashed table and a value from an
+/// earlier loop.
+pub(crate) struct HirHashKey {
+    pub(crate) column: usize,
+    pub(crate) value: hir::Expr,
+    pub(crate) affinity: crate::vdbe::affinity::Affinity,
+    pub(crate) collation: Option<crate::translate::collate::CollationSeq>,
 }
 
 #[derive(Clone, Copy)]
@@ -1520,7 +1551,7 @@ impl<'a> HirPlanContext<'a> {
                     "query block with FROM produced no B-tree access plan".to_string(),
                 )
             })?;
-        Ok(HirQueryBlockPlan {
+        let mut plan = HirQueryBlockPlan {
             block: block.id,
             groups: access.groups,
             loops: access.loops,
@@ -1534,6 +1565,159 @@ impl<'a> HirPlanContext<'a> {
             inner_joins,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
+        };
+        self.use_hash_lookups(block, &mut plan, schema);
+        Ok(plan)
+    }
+
+    /// Replace automatic indexes with hash tables where that cannot change
+    /// the result, as legacy's hash joins do. A hash table is built faster
+    /// than an index and finds a row without searching a tree.
+    ///
+    /// When a hash table grows past its memory budget, it moves rows to
+    /// disk, and a lookup that needs those rows waits: the loop before it
+    /// records its rowid, and after that loop ends, those rows run again by
+    /// rowid. So:
+    ///
+    /// - the loop before the lookup must read a rowid table directly, so it
+    ///   can go back to a row by its rowid;
+    /// - the plan must not rely on the order the loops return rows in, to
+    ///   skip a sort or to stop at the first MIN or MAX value; and
+    /// - neither table may be in an outer join, whose NULL row would come
+    ///   out before the waiting rows are tried.
+    ///
+    /// Only a SELECT statement uses them, since the table is read once and a
+    /// statement that writes could change it.
+    fn use_hash_lookups(
+        &self,
+        block: &hir::QueryBlock,
+        plan: &mut HirQueryBlockPlan,
+        schema: &Schema,
+    ) {
+        let Some(from) = &block.from else {
+            return;
+        };
+        if !matches!(self.document.root, hir::HirRoot::Query(_))
+            || plan.order_sort_elided
+            || plan.group_sort_elided
+            || plan.min_max_first_value
+            || plan.simple_count
+            || plan.limit_applied
+            || !plan.groups.is_empty()
+            || plan
+                .predicates
+                .iter()
+                .any(|predicate| predicate.from_outer_join.is_some())
+            || from.joins.iter().any(|join| match join.kind {
+                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
+                hir::JoinKind::Left => !plan.inner_joins.contains(&join.right),
+                hir::JoinKind::Right | hir::JoinKind::Full => true,
+            })
+        {
+            return;
+        }
+        for position in 1..plan.loops.len() {
+            if !self.reads_rowid_table_directly(&plan.loops[position - 1], schema) {
+                continue;
+            }
+            if let Some(lookup) = self.hash_lookup(&plan.loops[position], schema) {
+                plan.loops[position].access = HirSourceAccess::Hash(lookup);
+            }
+        }
+    }
+
+    /// Whether a loop reads a rowid B-tree table through its own cursor, so
+    /// a rowid puts it back on a row.
+    fn reads_rowid_table_directly(&self, planned_loop: &HirPlannedLoop, schema: &Schema) -> bool {
+        let HirSourceAccess::BTree {
+            operation,
+            table_lookup: BtreeTableLookup::ScanOnly,
+        } = &planned_loop.access
+        else {
+            return false;
+        };
+        matches!(
+            operation,
+            HirBtreeOperation::Scan { index: None, .. }
+                | HirBtreeOperation::Seek { index: None, .. }
+                | HirBtreeOperation::RowidEq { .. }
+        ) && self.plain_rowid_table(planned_loop.source, schema)
+    }
+
+    /// A rowid B-tree table without custom types that is not a materialized
+    /// view, whose cursor also reads the transaction's changes.
+    fn plain_rowid_table(&self, source: SourceId, schema: &Schema) -> bool {
+        let definition = self.definition(source);
+        let hir::SourceKind::Table(table) = &definition.kind else {
+            return false;
+        };
+        table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_rowid && !schema.is_materialized_view(&table.name))
+            && definition.column_type_programs.iter().all(Option::is_none)
+            && definition
+                .columns
+                .iter()
+                .all(|column| !column.type_fact.is_array())
+    }
+
+    /// The hash lookup that can replace a loop's automatic index: every key
+    /// of its seek is an `=` with a collation the hash table supports.
+    fn hash_lookup(&self, planned_loop: &HirPlannedLoop, schema: &Schema) -> Option<HirHashLookup> {
+        use crate::translate::collate::CollationSeq;
+        use crate::translate::plan::SeekKeyComponent;
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index),
+                    seek_def,
+                },
+            table_lookup: BtreeTableLookup::ScanOnly,
+        } = &planned_loop.access
+        else {
+            return None;
+        };
+        if !index.ephemeral
+            || !self.plain_rowid_table(planned_loop.source, schema)
+            || seek_def.prefix.is_empty()
+            || !matches!(seek_def.start.last_component, SeekKeyComponent::None)
+            || !matches!(seek_def.end.last_component, SeekKeyComponent::None)
+        {
+            return None;
+        }
+        let keys = seek_def
+            .prefix
+            .iter()
+            .zip(&index.columns)
+            .map(|(component, column)| {
+                let (turso_parser::ast::Operator::Equals, value, affinity) =
+                    component.eq.as_ref()?
+                else {
+                    return None;
+                };
+                if component.lower_bound.is_some()
+                    || component.upper_bound.is_some()
+                    || matches!(column.collation, Some(CollationSeq::Custom(_)))
+                    || !reads_a_row(value)
+                {
+                    return None;
+                }
+                Some(HirHashKey {
+                    column: column.pos_in_table,
+                    value: value.clone(),
+                    affinity: *affinity,
+                    collation: column.collation,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(HirHashLookup {
+            keys,
+            columns: index
+                .columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .collect(),
         })
     }
 
