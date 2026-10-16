@@ -1255,6 +1255,47 @@ expect {
     4|3|6|9|5|3
 }
 
+test json_error_position_missing_value_before_punctuation {
+    SELECT json_error_position('{"a": }'),
+           json_error_position('[1, ,2]'),
+           json_error_position('[ \}'),
+           json_error_position('{"a": ,"b":1}'),
+           json_error_position('[ /* c */ ,'),
+           json_error_position('[[ ,]]'),
+           json_error_position('{"a": ]}'),
+           json_error_position('{"a": :}'),
+           json_error_position('[1, \}'),
+           json_error_position(' ]');
+}
+expect {
+    6|4|2|6|2|3|6|6|4|2
+}
+
+test json_error_position_missing_or_non_string_object_key {
+    SELECT json_error_position('\{ :'),
+           json_error_position('\{ ,'),
+           json_error_position('{"a":1, :}'),
+           json_error_position('\{"a":1, :'),
+           json_error_position(char(123, 123)),
+           json_error_position('\{['),
+           json_error_position('\{ \{'),
+           json_error_position('\{"a":1, ['),
+           json_error_position('\{"a":1, \{'),
+           json_error_position('{ 1}'),
+           json_error_position('{ [1]:2}'),
+           json_error_position('{"a":1, 1}');
+}
+expect {
+    3|3|9|9|3|3|4|10|10|2|2|8
+}
+
+test json_array_elements_need_a_comma {
+    SELECT json_valid('[1 2]'), json_error_position('[1 2]');
+}
+expect {
+    0|4
+}
+
 test json_object_simple {
     SELECT json_object('key', 'value');
 }
