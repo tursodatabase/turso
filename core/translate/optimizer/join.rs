@@ -1441,60 +1441,20 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
     let (left_join_illegal_map, required_lhs_by_table) = {
-        let ordering_constrained_count = joined_tables
-            .iter()
-            .filter(|t| {
-                t.join_info
-                    .as_ref()
-                    .is_some_and(|j| j.is_ordering_constrained())
-            })
-            .count();
-        let has_full_outer = joined_tables
-            .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
-        if ordering_constrained_count == 0 && !has_full_outer {
+        let required_lhs_by_table = required_lhs_by_table(joined_tables)?;
+        if required_lhs_by_table.iter().all(TableMask::is_empty) {
             (None, None)
         } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
-            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-                    // to appear after the LHS table in the join order.
-                    if joined_table
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|j| j.is_ordering_constrained())
-                    {
-                        required_lhs_by_table[j].set(i)?;
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j)?;
-                        } else {
-                            let mut mask = TableMask::default();
-                            mask.set(j)?;
-                            left_join_illegal_map.insert(i, mask);
-                        }
-                    }
-                }
-            }
-            // A RIGHT or FULL JOIN is a reordering barrier in both directions.
-            // A later table cannot move before its right operand because the
-            // unmatched-right scan runs after the normal loops.
-            for (k, t) in joined_tables.iter().enumerate() {
-                if !t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows) {
-                    continue;
-                }
-                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
-                    required_lhs.set(k)?;
-                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
-                        illegal_lhs.set(j)?;
+            // map from lhs table index to the rhs tables that must come after it
+            let mut left_join_illegal_map: HashMap<usize, TableMask> = HashMap::default();
+            for (rhs, required_lhs) in required_lhs_by_table.iter().enumerate() {
+                for lhs in required_lhs.iter() {
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&lhs) {
+                        illegal_lhs.set(rhs)?;
                     } else {
                         let mut mask = TableMask::default();
-                        mask.set(j)?;
-                        left_join_illegal_map.insert(k, mask);
+                        mask.set(rhs)?;
+                        left_join_illegal_map.insert(lhs, mask);
                     }
                 }
             }
@@ -1792,23 +1752,11 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
+    let left_join_deps: HashMap<usize, TableMask> = required_lhs_by_table(joined_tables)?
+        .into_iter()
         .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_ordering_constrained())
-        })
-        .map(|(j, _)| {
-            let mut required = TableMask::default();
-            for k in 0..j {
-                required.set(k)?;
-            }
-            Ok((j, required))
-        })
-        .collect::<Result<_>>()?;
+        .filter(|(_, required)| !required.is_empty())
+        .collect();
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
@@ -1941,6 +1889,36 @@ fn compute_greedy_join_order<'a>(
         best_plan: current_plan.expect("loop invariant: current_plan always Some"),
         best_ordered_plan: None, // Greedy doesn't track ordered variants
     }))
+}
+
+/// For each table, the tables that must come before it in any join order.
+fn required_lhs_by_table(joined_tables: &[JoinedTable]) -> Result<Vec<TableMask>> {
+    let mut required_lhs_by_table = vec![TableMask::default(); joined_tables.len()];
+    for (j, joined_table) in joined_tables.iter().enumerate() {
+        // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
+        // to appear after the LHS table in the join order.
+        if joined_table
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.is_ordering_constrained())
+        {
+            for i in 0..j {
+                required_lhs_by_table[j].set(i)?;
+            }
+        }
+    }
+    // A RIGHT or FULL JOIN is a reordering barrier in both directions.
+    // A later table cannot move before its right operand because the
+    // unmatched-right scan runs after the normal loops.
+    for (k, t) in joined_tables.iter().enumerate() {
+        if !t.join_info.as_ref().is_some_and(JoinInfo::keeps_right_rows) {
+            continue;
+        }
+        for required_lhs in required_lhs_by_table.iter_mut().skip(k + 1) {
+            required_lhs.set(k)?;
+        }
+    }
+    Ok(required_lhs_by_table)
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
