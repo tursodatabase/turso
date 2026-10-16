@@ -7274,6 +7274,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "strum",
  "tempfile",
+ "tracing",
  "turso_core",
  "turso_ext",
  "turso_parser",
@@ -7315,10 +7316,12 @@ dependencies = [
  "async-trait",
  "futures",
  "pgwire",
+ "tempfile",
  "tokio",
  "tracing",
  "turso_core",
  "turso_pg",
+ "turso_pg_client",
 ]
 
 [[package]]

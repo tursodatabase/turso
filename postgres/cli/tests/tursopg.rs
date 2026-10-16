@@ -1,5 +1,5 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Output, Stdio};
 
 fn run_tursopg(input: &[u8]) -> Output {
@@ -943,47 +943,36 @@ fn copy_from_file_not_found_repl() {
 // Wire protocol: COPY FROM returns "COPY N"
 // ---------------------------------------------------------------------------
 
-/// Start tursopg with --server on a kernel-assigned ephemeral port and wait
-/// for it to be ready. Returns the child and the port it is serving.
+/// Start tursopg with --server on a port that the server's operating system
+/// picks, and return the child and the port it is serving.
 ///
-/// The port must not be derived from a fixed seed: each test runs in its own
-/// process, so two concurrently started tests can compute the same port, and
-/// the loser of the bind race silently connects to the winner's server — and
-/// then fails mid-test when the winner tears it down. Instead, ask the kernel
-/// for a free ephemeral port and verify our own child is the process that
-/// came up on it, retrying with a fresh port if the child dies on bind.
+/// The test cannot pick a free port and pass it to the server: another
+/// process can take the port before the server binds it, and the test then
+/// talks to that process. So the server binds port 0 and the test reads the
+/// address that the server prints once it is listening.
 fn start_tursopg_server() -> (Child, u16) {
-    for _ in 0..10 {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
-            .arg("--server")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursopg server");
+    start_tursopg_server_with_db(":memory:")
+}
 
-        // Wait for the server to be ready by polling TCP connect, bailing out
-        // to a new port if the child exited (lost a bind race).
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        child.kill().ok();
-        child.wait().ok();
-    }
-    panic!("tursopg server did not start");
+fn start_tursopg_server_with_db(db_path: impl AsRef<std::ffi::OsStr>) -> (Child, u16) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(db_path)
+        .arg("--server")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start tursopg server");
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let port = line
+        .strip_prefix("PostgreSQL server listening on 127.0.0.1:")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("tursopg server did not start, printed: {line:?}"));
+    child.stdout = Some(stdout.into_inner());
+    (child, port)
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1586,4 +1575,46 @@ fn schema_sidecar_reattaches_on_reopen() {
         out.contains("persisted"),
         "expected 'persisted' in output, got: {out}"
     );
+}
+
+/// A schema that the server attached at startup and a client dropped has its
+/// file deleted once no client has it attached.
+#[test]
+fn server_deletes_file_of_schema_attached_at_startup_when_a_client_drops_it() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("tursopg_server_drop_schema_{timestamp}"));
+    std::fs::create_dir(&test_dir).unwrap();
+    let db_path = test_dir.join("main.db");
+    let out = run_tursopg_with_db(&db_path, b"CREATE SCHEMA s;\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let schema_files = || -> Vec<String> {
+        std::fs::read_dir(&test_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("turso-postgres-schema-s.db"))
+            .collect()
+    };
+    assert!(!schema_files().is_empty());
+
+    let (mut server, port) = start_tursopg_server_with_db(&db_path);
+    let mut client = PgTestClient::connect(port);
+    client.send_query("DROP SCHEMA s");
+    client.read_until_ready();
+    drop(client);
+
+    let mut remaining = schema_files();
+    for _ in 0..50 {
+        if remaining.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        remaining = schema_files();
+    }
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&test_dir).ok();
+    assert_eq!(remaining, Vec::<String>::new());
 }

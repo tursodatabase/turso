@@ -15,6 +15,10 @@ impl GenericIO {
 }
 
 impl IO for GenericIO {
+    fn uses_host_file_system(&self) -> bool {
+        true
+    }
+
     #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);

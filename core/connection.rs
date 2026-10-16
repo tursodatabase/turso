@@ -386,6 +386,10 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// Called with the name of an attached database when a statement starts
+/// writing to it. See [`Connection::set_attached_write_check`].
+pub type AttachedWriteCheck = dyn Fn(&str) -> Result<()> + Send + Sync;
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -394,6 +398,7 @@ impl Drop for ExplicitCheckpointGuard {
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
+    pub(super) attached_write_check: RwLock<Option<Arc<AttachedWriteCheck>>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -645,6 +650,23 @@ impl Drop for Connection {
 impl Connection {
     pub fn context<C: Any>(&self) -> Option<&C> {
         self.context.as_deref()?.downcast_ref()
+    }
+
+    /// Sets a check that runs when a statement starts writing to an attached
+    /// database, after the statement has taken the write lock of that
+    /// database. If the check returns an error, the statement fails with it.
+    pub fn set_attached_write_check(&self, check: Arc<AttachedWriteCheck>) {
+        *self.attached_write_check.write() = Some(check);
+    }
+
+    pub(crate) fn check_attached_write(&self, database_id: usize) -> Result<()> {
+        let Some(check) = self.attached_write_check.read().clone() else {
+            return Ok(());
+        };
+        let name = self
+            .get_database_name_by_index(database_id)
+            .expect("a database that a statement writes to has a name");
+        check(&name)
     }
 
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {

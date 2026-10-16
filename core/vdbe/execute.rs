@@ -5102,6 +5102,9 @@ pub fn op_transaction_inner(
                         return Err(err);
                     }
                 }
+                if is_secondary_db && *db != crate::TEMP_DB_ID && statement_writes_db {
+                    program.connection.check_attached_write(*db)?;
+                }
 
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
