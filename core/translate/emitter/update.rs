@@ -910,8 +910,12 @@ fn emit_update_column_values<'a>(
                                     && t_ctx
                                         .resolver
                                         .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
+                                        .resolve_type_unchecked(ty)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|resolved| {
+                                            resolved.chain.iter().any(|td| td.encode().is_some())
+                                        })
                             };
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(

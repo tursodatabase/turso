@@ -993,6 +993,105 @@ expect {
     5|10
 }
 
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-expression-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
+    CREATE INDEX i ON t(x + 0);
+    INSERT INTO t VALUES (1, 5);
+    SELECT count(*) FROM t WHERE x + 0 = 5;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-index-lookup {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
+    CREATE INDEX i ON t(x);
+    INSERT INTO t VALUES (1, 5), (2, 6);
+    SELECT id FROM t WHERE x = 5;
+    UPDATE t SET x = 9 WHERE x = 6;
+    SELECT id, x FROM t ORDER BY id;
+}
+expect {
+    1
+    1|5
+    2|9
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-update-many-rows-to-constant {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 6), (3, 7);
+    UPDATE t SET x = 9;
+    SELECT id, x FROM t;
+}
+expect {
+    1|9
+    2|9
+    3|9
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-hash-join {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, x pc) STRICT;
+    CREATE TABLE u(id INTEGER PRIMARY KEY, k INT, y pc) STRICT;
+    INSERT INTO t VALUES (1, 1, 5);
+    INSERT INTO u VALUES (1, 1, 7);
+    SELECT t.x, u.y FROM t JOIN u ON t.k = u.k;
+}
+expect {
+    5|7
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-not-null-checks-decoded-value {
+    CREATE TYPE g BASE integer ENCODE value DECODE nullif(value, 0);
+    CREATE DOMAIN gd AS g;
+    CREATE TABLE t(x gd NOT NULL) STRICT;
+    INSERT INTO t VALUES (0);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-alter-add-column-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
+    INSERT INTO t VALUES (1, 5);
+    ALTER TABLE t ADD COLUMN y pc DEFAULT 7;
+    SELECT id, x, y FROM t;
+}
+expect {
+    1|5|7
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-custom-type-after-trigger-new {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN pc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.x); END;
+    INSERT INTO t VALUES (1, 5);
+    SELECT v FROM log;
+}
+expect {
+    5
+}
+
 
 # ------------------------------------------------------------------------------
 # Adversarial tests: parser / name handling
