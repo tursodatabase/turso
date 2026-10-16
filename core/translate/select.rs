@@ -320,6 +320,7 @@ fn prepare_one_select_plan(
             let preplan_ctes_for_non_from_subqueries = with.is_some()
                 && select_has_non_from_subqueries(
                     &columns,
+                    from.as_ref(),
                     where_clause.as_deref(),
                     group_by.as_ref(),
                     &window_clause,
@@ -1659,8 +1660,24 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
     false
 }
 
+fn from_clause_has_on_subqueries(from: &ast::FromClause) -> bool {
+    let nested_has_on_subqueries = |table: &ast::SelectTable| match table {
+        ast::SelectTable::Sub(inner, _) => from_clause_has_on_subqueries(inner),
+        _ => false,
+    };
+    nested_has_on_subqueries(&from.select)
+        || from.joins.iter().any(|join| {
+            let on_has_subquery = match &join.constraint {
+                Some(ast::JoinConstraint::On(expr)) => expr_contains_subquery(expr),
+                _ => false,
+            };
+            on_has_subquery || nested_has_on_subqueries(&join.table)
+        })
+}
+
 fn select_has_non_from_subqueries(
     columns: &[ResultColumn],
+    from: Option<&ast::FromClause>,
     where_clause: Option<&Expr>,
     group_by: Option<&ast::GroupBy>,
     window_clause: &[ast::WindowDef],
@@ -1675,6 +1692,10 @@ fn select_has_non_from_subqueries(
     }
 
     if where_clause.is_some_and(expr_contains_subquery) {
+        return true;
+    }
+
+    if from.is_some_and(from_clause_has_on_subqueries) {
         return true;
     }
 
