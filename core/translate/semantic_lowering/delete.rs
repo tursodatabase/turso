@@ -48,20 +48,12 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     // RETURNING with a subquery reads a copy of the deleted row. The copy
-    // holds stored values only, so it is not built yet for generated
-    // columns or custom types.
+    // holds stored values, so it is not built yet for custom types.
     if returning_has_subquery(delete) {
         let source = document.source(delete.target).ok_or_else(|| {
             LimboError::InternalError(format!("HIR DELETE target {} is missing", delete.target))
         })?;
-        let generated = match &source.kind {
-            hir::SourceKind::Table(table) => table
-                .value()
-                .btree()
-                .is_some_and(|table| table.columns().iter().any(|column| column.is_generated())),
-            _ => false,
-        };
-        if generated || source.column_type_programs.iter().any(Option::is_some) {
+        if source.column_type_programs.iter().any(Option::is_some) {
             return Ok(true);
         }
     }
@@ -469,9 +461,15 @@ fn emit_delete_row(
                 .any(|output| has_subquery(&output.expr))
         })
         .map(|_| {
+            // A virtual column is not stored; reading it through the copy
+            // computes it from the other columns.
             let start = program.alloc_registers(table.columns().len());
-            for position in 0..table.columns().len() {
-                program.emit_column_or_rowid(table_cursor, position, start + position);
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated() {
+                    program.emit_null(start + position, None);
+                } else {
+                    program.emit_column_or_rowid(table_cursor, position, start + position);
+                }
             }
             start
         });

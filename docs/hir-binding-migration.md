@@ -209,12 +209,12 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| A subquery in RETURNING, on a table with generated columns or custom types | A copy of the deleted row with those columns |
+| A subquery in RETURNING, on a table with custom types | A copy of the deleted row with decoded values |
 | CDC, virtual tables, materialized views on the table, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
-UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`)
-when it changes neither the rowid nor the index its loop reads. The new row
+UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`).
+The new row
 is built in registers, NOT NULL and UNIQUE are checked with the statement's
 or the constraint's conflict mode (ABORT, FAIL, ROLLBACK, IGNORE), and only
 indexes whose key or WHERE term reads a changed column are rewritten: every
@@ -306,7 +306,8 @@ A subquery in RETURNING whose own FROM clause names the target table runs
 again for each row, as in SQLite and legacy, so it sees the rows written so
 far; any other runs once. DELETE then reads RETURNING from a copy of the row
 taken before the row and its index entries are deleted, so the subquery no
-longer sees the row.
+longer sees the row. A virtual column read through that copy is computed
+from the copied columns (legacy returns another column's value there).
 
 Triggers fired by these statements are compiled from HIR too
 (`semantic_lowering/trigger.rs`). Each trigger is analyzed as its own HIR

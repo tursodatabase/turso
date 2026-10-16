@@ -1177,6 +1177,12 @@ fn hir_generated_columns_match_sqlite() {
         "INSERT INTO sg(a, c) VALUES (11, 'q') ON CONFLICT(c) DO UPDATE SET a = excluded.a, c = 12",
         "INSERT INTO sg(a, c) VALUES (13, '12') ON CONFLICT(c) DO UPDATE SET a = 'bad'",
         "SELECT a, typeof(a), b, typeof(b), c, typeof(c), d FROM sg ORDER BY a",
+        // A DELETE whose RETURNING has a subquery reads the virtual columns
+        // of the deleted row. Legacy returns another column's value.
+        "CREATE TABLE dg(a INTEGER PRIMARY KEY, b, c AS (b * 2), d TEXT, e AS (d || c))",
+        "INSERT INTO dg(a, b, d) VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z')",
+        "DELETE FROM dg WHERE a = 2 RETURNING a, c, e, (SELECT count(*) FROM dg), (SELECT max(c) FROM dg)",
+        "DELETE FROM dg WHERE a > 0 RETURNING e, (SELECT group_concat(e) FROM dg)",
     ] {
         assert_matches_sqlite(&db, &conn, &sqlite, sql);
     }
