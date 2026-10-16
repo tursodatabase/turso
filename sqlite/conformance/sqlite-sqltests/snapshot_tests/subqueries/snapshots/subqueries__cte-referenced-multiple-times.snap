@@ -37,7 +37,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1   p2   p3  p4            p5  comment
-   0  Init                0  174    0                 0  Start at 174
+   0  Init                0  175    0                 0  Start at 175
    1  Once               54    0    0                 0  goto 54
    2  BeginSubrtn         3    0    0                 0  r[3]=NULL
    3  Null                0    1    0                 0  r[1]=NULL
@@ -187,29 +187,30 @@ addr  opcode             p1   p2   p3  p4            p5  comment
  147  Integer             0   45    0                 0  r[45]=0
  148  Return             53    0    0                 0
  149  Return             41    0    0                 0
- 150  OpenRead            7    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
- 151  Rewind              7  173    0                 0  Rewind table customers
- 152    Once            160    0    0                 0  goto 160
- 153    OpenAutoindex     8    0    0                 0  cursor=8
- 154    Rewind            4  160    0                 0  Rewind  ephemeral()
- 155      ColumnRange     4    0   59  2              0  r[59..60]=ephemeral().customer_id..total
- 156      RowId           4   61    0                 0  r[61]=ephemeral().rowid
- 157      MakeRecord     59    3   62                 0  r[62]=mkrec(r[59..61]); for ephemeral_subquery_t5
- 158      IdxInsert       8   62   59                 0  key=r[62]
- 159    Next              4  155    0                 0
- 160    RowId             7   63    0                 0  r[63]=customers.rowid
- 161    Copy              1   64    0                 0  r[64]=r[1]
- 162    IsNull           64  172    0                 0  if (r[64]==NULL) goto 172
- 163    SeekGT            8  172   63                 0  key=[63..64]
- 164      IdxGT           8  172   63                 0  key=[63..63]
- 165      DeferredSeek    8    4    0                 0
- 166      ColumnRange     4    0   39  2              0  r[39..40]=ephemeral().customer_id..total
- 167      Column          7    1   56                 0  r[56]=customers.name
- 168      Column          8    1   57                 0  r[57]=ephemeral(ephemeral_subquery_t5).total
- 169      Copy            2   58    0                 0  r[58]=r[2]
- 170      ResultRow      56    3    0                 0  output=r[56..58]
- 171    Next              8  164    0                 0
- 172  Next                7  152    0                 1
- 173  Halt                0    0    0                 0
- 174  Transaction         0    1   11                 0  iDb=0 tx_mode=Read
- 175  Goto                0    1    0                 0
+ 150  Gosub              41  109    0                 0
+ 151  OpenRead            7    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+ 152  Rewind              7  174    0                 0  Rewind table customers
+ 153    Once            161    0    0                 0  goto 161
+ 154    OpenAutoindex     8    0    0                 0  cursor=8
+ 155    Rewind            4  161    0                 0  Rewind  ephemeral()
+ 156      ColumnRange     4    0   59  2              0  r[59..60]=ephemeral().customer_id..total
+ 157      RowId           4   61    0                 0  r[61]=ephemeral().rowid
+ 158      MakeRecord     59    3   62                 0  r[62]=mkrec(r[59..61]); for ephemeral_subquery_t5
+ 159      IdxInsert       8   62   59                 0  key=r[62]
+ 160    Next              4  156    0                 0
+ 161    RowId             7   63    0                 0  r[63]=customers.rowid
+ 162    Copy              1   64    0                 0  r[64]=r[1]
+ 163    IsNull           64  173    0                 0  if (r[64]==NULL) goto 173
+ 164    SeekGT            8  173   63                 0  key=[63..64]
+ 165      IdxGT           8  173   63                 0  key=[63..63]
+ 166      DeferredSeek    8    4    0                 0
+ 167      ColumnRange     4    0   39  2              0  r[39..40]=ephemeral().customer_id..total
+ 168      Column          7    1   56                 0  r[56]=customers.name
+ 169      Column          8    1   57                 0  r[57]=ephemeral(ephemeral_subquery_t5).total
+ 170      Copy            2   58    0                 0  r[58]=r[2]
+ 171      ResultRow      56    3    0                 0  output=r[56..58]
+ 172    Next              8  165    0                 0
+ 173  Next                7  153    0                 1
+ 174  Halt                0    0    0                 0
+ 175  Transaction         0    1   11                 0  iDb=0 tx_mode=Read
+ 176  Goto                0    1    0                 0

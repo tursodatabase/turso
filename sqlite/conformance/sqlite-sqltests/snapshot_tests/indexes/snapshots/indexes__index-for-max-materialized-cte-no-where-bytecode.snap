@@ -20,7 +20,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4           p5  comment
-   0  Init             0  25   0                0  Start at 25
+   0  Init             0  26   0                0  Start at 26
    1  Gosub            2   3   0                0
    2  Goto             0  14   0                0
    3  Once            13   0   0                0  goto 13
@@ -34,16 +34,17 @@ addr  opcode          p1  p2  p3  p4           p5  comment
   11    Insert         0   4   5                4  intkey=r[5] data=r[4]
   12  Next             1   7   0                1
   13  Return           2   0   0                0
-  14  Null             0   7   0                0  r[7]=NULL
-  15  Last             0  21   0                0
-  16    Column         0   0   1                0  r[1]=ephemeral().price
-  17    Copy           1   8   0                0  r[8]=r[1]
-  18    AggStep        0   8   7  max(Binary)   0  accum=r[7] step(r[8])
-  19    Goto           0  21   0                0
-  20  Prev             0  16   0                0
-  21  AggFinal         0   7   0  max           0  accum=r[7]
-  22  Copy             7   6   0                0  r[6]=r[7]
-  23  ResultRow        6   1   0                0  output=r[6]
-  24  Halt             0   0   0                0
-  25  Transaction      0   1  14                0  iDb=0 tx_mode=Read
-  26  Goto             0   1   0                0
+  14  Gosub            2   3   0                0
+  15  Null             0   7   0                0  r[7]=NULL
+  16  Last             0  22   0                0
+  17    Column         0   0   1                0  r[1]=ephemeral().price
+  18    Copy           1   8   0                0  r[8]=r[1]
+  19    AggStep        0   8   7  max(Binary)   0  accum=r[7] step(r[8])
+  20    Goto           0  22   0                0
+  21  Prev             0  17   0                0
+  22  AggFinal         0   7   0  max           0  accum=r[7]
+  23  Copy             7   6   0                0  r[6]=r[7]
+  24  ResultRow        6   1   0                0  output=r[6]
+  25  Halt             0   0   0                0
+  26  Transaction      0   1  14                0  iDb=0 tx_mode=Read
+  27  Goto             0   1   0                0

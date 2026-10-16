@@ -1572,6 +1572,10 @@ pub fn emit_from_clause_subqueries(
             // Check if this is a CTE that's already materialized
             if let Some(cte_id) = from_clause_subquery.cte_id() {
                 if let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() {
+                    program.emit_insn(Insn::Gosub {
+                        target_pc: cte_info.fill_subroutine.label,
+                        return_reg: cte_info.fill_subroutine.return_reg,
+                    });
                     if from_clause_subquery.materialized_cursor_id.is_some() {
                         tracing::trace!(
                             cte_id,
@@ -1581,10 +1585,6 @@ pub fn emit_from_clause_subqueries(
                         program.pop_current_parent_explain();
                         continue;
                     }
-                    program.emit_insn(Insn::Gosub {
-                        target_pc: cte_info.fill_subroutine.label,
-                        return_reg: cte_info.fill_subroutine.return_reg,
-                    });
                     // === SUBSEQUENT CTE REFERENCE: Use OpenDup ===
                     // Create a dup cursor pointing to the same ephemeral table
                     let dup_cursor_id =

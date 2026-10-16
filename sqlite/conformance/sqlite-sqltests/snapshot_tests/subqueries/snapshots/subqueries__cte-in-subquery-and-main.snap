@@ -32,7 +32,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1   p2   p3  p4              p5  comment
-   0  Init                0  129    0                   0  Start at 129
+   0  Init                0  130    0                   0  Start at 130
    1  Once               54    0    0                   0  goto 54
    2  BeginSubrtn         2    0    0                   0  r[2]=NULL
    3  Null                0    1    0                   0  r[1]=NULL
@@ -129,38 +129,39 @@ addr  opcode             p1   p2   p3  p4              p5  comment
   94  Integer             0   26    0                   0  r[26]=0
   95  Return             34    0    0                   0
   96  Return             22    0    0                   0
-  97  OpenRead            5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  98  Rewind              5  128    0                   0  Rewind table products
-  99    Column            5    3   41                   0  r[41]=products.price
- 100    RealAffinity     41    0    0                   0
- 101    Copy              1   43    0                   0  r[43]=r[1]
- 102    Multiply         43   44   42                   0  r[42]=r[43]*r[44]
- 103    Le               41   42  127  Binary           0  if r[41]<=r[42] goto 127
- 104    Once            113    0    0                   0  goto 113
- 105    OpenAutoindex     6    0    0                   0  cursor=6
- 106    Rewind            2  113    0                   0  Rewind  ephemeral()
- 107      ColumnRange     2    0   45  2                0  r[45..46]=ephemeral().category_id..avg_price
- 108      RowId           2   47    0                   0  r[47]=ephemeral().rowid
- 109      MakeRecord     45    3   48                   0  r[48]=mkrec(r[45..47]); for ephemeral_subquery_t5
- 110      FilterAdd       6   45    1                   0  bloom_filter_add(r[45..46])
- 111      IdxInsert       6   48   45                   0  key=r[48]
- 112    Next              2  107    0                   0
- 113    Column            5    2   49                   0  r[49]=products.category_id
- 114    IsNull           49  127    0                   0  if (r[49]==NULL) goto 127
- 115    Affinity         49    1    0                   0  r[49..50] = C
- 116    Filter            6  127   49                   1  if !bloom_filter(r[49..50]) goto 127
- 117    SeekGE            6  127   49                   0  key=[49..49]
- 118      IdxGT           6  127   49                   0  key=[49..49]
- 119      DeferredSeek    6    2    0                   0
- 120      ColumnRange     2    0   20  2                0  r[20..21]=ephemeral().category_id..avg_price
- 121      Column          5    1   37                   0  r[37]=products.name
- 122      Column          5    3   38                   0  r[38]=products.price
- 123      RealAffinity   38    0    0                   0
- 124      Column          6    1   39                   0  r[39]=ephemeral(ephemeral_subquery_t5).avg_price
- 125      ResultRow      37    3    0                   0  output=r[37..39]
- 126    Next              6  118    0                   0
- 127  Next                5   99    0                   1
- 128  Halt                0    0    0                   0
- 129  Transaction         0    1   11                   0  iDb=0 tx_mode=Read
- 130  Real                0   44    0  0.8              0  r[44]=0.8
- 131  Goto                0    1    0                   0
+  97  Gosub              22   56    0                   0
+  98  OpenRead            5    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  99  Rewind              5  129    0                   0  Rewind table products
+ 100    Column            5    3   41                   0  r[41]=products.price
+ 101    RealAffinity     41    0    0                   0
+ 102    Copy              1   43    0                   0  r[43]=r[1]
+ 103    Multiply         43   44   42                   0  r[42]=r[43]*r[44]
+ 104    Le               41   42  128  Binary           0  if r[41]<=r[42] goto 128
+ 105    Once            114    0    0                   0  goto 114
+ 106    OpenAutoindex     6    0    0                   0  cursor=6
+ 107    Rewind            2  114    0                   0  Rewind  ephemeral()
+ 108      ColumnRange     2    0   45  2                0  r[45..46]=ephemeral().category_id..avg_price
+ 109      RowId           2   47    0                   0  r[47]=ephemeral().rowid
+ 110      MakeRecord     45    3   48                   0  r[48]=mkrec(r[45..47]); for ephemeral_subquery_t5
+ 111      FilterAdd       6   45    1                   0  bloom_filter_add(r[45..46])
+ 112      IdxInsert       6   48   45                   0  key=r[48]
+ 113    Next              2  108    0                   0
+ 114    Column            5    2   49                   0  r[49]=products.category_id
+ 115    IsNull           49  128    0                   0  if (r[49]==NULL) goto 128
+ 116    Affinity         49    1    0                   0  r[49..50] = C
+ 117    Filter            6  128   49                   1  if !bloom_filter(r[49..50]) goto 128
+ 118    SeekGE            6  128   49                   0  key=[49..49]
+ 119      IdxGT           6  128   49                   0  key=[49..49]
+ 120      DeferredSeek    6    2    0                   0
+ 121      ColumnRange     2    0   20  2                0  r[20..21]=ephemeral().category_id..avg_price
+ 122      Column          5    1   37                   0  r[37]=products.name
+ 123      Column          5    3   38                   0  r[38]=products.price
+ 124      RealAffinity   38    0    0                   0
+ 125      Column          6    1   39                   0  r[39]=ephemeral(ephemeral_subquery_t5).avg_price
+ 126      ResultRow      37    3    0                   0  output=r[37..39]
+ 127    Next              6  119    0                   0
+ 128  Next                5  100    0                   1
+ 129  Halt                0    0    0                   0
+ 130  Transaction         0    1   11                   0  iDb=0 tx_mode=Read
+ 131  Real                0   44    0  0.8              0  r[44]=0.8
+ 132  Goto                0    1    0                   0

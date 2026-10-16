@@ -28,7 +28,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4           p5  comment
-   0  Init              0  42   0                0  Start at 42
+   0  Init              0  43   0                0  Start at 43
    1  Gosub             3   3   0                0
    2  Goto              0  14   0                0
    3  Once             13   0   0                0  goto 13
@@ -42,34 +42,35 @@ addr  opcode           p1  p2  p3  p4           p5  comment
   11    Insert          0   5   6                4  intkey=r[6] data=r[5]
   12  Next              1   7   0                1
   13  Return            3   0   0                0
-  14  Rewind            0  41   0                0  Rewind  ephemeral()
-  15    Column          0   0   2                0  r[2]=ephemeral().price
-  16    Copy            2   9   0                0  r[9]=r[2]
-  17    Ge              9  10  40  Binary        0  if r[9]>=r[10] goto 40
-  18    BeginSubrtn    11   0   0                0  r[11]=NULL
-  19    Null            0   1   0                0  r[1]=NULL
-  20    Gosub           3   3   0                0
-  21    OpenDup         2   0   0                0  new_cursor=2, original_cursor=0
-  22    Null            0  14   0                0  r[14]=NULL
-  23    Integer         1  15   0                0  r[15]=1; LIMIT counter
-  24    IfNot          15  34   0                0  if !r[15] goto 34
-  25    Last            2  34   0                0
-  26      Column        2   0  12                0  r[12]=ephemeral().price
-  27      Copy         12  17   0                0  r[17]=r[12]
-  28      Copy          2  18   0                0  r[18]=r[2]
-  29      Ge           17  18  33  Binary        0  if r[17]>=r[18] goto 33
-  30      Copy         12  19   0                0  r[19]=r[12]
-  31      AggStep       0  19  14  max(Binary)   0  accum=r[14] step(r[19])
-  32      Goto          0  34   0                0
-  33    Prev            2  26   0                0
-  34    AggFinal        0  14   0  max           0  accum=r[14]
-  35    Copy           14  13   0                0  r[13]=r[14]
-  36    Copy           13   1   0                0  r[1]=r[13]
-  37    Return         11   0   1                0
-  38    Copy            1   7   0                0  r[7]=r[1]
-  39    ResultRow       7   1   0                0  output=r[7]
-  40  Next              0  15   0                0
-  41  Halt              0   0   0                0
-  42  Transaction       0   1  14                0  iDb=0 tx_mode=Read
-  43  Integer         100  10   0                0  r[10]=100
-  44  Goto              0   1   0                0
+  14  Gosub             3   3   0                0
+  15  Rewind            0  42   0                0  Rewind  ephemeral()
+  16    Column          0   0   2                0  r[2]=ephemeral().price
+  17    Copy            2   9   0                0  r[9]=r[2]
+  18    Ge              9  10  41  Binary        0  if r[9]>=r[10] goto 41
+  19    BeginSubrtn    11   0   0                0  r[11]=NULL
+  20    Null            0   1   0                0  r[1]=NULL
+  21    Gosub           3   3   0                0
+  22    OpenDup         2   0   0                0  new_cursor=2, original_cursor=0
+  23    Null            0  14   0                0  r[14]=NULL
+  24    Integer         1  15   0                0  r[15]=1; LIMIT counter
+  25    IfNot          15  35   0                0  if !r[15] goto 35
+  26    Last            2  35   0                0
+  27      Column        2   0  12                0  r[12]=ephemeral().price
+  28      Copy         12  17   0                0  r[17]=r[12]
+  29      Copy          2  18   0                0  r[18]=r[2]
+  30      Ge           17  18  34  Binary        0  if r[17]>=r[18] goto 34
+  31      Copy         12  19   0                0  r[19]=r[12]
+  32      AggStep       0  19  14  max(Binary)   0  accum=r[14] step(r[19])
+  33      Goto          0  35   0                0
+  34    Prev            2  27   0                0
+  35    AggFinal        0  14   0  max           0  accum=r[14]
+  36    Copy           14  13   0                0  r[13]=r[14]
+  37    Copy           13   1   0                0  r[1]=r[13]
+  38    Return         11   0   1                0
+  39    Copy            1   7   0                0  r[7]=r[1]
+  40    ResultRow       7   1   0                0  output=r[7]
+  41  Next              0  16   0                0
+  42  Halt              0   0   0                0
+  43  Transaction       0   1  14                0  iDb=0 tx_mode=Read
+  44  Integer         100  10   0                0  r[10]=100
+  45  Goto              0   1   0                0

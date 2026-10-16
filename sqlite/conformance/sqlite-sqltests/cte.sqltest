@@ -1607,6 +1607,15 @@ expect {
     1|0
 }
 
+test materialized-cte-read-by-another-materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a), y AS MATERIALIZED (SELECT a FROM x)
+    SELECT a, (SELECT (SELECT a FROM y WHERE a = t0.c0) FROM t0) IS NULL FROM y;
+}
+expect {
+    0|1
+}
+
 test correlated-materialized-cte-first-read-in-a-loop-that-does-not-run {
     CREATE TABLE t0(c0);
     CREATE TABLE t1(c);
