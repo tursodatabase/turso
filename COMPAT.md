@@ -98,6 +98,15 @@ an existing database that already contains invalid UTF-8 in a text column is
 affected the same way. Storing and reading blobs is not affected; bytes only
 change when they are converted to text.
 
+`char()` has the same limitation. SQLite encodes a surrogate codepoint
+(U+D800 to U+DFFF) as bytes that are not valid UTF-8; Turso returns U+FFFD:
+
+```sql
+SELECT HEX(CHAR(56938));
+-- SQLite: EDB9AA
+-- Turso:  EFBFBD
+```
+
 ## SQLite query language
 
 ### Statements
