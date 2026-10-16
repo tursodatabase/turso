@@ -1844,7 +1844,19 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                let parses_without_parentheses = match expr.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) => true,
+                    Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, operand) => {
+                        matches!(operand.as_ref(), Expr::Literal(_))
+                    }
+                    _ => false,
+                };
+                if parses_without_parentheses {
+                    return expr.to_tokens(s, context);
+                }
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;
