@@ -3426,6 +3426,10 @@ fn emit_hir_aggregate_capture(
     first_row: usize,
     captures: &[HirAggregateCapture],
 ) -> Result<()> {
+    // With no bare column to keep, there is nothing to capture per row.
+    if captures.is_empty() {
+        return Ok(());
+    }
     let captured = program.allocate_label();
     program.emit_insn(Insn::If {
         reg: first_row,
@@ -10475,7 +10479,18 @@ pub(super) mod tests {
             .iter()
             .enumerate()
             .filter_map(|(position, (insn, _))| {
-                matches!(insn, Insn::IfNot { .. }).then_some(position)
+                matches!(
+                    insn,
+                    Insn::IfNot { .. }
+                        | Insn::Ne { .. }
+                        | Insn::NotNull { .. }
+                        | Insn::Eq { .. }
+                        | Insn::Lt { .. }
+                        | Insn::Le { .. }
+                        | Insn::Gt { .. }
+                        | Insn::Ge { .. }
+                )
+                .then_some(position)
             })
             .collect::<Vec<_>>();
         assert_eq!(failures.len(), 2);
@@ -10764,7 +10779,18 @@ pub(super) mod tests {
             .iter()
             .enumerate()
             .filter_map(|(position, (insn, _))| {
-                matches!(insn, Insn::IfNot { .. }).then_some(position)
+                matches!(
+                    insn,
+                    Insn::IfNot { .. }
+                        | Insn::Ne { .. }
+                        | Insn::NotNull { .. }
+                        | Insn::Eq { .. }
+                        | Insn::Lt { .. }
+                        | Insn::Le { .. }
+                        | Insn::Gt { .. }
+                        | Insn::Ge { .. }
+                )
+                .then_some(position)
             })
             .collect::<Vec<_>>();
         assert_eq!(failures.len(), 3);

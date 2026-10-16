@@ -830,3 +830,56 @@ fn hir_between_on_a_column_seeks_an_index_range() {
         );
     }
 }
+
+#[test]
+fn hir_conditions_jump_on_comparisons_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    let opcodes = |sql: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // `extra = 'b'` is one jump on the comparison, and its constant is
+    // loaded once, after the program's Transaction.
+    let program = opcodes("SELECT id FROM items WHERE extra = 'b'");
+    assert!(program.iter().any(|opcode| opcode == "Ne"), "{program:?}");
+    assert!(
+        !program
+            .iter()
+            .any(|opcode| opcode == "ZeroOrNull" || opcode == "IfNot"),
+        "{program:?}"
+    );
+    let transaction = program
+        .iter()
+        .position(|opcode| opcode == "Transaction")
+        .expect("program reads a table");
+    let constant = program
+        .iter()
+        .rposition(|opcode| opcode == "String8")
+        .expect("the constant is loaded");
+    assert!(constant > transaction, "{program:?}");
+
+    for sql in [
+        "SELECT id FROM items WHERE value = 20 ORDER BY id",
+        "SELECT id FROM items WHERE value != 20 ORDER BY id",
+        "SELECT id FROM items WHERE value < 30 OR extra = 'c' ORDER BY id",
+        "SELECT id FROM items WHERE NOT (value >= 30) ORDER BY id",
+        "SELECT id FROM items WHERE value IS 20 ORDER BY id",
+        "SELECT id FROM items WHERE value IS NOT 20 ORDER BY id",
+        "SELECT id FROM items WHERE value IS NOT NULL AND value <= 30 ORDER BY id",
+        "SELECT id FROM items WHERE (value > 15) IS NULL ORDER BY id",
+        "SELECT id, CASE WHEN value > 25 THEN 'big' ELSE 'small' END FROM items ORDER BY id",
+        "SELECT count(*) FROM items i JOIN tags t ON t.item_id = i.id AND t.tag = 'x'",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

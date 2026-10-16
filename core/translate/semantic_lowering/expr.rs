@@ -4510,10 +4510,197 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
         ) {
             return Ok(());
         }
+        if self.emit_comparison_jump(expression, context.metadata())? {
+            return Ok(());
+        }
         let register = self.program.alloc_register();
-        translate_expr(self.program, self.document, expression, register)?;
+        translate_condition_operand(self.program, self.document, expression, register)?;
         expr::emit_cond_jump(self.program, context.metadata(), register);
         Ok(())
+    }
+}
+
+/// Lower a value a condition tests into its own register. Like legacy, a
+/// value that is the same on every row, such as the `5` of `x = 5`, is
+/// computed once before the loops.
+fn translate_condition_operand(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<usize> {
+    let span = (!program.constant_span_is_open() && hir_expr_is_constant(program, expression))
+        .then(|| program.constant_span_start());
+    let result = translate_expr(program, document, expression, target);
+    if let Some(span) = span {
+        program.constant_span_end(span);
+    }
+    result
+}
+
+/// Whether an expression has the same value on every row. An expression
+/// whose value a register holds at run time, such as a group key, is not:
+/// that register is filled later.
+fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> bool {
+    let mut constant = true;
+    expression.for_each(&mut |node| {
+        if !constant {
+            return;
+        }
+        if program.expression_register(node).is_some() {
+            constant = false;
+            return;
+        }
+        constant = match node {
+            hir::Expr::Literal(_)
+            | hir::Expr::Parameter(_)
+            | hir::Expr::Unary { .. }
+            | hir::Expr::Between { .. }
+            | hir::Expr::Case { .. }
+            | hir::Expr::Cast { .. }
+            | hir::Expr::Collate { .. }
+            | hir::Expr::IsNull(_)
+            | hir::Expr::NotNull(_)
+            | hir::Expr::TruthTest { .. }
+            | hir::Expr::InList { .. }
+            | hir::Expr::Row(_) => true,
+            hir::Expr::Binary { custom, .. } => custom.is_none(),
+            hir::Expr::Function(call) => {
+                matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && crate::function::Deterministic::is_deterministic(call.function.value())
+            }
+            _ => false,
+        };
+    });
+    constant
+}
+
+impl ConditionLowerer<'_, '_> {
+    /// Like legacy, a scalar comparison jumps on its own result instead of
+    /// computing a truth value first: `WHERE x = 1` becomes one `Ne` that
+    /// skips the row. As with a computed value, NULL counts as false. Returns
+    /// false, having emitted nothing, for other expressions.
+    fn emit_comparison_jump(
+        &mut self,
+        expression: &hir::Expr,
+        metadata: expr::ConditionMetadata,
+    ) -> Result<bool> {
+        let hir::Expr::Binary {
+            lhs,
+            operator,
+            rhs,
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison),
+        } = expression
+        else {
+            return Ok(false);
+        };
+        let [component] = comparison.components.as_slice() else {
+            return Ok(false);
+        };
+        let null_equal = match operator {
+            Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals => false,
+            Operator::Is | Operator::IsNot
+                if !matches!(
+                    rhs.as_ref(),
+                    hir::Expr::Literal(Literal::True | Literal::False)
+                ) =>
+            {
+                true
+            }
+            _ => return Ok(false),
+        };
+        let target_pc = if metadata.jump_if_condition_is_true {
+            metadata.jump_target_when_true
+        } else {
+            metadata.jump_target_when_false
+        };
+        // Jumping when the condition is false tests the opposite operator.
+        let operator = if metadata.jump_if_condition_is_true {
+            *operator
+        } else {
+            match operator {
+                Operator::Equals => Operator::NotEquals,
+                Operator::NotEquals => Operator::Equals,
+                Operator::Less => Operator::GreaterEquals,
+                Operator::LessEquals => Operator::Greater,
+                Operator::Greater => Operator::LessEquals,
+                Operator::GreaterEquals => Operator::Less,
+                Operator::Is => Operator::IsNot,
+                Operator::IsNot => Operator::Is,
+                other => *other,
+            }
+        };
+        let lhs_register = self.program.alloc_register();
+        translate_condition_operand(self.program, self.document, lhs, lhs_register)?;
+        let rhs_register = self.program.alloc_register();
+        translate_condition_operand(self.program, self.document, rhs, rhs_register)?;
+        let flags = if null_equal {
+            CmpInsFlags::default()
+                .with_affinity(component.affinity)
+                .null_eq()
+        } else if metadata.jump_if_condition_is_true {
+            comparison_flags(component)
+        } else {
+            comparison_flags(component).jump_if_null()
+        };
+        let (lhs, rhs, collation) = (lhs_register, rhs_register, comparison_collation(component));
+        self.program.emit_insn(match operator {
+            Operator::Equals | Operator::Is => Insn::Eq {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            Operator::NotEquals | Operator::IsNot => Insn::Ne {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            Operator::Less => Insn::Lt {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            Operator::LessEquals => Insn::Le {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            Operator::Greater => Insn::Gt {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            Operator::GreaterEquals => Insn::Ge {
+                lhs,
+                rhs,
+                target_pc,
+                flags,
+                collation,
+            },
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR comparison jump has no instruction for {other:?}"
+                )))
+            }
+        });
+        Ok(true)
     }
 }
 

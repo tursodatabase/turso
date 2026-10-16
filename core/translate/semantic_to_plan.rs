@@ -14,7 +14,7 @@ use super::{
     },
     plan::{
         ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirFromLayout, HirJoinInfo,
-        HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
+        HirPlanSource, HirPlannedSource, HirWhereTerm,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
