@@ -191,6 +191,11 @@ impl ExprPolicy {
         self
     }
 
+    const fn without_windows(mut self) -> Self {
+        self.allow_windows = false;
+        self
+    }
+
     pub(super) const fn schema_expression() -> Self {
         Self {
             precedence: NamePrecedence::SourcesOnly,
@@ -496,10 +501,15 @@ struct FunctionWindowFrame {
     exclude: Option<ast::FrameExclude>,
 }
 
+/// A WINDOW clause definition, with what it inherits from its base window.
+/// Like SQLite, its expressions are analyzed where a window function uses
+/// it, so they may read the block's aggregates, and a definition no
+/// function uses is never analyzed.
 #[derive(Clone)]
 struct NamedFunctionWindow {
     name: String,
-    window: FunctionWindow,
+    partition_by: Vec<Box<ast::Expr>>,
+    order_by: Vec<ast::SortedColumn>,
     frame: Option<ast::FrameClause>,
 }
 
@@ -561,16 +571,18 @@ impl FunctionWindow {
     }
 }
 
-fn chain_function_window(
-    mut window: FunctionWindow,
-    base: &FunctionWindow,
+/// SQLite's rules for a window that names a base window: it may only add
+/// an ORDER BY the base lacks, and a frame.
+fn check_window_chain(
+    has_partition: bool,
+    both_have_order: bool,
     base_has_frame: bool,
     base_name: &str,
-) -> Result<FunctionWindow> {
-    if !window.partition_by.is_empty() {
+) -> Result<()> {
+    if has_partition {
         crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base_name);
     }
-    if !base.order_by.is_empty() && !window.order_by.is_empty() {
+    if both_have_order {
         crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base_name);
     }
     if base_has_frame {
@@ -579,6 +591,21 @@ fn chain_function_window(
             base_name
         );
     }
+    Ok(())
+}
+
+fn chain_function_window(
+    mut window: FunctionWindow,
+    base: &FunctionWindow,
+    base_has_frame: bool,
+    base_name: &str,
+) -> Result<FunctionWindow> {
+    check_window_chain(
+        !window.partition_by.is_empty(),
+        !base.order_by.is_empty() && !window.order_by.is_empty(),
+        base_has_frame,
+        base_name,
+    )?;
     window.partition_by.clone_from(&base.partition_by);
     if window.order_by.is_empty() {
         window.order_by.clone_from(&base.order_by);
@@ -1834,16 +1861,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_named_windows(
         &mut self,
         definitions: &'ast [ast::WindowDef],
-        scope: &Scope,
-        policy: ExprPolicy,
         functions: &mut QueryFunctionState,
     ) -> Result<()> {
-        let parent = functions.block.query;
         for definition in definitions {
-            let name = normalize_ident(definition.name.as_str());
-            let mut window =
-                self.analyze_window_definition(&definition.window, scope, policy, parent)?;
-            if let Some(base) = &definition.window.base {
+            let window = &definition.window;
+            let mut named = NamedFunctionWindow {
+                name: normalize_ident(definition.name.as_str()),
+                partition_by: window.partition_by.clone(),
+                order_by: window.order_by.clone(),
+                frame: window.frame_clause.clone(),
+            };
+            if let Some(base) = &window.base {
                 // SQLite ignores the base on the first WINDOW definition.
                 if !functions.named_windows.is_empty() {
                     let base = normalize_ident(base.as_str());
@@ -1852,48 +1880,71 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .iter()
                         .rfind(|window| window.name == base)
                         .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
-                    window = chain_function_window(
-                        window,
-                        &inherited.window,
+                    check_window_chain(
+                        !named.partition_by.is_empty(),
+                        !inherited.order_by.is_empty() && !named.order_by.is_empty(),
                         inherited.frame.is_some(),
                         &base,
                     )?;
+                    named.partition_by.clone_from(&inherited.partition_by);
+                    if named.order_by.is_empty() {
+                        named.order_by.clone_from(&inherited.order_by);
+                    }
                 }
             }
-            functions.named_windows.push(NamedFunctionWindow {
-                name,
-                window,
-                frame: definition.window.frame_clause.clone(),
-            });
+            functions.named_windows.push(named);
         }
         Ok(())
     }
 
-    fn analyze_window_definition(
+    /// The PARTITION BY and ORDER BY of a named window, analyzed where a
+    /// window function uses it.
+    fn analyze_named_window(
         &mut self,
-        window: &'ast ast::Window,
+        name: &str,
         scope: &Scope,
         policy: ExprPolicy,
-        parent: hir::QueryId,
-    ) -> Result<FunctionWindow> {
+        functions: &mut QueryFunctionState,
+    ) -> Result<(FunctionWindow, NamedFunctionWindow)> {
+        let named = functions
+            .named_windows
+            .iter()
+            .rfind(|window| window.name == name)
+            .cloned()
+            .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
+        let policy = policy.without_windows();
+        let mut context = FunctionContext::Query(functions);
         let mut partition_by = ExprChildren::new();
-        for expression in &window.partition_by {
-            partition_by.push(self.analyze_query_scalar_expr(expression, scope, policy, parent)?);
+        for expression in &named.partition_by {
+            partition_by.push(self.analyze_resolved_expr_with_functions(
+                expression,
+                scope,
+                policy,
+                &mut context,
+                None,
+            )?);
         }
-        let mut order_by = Vec::with_capacity(window.order_by.len());
-        for term in &window.order_by {
+        let mut order_by = Vec::with_capacity(named.order_by.len());
+        for term in &named.order_by {
             order_by.push(FunctionOrderTerm {
-                value: self.analyze_query_scalar_expr(&term.expr, scope, policy, parent)?,
+                value: self.analyze_resolved_expr_with_functions(
+                    &term.expr,
+                    scope,
+                    policy,
+                    &mut context,
+                    None,
+                )?,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
             });
         }
-        Ok(FunctionWindow {
+        let window = FunctionWindow {
             partition_by,
             order_by,
             frame: None,
             name: None,
-        })
+        };
+        Ok((window, named))
     }
 
     fn analyze_window_frame(
@@ -1939,16 +1990,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         function: &Func,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &QueryFunctionState,
+        functions: &mut QueryFunctionState,
     ) -> Result<FunctionWindow> {
         match over {
             FunctionOver::Named(name) => {
-                let named = functions
-                    .named_windows
-                    .iter()
-                    .rfind(|window| window.name == name)
-                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
-                let mut window = named.window.clone();
+                let (mut window, named) =
+                    self.analyze_named_window(&name, scope, policy, functions)?;
                 window.name = Some(name);
                 if !function_ignores_user_frame(function) {
                     window.frame = named
@@ -1964,12 +2011,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 base: Some(base),
                 window,
             } => {
-                let named = functions
-                    .named_windows
-                    .iter()
-                    .rfind(|window| window.name == base)
-                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
-                chain_function_window(window, &named.window, named.frame.is_some(), &base)
+                let (base_window, named) =
+                    self.analyze_named_window(&base, scope, policy, functions)?;
+                chain_function_window(window, &base_window, named.frame.is_some(), &base)
             }
         }
     }

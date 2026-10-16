@@ -919,7 +919,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => (None, Scope::new(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
-        self.analyze_named_windows(window_clause, &scope, policies.select(), &mut functions)?;
+        self.analyze_named_windows(window_clause, &mut functions)?;
         let outputs = self.analyze_outputs(
             block_id,
             columns,
@@ -10310,6 +10310,49 @@ mod tests {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid chain fails");
             assert_eq!(error.to_string(), expected, "SQL: {sql}");
         }
+    }
+
+    #[test]
+    fn named_windows_are_analyzed_where_a_function_uses_them() {
+        let schema = schema_with_items();
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT rank() OVER ranked FROM items WINDOW ranked AS (ORDER BY sum(score))",
+        )
+        .expect("a named window may read the block's aggregates");
+        document
+            .validate()
+            .expect("named window aggregates produce closed HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 1);
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items WINDOW unused AS (ORDER BY sum(missing))",
+        )
+        .expect("like SQLite, a window no function uses is not analyzed");
+        document
+            .validate()
+            .expect("named window aggregates produce closed HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 0);
+
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT rank() OVER nested FROM items WINDOW nested AS (ORDER BY rank() OVER ())",
+        )
+        .expect_err("a named window cannot hold a window function");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of window function rank()"
+        );
     }
 
     #[test]
