@@ -2023,33 +2023,9 @@ impl Limbo {
     }
 
     fn write_sql_value_from_value<W: Write>(out: &mut W, v: &Value) -> io::Result<()> {
-        match v {
-            Value::Null => out.write_all(b"NULL"),
-            Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
-            Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
-            Value::Text(s) => {
-                out.write_all(b"'")?;
-                let bytes = s.value.as_bytes();
-                let mut i = 0;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    if b == b'\'' {
-                        out.write_all(b"''")?;
-                    } else {
-                        out.write_all(&[b])?;
-                    }
-                    i += 1;
-                }
-                out.write_all(b"'")
-            }
-            Value::Blob(b) => {
-                out.write_all(b"X'")?;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                for &byte in b {
-                    out.write_all(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0F) as usize]])?;
-                }
-                out.write_all(b"'")
-            }
+        match v.exec_quote() {
+            Value::Text(s) => out.write_all(s.as_str().as_bytes()),
+            _ => unreachable!("quote() always returns TEXT"),
         }
     }
 
@@ -2485,5 +2461,56 @@ mod tests {
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_dump_and_reload_infinite_real() -> anyhow::Result<()> {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL);")?;
+        conn.execute("INSERT INTO t VALUES(1, 1e400), (2, -1e400), (3, 1.5), (4, NULL);")?;
+
+        let mut dump_out = Vec::new();
+        Limbo::dump_database_from_conn(true, conn.clone(), &mut dump_out, NoopProgress)?;
+        let dump_sql = String::from_utf8(dump_out)?;
+        assert!(
+            dump_sql.contains("9.0e+999"),
+            "dump should emit SQLite-compatible +inf: {dump_sql}"
+        );
+        assert!(
+            dump_sql.contains("-9.0e+999"),
+            "dump should emit SQLite-compatible -inf: {dump_sql}"
+        );
+        let dump_lc = dump_sql.to_ascii_lowercase();
+        assert!(
+            !dump_lc.contains(",inf)") && !dump_lc.contains(",-inf)"),
+            "dump must not emit an unparseable Inf token: {dump_sql}"
+        );
+
+        let io2: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+        let db2 = Database::open_file(io2, ":memory:", Arc::new(SqliteDialect))?;
+        let conn2 = db2.connect()?;
+        for stmt in dump_sql.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let upper = stmt.to_ascii_uppercase();
+            if upper.starts_with("CREATE") || upper.starts_with("INSERT") {
+                conn2.execute(stmt)?;
+            }
+        }
+
+        let mut quotes = Vec::new();
+        if let Some(mut rows) = conn2.query("SELECT quote(x) FROM t ORDER BY id;")? {
+            rows.run_with_row_callback(|row| {
+                quotes.push(row.get::<&str>(0)?.to_string());
+                Ok(())
+            })?;
+        }
+        assert_eq!(quotes, vec!["9.0e+999", "-9.0e+999", "1.5", "NULL"]);
+
+        Ok(())
     }
 }
