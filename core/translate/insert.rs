@@ -1507,6 +1507,47 @@ fn emit_rowid_generation(
                     ctx.table.name
                 ))
             })?;
+        let minimum_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: minimum_rowid_reg,
+            value: 0,
+        });
+        let table_empty_label = program.allocate_label();
+        program.emit_insn(Insn::Last {
+            cursor_id: ctx.cursor_id,
+            pc_if_empty: table_empty_label,
+        });
+        program.emit_insn(Insn::RowId {
+            cursor_id: ctx.cursor_id,
+            dest: minimum_rowid_reg,
+        });
+        program.preassign_label_to_next_insn(table_empty_label);
+
+        let no_overflow_label = program.allocate_label();
+        let max_i64_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: max_i64_reg,
+            value: i64::MAX,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: minimum_rowid_reg,
+            rhs: max_i64_reg,
+            target_pc: no_overflow_label,
+            flags: Default::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_FULL,
+            description: "database or disk is full".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(no_overflow_label);
+        program.emit_insn(Insn::AddImm {
+            register: minimum_rowid_reg,
+            value: 1,
+        });
+
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
@@ -1515,6 +1556,7 @@ fn emit_rowid_generation(
             &seq,
             insertion.key_register(),
             None,
+            Some(minimum_rowid_reg),
         )?;
     } else if let Some(AutoincMeta {
         r_seq,
