@@ -1,0 +1,103 @@
+@database :memory:
+
+setup json_index {
+    CREATE TABLE t1(x INT, y TEXT);
+    INSERT INTO t1 VALUES(1, '{b:5}');
+    CREATE INDEX t1_json ON t1(json(y));
+}
+
+@cross-check-integrity
+test json-argument-of-coalesce-keeps-subtype {
+    CREATE TABLE t0(x INT, y TEXT);
+    INSERT INTO t0 VALUES(1, '{b:5}');
+    CREATE INDEX t0_coalesce ON t0(coalesce(null, json(y)));
+    SELECT json_insert('{}', '$.a', coalesce(null, json(y)))->>'$.a.b' FROM t0;
+}
+expect {
+    5
+}
+
+@setup json_index
+test json-argument-keeps-subtype-when-also-selected {
+    SELECT json(y), json_insert('{}', '$.a', json(y)) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"b":5}|{"a":{"b":5}}
+}
+
+@setup json_index
+test parenthesized-json-argument-keeps-subtype {
+    SELECT json_insert('{}', '$.a', (json(y))) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"a":{"b":5}}
+}
+
+@setup json_index
+test json-aggregate-argument-keeps-subtype {
+    SELECT json(y), json_group_array(json(y)) FROM t1 INDEXED BY t1_json;
+}
+expect {
+    {"b":5}|[{"b":5}]
+}
+
+@setup json_index
+test json-argument-of-arrow-keeps-subtype {
+    SELECT json_array(json(y) -> '$') FROM t1 INDEXED BY t1_json;
+}
+expect {
+    [{"b":5}]
+}
+
+setup collate_index {
+    CREATE TABLE t2(x TEXT PRIMARY KEY, y TEXT);
+    INSERT INTO t2 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t2_nocase ON t2(+y COLLATE NOCASE);
+}
+
+@setup collate_index
+test indexed-collate-expression-in-where-keeps-collation {
+    SELECT x FROM t2 INDEXED BY t2_nocase WHERE x = +y COLLATE NOCASE;
+}
+expect {
+    alpha
+}
+
+@setup collate_index
+test indexed-collate-expression-in-result-keeps-collation {
+    SELECT x, x = +y COLLATE NOCASE FROM t2 INDEXED BY t2_nocase ORDER BY x;
+}
+expect {
+    alpha|1
+    bravo|0
+}
+
+@setup collate_index
+@cross-check-integrity
+test indexed-collate-expression-in-delete-keeps-collation {
+    DELETE FROM t2 INDEXED BY t2_nocase WHERE x IS +y COLLATE NOCASE;
+    SELECT x FROM t2;
+}
+expect {
+    bravo
+}
+
+test indexed-unary-plus-column-keeps-column-collation {
+    CREATE TABLE t3(x TEXT, y TEXT COLLATE NOCASE);
+    INSERT INTO t3 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t3_plus ON t3(+y);
+    SELECT x FROM t3 INDEXED BY t3_plus WHERE +y = x;
+}
+expect {
+    alpha
+}
+
+test indexed-function-value-uses-collation-of-other-column {
+    CREATE TABLE t4(x TEXT COLLATE NOCASE, y TEXT);
+    INSERT INTO t4 VALUES('alpha', 'ALPHA'), ('bravo', 'charlie');
+    CREATE INDEX t4_trim ON t4(trim(y));
+    SELECT x FROM t4 INDEXED BY t4_trim WHERE trim(y) = x;
+}
+expect {
+    alpha
+}

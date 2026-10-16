@@ -118,7 +118,51 @@ pub fn translate_expr(
             resolver,
             cached,
         )?;
-    } else if !try_emit_expression_index_value_if_any(
+    } else {
+        let marked_before =
+            mark_arguments_that_keep_subtypes(program, referenced_tables, expr, resolver)?;
+        let translated = translate_expr_from_index_or_by_kind(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+        );
+        program.unmark_subtype_arguments(marked_before);
+        translated?;
+    }
+
+    if let Some(span) = constant_span {
+        program.constant_span_end(span);
+    }
+
+    Ok(target_register)
+}
+
+#[inline(never)]
+fn mark_arguments_that_keep_subtypes(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if !uses_expression_index_values(program, referenced_tables) {
+        return Ok(program.mark_subtype_arguments(&[]));
+    }
+    let is_subtype_argument = program.is_subtype_argument(expr);
+    let arguments = arguments_that_keep_subtypes(expr, is_subtype_argument, resolver)?;
+    Ok(program.mark_subtype_arguments(&arguments))
+}
+
+#[inline(never)]
+fn translate_expr_from_index_or_by_kind(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    if !try_emit_expression_index_value_if_any(
         program,
         referenced_tables,
         expr,
@@ -127,11 +171,6 @@ pub fn translate_expr(
     )? {
         translate_expr_by_kind(program, referenced_tables, expr, target_register, resolver)?;
     }
-
-    if let Some(span) = constant_span {
-        program.constant_span_end(span);
-    }
-
     Ok(target_register)
 }
 
@@ -325,17 +364,27 @@ fn try_emit_expression_index_value_if_any(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let has_expression_indexes = !program.flags.skip_expression_index_values()
+    if !uses_expression_index_values(program, referenced_tables) {
+        return Ok(false);
+    }
+    let is_subtype_argument = program.is_subtype_argument(expr);
+    if index_value_would_lose_subtype(expr, is_subtype_argument, resolver)? {
+        return Ok(false);
+    }
+    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+}
+
+fn uses_expression_index_values(
+    program: &ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+) -> bool {
+    !program.flags.skip_expression_index_values()
         && referenced_tables.is_some_and(|tables| {
             tables
                 .joined_tables()
                 .iter()
                 .any(|t| !t.expression_index_usages.is_empty())
-        });
-    if !has_expression_indexes {
-        return Ok(false);
-    }
-    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
+        })
 }
 
 #[inline(never)]

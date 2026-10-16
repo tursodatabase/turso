@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::collate::get_index_value_collation_ctx;
 use crate::translate::expression_index::normalize_expr_for_index_matching;
 
 #[derive(Debug, Clone, Copy)]
@@ -295,6 +296,11 @@ pub(super) fn try_emit_expression_index_value(
     };
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+        program.set_collation(get_index_value_collation_ctx(
+            expr,
+            referenced_tables,
+            resolver,
+        )?);
         return Ok(true);
     }
 
