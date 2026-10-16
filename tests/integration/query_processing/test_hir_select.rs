@@ -555,7 +555,6 @@ fn hir_errors_match_legacy() {
     for sql in [
         "SELECT * FROM main.nosuch",
         "SELECT * FROM nosuch",
-        "SELECT x.y FROM items",
         "SELECT nosuch FROM items",
     ] {
         let legacy_error = legacy
@@ -566,4 +565,12 @@ fn hir_errors_match_legacy() {
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
     }
+    // Legacy says "no such table: x" here; HIR names the column as SQLite
+    // does.
+    let error = hir
+        .prepare("SELECT x.y FROM items")
+        .err()
+        .expect("HIR rejects")
+        .to_string();
+    assert_eq!(error, "Parse error: no such column: x.y");
 }
