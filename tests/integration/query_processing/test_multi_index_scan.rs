@@ -193,3 +193,46 @@ fn hir_uses_one_seek_per_or_branch() {
         );
     }
 }
+
+/// Through HIR too, a WHERE term that rejects the NULL row of a LEFT JOIN
+/// makes it an inner join, so the OR term can drive the right table's loop.
+#[test]
+fn hir_turns_a_null_rejected_left_join_into_an_inner_join() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE g(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE h(id INTEGER, v INTEGER, w INTEGER)",
+        "CREATE INDEX hv ON h(v)",
+        "CREATE INDEX hw ON h(w)",
+        "INSERT INTO g VALUES (1), (2), (3)",
+        "INSERT INTO h VALUES (1, 5, 0), (2, 0, 7), (9, 5, 7)",
+    ] {
+        limbo_exec_rows(&conn, sql);
+        sqlite_conn.execute(sql, []).unwrap();
+    }
+    let query = "SELECT * FROM g LEFT JOIN h ON g.id = h.id WHERE h.v = 5 OR h.w = 7";
+    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"))
+        .iter()
+        .filter_map(|row| match row.get(3) {
+            Some(Value::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("MULTI-INDEX OR h"), "{plan}");
+    for sql in [
+        query,
+        // IS NULL keeps the NULL row, so the join stays a LEFT JOIN.
+        "SELECT g.id, h.id FROM g LEFT JOIN h ON g.id = h.id WHERE h.v IS NULL",
+        "SELECT g.id, h.id FROM g LEFT JOIN h ON g.id = h.id WHERE coalesce(h.v, 1) = 1",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite_conn, sql),
+            "{sql}"
+        );
+    }
+}

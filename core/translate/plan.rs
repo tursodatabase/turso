@@ -1526,6 +1526,16 @@ impl HirPlanSource {
         }
     }
 
+    pub(crate) fn join_info_mut(&mut self) -> Option<&mut HirJoinInfo> {
+        match self {
+            Self::BTree(source) => source.join_info.as_mut(),
+            Self::Derived { join_info, .. }
+            | Self::Cte { join_info, .. }
+            | Self::RecursiveCte { join_info, .. }
+            | Self::RecursiveInput { join_info, .. } => join_info.as_mut(),
+        }
+    }
+
     pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
         match self {
             Self::BTree(source) => source.join_info.as_ref(),

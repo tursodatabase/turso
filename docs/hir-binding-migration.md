@@ -190,6 +190,12 @@ still differ where the bytecode differs: legacy runs uncorrelated subqueries
 before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
 joins, which HIR does not.
 
+Like legacy, a LEFT JOIN outside parentheses whose NULL row a WHERE term
+rejects (a comparison or arithmetic on one of its columns, but not IS,
+IS NULL, CASE or a function) is planned as an inner join, so its tables can
+be joined in any order and its ON terms seek like WHERE terms; lowering then
+emits no NULL row for it.
+
 Like legacy's OR-by-union, a table whose chosen loop is a plain scan is
 instead read through one seek per branch of a WHERE OR term (`v = 5 OR w =
 3` with an index on each column), when every branch can seek an index or the

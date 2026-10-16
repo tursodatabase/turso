@@ -160,6 +160,9 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) order_sort_elided: bool,
     /// An index method applies LIMIT and OFFSET while it scans.
     pub(crate) limit_applied: bool,
+    /// LEFT JOINs run as inner joins, because a WHERE term rejects the NULL
+    /// row they would add.
+    pub(crate) inner_joins: Vec<SourceId>,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -225,6 +228,81 @@ pub(crate) enum HirSourceAccess {
 struct HirQueryEstimate {
     output_cardinality: f64,
     cost: Cost,
+}
+
+/// Like legacy: turn each LEFT JOIN whose NULL row a WHERE term rejects into
+/// an inner join, so its tables can be joined in any order, and return the
+/// right sources of those joins. Its ON terms become ordinary terms.
+fn left_joins_rejected_by_where(input: &mut HirQueryBlockPlanInput) -> Vec<SourceId> {
+    let mut converted = Vec::new();
+    // A parenthesized group's join is left alone.
+    if !input.groups.is_empty() {
+        return converted;
+    }
+    loop {
+        let rejected = input.sources.iter().position(|source| {
+            source
+                .join_info()
+                .is_some_and(|join| join.kind == hir::JoinKind::Left)
+                && input.predicates.iter().any(|term| {
+                    term.from_outer_join.is_none() && rejects_null_row(&term.expr, source.source())
+                })
+        });
+        let Some(position) = rejected else {
+            return converted;
+        };
+        let source = input.sources[position].source();
+        if let Some(join) = input.sources[position].join_info_mut() {
+            join.kind = hir::JoinKind::Inner;
+        }
+        for term in &mut input.predicates {
+            if term.from_outer_join == Some(source) {
+                term.from_outer_join = None;
+            }
+        }
+        converted.push(source);
+    }
+}
+
+/// Port of legacy's `where_term_is_null_rejecting_for_table` (SQLite's
+/// `impliesNotNullRow`): whether `expr` can never be TRUE when every column
+/// of `source` is NULL. When unsure, it says no.
+fn rejects_null_row(expr: &hir::Expr, source: SourceId) -> bool {
+    use turso_parser::ast::Operator::{And, Is, IsNot, Or};
+    let rejects = |expr: &hir::Expr| rejects_null_row(expr, source);
+    match expr {
+        hir::Expr::Column(column) => column.source == source,
+        hir::Expr::RowId(rowid) => *rowid == source,
+        // These can be TRUE, or not NULL, when every input is NULL.
+        hir::Expr::Binary {
+            operator: Is | IsNot,
+            ..
+        }
+        | hir::Expr::IsNull(_)
+        | hir::Expr::NotNull(_)
+        | hir::Expr::TruthTest { .. }
+        | hir::Expr::Case { .. }
+        | hir::Expr::Function(_)
+        | hir::Expr::Like { .. } => false,
+        // Either arm could be TRUE through the other one.
+        hir::Expr::Binary {
+            lhs,
+            operator: And | Or,
+            rhs,
+            ..
+        } => rejects(lhs) && rejects(rhs),
+        // A comparison or arithmetic with a NULL input is NULL.
+        hir::Expr::Binary { lhs, rhs, .. } => rejects(lhs) || rejects(rhs),
+        // NULL is never in a non-empty list.
+        hir::Expr::InList { lhs, values, .. } => !values.is_empty() && rejects(lhs),
+        hir::Expr::Between {
+            expr, start, end, ..
+        } => rejects(expr) || (rejects(start) && rejects(end)),
+        hir::Expr::Unary { expr, .. }
+        | hir::Expr::Cast { expr, .. }
+        | hir::Expr::Collate { expr, .. } => rejects(expr),
+        _ => false,
+    }
 }
 
 /// The most result columns a query block may have, SQLite's default
@@ -975,6 +1053,7 @@ impl<'a> HirPlanContext<'a> {
                 group_sort_elided: false,
                 order_sort_elided: false,
                 limit_applied: false,
+                inner_joins: Vec::new(),
                 output_cardinality,
                 cost: Cost(0.0),
             });
@@ -989,6 +1068,7 @@ impl<'a> HirPlanContext<'a> {
             );
         }
         let where_start = input.where_start;
+        let inner_joins = left_joins_rejected_by_where(&mut input);
         if let Some(plan) = self.plan_index_method(block, order_by, limit, &mut input)? {
             return Ok(plan);
         }
@@ -1034,6 +1114,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: access.group_sort_elided,
             order_sort_elided: access.order_sort_elided,
             limit_applied: false,
+            inner_joins,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
@@ -1109,6 +1190,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: false,
             order_sort_elided: matched.applies_order_by,
             limit_applied: matched.applies_limit,
+            inner_joins: Vec::new(),
             output_cardinality: 1.0,
             cost: Cost(1.0),
         }))
@@ -1215,6 +1297,7 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: false,
             order_sort_elided: false,
             limit_applied: false,
+            inner_joins: Vec::new(),
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         }))

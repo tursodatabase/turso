@@ -368,6 +368,8 @@ pub(super) struct HirLoopsPlan<'a> {
     predicates: &'a [crate::translate::plan::HirWhereTerm],
     /// Index of the first WHERE term; earlier terms come from the FROM clause.
     where_start: usize,
+    /// LEFT JOINs the plan runs as inner joins.
+    inner_joins: &'a [SourceId],
 }
 
 impl<'a> HirLoopsPlan<'a> {
@@ -377,6 +379,7 @@ impl<'a> HirLoopsPlan<'a> {
             loops: &plan.loops,
             predicates: &plan.predicates,
             where_start: plan.where_start,
+            inner_joins: &plan.inner_joins,
         }
     }
 
@@ -386,6 +389,7 @@ impl<'a> HirLoopsPlan<'a> {
             loops: &plan.loops,
             predicates: &plan.predicates,
             where_start: plan.where_start,
+            inner_joins: &[],
         }
     }
 }
@@ -3282,6 +3286,9 @@ fn emit_join_loops(
             ));
         }
         check_hir_full_join_shape(document, from, &joins)?;
+        joins
+            .owners
+            .retain(|(owner, _)| !loops_plan.inner_joins.contains(owner));
     }
     if loops_plan.predicates.iter().any(|predicate| {
         predicate
