@@ -4611,6 +4611,19 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
+    /// Names of the collations registered on this connection, sorted.
+    pub fn get_syms_collation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .syms
+            .read()
+            .collations
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
     pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
         self.syms
