@@ -1,5 +1,5 @@
 use crate::alloc::TursoIteratorExt;
-use crate::numeric::StrToF64;
+use crate::numeric::{str_to_f64, StrToF64};
 use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
@@ -1326,22 +1326,19 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
                     e.kind(),
                     std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
                 ) {
-                    // if overflow, we return the representation as a real.
-                    // we have to match sqlite exactly here, so we match sqlite3AtoF
-                    let value = text.parse::<f64>().unwrap_or_default();
-                    let factor = 10f64.powi(15 - value.abs().log10().ceil() as i32);
-                    Ok(Value::from_f64((value * factor).round() / factor))
+                    Ok(Value::from_f64(text_to_f64(text)))
                 } else {
                     Err(())
                 }
             }
         },
-        ValueType::Float => {
-            let value = text.parse::<f64>().unwrap_or(0.0);
-            Ok(real_to_numeric_value(value))
-        }
+        ValueType::Float => Ok(real_to_numeric_value(text_to_f64(text))),
         _ => unreachable!(),
     }
+}
+
+fn text_to_f64(text: &str) -> f64 {
+    str_to_f64(text).map_or(0.0, f64::from)
 }
 
 /// Applies the same normalization strategy as SQLite:
@@ -6245,7 +6242,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9.223372036854776e18)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -6254,7 +6251,7 @@ pub mod tests {
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9.223372036854776e18)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -6414,7 +6411,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::from_f64(9.22337203685478e18)
+            Value::from_f64(9.223372036854776e18)
         ); // Exceeds i64, becomes float
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
@@ -6422,7 +6419,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::from_f64(-9.22337203685478e18)
+            Value::from_f64(-9.223372036854776e18)
         ); // Exceeds i64, becomes float
 
         assert_eq!(
