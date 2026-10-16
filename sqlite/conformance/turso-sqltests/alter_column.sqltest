@@ -464,7 +464,7 @@ test alter-table-add-column-with-fk-updates-schema {
     SELECT sql FROM sqlite_schema WHERE name = 's';
 }
 expect {
-    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))
+    CREATE TABLE s (a, b REFERENCES t(a))
 }
 
 test alter-table-add-self-ref-fk-updates-schema {
@@ -473,7 +473,7 @@ test alter-table-add-self-ref-fk-updates-schema {
     SELECT sql FROM sqlite_schema WHERE name = 's';
 }
 expect {
-    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))
+    CREATE TABLE s (a, b REFERENCES s(a))
 }
 
 # NOT NULL column without default on EMPTY table should succeed (SQLite behavior)

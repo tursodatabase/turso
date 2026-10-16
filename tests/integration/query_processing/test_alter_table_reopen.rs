@@ -348,3 +348,48 @@ fn test_alter_table_add_column_preserves_unique_constraint_desc_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_keeps_column_level_foreign_keys_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_table_column_fk_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (a INTEGER REFERENCES parent(id), doomed INTEGER, keep INTEGER)",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE child ADD COLUMN b INTEGER REFERENCES parent(id)")
+            .unwrap();
+        conn.execute("ALTER TABLE child DROP COLUMN doomed")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        assert_that!(conn.execute("INSERT INTO child (a) VALUES (1)"))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("FOREIGN KEY constraint failed");
+        assert_that!(conn.execute("INSERT INTO child (b) VALUES (1)"))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("FOREIGN KEY constraint failed");
+
+        conn.execute("ALTER TABLE child DROP COLUMN a").unwrap();
+        conn.execute("ALTER TABLE child DROP COLUMN b").unwrap();
+        let schema: Vec<(i64,)> = conn
+            .exec_rows("SELECT sql LIKE '%REFERENCES%' FROM sqlite_schema WHERE name = 'child'");
+        assert_eq!(schema, vec![(0,)]);
+        conn.close().unwrap();
+    }
+}

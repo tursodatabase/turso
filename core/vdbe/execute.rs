@@ -17133,6 +17133,9 @@ pub fn op_drop_column(
                 .as_ref()
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
+        btree
+            .foreign_keys
+            .retain(|fk| !fk.is_column_constraint_on(&col_name));
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())

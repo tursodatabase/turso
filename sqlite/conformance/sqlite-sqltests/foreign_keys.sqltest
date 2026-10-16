@@ -3706,6 +3706,62 @@ test fk-drop-column-composite-fk-fails {
 expect error {
 }
 
+# DROP COLUMN removes a column-level FK together with the column (#9077)
+@cross-check-integrity
+test fk-drop-column-column-level-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id INTEGER REFERENCES parent(id), keep INTEGER);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 10);
+    ALTER TABLE child DROP COLUMN parent_id;
+    PRAGMA foreign_key_list(child);
+    SELECT * FROM child;
+}
+expect {
+    10
+}
+
+# A column added with ADD COLUMN ... REFERENCES has a column-level FK and can be dropped
+@cross-check-integrity
+test fk-drop-column-added-column-level-fk {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(keep INTEGER);
+    ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id);
+    ALTER TABLE child DROP COLUMN parent_id;
+    PRAGMA foreign_key_list(child);
+    INSERT INTO child VALUES (10);
+    SELECT * FROM child;
+}
+expect {
+    10
+}
+
+# Only the dropped column's own column-level FK goes away, whatever the case of its name
+@cross-check-integrity
+test fk-drop-column-removes-only-its-column-level-fk {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+    CREATE TABLE child(ParentId INTEGER REFERENCES parent(id), b INTEGER REFERENCES parent(id), c TEXT,
+        FOREIGN KEY(c) REFERENCES parent(code));
+    ALTER TABLE child DROP COLUMN ParentId;
+    PRAGMA foreign_key_list(child);
+}
+expect {
+    0|0|parent|c|code|NO ACTION|NO ACTION|NONE
+    1|0|parent|b|id|NO ACTION|NO ACTION|NONE
+}
+
+# A column that also appears in a table-level FK still cannot be dropped
+@cross-check-integrity
+test fk-drop-column-column-and-table-level-fk-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(a INTEGER REFERENCES parent(id), keep INTEGER,
+        FOREIGN KEY(a) REFERENCES parent(id));
+    ALTER TABLE child DROP COLUMN a;
+}
+expect error {
+}
+
 # No-op UPDATE on NULL FK column with deferred FK should not error (#5410)
 @cross-check-integrity
 test fk-deferred-noop-update-null {

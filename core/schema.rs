@@ -3707,6 +3707,15 @@ impl BTreeTable {
                     sql.push_str(&check_constraint.sql());
                 }
             }
+
+            for fk in self
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.is_column_constraint_on(column_name))
+            {
+                sql.push(' ');
+                push_references_clause(&mut sql, fk);
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -3727,7 +3736,11 @@ impl BTreeTable {
             push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
         }
 
-        for fk in &self.foreign_keys {
+        for fk in self
+            .foreign_keys
+            .iter()
+            .filter(|fk| !fk.is_column_constraint)
+        {
             sql.push_str(", FOREIGN KEY (");
             for (i, col) in fk.child_columns.iter().enumerate() {
                 if i > 0 {
@@ -4810,6 +4823,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })
                             .unwrap_or(RefAct::NoAction),
                         deferred,
+                        is_column_constraint: false,
                         decl_order: table_fk_order,
                     };
                     foreign_keys.try_push(Arc::new(fk))?;
@@ -5020,6 +5034,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     }
                                     None => false,
                                 },
+                                is_column_constraint: true,
                                 decl_order: column_fk_order,
                             };
                             foreign_keys.try_push(Arc::new(fk))?;
@@ -5299,6 +5314,7 @@ pub struct ForeignKey {
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
+    pub is_column_constraint: bool,
     /// Declaration order among this table's foreign key constraints.
     ///
     /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
@@ -5312,6 +5328,14 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    pub fn is_column_constraint_on(&self, column_name: &str) -> bool {
+        self.is_column_constraint
+            && self
+                .child_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(column_name))
+    }
+
     fn validate(&self) -> Result<()> {
         if self
             .parent_columns
