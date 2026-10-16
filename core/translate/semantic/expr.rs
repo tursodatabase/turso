@@ -2120,7 +2120,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     fn build_between_expr(
-        &self,
+        &mut self,
         lhs_syntax: &ast::Expr,
         start_syntax: &ast::Expr,
         end_syntax: &ast::Expr,
@@ -2136,6 +2136,45 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             || expr.components.len() != end.components.len()
         {
             crate::bail_parse_error!("row value misused");
+        }
+        // Like legacy, BETWEEN on a custom type is `x >= a AND x <= b` with
+        // the type's own comparison operators.
+        if expr.components.len() == 1 {
+            let (tested, low, high) = (
+                &expr.components[0],
+                &start.components[0],
+                &end.components[0],
+            );
+            let custom = self
+                .resolve_custom_binary_operator(ast::Operator::GreaterEquals, tested, low)?
+                .is_some()
+                || self
+                    .resolve_custom_binary_operator(ast::Operator::LessEquals, tested, high)?
+                    .is_some();
+            if custom {
+                let lower = self.build_scalar_binary_expr(
+                    tested.clone(),
+                    ast::Operator::GreaterEquals,
+                    low.clone(),
+                )?;
+                let upper = self.build_scalar_binary_expr(
+                    tested.clone(),
+                    ast::Operator::LessEquals,
+                    high.clone(),
+                )?;
+                let both = self.build_scalar_binary_expr(lower, ast::Operator::And, upper)?;
+                if !negated {
+                    return Ok(both);
+                }
+                return Ok(computed_expr(
+                    hir::Expr::Unary {
+                        operator: ast::UnaryOperator::Not,
+                        expr: Box::new(both.expr),
+                    },
+                    hir::TypeFact::known(Type::Integer),
+                    ExprCollation::Absent,
+                ));
+            }
         }
         let start_comparison = expression_operand_comparison(&expr.components, &start.components);
         let end_comparison = expression_operand_comparison(&expr.components, &end.components);

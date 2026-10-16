@@ -810,6 +810,87 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
     }
 }
 
+/// Queries planned through HIR read an FTS index as legacy does: a query
+/// shaped like one of the index's patterns scans the index, reads scores
+/// from it, and leaves ORDER BY and LIMIT to it; in a join, the FTS table is
+/// read first through the index. Without the index,
+/// `fts_score` is always 0 and a ranked LIMIT returns rows that do not match.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_queries_through_hir_use_the_index(tmp_db: TempDatabase) {
+    let legacy = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+        "CREATE INDEX fts_articles ON articles USING fts (title, body)",
+        "INSERT INTO articles VALUES (1, 'hello world', 'this is a test')",
+        "INSERT INTO articles VALUES (2, 'another', 'hello again')",
+        "INSERT INTO articles VALUES (3, 'no match', 'something else')",
+    ] {
+        legacy.execute(sql).unwrap();
+    }
+    let hir = tmp_db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for sql in [
+        "SELECT fts_score(title, body, 'hello') AS score FROM articles ORDER BY score DESC LIMIT -1",
+        "SELECT fts_score(title, body, 'hello') AS score FROM articles ORDER BY score DESC LIMIT 1",
+        "SELECT id, fts_score(title, body, 'hello') AS score FROM articles \
+         WHERE fts_match(title, body, 'hello') ORDER BY score DESC",
+        "SELECT id FROM articles WHERE fts_match(title, body, 'hello') AND id > 1",
+        "SELECT count(*) FROM articles WHERE fts_match(body, title, 'hello')",
+    ] {
+        let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            format!("{plan:?}").contains("QUERY INDEX METHOD fts"),
+            "{sql}: {plan:?}"
+        );
+        assert_eq!(limbo_exec_rows(&hir, sql), limbo_exec_rows(&legacy, sql), "{sql}");
+    }
+    // In an inner join the FTS table is read first, through the index.
+    legacy
+        .execute("CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    legacy
+        .execute("INSERT INTO authors VALUES (1, 'ann'), (2, 'bob')")
+        .unwrap();
+    let join = "SELECT a.id, u.name FROM articles a JOIN authors u ON a.id = u.id \
+                WHERE fts_match(a.title, a.body, 'hello') ORDER BY a.id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {join}"));
+    assert!(
+        format!("{plan:?}").contains("QUERY INDEX METHOD fts"),
+        "{plan:?}"
+    );
+    assert_eq!(limbo_exec_rows(&hir, join), limbo_exec_rows(&legacy, join));
+    // The columns of an FTS function may come in any order; legacy then
+    // reads the score as 0.
+    assert_eq!(
+        limbo_exec_rows(
+            &hir,
+            "SELECT id, fts_score(body, title, 'hello') > 0 FROM articles \
+             WHERE fts_match(title, body, 'hello') ORDER BY id",
+        ),
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(1)
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(1)
+            ],
+        ]
+    );
+    // The index applies LIMIT only without OFFSET; legacy drops the OFFSET
+    // here and returns the best row instead of the second one.
+    assert_eq!(
+        limbo_exec_rows(
+            &hir,
+            "SELECT id FROM articles WHERE fts_match(title, body, 'hello') \
+             ORDER BY fts_score(title, body, 'hello') DESC LIMIT 1 OFFSET 1",
+        ),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_limit_zero_and_negative(tmp_db: TempDatabase) {

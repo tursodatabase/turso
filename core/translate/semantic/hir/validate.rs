@@ -286,7 +286,9 @@ impl<'document> HirValidator<'document> {
                 replace_defaults,
                 triggers,
                 foreign_keys,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree INSERT metadata belongs to a non-B-tree target",
@@ -316,40 +318,7 @@ impl<'document> HirValidator<'document> {
                     &upsert_assignments,
                 )?;
                 self.visit_dml_foreign_keys(insert.target, insert.target, foreign_keys)?;
-                let target_has_autoincrement = target_table
-                    .value()
-                    .btree()
-                    .is_some_and(|table| table.has_autoincrement);
-                self.require(
-                    target_has_autoincrement == autoincrement.is_some(),
-                    "INSERT AUTOINCREMENT metadata disagrees with its target",
-                )?;
-                if let Some(autoincrement) = autoincrement {
-                    self.visit_catalog_object(
-                        &autoincrement.sqlite_sequence,
-                        "AUTOINCREMENT sqlite_sequence table",
-                    )?;
-                    self.require(
-                        autoincrement.sqlite_sequence.database() == target_table.database(),
-                        "INSERT target and sqlite_sequence belong to different databases",
-                    )?;
-                    self.require(
-                        autoincrement
-                            .sqlite_sequence
-                            .value()
-                            .get_name()
-                            .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
-                        "INSERT AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
-                    )?;
-                    if let Some(sequence) = &autoincrement.mvcc_sequence {
-                        self.visit_sequence_operation(sequence)?;
-                        self.require(
-                            sequence.sqlite_sequence.as_ref()
-                                == Some(&autoincrement.sqlite_sequence),
-                            "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
-                        )?;
-                    }
-                }
+                self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults.iter().chain(replace_defaults) {
                     self.validate_column_position(insert.target, default.column)?;
                     self.visit_expr(&default.value)?;
@@ -471,7 +440,10 @@ impl<'document> HirValidator<'document> {
                 defaults,
                 triggers,
                 foreign_keys,
+                autoincrement,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree UPDATE metadata belongs to a non-B-tree target",
@@ -487,6 +459,7 @@ impl<'document> HirValidator<'document> {
                     &update.assignments,
                 )?;
                 self.visit_dml_foreign_keys(update.target, update.new_source, foreign_keys)?;
+                self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults {
                     self.validate_column_position(update.new_source, default.column)?;
                     self.visit_expr(&default.value)?;
@@ -531,7 +504,9 @@ impl<'document> HirValidator<'document> {
             DeleteTargetKind::BTree {
                 triggers,
                 foreign_keys,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree DELETE metadata belongs to a non-B-tree target",
@@ -2111,9 +2086,11 @@ impl<'document> HirValidator<'document> {
                     source.id
                 ),
             )?;
+            // Only a B-tree record can be short and need a DEFAULT.
             let default = &source.default_expressions[position];
+            let reads_default = table.value().btree().is_some() && catalog_column.default.is_some();
             self.require(
-                matches!(default, ColumnReadExpression::Absent) == catalog_column.default.is_none(),
+                matches!(default, ColumnReadExpression::Absent) != reads_default,
                 format!(
                     "source {} default-expression slot {position} disagrees with its catalog table",
                     source.id
@@ -2161,10 +2138,7 @@ impl<'document> HirValidator<'document> {
                 )?;
                 previous = Some(constraint.catalog_position);
                 let catalog = &table.check_constraints[constraint.catalog_position];
-                let expected = catalog
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| catalog.expr.to_string());
+                let expected = catalog.error_description();
                 self.require(
                     constraint.description == expected,
                     format!("source {} CHECK descriptions are out of order", source.id),
@@ -2354,6 +2328,77 @@ impl<'document> HirValidator<'document> {
                 )
             }
         }
+    }
+
+    /// The change capture table of a DML target: a table of the main
+    /// database other than the target itself.
+    fn validate_capture_changes(
+        &self,
+        target_table: &ResolvedTable,
+        capture_changes: Option<&CaptureChanges>,
+    ) -> ValidationResult {
+        let Some(capture_changes) = capture_changes else {
+            return Ok(());
+        };
+        self.visit_catalog_object(&capture_changes.table, "change capture table")?;
+        self.require(
+            capture_changes.table.database() == Some(DatabaseId::new(crate::MAIN_DB_ID))
+                && capture_changes.table.value().btree().is_some(),
+            "change capture table is not a table of the main database",
+        )?;
+        self.require(
+            capture_changes.table != *target_table,
+            "a DML target captures its own changes",
+        )?;
+        if let Some(sequence) = &capture_changes.change_ids {
+            self.visit_sequence_operation(sequence)?;
+        }
+        Ok(())
+    }
+
+    /// The AUTOINCREMENT metadata of an INSERT or UPDATE target: present
+    /// exactly for an AUTOINCREMENT table, with its database's
+    /// `sqlite_sequence` and, under MVCC, the hidden sequence that keeps it.
+    fn validate_autoincrement(
+        &self,
+        target_table: &ResolvedTable,
+        autoincrement: Option<&ResolvedAutoincrement>,
+    ) -> ValidationResult {
+        let target_has_autoincrement = target_table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_autoincrement);
+        self.require(
+            target_has_autoincrement == autoincrement.is_some(),
+            "AUTOINCREMENT metadata disagrees with its target",
+        )?;
+        let Some(autoincrement) = autoincrement else {
+            return Ok(());
+        };
+        self.visit_catalog_object(
+            &autoincrement.sqlite_sequence,
+            "AUTOINCREMENT sqlite_sequence table",
+        )?;
+        self.require(
+            autoincrement.sqlite_sequence.database() == target_table.database(),
+            "DML target and sqlite_sequence belong to different databases",
+        )?;
+        self.require(
+            autoincrement
+                .sqlite_sequence
+                .value()
+                .get_name()
+                .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+            "AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
+        )?;
+        if let Some(sequence) = &autoincrement.mvcc_sequence {
+            self.visit_sequence_operation(sequence)?;
+            self.require(
+                sequence.sqlite_sequence.as_ref() == Some(&autoincrement.sqlite_sequence),
+                "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
+            )?;
+        }
+        Ok(())
     }
 
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {

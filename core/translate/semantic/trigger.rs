@@ -350,7 +350,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             Some(context.database),
             context.table,
         );
-        let analyzed_columns = self.source_columns(&table)?;
+        // A BEFORE INSERT trigger reads only NEW, which it gets as SQL values,
+        // so nothing decodes.
+        let decodes =
+            !context.new_is_decoded || !matches!(context.event, ast::TriggerEvent::Insert);
+        let analyzed_columns = self.source_columns_with(&table, decodes)?;
         let columns = analyzed_columns
             .iter()
             .map(|column| column.column.clone())
@@ -361,14 +365,19 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect::<Vec<_>>();
         let rowid_available = table_has_rowid(table.value());
 
+        // A BEFORE trigger gets NEW before it is encoded, so reading it does
+        // not decode.
+        let new_type_programs = if context.new_is_decoded {
+            vec![None; column_type_programs.len()]
+        } else {
+            column_type_programs.clone()
+        };
         let mut create_row = |row| {
-            self.create_trigger_row_source(
-                row,
-                &table,
-                &columns,
-                &column_type_programs,
-                rowid_available,
-            )
+            let programs = match row {
+                TriggerRow::New => &new_type_programs,
+                TriggerRow::Old => &column_type_programs,
+            };
+            self.create_trigger_row_source(row, &table, &columns, programs, rowid_available)
         };
         let (new_source, old_source) = match &context.event {
             ast::TriggerEvent::Insert => (Some(create_row(TriggerRow::New)?), None),

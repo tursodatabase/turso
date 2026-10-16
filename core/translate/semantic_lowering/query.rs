@@ -716,7 +716,7 @@ pub(crate) fn prepare_subquery(
     Ok(PreparedSubquery {
         query: query_id,
         destination: prepared.destination,
-        correlated: document.reads_outer_sources(query_id),
+        correlated: document.reads_outer_sources(query_id) || program.reruns_subquery(query_id),
     })
 }
 
@@ -1023,7 +1023,12 @@ pub(crate) fn emit_planned_query_body(
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;
-    let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
+    // An index method may apply LIMIT and OFFSET while it scans.
+    let limit = query
+        .limit
+        .as_ref()
+        .filter(|_| !planned_query.blocks[0].limit_applied);
+    let limit = initialize_limit(program, document, limit, done)?;
     let output = if let Some(sorter) = sorter.as_ref() {
         HirRowOutput {
             target: HirRowTarget::Sorter(sorter),
@@ -1071,7 +1076,12 @@ fn emit_planned_query_block(
         },
         distinct: distinct.as_ref(),
     };
-    emit_planned_query_block_with_output(program, plan, query, block_index, &output, done)
+    // A row the block skips (WHERE, OFFSET) ends only this block; the next
+    // block of a compound still runs. A spent LIMIT ends the whole query.
+    let block_done = program.allocate_label();
+    emit_planned_query_block_with_output(program, plan, query, block_index, &output, block_done)?;
+    program.preassign_label_to_next_insn(block_done);
+    Ok(())
 }
 
 fn emit_planned_query_block_with_output(
@@ -1524,16 +1534,20 @@ fn emit_hir_group_input(
                     &runtime.grouping.keys[*index],
                     runtime.state.current_keys + index,
                 )?,
+                // The group's row registers hold columns as stored; reading
+                // them through the bound source decodes them once.
                 HirGroupInput::Column {
                     reference,
                     row_register,
                     ..
-                } => super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::Column(*reference),
-                    *row_register,
-                )?,
+                } => super::dml::with_stored_values(program, |program| {
+                    super::expr::translate_expr(
+                        program,
+                        document,
+                        &hir::Expr::Column(*reference),
+                        *row_register,
+                    )
+                })?,
                 HirGroupInput::RowId {
                     source,
                     row_register,
@@ -1553,12 +1567,14 @@ fn emit_hir_group_input(
         let expression = match input {
             HirGroupInput::Key(index) => &runtime.grouping.keys[*index],
             HirGroupInput::Column { reference, .. } => {
-                super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::Column(*reference),
-                    target,
-                )?;
+                super::dml::with_stored_values(program, |program| {
+                    super::expr::translate_expr(
+                        program,
+                        document,
+                        &hir::Expr::Column(*reference),
+                        target,
+                    )
+                })?;
                 continue;
             }
             HirGroupInput::RowId { source, .. } => {
@@ -2456,6 +2472,9 @@ pub(super) struct PreparedHirBtreeLoop<'a> {
     pub(super) table_cursor: Option<CursorID>,
     pub(super) autoindex_source_cursor: Option<CursorID>,
     pub(super) table_has_rowid: bool,
+    /// Expressions of the query block an index without a table cursor
+    /// supplies, each with the index column holding it.
+    pub(super) index_keys: Vec<(&'a hir::Expr, usize)>,
 }
 
 struct PreparedHirMaterializedLoop<'a> {
@@ -2468,6 +2487,19 @@ struct PreparedHirVirtualLoop<'a> {
     source: &'a hir::Source,
     operation: &'a HirVirtualTableOperation,
     cursor: CursorID,
+}
+
+/// A scan through a query pattern of an index method, such as FTS: the
+/// index returns rowids, and the values of the pattern's result columns.
+struct PreparedHirIndexMethodLoop<'a> {
+    source: &'a hir::Source,
+    access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
+    index_cursor: CursorID,
+    table_cursor: CursorID,
+    database: usize,
+    /// Expressions of the query block the index returns, each with the
+    /// index column that holds it.
+    covered: Vec<(&'a hir::Expr, usize)>,
 }
 
 struct PreparedHirRegistersLoop<'a> {
@@ -2500,6 +2532,7 @@ impl HirMaterializedQuery {
 enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Virtual(PreparedHirVirtualLoop<'a>),
+    IndexMethod(PreparedHirIndexMethodLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
     Coroutine(PreparedHirCoroutineLoop<'a>),
@@ -2510,6 +2543,7 @@ impl PreparedHirLoop<'_> {
         match self {
             Self::BTree(prepared) => Some(prepared.cursor),
             Self::Virtual(prepared) => Some(prepared.cursor),
+            Self::IndexMethod(prepared) => Some(prepared.index_cursor),
             Self::Materialized(prepared) => Some(prepared.cursor),
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -2519,6 +2553,7 @@ impl PreparedHirLoop<'_> {
         match self {
             Self::BTree(prepared) => prepared.table_cursor,
             Self::Virtual(_) => None,
+            Self::IndexMethod(prepared) => Some(prepared.table_cursor),
             Self::Materialized(_) => None,
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -3484,7 +3519,9 @@ impl HirLoopNest<'_, '_> {
                     );
                     register_bindings.push((registers.source.id, original));
                 }
-                PreparedHirLoop::Virtual(_) | PreparedHirLoop::Coroutine(_) => {
+                PreparedHirLoop::Virtual(_)
+                | PreparedHirLoop::IndexMethod(_)
+                | PreparedHirLoop::Coroutine(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -3641,6 +3678,7 @@ fn prepare_hir_right_outer_join(
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
         PreparedHirLoop::Virtual(_)
+        | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::Registers(_)
         | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
@@ -4048,6 +4086,14 @@ pub(super) fn hir_loop_explain(
                 ),
             }
         }
+        HirSourceAccess::IndexMethod(access) => EqpDetail::IndexMethod {
+            method: access
+                .index
+                .index_method
+                .as_ref()
+                .map(|method| method.definition().method_name.to_string())
+                .unwrap_or_default(),
+        },
         HirSourceAccess::Virtual(_) => EqpDetail::Scan {
             table,
             index: None,
@@ -4245,6 +4291,9 @@ fn prepare_hir_loop_unexplained<'a>(
         HirSourceAccess::Virtual(operation) => Ok(PreparedHirLoop::Virtual(
             prepare_hir_virtual_loop(program, &plan.document, planned_loop.source, operation)?,
         )),
+        HirSourceAccess::IndexMethod(access) => Ok(PreparedHirLoop::IndexMethod(
+            prepare_hir_index_method_loop(program, plan, planned_loop.source, access)?,
+        )),
         HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
             prepare_hir_materialized_loop(
                 program,
@@ -4348,6 +4397,185 @@ fn prepare_hir_virtual_loop<'a>(
         source,
         operation,
         cursor,
+    })
+}
+
+fn prepare_hir_index_method_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
+) -> Result<PreparedHirIndexMethodLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop references missing source {source_id}"
+        ))
+    })?;
+    let table = match &source.kind {
+        hir::SourceKind::Table(table) => table.value().btree(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} is not a B-tree table"
+        ))
+    })?;
+    let database = source.database.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} has no database"
+        ))
+    })?;
+    let database_snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method loop source {source_id} references missing database {database:?}"
+        ))
+    })?;
+    program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let index_cursor = program.alloc_cursor_index(None, &access.index)?;
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor,
+        root_page: table.root_page,
+        db: database.index(),
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: index_cursor,
+        root_page: access.index.root_page,
+        db: database.index(),
+    });
+    // Columns are read from the table, which follows the index's rowids.
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    // The expressions of this block that the index returns.
+    let covered = find_block_subexpressions(plan, source, |expression| {
+        access
+            .covered
+            .iter()
+            .find(|(covered, _)| covered.equivalent(expression))
+            .map(|(_, column)| *column)
+    })?;
+    Ok(PreparedHirIndexMethodLoop {
+        source,
+        access,
+        index_cursor,
+        table_cursor,
+        database: database.index(),
+        covered,
+    })
+}
+
+/// Every expression the query block owning `source` evaluates per row: its
+/// outputs, grouping keys and HAVING, its query's ORDER BY, and the WHERE
+/// terms its plan left to check.
+fn hir_block_expressions<'a>(
+    plan: &'a HirPlan,
+    source: &hir::Source,
+) -> Result<Vec<&'a hir::Expr>> {
+    let document = &plan.document;
+    let hir::SourceOwner::QueryBlock(block_id) = source.owner else {
+        return Ok(Vec::new());
+    };
+    let block = document.query_block(block_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query block {block_id:?} is missing"))
+    })?;
+    let query = document.query(block_id.query).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query {} is missing", block_id.query))
+    })?;
+    let mut roots = block
+        .outputs
+        .iter()
+        .map(|output| &output.expr)
+        .collect::<Vec<_>>();
+    if let Some(grouping) = hir_grouping(block) {
+        roots.extend(&grouping.keys);
+        roots.extend(&grouping.having);
+    }
+    roots.extend(query.order_by.iter().map(|term| &term.expr));
+    if let Some(planned) = plan.planned_query(block_id.query).and_then(|planned| {
+        planned
+            .blocks
+            .iter()
+            .find(|planned| planned.block == block_id)
+    }) {
+        roots.extend(
+            planned
+                .predicates
+                .iter()
+                .filter(|term| !term.consumed)
+                .map(|term| &term.expr),
+        );
+    }
+    Ok(roots)
+}
+
+/// The largest parts of the block's expressions for which `matches` names a
+/// column of a cursor, with that column.
+fn find_block_subexpressions<'a>(
+    plan: &'a HirPlan,
+    source: &hir::Source,
+    matches: impl Fn(&hir::Expr) -> Option<usize>,
+) -> Result<Vec<(&'a hir::Expr, usize)>> {
+    let mut found = Vec::new();
+    let mut pending = hir_block_expressions(plan, source)?;
+    while let Some(expression) = pending.pop() {
+        if let Some(column) = matches(expression) {
+            found.push((expression, column));
+            continue;
+        }
+        pending.extend((0..).map_while(|position| expression.child(position)));
+    }
+    Ok(found)
+}
+
+fn start_hir_index_method_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirIndexMethodLoop<'_>,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    // The pattern's number, then the values of its placeholders.
+    let arguments = &prepared.access.arguments;
+    let start = program.alloc_registers(arguments.len() + 1);
+    program.emit_int(prepared.access.pattern as i64, start);
+    for (position, argument) in arguments.iter().enumerate() {
+        super::expr::translate_expr(program, document, argument, start + 1 + position)?;
+    }
+    program.emit_insn(Insn::IndexMethodQuery {
+        db: prepared.database,
+        cursor_id: prepared.index_cursor,
+        start_reg: start,
+        count_reg: arguments.len() + 1,
+        pc_if_empty: exhausted,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::DeferredSeek {
+        index_cursor_id: prepared.index_cursor,
+        table_cursor_id: prepared.table_cursor,
+    });
+    for (expression, column) in &prepared.covered {
+        let register = program.alloc_register();
+        program.emit_column_or_rowid(prepared.index_cursor, *column, register);
+        program.bind_expression_register(expression, register);
+    }
+    Ok(HirBtreeLoop {
+        cursor: Some(prepared.index_cursor),
+        loop_start,
+        next,
+        exhausted,
+        advance: HirLoopAdvance::Cursor {
+            direction: IterationDirection::Forwards,
+            fullscan: false,
+        },
+        left_join,
     })
 }
 
@@ -4848,6 +5076,27 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         });
     }
 
+    // An index read without its table supplies the expressions it keys,
+    // such as `a + b` for an index on `t(a + b)`.
+    let index_keys = match index {
+        Some(index) if table_cursor.is_none() && !index.ephemeral => {
+            match source
+                .index_expressions
+                .iter()
+                .find(|expressions| expressions.index.value().name == index.name)
+            {
+                Some(expressions) if expressions.columns.iter().any(Option::is_some) => {
+                    find_block_subexpressions(plan, source, |expression| {
+                        expressions.columns.iter().position(|key| {
+                            key.as_ref().is_some_and(|key| key.equivalent(expression))
+                        })
+                    })?
+                }
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
     Ok(PreparedHirBtreeLoop {
         source,
         operation,
@@ -4856,6 +5105,7 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         table_cursor,
         autoindex_source_cursor,
         table_has_rowid: table.has_rowid,
+        index_keys,
     })
 }
 
@@ -4980,6 +5230,9 @@ fn start_hir_loop(
         }
         PreparedHirLoop::Virtual(prepared) => {
             start_hir_virtual_loop(program, document, prepared, left_join)
+        }
+        PreparedHirLoop::IndexMethod(prepared) => {
+            start_hir_index_method_loop(program, document, prepared, left_join)
         }
         PreparedHirLoop::Registers(prepared) => {
             if !matches!(
@@ -5175,6 +5428,11 @@ pub(super) fn start_hir_btree_loop(
                 table_cursor_id: table_cursor,
             });
         }
+    }
+    for (expression, column) in &prepared.index_keys {
+        let register = program.alloc_register();
+        program.emit_column_or_rowid(prepared.cursor, *column, register);
+        program.bind_expression_register(expression, register);
     }
     Ok(HirBtreeLoop {
         cursor: Some(prepared.cursor),
@@ -5654,7 +5912,7 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, document, output_definitions, outputs);
+    emit_array_results(program, document, output_definitions, outputs)?;
     emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -5902,7 +6160,7 @@ fn emit_query_row_with_inputs<'expr>(
     }
 
     if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
-        emit_array_results(program, document, outputs, start);
+        emit_array_results(program, document, outputs, start)?;
     }
 
     if let Some(distinct) = output.distinct {
@@ -6436,7 +6694,7 @@ pub(super) fn emit_array_results(
     document: &HirDocument,
     outputs: &[hir::Output],
     start: usize,
-) {
+) -> Result<()> {
     for (position, output) in outputs.iter().enumerate() {
         if !output.type_fact.is_array() && !hir_expr_passes_array(document, &output.expr) {
             continue;
@@ -6447,9 +6705,36 @@ pub(super) fn emit_array_results(
             reg: register,
             target_pc: skip,
         });
+        // Like legacy, an array column of a custom type has its elements
+        // decoded for display.
+        if let Some(decode) = array_column_decode(document, &output.expr) {
+            super::expr::translate_schema_calls_on_elements(program, document, decode, register)?;
+        }
         program.emit_insn(Insn::ArrayDecode { reg: register });
         program.preassign_label_to_next_insn(skip);
     }
+    Ok(())
+}
+
+/// The element decode programs of an array column of a custom type that
+/// `expression` reads directly.
+fn array_column_decode<'a>(
+    document: &'a HirDocument,
+    expression: &hir::Expr,
+) -> Option<&'a [hir::BoundSchemaCall]> {
+    let hir::Expr::Column(reference) = expression else {
+        return None;
+    };
+    let source = document.source(reference.source)?;
+    if !source.columns.get(reference.column)?.type_fact.is_array() {
+        return None;
+    }
+    source
+        .column_type_programs
+        .get(reference.column)?
+        .as_ref()
+        .map(|programs| programs.decode.as_slice())
+        .filter(|decode| !decode.is_empty())
 }
 
 /// Like legacy, an expression that can pass an array value through is
@@ -6591,6 +6876,7 @@ pub(super) mod tests {
                 custom_types_enabled: true,
                 dqs_dml: DoubleQuotedDml::Enabled,
                 foreign_keys_enabled: true,
+                capture_changes_table: None,
             },
             SemanticRootInput::Statement(&statement),
         )

@@ -2,7 +2,7 @@
 //! legacy planner does. Each case runs on two fresh databases, one per
 //! planner, and compares what is left behind.
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 
 const SETUP: &[&str] = &[
     "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c TEXT, d REAL, g AS (b * 2) VIRTUAL)",
@@ -255,6 +255,63 @@ fn hir_update_matches_legacy() {
             "SELECT * FROM ur ORDER BY a",
             "PRAGMA integrity_check",
         ],
+        // A subquery in WHERE: the rows to change are collected first, so the
+        // subquery never sees a changed row.
+        &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        &["UPDATE u SET b = b + 1 WHERE b < (SELECT max(b) FROM u)"],
+        &["UPDATE u SET d = d + 1 WHERE EXISTS (SELECT 1 FROM t WHERE t.a = u.a AND t.c = u.c)"],
+        &["UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2"],
+        &["UPDATE OR IGNORE u SET b = 2 WHERE a IN (SELECT a FROM t) RETURNING a, b"],
+        // A RETURNING subquery that reads the target runs again for each
+        // row.
+        &["UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
+           (SELECT count(*) FROM u AS x WHERE x.d = u.d)"],
+        // Subqueries in SET read the table as the loop changes it, row by
+        // row.
+        &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
+        &["UPDATE u SET d = (SELECT max(x.d) FROM u AS x WHERE x.a < u.a)"],
+        &["UPDATE u SET d = (SELECT sum(x.d) FROM u AS x WHERE x.a <= u.a) WHERE a > 2"],
+        &["UPDATE u SET b = (SELECT max(b) FROM u) + a"],
+        // A new rowid moves the row: every index entry changes, a taken rowid
+        // conflicts, and the rows are collected first.
+        &[
+            "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d CHECK (d IS NOT 'bad'))",
+            "CREATE INDEX u_c ON u(c)",
+            "CREATE TABLE n(x, y)",
+            "CREATE TABLE log(o, nw)",
+            "INSERT INTO u VALUES (1, 1, 'x', 1), (2, 2, 'y', 2), (3, 3, 'z', 3), (5, 5, 'p', 5)",
+            "INSERT INTO n(rowid, x, y) VALUES (1, 'a', 1), (2, 'b', 2)",
+            "UPDATE u SET a = a + 10",
+            "SELECT * FROM u ORDER BY a",
+            "UPDATE u SET a = 12 WHERE a = 11",
+            "UPDATE OR IGNORE u SET a = 12 WHERE a = 11",
+            "UPDATE OR REPLACE u SET a = 12 WHERE a = 11",
+            "SELECT * FROM u ORDER BY a",
+            "SELECT c, a FROM u INDEXED BY u_c ORDER BY c",
+            "UPDATE u SET rowid = 100, c = 'q' WHERE b = 3",
+            "UPDATE u SET a = a WHERE b = 5",
+            "UPDATE u SET a = NULL WHERE b = 5",
+            "UPDATE u SET a = 'abc' WHERE b = 5",
+            "UPDATE u SET a = '7' WHERE b = 5",
+            "SELECT * FROM u ORDER BY a",
+            "UPDATE n SET rowid = rowid + 1",
+            "SELECT rowid, * FROM n ORDER BY rowid",
+            "UPDATE n SET rowid = 3 WHERE x = 'a'",
+            "CREATE TRIGGER t AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (old.a, new.a); END",
+            "CREATE TRIGGER tb BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (old.rowid, new.rowid); END",
+            "UPDATE u SET a = a * 2 WHERE a < 50 RETURNING a, b, rowid",
+            "SELECT * FROM log",
+            "UPDATE u SET (a, c) = (SELECT 300, 'row') WHERE a = 200",
+            "UPDATE u SET a = 7, d = 'bad' WHERE a = 300",
+            "UPDATE OR IGNORE u SET a = a + 1, d = 'bad'",
+            "SELECT * FROM u ORDER BY a",
+            "PRAGMA integrity_check",
+        ],
+        // The rightmost of two assignments to the rowid wins.
+        &[
+            "UPDATE u SET a = 1, rowid = 20 WHERE a = 2",
+            "UPDATE u SET rowid = 7, a = 8 WHERE a = 20",
+        ],
         // Statements that still go through legacy.
         &[
             "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
@@ -265,8 +322,7 @@ fn hir_update_matches_legacy() {
         &["UPDATE u SET a = a + 10 WHERE a = 1"],
         &["UPDATE OR REPLACE u SET b = 1 WHERE a = 2"],
         &["UPDATE u SET b = b + 100 WHERE b > 2"],
-        &["UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1"],
-        &["UPDATE u SET d = 1 WHERE b IN (SELECT b FROM u WHERE c = 'x')"],
+        &["UPDATE u SET (c, d) = (SELECT 'm', a FROM u AS x WHERE x.a = u.a + 1) WHERE a > 4"],
         // UPDATE ... FROM: the join fills a scratch table first.
         &["UPDATE u SET c = log.a FROM log WHERE log.a = u.a"],
         &["UPDATE u SET c = t.c, d = t.d + u.d FROM t WHERE t.a = u.a RETURNING *"],
@@ -422,6 +478,126 @@ fn hir_insert_matches_legacy() {
              ON CONFLICT(k) DO UPDATE SET v = v + excluded.v, n = n + 1",
             "SELECT * FROM kv ORDER BY k",
         ],
+        // The ON CONFLICT target picks the UNIQUE index with the same key
+        // terms, in any order, with the same collation and WHERE clause.
+        &[
+            "CREATE TABLE m(x, y, z TEXT COLLATE nocase, w, UNIQUE(x, y))",
+            "CREATE UNIQUE INDEX m_z ON m(z)",
+            "CREATE UNIQUE INDEX m_w ON m(abs(w)) WHERE w > 0",
+            "INSERT INTO m VALUES (1, 1, 'a', 1), (1, 2, 'b', 2)",
+            "INSERT INTO m VALUES (1, 2, 'c', 3) ON CONFLICT(y, x) DO UPDATE SET z = 'yx'",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z) DO UPDATE SET w = 10",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z COLLATE NOCASE) DO UPDATE SET w = 11",
+            "INSERT INTO m VALUES (9, 9, 'A', 4) ON CONFLICT(z COLLATE binary) DO NOTHING",
+            "INSERT INTO m VALUES (8, 8, 'q', -11) ON CONFLICT(abs(w)) WHERE w > 0 DO UPDATE SET x = 0",
+            "INSERT INTO m VALUES (8, 8, 'q', 11) ON CONFLICT(abs(w)) DO NOTHING",
+            "INSERT INTO m VALUES (8, 8, 'q', 11) ON CONFLICT(abs(w)) WHERE w > 0 DO UPDATE SET x = 0",
+            "INSERT INTO m VALUES (8, 8, 'q', 12) ON CONFLICT(x) DO NOTHING",
+            "SELECT * FROM m ORDER BY rowid",
+        ],
+        // CHECK constraints: IGNORE skips the row, REPLACE still aborts, an
+        // UPSERT checks with ABORT, and an UPDATE checks only the
+        // constraints that read a changed column.
+        &[
+            "CREATE TABLE ck(a INTEGER PRIMARY KEY, b INT CHECK (b > 0), c TEXT, d, \
+             CONSTRAINT named CHECK (length(c) < 4), CHECK ( \"d\" IS NOT 'bad' ))",
+            "INSERT INTO ck VALUES (1, 1, 'x', 0)",
+            "INSERT INTO ck VALUES (2, 0, 'x', 0)",
+            "INSERT INTO ck VALUES (3, 1, 'xxxxx', 0)",
+            "INSERT INTO ck VALUES (4, 1, 'x', 'bad')",
+            "INSERT INTO ck VALUES (5, NULL, NULL, NULL)",
+            "INSERT OR IGNORE INTO ck VALUES (6, -1, 'x', 0), (7, 7, 'x', 0)",
+            "INSERT OR REPLACE INTO ck VALUES (1, -1, 'x', 0)",
+            "INSERT INTO ck VALUES (1, 2, 'y', 0) ON CONFLICT(a) DO UPDATE SET b = -excluded.b",
+            "INSERT INTO ck VALUES (1, 2, 'y', 0) ON CONFLICT(a) DO UPDATE SET c = 'zz'",
+            "UPDATE ck SET b = 0 WHERE a = 1",
+            "UPDATE ck SET c = 'long' WHERE a = 1",
+            "UPDATE OR IGNORE ck SET b = b - 1",
+            "PRAGMA ignore_check_constraints = 1",
+            "INSERT INTO ck VALUES (8, -8, 'xxxxxx', 'bad')",
+            "UPDATE ck SET b = -9 WHERE a = 7",
+            "PRAGMA ignore_check_constraints = 0",
+            "UPDATE ck SET c = c WHERE a = 8",
+            "UPDATE ck SET d = 1 WHERE a = 8",
+            "CREATE TABLE ckr(x INTEGER PRIMARY KEY CHECK (x < 100), y CHECK (y <> x))",
+            "INSERT INTO ckr VALUES (5, 6)",
+            "INSERT INTO ckr VALUES (500, 6)",
+            "INSERT INTO ckr(y) VALUES (1)",
+            "UPDATE ckr SET y = 5",
+            "SELECT * FROM ck ORDER BY a",
+            "SELECT * FROM ckr ORDER BY x",
+        ],
+        // AUTOINCREMENT keeps the largest rowid ever used in sqlite_sequence.
+        &[
+            "CREATE TABLE ai(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE, c CHECK (c IS NOT 'bad'))",
+            "CREATE TABLE log(x)",
+            "INSERT INTO ai(b) VALUES (1)",
+            "INSERT INTO ai(b) VALUES (2), (3)",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai VALUES (10, 4, NULL)",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai VALUES (5, 5, NULL)",
+            "SELECT * FROM sqlite_sequence",
+            "DELETE FROM ai WHERE a = 10",
+            "INSERT INTO ai(b) VALUES (6)",
+            "SELECT * FROM ai ORDER BY a",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT OR IGNORE INTO ai VALUES (20, 7, 'bad')",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai VALUES (NULL, 8, NULL), (30, 9, NULL), (NULL, 10, NULL)",
+            "SELECT * FROM ai ORDER BY a",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai(b) VALUES (1)",
+            "INSERT OR IGNORE INTO ai(b) VALUES (1), (11)",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT OR REPLACE INTO ai(b, c) VALUES (1, 'r')",
+            "SELECT * FROM ai ORDER BY a",
+            "SELECT * FROM sqlite_sequence",
+            "CREATE TABLE ai2(a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
+            "INSERT INTO ai2(b) SELECT b FROM ai WHERE 0",
+            "SELECT * FROM sqlite_sequence",
+            "CREATE TRIGGER t AFTER INSERT ON ai2 BEGIN INSERT INTO ai(b) VALUES (new.b + 1000); END",
+            "INSERT INTO ai2(b) SELECT b FROM ai WHERE b < 4",
+            "SELECT * FROM ai ORDER BY a",
+            "SELECT * FROM ai2 ORDER BY a",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai VALUES (9223372036854775807, 99, NULL)",
+            "INSERT INTO ai(b) VALUES (100)",
+            "SELECT * FROM sqlite_sequence",
+            "INSERT INTO ai(b) VALUES (2) ON CONFLICT(b) DO UPDATE SET c = 'up'",
+            "INSERT INTO ai VALUES (50, 2, NULL) ON CONFLICT(b) DO NOTHING",
+            "SELECT * FROM sqlite_sequence",
+        ],
+        // STRICT tables check each value against its column type instead of
+        // applying affinity.
+        &[
+            "CREATE TABLE s(a INTEGER PRIMARY KEY, b INT, c TEXT, d REAL, e BLOB, f ANY, g INTEGER NOT NULL DEFAULT 0, UNIQUE(b)) STRICT",
+            "INSERT INTO s(b, c, d, e, f) VALUES (1, 'x', 1.5, x'00', 'any')",
+            "INSERT INTO s(b, c, d, e, f) VALUES ('2', 3, 4, x'01', 5)",
+            "INSERT INTO s(b) VALUES ('x')",
+            "INSERT INTO s(b, d) VALUES (3, 'abc')",
+            "INSERT INTO s(b, c) VALUES (4, x'00')",
+            "INSERT INTO s(b, e) VALUES (5, 'text')",
+            "INSERT INTO s(b, d) VALUES (6, '7.5')",
+            "INSERT INTO s(b, d) VALUES (7, 8)",
+            "INSERT INTO s(a, b) VALUES ('9', 9)",
+            "INSERT INTO s(a, b) VALUES ('z', 10)",
+            "INSERT OR IGNORE INTO s(b) VALUES ('bad'), (11)",
+            "SELECT a, b, typeof(b), c, typeof(c), d, typeof(d), e, f, typeof(f), g FROM s ORDER BY a",
+            "UPDATE s SET b = '12' WHERE a = 1",
+            "UPDATE s SET b = 'nope' WHERE a = 1",
+            "UPDATE s SET d = '1e2' WHERE a = 2",
+            "UPDATE OR IGNORE s SET c = 5",
+            "UPDATE s SET g = NULL WHERE a = 1",
+            "INSERT INTO s(b, c) VALUES (1, 'u') ON CONFLICT(b) DO NOTHING",
+            "INSERT INTO s(b, c) VALUES (12, 'u') ON CONFLICT(b) DO UPDATE SET d = '3'",
+            "INSERT INTO s(b, c) VALUES (12, 'u') ON CONFLICT(b) DO UPDATE SET d = 'q'",
+            "SELECT a, b, typeof(b), c, typeof(c), d, typeof(d), e, f, typeof(f), g FROM s ORDER BY a",
+            "CREATE TABLE p(x INT PRIMARY KEY, y TEXT) STRICT",
+            "INSERT INTO p VALUES (NULL, 'a')",
+            "INSERT INTO p VALUES ('1', 2)",
+            "SELECT x, typeof(x), y, typeof(y) FROM p",
+        ],
         // REPLACE deletes the rows the new row conflicts with.
         &["INSERT OR REPLACE INTO u VALUES (1, 10, 'r', 1)"],
         &["INSERT OR REPLACE INTO u VALUES (10, 2, 'r', 1)"],
@@ -464,8 +640,24 @@ fn hir_insert_matches_legacy() {
         &["INSERT OR REPLACE INTO u VALUES (1, 60, 'v', 1)"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = log.a"],
-        &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
         &["INSERT INTO t(b) VALUES (62)"],
+        // Like legacy, a RETURNING subquery that reads the target runs again
+        // for each row.
+        &["INSERT INTO u(b) VALUES (69), (70) RETURNING (SELECT count(*) FROM u)"],
+        // Subqueries in VALUES. Rows that read the target are all computed
+        // before any is inserted.
+        &["INSERT INTO u(b, c) VALUES (61, (SELECT max(c) FROM u))"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(b) FROM u) + 1, 'r1'), \
+           ((SELECT max(b) FROM u) + 1, 'r2')"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(b) FROM u) + 1, 'r1'), \
+           ((SELECT max(b) FROM u) + 2, (SELECT count(*) FROM u))"],
+        &["INSERT INTO u(b, c) VALUES ((SELECT max(a) FROM log) + 70, 'l'), (71, 'm')"],
+        // With triggers, the rows are computed before any is inserted too.
+        &[
+            "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
+            "INSERT INTO u(b, c) VALUES (72, last_insert_rowid()), (73, last_insert_rowid()), \
+             (74, (SELECT count(*) FROM log))",
+        ],
         // Triggers run from HIR-compiled subprograms. NEW.rowid reads -1 in
         // a BEFORE trigger until the rowid is known.
         &[
@@ -531,8 +723,8 @@ const FK_SETUP: &[&str] = &[
     "CREATE TABLE s(id INTEGER PRIMARY KEY, up INTEGER REFERENCES s(id))",
     "CREATE TABLE q(k TEXT UNIQUE, up INTEGER REFERENCES q(k))",
     "CREATE TABLE rk(k TEXT REFERENCES p(k) ON UPDATE RESTRICT)",
-    // ON UPDATE CASCADE still goes to legacy, on a parent of its own so the
-    // other UPDATEs of `p` stay on HIR.
+    // ON UPDATE CASCADE, on a parent of its own so the other UPDATEs of `p`
+    // check only.
     "CREATE TABLE p2(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
     "CREATE TABLE ck(k TEXT REFERENCES p2(k) ON UPDATE CASCADE)",
     "INSERT INTO p VALUES (1, 'one', 1, 1), (2, 'two', 2, 2), (3, 'three', 3, 3), \
@@ -552,6 +744,30 @@ const FK_SETUP: &[&str] = &[
 fn hir_foreign_keys_match_legacy() {
     for statements in [
         &["DELETE FROM p WHERE id = 5"][..],
+        // A new rowid changes a rowid parent key; a row may be its own parent
+        // under its new rowid.
+        &[
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, k)",
+            "CREATE TABLE c(x REFERENCES p(id))",
+            "CREATE TABLE s(id INTEGER PRIMARY KEY, up REFERENCES s(id))",
+            "CREATE TABLE d(x REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO c VALUES (1)",
+            "INSERT INTO s VALUES (1, NULL), (2, 1)",
+            "UPDATE p SET id = 10 WHERE id = 1",
+            "UPDATE p SET id = 20 WHERE id = 2",
+            "UPDATE p SET rowid = 30 WHERE id = 3",
+            "SELECT * FROM p ORDER BY id",
+            "UPDATE s SET id = 5 WHERE id = 1",
+            "UPDATE s SET id = 6, up = 6 WHERE id = 2",
+            "SELECT * FROM s ORDER BY id",
+            "BEGIN",
+            "INSERT INTO d VALUES (40)",
+            "UPDATE p SET id = 40 WHERE id = 20",
+            "COMMIT",
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM d",
+        ],
         // A child found by scanning `c`, and one found through `c_y`.
         &["DELETE FROM p WHERE id = 1"],
         &["DELETE FROM p WHERE id = 2"],
@@ -776,6 +992,923 @@ fn hir_delete_binds_parameters_like_legacy() {
     assert_eq!(run(true), run(false));
 }
 
+/// Subqueries in an UPDATE's SET and WHERE see the table as SQLite's do.
+#[test]
+fn hir_update_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d)",
+        "INSERT INTO u VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', -1), (3, 3, 'z', 3), \
+         (4, 4, NULL, NULL), (5, 5, 'p', 5), (6, 6, 'q', 5)",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "UPDATE u SET c = (SELECT max(c) FROM u) WHERE a = 1",
+        "UPDATE u SET d = (SELECT max(x.d) FROM u AS x WHERE x.a < u.a)",
+        "UPDATE u SET d = (SELECT sum(x.d) FROM u AS x WHERE x.a <= u.a) WHERE a > 2",
+        "UPDATE u SET b = (SELECT max(b) FROM u) + a",
+        "UPDATE u SET b = b + 10 WHERE (SELECT count(*) FROM u AS x WHERE x.b > u.b) > 2",
+        "UPDATE u SET d = d + 1 WHERE b < (SELECT max(b) FROM u)",
+        // One subquery row assigned to several columns runs once per row.
+        "UPDATE u SET (c, d) = (SELECT 'm', a FROM u AS x WHERE x.a = u.a + 1) WHERE a > 4",
+        "UPDATE u SET (c, b) = (SELECT 'k', 100), d = 7 WHERE a = 1",
+        "UPDATE u SET (b, c) = (SELECT max(b) + 1, count(*) FROM u) WHERE a = 2",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+        let select = "SELECT * FROM u ORDER BY a";
+        assert_eq!(
+            limbo_exec_rows(&conn, select),
+            sqlite_exec_rows(&sqlite, select),
+            "{sql}"
+        );
+    }
+}
+
+/// Subqueries in INSERT VALUES see the table as SQLite's do: each VALUES
+/// row is computed after the rows before it are written.
+#[test]
+fn hir_insert_values_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE v(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "INSERT INTO v VALUES (1, 1, 'x'), (2, 2, 'y')",
+        "CREATE TABLE w(x)",
+        "INSERT INTO w VALUES (10), (20)",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "INSERT INTO v(b, c) VALUES ((SELECT max(b) FROM v) + 1, 'one')",
+        "INSERT INTO v(b, c) VALUES ((SELECT max(b) FROM v) + 1, 'r1'), \
+         ((SELECT max(b) FROM v) + 1, 'r2'), ((SELECT count(*) FROM v) * 10, 'r3')",
+        "INSERT INTO v(b, c) VALUES ((SELECT max(x) FROM w), (SELECT group_concat(c) FROM v))",
+        "INSERT INTO v(b, c) VALUES (100, 'p'), ((SELECT b FROM v WHERE c = 'p') + 1, 'q')",
+        "INSERT INTO v(b, c) VALUES ((SELECT 1 WHERE 0), (SELECT c FROM v WHERE a = 1))",
+        "INSERT INTO v(b) VALUES ((SELECT b FROM v WHERE a = 1))",
+    ] {
+        let turso = conn.execute(sql).map_err(|e| e.to_string());
+        let reference = sqlite.execute(sql, ()).map_err(|e| e.to_string());
+        assert_eq!(
+            turso.is_ok(),
+            reference.is_ok(),
+            "{sql}: {turso:?} {reference:?}"
+        );
+        let select = "SELECT * FROM v ORDER BY a";
+        assert_eq!(
+            limbo_exec_rows(&conn, select),
+            sqlite_exec_rows(&sqlite, select),
+            "{sql}"
+        );
+    }
+}
+
+/// Like SQLite, every subquery in RETURNING runs again for each row, so it
+/// sees the rows written so far.
+#[test]
+fn hir_returning_subqueries_match_sqlite() {
+    let setup = [
+        "CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE, c, d)",
+        "CREATE TABLE log(x)",
+        "CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.a); END",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in setup {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "INSERT INTO u VALUES (1, 1, 'x', 1.0), (2, 2, 'yy', -1), (3, 3, 'z', 3), \
+         (4, 4, NULL, NULL), (5, 5, 'p', 5), (6, 6, 'q', 5) \
+         RETURNING a, (SELECT count(*) FROM u), (SELECT max(b) FROM u WHERE b < 4)",
+        "UPDATE u SET d = 0 WHERE a < 3 RETURNING a, (SELECT sum(d) FROM u), \
+         (SELECT count(*) FROM u AS x WHERE x.d = u.d), (SELECT count(*) FROM log)",
+        "INSERT INTO u(b) VALUES (10), (11) RETURNING (SELECT group_concat(b) FROM u WHERE b > 5), \
+         (SELECT count(*) FROM (SELECT * FROM u))",
+        "UPDATE u SET c = 'k' WHERE a = 4 RETURNING EXISTS (SELECT 1 FROM u WHERE c = 'k'), \
+         (SELECT a FROM u WHERE c = 'k') IN (SELECT a FROM u)",
+        "INSERT INTO u(b) VALUES (12), (13) RETURNING \
+         (SELECT count(*) FROM log WHERE x IN (SELECT a FROM u)), \
+         (SELECT count(*) FROM log UNION ALL SELECT count(*) FROM u LIMIT 1 OFFSET 1), \
+         (WITH w AS (SELECT b FROM u) SELECT max(b) FROM w), \
+         (SELECT max(x.b) FROM u AS x WHERE x.b < u.b)",
+        "UPDATE u SET b = b + 100 WHERE a > 7 RETURNING b, (SELECT max(b) FROM u), \
+         (SELECT count(*) FROM log)",
+        "DELETE FROM u WHERE a < 3 RETURNING a, (SELECT count(*) FROM u), \
+         (SELECT group_concat(a) FROM u WHERE a < 5), (SELECT count(*) FROM log)",
+        "DELETE FROM u WHERE b > 10 RETURNING b, (SELECT max(b) FROM u), \
+         EXISTS (SELECT 1 FROM u AS x WHERE x.b = u.b)",
+        "SELECT * FROM u ORDER BY a",
+        "SELECT * FROM log",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// Virtual generated columns: computed for each new row from its other
+/// columns, indexed, checked and returned as SQLite does, and not stored.
+/// Legacy reports a NOT NULL failure for the UNIQUE conflict on `e` below.
+#[test]
+fn hir_generated_columns_match_sqlite() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE g(a INTEGER PRIMARY KEY, b, c AS (b * 2), d TEXT, e AS (c + length(d)) NOT NULL, f AS (a + 100), CHECK (c < 100))",
+        "CREATE INDEX g_c ON g(c)",
+        "CREATE UNIQUE INDEX g_e ON g(e)",
+        "CREATE INDEX g_x ON g(f * 2)",
+        "CREATE TABLE log(x, y)",
+        "INSERT INTO g(b, d) VALUES (1, 'x'), (2, 'yy')",
+        "INSERT INTO g(a, b, d) VALUES (10, 3, 'zzz')",
+        "SELECT * FROM g ORDER BY a",
+        "INSERT INTO g(b, d) VALUES (60, 'x')",
+        "INSERT INTO g(b, d) VALUES (1, NULL)",
+        "INSERT INTO g(b, d) VALUES (2, 'x')",
+        "INSERT OR IGNORE INTO g(b, d) VALUES (2, 'x'), (5, 'k')",
+        "INSERT INTO g(c) VALUES (1)",
+        "SELECT * FROM g ORDER BY a",
+        "UPDATE g SET b = b + 1",
+        "SELECT * FROM g ORDER BY a",
+        "UPDATE g SET d = 'long' WHERE a = 1",
+        "UPDATE g SET b = 70 WHERE a = 1",
+        "UPDATE g SET c = 1",
+        "UPDATE g SET a = a + 1000 WHERE a = 10",
+        "SELECT * FROM g ORDER BY a",
+        "SELECT c, a FROM g INDEXED BY g_c ORDER BY c",
+        "SELECT e, a FROM g INDEXED BY g_e ORDER BY e",
+        "CREATE TRIGGER tb BEFORE UPDATE ON g BEGIN INSERT INTO log VALUES (old.c, new.c); END",
+        "CREATE TRIGGER ta AFTER INSERT ON g BEGIN INSERT INTO log VALUES (new.c, new.e); END",
+        "UPDATE g SET b = 0 WHERE a = 2",
+        "INSERT INTO g(b, d) VALUES (7, 'q') RETURNING a, c, e, f",
+        "INSERT INTO g(a, b, d) VALUES (2, 9, 'w') ON CONFLICT(a) DO UPDATE SET b = excluded.b RETURNING *",
+        "SELECT * FROM log",
+        "SELECT * FROM g ORDER BY a",
+        "DELETE FROM g WHERE c > 10",
+        "SELECT * FROM g ORDER BY a",
+        "PRAGMA integrity_check",
+        // A STRICT table checks the types of its stored columns only.
+        "CREATE TABLE sg(a INT PRIMARY KEY, b INT AS (a || 'x'), c TEXT UNIQUE, d ANY AS (a * 2)) STRICT",
+        "INSERT INTO sg(a, c) VALUES (1, 'q'), ('2', 3)",
+        "INSERT INTO sg(a, c) VALUES ('x', 'r')",
+        "UPDATE sg SET a = '7' WHERE a = 1",
+        "UPDATE sg SET a = 'zz' WHERE a = 2",
+        "INSERT INTO sg(a, c) VALUES (11, 'q') ON CONFLICT(c) DO UPDATE SET a = excluded.a, c = 12",
+        "INSERT INTO sg(a, c) VALUES (13, '12') ON CONFLICT(c) DO UPDATE SET a = 'bad'",
+        "SELECT a, typeof(a), b, typeof(b), c, typeof(c), d FROM sg ORDER BY a",
+        // A DELETE whose RETURNING has a subquery reads the virtual columns
+        // of the deleted row. Legacy returns another column's value.
+        "CREATE TABLE dg(a INTEGER PRIMARY KEY, b, c AS (b * 2), d TEXT, e AS (d || c))",
+        "INSERT INTO dg(a, b, d) VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z')",
+        "DELETE FROM dg WHERE a = 2 RETURNING a, c, e, (SELECT count(*) FROM dg), (SELECT max(c) FROM dg)",
+        "DELETE FROM dg WHERE a > 0 RETURNING e, (SELECT group_concat(e) FROM dg)",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// Foreign-key actions: ON DELETE and ON UPDATE CASCADE, SET NULL and SET
+/// DEFAULT change the child rows, through triggers and through a table that
+/// references itself. HIR matches SQLite where legacy does not: a DELETE
+/// whose SET DEFAULT leaves a child pointing at a missing parent fails.
+#[test]
+fn hir_foreign_key_actions_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
+        "CREATE TABLE c1(x REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE, v)",
+        "CREATE TABLE c2(y TEXT DEFAULT 'two' REFERENCES p(k) ON DELETE SET DEFAULT ON UPDATE SET NULL)",
+        "CREATE TABLE c3(z REFERENCES p(id) ON DELETE SET NULL)",
+        "CREATE TABLE tree(id INTEGER PRIMARY KEY, up REFERENCES tree(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tc AFTER DELETE ON c1 BEGIN INSERT INTO log VALUES ('c1 ' || old.x); END",
+        "INSERT INTO p VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+        "INSERT INTO c1 VALUES (1, 'a'), (1, 'b'), (2, 'c'), (NULL, 'd')",
+        "INSERT INTO c2 VALUES ('one'), ('three'), (NULL)",
+        "INSERT INTO c3 VALUES (1), (3)",
+        "INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2), (4, 1), (5, NULL)",
+        "DELETE FROM p WHERE id = 1",
+        "SELECT * FROM c1 ORDER BY v",
+        "SELECT * FROM c2 ORDER BY y",
+        "SELECT * FROM c3 ORDER BY z",
+        "SELECT * FROM log",
+        "UPDATE p SET id = 20 WHERE id = 2",
+        "SELECT * FROM c1 ORDER BY v",
+        "UPDATE p SET k = 'tres' WHERE k = 'three'",
+        "SELECT * FROM c2 ORDER BY y",
+        "DELETE FROM tree WHERE id = 1",
+        "SELECT * FROM tree ORDER BY id",
+        "INSERT INTO tree VALUES (6, 5), (7, 6)",
+        "UPDATE tree SET id = 50 WHERE id = 5",
+        "SELECT * FROM tree ORDER BY id",
+        "DELETE FROM p WHERE id = 20 RETURNING id, (SELECT count(*) FROM c1)",
+        "SELECT * FROM c1 ORDER BY v",
+        "DELETE FROM p",
+        "SELECT * FROM c2 ORDER BY y",
+        "PRAGMA foreign_key_check",
+        // Two tables whose CASCADEs reach each other, a key of two columns
+        // whose SET DEFAULT points at a missing parent (legacy lets this
+        // last DELETE through), actions fired from a trigger, and a deferred
+        // SET NULL.
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, b_id REFERENCES b(id) ON DELETE CASCADE)",
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, a_id REFERENCES a(id) ON DELETE CASCADE)",
+        "INSERT INTO a VALUES (1, NULL), (2, NULL)",
+        "INSERT INTO b VALUES (10, 1), (20, 2)",
+        "UPDATE a SET b_id = 20 WHERE id = 1",
+        "DELETE FROM a WHERE id = 2",
+        "SELECT * FROM a ORDER BY id",
+        "SELECT * FROM b ORDER BY id",
+        "CREATE TABLE mp(x, y, PRIMARY KEY (x, y))",
+        "CREATE TABLE mc(u DEFAULT 9, w DEFAULT 9, FOREIGN KEY (u, w) REFERENCES mp(x, y) ON DELETE SET DEFAULT ON UPDATE CASCADE)",
+        "INSERT INTO mp VALUES (1, 1), (2, 2), (9, 9)",
+        "INSERT INTO mc VALUES (1, 1), (2, 2)",
+        "UPDATE mp SET y = 3 WHERE x = 2",
+        "SELECT * FROM mc ORDER BY u",
+        "DELETE FROM mp WHERE x = 1",
+        "SELECT * FROM mc ORDER BY u",
+        "DELETE FROM mp WHERE x = 9",
+        "SELECT * FROM mp ORDER BY x",
+        "CREATE TABLE tp(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE tc(p REFERENCES tp(id) ON DELETE CASCADE)",
+        "CREATE TABLE gone(id)",
+        "CREATE TRIGGER tg AFTER INSERT ON gone BEGIN DELETE FROM tp WHERE id = new.id; END",
+        "INSERT INTO tp VALUES (1), (2)",
+        "INSERT INTO tc VALUES (1), (2), (2)",
+        "INSERT INTO gone VALUES (2)",
+        "SELECT * FROM tc ORDER BY p",
+        "CREATE TABLE dp(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE dc(p REFERENCES dp(id) ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO dp VALUES (1)",
+        "INSERT INTO dc VALUES (1)",
+        "BEGIN",
+        "UPDATE dp SET id = 2",
+        "COMMIT",
+        "SELECT * FROM dc",
+        // Rows that REPLACE deletes fire their ON DELETE actions, whether
+        // the statement, the constraint or a rowid change asks for REPLACE.
+        "CREATE TABLE rp(id INTEGER PRIMARY KEY, k UNIQUE)",
+        "CREATE TABLE rc(x REFERENCES rp(id) ON DELETE CASCADE)",
+        "CREATE TABLE rd(y REFERENCES rp(k) ON DELETE SET NULL)",
+        "INSERT INTO rp VALUES (1, 'a'), (2, 'b')",
+        "INSERT INTO rc VALUES (1), (2)",
+        "INSERT INTO rd VALUES ('a'), ('b')",
+        "INSERT OR REPLACE INTO rp VALUES (3, 'a')",
+        "SELECT * FROM rc ORDER BY x",
+        "SELECT * FROM rd ORDER BY y",
+        "REPLACE INTO rp VALUES (2, 'z')",
+        "SELECT * FROM rc ORDER BY x",
+        "UPDATE OR REPLACE rp SET k = 'z' WHERE id = 3",
+        "SELECT * FROM rp ORDER BY id",
+        "SELECT * FROM rd ORDER BY y",
+        "INSERT INTO rc VALUES (3)",
+        "UPDATE OR REPLACE rp SET id = 3 WHERE id = 2",
+        "SELECT * FROM rc ORDER BY x",
+        "CREATE TABLE rq(id INTEGER PRIMARY KEY, v UNIQUE ON CONFLICT REPLACE)",
+        "CREATE TABLE re(z REFERENCES rq(v) ON DELETE CASCADE)",
+        "INSERT INTO rq VALUES (1, 'v')",
+        "INSERT INTO re VALUES ('v')",
+        "INSERT INTO rq VALUES (2, 'v')",
+        "SELECT * FROM re",
+        "CREATE TABLE rs(id INTEGER PRIMARY KEY, up REFERENCES rs(id) ON DELETE CASCADE)",
+        "INSERT INTO rs VALUES (1, NULL), (2, 1), (3, 2)",
+        "REPLACE INTO rs VALUES (1, NULL)",
+        "SELECT * FROM rs ORDER BY id",
+        "CREATE TRIGGER rt AFTER INSERT ON log BEGIN REPLACE INTO rq VALUES (3, new.m); END",
+        "INSERT INTO rq VALUES (4, 'w')",
+        "INSERT INTO re VALUES ('w')",
+        "INSERT INTO log VALUES ('w')",
+        "SELECT * FROM re",
+        "PRAGMA foreign_key_check",
+        // An UPSERT's DO UPDATE fires the ON UPDATE actions of a parent key
+        // it changes, after the row is written and before RETURNING.
+        "CREATE TABLE up(id INTEGER PRIMARY KEY, k UNIQUE, v)",
+        "CREATE TABLE uc(x REFERENCES up(k) ON UPDATE CASCADE, n)",
+        "CREATE TABLE ud(y REFERENCES up(k) ON UPDATE SET NULL)",
+        "CREATE TABLE ue(z REFERENCES up(id) ON UPDATE CASCADE)",
+        "CREATE TABLE ulog(m)",
+        "CREATE TRIGGER utc AFTER UPDATE ON uc BEGIN INSERT INTO ulog VALUES (old.x || '->' || new.x); END",
+        "INSERT INTO up VALUES (1, 'a', 0), (2, 'b', 0)",
+        "INSERT INTO uc VALUES ('a', 1), ('b', 2)",
+        "INSERT INTO ud VALUES ('a'), ('b')",
+        "INSERT INTO ue VALUES (1), (2)",
+        "INSERT INTO up VALUES (1, 'zz', 5) ON CONFLICT(id) DO UPDATE SET k = excluded.k RETURNING *, (SELECT count(*) FROM uc WHERE x = 'zz')",
+        "SELECT * FROM uc ORDER BY n",
+        "SELECT * FROM ud ORDER BY y",
+        "INSERT INTO up VALUES (9, 'b', 5) ON CONFLICT(k) DO UPDATE SET v = v + 1",
+        "INSERT INTO up VALUES (9, 'b', 5) ON CONFLICT(k) DO UPDATE SET id = 20",
+        "SELECT * FROM ue ORDER BY z",
+        "INSERT INTO up VALUES (20, 'q', 0), (1, 'r', 0) ON CONFLICT(id) DO UPDATE SET k = excluded.k || '!'",
+        "INSERT INTO up VALUES (20, 'q', 0) ON CONFLICT(k) DO NOTHING ON CONFLICT(id) DO UPDATE SET k = 'w'",
+        "SELECT * FROM uc ORDER BY n",
+        "SELECT * FROM ulog",
+        "CREATE TABLE us(id INTEGER PRIMARY KEY, k UNIQUE, up REFERENCES us(k) ON UPDATE CASCADE)",
+        "INSERT INTO us VALUES (1, 'a', NULL), (2, 'b', 'a'), (3, 'c', 'a')",
+        "INSERT INTO us VALUES (1, 'x', NULL) ON CONFLICT(id) DO UPDATE SET k = 'aa'",
+        "SELECT * FROM us ORDER BY id",
+        "PRAGMA foreign_key_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// An UPSERT takes over conflicts on the constraints it names; any other
+/// conflict resolves as without it, by the statement's OR clause or the
+/// constraint's own ON CONFLICT, as in SQLite. Legacy drops the UPSERT under
+/// OR IGNORE and stops the statement on the other conflicts.
+#[test]
+fn hir_upsert_other_conflicts_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE uo(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "INSERT INTO uo VALUES (1, 1, 'x')",
+        "INSERT OR IGNORE INTO uo VALUES (1, 2, 'y') ON CONFLICT(a) DO UPDATE SET c = 'up'",
+        "SELECT * FROM uo",
+        "INSERT OR IGNORE INTO uo VALUES (2, 1, 'z') ON CONFLICT(a) DO UPDATE SET c = 'up2'",
+        "SELECT * FROM uo",
+        "INSERT OR REPLACE INTO uo VALUES (5, 1, 'r') ON CONFLICT(a) DO UPDATE SET c = 'up3'",
+        "SELECT * FROM uo",
+        "CREATE TABLE uc(a INTEGER PRIMARY KEY, b UNIQUE ON CONFLICT REPLACE, c UNIQUE ON CONFLICT IGNORE, d)",
+        "INSERT INTO uc VALUES (1, 1, 1, 'x'), (2, 2, 2, 'y')",
+        "INSERT INTO uc VALUES (3, 1, 9, 'z') ON CONFLICT(a) DO UPDATE SET d = 'up'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT INTO uc VALUES (4, 8, 2, 'w') ON CONFLICT(a) DO UPDATE SET d = 'up'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT INTO uc VALUES (3, 2, 7, 'v') ON CONFLICT(a) DO UPDATE SET d = 'up3'",
+        "SELECT * FROM uc ORDER BY a",
+        "INSERT OR FAIL INTO uc VALUES (10, 2, 70, 'f') ON CONFLICT(a) DO NOTHING",
+        "SELECT * FROM uc ORDER BY a",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// An UPSERT's DO UPDATE fires the UPDATE triggers of the columns it sets,
+/// with the conflicting row as OLD: BEFORE once the new row passed its CHECK
+/// constraints, AFTER once RETURNING has read the row, as in SQLite.
+#[test]
+fn hir_upsert_triggers_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c, n DEFAULT 0)",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('before ' || old.c || '>' || new.c); END",
+        "CREATE TRIGGER au AFTER UPDATE OF c ON t BEGIN INSERT INTO log VALUES ('after ' || old.c || '>' || new.c || ' ' || (SELECT count(*) FROM log)); END",
+        "CREATE TRIGGER an AFTER UPDATE OF n ON t BEGIN INSERT INTO log VALUES ('n ' || new.n); END",
+        "CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('insert ' || new.a); END",
+        "INSERT INTO t(a, b, c) VALUES (1, 1, 'x')",
+        "INSERT INTO t(a, b, c) VALUES (1, 2, 'y') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "INSERT INTO t(a, b, c) VALUES (2, 1, 'z') ON CONFLICT(b) DO UPDATE SET n = n + 1 RETURNING a, n, (SELECT count(*) FROM log)",
+        "INSERT INTO t(a, b, c) VALUES (3, 3, 'w') ON CONFLICT DO UPDATE SET c = 'never'",
+        "CREATE TRIGGER ig BEFORE UPDATE ON t WHEN new.c = 'skip' BEGIN SELECT RAISE(IGNORE); END",
+        "INSERT INTO t(a, b, c) VALUES (1, 9, 'skip') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "CREATE TRIGGER del BEFORE UPDATE ON t WHEN new.c = 'gone' BEGIN DELETE FROM t WHERE a = old.a; END",
+        "INSERT INTO t(a, b, c) VALUES (3, 9, 'gone') ON CONFLICT(a) DO UPDATE SET c = excluded.c",
+        "SELECT * FROM t ORDER BY a",
+        "SELECT * FROM log",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// A DO UPDATE that sets the INTEGER PRIMARY KEY moves the row: the new
+/// rowid must be free, and every index entry and the row are rewritten.
+#[test]
+fn hir_upsert_moving_rows_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE um(a INTEGER PRIMARY KEY, b UNIQUE, c)",
+        "CREATE INDEX um_c ON um(c)",
+        "CREATE TABLE umlog(m)",
+        "CREATE TRIGGER au AFTER UPDATE ON um BEGIN INSERT INTO umlog VALUES (old.a || '>' || new.a); END",
+        "INSERT INTO um VALUES (1, 1, 'x'), (2, 2, 'y')",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 10",
+        "SELECT * FROM um ORDER BY a",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 2",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = a + 5, c = 'moved' RETURNING *",
+        "INSERT INTO um VALUES (3, 1, 'z') ON CONFLICT(b) DO UPDATE SET a = 'abc'",
+        "INSERT INTO um VALUES (15, 7, 'q') ON CONFLICT(a) DO UPDATE SET a = excluded.b, b = 70",
+        "SELECT * FROM um ORDER BY a",
+        "SELECT c, a FROM um INDEXED BY um_c ORDER BY c",
+        "SELECT * FROM umlog",
+        "PRAGMA integrity_check",
+        // `rowid` names the rowid, on a table without an INTEGER PRIMARY KEY
+        // too, unless the table has a column of that name. Legacy rejects it.
+        "INSERT INTO um VALUES (3, 70, 'z') ON CONFLICT(b) DO UPDATE SET rowid = 30 RETURNING *",
+        "CREATE TABLE un(v UNIQUE, w)",
+        "CREATE INDEX un_w ON un(w)",
+        "INSERT INTO un VALUES ('a', 1), ('b', 3)",
+        "INSERT INTO un VALUES ('a', 2) ON CONFLICT(v) DO UPDATE SET oid = 9, w = excluded.w RETURNING rowid, *",
+        "INSERT INTO un VALUES ('b', 4) ON CONFLICT(v) DO UPDATE SET _rowid_ = 9",
+        "INSERT INTO un VALUES ('b', 4) ON CONFLICT(v) DO UPDATE SET rowid = 'x'",
+        "SELECT rowid, * FROM un ORDER BY rowid",
+        "SELECT w FROM un INDEXED BY un_w ORDER BY w",
+        "CREATE TABLE ur(rowid, v UNIQUE)",
+        "INSERT INTO ur VALUES (1, 'a')",
+        "INSERT INTO ur VALUES (2, 'a') ON CONFLICT(v) DO UPDATE SET rowid = 50",
+        "SELECT _rowid_, * FROM ur",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// An UPDATE that changes the key of the index its loop reads, or that may
+/// REPLACE rows while reading an index, collects its rows first, as SQLite
+/// does. Legacy loses a row when a constraint-level REPLACE runs during an
+/// index loop.
+#[test]
+fn hir_update_through_a_changing_index_matches_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
+        "CREATE INDEX ta ON t(a)",
+        "CREATE INDEX tb ON t(b)",
+        "INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'w'), (5, 5, 50, 'v')",
+        "UPDATE t INDEXED BY ta SET a = a + 1 WHERE a > 1",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET a = a * 10 WHERE a > 3 RETURNING id, a",
+        "UPDATE t INDEXED BY tb SET c = 'x' WHERE b > 25",
+        "SELECT * FROM t ORDER BY id",
+        "INSERT INTO t VALUES (6, 6, 60, 'q'), (7, 7, 70, 'r'), (8, 8, 80, 's')",
+        "UPDATE t INDEXED BY tb SET c = 'q', b = b + 1 WHERE b >= 60",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t INDEXED BY ta SET a = 100 - a WHERE a BETWEEN 1 AND 70",
+        "SELECT * FROM t ORDER BY id",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// DML on a table with a materialized view goes through HIR, and the view
+/// follows each change. The UPDATE is one legacy gets wrong (it loses a row
+/// when a constraint's REPLACE runs during an index loop), so the table is
+/// checked against SQLite too.
+#[test]
+fn hir_dml_keeps_materialized_views_up_to_date() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
+        "CREATE INDEX tb ON t(b)",
+        "INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 2, 20, 'y'), (3, 3, 30, 'z'), (4, 4, 40, 'w')",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, a, c FROM t WHERE a > 1")
+        .unwrap();
+    for sql in [
+        "UPDATE t INDEXED BY tb SET c = 'x' WHERE b > 25",
+        "INSERT INTO t VALUES (5, 5, 50, 'v') ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (5, 6, 60, 'q') ON CONFLICT(id) DO UPDATE SET a = excluded.a",
+        "UPDATE t SET id = id + 10 WHERE a > 4",
+        "DELETE FROM t WHERE a = 2",
+        "REPLACE INTO t VALUES (20, 7, 70, 'x')",
+    ] {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+        let rows = "SELECT * FROM t ORDER BY id";
+        assert_eq!(
+            limbo_exec_rows(&conn, rows),
+            sqlite_exec_rows(&sqlite, rows),
+            "{sql}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT * FROM v ORDER BY id"),
+            limbo_exec_rows(&conn, "SELECT id, a, c FROM t WHERE a > 1 ORDER BY id"),
+            "{sql}"
+        );
+    }
+}
+
+/// INSERT, UPSERT and UPDATE on STRICT tables with custom types, as legacy
+/// does them: the values written are type checked, encoded and checked
+/// again; CHECK constraints and foreign keys compare stored values; index
+/// expressions, RETURNING, `excluded` and triggers see decoded values.
+#[test]
+fn hir_custom_type_writes_match_legacy() {
+    let statements = [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value)",
+        "CREATE TYPE tricky BASE integer ENCODE value DECODE CASE WHEN value = 42 THEN NULL ELSE value END",
+        "CREATE TABLE p(id cents PRIMARY KEY, name rev) STRICT",
+        "CREATE INDEX p_initial ON p(substr(name, 1, 1))",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid cents REFERENCES p(id) ON DELETE CASCADE, \
+         amount cents CHECK (amount < CAST(50 AS cents)), t tricky NOT NULL) STRICT",
+        "CREATE TABLE log(m TEXT) STRICT",
+        "CREATE TRIGGER tl AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.name || ':' || new.id); END",
+        "PRAGMA foreign_keys = ON",
+        "INSERT INTO p VALUES (1, 'Hello'), (2, 'world') RETURNING id, name",
+        "INSERT INTO p VALUES ('x', 'bad')",
+        "INSERT INTO c VALUES (1, 1, 20, 7)",
+        "INSERT INTO c VALUES (2, 3, 20, 7)",
+        "INSERT INTO c VALUES (3, 2, 60, 7)",
+        "INSERT INTO c VALUES (4, 2, 10, 42)",
+        "INSERT OR IGNORE INTO c VALUES (5, 2, 10, 42)",
+        "SELECT * FROM p ORDER BY id",
+        "SELECT id, hex(name) FROM p ORDER BY id",
+        "SELECT * FROM p WHERE substr(name, 1, 1) = 'h'",
+        "SELECT * FROM c ORDER BY id",
+        "SELECT * FROM log",
+        "CREATE TRIGGER tu AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (old.name || '>' || new.name); END",
+        "UPDATE p SET name = 'Again' WHERE id = 2 RETURNING id, name",
+        "SELECT * FROM p WHERE substr(name, 1, 1) = 'a'",
+        "UPDATE p SET id = 'x'",
+        "UPDATE c SET amount = 60 WHERE id = 1",
+        "UPDATE c SET amount = amount + 5 WHERE id = 1 RETURNING amount",
+        "UPDATE c SET pid = 3 WHERE id = 1",
+        "UPDATE c SET t = 42 WHERE id = 1",
+        "UPDATE OR IGNORE c SET t = 42",
+        "UPDATE c SET id = 9 WHERE id = 1 RETURNING *",
+        "SELECT id, hex(name) FROM p ORDER BY id",
+        "SELECT * FROM c ORDER BY id",
+        "SELECT * FROM log",
+        "CREATE TABLE u(k rev PRIMARY KEY, v cents, w cents NOT NULL) STRICT",
+        "CREATE TRIGGER uu BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (old.k || old.v || '>' || new.k || new.v); END",
+        "INSERT INTO u VALUES ('A', 1, 2)",
+        "INSERT INTO u VALUES ('a', 5, 6) ON CONFLICT(k) DO UPDATE SET v = excluded.v + v RETURNING *",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = excluded.w WHERE v < excluded.v RETURNING k, v, w",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = NULL",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = 'x'",
+        "INSERT INTO u VALUES ('b', 1, 1), ('B', 2, 2) ON CONFLICT DO UPDATE SET k = 'c'",
+        "SELECT k, hex(k), v, w FROM u",
+        "SELECT * FROM log",
+        "INSERT INTO p VALUES (2, 'x') ON CONFLICT DO UPDATE SET id = 5",
+        "SELECT * FROM c",
+        "CREATE TABLE arr(id INTEGER PRIMARY KEY, tags TEXT[] NOT NULL, grid INTEGER[][]) STRICT",
+        "INSERT INTO arr VALUES (1, '{a,b}', '{{1,2},{3}}'), (2, ARRAY['c'], NULL) RETURNING *",
+        "INSERT INTO arr VALUES (3, 'not an array', NULL)",
+        "INSERT INTO arr VALUES (4, NULL, NULL)",
+        "UPDATE arr SET tags[1] = 'z' WHERE id = 1 RETURNING tags",
+        "UPDATE arr SET grid = '{{9}}' WHERE id = 2",
+        // Legacy decodes arrays to text here, so `excluded.tags || tags`
+        // would join text where HIR joins arrays.
+        "INSERT INTO arr VALUES (2, '{d}', NULL) ON CONFLICT DO UPDATE SET tags = excluded.tags",
+        "SELECT id, tags, grid, tags[2] FROM arr ORDER BY id",
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM c",
+    ];
+    let run = |hir: bool| {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        statements
+            .iter()
+            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let (legacy, hir) = (run(false), run(true));
+    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
+        assert_eq!(legacy, hir, "{sql}");
+    }
+}
+
+/// BEFORE triggers and virtual columns of a table with custom types read
+/// SQL values: NEW holds the values a statement writes and the decoded
+/// values of the columns an UPDATE leaves alone. Legacy shows a BEFORE
+/// UPDATE trigger those columns as stored, and decodes the values a virtual
+/// column reads twice or not at all.
+#[test]
+fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
+    let db = TempDatabase::builder()
+        .with_opts(
+            turso_core::DatabaseOpts::new()
+                .with_custom_types(true)
+                .with_generated_columns(true),
+        )
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a cents, b cents, v INTEGER AS (a + b)) STRICT",
+        "CREATE TABLE log(m TEXT)",
+        "CREATE TRIGGER bi BEFORE INSERT ON t BEGIN \
+         INSERT INTO log VALUES ('bi ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN \
+         INSERT INTO log VALUES ('bu ' || old.a || ' ' || old.b || ' > ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+         INSERT INTO log VALUES ('au ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "INSERT INTO t VALUES (1, 2, 3)",
+        "UPDATE t SET a = 7 WHERE id = 1",
+        "INSERT INTO t VALUES (1, 9, 9) ON CONFLICT DO UPDATE SET b = excluded.b",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT a, b, v FROM t"),
+        ["[Integer(7), Integer(9), Integer(16)]"]
+    );
+    assert_eq!(
+        rows("SELECT m FROM log"),
+        [
+            "[Text(\"bi 2 3 5\")]",
+            "[Text(\"bu 2 3 > 7 3 10\")]",
+            "[Text(\"au 7 3 10\")]",
+            "[Text(\"bi 9 9 18\")]",
+            "[Text(\"bu 7 3 > 7 9 16\")]",
+            "[Text(\"au 7 9 16\")]",
+        ]
+    );
+}
+
+/// Queries over custom-typed columns: GROUP BY keeps the grouped columns as
+/// stored so aggregates decode them once, BETWEEN uses the type's own
+/// comparison operators, and an array of a custom type has its elements
+/// decoded for display, as legacy does.
+#[test]
+fn hir_custom_type_queries_match_legacy() {
+    let statements = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2), grp TEXT, flag INTEGER) STRICT",
+        "INSERT INTO t VALUES (1, 100, 'a', 1), (2, 9, 'a', 0), (3, 50, 'b', 1), (4, -5, 'b', 0)",
+        "SELECT grp, sum(val), max(val) FROM t GROUP BY grp ORDER BY grp",
+        "SELECT grp, sum(val) FILTER (WHERE flag = 1) AS s FROM t GROUP BY grp HAVING s > 0",
+        "SELECT id, val FROM t WHERE val BETWEEN 9 AND 50 ORDER BY id",
+        "SELECT id FROM t WHERE val NOT BETWEEN 9 AND 50 ORDER BY id",
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, c cents[]) STRICT",
+        "INSERT INTO a VALUES (1, '{1,2,3}'), (2, ARRAY[7])",
+        "SELECT id, c FROM a ORDER BY id",
+        "SELECT c FROM a ORDER BY id DESC",
+    ];
+    let run = |hir: bool| {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        statements
+            .iter()
+            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let (legacy, hir) = (run(false), run(true));
+    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
+        assert!(legacy.is_ok(), "{sql}: {legacy:?}");
+        assert_eq!(legacy, hir, "{sql}");
+    }
+}
+
+/// Change data capture through HIR writes one row per changed row and one
+/// COMMIT row per statement. Legacy also writes a COMMIT row for each
+/// trigger or foreign-key action it runs, files the new image of a row an
+/// UPDATE moves under `before`, and gives UPSERT DO UPDATE the new row as its
+/// before image.
+#[test]
+fn hir_change_capture_records_each_change_once() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, v)",
+        "CREATE TABLE l(m)",
+        "CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO l VALUES (new.id); END",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    limbo_exec_rows(&conn, "PRAGMA capture_data_changes_conn('full')");
+    for sql in [
+        "INSERT INTO p VALUES (1, 10)",
+        "UPDATE p SET id = 2",
+        "INSERT INTO p VALUES (2, 0) ON CONFLICT(id) DO UPDATE SET v = 30",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let image = |column: &str| {
+        format!(
+            "CASE WHEN table_name IS NULL THEN NULL \
+             ELSE bin_record_json_object(table_columns_json_array(table_name), {column}) END"
+        )
+    };
+    let rows = limbo_exec_rows(
+        &conn,
+        &format!(
+            "SELECT change_type, table_name, id, {}, {} FROM turso_cdc ORDER BY change_id",
+            image("before"),
+            image("after")
+        ),
+    );
+    let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+    let int = rusqlite::types::Value::Integer;
+    let null = rusqlite::types::Value::Null;
+    let commit = vec![
+        int(2),
+        null.clone(),
+        null.clone(),
+        null.clone(),
+        null.clone(),
+    ];
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(1), text("l"), int(1), null.clone(), text(r#"{"m":1}"#)],
+            vec![
+                int(1),
+                text("p"),
+                int(1),
+                null.clone(),
+                text(r#"{"id":1,"v":10}"#)
+            ],
+            commit.clone(),
+            vec![
+                int(-1),
+                text("p"),
+                int(1),
+                text(r#"{"id":1,"v":10}"#),
+                null.clone()
+            ],
+            vec![
+                int(1),
+                text("p"),
+                int(2),
+                null.clone(),
+                text(r#"{"id":2,"v":10}"#)
+            ],
+            commit.clone(),
+            vec![
+                int(0),
+                text("p"),
+                int(2),
+                text(r#"{"id":2,"v":10}"#),
+                text(r#"{"id":2,"v":30}"#),
+            ],
+            commit,
+        ]
+    );
+}
+
+/// RETURNING subqueries of UPDATE ... FROM: a correlated one runs per row,
+/// any other once, as in SQLite. Legacy runs one that reads the target
+/// through a derived table again for each row.
+#[test]
+fn hir_update_from_returning_subqueries_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE s(id INTEGER PRIMARY KEY, bump INTEGER)",
+        "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
+        "INSERT INTO s VALUES(1,1),(2,2),(3,3)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t WHEN NEW.id = 1 BEGIN UPDATE s SET bump = bump + 100 WHERE id = 2; END",
+        "UPDATE t SET v = s.bump FROM s WHERE t.id = s.id RETURNING id, v, (SELECT sum(bump) FROM s), (SELECT bump FROM s WHERE s.id = t.id)",
+        "UPDATE t SET v = s.bump + 1 FROM s WHERE t.id = s.id RETURNING id, (SELECT max(v) FROM t)",
+        "UPDATE t SET v = s.bump + 2 FROM s WHERE t.id = s.id RETURNING id, (SELECT count(*) FROM t AS x WHERE x.v > 5)",
+        "UPDATE t SET v = v + 1 FROM (SELECT 1) RETURNING id, (SELECT group_concat(v) FROM (SELECT v FROM t ORDER BY id))",
+        "UPDATE t SET v = v + 1 FROM (SELECT 1) RETURNING id, EXISTS (SELECT 1 FROM s WHERE bump > 200), id IN (SELECT id FROM s WHERE bump > 50)",
+        "UPDATE t SET v = 1 WHERE id < 3 RETURNING id, (SELECT max(v) FROM t), (SELECT group_concat(v) FROM (SELECT v FROM t ORDER BY id))",
+        // A CTE that FROM and RETURNING both read.
+        "WITH c(total) AS (SELECT sum(bump) FROM s) UPDATE t SET v = 0 FROM c WHERE t.id > 0 RETURNING id, v, (SELECT total FROM c)",
+        "WITH c(id, bump) AS (SELECT id, bump FROM s) UPDATE t SET v = src.bump FROM c AS src WHERE t.id = src.id RETURNING id, (SELECT bump FROM c WHERE c.id = t.id)",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// UPDATE ... FROM that sets the rowid moves each joined row, with its
+/// index entries, as SQLite does.
+#[test]
+fn hir_update_from_moving_rows_match_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v, w UNIQUE)",
+        "CREATE INDEX tv ON t(v)",
+        "CREATE TABLE m(old, new, tag)",
+        "INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)",
+        "INSERT INTO m VALUES (1, 100, 'x'), (2, 200, 'y')",
+        "UPDATE t SET id = m.new, v = v || m.tag FROM m WHERE m.old = t.id RETURNING id, v, w",
+        "SELECT id, v FROM t INDEXED BY tv ORDER BY v",
+        "UPDATE t SET rowid = m.old FROM m WHERE m.new = t.id",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET id = 3 FROM m WHERE m.old = t.id AND m.tag = 'x'",
+        "UPDATE OR REPLACE t SET id = 3 FROM m WHERE m.old = t.id AND m.tag = 'x'",
+        "SELECT * FROM t ORDER BY id",
+        "UPDATE t SET (id, v) = (SELECT m.new + 1, m.tag) FROM m WHERE m.old = t.id",
+        "UPDATE t SET rowid = m.new + 2, id = m.new + 3 FROM m WHERE m.new + 1 = t.id RETURNING *",
+        "UPDATE t SET id = id + 1, _rowid_ = id + 2 WHERE id > 100 RETURNING *",
+        "UPDATE t SET id = 'abc' FROM m WHERE m.new + 3 = t.id",
+        "SELECT * FROM t ORDER BY id",
+        "CREATE TABLE log(m)",
+        "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (old.id || '->' || new.id); END",
+        "UPDATE t SET id = id + 1000 FROM (SELECT 1 AS k) WHERE k = 1",
+        "SELECT * FROM t ORDER BY id",
+        "SELECT * FROM log ORDER BY m",
+        "PRAGMA integrity_check",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// Like SQLite, a DEFAULT on an INTEGER PRIMARY KEY is never used: a row
+/// that does not give the rowid gets a new one. Legacy uses the DEFAULT for
+/// DEFAULT VALUES.
+#[test]
+fn hir_rowid_default_matches_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE d1(id INTEGER PRIMARY KEY DEFAULT 5, v)",
+        "INSERT INTO d1(v) VALUES (1), (2)",
+        "INSERT INTO d1 DEFAULT VALUES",
+        "INSERT INTO d1 DEFAULT VALUES RETURNING id",
+        "INSERT INTO d1(v) SELECT 3",
+        "SELECT * FROM d1 ORDER BY id",
+        "CREATE TABLE d2(id INTEGER PRIMARY KEY AUTOINCREMENT DEFAULT 10, v)",
+        "INSERT INTO d2 DEFAULT VALUES",
+        "SELECT * FROM d2",
+        "SELECT * FROM sqlite_sequence",
+        "CREATE TABLE d3(id INTEGER PRIMARY KEY DEFAULT 'x', v)",
+        "INSERT INTO d3 DEFAULT VALUES",
+        "SELECT * FROM d3",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// `ON CONFLICT(rowid)` names the rowid of any rowid table, as in SQLite.
+/// Legacy rejects it.
+#[test]
+fn hir_upsert_on_rowid_matches_sqlite() {
+    let statements = [
+        "CREATE TABLE a1(x INTEGER PRIMARY KEY, y)",
+        "CREATE TABLE a2(x, y)",
+        "INSERT INTO a1 VALUES (1, 1)",
+        "INSERT INTO a2(rowid, x, y) VALUES (1, 1, 1)",
+        "INSERT INTO a1 VALUES (1, 2) ON CONFLICT(rowid) DO UPDATE SET y = 10",
+        "INSERT INTO a2(rowid, x, y) VALUES (1, 1, 2) ON CONFLICT(rowid) DO UPDATE SET y = 20",
+        "INSERT INTO a2(rowid, x, y) VALUES (2, 1, 2) ON CONFLICT(_rowid_) DO NOTHING",
+    ];
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in statements {
+        conn.execute(sql).unwrap();
+        sqlite.execute(sql, ()).unwrap();
+    }
+    for sql in ["SELECT * FROM a1", "SELECT rowid, * FROM a2 ORDER BY rowid"] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn hir_delete_errors_match_legacy() {
     let db = TempDatabase::new_empty();
@@ -795,13 +1928,176 @@ fn hir_delete_errors_match_legacy() {
         "DELETE FROM sqlite_schema",
         "DELETE FROM t INDEXED BY nosuch",
         "DELETE FROM t RETURNING t.*",
+        "UPDATE sqlite_schema SET name = 'x'",
+        "INSERT INTO sqlite_master VALUES (1, 2, 3, 4, 5)",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT(b) DO NOTHING",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT(a NULLS FIRST) DO NOTHING",
     ] {
         let legacy_error = legacy
             .prepare(sql)
             .err()
-            .expect("legacy rejects")
+            .unwrap_or_else(|| panic!("legacy rejects {sql}"))
             .to_string();
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
     }
+    // Legacy differs from SQLite on these: it reports a missing constraint
+    // for an unknown column and accepts COLLATE on the INTEGER PRIMARY KEY.
+    // HIR follows SQLite.
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)", ())
+        .unwrap();
+    for (sql, message) in [
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(nosuch) DO NOTHING",
+            "no such column: nosuch",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(a COLLATE nocase) DO NOTHING",
+            "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+        ),
+    ] {
+        let sqlite_error = sqlite
+            .prepare(sql)
+            .err()
+            .expect("SQLite rejects")
+            .to_string();
+        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
+        assert!(
+            sqlite_error.contains(message),
+            "{sql}: SQLite {sqlite_error}"
+        );
+        assert!(hir_error.contains(message), "{sql}: HIR {hir_error}");
+    }
+}
+
+/// Run `sql` on Turso through HIR and on rusqlite's SQLite, and check that
+/// both return the same rows, or both fail with SQLite's message (in any
+/// case).
+fn assert_matches_sqlite(
+    db: &TempDatabase,
+    conn: &std::sync::Arc<turso_core::Connection>,
+    sqlite: &rusqlite::Connection,
+    sql: &str,
+) {
+    let turso = limbo_exec_rows_fallible(db, conn, sql).map_err(|e| e.to_string());
+    let reference = sqlite
+        .prepare(sql)
+        .and_then(|mut statement| {
+            let mut rows = statement.query(())?;
+            let mut values = Vec::new();
+            while let Some(row) = rows.next()? {
+                let mut value = Vec::new();
+                for i in 0..row.as_ref().column_count() {
+                    value.push(row.get::<_, rusqlite::types::Value>(i)?);
+                }
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .map_err(|e| e.to_string());
+    match (&turso, &reference) {
+        (Ok(turso), Ok(reference)) => assert_eq!(turso, reference, "{sql}"),
+        // Turso words some errors differently, e.g. "immediate foreign key
+        // constraint failed" for "FOREIGN KEY constraint failed".
+        (Err(turso), Err(reference)) => assert!(
+            turso.to_lowercase().contains(&reference.to_lowercase()),
+            "{sql}: {turso} vs {reference}"
+        ),
+        _ => panic!("{sql}: {turso:?} vs {reference:?}"),
+    }
+}
+
+/// INSERT, UPDATE and DELETE through HIR keep an FTS index, which has no
+/// B-tree of its own, up to date, as legacy does.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn hir_dml_writes_fts_indexes() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)",
+        "CREATE INDEX docs_fts ON docs USING fts(body)",
+        "CREATE TABLE src(v INTEGER)",
+        "CREATE TRIGGER tr AFTER INSERT ON src BEGIN \
+         INSERT INTO docs VALUES (new.v, 'fromtrigger'); END",
+        "INSERT INTO docs VALUES (1, 'apple'), (2, 'banana'), (3, 'apple pie')",
+        "INSERT INTO src VALUES (4)",
+        "UPDATE docs SET body = 'cherry' WHERE id = 3",
+        "DELETE FROM docs WHERE id = 1",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let matching = |word: &str| {
+        limbo_exec_rows(
+            &conn,
+            &format!("SELECT id FROM docs WHERE fts_match(body, '{word}') ORDER BY id"),
+        )
+    };
+    let ids = |ids: &[i64]| {
+        ids.iter()
+            .map(|id| vec![rusqlite::types::Value::Integer(*id)])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(matching("apple"), ids(&[]));
+    assert_eq!(matching("banana"), ids(&[2]));
+    assert_eq!(matching("cherry"), ids(&[3]));
+    assert_eq!(matching("fromtrigger"), ids(&[4]));
+}
+
+/// INSERT into a WITHOUT ROWID table through HIR checks the whole primary
+/// key and stores its columns first. Legacy lets a duplicate composite key
+/// in and rejects INSERT OR IGNORE.
+#[test]
+fn hir_inserts_into_without_rowid_tables() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_without_rowid(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE w(b, a TEXT PRIMARY KEY) WITHOUT ROWID",
+        "CREATE TABLE w2(a INTEGER, b TEXT, c, PRIMARY KEY (b, a)) WITHOUT ROWID",
+        "INSERT INTO w VALUES (3, 'z'), (1, 'a')",
+        "INSERT OR IGNORE INTO w VALUES (5, 'z'), (6, 'm')",
+        "INSERT INTO w2 VALUES (1, 'x', 'p'), (2, 'x', 'q'), (1, 'y', 'r')",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let error = |sql| {
+        limbo_exec_rows_fallible(&db, &conn, sql)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(error("INSERT INTO w VALUES (5, 'z')").contains("UNIQUE constraint failed: w.a"));
+    assert!(error("INSERT INTO w VALUES (5, NULL)").contains("NOT NULL constraint failed: w.a"));
+    assert!(error("INSERT INTO w2 VALUES (1, 'x', 'dup')")
+        .contains("UNIQUE constraint failed: w2.b, w2.a"));
+    assert!(error("INSERT OR REPLACE INTO w VALUES (7, 'q')").contains("not supported"));
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT * FROM w"),
+        [
+            "[Integer(1), Text(\"a\")]",
+            "[Integer(6), Text(\"m\")]",
+            "[Integer(3), Text(\"z\")]",
+        ]
+    );
+    assert_eq!(
+        rows("SELECT a, b FROM w2"),
+        [
+            "[Integer(1), Text(\"x\")]",
+            "[Integer(2), Text(\"x\")]",
+            "[Integer(1), Text(\"y\")]",
+        ]
+    );
 }

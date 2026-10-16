@@ -1,9 +1,13 @@
 //! Bytecode lowering from resolved semantic HIR.
 
+mod autoincrement;
+mod cdc;
 mod delete;
 mod dml;
+mod emit;
 pub(super) mod expr;
 mod fkey;
+mod fkey_action;
 mod insert;
 pub(super) mod query;
 mod trigger;
@@ -16,7 +20,6 @@ use crate::{
     schema::{Schema, Type},
     sync::Arc,
     translate::{
-        emitter::Resolver,
         optimizer::cost_model_params,
         plan::QueryDestination,
         semantic::{
@@ -32,16 +35,18 @@ use crate::{
     Connection, LimboError, Result,
 };
 
+use dml::Subprograms;
+
 /// Prepare a top-level SELECT through semantic HIR: analyze, plan, and lower
 /// it without the legacy binder, planner, or emitter.
 pub(crate) fn translate_select(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let plan = analyze_and_plan(statement, schema, resolver, connection)?;
+    let plan = analyze_and_plan(statement, schema, settings, connection)?;
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
@@ -59,11 +64,19 @@ pub(crate) fn translate_select(
 pub(crate) fn translate_delete(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
+    let ast::Stmt::Delete { tbl_name, .. } = statement else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, tbl_name)? {
+        return Ok(false);
+    }
+    let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
     else {
@@ -71,16 +84,14 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
-    if delete::needs_legacy(delete, access, program)? {
+    if delete::needs_legacy(&plan.document, delete, access)? {
         return Ok(false);
     }
-    // Triggers are compiled before anything is emitted, so one that needs
-    // legacy still leaves the whole statement to legacy.
-    let Some(triggers) = trigger::delete_triggers(&session, program, &plan, delete)? else {
+    let Some(subprograms) = Subprograms::for_delete(&session, program, &plan, delete)? else {
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
-    delete::emit_delete(program, &plan, delete, access, &triggers)?;
+    delete::emit_delete(program, &plan, delete, access, &subprograms)?;
     if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -94,26 +105,38 @@ pub(crate) fn translate_delete(
 pub(crate) fn translate_update(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
-    let plan = session.plan(SemanticRootInput::Statement(statement))?;
-    let (update, access) = update::update_root(&plan)?;
-    if update::needs_legacy(&plan, update, access, program)? {
+    let ast::Stmt::Update(syntax) = statement else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, &syntax.tbl_name)? {
         return Ok(false);
     }
-    let Some(triggers) = trigger::update_triggers(&session, program, &plan, update)? else {
+    let session = HirSession::new(schema, settings, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(statement))?;
+    let (update, access) = update::update_root(&plan)?;
+    let mvcc = uses_mvcc(connection, &plan.document, update.target);
+    if update::needs_legacy(&plan, update, access)? {
+        return Ok(false);
+    }
+    let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
         return Ok(false);
     };
-    let mvcc = plan
-        .document
-        .source(update.target)
-        .and_then(|source| source.database)
-        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
     program.set_hir_plan(plan.clone());
-    update::emit_update(program, &plan, update, access, &triggers, mvcc)?;
+    update::emit_update(
+        program,
+        &plan,
+        update,
+        access,
+        &subprograms,
+        mvcc,
+        !connection.check_constraints_ignored(),
+    )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
@@ -127,26 +150,83 @@ pub(crate) fn translate_update(
 pub(crate) fn translate_insert(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
-    let session = HirSession::new(schema, resolver, connection)?;
+    let ast::Stmt::Insert { tbl_name, .. } = statement else {
+        return Err(LimboError::InternalError(
+            "HIR INSERT got another statement".into(),
+        ));
+    };
+    if target_needs_legacy(schema, connection, tbl_name)? {
+        return Ok(false);
+    }
+    let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
     if insert::needs_legacy(&plan, insert, program)? {
         return Ok(false);
     }
-    let Some(triggers) = trigger::insert_triggers(&session, program, &plan, insert)? else {
+    let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
         return Ok(false);
     };
     program.set_hir_plan(plan.clone());
-    insert::emit_insert(program, &plan, insert, &triggers)?;
+    insert::emit_insert(
+        program,
+        &plan,
+        insert,
+        &subprograms,
+        uses_mvcc(connection, &plan.document, insert.target),
+        !connection.check_constraints_ignored(),
+    )?;
     if let Some(returning) = &insert.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
     Ok(true)
+}
+
+/// Checks of a DML target that legacy makes by name, in the main schema,
+/// before it looks the table up. A protected system table or a materialized
+/// view cannot be written. A table that materialized views read still needs
+/// legacy, which keeps the views up to date.
+/// Whether the database of `target` keeps its rows in MVCC.
+pub(super) fn uses_mvcc(
+    connection: &Connection,
+    document: &HirDocument,
+    target: hir::SourceId,
+) -> bool {
+    document
+        .source(target)
+        .and_then(|source| source.database)
+        .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some())
+}
+
+fn target_needs_legacy(
+    schema: &Schema,
+    connection: &Connection,
+    name: &ast::QualifiedName,
+) -> Result<bool> {
+    let table_name = crate::util::normalize_ident(name.name.as_str());
+    if !connection.is_mvcc_bootstrap_connection() && !crate::schema::allow_user_dml(&table_name) {
+        crate::bail_parse_error!("table {table_name} may not be modified");
+    }
+    if schema.is_materialized_view(&table_name) {
+        crate::bail_parse_error!("cannot modify materialized view {table_name}");
+    }
+    if schema
+        .get_btree_table(&table_name)
+        .is_some_and(|table| !table.has_rowid)
+        && !schema
+            .get_dependent_materialized_views(&table_name)
+            .is_empty()
+    {
+        crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
+    }
+    // The VM keeps dependent materialized views up to date as rows are
+    // written; legacy reports views built by another DBSP version.
+    Ok(schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()))
 }
 
 /// What every HIR document of one statement is analyzed and planned with:
@@ -159,12 +239,47 @@ pub(super) struct HirSession<'a> {
     dialect: Arc<dyn crate::dialect::Dialect>,
     custom_types_enabled: bool,
     dqs_dml: DoubleQuotedDml,
+    /// The foreign-key actions being compiled.
+    actions: fkey_action::ActionStack,
+}
+
+/// The settings a statement is analyzed with, taken from the connection
+/// and the prepare call rather than from legacy's resolver.
+pub(crate) struct HirSettings<'a> {
+    symbols: &'a crate::SymbolTable,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+    custom_types_enabled: bool,
+    dqs_dml: DoubleQuotedDml,
+    /// The databases an unqualified name is looked up in, when the prepare
+    /// call sets them.
+    search_path: Option<&'a [String]>,
+}
+
+impl<'a> HirSettings<'a> {
+    pub(crate) fn new(
+        connection: &Connection,
+        symbols: &'a crate::SymbolTable,
+        dialect: Arc<dyn crate::dialect::Dialect>,
+        search_path: Option<&'a [String]>,
+    ) -> Self {
+        Self {
+            symbols,
+            dialect,
+            custom_types_enabled: connection.experimental_custom_types_enabled(),
+            dqs_dml: if connection.get_dqs_dml() {
+                DoubleQuotedDml::Enabled
+            } else {
+                DoubleQuotedDml::Disabled
+            },
+            search_path,
+        }
+    }
 }
 
 impl<'a> HirSession<'a> {
     fn new(
         schema: &'a Arc<Schema>,
-        resolver: &'a Resolver,
+        settings: &HirSettings<'a>,
         connection: &'a Arc<Connection>,
     ) -> Result<Self> {
         let catalog = SemanticCatalog::capture(
@@ -172,22 +287,19 @@ impl<'a> HirSession<'a> {
             connection.database_schemas(),
             &connection.temp.database,
             connection.attached_databases(),
-            resolver.custom_types_enabled(),
-            resolver.dialect.as_ref(),
-            resolver.unqualified_database_search_path().as_deref(),
+            settings.custom_types_enabled,
+            settings.dialect.as_ref(),
+            settings.search_path,
         )?;
         Ok(Self {
             schema,
             connection,
             catalog,
-            symbols: resolver.symbol_table,
-            dialect: resolver.dialect.clone(),
-            custom_types_enabled: resolver.custom_types_enabled(),
-            dqs_dml: if resolver.dqs_dml.is_enabled() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
+            symbols: settings.symbols,
+            dialect: settings.dialect.clone(),
+            custom_types_enabled: settings.custom_types_enabled,
+            dqs_dml: settings.dqs_dml,
+            actions: fkey_action::ActionStack::default(),
         })
     }
 
@@ -201,6 +313,11 @@ impl<'a> HirSession<'a> {
                 custom_types_enabled: self.custom_types_enabled,
                 dqs_dml: self.dqs_dml,
                 foreign_keys_enabled: self.connection.foreign_keys_enabled(),
+                capture_changes_table: self
+                    .connection
+                    .get_capture_data_changes_info()
+                    .as_ref()
+                    .map(|info| info.table.clone()),
             },
             input,
         )?;
@@ -216,10 +333,10 @@ impl<'a> HirSession<'a> {
 fn analyze_and_plan(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
-    resolver: &Resolver,
+    settings: &HirSettings<'_>,
     connection: &Arc<Connection>,
 ) -> Result<Arc<HirPlan>> {
-    HirSession::new(schema, resolver, connection)?.plan(SemanticRootInput::Statement(statement))
+    HirSession::new(schema, settings, connection)?.plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It
@@ -233,6 +350,9 @@ pub(crate) struct ResolvedResultColumn {
     pub(crate) name_is_alias: bool,
     pub(crate) value: ResolvedResultValue,
     pub(crate) affinity: Affinity,
+    /// The type name `Statement::get_column_type_info` reports for a
+    /// computed value, inferred as legacy does.
+    pub(crate) primitive: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,9 +405,102 @@ fn resolved_output_columns(
                 ),
                 value: resolved_result_value(document, &output.expr)?,
                 affinity: output.affinity,
+                primitive: expression_primitive(document, &output.expr),
             })
         })
         .collect()
+}
+
+/// The type name of a computed value, by legacy's rules: a literal has its
+/// own type; arithmetic over two INTEGERs is INTEGER, over INTEGERs and REALs
+/// REAL, and NUMERIC otherwise; comparisons, logic and bitwise operators give
+/// INTEGER; `||` gives TEXT; anything else reports its affinity.
+fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
+    use ast::{Operator, UnaryOperator};
+    let arithmetic = |lhs: Option<&'static str>, rhs: Option<&'static str>| match (lhs, rhs) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
+        _ => "NUMERIC",
+    };
+    match expression {
+        hir::Expr::Literal(literal) => {
+            match crate::translate::alter::literal_default_value(literal)
+                .ok()?
+                .value_type()
+            {
+                crate::types::ValueType::Integer => Some("INTEGER"),
+                crate::types::ValueType::Float => Some("REAL"),
+                crate::types::ValueType::Text => Some("TEXT"),
+                _ => None,
+            }
+        }
+        hir::Expr::Collate { expr, .. } => expression_primitive(document, expr),
+        hir::Expr::Unary { operator, expr } => match operator {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Negative => Some(arithmetic(
+                Some("INTEGER"),
+                expression_primitive(document, expr),
+            )),
+            UnaryOperator::Positive => expression_primitive(document, expr),
+        },
+        hir::Expr::Binary {
+            lhs, operator, rhs, ..
+        } => match operator {
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulus => Some(arithmetic(
+                expression_primitive(document, lhs),
+                expression_primitive(document, rhs),
+            )),
+            Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseNot
+            | Operator::LeftShift
+            | Operator::RightShift
+            | Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot
+            | Operator::And
+            | Operator::Or
+            | Operator::ArrayContains
+            | Operator::ArrayOverlap => Some("INTEGER"),
+            Operator::Concat => Some("TEXT"),
+            Operator::ArrowRight | Operator::ArrowRightShift => None,
+        },
+        hir::Expr::RowId(_) => Some("INTEGER"),
+        _ => match expression_affinity(document, expression) {
+            Affinity::Integer => Some("INTEGER"),
+            Affinity::Real => Some("REAL"),
+            Affinity::Text => Some("TEXT"),
+            Affinity::Numeric => Some("NUMERIC"),
+            Affinity::Blob | Affinity::None => None,
+        },
+    }
+}
+
+/// The affinity legacy gives an operand: a column's or CAST's own, and
+/// none for other expressions.
+fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affinity {
+    match expression {
+        hir::Expr::Column(reference) => document
+            .source(reference.source)
+            .and_then(|source| source.columns.get(reference.column))
+            .map_or(Affinity::Blob, |column| column.affinity),
+        hir::Expr::RowId(_) => Affinity::Integer,
+        hir::Expr::Output(id) => document
+            .output(*id)
+            .map_or(Affinity::Blob, |output| output.affinity),
+        hir::Expr::Cast { target, .. } => target.affinity,
+        hir::Expr::Collate { expr, .. } => expression_affinity(document, expr),
+        _ => Affinity::Blob,
+    }
 }
 
 fn resolved_result_value(

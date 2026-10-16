@@ -54,3 +54,28 @@ expect {
     alice|2
     bob|2
 }
+
+# A covering scan of an expression index reads the indexed expression from
+# the index, since no table cursor is open to compute it from.
+test expr-index-covering-scan-projects-the-expression {
+    CREATE TABLE t3(a INTEGER, b INTEGER);
+    INSERT INTO t3 VALUES (1, 2), (3, 4), (5, 6);
+    CREATE INDEX t3_sum ON t3(a + b);
+    SELECT a + b FROM t3;
+}
+expect {
+    3
+    7
+    11
+}
+
+test expr-index-covering-scan-filters-on-the-expression {
+    CREATE TABLE t4(a INTEGER, b INTEGER);
+    INSERT INTO t4 VALUES (1, 2), (3, 4), (5, 6);
+    CREATE INDEX t4_sum ON t4(a + b);
+    SELECT (a + b) * 2 FROM t4 WHERE a + b > 4;
+}
+expect {
+    14
+    22
+}

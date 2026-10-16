@@ -10,15 +10,14 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
+use super::emit::{any_effective_replace, constraint_may_abort, halt_desc_and_on_error};
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
-        insert::halt_desc_and_on_error,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirRoot},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirRootPlan, HirSourceAccess},
-        stmt_journal::{any_effective_replace, constraint_may_abort},
     },
     vdbe::{
         affinity::Affinity,
@@ -26,18 +25,21 @@ use crate::{
         insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    CaptureDataChangesExt, LimboError, Result,
+    LimboError, Result,
 };
 
+use super::autoincrement::Sequence;
 use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer,
+    DmlTarget, ReturningBuffer, Subprograms,
 };
+use super::fkey_action::CompiledAction;
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
     PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
+use crate::translate::emitter::OperationMode;
 
 /// Whether this UPDATE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -46,7 +48,6 @@ pub(super) fn needs_legacy(
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
-    program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
     if !update.order_by.is_empty()
@@ -55,28 +56,9 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    // Subqueries: legacy collects the rows to change first when the WHERE
-    // clause has one, and reads SET and RETURNING subqueries at set points.
-    if update.predicate.as_ref().is_some_and(has_subquery)
-        || update
-            .assignments
-            .iter()
-            .any(|assignment| has_subquery(&assignment.value))
-        || update.returning.as_ref().is_some_and(|returning| {
-            returning
-                .outputs
-                .iter()
-                .any(|output| has_subquery(&output.expr))
-        })
-    {
-        return Ok(true);
-    }
-    let foreign_keys = match &update.target_kind {
-        hir::UpdateTargetKind::BTree { foreign_keys, .. } => foreign_keys,
-        hir::UpdateTargetKind::Virtual => return Ok(true),
-    };
-    if program.capture_data_changes_info().table().is_some() {
-        return Ok(true);
+    // Like legacy, writes to a virtual table record no change data.
+    if let Some(table) = super::dml::virtual_target(document, update.target)? {
+        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -90,37 +72,40 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // STRICT type checks, custom types, generated columns, and CHECK
-    // constraints are not lowered yet.
-    if table.is_strict
-        || !table.check_constraints.is_empty()
-        || table.columns().iter().any(Column::is_generated)
-        || source.column_type_programs.iter().any(Option::is_some)
-    {
+    if super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
     }
-    let assigned = assigned_columns(update)?;
-    // ON UPDATE CASCADE, SET NULL and SET DEFAULT change other rows.
-    if super::fkey::update_needs_legacy(foreign_keys, &assigned_positions(&assigned)) {
-        return Ok(true);
-    }
-    // REPLACE deletes the rows the new row conflicts with; an ON DELETE
-    // action on them still needs legacy.
-    let replaces = may_replace(update, source);
-    if replaces && super::fkey::delete_needs_legacy(foreign_keys) {
-        return Ok(true);
-    }
-    // Changing the rowid moves the row; legacy collects the rows first.
-    if assigned.iter().any(|column| match column {
-        hir::TargetColumn::RowId => true,
-        hir::TargetColumn::Column(column) => table
+    // Custom types are lowered unless a virtual column has one.
+    if super::dml::has_custom_types(source) {
+        if !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. }) {
+            return Ok(true);
+        }
+        let custom_virtual = table
             .columns()
-            .get(*column)
-            .is_some_and(Column::is_rowid_alias),
-    }) {
-        return Ok(true);
+            .iter()
+            .zip(&source.column_type_programs)
+            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
+        if custom_virtual {
+            return Ok(true);
+        }
     }
     if update.from.is_some() {
+        // A RETURNING subquery may read a CTE the FROM clause reads too.
+        // SQLite may keep one copy of it, read before any row changes, but
+        // HIR would read it again after triggers ran.
+        if update.returning.as_ref().is_some_and(|returning| {
+            returning.outputs.iter().any(|output| {
+                let mut reads_cte = false;
+                output.expr.for_each(&mut |expression| {
+                    if let hir::Expr::Subquery(subquery) = expression {
+                        reads_cte |= document.query_reads_cte(super::dml::subquery_query(subquery));
+                    }
+                });
+                reads_cte
+            })
+        }) {
+            return Ok(true);
+        }
         // UPDATE ... FROM fills a scratch table during the join, so no loop
         // reads a table it changes. RETURNING reads only the updated row.
         let reads_from = update.returning.as_ref().is_some_and(|returning| {
@@ -146,31 +131,8 @@ pub(super) fn needs_legacy(
     let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
         return Ok(true);
     };
-    let Some(iteration_index) = operation_index(operation) else {
-        return Ok(false);
-    };
-    // A REPLACE declared on an index deletes rows while the loop reads an
-    // index; legacy does that in place.
-    if iteration_index.ephemeral || (replaces && update.conflict.is_none()) {
-        return Ok(true);
-    }
-    // Changing the index the loop reads could visit a row again; legacy
-    // collects the rows first.
-    let Some(iteration) = source
-        .index_expressions
-        .iter()
-        .find(|index| index.index.value().name == iteration_index.name)
-    else {
-        return Err(LimboError::InternalError(format!(
-            "HIR UPDATE target does not list index {}",
-            iteration_index.name
-        )));
-    };
-    Ok(index_reads_assigned_column(
-        update.target,
-        iteration,
-        &assigned,
-    ))
+    // A loop over an index built for this statement is not lowered yet.
+    Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
 }
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
@@ -180,10 +142,17 @@ pub(super) fn emit_update(
     plan: &HirPlan,
     update: &hir::Update,
     access: &HirAccessPlan,
-    triggers: &[CompiledTrigger],
+    subprograms: &Subprograms<'_>,
     mvcc: bool,
+    enforce_checks: bool,
 ) -> Result<()> {
+    let triggers = &subprograms.triggers[..];
+    let actions = &subprograms.actions[..];
+    let replace_actions = &subprograms.replace_actions[..];
     let document = &plan.document;
+    if let Some(table) = super::dml::virtual_target(document, update.target)? {
+        return emit_virtual_update(program, plan, update, access, &table);
+    }
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
     // target is the only loop.
     let single_loop = match &update.from {
@@ -212,6 +181,8 @@ pub(super) fn emit_update(
     let hir::UpdateTargetKind::BTree {
         foreign_keys,
         defaults,
+        autoincrement,
+        capture_changes,
         ..
     } = &update.target_kind
     else {
@@ -219,7 +190,8 @@ pub(super) fn emit_update(
             "HIR UPDATE target is not a B-tree table".into(),
         ));
     };
-    let target = DmlTarget::new(program, document, update.target, "UPDATE")?;
+    let target = DmlTarget::new(program, document, update.target, "UPDATE")?
+        .with_capture(program, capture_changes.as_ref())?;
     let table = target.table;
     let new_source = document.source(update.new_source).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -234,21 +206,35 @@ pub(super) fn emit_update(
         .flags
         .set_has_statement_conflict(has_statement_conflict);
 
-    let assigned = assigned_columns(update)?;
+    let assigned = with_generated_dependents(table, assigned_columns(update)?)?;
     let mut values = vec![None; table.columns().len()];
+    // The new rowid, when the UPDATE sets it. The INTEGER PRIMARY KEY
+    // column keeps NULL, as in the stored record.
+    let mut rowid_value = None;
     for assignment in &update.assignments {
-        let [hir::TargetColumn::Column(column)] = assignment.columns.as_slice() else {
-            return Err(LimboError::InternalError(
-                "HIR UPDATE assignment does not set exactly one column".into(),
-            ));
-        };
-        values[*column] = Some(&assignment.value);
+        let width = assignment.columns.len();
+        for (part, target_column) in assignment.columns.iter().enumerate() {
+            let value = match width {
+                1 => NewValue::Expr(&assignment.value),
+                _ => NewValue::RowPart {
+                    row: &assignment.value,
+                    part,
+                    width,
+                },
+            };
+            match target_column {
+                column if is_rowid_target(table, column) => rowid_value = Some(value),
+                hir::TargetColumn::Column(column) => values[*column] = Some(value),
+                hir::TargetColumn::RowId => unreachable!("the rowid target was matched above"),
+            }
+        }
     }
     // Indexes whose key or WHERE term reads a changed column, in schema
     // order, with the NEW-row expressions for the same index.
     let mut changed_indexes = Vec::new();
+    // Every index entry holds the rowid, so a new rowid changes them all.
     for old in &target.source.index_expressions {
-        if !index_reads_assigned_column(update.target, old, &assigned) {
+        if rowid_value.is_none() && !index_reads_assigned_column(update.target, old, &assigned) {
             continue;
         }
         let new = new_source
@@ -301,7 +287,7 @@ pub(super) fn emit_update(
                     (index.on_conflict, index.unique)
                 }),
                 has_notnull,
-                false,
+                !table.check_constraints.is_empty(),
                 has_unique,
             ),
     );
@@ -326,9 +312,37 @@ pub(super) fn emit_update(
         has_statement_conflict,
     };
 
-    let assigned = assigned_positions(&assigned);
+    let assigned = assigned_positions(table, &assigned);
+    // Like SQLite, only the CHECK constraints that read a changed column
+    // run. They read the new row.
+    let checks = if enforce_checks {
+        let constraints = new_source.check_constraints.as_deref().ok_or_else(|| {
+            LimboError::InternalError("HIR UPDATE new row has no CHECK constraints".into())
+        })?;
+        constraints
+            .iter()
+            .filter(|constraint| {
+                let mut reads_changed = false;
+                constraint.expression.for_each(&mut |expression| {
+                    reads_changed |= match expression {
+                        hir::Expr::Column(hir::ColumnRef { source, column }) => {
+                            *source == new_source.id && assigned.contains(column)
+                        }
+                        hir::Expr::RowId(source) => {
+                            *source == new_source.id && rowid_value.is_some()
+                        }
+                        _ => false,
+                    };
+                });
+                reads_changed
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // UPDATE ... FROM computes the assigned values during the join, into a
-    // scratch table with one column per assignment.
+    // scratch table with one column per assigned column, then one for the
+    // new rowid when the UPDATE sets it.
     let scratch_columns = values
         .iter()
         .scan(0, |next, value| {
@@ -342,7 +356,8 @@ pub(super) fn emit_update(
         .from
         .as_ref()
         .map(|_| -> Result<CursorID> {
-            let width = scratch_columns.iter().flatten().count();
+            let width =
+                scratch_columns.iter().flatten().count() + usize::from(rowid_value.is_some());
             let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
                 0,
                 "update_from_scratch".to_string(),
@@ -371,6 +386,12 @@ pub(super) fn emit_update(
             Ok(program.alloc_cursor_id(CursorType::BTreeTable(table)))
         })
         .transpose()?;
+    let sequence = match (autoincrement, rowid_value) {
+        (Some(autoincrement), Some(_)) => {
+            Some(Sequence::new(autoincrement, target.database, table, mvcc)?)
+        }
+        _ => None,
+    };
     let row_layout = UpdateRowLayout {
         values: &values,
         scratch: scratch.map(|cursor| (cursor, scratch_columns.as_slice())),
@@ -378,16 +399,35 @@ pub(super) fn emit_update(
         replaces,
         assigned: &assigned,
         changed_indexes: &changed_indexes,
+        checks: &checks,
+        rowid_value,
         new_source: new_source.id,
         foreign_keys,
         returning,
         triggers,
         mvcc,
+        actions,
+        replace_actions,
+        sequence: sequence.as_ref(),
     };
     let done = program.allocate_label();
-    // Like legacy, an UPDATE with triggers or OR REPLACE first collects its
-    // rowids, since a trigger or a REPLACE can change the table.
+    // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
+    // WHERE clause first collects its rowids, since a trigger or a REPLACE
+    // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
+    let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
+    // Like legacy, an UPDATE that moves rows, changes the key of the index
+    // its loop reads, or may REPLACE rows while reading an index collects
+    // its rows first, so the loop never reaches a changed row again.
+    let moves_rows = rowid_value.is_some()
+        || single_loop
+            .and_then(|(_, operation)| operation_index(operation))
+            .is_some_and(|index| {
+                replaces
+                    || changed_indexes
+                        .iter()
+                        .any(|(old, _)| old.index.value().name == index.name)
+            });
     match single_loop {
         None => emit_from_update(
             program,
@@ -399,22 +439,202 @@ pub(super) fn emit_update(
             row,
             done,
         )?,
-        Some((_, operation)) if triggers.is_empty() && !statement_replace => {
+        Some((_, operation))
+            if triggers.is_empty()
+                && actions.is_empty()
+                && !statement_replace
+                && !where_subquery
+                && !moves_rows =>
+        {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
         Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
     }
     program.preassign_label_to_next_insn(done);
+    target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
     }
     Ok(())
 }
 
+/// UPDATE of a virtual table, as legacy does it: each row the loop finds is
+/// handed to the table with `VUpdate`, as its old rowid, its new rowid and
+/// every column, the columns it does not set read from the row.
+fn emit_virtual_update(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    update: &hir::Update,
+    access: &HirAccessPlan,
+    table: &crate::sync::Arc<crate::vtab::VirtualTable>,
+) -> Result<()> {
+    if update.returning.is_some() {
+        crate::bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
+    }
+    if table.readonly() {
+        return Err(LimboError::ReadOnly);
+    }
+    let document = &plan.document;
+    let columns = table.columns.len();
+    let mut values = vec![None; columns];
+    let mut rowid_value = None;
+    for assignment in &update.assignments {
+        let width = assignment.columns.len();
+        for (part, target_column) in assignment.columns.iter().enumerate() {
+            let value = match width {
+                1 => NewValue::Expr(&assignment.value),
+                _ => NewValue::RowPart {
+                    row: &assignment.value,
+                    part,
+                    width,
+                },
+            };
+            match target_column {
+                hir::TargetColumn::RowId => rowid_value = Some(value),
+                hir::TargetColumn::Column(column) => values[*column] = Some(value),
+            }
+        }
+    }
+    let conflict_action = update
+        .conflict
+        .map_or(0, |conflict| conflict.bit_value() as u16);
+    program.begin_write_operation()?;
+    let cursor = super::dml::open_virtual_for_write(program, table);
+    super::query::emit_dml_join_loops(
+        program,
+        plan,
+        None,
+        super::query::HirLoopsPlan::of_access(access),
+        &|program, next| {
+            // The columns the UPDATE does not set are read from the loop's
+            // cursor, as a B-tree UPDATE reads them from its table cursor.
+            let Some(SourceBinding::Virtual {
+                cursor: loop_cursor,
+            }) = program.source_binding(update.target).copied()
+            else {
+                return Err(LimboError::InternalError(
+                    "HIR virtual-table UPDATE target is not read by a virtual-table loop".into(),
+                ));
+            };
+            let start = program.alloc_registers(columns + 2);
+            super::expr::translate_expr(
+                program,
+                document,
+                &hir::Expr::RowId(update.target),
+                start,
+            )?;
+            // Like legacy, a row without a rowid is skipped.
+            program.emit_insn(Insn::IsNull {
+                reg: start,
+                target_pc: next,
+            });
+            let mut rows = RowValues::default();
+            match rowid_value {
+                Some(value) => value.emit(
+                    program,
+                    document,
+                    start + 1,
+                    &mut rows,
+                    super::expr::translate_expr_no_constant_opt,
+                )?,
+                None => program.emit_insn(Insn::Copy {
+                    src_reg: start,
+                    dst_reg: start + 1,
+                    extra_amount: 0,
+                }),
+            }
+            for (column, value) in values.iter().enumerate() {
+                let register = start + 2 + column;
+                match value {
+                    Some(value) => value.emit(
+                        program,
+                        document,
+                        register,
+                        &mut rows,
+                        super::expr::translate_expr_no_constant_opt,
+                    )?,
+                    None => program.emit_insn(Insn::VColumn {
+                        cursor_id: loop_cursor,
+                        column,
+                        dest: register,
+                    }),
+                }
+            }
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: cursor,
+                arg_count: columns + 2,
+                start_reg: start,
+                conflict_action,
+            });
+            Ok(())
+        },
+    )
+}
+
+/// The new value of one column an UPDATE sets.
+#[derive(Clone, Copy)]
+enum NewValue<'a> {
+    Expr(&'a hir::Expr),
+    /// `SET (a, b) = (SELECT ...)`: value `part` of a row of `width` values.
+    RowPart {
+        row: &'a hir::Expr,
+        part: usize,
+        width: usize,
+    },
+}
+
+/// The rows of `SET (a, b) = (SELECT ...)` already computed for the current
+/// row, each in consecutive registers, so that each runs once.
+#[derive(Default)]
+struct RowValues<'a> {
+    computed: Vec<(&'a hir::Expr, usize)>,
+}
+
+/// Lowers one HIR expression into a register.
+type Translate = fn(&mut ProgramBuilder, &hir::HirDocument, &hir::Expr, usize) -> Result<usize>;
+
+impl<'a> NewValue<'a> {
+    fn emit(
+        self,
+        program: &mut ProgramBuilder,
+        document: &hir::HirDocument,
+        register: usize,
+        rows: &mut RowValues<'a>,
+        translate: Translate,
+    ) -> Result<()> {
+        match self {
+            NewValue::Expr(value) => {
+                translate(program, document, value, register)?;
+            }
+            NewValue::RowPart { row, part, width } => {
+                let start = match rows
+                    .computed
+                    .iter()
+                    .find(|(computed, _)| std::ptr::eq(*computed, row))
+                {
+                    Some((_, start)) => *start,
+                    None => {
+                        let start = program.alloc_registers(width);
+                        super::expr::translate_expr_no_constant_opt(program, document, row, start)?;
+                        rows.computed.push((row, start));
+                        start
+                    }
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: start + part,
+                    dst_reg: register,
+                    extra_amount: 0,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What every row of an UPDATE computes, shared by both loops.
 struct UpdateRowLayout<'a> {
     /// Each column's assigned value, if any.
-    values: &'a [Option<&'a hir::Expr>],
+    values: &'a [Option<NewValue<'a>>],
     /// UPDATE ... FROM: the scratch table the join filled, and for each
     /// assigned column the scratch column holding its value.
     scratch: Option<(CursorID, &'a [Option<usize>])>,
@@ -426,11 +646,21 @@ struct UpdateRowLayout<'a> {
     assigned: &'a [usize],
     /// The indexes the UPDATE changes, with their OLD- and NEW-row expressions.
     changed_indexes: &'a [(&'a hir::IndexExpressions, &'a hir::IndexExpressions)],
+    /// The CHECK constraints the new row must pass.
+    checks: &'a [&'a hir::CheckConstraint],
+    /// The new rowid, when the UPDATE sets it.
+    rowid_value: Option<NewValue<'a>>,
     new_source: hir::SourceId,
     foreign_keys: &'a hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'a>>,
     triggers: &'a [CompiledTrigger],
     mvcc: bool,
+    /// The ON UPDATE actions to run once the row is written.
+    actions: &'a [CompiledAction<'a>],
+    /// The ON DELETE actions of a row REPLACE deletes.
+    replace_actions: &'a [CompiledAction<'a>],
+    /// AUTOINCREMENT, when the UPDATE sets the rowid: the target's sequence.
+    sequence: Option<&'a Sequence>,
 }
 
 /// Registers and conflict settings of an UPDATE's row, before the cursor
@@ -484,6 +714,7 @@ fn emit_scan_update(
         table_cursor: lookup_cursor,
         autoindex_source_cursor: None,
         table_has_rowid: target.table.has_rowid,
+        index_keys: Vec::new(),
     };
     emit_access_predicates(program, document, access, None, done)?;
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
@@ -493,6 +724,7 @@ fn emit_scan_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -566,6 +798,7 @@ fn emit_rowset_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -606,7 +839,7 @@ fn emit_from_update(
     let (scratch, columns) = layout.scratch.ok_or_else(|| {
         LimboError::InternalError("HIR UPDATE ... FROM has no scratch table".into())
     })?;
-    let width = columns.iter().flatten().count();
+    let width = columns.iter().flatten().count() + usize::from(layout.rowid_value.is_some());
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: scratch,
         is_table: true,
@@ -615,11 +848,19 @@ fn emit_from_update(
         .values
         .iter()
         .filter_map(|value| *value)
+        .chain(layout.rowid_value)
         .collect::<Vec<_>>();
     let write = |program: &mut ProgramBuilder, _next: BranchOffset| -> Result<()> {
         let start = program.alloc_registers(width.max(1));
+        let mut rows = RowValues::default();
         for (offset, value) in assigned.iter().enumerate() {
-            super::expr::translate_expr_no_constant_opt(program, document, value, start + offset)?;
+            value.emit(
+                program,
+                document,
+                start + offset,
+                &mut rows,
+                super::expr::translate_expr_no_constant_opt,
+            )?;
         }
         let rowid = program.alloc_register();
         super::expr::translate_expr(
@@ -662,6 +903,7 @@ fn emit_from_update(
         target,
         table_cursor,
         rowid: program.alloc_registers(target.table.columns().len() + 1),
+        new_rowid: layout.rowid_value.map(|_| program.alloc_register()),
         or_conflict: settings.or_conflict,
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
@@ -734,15 +976,17 @@ fn open_changed_indexes<'a>(
         .changed_indexes
         .iter()
         .map(|(old, _)| {
-            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(old.index.handle()));
+            // An index method without a B-tree of its own (such as FTS)
+            // gets its own kind of cursor, as in legacy.
+            let cursor = program.alloc_cursor_index(None, &old.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(old.index.value().root_page),
                 db: target.database,
             });
-            cursor
+            Ok(cursor)
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(IndexCursors {
         changed,
         all: Vec::new(),
@@ -765,26 +1009,122 @@ pub(super) fn update_root(plan: &HirPlan) -> Result<(&hir::Update, &HirAccessPla
 
 /// Whether a conflict of the new row may resolve with REPLACE: the
 /// statement's OR REPLACE, or ON CONFLICT REPLACE on an index.
-fn may_replace(update: &hir::Update, source: &hir::Source) -> bool {
+fn may_replace(
+    update: &hir::Update,
+    source: &hir::Source,
+    table: &crate::schema::BTreeTable,
+    sets_rowid: bool,
+) -> bool {
     match update.conflict {
         Some(conflict) => conflict == ResolveType::Replace,
-        None => source
-            .index_expressions
-            .iter()
-            .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace)),
+        None => {
+            (sets_rowid && table.rowid_alias_conflict_clause == Some(ResolveType::Replace))
+                || source
+                    .index_expressions
+                    .iter()
+                    .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
+        }
     }
 }
 
-/// The table positions of `assigned`. The rowid has none; an UPDATE that
-/// sets it goes to legacy.
-fn assigned_positions(assigned: &[hir::TargetColumn]) -> Vec<usize> {
-    assigned
+/// Whether an assignment target is the rowid: `rowid` itself or the
+/// INTEGER PRIMARY KEY column.
+fn is_rowid_target(table: &crate::schema::BTreeTable, column: &hir::TargetColumn) -> bool {
+    match column {
+        hir::TargetColumn::RowId => true,
+        hir::TargetColumn::Column(column) => table
+            .columns()
+            .get(*column)
+            .is_some_and(Column::is_rowid_alias),
+    }
+}
+
+/// The table positions of `assigned`. Setting `rowid` sets the INTEGER
+/// PRIMARY KEY column, when the table has one.
+fn assigned_positions(
+    table: &crate::schema::BTreeTable,
+    assigned: &[hir::TargetColumn],
+) -> Vec<usize> {
+    let mut positions = assigned
         .iter()
         .filter_map(|column| match column {
             hir::TargetColumn::Column(column) => Some(*column),
-            hir::TargetColumn::RowId => None,
+            hir::TargetColumn::RowId => table.columns().iter().position(Column::is_rowid_alias),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+/// `assigned` and the virtual generated columns that read one of them, which
+/// change with them.
+pub(super) fn with_generated_dependents(
+    table: &crate::schema::BTreeTable,
+    mut assigned: Vec<hir::TargetColumn>,
+) -> Result<Vec<hir::TargetColumn>> {
+    if !table.has_virtual_columns() {
+        return Ok(assigned);
+    }
+    let affected = table.columns_affected_by_update(assigned_positions(table, &assigned))?;
+    for (position, column) in table.columns().iter().enumerate() {
+        let dependent = hir::TargetColumn::Column(position);
+        if column.is_virtual_generated() && affected.get(position) && !assigned.contains(&dependent)
+        {
+            assigned.push(dependent);
+        }
+    }
+    Ok(assigned)
+}
+
+/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
+/// means one needs legacy.
+pub(super) fn replace_actions<'a>(
+    session: &super::HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    update: &'a hir::Update,
+) -> Result<Option<Vec<CompiledAction<'a>>>> {
+    let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let source = plan.document.source(update.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR UPDATE target {} is missing", update.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Ok(Some(Vec::new()));
+    };
+    let table = table.value().require_btree()?;
+    let sets_rowid = assigned_columns(update)?
+        .iter()
+        .any(|column| is_rowid_target(&table, column));
+    if !may_replace(update, source, &table, sets_rowid) {
+        return Ok(Some(Vec::new()));
+    }
+    super::fkey_action::compile_actions(
+        session,
+        parent,
+        foreign_keys,
+        super::fkey_action::ParentChange::Delete,
+        &[],
+    )
+}
+
+/// The table positions an UPDATE changes: the columns it sets, the INTEGER
+/// PRIMARY KEY when it sets the rowid, and the virtual columns that read
+/// them.
+pub(super) fn changed_positions(plan: &HirPlan, update: &hir::Update) -> Result<Vec<usize>> {
+    let source = plan.document.source(update.target).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR UPDATE target {} is missing", update.target))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Err(LimboError::InternalError(
+            "HIR UPDATE target is not a table".into(),
+        ));
+    };
+    let table = table.value().require_btree()?;
+    let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
+    Ok(assigned_positions(&table, &assigned))
 }
 
 fn assigned_columns(update: &hir::Update) -> Result<Vec<hir::TargetColumn>> {
@@ -831,6 +1171,8 @@ struct UpdateRow<'a, 'b> {
     target: &'a DmlTarget<'b>,
     table_cursor: CursorID,
     rowid: usize,
+    /// The new rowid, when the UPDATE sets it.
+    new_rowid: Option<usize>,
     or_conflict: ResolveType,
     has_statement_conflict: bool,
     /// What NOT NULL ON CONFLICT REPLACE stores instead of a NULL.
@@ -853,6 +1195,121 @@ struct NewIndexKey {
 impl UpdateRow<'_, '_> {
     fn start(&self) -> usize {
         self.rowid + 1
+    }
+
+    /// The rowid the row is written with.
+    fn written_rowid(&self) -> usize {
+        self.new_rowid.unwrap_or(self.rowid)
+    }
+
+    /// Bind the NEW row to its registers and compute its virtual generated
+    /// columns there. With `check_notnull`, a changed NOT NULL virtual
+    /// column is checked too, as legacy does.
+    fn emit_virtual_columns(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        check_notnull: bool,
+    ) -> Result<()> {
+        let table = self.target.table;
+        if table.has_virtual_columns() && super::dml::has_custom_types(self.target.source) {
+            // The new row holds the values the UPDATE sets as SQL values and
+            // the others as stored, so the virtual columns are computed from
+            // a copy of it as SQL values.
+            let row = self.emit_sql_values(program, layout)?;
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: row + position,
+                        dst_reg: self.start() + position,
+                        extra_amount: 0,
+                    });
+                }
+            }
+        }
+        program.bind_source(
+            layout.new_source,
+            SourceBinding::Registers {
+                start: self.start(),
+                rowid: Some(self.written_rowid()),
+            },
+        );
+        if !super::dml::has_custom_types(self.target.source) {
+            super::dml::emit_virtual_columns(
+                program,
+                self.target.document,
+                layout.new_source,
+                table,
+                self.start(),
+            )?;
+        }
+        if check_notnull {
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated()
+                    && column.notnull()
+                    && layout.assigned.contains(&position)
+                {
+                    self.emit_notnull_check(program, position, column)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A copy of the new row as SQL values, with its virtual columns
+    /// computed: the values the UPDATE sets as they are, and the other
+    /// columns, which hold stored values, decoded.
+    fn emit_sql_values(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+    ) -> Result<usize> {
+        let DmlTarget {
+            document,
+            source,
+            table,
+            ..
+        } = *self.target;
+        let columns = table.columns().len();
+        let row = program.alloc_registers(columns);
+        program.emit_insn(Insn::Copy {
+            src_reg: self.start(),
+            dst_reg: row,
+            extra_amount: columns - 1,
+        });
+        for (position, value) in layout.values.iter().enumerate() {
+            if value.is_some() {
+                continue;
+            }
+            if let Some(programs) = source.column_type_programs[position]
+                .as_ref()
+                .filter(|programs| !programs.decode.is_empty())
+            {
+                let null = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: row + position,
+                    target_pc: null,
+                });
+                super::expr::translate_schema_calls_in_place(
+                    program,
+                    document,
+                    &programs.decode,
+                    row + position,
+                )?;
+                program.preassign_label_to_next_insn(null);
+            }
+        }
+        program.bind_source(
+            layout.new_source,
+            SourceBinding::Registers {
+                start: row,
+                rowid: Some(self.written_rowid()),
+            },
+        );
+        super::dml::with_stored_values(program, |program| {
+            super::dml::emit_virtual_columns(program, document, layout.new_source, table, row)
+        })?;
+        Ok(row)
     }
 
     /// Rewrite the row the table cursor is on.
@@ -882,27 +1339,53 @@ impl UpdateRow<'_, '_> {
                 table_cursor: None,
             },
         );
+        // Change data capture in `full` mode records which columns changed:
+        // a flag per column, then the new value of each changed one.
+        let updates = self
+            .target
+            .capture
+            .as_ref()
+            .filter(|_| super::cdc::Capture::records_updates(program))
+            .map(|_| program.alloc_registers(2 * columns));
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
-        self.emit_new_values(program, layout, !has_before)?;
+        self.emit_new_values(program, layout, !has_before, updates)?;
+        self.emit_virtual_columns(program, layout, !has_before)?;
+        if let Some(updates) = updates {
+            // Like legacy, a changed virtual column records its value.
+            for &position in layout.assigned {
+                if table.columns()[position].is_virtual_generated() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: self.start() + position,
+                        dst_reg: updates + columns + position,
+                        extra_amount: 0,
+                    });
+                }
+            }
+        }
         let new_row = TriggerRow {
             columns: self.start(),
-            rowid: self.rowid,
+            rowid: self.written_rowid(),
         };
         // The OLD row the triggers read, as a query would read it.
         let old_row = (!layout.triggers.is_empty())
             .then(|| -> Result<TriggerRow> {
                 let start = program.alloc_registers(columns);
-                for column in 0..columns {
-                    super::expr::translate_expr_no_constant_opt(
-                        program,
-                        document,
-                        &hir::Expr::Column(hir::ColumnRef {
-                            source: source.id,
-                            column,
-                        }),
-                        start + column,
-                    )?;
-                }
+                // The trigger program decodes custom-typed values itself, so it is
+                // given them as stored.
+                super::dml::with_stored_values(program, |program| {
+                    for column in 0..columns {
+                        super::expr::translate_expr_no_constant_opt(
+                            program,
+                            document,
+                            &hir::Expr::Column(hir::ColumnRef {
+                                source: source.id,
+                                column,
+                            }),
+                            start + column,
+                        )?;
+                    }
+                    Ok(())
+                })?;
                 Ok(TriggerRow {
                     columns: start,
                     rowid: self.rowid,
@@ -910,6 +1393,15 @@ impl UpdateRow<'_, '_> {
             })
             .transpose()?;
         if has_before {
+            // A BEFORE trigger reads NEW as SQL values.
+            let new_row = if super::dml::has_custom_types(source) {
+                TriggerRow {
+                    columns: self.emit_sql_values(program, layout)?,
+                    rowid: self.written_rowid(),
+                }
+            } else {
+                new_row
+            };
             for trigger in fires(TriggerTime::Before) {
                 // RAISE(IGNORE) skips the rest of this row.
                 trigger.emit_fire(program, old_row, Some(new_row), columns, self.skip_row)?;
@@ -924,7 +1416,7 @@ impl UpdateRow<'_, '_> {
             });
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
             {
-                if value.is_none() && !column.is_rowid_alias() {
+                if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
                     program.emit_column_or_rowid(
                         self.table_cursor,
                         position,
@@ -939,13 +1431,44 @@ impl UpdateRow<'_, '_> {
                 }
             }
         }
-        program.bind_source(
-            layout.new_source,
-            SourceBinding::Registers {
-                start: self.start(),
-                rowid: Some(self.rowid),
-            },
-        );
+        if has_before {
+            // The trigger may have changed the columns they read.
+            self.emit_virtual_columns(program, layout, true)?;
+        }
+        // Like legacy, a new rowid is checked first, unless REPLACE resolves
+        // its conflict, which happens after the indexes are checked.
+        if self.new_rowid.is_some() && self.rowid_conflict() != ResolveType::Replace {
+            self.emit_rowid_check(program)?;
+        }
+        // Like legacy, a STRICT type check and then CHECK constraints run
+        // after NOT NULL and before any index is checked.
+        if super::dml::has_custom_types(source) {
+            // Like legacy, only the values the UPDATE sets are checked as
+            // input and encoded; the others are read as stored.
+            let set = layout
+                .values
+                .iter()
+                .enumerate()
+                .filter_map(|(position, value)| value.map(|_| position))
+                .collect::<Vec<_>>();
+            super::dml::emit_custom_type_writes(
+                program,
+                document,
+                source,
+                table,
+                self.start(),
+                Some(&set),
+            )?;
+        } else if table.is_strict {
+            super::dml::emit_strict_type_check(program, table, self.start());
+        }
+        super::dml::emit_check_constraints(
+            program,
+            document,
+            layout.checks.iter().copied(),
+            self.or_conflict,
+            self.skip_row,
+        )?;
 
         // Like legacy, check every changed index before changing any of them:
         // build the new keys and check UNIQUE, then delete the old entries,
@@ -953,6 +1476,11 @@ impl UpdateRow<'_, '_> {
         let mut new_keys = Vec::with_capacity(layout.changed_indexes.len());
         for ((old, new), cursor) in layout.changed_indexes.iter().zip(index_cursors) {
             new_keys.push(self.emit_new_index_key(program, layout, cursors, old, new, *cursor)?);
+        }
+        if let Some(new_rowid) = self.new_rowid {
+            if self.rowid_conflict() == ResolveType::Replace {
+                self.emit_rowid_replace(program, layout, cursors, new_rowid)?;
+            }
         }
         // Like legacy, foreign keys are checked after the other constraints
         // and before anything is rewritten.
@@ -963,10 +1491,23 @@ impl UpdateRow<'_, '_> {
             source.id,
             layout.new_source,
             self.rowid,
+            self.written_rowid(),
             layout.assigned,
             self.target.database,
             layout.replaces,
         )?;
+        // The parent key before the change, for the actions.
+        let action_keys = layout
+            .actions
+            .iter()
+            .map(|action| {
+                super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The row before the change, for change data capture.
+        let capture_before = self.target.capture.as_ref().and_then(|capture| {
+            capture.before_record(program, table, self.table_cursor, self.rowid)
+        });
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1015,39 +1556,109 @@ impl UpdateRow<'_, '_> {
             }
         }
 
-        let record = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(self.start()),
-            count: to_u32(columns),
-            dest_reg: to_u32(record),
-            index_name: None,
-            affinity_str: Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
-                    .collect(),
-            ),
-        });
+        let record = super::dml::emit_row_record(program, table, self.start());
         // MVCC keeps every version of a row, so the old one is deleted and
-        // the new one inserted.
-        if layout.mvcc {
+        // the new one inserted. A row with a new rowid moves the same way.
+        if layout.mvcc || self.new_rowid.is_some() {
             program.emit_insn(Insn::Delete {
                 cursor_id: self.table_cursor,
                 table_name: table.name.clone(),
                 is_part_of_update: true,
             });
         }
+        let flag = match self.new_rowid {
+            // The cursor is not on the new rowid's place in the table.
+            Some(_) => InsertFlags::new()
+                .require_seek()
+                .update_rowid_change()
+                .skip_last_rowid(),
+            None => InsertFlags::new().skip_last_rowid(),
+        };
         program.emit_insn(Insn::Insert {
             cursor: self.table_cursor,
-            key_reg: self.rowid,
+            key_reg: self.written_rowid(),
             record_reg: record,
-            flag: InsertFlags::new().skip_last_rowid(),
+            flag,
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
+        if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
+            sequence.emit_moved_row(program, self.written_rowid())?;
+        }
+        // Like legacy and SQLite, the actions run once the row is written,
+        // for a parent key that changed, before RETURNING reads the row.
+        for (action, old_key) in layout.actions.iter().zip(action_keys) {
+            let new_key = super::fkey::emit_parent_key(
+                program,
+                document,
+                action.foreign_key,
+                layout.new_source,
+            )?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
+        }
+        if !layout.actions.is_empty() {
+            // An action may have written this table and moved the cursor.
+            let back = program.allocate_label();
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: self.table_cursor,
+                src_reg: self.written_rowid(),
+                target_pc: back,
+            });
+            program.preassign_label_to_next_insn(back);
+        }
+        // Like legacy, a moved row is captured as deleted and inserted.
+        if let Some(capture) = &self.target.capture {
+            let after = capture.after_record(program, table, self.start(), self.written_rowid());
+            if self.new_rowid.is_some() {
+                capture.emit_row(
+                    program,
+                    OperationMode::DELETE,
+                    self.rowid,
+                    capture_before,
+                    None,
+                    None,
+                )?;
+                capture.emit_row(
+                    program,
+                    OperationMode::INSERT,
+                    self.written_rowid(),
+                    None,
+                    after,
+                    None,
+                )?;
+            } else {
+                let updates = updates.map(|updates| {
+                    let record = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(updates),
+                        count: to_u32(2 * columns),
+                        dest_reg: to_u32(record),
+                        index_name: None,
+                        affinity_str: None,
+                    });
+                    record
+                });
+                capture.emit_row(
+                    program,
+                    OperationMode::UPDATE(crate::translate::emitter::UpdateRowSource::Normal),
+                    self.rowid,
+                    capture_before,
+                    after,
+                    updates,
+                )?;
+            }
+        }
         if let Some(returning) = layout.returning {
-            let start = returning.emit_values(program, document)?;
+            let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
         // Like legacy, AFTER triggers fire after RETURNING has read the row,
@@ -1068,8 +1679,33 @@ impl UpdateRow<'_, '_> {
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
+        updates: Option<usize>,
     ) -> Result<()> {
         let table = self.target.table;
+        let mut rows = RowValues::default();
+        if let (Some(value), Some(new_rowid)) = (layout.rowid_value, self.new_rowid) {
+            match layout.scratch {
+                // UPDATE ... FROM computed it during the join, after the
+                // assigned columns.
+                Some((cursor, columns)) => program.emit_insn(Insn::Column {
+                    cursor_id: cursor,
+                    column: columns.iter().flatten().count(),
+                    dest: new_rowid,
+                    default: None,
+                }),
+                None => value.emit(
+                    program,
+                    self.target.document,
+                    new_rowid,
+                    &mut rows,
+                    super::expr::translate_expr,
+                )?,
+            }
+            program.emit_insn(Insn::MustBeInt {
+                reg: new_rowid,
+                target_pc: None,
+            });
+        }
         for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate() {
             let register = self.start() + position;
             match value {
@@ -1090,11 +1726,12 @@ impl UpdateRow<'_, '_> {
                             });
                         }
                         None => {
-                            super::expr::translate_expr(
+                            value.emit(
                                 program,
                                 self.target.document,
-                                value,
                                 register,
+                                &mut rows,
+                                super::expr::translate_expr,
                             )?;
                         }
                     }
@@ -1102,20 +1739,41 @@ impl UpdateRow<'_, '_> {
                         self.emit_notnull_check(program, position, column)?;
                     }
                 }
-                None if column.is_rowid_alias() => program.emit_null(register, None),
+                // A virtual column is computed once the row is built.
+                None if column.is_rowid_alias() || column.is_virtual_generated() => {
+                    program.emit_null(register, None)
+                }
                 None => program.emit_column_or_rowid(self.table_cursor, position, register),
             }
         }
+        // Like legacy, the changed columns record their new values before
+        // affinity is applied; a changed INTEGER PRIMARY KEY records NULL.
+        if let Some(updates) = updates {
+            let columns = table.columns().len();
+            for (position, value) in layout.values.iter().enumerate() {
+                let changed = layout.assigned.contains(&position);
+                program.emit_bool(changed, updates + position);
+                match value {
+                    Some(_) if changed => program.emit_insn(Insn::Copy {
+                        src_reg: self.start() + position,
+                        dst_reg: updates + columns + position,
+                        extra_amount: 0,
+                    }),
+                    _ => program.emit_null(updates + columns + position, None),
+                }
+            }
+        }
         // Like legacy, apply column affinity to the new row before any index
-        // or constraint reads it.
+        // or constraint reads it. A STRICT table is type checked later.
         let affinities = table
             .columns()
             .iter()
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
-        if affinities
-            .iter()
-            .any(|affinity| *affinity != Affinity::Blob)
+        if !table.is_strict
+            && affinities
+                .iter()
+                .any(|affinity| *affinity != Affinity::Blob)
         {
             if let Some(count) = NonZeroUsize::new(affinities.len()) {
                 program.emit_insn(Insn::Affinity {
@@ -1229,16 +1887,18 @@ impl UpdateRow<'_, '_> {
         for (offset, (column, expression)) in index.columns.iter().zip(&new.columns).enumerate() {
             let register = start + offset;
             match expression {
-                Some(expression) => super::expr::translate_expr_no_constant_opt(
-                    program, document, expression, register,
-                )?,
-                None => {
+                Some(expression) if !super::dml::is_virtual_key_column(table, column) => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, expression, register,
+                    )?
+                }
+                _ => {
                     let source = if table
                         .columns()
                         .get(column.pos_in_table)
                         .is_some_and(Column::is_rowid_alias)
                     {
-                        self.rowid
+                        self.written_rowid()
                     } else {
                         self.start() + column.pos_in_table
                     };
@@ -1252,7 +1912,7 @@ impl UpdateRow<'_, '_> {
             };
         }
         program.emit_insn(Insn::Copy {
-            src_reg: self.rowid,
+            src_reg: self.written_rowid(),
             dst_reg: start + columns,
             extra_amount: 0,
         });
@@ -1303,6 +1963,111 @@ impl UpdateRow<'_, '_> {
             old_in_index,
             new_in_index,
         })
+    }
+
+    /// How a conflict on the new rowid resolves.
+    fn rowid_conflict(&self) -> ResolveType {
+        if self.has_statement_conflict {
+            self.or_conflict
+        } else {
+            self.target
+                .table
+                .rowid_alias_conflict_clause
+                .unwrap_or(ResolveType::Abort)
+        }
+    }
+
+    /// A new rowid must not belong to another row. Like legacy, this runs
+    /// before the indexes are checked; then the cursor goes back to the row.
+    fn emit_rowid_check(&self, program: &mut ProgramBuilder) -> Result<()> {
+        let new_rowid = self.new_rowid.expect("the UPDATE sets the rowid");
+        let free = program.allocate_label();
+        program.emit_insn(Insn::Eq {
+            lhs: new_rowid,
+            rhs: self.rowid,
+            target_pc: free,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: new_rowid,
+            target_pc: free,
+        });
+        match self.rowid_conflict() {
+            ResolveType::Ignore => program.emit_insn(Insn::Goto {
+                target_pc: self.skip_row,
+            }),
+            conflict => {
+                let table = self.target.table;
+                let column = table
+                    .columns()
+                    .iter()
+                    .find(|column| column.is_rowid_alias())
+                    .and_then(|column| column.name.as_deref())
+                    .unwrap_or("rowid");
+                let (description, on_error) = halt_desc_and_on_error(
+                    &format!("{}.{column}", table.name),
+                    conflict,
+                    self.has_statement_conflict,
+                );
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description,
+                    on_error,
+                    description_reg: None,
+                });
+            }
+        }
+        program.preassign_label_to_next_insn(free);
+        // NotExists moved the cursor.
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: self.rowid,
+            target_pc: self.skip_row,
+        });
+        Ok(())
+    }
+
+    /// REPLACE on a new rowid: like legacy, after the indexes are checked,
+    /// delete the row that has it, then go back to this row.
+    fn emit_rowid_replace(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+        cursors: &IndexCursors<'_>,
+        new_rowid: usize,
+    ) -> Result<()> {
+        let free = program.allocate_label();
+        program.emit_insn(Insn::Eq {
+            lhs: new_rowid,
+            rhs: self.rowid,
+            target_pc: free,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: new_rowid,
+            target_pc: free,
+        });
+        super::dml::emit_replace_delete(
+            program,
+            self.target,
+            self.table_cursor,
+            &cursors.all,
+            layout.foreign_keys,
+            new_rowid,
+            Some(layout.new_source),
+            layout.replace_actions,
+        )?;
+        program.preassign_label_to_next_insn(free);
+        program.emit_insn(Insn::NotExists {
+            cursor: self.table_cursor,
+            rowid_reg: self.rowid,
+            target_pc: self.skip_row,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1364,6 +2129,7 @@ impl UpdateRow<'_, '_> {
                     layout.foreign_keys,
                     found,
                     Some(layout.new_source),
+                    layout.replace_actions,
                 )?;
                 let back = program.allocate_label();
                 program.emit_insn(Insn::SeekRowid {
@@ -1420,6 +2186,15 @@ mod tests {
             ))
             .unwrap();
         schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE checked(id INTEGER PRIMARY KEY, a CHECK (a > 0), b CHECK (b > 0))",
+                    4,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        schema
             .add_index(Arc::new(Index {
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
@@ -1445,15 +2220,25 @@ mod tests {
     }
 
     fn emit(sql: &str) -> ProgramBuilder {
-        let plan = Arc::new(analyze_plan(schema(), sql));
+        emit_with(schema(), sql)
+    }
+
+    fn emit_with(schema: Schema, sql: &str) -> ProgramBuilder {
+        let plan = Arc::new(analyze_plan(schema, sql));
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
-        assert!(
-            !needs_legacy(&plan, update, access, &program).unwrap(),
-            "{sql}"
-        );
+        assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
-        emit_update(&mut program, &plan, update, access, &[], false).unwrap();
+        emit_update(
+            &mut program,
+            &plan,
+            update,
+            access,
+            &Subprograms::default(),
+            false,
+            true,
+        )
+        .unwrap();
         program
     }
 
@@ -1504,23 +2289,232 @@ mod tests {
     }
 
     #[test]
-    fn update_that_needs_legacy_is_left_to_it() {
+    fn update_checks_only_the_check_constraints_that_read_a_changed_column() {
+        fn is_check_halt(insn: &Insn) -> bool {
+            matches!(
+                insn,
+                Insn::Halt { err_code, .. } if *err_code == crate::error::SQLITE_CONSTRAINT_CHECK
+            )
+        }
+        let program = emit("UPDATE checked SET a = 1");
+        assert_eq!(count(&program, is_check_halt), 1);
+        let program = emit("UPDATE checked SET a = 1, b = 2");
+        assert_eq!(count(&program, is_check_halt), 2);
+    }
+
+    #[test]
+    fn update_with_a_where_subquery_collects_its_rowids_first() {
+        let program = emit("UPDATE items SET extra = 'y' WHERE value IN (SELECT value FROM items)");
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+            1
+        );
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::RowSetRead { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn update_with_set_subqueries_goes_through_hir() {
         for sql in [
-            "UPDATE items SET id = id + 1",
-            "UPDATE items SET rowid = 5 WHERE id = 1",
-            "UPDATE OR REPLACE items SET value = 1",
             "UPDATE items SET extra = (SELECT max(extra) FROM items)",
-            "UPDATE items SET extra = 'y' WHERE value IN (SELECT value FROM items)",
-            "UPDATE items SET extra = 'y' RETURNING (SELECT 1)",
-            // The loop reads the index whose key changes.
-            "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
+            "UPDATE items SET extra = (SELECT max(i.extra) FROM items AS i WHERE i.id < items.id)",
+            "UPDATE items SET (value, extra) = (SELECT 1, 'x') WHERE id = 1",
         ] {
-            let plan = analyze_plan(schema(), sql);
-            let (update, access) = update_root(&plan).unwrap();
+            // `emit` checks that HIR takes the statement.
+            let program = emit(sql);
             assert!(
-                needs_legacy(&plan, update, access, &program()).unwrap(),
+                count(&program, |insn| matches!(insn, Insn::Insert { .. })) >= 1,
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn returning_subquery_that_reads_the_target_runs_for_each_row() {
+        let once = |sql| count(&emit(sql), |insn| matches!(insn, Insn::Once { .. }));
+        assert_eq!(
+            once("UPDATE items SET extra = 'y' RETURNING (SELECT count(*) FROM items)"),
+            0
+        );
+        assert_eq!(once("UPDATE items SET extra = 'y' RETURNING (SELECT 1)"), 1);
+    }
+
+    #[test]
+    fn update_of_the_rowid_moves_the_row() {
+        for sql in [
+            "UPDATE items SET id = id + 1",
+            "UPDATE items SET rowid = 5 WHERE id = 1",
+            // Like SQLite, the last of two rowid assignments wins.
+            "UPDATE items SET id = 4, rowid = 5 WHERE id = 1",
+        ] {
+            let program = emit(sql);
+            // The rows are collected first, and the row is deleted and
+            // inserted again under its new rowid.
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+                1,
+                "{sql}"
+            );
+            assert_eq!(
+                count(&program, |insn| matches!(
+                    insn,
+                    Insn::Delete {
+                        is_part_of_update: true,
+                        ..
+                    }
+                )),
+                1,
+                "{sql}"
+            );
+            // The index entry holds the rowid, so it changes too.
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::IdxInsert { .. })),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_from_that_sets_the_rowid_reads_it_from_the_scratch_table() {
+        let program = emit("UPDATE items SET id = o.id + 10 FROM items AS o WHERE o.id = items.id");
+        let scratch = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => Some(*cursor_id),
+                _ => None,
+            })
+            .unwrap();
+        // The join stores the new rowid; the row is then moved with it.
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let read = position(
+            &|insn| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == scratch),
+        );
+        assert!(read < position(&|insn| matches!(insn, Insn::MustBeInt { .. })));
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::Delete {
+                    is_part_of_update: true,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn update_or_replace_that_fires_foreign_key_actions_goes_through_hir() {
+        let schema = || {
+            let mut schema = schema();
+            for (sql, root_page) in [
+                ("CREATE TABLE parent(id INTEGER PRIMARY KEY, k UNIQUE)", 10),
+                (
+                    "CREATE TABLE child(x REFERENCES parent(k) ON DELETE SET NULL)",
+                    11,
+                ),
+            ] {
+                schema
+                    .add_btree_table(Arc::new(BTreeTable::from_sql(sql, root_page).unwrap()))
+                    .unwrap();
+            }
+            schema
+        };
+        for sql in [
+            "UPDATE OR REPLACE parent SET k = 'a'",
+            "UPDATE OR REPLACE parent SET id = 1",
+        ] {
+            let plan = analyze_plan(schema(), sql);
+            let (update, access) = update_root(&plan).unwrap();
+            assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn update_through_a_changing_index_collects_its_rows_first() {
+        for sql in [
+            "UPDATE OR REPLACE items SET value = 1",
+            // The loop reads the index whose key changes.
+            "UPDATE items INDEXED BY items_value SET value = value + 1 WHERE value > 1",
+        ] {
+            let program = emit(sql);
+            assert_eq!(
+                count(&program, |insn| matches!(insn, Insn::RowSetAdd { .. })),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_of_an_array_element_rewrites_the_array() {
+        let mut schema = schema();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE tagged(id INTEGER PRIMARY KEY, tags TEXT[], other TEXT[]) STRICT",
+                    150,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE tagged SET tags[1] = 'x'");
+        assert_eq!(
+            count(&program, |insn| matches!(
+                insn,
+                Insn::ArraySetElement { .. }
+            )),
+            1
+        );
+        // Only the array the UPDATE sets is encoded again.
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::ArrayEncode { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn update_encodes_only_the_custom_typed_columns_it_sets() {
+        let mut schema = schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents, other cents) STRICT",
+                    140,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE priced SET amount = 20");
+        // The input check, the encoding, then the check of the stored type,
+        // for `amount` only: `other` is written back as stored.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .enumerate()
+                .filter(|(_, (insn, _))| matches(insn))
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>()
+        };
+        let checks = position(|insn| matches!(insn, Insn::TypeCheck { .. }));
+        let encodes = position(|insn| matches!(insn, Insn::Multiply { .. }));
+        assert_eq!(checks.len(), 2);
+        assert_eq!(encodes.len(), 1);
+        assert!(checks[0] < encodes[0] && encodes[0] < checks[1]);
     }
 }

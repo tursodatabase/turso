@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
+pub(crate) mod hir_index_method;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
@@ -112,6 +113,20 @@ pub fn translate(
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
+    // Engine-generated helper statements are always SQLite text and must
+    // resolve functions with SQLite semantics regardless of the database's
+    // dialect — the same invariant as unmarked schema rows.
+    let dialect = if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+    } else {
+        connection.dialect()
+    };
+    let hir_settings = semantic_lowering::HirSettings::new(
+        &connection,
+        syms,
+        dialect.clone(),
+        prepare_options.unqualified_database_search_path.as_deref(),
+    );
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
@@ -120,14 +135,7 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
-            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
-        } else {
-            connection.dialect()
-        },
+        dialect,
         &prepare_options.unqualified_database_search_path,
     );
 
@@ -149,7 +157,7 @@ pub fn translate(
             semantic_lowering::translate_select(
                 &stmt,
                 schema,
-                &resolver,
+                &hir_settings,
                 &mut program,
                 &connection,
             )?
@@ -157,17 +165,9 @@ pub fn translate(
         stmt => {
             // DML that HIR lowers today goes through it; everything else,
             // and DML it does not lower yet, stays on legacy.
-            let hir_schema = (connection.experimental_hir_enabled()
-                && !connection.is_nested_stmt())
-            .then_some(schema);
-            translate_statement(
-                stmt,
-                &mut resolver,
-                &mut program,
-                &connection,
-                input,
-                hir_schema,
-            )?
+            let hir = (connection.experimental_hir_enabled() && !connection.is_nested_stmt())
+                .then_some((schema, &hir_settings));
+            translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?
         }
     };
 
@@ -189,8 +189,8 @@ pub fn translate_inner(
     translate_statement(stmt, resolver, program, connection, input, None)
 }
 
-/// Translate one statement. With `hir_schema`, a statement that HIR can lower
-/// goes through semantic HIR instead of legacy.
+/// Translate one statement. With `hir`, a statement that HIR can lower goes
+/// through semantic HIR instead of legacy.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 fn translate_statement(
     stmt: ast::Stmt,
@@ -198,7 +198,7 @@ fn translate_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir_schema: Option<&Arc<Schema>>,
+    hir: Option<(&Arc<Schema>, &semantic_lowering::HirSettings<'_>)>,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -257,62 +257,25 @@ fn translate_statement(
         None
     };
 
-    let lowered_by_hir = match (hir_schema, &stmt) {
-        (
-            Some(schema),
-            ast::Stmt::Delete {
-                tbl_name,
-                where_clause,
-                ..
-            },
-        ) => {
+    let lowered_by_hir = match (hir, &stmt) {
+        (Some((schema, settings)), ast::Stmt::Delete { where_clause, .. }) => {
             if where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            // Legacy checks these by name before it looks the table up.
-            let table_name = crate::util::normalize_ident(tbl_name.name.as_str());
-            crate::schema::allow_user_dml(&table_name)
-                && !resolver.schema().is_materialized_view(&table_name)
-                && resolver
-                    .schema()
-                    .get_dependent_materialized_views(&table_name)
-                    .is_empty()
-                && semantic_lowering::translate_delete(
-                    &stmt, schema, resolver, program, connection,
-                )?
+            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?
         }
-        (Some(schema), ast::Stmt::Update(update)) => {
+        (Some((schema, settings)), ast::Stmt::Update(update)) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            // Legacy checks these by name before it looks the table up.
-            let table_name = crate::util::normalize_ident(update.tbl_name.name.as_str());
-            crate::schema::allow_user_dml(&table_name)
-                && !resolver.schema().is_materialized_view(&table_name)
-                && resolver
-                    .schema()
-                    .get_dependent_materialized_views(&table_name)
-                    .is_empty()
-                && semantic_lowering::translate_update(
-                    &stmt, schema, resolver, program, connection,
-                )?
+            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?
         }
-        (Some(schema), ast::Stmt::Insert { tbl_name, .. }) => {
-            // Legacy checks these by name before it looks the table up.
-            let table_name = crate::util::normalize_ident(tbl_name.name.as_str());
-            crate::schema::allow_user_dml(&table_name)
-                && !resolver.schema().is_materialized_view(&table_name)
-                && resolver
-                    .schema()
-                    .get_dependent_materialized_views(&table_name)
-                    .is_empty()
-                && semantic_lowering::translate_insert(
-                    &stmt, schema, resolver, program, connection,
-                )?
+        (Some((schema, settings)), ast::Stmt::Insert { .. }) => {
+            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
         }
         _ => false,
     };

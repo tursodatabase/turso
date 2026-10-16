@@ -3182,6 +3182,16 @@ impl CheckConstraint {
         }
     }
 
+    /// What SQLite reports when this constraint fails: its name, or its
+    /// expression's text as the user wrote it.
+    pub fn error_description(&self) -> String {
+        match (&self.name, &self.source) {
+            (Some(name), _) => name.clone(),
+            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, None) => self.expr.to_string(),
+        }
+    }
+
     /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
     pub fn sql(&self) -> String {
         match &self.source {

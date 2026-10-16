@@ -158,6 +158,8 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order, so the query needs no sorter.
     pub(crate) order_sort_elided: bool,
+    /// An index method applies LIMIT and OFFSET while it scans.
+    pub(crate) limit_applied: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -199,6 +201,8 @@ pub(crate) enum HirSourceAccess {
         table_lookup: BtreeTableLookup,
     },
     Virtual(HirVirtualTableOperation),
+    /// A scan through one query pattern of an index method, such as FTS.
+    IndexMethod(crate::translate::hir_index_method::HirIndexMethodAccess),
     Derived {
         query: QueryId,
     },
@@ -220,6 +224,10 @@ struct HirQueryEstimate {
     output_cardinality: f64,
     cost: Cost,
 }
+
+/// The most result columns a query block may have, SQLite's default
+/// SQLITE_MAX_COLUMN.
+const MAX_RESULT_COLUMNS: usize = 2000;
 
 /// State shared while one HIR document is converted into plan nodes.
 pub(crate) struct HirPlanContext<'a> {
@@ -434,6 +442,11 @@ impl<'a> HirPlanContext<'a> {
             .is_empty()
             .then_some(query.order_by.as_slice())
             .unwrap_or_default();
+        let block_limit = query
+            .compounds
+            .is_empty()
+            .then_some(query.limit.as_ref())
+            .flatten();
         let query_estimate = |query| {
             planned
                 .iter()
@@ -447,7 +460,15 @@ impl<'a> HirPlanContext<'a> {
             .blocks
             .iter()
             .map(|block| {
-                self.plan_query_block(block, block_order_by, 1.0, schema, params, &query_estimate)
+                self.plan_query_block(
+                    block,
+                    block_order_by,
+                    block_limit,
+                    1.0,
+                    schema,
+                    params,
+                    &query_estimate,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let estimate = query_estimate_from_blocks(query, &blocks, params);
@@ -921,11 +942,16 @@ impl<'a> HirPlanContext<'a> {
         &self,
         block: &hir::QueryBlock,
         order_by: &[hir::OrderTerm],
+        limit: Option<&hir::Limit>,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirQueryBlockPlan> {
+        // Like legacy and SQLite's SQLITE_MAX_COLUMN.
+        if block.outputs.len() > MAX_RESULT_COLUMNS {
+            crate::bail_parse_error!("too many columns in result set");
+        }
         let query = self
             .document
             .query(block.id.query)
@@ -945,13 +971,34 @@ impl<'a> HirPlanContext<'a> {
                 where_start: input.where_start,
                 group_sort_elided: false,
                 order_sort_elided: false,
+                limit_applied: false,
                 output_cardinality,
                 cost: Cost(0.0),
             });
         }
 
-        let input = self.query_block_input(block, order_by, &usage)?;
+        let mut input = self.query_block_input(block, order_by, &usage)?;
+        // Join planning tracks tables in a 64-bit mask.
+        if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
+            crate::bail_parse_error!(
+                "Only up to {} tables can be joined",
+                crate::translate::plan::TableReferences::MAX_JOINED_TABLES
+            );
+        }
         let where_start = input.where_start;
+        if let Some(plan) = self.plan_index_method(block, order_by, limit, &mut input)? {
+            return Ok(plan);
+        }
+        if let Some(plan) = self.plan_index_method_join(
+            block,
+            &mut input,
+            initial_cardinality,
+            schema,
+            params,
+            query_estimate,
+        )? {
+            return Ok(plan);
+        }
         let order_target = if order_by.is_empty() {
             self.grouping_target(block)
         } else {
@@ -982,9 +1029,190 @@ impl<'a> HirPlanContext<'a> {
             where_start,
             group_sort_elided: access.group_sort_elided,
             order_sort_elided: access.order_sort_elided,
+            limit_applied: false,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
+    }
+
+    /// Plan a block that reads one table through a query pattern of one of
+    /// its index methods, such as FTS, as legacy does. Like legacy, only the
+    /// first table of a block is tried, and only when it is the only one.
+    fn plan_index_method(
+        &self,
+        block: &hir::QueryBlock,
+        order_by: &[hir::OrderTerm],
+        limit: Option<&hir::Limit>,
+        input: &mut HirQueryBlockPlanInput,
+    ) -> Result<Option<HirQueryBlockPlan>> {
+        let [HirPlanSource::BTree(planned)] = input.sources.as_slice() else {
+            return Ok(None);
+        };
+        // A FROM-clause predicate, such as a table function's argument, is
+        // not one the index applies.
+        if input.predicates[..input.where_start]
+            .iter()
+            .any(|term| !term.consumed)
+        {
+            return Ok(None);
+        }
+        let source = self.definition(planned.internal_id);
+        let hir::QueryBlockBody::Select {
+            distinctness,
+            grouping,
+            ..
+        } = &block.body
+        else {
+            return Ok(None);
+        };
+        // Like legacy, a grouped block keeps its usual scan.
+        if grouping.is_some() {
+            return Ok(None);
+        }
+        let rows_are_output = distinctness.is_none()
+            && block.aggregate_count == 0
+            && block.window_function_count == 0
+            && block.windows.is_empty();
+        let Some(matched) = crate::translate::hir_index_method::match_index_methods(
+            &crate::translate::hir_index_method::IndexMethodQuery {
+                document: self.document,
+                source,
+                outputs: &block.outputs,
+                predicates: &input.predicates,
+                where_start: input.where_start,
+                order_by,
+                limit,
+                rows_are_output,
+            },
+        ) else {
+            return Ok(None);
+        };
+        if let Some(position) = matched.predicate {
+            input.predicates[position].consumed = true;
+        }
+        let source_id = source.id;
+        let predicates = std::mem::take(&mut input.predicates);
+        Ok(Some(HirQueryBlockPlan {
+            block: block.id,
+            groups: std::mem::take(&mut input.groups),
+            loops: vec![HirPlannedLoop {
+                source: source_id,
+                source_position: 0,
+                access: HirSourceAccess::IndexMethod(matched.access),
+            }],
+            predicates,
+            where_start: input.where_start,
+            group_sort_elided: false,
+            order_sort_elided: matched.applies_order_by,
+            limit_applied: matched.applies_limit,
+            output_cardinality: 1.0,
+            cost: Cost(1.0),
+        }))
+    }
+
+    /// Plan an inner join whose tables include one read through an index
+    /// method, such as FTS, for one of its WHERE terms. Like legacy when its
+    /// join planner picks the index, that table becomes the outer loop; the
+    /// other tables are planned as if its columns were known values, so the
+    /// join terms can seek them.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_index_method_join(
+        &self,
+        block: &hir::QueryBlock,
+        input: &mut HirQueryBlockPlanInput,
+        initial_cardinality: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<Option<HirQueryBlockPlan>> {
+        let inner = |source: &HirPlanSource| {
+            source.join_info().is_none_or(|join| {
+                matches!(
+                    join.kind,
+                    hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross
+                )
+            })
+        };
+        if input.sources.len() < 2 || !input.groups.is_empty() || !input.sources.iter().all(inner) {
+            return Ok(None);
+        }
+        let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
+            return Ok(None);
+        };
+        if grouping.is_some() {
+            return Ok(None);
+        }
+        let Some((position, matched)) =
+            input
+                .sources
+                .iter()
+                .enumerate()
+                .find_map(|(position, source)| {
+                    let source = self.definition(source.btree()?.internal_id);
+                    crate::translate::hir_index_method::match_index_methods(
+                        &crate::translate::hir_index_method::IndexMethodQuery {
+                            document: self.document,
+                            source,
+                            outputs: &block.outputs,
+                            predicates: &input.predicates,
+                            where_start: input.where_start,
+                            order_by: &[],
+                            limit: None,
+                            rows_are_output: false,
+                        },
+                    )
+                    .filter(|matched| matched.predicate.is_some())
+                    .map(|matched| (position, matched))
+                })
+        else {
+            return Ok(None);
+        };
+        if let Some(predicate) = matched.predicate {
+            input.predicates[predicate].consumed = true;
+        }
+        let indexed = input.sources.remove(position);
+        let rest = HirQueryBlockPlanInput {
+            sources: std::mem::take(&mut input.sources),
+            groups: Vec::new(),
+            predicates: std::mem::take(&mut input.predicates),
+            where_start: input.where_start,
+        };
+        let access = self
+            .plan_source_access(
+                rest,
+                None,
+                initial_cardinality,
+                schema,
+                params,
+                query_estimate,
+            )?
+            .ok_or_else(|| {
+                LimboError::InternalError("HIR join produced no access plan".to_string())
+            })?;
+        let mut loops = Vec::with_capacity(access.loops.len() + 1);
+        loops.push(HirPlannedLoop {
+            source: indexed.source(),
+            source_position: position,
+            access: HirSourceAccess::IndexMethod(matched.access),
+        });
+        loops.extend(access.loops.into_iter().map(|mut planned_loop| {
+            if planned_loop.source_position >= position {
+                planned_loop.source_position += 1;
+            }
+            planned_loop
+        }));
+        Ok(Some(HirQueryBlockPlan {
+            block: block.id,
+            groups: Vec::new(),
+            loops,
+            predicates: access.predicates,
+            where_start: input.where_start,
+            group_sort_elided: false,
+            order_sort_elided: false,
+            limit_applied: false,
+            output_cardinality: access.output_cardinality,
+            cost: access.cost,
+        }))
     }
 
     /// Choose source access methods and a complete join order directly from
@@ -2552,6 +2780,7 @@ mod tests {
             .plan_query_block(
                 &block,
                 &[],
+                None,
                 7.0,
                 &Schema::default(),
                 &CostModelParams::default(),

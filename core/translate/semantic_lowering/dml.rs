@@ -3,10 +3,11 @@
 use turso_parser::ast;
 
 use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
-        expr::{emit_returning_scan_back, ConditionMetadata, ReturningBufferCtx},
+        expr::ConditionMetadata,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, SourceId},
         semantic_to_plan::HirAccessPlan,
@@ -19,7 +20,109 @@ use crate::{
     LimboError, Result,
 };
 
+use super::fkey_action::CompiledAction;
 use super::query::{emit_array_results, predicate_loop};
+use super::trigger::CompiledTrigger;
+use super::{HirPlan, HirSession};
+
+/// The subprograms a DML statement fires. They are compiled before anything
+/// is emitted, so one that needs legacy leaves the whole statement to it.
+#[derive(Default)]
+pub(super) struct Subprograms<'a> {
+    /// The statement's row triggers.
+    pub(super) triggers: Vec<CompiledTrigger>,
+    /// The foreign-key actions of the statement's own change: ON DELETE for
+    /// a DELETE, ON UPDATE for an UPDATE.
+    pub(super) actions: Vec<CompiledAction<'a>>,
+    /// The ON DELETE actions of the rows REPLACE deletes.
+    pub(super) replace_actions: Vec<CompiledAction<'a>>,
+    /// INSERT: the UPDATE triggers an UPSERT's DO UPDATE fires.
+    pub(super) upsert_triggers: Vec<CompiledTrigger>,
+    /// INSERT: the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
+    /// clause order.
+    pub(super) upsert_actions: Vec<Vec<CompiledAction<'a>>>,
+}
+
+impl<'a> Subprograms<'a> {
+    /// What a DELETE fires. `None` means one needs legacy.
+    pub(super) fn for_delete(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        delete: &'a hir::Delete,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::delete_triggers(session, parent, plan, delete)? else {
+            return Ok(None);
+        };
+        let Some(actions) = super::fkey_action::delete_actions(session, parent, delete)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions,
+            ..Self::default()
+        }))
+    }
+
+    /// What an UPDATE fires. `None` means one needs legacy.
+    pub(super) fn for_update(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        update: &'a hir::Update,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::update_triggers(session, parent, plan, update)? else {
+            return Ok(None);
+        };
+        let Some(actions) = super::fkey_action::update_actions(session, parent, plan, update)?
+        else {
+            return Ok(None);
+        };
+        let Some(replace_actions) = super::update::replace_actions(session, parent, plan, update)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions,
+            replace_actions,
+            ..Self::default()
+        }))
+    }
+
+    /// What an INSERT fires. `None` means one needs legacy.
+    pub(super) fn for_insert(
+        session: &HirSession<'_>,
+        parent: &ProgramBuilder,
+        plan: &HirPlan,
+        insert: &'a hir::Insert,
+    ) -> Result<Option<Self>> {
+        let Some(triggers) = super::trigger::insert_triggers(session, parent, plan, insert)? else {
+            return Ok(None);
+        };
+        let Some(upsert_triggers) =
+            super::trigger::upsert_update_triggers(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        let Some(replace_actions) = super::insert::replace_actions(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        let Some(upsert_actions) =
+            super::fkey_action::upsert_actions(session, parent, plan, insert)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            triggers,
+            actions: Vec::new(),
+            replace_actions,
+            upsert_triggers,
+            upsert_actions,
+        }))
+    }
+}
 
 /// The B-tree table a DELETE or UPDATE writes, with what HIR resolved for it.
 pub(super) struct DmlTarget<'a> {
@@ -27,6 +130,8 @@ pub(super) struct DmlTarget<'a> {
     pub(super) source: &'a hir::Source,
     pub(super) table: &'a Arc<BTreeTable>,
     pub(super) database: usize,
+    /// The capture table, when the statement captures its changes.
+    pub(super) capture: Option<super::cdc::Capture<'a>>,
 }
 
 impl<'a> DmlTarget<'a> {
@@ -73,7 +178,26 @@ impl<'a> DmlTarget<'a> {
             source,
             table,
             database: database.index(),
+            capture: None,
         })
+    }
+
+    /// Open the capture table when the statement captures its changes.
+    pub(super) fn with_capture(
+        mut self,
+        program: &mut ProgramBuilder,
+        capture: Option<&'a hir::CaptureChanges>,
+    ) -> Result<Self> {
+        self.capture = super::cdc::Capture::open(program, capture, self.table)?;
+        Ok(self)
+    }
+
+    /// At the end of the statement: the COMMIT row of change data capture.
+    pub(super) fn emit_capture_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
+        match &self.capture {
+            Some(capture) => capture.emit_commit(program),
+            None => Ok(()),
+        }
     }
 
     /// The catalog table the target writes.
@@ -117,8 +241,9 @@ impl<'a> DmlTarget<'a> {
             if skip.is_some_and(|skip| skip.name == index.name) {
                 continue;
             }
-            let cursor =
-                program.alloc_cursor_id(CursorType::BTreeIndex(expressions.index.handle()));
+            // An index method without a B-tree of its own (such as FTS) gets
+            // its own kind of cursor, as in legacy.
+            let cursor = program.alloc_cursor_index(None, &expressions.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
@@ -196,6 +321,17 @@ pub(super) fn emit_index_key(
     table_cursor: CursorID,
     expressions: &hir::IndexExpressions,
 ) -> Result<(usize, usize)> {
+    emit_index_key_values(program, document, source, table, table_cursor, expressions)
+}
+
+fn emit_index_key_values(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &BTreeTable,
+    table_cursor: CursorID,
+    expressions: &hir::IndexExpressions,
+) -> Result<(usize, usize)> {
     let index = expressions.index.value();
     let count = index.columns.len() + 1;
     let start = program.alloc_registers(count);
@@ -254,6 +390,7 @@ pub(super) fn emit_index_key(
 ///
 /// `replacement` is the row an UPDATE writes in its place: an immediate NO
 /// ACTION parent key it keeps cannot leave a child without its parent.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_replace_delete(
     program: &mut ProgramBuilder,
     target: &DmlTarget<'_>,
@@ -262,12 +399,14 @@ pub(super) fn emit_replace_delete(
     foreign_keys: &hir::DmlForeignKeys,
     conflict: usize,
     replacement: Option<SourceId>,
+    actions: &[CompiledAction<'_>],
 ) -> Result<()> {
     let DmlTarget {
         document,
         source,
         table,
         database,
+        ..
     } = *target;
     let missing = program.allocate_label();
     program.emit_insn(Insn::SeekRowid {
@@ -292,6 +431,14 @@ pub(super) fn emit_replace_delete(
         database,
         replacement,
     )?;
+    // Like legacy, the ON DELETE actions of the deleted row run once it is
+    // gone.
+    let action_keys = actions
+        .iter()
+        .map(|action| {
+            super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
     for (expressions, cursor) in indexes {
         let skip = match &expressions.predicate {
             Some(predicate) => {
@@ -321,11 +468,25 @@ pub(super) fn emit_replace_delete(
             program.preassign_label_to_next_insn(skip);
         }
     }
+    if let Some(capture) = &target.capture {
+        let before = capture.before_record(program, table, table_cursor, conflict);
+        capture.emit_row(
+            program,
+            crate::translate::emitter::OperationMode::DELETE,
+            conflict,
+            before,
+            None,
+            None,
+        )?;
+    }
     program.emit_insn(Insn::Delete {
         cursor_id: table_cursor,
         table_name: table.name.clone(),
         is_part_of_update: true,
     });
+    for (action, key) in actions.iter().zip(action_keys) {
+        action.emit_fire(program, key, None)?;
+    }
     program.preassign_label_to_next_insn(missing);
     Ok(())
 }
@@ -388,6 +549,39 @@ fn is_non_null_literal(expression: &hir::Expr) -> bool {
     )
 }
 
+/// The virtual table a DML statement writes, or `None` for a B-tree target.
+pub(super) fn virtual_target(
+    document: &HirDocument,
+    target: SourceId,
+) -> Result<Option<Arc<crate::vtab::VirtualTable>>> {
+    let source = document
+        .source(target)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR DML target {target} is missing")))?;
+    Ok(match &source.kind {
+        hir::SourceKind::Table(table) => table.value().virtual_table(),
+        _ => None,
+    })
+}
+
+/// Whether a write to a virtual table stays in legacy: `sqlite_dbpage`,
+/// which legacy writes only in testing builds.
+pub(super) fn virtual_needs_legacy(table: &crate::vtab::VirtualTable) -> bool {
+    table.name == "sqlite_dbpage"
+}
+
+/// Open a virtual table for writing, as legacy does: the rows a statement
+/// writes are handed to the table with `VUpdate` through this cursor, inside
+/// the table's own transaction.
+pub(super) fn open_virtual_for_write(
+    program: &mut ProgramBuilder,
+    table: &Arc<crate::vtab::VirtualTable>,
+) -> CursorID {
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    cursor
+}
+
 /// RETURNING rows of a DML statement. Like legacy, they wait in an
 /// ephemeral table until every row is written, then are returned.
 #[derive(Clone, Copy)]
@@ -397,6 +591,38 @@ pub(super) struct ReturningBuffer<'a> {
 }
 
 impl<'a> ReturningBuffer<'a> {
+    /// Like [`Self::open`], for a target that is not a B-tree table.
+    pub(super) fn open_scratch(
+        program: &mut ProgramBuilder,
+        returning: Option<&'a hir::Returning>,
+    ) -> Option<Self> {
+        let returning = returning?;
+        let table = Arc::new(BTreeTable::new(
+            0,
+            "returning_scratch".to_string(),
+            Vec::new(),
+            (0..returning.outputs.len())
+                .map(|column| {
+                    crate::schema::Column::new(
+                        Some(format!("value_{column}")),
+                        "BLOB".to_string(),
+                        None,
+                        None,
+                        crate::schema::Type::Blob,
+                        None,
+                        crate::schema::ColDef::default(),
+                    )
+                })
+                .collect(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        Self::open(program, &table, Some(returning))
+    }
+
     pub(super) fn open(
         program: &mut ProgramBuilder,
         table: &Arc<BTreeTable>,
@@ -420,7 +646,21 @@ impl<'a> ReturningBuffer<'a> {
         &self,
         program: &mut ProgramBuilder,
         document: &HirDocument,
+        target: &hir::ResolvedTable,
     ) -> Result<usize> {
+        // Like SQLite, a subquery in RETURNING whose FROM clause names the
+        // target table runs again for each row, so it sees the rows written
+        // so far; any other runs once.
+        for output in self.outputs {
+            output.expr.for_each(&mut |expression| {
+                if let hir::Expr::Subquery(subquery) = expression {
+                    let query = subquery_query(subquery);
+                    if document.query_reads_table_directly(query, target) {
+                        program.rerun_subquery(query);
+                    }
+                }
+            });
+        }
         let start = program.alloc_registers(self.outputs.len());
         for (position, output) in self.outputs.iter().enumerate() {
             super::expr::translate_expr_no_constant_opt(
@@ -430,7 +670,7 @@ impl<'a> ReturningBuffer<'a> {
                 start + position,
             )?;
         }
-        emit_array_results(program, document, self.outputs, start);
+        emit_array_results(program, document, self.outputs, start)?;
         Ok(start)
     }
 
@@ -463,14 +703,397 @@ impl<'a> ReturningBuffer<'a> {
     pub(super) fn emit_rows(&self, program: &mut ProgramBuilder) {
         // Legacy checks foreign keys before returning any row.
         program.emit_insn(Insn::FkCheck { deferred: false });
-        emit_returning_scan_back(
-            program,
-            &ReturningBufferCtx {
+        let done = program.allocate_label();
+        let next = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(next);
+        let count = self.outputs.len();
+        let start = program.alloc_registers(count);
+        for i in 0..count {
+            program.emit_insn(Insn::Column {
                 cursor_id: self.cursor,
-                num_columns: self.outputs.len(),
-            },
-        );
+                column: i,
+                dest: start + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::ResultRow {
+            start_reg: start,
+            count,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: self.cursor,
+            pc_if_next: next,
+            fullscan: false,
+        });
+        program.preassign_label_to_next_insn(done);
     }
+}
+
+/// Check each CHECK constraint against the new row, which the constraint's
+/// source must be bound to. Like SQLite, a NULL result passes. A failure
+/// skips the row under IGNORE and stops the statement otherwise; REPLACE
+/// does not apply to CHECK.
+/// Run `emit` reading custom-typed columns as stored, not decoded. Like
+/// legacy, CHECK constraints compare stored values.
+pub(super) fn with_stored_values<T>(
+    program: &mut ProgramBuilder,
+    emit: impl FnOnce(&mut ProgramBuilder) -> Result<T>,
+) -> Result<T> {
+    let previous = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(true);
+    let result = emit(program);
+    program.flags.set_suppress_custom_type_decode(previous);
+    result
+}
+
+pub(super) fn emit_check_constraints<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    with_stored_values(program, |program| {
+        emit_check_constraint_list(program, document, constraints, or_conflict, skip_row)
+    })
+}
+
+fn emit_check_constraint_list<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    for constraint in constraints {
+        let result = program.alloc_register();
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &constraint.expression,
+            result,
+        )?;
+        let passed = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: result,
+            target_pc: passed,
+        });
+        program.emit_insn(Insn::If {
+            reg: result,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        if or_conflict == ast::ResolveType::Ignore {
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row,
+            });
+        } else {
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: constraint.description.clone(),
+                on_error: None,
+                description_reg: None,
+            });
+        }
+        program.preassign_label_to_next_insn(passed);
+    }
+    Ok(())
+}
+
+/// The query an expression subquery runs.
+pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
+    match subquery {
+        hir::SubqueryExpr::Scalar { query, .. }
+        | hir::SubqueryExpr::Row { query }
+        | hir::SubqueryExpr::Exists(query)
+        | hir::SubqueryExpr::In { query, .. } => *query,
+    }
+}
+
+/// Whether the target is a STRICT table HIR does not lower yet: one with an
+/// array column, or a type name that is neither built in nor custom.
+pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
+    let builtin = |name: &str| {
+        ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+            .iter()
+            .any(|builtin| name.eq_ignore_ascii_case(builtin))
+    };
+    table.is_strict
+        && table
+            .columns()
+            .iter()
+            .enumerate()
+            .any(|(position, column)| {
+                if column.is_array() {
+                    // An array of a custom type is not lowered yet.
+                    !builtin(&column.ty_str)
+                } else {
+                    custom_chain(source, position).is_none() && !builtin(&column.ty_str)
+                }
+            })
+}
+
+/// STRICT: check each value of the row in `start..` against its column's
+/// type, converting it where SQLite allows and failing otherwise, as legacy
+/// does. A STRICT table gets this instead of column affinity.
+pub(super) fn emit_strict_type_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    // Like SQLite, a virtual column is not checked: it is checked as ANY.
+    let table_reference = if table.has_virtual_columns() {
+        let mut checked = (**table).clone();
+        for column in checked.columns_mut().iter_mut() {
+            if column.is_virtual_generated() {
+                column.ty_str = "ANY".to_string();
+            }
+        }
+        Arc::new(checked)
+    } else {
+        table.clone()
+    };
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference,
+    });
+}
+
+/// The custom type of `column` of `source`: its definitions from the
+/// declared type through its ancestors.
+fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedType]> {
+    source.columns[column]
+        .type_fact
+        .declared
+        .as_ref()
+        .map(|declared| declared.custom_chain.as_slice())
+        .filter(|chain| !chain.is_empty())
+}
+
+/// Whether a column of the target has a custom type.
+pub(super) fn has_custom_types(source: &hir::Source) -> bool {
+    source.column_type_programs.iter().any(Option::is_some)
+        || source
+            .columns
+            .iter()
+            .any(|column| column.type_fact.is_array())
+}
+
+/// STRICT with custom types, as legacy does it: check each value in
+/// `start..` against the type its column accepts as input, encode it, then
+/// check the encoded value against the column's base type. Only the columns
+/// at `only` are checked as input and encoded; `None` means all of them.
+pub(super) fn emit_custom_type_writes(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &Arc<BTreeTable>,
+    start: usize,
+    only: Option<&[usize]>,
+) -> Result<()> {
+    let written = |column: usize| only.is_none_or(|only| only.contains(&column));
+    let check_table = |input: bool| {
+        let mut checked = (**table).clone();
+        for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+            if column.is_virtual_generated() || (input && !written(position)) {
+                column.ty_str = "ANY".to_string();
+                if input {
+                    column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                }
+                continue;
+            }
+            // Like legacy, an array is given as text or a blob, and is
+            // stored as a record blob.
+            if column.is_array() {
+                column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
+                column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                continue;
+            }
+            let Some(chain) = custom_chain(source, position) else {
+                continue;
+            };
+            if input {
+                column.ty_str = chain[0].value().value_input_type().to_uppercase();
+            } else {
+                let base = chain.last().expect("a custom chain is not empty");
+                column.ty_str = base.value().base().to_uppercase();
+                column.override_affinity(crate::vdbe::affinity::Affinity::None);
+            }
+        }
+        Arc::new(checked)
+    };
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(true),
+    });
+    // Like legacy, an array is parsed and its elements checked against the
+    // element type, then stored as a record blob. Only the outer array of a
+    // multi-dimensional one checks nothing but that its elements are arrays.
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.is_array() || column.is_virtual_generated() || !written(position) {
+            continue;
+        }
+        let register = start + position;
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: register,
+            target_pc: skip,
+        });
+        let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
+        program.emit_insn(Insn::ArrayEncode {
+            data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                reg: register,
+                element_affinity: if any {
+                    crate::vdbe::affinity::Affinity::Blob
+                } else {
+                    crate::vdbe::affinity::Affinity::affinity(&column.ty_str)
+                },
+                element_type: if any {
+                    "ANY".into()
+                } else {
+                    column.ty_str.to_uppercase().into()
+                },
+                table_name: table.name.as_str().into(),
+                col_name: column.name.as_deref().unwrap_or("").into(),
+            }),
+        });
+        program.preassign_label_to_next_insn(skip);
+    }
+    for (position, programs) in source.column_type_programs.iter().enumerate() {
+        let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
+            continue;
+        };
+        let register = start + position;
+        let skip = (!programs.encode_nulls).then(|| {
+            let skip = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: register,
+                target_pc: skip,
+            });
+            skip
+        });
+        super::expr::translate_schema_calls_in_place(
+            program,
+            document,
+            &programs.encode,
+            register,
+        )?;
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(false),
+    });
+    Ok(())
+}
+
+/// Compute each virtual generated column of the row in registers
+/// `start + column` into its register, in dependency order, as legacy does.
+/// `source` must be bound to those registers. Reads of the row through
+/// `source` compute virtual columns anyway; this fills the registers that
+/// are copied directly, such as index keys, NOT NULL checks and triggers.
+pub(super) fn emit_virtual_columns(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: SourceId,
+    table: &BTreeTable,
+    start: usize,
+) -> Result<()> {
+    if !table.has_virtual_columns() {
+        return Ok(());
+    }
+    for (column, _) in table
+        .columns_topo_sort()?
+        .iter()
+        .filter(|(_, column)| column.is_virtual_generated())
+    {
+        super::expr::translate_expr_no_constant_opt(
+            program,
+            document,
+            &hir::Expr::Column(hir::ColumnRef { source, column }),
+            start + column,
+        )?;
+    }
+    Ok(())
+}
+
+/// The record of the row in registers `start + column`. A virtual
+/// generated column is not stored, so with one the stored columns are first
+/// copied together, in their stored order.
+pub(super) fn emit_row_record(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    start: usize,
+) -> usize {
+    // A WITHOUT ROWID table stores its primary key columns first.
+    let stored = if table.has_virtual_columns() || !table.has_rowid {
+        let mut stored = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(position, column)| {
+                (table.logical_to_physical_column(position), position, column)
+            })
+            .collect::<Vec<_>>();
+        stored.sort_by_key(|(physical, _, _)| *physical);
+        let block = program.alloc_registers(stored.len());
+        for (offset, (_, position, _)) in stored.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: start + position,
+                dst_reg: block + offset,
+                extra_amount: 0,
+            });
+        }
+        let affinities = stored
+            .iter()
+            .map(|(_, _, column)| column.affinity_with_strict(table.is_strict).aff_mask())
+            .collect::<String>();
+        (block, stored.len(), affinities)
+    } else {
+        let affinities = table
+            .columns()
+            .iter()
+            .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+            .collect::<String>();
+        (start, table.columns().len(), affinities)
+    };
+    let (block, count, affinities) = stored;
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(block),
+        count: to_u32(count),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: Some(affinities),
+    });
+    record
+}
+
+/// Whether an index key column is a virtual generated column of `table`.
+/// Its value is in the row's registers, computed with the column's
+/// affinity, so a new key copies it instead of computing it again.
+pub(super) fn is_virtual_key_column(
+    table: &BTreeTable,
+    column: &crate::schema::IndexColumn,
+) -> bool {
+    column.pos_in_table != EXPR_INDEX_SENTINEL
+        && table
+            .columns()
+            .get(column.pos_in_table)
+            .is_some_and(|column| column.is_virtual_generated())
 }
 
 /// Whether an expression contains a subquery.

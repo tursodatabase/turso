@@ -8,6 +8,8 @@
 
 use std::num::NonZeroU32;
 
+use super::dml::Subprograms;
+
 use turso_parser::ast::{ResolveType, TriggerTime};
 
 use crate::{
@@ -118,6 +120,7 @@ fn compile_trigger(
             .then(|| hir::DatabaseId::new(database)),
         table_name: &table.name,
         event: definition.event.clone(),
+        new_is_decoded: definition.time == TriggerTime::Before,
         predicate: definition.when_clause.as_ref(),
         commands: &definition.commands,
         conflict_override,
@@ -132,49 +135,32 @@ fn compile_trigger(
     if let Some(conflict) = conflict_override {
         builder.set_trigger_conflict_override(conflict);
     }
-    // Triggers that the body's own DML fires, per command.
+    // What the body's own DML fires, per command.
     let mut nested = Vec::with_capacity(commands.len());
     for (command, command_plan) in root.commands.iter().zip(commands) {
-        let mut command_triggers = Vec::new();
-        let needs_legacy = match (command, command_plan) {
-            (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => false,
+        let compiled = match (command, command_plan) {
+            (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => {
+                Some(Subprograms::default())
+            }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
                 if super::insert::needs_legacy(&plan, insert, &builder)? {
-                    true
+                    None
                 } else {
-                    match insert_triggers(session, &builder, &plan, insert)? {
-                        Some(triggers) => {
-                            command_triggers = triggers;
-                            false
-                        }
-                        None => true,
-                    }
+                    Subprograms::for_insert(session, &builder, &plan, insert)?
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                if super::update::needs_legacy(&plan, update, access, &builder)? {
-                    true
+                if super::update::needs_legacy(&plan, update, access)? {
+                    None
                 } else {
-                    match update_triggers(session, &builder, &plan, update)? {
-                        Some(triggers) => {
-                            command_triggers = triggers;
-                            false
-                        }
-                        None => true,
-                    }
+                    Subprograms::for_update(session, &builder, &plan, update)?
                 }
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                if super::delete::needs_legacy(delete, access, &builder)? {
-                    true
+                if super::delete::needs_legacy(&plan.document, delete, access)? {
+                    None
                 } else {
-                    match delete_triggers(session, &builder, &plan, delete)? {
-                        Some(triggers) => {
-                            command_triggers = triggers;
-                            false
-                        }
-                        None => true,
-                    }
+                    Subprograms::for_delete(session, &builder, &plan, delete)?
                 }
             }
             _ => {
@@ -183,10 +169,10 @@ fn compile_trigger(
                 ));
             }
         };
-        if needs_legacy {
+        let Some(compiled) = compiled else {
             return Ok(Compiled::NeedsLegacy);
-        }
-        nested.push(command_triggers);
+        };
+        nested.push(compiled);
     }
 
     builder.prologue();
@@ -231,9 +217,7 @@ fn compile_trigger(
         )?;
         builder.preassign_label_to_next_insn(passed);
     }
-    for ((command, command_plan), command_triggers) in
-        root.commands.iter().zip(commands).zip(&nested)
-    {
+    for ((command, command_plan), subprograms) in root.commands.iter().zip(commands).zip(&nested) {
         match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(query)) => {
                 // The subprogram's result rows are discarded.
@@ -245,27 +229,31 @@ fn compile_trigger(
                 )?;
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                super::insert::emit_insert(&mut builder, &plan, insert, command_triggers)?;
+                super::insert::emit_insert(
+                    &mut builder,
+                    &plan,
+                    insert,
+                    subprograms,
+                    super::uses_mvcc(connection, &plan.document, insert.target),
+                    !connection.check_constraints_ignored(),
+                )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                let mvcc = plan
-                    .document
-                    .source(update.target)
-                    .and_then(|source| source.database)
-                    .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some());
+                let mvcc = super::uses_mvcc(connection, &plan.document, update.target);
                 super::update::emit_update(
                     &mut builder,
                     &plan,
                     update,
                     access,
-                    command_triggers,
+                    subprograms,
                     mvcc,
+                    !connection.check_constraints_ignored(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                super::delete::emit_delete(&mut builder, &plan, delete, access, command_triggers)?;
+                super::delete::emit_delete(&mut builder, &plan, delete, access, subprograms)?;
                 builder.emit_insn(Insn::ResetCount);
             }
             _ => {
@@ -338,6 +326,28 @@ pub(super) fn insert_triggers(
         insert.target,
         &triggers.insert,
         conflict_override,
+    )
+}
+
+/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. `None` means one
+/// needs legacy. Like legacy, an OR IGNORE or OR REPLACE inside them does
+/// not hide an error: they run with ABORT.
+pub(super) fn upsert_update_triggers(
+    session: &HirSession<'_>,
+    parent: &ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+) -> Result<Option<Vec<CompiledTrigger>>> {
+    let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+        return Ok(Some(Vec::new()));
+    };
+    target_triggers(
+        session,
+        parent,
+        plan,
+        insert.target,
+        &triggers.upsert_update,
+        Some(ResolveType::Abort),
     )
 }
 

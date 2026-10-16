@@ -13,7 +13,7 @@ use turso_parser::ast::TriggerTime;
 use crate::{
     translate::{
         optimizer::HirBtreeOperation,
-        semantic::hir,
+        semantic::hir::{self, HirDocument},
         semantic_to_plan::{HirAccessPlan, HirPlan, HirSourceAccess},
     },
     vdbe::{
@@ -21,50 +21,35 @@ use crate::{
         insn::{Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    CaptureDataChangesExt, LimboError, Result,
+    LimboError, Result,
 };
 
 use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer,
+    DmlTarget, ReturningBuffer, Subprograms,
 };
+use super::fkey_action::CompiledAction;
 use super::query::{
     close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
     PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
+use crate::translate::emitter::OperationMode;
 
 /// Whether this DELETE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
 /// the whole statement.
 pub(super) fn needs_legacy(
+    document: &HirDocument,
     delete: &hir::Delete,
     access: &HirAccessPlan,
-    program: &ProgramBuilder,
 ) -> Result<bool> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
-    // A RETURNING subquery that reads the target must see the table after
-    // the row is deleted, but HIR reads RETURNING values before.
-    if delete.returning.as_ref().is_some_and(|returning| {
-        returning
-            .outputs
-            .iter()
-            .any(|output| has_subquery(&output.expr))
-    }) {
-        return Ok(true);
-    }
-    match &delete.target_kind {
-        hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
-            if super::fkey::delete_needs_legacy(foreign_keys) {
-                return Ok(true);
-            }
-        }
-        hir::DeleteTargetKind::Virtual => return Ok(true),
-    }
-    if program.capture_data_changes_info().table().is_some() {
-        return Ok(true);
+    // Like legacy, writes to a virtual table record no change data.
+    if let Some(table) = super::dml::virtual_target(document, delete.target)? {
+        return Ok(super::dml::virtual_needs_legacy(&table));
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -80,6 +65,16 @@ pub(super) fn needs_legacy(
     }
 }
 
+/// Whether a RETURNING value of the DELETE has a subquery.
+fn returning_has_subquery(delete: &hir::Delete) -> bool {
+    delete.returning.as_ref().is_some_and(|returning| {
+        returning
+            .outputs
+            .iter()
+            .any(|output| has_subquery(&output.expr))
+    })
+}
+
 /// Emit a DELETE that [`needs_legacy`] accepted. `delete` is the plan's
 /// root or one command of a trigger in it.
 pub(super) fn emit_delete(
@@ -87,9 +82,14 @@ pub(super) fn emit_delete(
     plan: &HirPlan,
     delete: &hir::Delete,
     access: &HirAccessPlan,
-    triggers: &[CompiledTrigger],
+    subprograms: &Subprograms<'_>,
 ) -> Result<()> {
+    let triggers = &subprograms.triggers[..];
+    let actions = &subprograms.actions[..];
     let document = &plan.document;
+    if let Some(table) = super::dml::virtual_target(document, delete.target)? {
+        return emit_virtual_delete(program, plan, delete, access, &table);
+    }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR DELETE plan has {} loops for one target",
@@ -107,15 +107,21 @@ pub(super) fn emit_delete(
             "HIR DELETE target does not use a B-tree loop".into(),
         ));
     };
-    let hir::DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind else {
+    let hir::DeleteTargetKind::BTree {
+        foreign_keys,
+        capture_changes,
+        ..
+    } = &delete.target_kind
+    else {
         return Err(LimboError::InternalError(
             "HIR DELETE target is not a B-tree table".into(),
         ));
     };
-    let target = DmlTarget::new(program, document, delete.target, "DELETE")?;
-    // Like legacy, a DELETE that fires triggers first collects its rowids,
-    // since a trigger can change the table.
-    let uses_rowset = uses_rowset(delete) || !triggers.is_empty();
+    let target = DmlTarget::new(program, document, delete.target, "DELETE")?
+        .with_capture(program, capture_changes.as_ref())?;
+    // Like legacy, a DELETE that fires triggers or foreign-key actions
+    // first collects its rowids, since they can change the table.
+    let uses_rowset = uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty();
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
     // After collecting rowids, legacy treats the delete as a scan.
@@ -140,6 +146,7 @@ pub(super) fn emit_delete(
             foreign_keys,
             returning,
             triggers,
+            actions,
             done,
         )?;
     } else {
@@ -154,6 +161,7 @@ pub(super) fn emit_delete(
         )?;
     }
     program.preassign_label_to_next_insn(done);
+    target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
     }
@@ -212,6 +220,7 @@ fn emit_scan_delete(
         table_cursor: lookup_cursor,
         autoindex_source_cursor: None,
         table_has_rowid: target.table.has_rowid,
+        index_keys: Vec::new(),
     };
     emit_access_predicates(program, document, access, None, done)?;
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
@@ -231,6 +240,7 @@ fn emit_scan_delete(
             table_cursor,
             rowid,
             foreign_keys,
+            actions: &[],
         },
         iteration,
         &other_indexes,
@@ -251,6 +261,7 @@ fn emit_rowset_delete(
     foreign_keys: &hir::DmlForeignKeys,
     returning: Option<ReturningBuffer<'_>>,
     triggers: &[CompiledTrigger],
+    actions: &[CompiledAction<'_>],
     done: BranchOffset,
 ) -> Result<()> {
     let document = target.document;
@@ -314,17 +325,22 @@ fn emit_rowset_delete(
                 },
             );
             let start = program.alloc_registers(columns);
-            for column in 0..columns {
-                super::expr::translate_expr_no_constant_opt(
-                    program,
-                    document,
-                    &hir::Expr::Column(hir::ColumnRef {
-                        source: target.source.id,
-                        column,
-                    }),
-                    start + column,
-                )?;
-            }
+            // The trigger program decodes custom-typed values itself, so it is
+            // given them as stored.
+            super::dml::with_stored_values(program, |program| {
+                for column in 0..columns {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: target.source.id,
+                            column,
+                        }),
+                        start + column,
+                    )?;
+                }
+                Ok(())
+            })?;
             Ok(TriggerRow {
                 columns: start,
                 rowid,
@@ -357,6 +373,7 @@ fn emit_rowset_delete(
             table_cursor,
             rowid,
             foreign_keys,
+            actions,
         },
         None,
         &indexes,
@@ -374,6 +391,51 @@ struct DeletedRow<'a> {
     /// The register holding the row's rowid.
     rowid: usize,
     foreign_keys: &'a hir::DmlForeignKeys,
+    /// The ON DELETE actions to run once the row is gone.
+    actions: &'a [CompiledAction<'a>],
+}
+
+/// DELETE from a virtual table, as legacy does it: each row the loop finds
+/// is handed to the table with `VUpdate`, with its rowid and a NULL.
+fn emit_virtual_delete(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    delete: &hir::Delete,
+    access: &HirAccessPlan,
+    table: &crate::sync::Arc<crate::vtab::VirtualTable>,
+) -> Result<()> {
+    if delete.returning.is_some() {
+        crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+    }
+    if table.readonly() {
+        return Err(LimboError::ReadOnly);
+    }
+    program.begin_write_operation()?;
+    let cursor = super::dml::open_virtual_for_write(program, table);
+    let document = &plan.document;
+    super::query::emit_dml_join_loops(
+        program,
+        plan,
+        None,
+        super::query::HirLoopsPlan::of_access(access),
+        &|program, _next| {
+            let start = program.alloc_registers(2);
+            super::expr::translate_expr(
+                program,
+                document,
+                &hir::Expr::RowId(delete.target),
+                start,
+            )?;
+            program.emit_null(start + 1, None);
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: cursor,
+                arg_count: 2,
+                start_reg: start,
+                conflict_action: 0,
+            });
+            Ok(())
+        },
+    )
 }
 
 /// Delete the row the table cursor is on: its foreign-key checks, its
@@ -393,6 +455,7 @@ fn emit_delete_row(
         source,
         table,
         database,
+        ..
     } = *target;
     let table_cursor = row.table_cursor;
     // Foreign-key keys, index keys and RETURNING values are read from the
@@ -413,6 +476,15 @@ fn emit_delete_row(
         database,
         None,
     )?;
+    // Like legacy, the parent key the actions need is read before the row
+    // is deleted, and the actions run once it is gone.
+    let action_keys = row
+        .actions
+        .iter()
+        .map(|action| {
+            super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
     // The key of the index the loop reads is taken before the row is
     // deleted and removed after it.
     let iteration_key = iteration
@@ -422,10 +494,34 @@ fn emit_delete_row(
             Ok((cursor, start, count, expressions))
         })
         .transpose()?;
-    // RETURNING reads the row before it is deleted. Without subqueries this
-    // gives the same values as legacy, which reads a copy of the row after.
+    // RETURNING reads the row before it is deleted, which gives the same
+    // values as legacy, which reads a copy of the row after. A subquery in
+    // RETURNING must not see the row any more, so then RETURNING reads a
+    // copy of the row once it and its index entries are gone.
+    let copy = returning
+        .as_ref()
+        .filter(|returning| {
+            returning
+                .outputs
+                .iter()
+                .any(|output| has_subquery(&output.expr))
+        })
+        .map(|_| {
+            // A virtual column is not stored; reading it through the copy
+            // computes it from the other columns.
+            let start = program.alloc_registers(table.columns().len());
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated() {
+                    program.emit_null(start + position, None);
+                } else {
+                    program.emit_column_or_rowid(table_cursor, position, start + position);
+                }
+            }
+            start
+        });
     let returning_row = returning
-        .map(|returning| returning.emit_values(program, document))
+        .filter(|_| copy.is_none())
+        .map(|returning| returning.emit_values(program, document, target.resolved_table()?))
         .transpose()?;
     for (expressions, cursor) in other_indexes {
         let skip = match &expressions.predicate {
@@ -456,6 +552,18 @@ fn emit_delete_row(
             program.preassign_label_to_next_insn(skip);
         }
     }
+    // Like legacy, the captured change reads the row before it is deleted.
+    if let Some(capture) = &target.capture {
+        let before = capture.before_record(program, table, table_cursor, row.rowid);
+        capture.emit_row(
+            program,
+            OperationMode::DELETE,
+            row.rowid,
+            before,
+            None,
+            None,
+        )?;
+    }
     program.emit_insn(Insn::Delete {
         cursor_id: table_cursor,
         table_name: table.name.clone(),
@@ -471,6 +579,20 @@ fn emit_delete_row(
             cursor_id: cursor,
             raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
         });
+    }
+    if let (Some(returning), Some(start)) = (returning, copy) {
+        program.bind_source(
+            source.id,
+            SourceBinding::Registers {
+                start,
+                rowid: Some(row.rowid),
+            },
+        );
+        let values = returning.emit_values(program, document, target.resolved_table()?)?;
+        returning.emit_buffer(program, values);
+    }
+    for (action, key) in row.actions.iter().zip(action_keys) {
+        action.emit_fire(program, key, None)?;
     }
     Ok(())
 }
@@ -497,9 +619,9 @@ mod tests {
         let plan = Arc::new(plan);
         let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(delete, access, &program).unwrap());
+        assert!(!needs_legacy(&plan.document, delete, access).unwrap());
         program.set_hir_plan(plan.clone());
-        emit_delete(&mut program, &plan, delete, access, &[]).unwrap();
+        emit_delete(&mut program, &plan, delete, access, &Subprograms::default()).unwrap();
         program
     }
 
@@ -565,17 +687,69 @@ mod tests {
     }
 
     #[test]
-    fn delete_with_a_returning_subquery_stays_on_legacy() {
-        let plan = analyze_plan(
+    fn delete_with_a_returning_subquery_returns_after_the_row_is_gone() {
+        let program = emit(analyze_plan(
             indexed_items_schema(),
             "DELETE FROM items WHERE value = 1 RETURNING (SELECT count(*) FROM items)",
+        ));
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        assert!(
+            position(|insn| matches!(insn, Insn::Delete { .. }))
+                < position(|insn| matches!(insn, Insn::BeginSubrtn { .. }))
         );
-        let (delete, access) = root(&plan);
-        assert!(needs_legacy(delete, access, &program()).unwrap());
     }
 
     #[test]
-    fn delete_stays_on_legacy_only_for_foreign_key_actions() {
+    fn delete_returning_subquery_decodes_the_copy_of_a_custom_typed_row() {
+        let mut schema = indexed_items_schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                    160,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit(analyze_plan(
+            schema,
+            "DELETE FROM priced RETURNING amount, (SELECT count(*) FROM priced)",
+        ));
+        // The copy of the row is read after the delete and decoded once.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        assert!(
+            position(|insn| matches!(insn, Insn::Delete { .. }))
+                < position(|insn| matches!(insn, Insn::Divide { .. }))
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Divide { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn delete_with_foreign_keys_goes_through_hir() {
         let schema = || {
             let mut schema = Schema::new();
             for (sql, root_page) in [
@@ -596,13 +770,13 @@ mod tests {
         for (sql, legacy) in [
             ("DELETE FROM parent", false),
             ("DELETE FROM child", false),
-            ("DELETE FROM other", true),
+            ("DELETE FROM other", false),
             ("DELETE FROM cascade", false),
         ] {
             let plan = analyze_plan(schema(), sql);
             let (delete, access) = root(&plan);
             assert_eq!(
-                needs_legacy(delete, access, &program()).unwrap(),
+                needs_legacy(&plan.document, delete, access).unwrap(),
                 legacy,
                 "{sql}"
             );

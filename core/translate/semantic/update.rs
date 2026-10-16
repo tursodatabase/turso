@@ -115,6 +115,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_update_triggers(&table, &assignments)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
+                autoincrement: self.analyze_autoincrement(&table)?,
+                capture_changes: self.analyze_capture_changes(&table)?,
             }
         };
         let returning = self.analyze_dml_returning_with_policies(

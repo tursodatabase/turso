@@ -57,6 +57,8 @@ pub(crate) struct SemanticContext<'catalog> {
     /// `PRAGMA foreign_keys`. When off, DML carries no foreign-key metadata,
     /// so a child table whose parent is missing can still be written.
     foreign_keys_enabled: bool,
+    /// The table change data capture writes to, when it is on.
+    capture_changes_table: Option<String>,
     snapshot: CatalogSnapshot,
 }
 
@@ -156,6 +158,7 @@ impl<'catalog> SemanticContext<'catalog> {
             unqualified_database_search_path,
             dqs_dml: DoubleQuotedDml::Enabled,
             foreign_keys_enabled: true,
+            capture_changes_table: None,
             snapshot: CatalogSnapshot::from_id(snapshot),
         })
     }
@@ -163,6 +166,15 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn with_dqs_dml(mut self, dqs_dml: DoubleQuotedDml) -> Self {
         self.dqs_dml = dqs_dml;
         self
+    }
+
+    pub(crate) fn with_capture_changes(mut self, table: Option<String>) -> Self {
+        self.capture_changes_table = table;
+        self
+    }
+
+    pub(crate) fn capture_changes_table(&self) -> Option<&str> {
+        self.capture_changes_table.as_deref()
     }
 
     pub(crate) fn with_foreign_keys(mut self, enabled: bool) -> Self {

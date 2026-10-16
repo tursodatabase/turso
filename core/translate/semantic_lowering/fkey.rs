@@ -13,16 +13,16 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::RefAct;
 
+use super::emit::{
+    copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
+    emit_skip_if_any_null, index_probe, index_scan_match_any, open_read_index, open_read_table,
+    table_scan_match_any,
+};
 use crate::{
     schema::BTreeTable,
     sync::Arc,
     translate::{
         collate::CollationSeq,
-        fkeys::{
-            copy_with_affinity, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, table_scan_match_any,
-        },
         semantic::hir::{self, HirDocument, SourceId},
     },
     vdbe::{
@@ -33,31 +33,17 @@ use crate::{
     LimboError, Result,
 };
 
-/// Whether a parent-side action needs legacy: HIR lowers only the checks.
-pub(super) fn delete_needs_legacy(foreign_keys: &hir::DmlForeignKeys) -> bool {
-    foreign_keys
-        .incoming
+/// Whether an UPDATE that sets the columns at `assigned` may change the
+/// parent key. A rowid parent key is the INTEGER PRIMARY KEY column, which
+/// `assigned` lists when the UPDATE sets the rowid.
+pub(super) fn parent_key_may_change(
+    foreign_key: &hir::ResolvedForeignKey,
+    assigned: &[usize],
+) -> bool {
+    foreign_key
+        .parent_positions
         .iter()
-        .any(|foreign_key| !is_check_only(foreign_key.declaration.on_delete))
-}
-
-/// Whether an UPDATE that sets the columns at `assigned` changes a parent
-/// key whose ON UPDATE action is not a plain check.
-pub(super) fn update_needs_legacy(foreign_keys: &hir::DmlForeignKeys, assigned: &[usize]) -> bool {
-    foreign_keys.incoming.iter().any(|foreign_key| {
-        !is_check_only(foreign_key.declaration.on_update)
-            && parent_key_may_change(foreign_key, assigned)
-    })
-}
-
-/// HIR never lowers an UPDATE that changes the rowid, so a rowid parent key
-/// never changes.
-fn parent_key_may_change(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
-    !foreign_key.parent_uses_rowid
-        && foreign_key
-            .parent_positions
-            .iter()
-            .any(|position| assigned.contains(position))
+        .any(|position| assigned.contains(position))
 }
 
 fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) -> bool {
@@ -65,10 +51,6 @@ fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) 
         .child_positions
         .iter()
         .any(|position| assigned.contains(position))
-}
-
-fn is_check_only(action: RefAct) -> bool {
-    matches!(action, RefAct::NoAction | RefAct::Restrict)
 }
 
 /// Checks before the row of `target` that the table cursor is on is deleted.
@@ -91,14 +73,18 @@ pub(super) fn emit_delete_checks(
     replacement: Option<SourceId>,
 ) -> Result<()> {
     for foreign_key in &foreign_keys.incoming {
+        // An ON DELETE action changes the children instead.
+        if super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Delete) {
+            continue;
+        }
         let declaration = &foreign_key.declaration;
         let keeps_key = replacement
             .filter(|_| declaration.on_delete == RefAct::NoAction && !declaration.deferred);
         let kept = match keeps_key {
             Some(replacement) => {
                 let width = foreign_key.parent_positions.len();
-                let old_key = emit_parent_key(program, document, foreign_key, target)?;
-                let new_key = emit_parent_key(program, document, foreign_key, replacement)?;
+                let old_key = emit_stored_parent_key(program, document, foreign_key, target)?;
+                let new_key = emit_stored_parent_key(program, document, foreign_key, replacement)?;
                 let kept = program.allocate_label();
                 emit_skip_if_same_key(program, old_key, new_key, width, kept);
                 Some(kept)
@@ -135,7 +121,7 @@ fn emit_children_still_point_here(
     database: usize,
 ) -> Result<()> {
     let width = foreign_key.parent_columns.len();
-    let key = emit_parent_key(program, document, foreign_key, target)?;
+    let key = emit_stored_parent_key(program, document, foreign_key, target)?;
     let skip = program.allocate_label();
     emit_skip_if_any_null(program, key, width, skip);
 
@@ -161,7 +147,7 @@ fn emit_children_still_point_here(
         None => table_scan_match_any(
             program,
             &child_table,
-            &foreign_key.declaration.child_columns,
+            &foreign_key.child_positions,
             key,
             self_reference.then_some(rowid),
             database,
@@ -332,7 +318,7 @@ pub(super) fn emit_insert_parent_repairs(
             deferred,
             target_pc: skip,
         });
-        let key = emit_parent_key(program, document, foreign_key, target)?;
+        let key = emit_stored_parent_key(program, document, foreign_key, target)?;
         let parent_table = btree(&foreign_key.parent_table)?;
         // The key is compared as the parent stores it.
         let affinities = if foreign_key.parent_uses_rowid {
@@ -372,7 +358,7 @@ pub(super) fn emit_insert_parent_repairs(
             None => table_scan_match_any(
                 program,
                 &child_table,
-                &foreign_key.declaration.child_columns,
+                &foreign_key.child_positions,
                 key,
                 None,
                 database,
@@ -396,6 +382,9 @@ pub(super) fn emit_insert_parent_repairs(
 /// deferred violation if its parent was missing, and a new key without a
 /// parent adds one.
 ///
+/// `rowid` holds the row's rowid in the table and `new_rowid` the one it is
+/// written with.
+///
 /// When the UPDATE may REPLACE (`replaces`), another row may still hold the
 /// new parent key until the write, so the repairs of the new key are
 /// returned to be emitted after it with [`emit_update_repairs`].
@@ -407,22 +396,22 @@ pub(super) fn emit_update_checks<'a>(
     old: SourceId,
     new: SourceId,
     rowid: usize,
+    new_rowid: usize,
     assigned: &[usize],
     database: usize,
     replaces: bool,
 ) -> Result<Vec<PendingRepair<'a>>> {
     let mut pending = Vec::new();
     for foreign_key in &foreign_keys.incoming {
-        if !parent_key_may_change(foreign_key, assigned) {
+        // An ON UPDATE action changes the children instead.
+        if !parent_key_may_change(foreign_key, assigned)
+            || super::fkey_action::has_action(foreign_key, super::fkey_action::ParentChange::Update)
+        {
             continue;
         }
-        assert!(
-            is_check_only(foreign_key.declaration.on_update),
-            "an ON UPDATE action that changes rows must go to legacy"
-        );
         let width = foreign_key.parent_positions.len();
-        let old_key = emit_parent_key(program, document, foreign_key, old)?;
-        let new_key = emit_parent_key(program, document, foreign_key, new)?;
+        let old_key = emit_stored_parent_key(program, document, foreign_key, old)?;
+        let new_key = emit_stored_parent_key(program, document, foreign_key, new)?;
         let deferred = foreign_key.declaration.deferred;
         // Set when the key changes, for the repairs after the write.
         let changed = (replaces && deferred).then(|| {
@@ -549,10 +538,11 @@ pub(super) fn emit_update_checks<'a>(
                 reg: parent_rowid,
                 target_pc: Some(missing),
             });
+            // The row may be its own parent, under its new rowid.
             if self_reference {
                 program.emit_insn(Insn::Eq {
                     lhs: parent_rowid,
-                    rhs: rowid,
+                    rhs: new_rowid,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
                     collation: None,
@@ -645,7 +635,7 @@ fn emit_new_parent_key_repairs(
 
 /// Jump to `same` when the two keys are equal, NULLs included, as legacy's
 /// parent-key change test does.
-fn emit_skip_if_same_key(
+pub(super) fn emit_skip_if_same_key(
     program: &mut ProgramBuilder,
     old_key: usize,
     new_key: usize,
@@ -703,7 +693,7 @@ fn emit_child_probe(
         None => table_scan_match_any(
             program,
             &child_table,
-            &foreign_key.declaration.child_columns,
+            &foreign_key.child_positions,
             key,
             exclude,
             database,
@@ -726,7 +716,7 @@ fn emit_own_parent_check(
     child_key: usize,
     ok: BranchOffset,
 ) -> Result<()> {
-    let parent_key = emit_parent_key(program, document, foreign_key, row)?;
+    let parent_key = emit_stored_parent_key(program, document, foreign_key, row)?;
     let mismatch = program.allocate_label();
     for offset in 0..foreign_key.child_positions.len() {
         program.emit_insn(Insn::Ne {
@@ -743,8 +733,9 @@ fn emit_own_parent_check(
 }
 
 /// Read the parent key of `row`, in the constraint's column order, into new
-/// registers and return the first.
-fn emit_parent_key(
+/// registers and return the first. Custom-typed columns are decoded, as a
+/// foreign-key action takes the key as SQL values.
+pub(super) fn emit_parent_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,
@@ -770,9 +761,34 @@ fn emit_parent_key(
     Ok(start)
 }
 
+/// Like [`emit_parent_key`], with custom-typed columns as stored: like
+/// legacy, the checks compare stored keys.
+fn emit_stored_parent_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_parent_key(program, document, foreign_key, row)
+    })
+}
+
 /// Read the child key of `row`, in the constraint's column order, into new
-/// registers and return the first.
+/// registers and return the first. Custom-typed columns are read as stored,
+/// as the checks compare stored keys.
 fn emit_child_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_child_key_values(program, document, foreign_key, row)
+    })
+}
+
+fn emit_child_key_values(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,
