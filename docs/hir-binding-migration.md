@@ -209,8 +209,12 @@ window). Where legacy differs, HIR is right: FTS columns may come in any
 order in a result column too (legacy reads 0 for the score then), the same
 `?1` must stand for the same expression in every place, and a query OFFSET
 the pattern lacks keeps the pattern from applying LIMIT (legacy drops the
-OFFSET). Not done yet: legacy also considers index methods for a table in a
-join, and for DELETE and UPDATE scans.
+OFFSET). In an inner join without parentheses or GROUP BY, a table whose
+WHERE term matches a pattern without ORDER BY or LIMIT is read first,
+through the index; the other tables are planned after it, treating its
+columns as known values, so join terms can seek them. Legacy weighs this
+against other join orders; HIR always takes it. Not done yet: index methods
+for DELETE and UPDATE scans.
 
 ### DML through HIR
 

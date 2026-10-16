@@ -191,14 +191,6 @@ fn match_pattern(
     if (applies_order_by || applies_limit) && !where_covered {
         return None;
     }
-    // A predicate that reads another table is not one the index can apply.
-    if query.predicates[..query.where_start]
-        .iter()
-        .any(|term| !term.consumed)
-    {
-        return None;
-    }
-
     let mut numbers = matcher.captures.keys().copied().collect::<Vec<_>>();
     numbers.sort_unstable();
     let arguments = numbers
