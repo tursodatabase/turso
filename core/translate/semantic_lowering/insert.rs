@@ -46,11 +46,11 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    if matches!(insert.target_kind, hir::InsertTargetKind::Virtual) {
-        return Ok(true);
-    }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
+    }
+    if let Some(table) = super::dml::virtual_target(document, insert.target)? {
+        return Ok(super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(
@@ -92,6 +92,9 @@ pub(super) fn emit_insert(
         ));
     }
     let document = &plan.document;
+    if let Some(table) = super::dml::virtual_target(document, insert.target)? {
+        return emit_virtual_insert(program, plan, insert, &table);
+    }
     let hir::InsertTargetKind::BTree {
         defaults,
         replace_defaults,
@@ -322,6 +325,103 @@ fn subquery_reads_table(
         }
     });
     reads
+}
+
+/// INSERT into a virtual table, as legacy does it: each row is handed to the
+/// table with `VUpdate`, as NULL, its rowid (NULL unless given) and every
+/// column, NULL where the statement gives none. Unlike legacy, which keeps
+/// only the last, every VALUES row is inserted, as in SQLite.
+fn emit_virtual_insert(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    insert: &hir::Insert,
+    table: &crate::sync::Arc<crate::vtab::VirtualTable>,
+) -> Result<()> {
+    if table.readonly() {
+        crate::bail_constraint_error!("Table is read-only: {}", table.name);
+    }
+    let document = &plan.document;
+    let rows: &[Vec<hir::Expr>] = match &insert.source {
+        hir::InsertSource::DefaultValues => &[Vec::new()],
+        hir::InsertSource::Values(rows) => rows,
+        hir::InsertSource::Query(_) => {
+            return Err(LimboError::InternalError(
+                "HIR INSERT into a virtual table reads a query".into(),
+            ))
+        }
+    };
+    let columns = table.columns.len();
+    let mut positions = vec![None; columns];
+    let mut rowid_position = None;
+    for (position, target_column) in insert.columns.iter().enumerate() {
+        if !target_column.uses_value {
+            continue;
+        }
+        match target_column.column {
+            hir::TargetColumn::RowId => rowid_position = Some(position),
+            hir::TargetColumn::Column(column) => positions[column] = Some(position),
+        }
+    }
+    let conflict_action = insert
+        .conflict
+        .map_or(0, |conflict| conflict.bit_value() as u16);
+    program.begin_read_operation()?;
+    let returning = ReturningBuffer::open_scratch(program, insert.returning.as_ref());
+    let cursor = super::dml::open_virtual_for_write(program, table);
+    let resolved_table = match document.source(insert.target).map(|source| &source.kind) {
+        Some(hir::SourceKind::Table(table)) => table,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "HIR INSERT target {} is not a table",
+                insert.target
+            )))
+        }
+    };
+    for row in rows {
+        let start = program.alloc_registers(columns + 2);
+        program.emit_null(start, None);
+        let emit = |program: &mut ProgramBuilder, position: Option<usize>, register: usize| {
+            match position {
+                Some(position) => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &row[position],
+                        register,
+                    )?;
+                }
+                None => program.emit_null(register, None),
+            }
+            Ok::<_, LimboError>(())
+        };
+        emit(program, rowid_position, start + 1)?;
+        for (column, position) in positions.iter().enumerate() {
+            emit(program, *position, start + 2 + column)?;
+        }
+        program.emit_insn(Insn::VUpdate {
+            cursor_id: cursor,
+            arg_count: columns + 2,
+            start_reg: start,
+            conflict_action,
+        });
+        if let Some(returning) = returning {
+            // RETURNING reads the values given, as in SQLite.
+            program.bind_source(
+                insert.target,
+                SourceBinding::Registers {
+                    start: start + 2,
+                    rowid: Some(start + 1),
+                },
+            );
+            let values = returning.emit_values(program, document, resolved_table)?;
+            returning.emit_buffer(program, values);
+        }
+    }
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    if let Some(returning) = returning {
+        returning.emit_rows(program);
+    }
+    Ok(())
 }
 
 /// The columns a DO UPDATE changes: the ones it sets and the virtual

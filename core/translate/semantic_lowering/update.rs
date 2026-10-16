@@ -56,11 +56,11 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    if matches!(update.target_kind, hir::UpdateTargetKind::Virtual) {
-        return Ok(true);
-    }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
+    }
+    if let Some(table) = super::dml::virtual_target(document, update.target)? {
+        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -141,6 +141,9 @@ pub(super) fn emit_update(
     let actions = &subprograms.actions[..];
     let replace_actions = &subprograms.replace_actions[..];
     let document = &plan.document;
+    if let Some(table) = super::dml::virtual_target(document, update.target)? {
+        return emit_virtual_update(program, plan, update, access, &table);
+    }
     // UPDATE ... FROM joins the target with the FROM clause; otherwise the
     // target is the only loop.
     let single_loop = match &update.from {
@@ -441,6 +444,119 @@ pub(super) fn emit_update(
         returning.emit_rows(program);
     }
     Ok(())
+}
+
+/// UPDATE of a virtual table, as legacy does it: each row the loop finds is
+/// handed to the table with `VUpdate`, as its old rowid, its new rowid and
+/// every column, the columns it does not set read from the row.
+fn emit_virtual_update(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    update: &hir::Update,
+    access: &HirAccessPlan,
+    table: &crate::sync::Arc<crate::vtab::VirtualTable>,
+) -> Result<()> {
+    if update.returning.is_some() {
+        crate::bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
+    }
+    if table.readonly() {
+        return Err(LimboError::ReadOnly);
+    }
+    let document = &plan.document;
+    let columns = table.columns.len();
+    let mut values = vec![None; columns];
+    let mut rowid_value = None;
+    for assignment in &update.assignments {
+        let width = assignment.columns.len();
+        for (part, target_column) in assignment.columns.iter().enumerate() {
+            let value = match width {
+                1 => NewValue::Expr(&assignment.value),
+                _ => NewValue::RowPart {
+                    row: &assignment.value,
+                    part,
+                    width,
+                },
+            };
+            match target_column {
+                hir::TargetColumn::RowId => rowid_value = Some(value),
+                hir::TargetColumn::Column(column) => values[*column] = Some(value),
+            }
+        }
+    }
+    let conflict_action = update
+        .conflict
+        .map_or(0, |conflict| conflict.bit_value() as u16);
+    program.begin_write_operation()?;
+    let cursor = super::dml::open_virtual_for_write(program, table);
+    super::query::emit_dml_join_loops(
+        program,
+        plan,
+        None,
+        super::query::HirLoopsPlan::of_access(access),
+        &|program, next| {
+            // The columns the UPDATE does not set are read from the loop's
+            // cursor, as a B-tree UPDATE reads them from its table cursor.
+            let Some(SourceBinding::Virtual {
+                cursor: loop_cursor,
+            }) = program.source_binding(update.target).copied()
+            else {
+                return Err(LimboError::InternalError(
+                    "HIR virtual-table UPDATE target is not read by a virtual-table loop".into(),
+                ));
+            };
+            let start = program.alloc_registers(columns + 2);
+            super::expr::translate_expr(
+                program,
+                document,
+                &hir::Expr::RowId(update.target),
+                start,
+            )?;
+            // Like legacy, a row without a rowid is skipped.
+            program.emit_insn(Insn::IsNull {
+                reg: start,
+                target_pc: next,
+            });
+            let mut rows = RowValues::default();
+            match rowid_value {
+                Some(value) => value.emit(
+                    program,
+                    document,
+                    start + 1,
+                    &mut rows,
+                    super::expr::translate_expr_no_constant_opt,
+                )?,
+                None => program.emit_insn(Insn::Copy {
+                    src_reg: start,
+                    dst_reg: start + 1,
+                    extra_amount: 0,
+                }),
+            }
+            for (column, value) in values.iter().enumerate() {
+                let register = start + 2 + column;
+                match value {
+                    Some(value) => value.emit(
+                        program,
+                        document,
+                        register,
+                        &mut rows,
+                        super::expr::translate_expr_no_constant_opt,
+                    )?,
+                    None => program.emit_insn(Insn::VColumn {
+                        cursor_id: loop_cursor,
+                        column,
+                        dest: register,
+                    }),
+                }
+            }
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: cursor,
+                arg_count: columns + 2,
+                start_reg: start,
+                conflict_action,
+            });
+            Ok(())
+        },
+    )
 }
 
 /// The new value of one column an UPDATE sets.

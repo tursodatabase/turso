@@ -204,6 +204,17 @@ first collects the rowids into a RowSet, then deletes them. HIR reads
 RETURNING values before the row is deleted; legacy reads a copy of the row
 after, which gives the same values when RETURNING has no subquery.
 
+A virtual table is written as legacy writes it: it is opened with `VOpen`
+and `VBegin`, and each row goes to the table's update method with
+`VUpdate`. A DELETE passes the rowid of each row the loop finds; an UPDATE
+passes the old rowid, the new rowid and every column, reading the ones it
+does not set from the loop's cursor; an INSERT passes NULL, the given rowid
+or NULL, and every column. Where legacy differs, HIR follows SQLite: every
+VALUES row is inserted (legacy keeps the last), INSERT ... RETURNING
+returns the values given, and DELETE or UPDATE ... RETURNING fail with
+SQLite's error (legacy panics or returns nothing). `sqlite_dbpage`, which
+legacy writes only in testing builds, still goes to legacy.
+
 A table with materialized views is written like any other: the VM updates
 the views as rows are inserted and deleted. Only views built by another
 DBSP version, which legacy reports as an error, still go to legacy.
@@ -214,7 +225,7 @@ still go to legacy:
 | DELETE feature | What HIR needs first |
 |---|---|
 | A subquery in RETURNING, on a table with custom types | A copy of the deleted row with decoded values |
-| CDC, virtual tables, materialized views built by another DBSP version, protected system tables | Lowering for each |
+| CDC, `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
 UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`).
@@ -243,7 +254,7 @@ derived table again for each row). These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
-| CDC, virtual tables | As for DELETE |
+| CDC, `sqlite_dbpage` | As for DELETE |
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
 | Custom types, array columns | Encoding |
@@ -262,7 +273,7 @@ inserted. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
-| CDC, virtual tables | As for DELETE |
+| CDC, `sqlite_dbpage` | As for DELETE |
 | WITHOUT ROWID tables, custom types, array columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once

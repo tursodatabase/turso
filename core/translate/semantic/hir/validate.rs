@@ -2080,9 +2080,11 @@ impl<'document> HirValidator<'document> {
                     source.id
                 ),
             )?;
+            // Only a B-tree record can be short and need a DEFAULT.
             let default = &source.default_expressions[position];
+            let reads_default = table.value().btree().is_some() && catalog_column.default.is_some();
             self.require(
-                matches!(default, ColumnReadExpression::Absent) == catalog_column.default.is_none(),
+                matches!(default, ColumnReadExpression::Absent) != reads_default,
                 format!(
                     "source {} default-expression slot {position} disagrees with its catalog table",
                     source.id

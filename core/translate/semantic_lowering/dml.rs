@@ -504,6 +504,39 @@ fn is_non_null_literal(expression: &hir::Expr) -> bool {
     )
 }
 
+/// The virtual table a DML statement writes, or `None` for a B-tree target.
+pub(super) fn virtual_target(
+    document: &HirDocument,
+    target: SourceId,
+) -> Result<Option<Arc<crate::vtab::VirtualTable>>> {
+    let source = document
+        .source(target)
+        .ok_or_else(|| LimboError::InternalError(format!("HIR DML target {target} is missing")))?;
+    Ok(match &source.kind {
+        hir::SourceKind::Table(table) => table.value().virtual_table(),
+        _ => None,
+    })
+}
+
+/// Whether a write to a virtual table stays in legacy: `sqlite_dbpage`,
+/// which legacy writes only in testing builds.
+pub(super) fn virtual_needs_legacy(table: &crate::vtab::VirtualTable) -> bool {
+    table.name == "sqlite_dbpage"
+}
+
+/// Open a virtual table for writing, as legacy does: the rows a statement
+/// writes are handed to the table with `VUpdate` through this cursor, inside
+/// the table's own transaction.
+pub(super) fn open_virtual_for_write(
+    program: &mut ProgramBuilder,
+    table: &Arc<crate::vtab::VirtualTable>,
+) -> CursorID {
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    cursor
+}
+
 /// RETURNING rows of a DML statement. Like legacy, they wait in an
 /// ephemeral table until every row is written, then are returned.
 #[derive(Clone, Copy)]
@@ -513,6 +546,38 @@ pub(super) struct ReturningBuffer<'a> {
 }
 
 impl<'a> ReturningBuffer<'a> {
+    /// Like [`Self::open`], for a target that is not a B-tree table.
+    pub(super) fn open_scratch(
+        program: &mut ProgramBuilder,
+        returning: Option<&'a hir::Returning>,
+    ) -> Option<Self> {
+        let returning = returning?;
+        let table = Arc::new(BTreeTable::new(
+            0,
+            "returning_scratch".to_string(),
+            Vec::new(),
+            (0..returning.outputs.len())
+                .map(|column| {
+                    crate::schema::Column::new(
+                        Some(format!("value_{column}")),
+                        "BLOB".to_string(),
+                        None,
+                        None,
+                        crate::schema::Type::Blob,
+                        None,
+                        crate::schema::ColDef::default(),
+                    )
+                })
+                .collect(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        Self::open(program, &table, Some(returning))
+    }
+
     pub(super) fn open(
         program: &mut ProgramBuilder,
         table: &Arc<BTreeTable>,

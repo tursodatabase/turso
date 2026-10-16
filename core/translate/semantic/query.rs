@@ -1025,12 +1025,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }
             })
             .collect();
+        // A DEFAULT fills a column missing from a short B-tree record. A
+        // virtual table returns every column itself.
+        let reads_defaults = table.value().btree().is_some();
         let default_expressions = table
             .value()
             .columns()
             .iter()
             .map(|column| {
-                if column.default.is_some() {
+                if reads_defaults && column.default.is_some() {
                     hir::ColumnReadExpression::NotRequired
                 } else {
                     hir::ColumnReadExpression::Absent

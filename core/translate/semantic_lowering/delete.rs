@@ -57,13 +57,11 @@ pub(super) fn needs_legacy(
             return Ok(true);
         }
     }
-    // ON DELETE actions are compiled with the statement; one that needs
-    // legacy sends it there.
-    if matches!(delete.target_kind, hir::DeleteTargetKind::Virtual) {
-        return Ok(true);
-    }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
+    }
+    if let Some(table) = super::dml::virtual_target(document, delete.target)? {
+        return Ok(super::dml::virtual_needs_legacy(&table));
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -101,6 +99,9 @@ pub(super) fn emit_delete(
     let triggers = &subprograms.triggers[..];
     let actions = &subprograms.actions[..];
     let document = &plan.document;
+    if let Some(table) = super::dml::virtual_target(document, delete.target)? {
+        return emit_virtual_delete(program, plan, delete, access, &table);
+    }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR DELETE plan has {} loops for one target",
@@ -397,6 +398,49 @@ struct DeletedRow<'a> {
 /// RETURNING values, its index entries, then the row. `iteration` is the
 /// index the loop reads, whose entry is removed last so the loop can still
 /// advance.
+/// DELETE from a virtual table, as legacy does it: each row the loop finds
+/// is handed to the table with `VUpdate`, with its rowid and a NULL.
+fn emit_virtual_delete(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    delete: &hir::Delete,
+    access: &HirAccessPlan,
+    table: &crate::sync::Arc<crate::vtab::VirtualTable>,
+) -> Result<()> {
+    if delete.returning.is_some() {
+        crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+    }
+    if table.readonly() {
+        return Err(LimboError::ReadOnly);
+    }
+    program.begin_write_operation()?;
+    let cursor = super::dml::open_virtual_for_write(program, table);
+    let document = &plan.document;
+    super::query::emit_dml_join_loops(
+        program,
+        plan,
+        None,
+        super::query::HirLoopsPlan::of_access(access),
+        &|program, _next| {
+            let start = program.alloc_registers(2);
+            super::expr::translate_expr(
+                program,
+                document,
+                &hir::Expr::RowId(delete.target),
+                start,
+            )?;
+            program.emit_null(start + 1, None);
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: cursor,
+                arg_count: 2,
+                start_reg: start,
+                conflict_action: 0,
+            });
+            Ok(())
+        },
+    )
+}
+
 fn emit_delete_row(
     program: &mut ProgramBuilder,
     target: &DmlTarget<'_>,

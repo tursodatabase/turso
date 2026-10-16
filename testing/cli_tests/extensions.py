@@ -541,6 +541,53 @@ def _test_kv(exec_name, ext_path):
     turso.quit()
 
 
+def test_kv_hir():
+    """Writes to a virtual table through the HIR lowering. Unlike legacy,
+    every VALUES row is inserted and INSERT ... RETURNING returns the rows, as
+    in SQLite, and DELETE or UPDATE ... RETURNING fail as in SQLite."""
+    os.environ["TURSO_EXPERIMENTAL_HIR"] = "1"
+    try:
+        turso = TestTursoShell()
+        turso.execute_dot(f".load {DEBUG_DIR}/libturso_ext_tests")
+        turso.execute_dot("create virtual table t using kv_store;")
+        turso.run_test_fn("insert into t values ('a', 'b'), ('c', 'd');", null)
+        turso.run_test_fn(
+            "select key, value from t order by key;",
+            lambda res: res == "a|b\nc|d",
+            "every VALUES row is inserted",
+        )
+        turso.run_test_fn(
+            "insert into t(value, key) values ('v', 'k') returning key, value;",
+            lambda res: res == "k|v",
+            "INSERT ... RETURNING returns the row",
+        )
+        turso.run_test_fn("update t set value = upper(value) where key > 'b';", null)
+        turso.run_test_fn(
+            "select comment, key, value from t order by key;",
+            lambda res: res == "auto-generated|a|b\nauto-generated|c|D\nauto-generated|k|V",
+            "UPDATE keeps the columns it does not set",
+        )
+        turso.run_test_fn("delete from t where key = 'c';", null)
+        turso.run_test_fn(
+            "select key from t order by key;",
+            lambda res: res == "a\nk",
+            "DELETE removes the row",
+        )
+        turso.run_test_fn(
+            "delete from t returning *;",
+            lambda res: "DELETE RETURNING is not available on virtual tables" in res,
+            "DELETE ... RETURNING fails as in SQLite",
+        )
+        turso.run_test_fn(
+            "update t set value = 'x' returning *;",
+            lambda res: "UPDATE RETURNING is not available on virtual tables" in res,
+            "UPDATE ... RETURNING fails as in SQLite",
+        )
+        turso.quit()
+    finally:
+        del os.environ["TURSO_EXPERIMENTAL_HIR"]
+
+
 def test_ipaddr():
     turso = TestTursoShell()
     ext_path = f"{DEBUG_DIR}/liblimbo_ipaddr"
@@ -1060,6 +1107,7 @@ def main():
         test_vfs()
         test_sqlite_vfs_compat()
         test_kv()
+        test_kv_hir()
         test_csv()
         test_tablestats()
         test_fuzzy()

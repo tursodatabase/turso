@@ -3292,6 +3292,10 @@ impl ExprLowerer<'_, '_, '_> {
             SourceBinding::BTree { scan_cursor, .. } => {
                 self.emit_btree_rowid(scan_cursor, target)?;
             }
+            SourceBinding::Virtual { cursor } => self.program.emit_insn(Insn::RowId {
+                cursor_id: cursor,
+                dest: target,
+            }),
             SourceBinding::Registers {
                 rowid: Some(register),
                 ..
