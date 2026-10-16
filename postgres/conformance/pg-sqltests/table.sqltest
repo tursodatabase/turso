@@ -177,6 +177,18 @@ expect {
     2025-01-06|2025-01-04|4
 }
 
+test table-indexed-date-column-with-default {
+    CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
+    INSERT INTO dates VALUES (1, 2, '2024-05-06');
+    CREATE INDEX dates_c ON dates (c);
+    SELECT c FROM dates;
+    SELECT a, c FROM dates WHERE c = '2024-05-06';
+}
+expect {
+    2024-05-06
+    1|2024-05-06
+}
+
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
     INSERT INTO events VALUES ('2024-01-15 10:30:00');
