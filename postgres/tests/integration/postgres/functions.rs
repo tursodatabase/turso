@@ -2,6 +2,24 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[turso_macros::test(mvcc)]
+fn test_pg_array_subquery_rebind_and_reset(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare("SELECT ARRAY(SELECT 17 AS v UNION ALL SELECT 2 ORDER BY v LIMIT $1)")
+        .unwrap();
+
+    for (limit, expected) in [(1, "{2}"), (0, "{}"), (2, "{2,17}"), (1, "{2}")] {
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(limit))
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]]
+        );
+        stmt.reset().unwrap();
+    }
+}
+
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut result = Vec::new();
