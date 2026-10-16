@@ -321,6 +321,58 @@ mod tests {
     }
 
     #[test]
+    fn test_json_patch_repeated_key_order() {
+        // A patch that names the same key twice, or that removes a key an
+        // earlier member of the same patch had just merged an object into, is
+        // applied in the order the members are written, like SQLite does.
+        let cases: &[(&str, &str, &str)] = &[
+            ("{}", r#"{"e":{"f":{"a":1}},"e":null}"#, "{}"),
+            ("{}", r#"{"e":{"f":1},"e":null}"#, "{}"),
+            (r#"{"e":[1]}"#, r#"{"e":{"x":1},"e":null}"#, "{}"),
+            (r#"{"e":{"a":1}}"#, r#"{"e":{"f":{"a":1}},"e":null}"#, "{}"),
+            (
+                r#"{"e":[1]}"#,
+                r#"{"e":{"0":{"a":1},"0":{}}}"#,
+                r#"{"e":{"0":{"a":1}}}"#,
+            ),
+            (
+                r#"{"e":[1]}"#,
+                r#"{"e":{"0":{"a":1},"0":{"b":2}}}"#,
+                r#"{"e":{"0":{"a":1,"b":2}}}"#,
+            ),
+            (
+                r#"{"a":{"x":1}}"#,
+                r#"{"a":{"x":null,"x":{"y":2}}}"#,
+                r#"{"a":{"x":{"y":2}}}"#,
+            ),
+            (
+                r#"{"a":{"x":1}}"#,
+                r#"{"a":{"x":{"y":2},"x":null}}"#,
+                r#"{"a":{}}"#,
+            ),
+            ("{}", r#"{"a":{"b":{"c":1},"b":null}}"#, r#"{"a":{}}"#),
+            (r#"{"a":1}"#, r#"{"a":{"b":null}}"#, r#"{"a":{}}"#),
+            ("[]", r#"{"a":1}"#, r#"{"a":1}"#),
+            (r#"{"a":[1,2]}"#, r#"{"a":{"b":1}}"#, r#"{"a":{"b":1}}"#),
+        ];
+
+        for (target, patch, expected) in cases {
+            let target = create_text(target);
+            let patch = create_text(patch);
+
+            let got = json_patch(&target, &patch, &JsonCacheCell::new()).unwrap();
+            assert_eq!(got, create_json(expected), "json_patch({target}, {patch})");
+
+            // the same merge through a JSONB blob has to read back as the same
+            // document: a deferred merge into a removed member used to leave a
+            // blob that could not be parsed again
+            let blob = jsonb_patch(&target, &patch, &JsonCacheCell::new()).unwrap();
+            let got = crate::json::get_json(&blob, None).unwrap();
+            assert_eq!(got, create_json(expected), "jsonb_patch({target}, {patch})");
+        }
+    }
+
+    #[test]
     fn test_basic_text_replacement() {
         let target = create_text(r#"{"name":"John","age":"30"}"#);
         let patch = create_text(r#"{"age":"31"}"#);
