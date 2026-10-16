@@ -3437,6 +3437,163 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A table read through one seek per branch of an OR term, such as `a = 1
+/// OR b = 2` with an index on each column. The branches' rowids are
+/// collected first, so each row is read once.
+#[derive(Clone, Debug)]
+pub(crate) struct HirOrUnion {
+    pub(crate) branches: Vec<HirBtreeOperation>,
+}
+
+/// Like legacy's OR-by-union: plan `source` as one seek per branch of one of
+/// its OR terms, when every branch can seek an index or the rowid and the
+/// seeks together cost less than scanning the table. The OR term itself is
+/// left in WHERE and checked again on each row read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_hir_or_union(
+    document: &hir::HirDocument,
+    layout: &crate::translate::plan::HirFromLayout<'_>,
+    source: &HirPlannedSource,
+    source_position: usize,
+    predicates: &[HirWhereTerm],
+    prior_sources: &TableMask,
+    base_row_count: RowCountEstimate,
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Option<HirOrUnion>> {
+    // An outer join's right side has rows the seeks would not produce.
+    if source.join_info.as_ref().is_some_and(|join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+        )
+    }) {
+        return Ok(None);
+    }
+    let definition = document.source(source.internal_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR OR planning references missing source {}",
+            source.internal_id
+        ))
+    })?;
+    let mut allowed = crate::alloc::TryClone::try_clone(prior_sources)?;
+    allowed.set(source_position)?;
+    let scan_cost = cost::estimate_cost_for_scan_or_seek::<hir::Expr>(
+        None,
+        &[],
+        &[],
+        1.0,
+        base_row_count,
+        false,
+        params,
+        None,
+    );
+    fn split<'a>(expr: &'a hir::Expr, operator: ast::Operator, parts: &mut Vec<&'a hir::Expr>) {
+        match expr {
+            hir::Expr::Binary {
+                lhs,
+                operator: found,
+                rhs,
+                ..
+            } if *found == operator => {
+                split(lhs, operator, parts);
+                split(rhs, operator, parts);
+            }
+            _ => parts.push(expr),
+        }
+    }
+    for term in predicates
+        .iter()
+        .filter(|term| !term.consumed && term.from_outer_join.is_none())
+    {
+        if !matches!(
+            &term.expr,
+            hir::Expr::Binary {
+                operator: ast::Operator::Or,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let mask = layout.table_mask(document, &term.expr)?;
+        if !mask.get(source_position) || !allowed.contains_all_set_bits_of(&mask) {
+            continue;
+        }
+        let mut disjuncts = Vec::new();
+        split(&term.expr, ast::Operator::Or, &mut disjuncts);
+        let mut branches = Vec::with_capacity(disjuncts.len());
+        let mut union_cost = Cost(0.0);
+        let mut union_rows = 0.0;
+        for disjunct in disjuncts {
+            let mut conjuncts = Vec::new();
+            split(disjunct, ast::Operator::And, &mut conjuncts);
+            let mut terms = conjuncts
+                .into_iter()
+                .map(|expr| HirWhereTerm {
+                    expr: expr.clone(),
+                    from_outer_join: None,
+                    consumed: false,
+                })
+                .collect::<Vec<_>>();
+            let constraints = constraints::hir_constraints_for_source(
+                document,
+                layout,
+                &terms,
+                constraints::HirConstraintSource::BTree(source),
+                schema,
+                params,
+                &|_| None,
+            )?;
+            let mut access = access_method::choose_single_btree_access_method(
+                &access_method::HirAccessSource::new(source, definition),
+                &constraints,
+                prior_sources,
+                source_position,
+                None,
+                &[],
+                schema,
+                &schema.analyze_stats,
+                1.0,
+                base_row_count,
+                params,
+            )?;
+            let seeks = match &access.params {
+                AccessMethodParams::BTreeTable {
+                    build_index: false,
+                    constraint_refs,
+                    ..
+                } => !constraint_refs.is_empty(),
+                AccessMethodParams::InSeek { .. } => true,
+                _ => false,
+            };
+            if !seeks {
+                branches.clear();
+                break;
+            }
+            union_cost = union_cost + access.cost;
+            union_rows += access.estimated_rows_per_outer_row;
+            branches.push(apply_hir_selected_btree_access(
+                source,
+                &constraints,
+                &mut terms,
+                &mut access,
+                prior_sources,
+                source_position,
+            )?);
+        }
+        if branches.is_empty() {
+            continue;
+        }
+        // Every rowid is added to and read from the row set, then looked up
+        // in the table.
+        let union_cost = union_cost + Cost(union_rows * 2.0 * params.cpu_cost_per_seek);
+        if union_cost.0 < scan_cost.0 {
+            return Ok(Some(HirOrUnion { branches }));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn apply_hir_selected_btree_access(
     source: &HirPlannedSource,
     constraints: &constraints::HirTableConstraints,

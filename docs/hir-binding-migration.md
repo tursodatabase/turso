@@ -190,6 +190,16 @@ still differ where the bytecode differs: legacy runs uncorrelated subqueries
 before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
 joins, which HIR does not.
 
+Like legacy's OR-by-union, a table whose chosen loop is a plain scan is
+instead read through one seek per branch of a WHERE OR term (`v = 5 OR w =
+3` with an index on each column), when every branch can seek an index or the
+rowid and together they cost less than the scan. The branches add the rowids
+they find to a row set, and the loop reads each of those rows once. Unlike
+legacy, this is decided after the join order, not while choosing it, so it
+may pick a different table of a join than legacy does; the OR term stays in
+WHERE and is checked again on each row. It is used only in SELECT, not yet
+in DELETE or UPDATE loops, and never on the right side of an outer join.
+
 Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
 stop an endless recursive CTE. HIR still materializes them in blocks with an

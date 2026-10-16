@@ -203,6 +203,8 @@ pub(crate) enum HirSourceAccess {
     Virtual(HirVirtualTableOperation),
     /// A scan through one query pattern of an index method, such as FTS.
     IndexMethod(crate::translate::hir_index_method::HirIndexMethodAccess),
+    /// One seek per branch of an OR term, reading each row once.
+    OrUnion(crate::translate::optimizer::HirOrUnion),
     Derived {
         query: QueryId,
     },
@@ -356,7 +358,7 @@ impl<'a> HirPlanContext<'a> {
             append_predicates(&mut input.predicates, predicate, None);
         }
 
-        self.plan_source_access(input, None, 1.0, schema, params, query_estimate)?
+        self.plan_source_access(input, None, false, 1.0, schema, params, query_estimate)?
             .ok_or_else(|| {
                 LimboError::InternalError("UPDATE target produced no access plan".to_string())
             })
@@ -397,6 +399,7 @@ impl<'a> HirPlanContext<'a> {
         self.plan_source_access(
             input,
             order_target.as_ref(),
+            false,
             1.0,
             schema,
             params,
@@ -1011,6 +1014,7 @@ impl<'a> HirPlanContext<'a> {
             .plan_source_access(
                 input,
                 order_target.as_ref(),
+                true,
                 initial_cardinality,
                 schema,
                 params,
@@ -1181,6 +1185,7 @@ impl<'a> HirPlanContext<'a> {
             .plan_source_access(
                 rest,
                 None,
+                true,
                 initial_cardinality,
                 schema,
                 params,
@@ -1223,6 +1228,9 @@ impl<'a> HirPlanContext<'a> {
         &self,
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
+        // Whether a table may be read through one seek per branch of an OR
+        // term, which DELETE and UPDATE loops do not do yet.
+        or_union: bool,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
@@ -1313,6 +1321,7 @@ impl<'a> HirPlanContext<'a> {
         let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
+        let mut read_out_of_order = false;
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
             let access = match &input.sources[source_position] {
                 HirPlanSource::BTree(source) => match &source.table {
@@ -1325,15 +1334,49 @@ impl<'a> HirPlanContext<'a> {
                             &prior_sources,
                             source_position,
                         )?;
-                        let definition = self.definition(source.internal_id);
-                        let table_lookup = selected_btree_index(&operation)
-                            .filter(|index| !source.index_is_covering(definition, index))
-                            .map_or(BtreeTableLookup::ScanOnly, |_| {
-                                BtreeTableLookup::TableRequired
-                            });
-                        HirSourceAccess::BTree {
-                            operation,
-                            table_lookup,
+                        // A scan may give way to one seek per branch of an
+                        // OR term.
+                        let union = match operation {
+                            HirBtreeOperation::Scan { .. } if or_union => {
+                                crate::translate::optimizer::plan_hir_or_union(
+                                    self.document,
+                                    &HirFromLayout::new(&input.sources, &input.groups),
+                                    source,
+                                    source_position,
+                                    &input.predicates,
+                                    &prior_sources,
+                                    base_rows[source_position],
+                                    schema,
+                                    params,
+                                )?
+                            }
+                            _ => None,
+                        };
+                        match union {
+                            Some(union) => {
+                                // The union reads rows in rowid order, not
+                                // the scan's, so an order the plan proved
+                                // from this table's loop no longer holds.
+                                read_out_of_order |= order_target.is_some_and(|target| {
+                                    target
+                                        .columns
+                                        .iter()
+                                        .any(|column| column.source == source.internal_id)
+                                });
+                                HirSourceAccess::OrUnion(union)
+                            }
+                            None => {
+                                let definition = self.definition(source.internal_id);
+                                let table_lookup = selected_btree_index(&operation)
+                                    .filter(|index| !source.index_is_covering(definition, index))
+                                    .map_or(BtreeTableLookup::ScanOnly, |_| {
+                                        BtreeTableLookup::TableRequired
+                                    });
+                                HirSourceAccess::BTree {
+                                    operation,
+                                    table_lookup,
+                                }
+                            }
                         }
                     }
                     Table::Virtual(_) => {
@@ -1418,8 +1461,8 @@ impl<'a> HirPlanContext<'a> {
             loops,
             where_start: input.where_start,
             predicates: input.predicates,
-            group_sort_elided,
-            order_sort_elided,
+            group_sort_elided: group_sort_elided && !read_out_of_order,
+            order_sort_elided: order_sort_elided && !read_out_of_order,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))

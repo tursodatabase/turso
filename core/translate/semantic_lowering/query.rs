@@ -2462,6 +2462,8 @@ enum HirLoopAdvance {
         index_backed: bool,
     },
     Virtual,
+    /// Go back to the loop's start, which reads the next row itself.
+    Restart,
 }
 
 pub(super) struct PreparedHirBtreeLoop<'a> {
@@ -2487,6 +2489,13 @@ struct PreparedHirVirtualLoop<'a> {
     source: &'a hir::Source,
     operation: &'a HirVirtualTableOperation,
     cursor: CursorID,
+}
+
+/// One seek per branch of an OR term: each branch adds the rowids it finds
+/// to a row set, and the loop then reads each of those rows once.
+struct PreparedHirOrUnionLoop<'a> {
+    table_cursor: CursorID,
+    branches: Vec<PreparedHirBtreeLoop<'a>>,
 }
 
 /// A scan through a query pattern of an index method, such as FTS: the
@@ -2533,6 +2542,7 @@ enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Virtual(PreparedHirVirtualLoop<'a>),
     IndexMethod(PreparedHirIndexMethodLoop<'a>),
+    OrUnion(PreparedHirOrUnionLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
     Coroutine(PreparedHirCoroutineLoop<'a>),
@@ -2544,6 +2554,7 @@ impl PreparedHirLoop<'_> {
             Self::BTree(prepared) => Some(prepared.cursor),
             Self::Virtual(prepared) => Some(prepared.cursor),
             Self::IndexMethod(prepared) => Some(prepared.index_cursor),
+            Self::OrUnion(prepared) => Some(prepared.table_cursor),
             Self::Materialized(prepared) => Some(prepared.cursor),
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -2554,6 +2565,7 @@ impl PreparedHirLoop<'_> {
             Self::BTree(prepared) => prepared.table_cursor,
             Self::Virtual(_) => None,
             Self::IndexMethod(prepared) => Some(prepared.table_cursor),
+            Self::OrUnion(_) => None,
             Self::Materialized(_) => None,
             Self::Registers(_) | Self::Coroutine(_) => None,
         }
@@ -3501,7 +3513,9 @@ impl HirLoopNest<'_, '_> {
         let mut register_bindings = Vec::new();
         for prepared in &self.prepared_loops[..right] {
             match prepared {
-                PreparedHirLoop::BTree(_) | PreparedHirLoop::Materialized(_) => {}
+                PreparedHirLoop::BTree(_)
+                | PreparedHirLoop::OrUnion(_)
+                | PreparedHirLoop::Materialized(_) => {}
                 PreparedHirLoop::Registers(registers) => {
                     let width = registers.source.columns.len().max(1);
                     let nulls = program.alloc_registers(width);
@@ -3679,6 +3693,7 @@ fn prepare_hir_right_outer_join(
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
         PreparedHirLoop::Virtual(_)
         | PreparedHirLoop::IndexMethod(_)
+        | PreparedHirLoop::OrUnion(_)
         | PreparedHirLoop::Registers(_)
         | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
@@ -4086,6 +4101,18 @@ pub(super) fn hir_loop_explain(
                 ),
             }
         }
+        HirSourceAccess::OrUnion(union) => EqpDetail::MultiIndex {
+            table,
+            union: true,
+            indexes: union
+                .branches
+                .iter()
+                .map(|branch| {
+                    selected_hir_btree_index(branch)
+                        .map_or_else(|| "PRIMARY KEY".to_string(), |index| index.name.clone())
+                })
+                .collect(),
+        },
         HirSourceAccess::IndexMethod(access) => EqpDetail::IndexMethod {
             method: access
                 .index
@@ -4294,6 +4321,12 @@ fn prepare_hir_loop_unexplained<'a>(
         HirSourceAccess::IndexMethod(access) => Ok(PreparedHirLoop::IndexMethod(
             prepare_hir_index_method_loop(program, plan, planned_loop.source, access)?,
         )),
+        HirSourceAccess::OrUnion(union) => Ok(PreparedHirLoop::OrUnion(prepare_hir_or_union_loop(
+            program,
+            plan,
+            planned_loop.source,
+            union,
+        )?)),
         HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
             prepare_hir_materialized_loop(
                 program,
@@ -4397,6 +4430,150 @@ fn prepare_hir_virtual_loop<'a>(
         source,
         operation,
         cursor,
+    })
+}
+
+/// The index a B-tree operation reads, if any.
+fn selected_hir_btree_index(operation: &HirBtreeOperation) -> Option<&Arc<Index>> {
+    match operation {
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
+        HirBtreeOperation::RowidEq { .. } => None,
+    }
+}
+
+fn prepare_hir_or_union_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    union: &'a crate::translate::optimizer::HirOrUnion,
+) -> Result<PreparedHirOrUnionLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR OR loop references missing source {source_id}"))
+    })?;
+    let table = match &source.kind {
+        hir::SourceKind::Table(table) => table.value().btree(),
+        _ => None,
+    }
+    .filter(|table| table.has_rowid)
+    .ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR OR loop source {source_id} is not a rowid table"
+        ))
+    })?;
+    let database = source.database.ok_or_else(|| {
+        LimboError::InternalError(format!("HIR OR loop source {source_id} has no database"))
+    })?;
+    let database_snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR OR loop source {source_id} references missing database {database:?}"
+        ))
+    })?;
+    program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    let table_cursor = program.alloc_cursor_id(match plan.materialized_view(source.id) {
+        Some(view) => CursorType::MaterializedView(table.clone(), view.clone()),
+        None => CursorType::BTreeTable(table.clone()),
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor,
+        root_page: table.root_page,
+        db: database.index(),
+    });
+    let branches = union
+        .branches
+        .iter()
+        .map(|operation| {
+            let index = selected_hir_btree_index(operation);
+            // A rowid seek reads the table itself.
+            let cursor = match index {
+                Some(index) => {
+                    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: cursor,
+                        root_page: index.root_page,
+                        db: database.index(),
+                    });
+                    cursor
+                }
+                None => table_cursor,
+            };
+            PreparedHirBtreeLoop {
+                source,
+                operation,
+                index,
+                cursor,
+                table_cursor: None,
+                autoindex_source_cursor: None,
+                table_has_rowid: true,
+                index_keys: Vec::new(),
+            }
+        })
+        .collect();
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    Ok(PreparedHirOrUnionLoop {
+        table_cursor,
+        branches,
+    })
+}
+
+fn start_hir_or_union_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirOrUnionLoop<'_>,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    // Collect the rowids each branch finds. The row set starts empty each
+    // time the loop starts, as it does for each row of an outer loop.
+    let rows = program.alloc_register();
+    program.emit_null(rows, None);
+    let rowid = program.alloc_register();
+    for branch in &prepared.branches {
+        let branch_loop = start_hir_btree_loop(program, document, branch, None)?;
+        match branch.index {
+            Some(_) => program.emit_insn(Insn::IdxRowId {
+                cursor_id: branch.cursor,
+                dest: rowid,
+            }),
+            None => program.emit_insn(Insn::RowId {
+                cursor_id: branch.cursor,
+                dest: rowid,
+            }),
+        }
+        program.emit_insn(Insn::RowSetAdd {
+            rowset_reg: rows,
+            value_reg: rowid,
+        });
+        close_hir_btree_loop(program, &branch_loop, &[]);
+    }
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg: rows,
+        pc_if_empty: exhausted,
+        dest_reg: rowid,
+    });
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: prepared.table_cursor,
+        src_reg: rowid,
+        target_pc: loop_start,
+    });
+    Ok(HirBtreeLoop {
+        cursor: Some(prepared.table_cursor),
+        loop_start,
+        next,
+        exhausted,
+        advance: HirLoopAdvance::Restart,
+        left_join,
     })
 }
 
@@ -5234,6 +5411,9 @@ fn start_hir_loop(
         PreparedHirLoop::IndexMethod(prepared) => {
             start_hir_index_method_loop(program, document, prepared, left_join)
         }
+        PreparedHirLoop::OrUnion(prepared) => {
+            start_hir_or_union_loop(program, document, prepared, left_join)
+        }
         PreparedHirLoop::Registers(prepared) => {
             if !matches!(
                 program.source_binding(prepared.source.id),
@@ -5551,7 +5731,7 @@ pub(super) fn close_hir_btree_loop(
     program.preassign_label_to_next_insn(hir_loop.next);
     match &hir_loop.advance {
         HirLoopAdvance::None => {}
-        HirLoopAdvance::Coroutine => program.emit_insn(Insn::Goto {
+        HirLoopAdvance::Coroutine | HirLoopAdvance::Restart => program.emit_insn(Insn::Goto {
             target_pc: hir_loop.loop_start,
         }),
         HirLoopAdvance::Cursor {

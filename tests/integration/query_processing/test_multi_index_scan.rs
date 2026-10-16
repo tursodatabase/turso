@@ -141,3 +141,55 @@ JOIN t4 ON t3.b = t4.b OR t3.c = t4.c";
         limbo_exec_rows(&conn, inner)
     );
 }
+
+/// HIR reads a table through one index seek per branch of an OR term, and
+/// returns each row once, as legacy does.
+#[test]
+fn hir_uses_one_seek_per_or_branch() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
+        "CREATE INDEX hv ON h(v)",
+        "CREATE INDEX hw ON h(w)",
+        "CREATE TABLE g(id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO g VALUES (1, 5), (2, 3)",
+    ] {
+        limbo_exec_rows(&conn, sql);
+        sqlite_conn.execute(sql, []).unwrap();
+    }
+    for id in 1..=200 {
+        let sql = format!("INSERT INTO h VALUES ({id}, {}, {})", id % 10, id % 7);
+        limbo_exec_rows(&conn, &sql);
+        sqlite_conn.execute(&sql, []).unwrap();
+    }
+    let plan = |sql: &str| {
+        limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+            .iter()
+            .filter_map(|row| match row.get(3) {
+                Some(Value::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for sql in [
+        "SELECT count(*), sum(id) FROM h WHERE v = 5 OR w = 3",
+        "SELECT count(*), sum(id) FROM h WHERE v = 5 OR w = 3 OR id = 7",
+        "SELECT id FROM h WHERE v IN (1, 2) OR w = 6 ORDER BY id DESC LIMIT 4",
+        "SELECT g.id, count(*) FROM g JOIN h ON h.v = g.k OR h.w = g.k GROUP BY g.id",
+    ] {
+        assert!(
+            plan(sql).contains("MULTI-INDEX OR h"),
+            "{sql}: {}",
+            plan(sql)
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite_conn, sql),
+            "{sql}"
+        );
+    }
+}
