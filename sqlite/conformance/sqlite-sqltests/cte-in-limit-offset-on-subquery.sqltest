@@ -1,0 +1,71 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/9999
+setup tables {
+    CREATE TABLE c(v);
+    INSERT INTO c VALUES (1);
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (1), (2), (3);
+}
+
+@setup tables
+test cte-in-limit-subquery {
+    WITH c(v) AS (SELECT 2) SELECT a FROM t LIMIT (SELECT v FROM c);
+}
+expect {
+    1
+    2
+}
+
+@setup tables
+test cte-in-offset-subquery {
+    WITH c(v) AS (SELECT 2) SELECT a FROM t LIMIT 1 OFFSET (SELECT v FROM c);
+}
+expect {
+    3
+}
+
+@setup tables
+test cte-in-limit-subquery-of-from-subquery {
+    WITH c(v) AS (SELECT 2) SELECT count(*) FROM (SELECT a FROM t LIMIT (SELECT v FROM c));
+}
+expect {
+    2
+}
+
+@setup tables
+test cte-in-join-on-subquery {
+    WITH c(v) AS (SELECT 2) SELECT t.a, u.b FROM t JOIN u ON u.b = t.a AND u.b >= (SELECT v FROM c) ORDER BY t.a;
+}
+expect {
+    2|2
+    3|3
+}
+
+@setup tables
+test cte-in-left-join-on-subquery {
+    WITH c(v) AS (SELECT 2) SELECT t.a, u.b FROM t LEFT JOIN u ON u.b = t.a AND u.b >= (SELECT v FROM c) ORDER BY t.a;
+}
+expect {
+    1|
+    2|2
+    3|3
+}
+
+@setup tables
+test cte-without-same-named-table-in-limit-and-on-subqueries {
+    WITH x(v) AS (SELECT 2) SELECT t.a FROM t JOIN u ON u.b = t.a AND u.b >= (SELECT v FROM x) LIMIT (SELECT v - 1 FROM x);
+}
+expect {
+    2
+}
+
+@setup tables
+test limit-subquery-cannot-reference-outer-cte-columns {
+    WITH x(v) AS (SELECT 2) SELECT v FROM x LIMIT (SELECT v);
+}
+expect error {
+    no such column: v
+}

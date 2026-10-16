@@ -373,7 +373,14 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    let get_outer_query_refs = |table_references: &TableReferences| {
+        let mut outer_query_refs = outer_query_refs_for_correlated_subquery(table_references)?;
+        outer_query_refs.retain(|outer_ref| outer_ref.is_cte_name_in_scope());
+        for outer_ref in outer_query_refs.iter_mut() {
+            outer_ref.cte_definition_only = true;
+        }
+        Ok(outer_query_refs)
+    };
     {
         let mut subquery_parser = get_subquery_parser(
             program,
