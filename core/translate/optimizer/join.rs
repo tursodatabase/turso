@@ -1,4 +1,4 @@
-use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
+use crate::{alloc::TryReserveError, turso_assert, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -1908,6 +1908,293 @@ fn hir_join_kind_is_ordering_constrained(kind: hir::JoinKind) -> bool {
     )
 }
 
+/// Above this many sources, HIR join ordering is greedy instead of trying
+/// every order.
+const HIR_EXHAUSTIVE_JOIN_LIMIT: usize = 8;
+
+/// A left-deep HIR join of some sources, ending with one of them.
+struct HirPartialJoin {
+    steps: Vec<(usize, AccessMethod)>,
+    output_cardinality: f64,
+    cost: Cost,
+}
+
+/// Choose an HIR join order. Like legacy, small joins try every order,
+/// building the cheapest plan for each set of sources and last source from
+/// the plans of its subsets, and keep both the cheapest plan and the
+/// cheapest one that returns rows in the order target's order. Larger joins
+/// use the greedy rules.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_hir_join_order(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    groups: &[HirFromGroupBoundary],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
+    order_target: Option<&HirOrderTarget<'_>>,
+    initial_input_cardinality: f64,
+    access_methods_arena: &mut Vec<AccessMethod>,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+    or_union: bool,
+) -> Result<Option<BestJoinOrderResult>> {
+    if sources.len() <= 1 || sources.len() > HIR_EXHAUSTIVE_JOIN_LIMIT {
+        return compute_hir_greedy_join_order(
+            document,
+            sources,
+            groups,
+            constraints,
+            where_clause,
+            base_table_rows,
+            source_costs,
+            order_target,
+            initial_input_cardinality,
+            access_methods_arena,
+            schema,
+            analyze_stats,
+            params,
+            or_union,
+        );
+    }
+    let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
+    let boundaries = HirJoinBoundaries {
+        groups,
+        ordering_restrictions: &ordering_restrictions,
+    };
+    let layout = HirFromLayout::new(sources, groups);
+    let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
+    let step = |position: usize, lhs_mask: &TableMask, input_cardinality: f64| {
+        hir_join_step(
+            document,
+            sources,
+            &layout,
+            constraints,
+            where_clause,
+            &predicate_work,
+            base_table_rows,
+            source_costs,
+            order_target,
+            position,
+            lhs_mask,
+            input_cardinality,
+            schema,
+            analyze_stats,
+            params,
+            or_union,
+        )
+    };
+    let allowed = |position: usize, lhs_mask: &TableMask| {
+        boundaries.allows_candidate(position, lhs_mask)
+            && ordering_restrictions
+                .required_lhs(position)
+                .is_none_or(|required| lhs_mask.contains_all_set_bits_of(required))
+    };
+
+    let mut memo: HashMap<TableMask, HashMap<usize, HirPartialJoin>> = HashMap::default();
+    let empty = TableMask::default();
+    for position in 0..sources.len() {
+        if !allowed(position, &empty) {
+            continue;
+        }
+        let Some(first) = step(position, &empty, initial_input_cardinality)? else {
+            continue;
+        };
+        let mut mask = TableMask::default();
+        mask.set(position)?;
+        let output_cardinality = rows_after_join(
+            initial_input_cardinality,
+            &first.access_method,
+            &constraints[position],
+            &empty,
+            mask.try_clone()?,
+            false,
+            params,
+        );
+        let cost = first.access_method.cost;
+        memo.entry(mask).or_default().insert(
+            position,
+            HirPartialJoin {
+                steps: vec![(position, first.access_method)],
+                output_cardinality,
+                cost,
+            },
+        );
+    }
+
+    let mut complete: Vec<HirPartialJoin> = Vec::new();
+    for subset_size in 2..=sources.len() {
+        for mask in generate_join_bitmasks(sources.len(), subset_size) {
+            let mask = mask?;
+            let mut best_by_last: HashMap<usize, HirPartialJoin> = HashMap::default();
+            for rhs in 0..sources.len() {
+                if !mask.get(rhs) {
+                    continue;
+                }
+                let mut lhs_mask = mask.try_clone()?;
+                lhs_mask.clear(rhs);
+                if !allowed(rhs, &lhs_mask) {
+                    continue;
+                }
+                let Some(lhs_plans) = memo.get(&lhs_mask) else {
+                    continue;
+                };
+                let connected = predicate_work
+                    .iter()
+                    .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(&lhs_mask));
+                let mut last_positions = lhs_plans.keys().copied().collect::<Vec<_>>();
+                last_positions.sort_unstable();
+                for last in last_positions {
+                    let lhs = &lhs_plans[&last];
+                    let Some(next) = step(rhs, &lhs_mask, lhs.output_cardinality)? else {
+                        continue;
+                    };
+                    let mut method = next.access_method;
+                    // Like legacy, a table nothing joins to the tables before
+                    // it pays for the cross product.
+                    if !connected {
+                        let base_rows = base_table_rows
+                            .get(rhs)
+                            .copied()
+                            .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+                        let self_selectivity =
+                            build_self_constraint_selectivity(&constraints[rhs], rhs);
+                        method.cost = method.cost
+                            + Cost(lhs.output_cardinality * *base_rows * self_selectivity);
+                    }
+                    let mut rhs_mask = TableMask::default();
+                    rhs_mask.set(rhs)?;
+                    let output_cardinality = rows_after_join(
+                        lhs.output_cardinality,
+                        &method,
+                        &constraints[rhs],
+                        &lhs_mask,
+                        rhs_mask,
+                        false,
+                        params,
+                    );
+                    let cost = lhs.cost + method.cost;
+                    if best_by_last
+                        .get(&rhs)
+                        .is_some_and(|existing| existing.cost.0 <= cost.0)
+                    {
+                        continue;
+                    }
+                    let mut steps = lhs
+                        .steps
+                        .iter()
+                        .map(|(position, method)| (*position, method.clone()))
+                        .collect::<Vec<_>>();
+                    steps.push((rhs, method));
+                    best_by_last.insert(
+                        rhs,
+                        HirPartialJoin {
+                            steps,
+                            output_cardinality,
+                            cost,
+                        },
+                    );
+                }
+            }
+            if subset_size == sources.len() {
+                let mut lasts = best_by_last.keys().copied().collect::<Vec<_>>();
+                lasts.sort_unstable();
+                for last in lasts {
+                    if let Some(plan) = best_by_last.remove(&last) {
+                        complete.push(plan);
+                    }
+                }
+            } else if !best_by_last.is_empty() {
+                memo.insert(mask, best_by_last);
+            }
+        }
+    }
+
+    let into_join = |plan: HirPartialJoin, arena: &mut Vec<AccessMethod>| JoinN {
+        data: plan
+            .steps
+            .into_iter()
+            .map(|(position, method)| {
+                arena.push(method);
+                (position, arena.len() - 1)
+            })
+            .collect(),
+        output_cardinality: plan.output_cardinality,
+        cost: plan.cost,
+    };
+    // Like legacy, a tie keeps the FROM clause's order, so rows of equally
+    // cheap plans come out in the same order as before.
+    let order_key = |plan: &HirPartialJoin| {
+        plan.steps
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>()
+    };
+    let Some(best_position) = (0..complete.len()).min_by(|left, right| {
+        complete[*left]
+            .cost
+            .0
+            .total_cmp(&complete[*right].cost.0)
+            .then_with(|| order_key(&complete[*left]).cmp(&order_key(&complete[*right])))
+    }) else {
+        return Err(LimboError::PlanningError(
+            "No valid HIR join order found".to_string(),
+        ));
+    };
+    // The cheapest plan whose loops already follow the order target, which
+    // the caller may prefer to skip a sort.
+    let mut best_ordered: Option<(usize, Cost)> = None;
+    if let Some(target) = order_target {
+        for (position, plan) in complete.iter().enumerate() {
+            if best_ordered.is_some_and(|(_, cost)| cost.0 <= plan.cost.0) {
+                continue;
+            }
+            let mut scratch = Vec::new();
+            let candidate = into_join(
+                HirPartialJoin {
+                    steps: plan
+                        .steps
+                        .iter()
+                        .map(|(source, method)| (*source, method.clone()))
+                        .collect(),
+                    output_cardinality: plan.output_cardinality,
+                    cost: plan.cost,
+                },
+                &mut scratch,
+            );
+            if super::order::hir_plan_satisfies_order_target(
+                &candidate, &scratch, sources, document, target, schema,
+            )? {
+                best_ordered = Some((position, plan.cost));
+            }
+        }
+    }
+    let best_ordered_position = best_ordered
+        .map(|(position, _)| position)
+        .filter(|position| *position != best_position);
+    let mut complete = complete.into_iter().map(Some).collect::<Vec<_>>();
+    let best_plan = into_join(
+        complete[best_position]
+            .take()
+            .expect("best HIR join plan is taken once"),
+        access_methods_arena,
+    );
+    let best_ordered_plan = best_ordered_position.map(|position| {
+        into_join(
+            complete[position]
+                .take()
+                .expect("ordered HIR join plan is taken once"),
+            access_methods_arena,
+        )
+    });
+    Ok(Some(BestJoinOrderResult {
+        best_plan,
+        best_ordered_plan,
+    }))
+}
+
 /// Build a left-deep HIR join plan using the existing greedy rules.
 ///
 /// HIR supports B-tree, virtual-table, derived, and CTE scans. Hash joins and
@@ -1928,6 +2215,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
+    or_union: bool,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.is_empty() {
         return Ok(None);
@@ -1940,7 +2228,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     };
     let layout = HirFromLayout::new(sources, groups);
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
-    let first_position = find_best_hir_starting_source(
+    let starting_sources = hir_starting_sources_by_score(
         document,
         sources,
         constraints,
@@ -1954,23 +2242,41 @@ pub(crate) fn compute_hir_greedy_join_order(
 
     let mut remaining: TableMask = (0..sources.len()).try_collect()?;
     let mut joined_mask = TableMask::default();
-    let first = hir_join_step(
-        document,
-        sources,
-        &layout,
-        constraints,
-        where_clause,
-        &predicate_work,
-        base_table_rows,
-        source_costs,
-        order_target,
-        first_position,
-        &joined_mask,
-        initial_input_cardinality,
-        schema,
-        analyze_stats,
-        params,
-    )?;
+    // A table function whose arguments read another table cannot start
+    // the join, so the best starting table its virtual table accepts wins.
+    let mut first = None;
+    for &position in &starting_sources {
+        first = hir_join_step(
+            document,
+            sources,
+            &layout,
+            constraints,
+            where_clause,
+            &predicate_work,
+            base_table_rows,
+            source_costs,
+            order_target,
+            position,
+            &joined_mask,
+            initial_input_cardinality,
+            schema,
+            analyze_stats,
+            params,
+            or_union,
+        )?;
+        if first.is_some() {
+            break;
+        }
+    }
+    let first = first.ok_or_else(|| {
+        let name = starting_sources
+            .first()
+            .and_then(|position| sources[*position].btree())
+            .map_or("", |source| source.table.get_name());
+        LimboError::PlanningError(format!(
+            "virtual table {name} rejected the available constraints"
+        ))
+    })?;
     let first_position = first.source_position;
     let mut first_mask = TableMask::default();
     first_mask.set(first_position)?;
@@ -2026,7 +2332,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 continue;
             }
 
-            let step = hir_join_step(
+            let Some(step) = hir_join_step(
                 document,
                 sources,
                 &layout,
@@ -2042,7 +2348,11 @@ pub(crate) fn compute_hir_greedy_join_order(
                 schema,
                 analyze_stats,
                 params,
-            )?;
+                or_union,
+            )?
+            else {
+                continue;
+            };
             let position = step.source_position;
             let mut method = step.access_method;
             if !connected {
@@ -2114,7 +2424,8 @@ fn hir_join_step(
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<HirJoinStep> {
+    or_union: bool,
+) -> Result<Option<HirJoinStep>> {
     let source = &sources[source_position];
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(source_position)?;
@@ -2131,39 +2442,85 @@ fn hir_join_step(
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
     let mut access_method = match source {
         HirPlanSource::BTree(source) => match &source.table {
-            Table::BTree(_) => choose_single_btree_access_method(
-                &HirAccessSource::new(
-                    source,
-                    document
-                        .source(source.internal_id)
-                        .expect("validated HIR contains referenced source"),
-                ),
-                &constraints[source_position],
-                lhs_mask,
-                source_position,
-                order_target,
-                &ready_where,
-                schema,
-                analyze_stats,
-                input_cardinality,
-                base_row_count,
-                params,
-            )?,
-            Table::Virtual(vtab) => find_best_hir_access_method_for_vtab(
-                vtab,
-                &constraints[source_position].constraints,
-                source_position,
-                lhs_mask,
-                input_cardinality,
-                base_row_count,
-                params,
-            )?
-            .ok_or_else(|| {
-                LimboError::PlanningError(format!(
-                    "virtual table {} rejected the available constraints",
-                    source.table.get_name()
-                ))
-            })?,
+            Table::BTree(_) => {
+                let mut method = choose_single_btree_access_method(
+                    &HirAccessSource::new(
+                        source,
+                        document
+                            .source(source.internal_id)
+                            .expect("validated HIR contains referenced source"),
+                    ),
+                    &constraints[source_position],
+                    lhs_mask,
+                    source_position,
+                    order_target,
+                    &ready_where,
+                    schema,
+                    analyze_stats,
+                    input_cardinality,
+                    base_row_count,
+                    params,
+                )?;
+                // A scan may later become one seek per branch of an OR term,
+                // so the join order weighs that union's cost, as legacy
+                // weighs its multi-index OR. When the union beats a scan or
+                // a temporary index, the step is a scan at the union's cost,
+                // which access planning then turns into the union.
+                let scans_or_builds = matches!(
+                    &method.params,
+                    AccessMethodParams::BTreeTable {
+                        build_index,
+                        constraint_refs,
+                        ..
+                    } if *build_index || constraint_refs.is_empty()
+                );
+                if or_union && scans_or_builds {
+                    if let Some((_, union_cost, union_rows)) = super::hir_or_union_with_cost(
+                        document,
+                        layout,
+                        source,
+                        source_position,
+                        where_clause,
+                        lhs_mask,
+                        base_row_count,
+                        schema,
+                        params,
+                    )? {
+                        let union_cost = Cost(union_cost.0 * input_cardinality);
+                        if union_cost.0 < method.cost.0 {
+                            method = AccessMethod {
+                                cost: union_cost,
+                                estimated_rows_per_outer_row: union_rows,
+                                consumed_where_terms: Default::default(),
+                                params: AccessMethodParams::BTreeTable {
+                                    iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                                    index: None,
+                                    build_index: false,
+                                    constraint_refs: Vec::new(),
+                                },
+                            };
+                        }
+                    }
+                }
+                method
+            }
+            Table::Virtual(vtab) => {
+                // The virtual table cannot be read after these tables, for
+                // example when an argument it needs reads a later table.
+                let Some(method) = find_best_hir_access_method_for_vtab(
+                    vtab,
+                    &constraints[source_position].constraints,
+                    source_position,
+                    lhs_mask,
+                    input_cardinality,
+                    base_row_count,
+                    params,
+                )?
+                else {
+                    return Ok(None);
+                };
+                method
+            }
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "HIR catalog source {} is not a table",
@@ -2202,10 +2559,10 @@ fn hir_join_step(
     };
     add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
 
-    Ok(HirJoinStep {
+    Ok(Some(HirJoinStep {
         source_position,
         access_method,
-    })
+    }))
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
@@ -2259,7 +2616,9 @@ where
     Ok(best.expect("no valid starting table").0)
 }
 
-fn find_best_hir_starting_source(
+/// The tables that may start the join, best first, scored like
+/// [find_best_starting_source].
+fn hir_starting_sources_by_score(
     document: &HirDocument,
     sources: &[HirPlanSource],
     constraints: &[HirTableConstraints],
@@ -2269,7 +2628,7 @@ fn find_best_hir_starting_source(
     boundaries: &HirJoinBoundaries<'_>,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<usize> {
+) -> Result<Vec<usize>> {
     let multipliers = compute_indexed_seek_benefits_optional(
         sources.len(),
         constraints,
@@ -2289,7 +2648,7 @@ fn find_best_hir_starting_source(
     )?;
 
     let empty = TableMask::default();
-    let mut best: Option<(usize, f64)> = None;
+    let mut candidates: Vec<(usize, f64)> = Vec::new();
     for position in 0..sources.len() {
         if !boundaries.allows_candidate(position, &empty) {
             continue;
@@ -2301,12 +2660,15 @@ fn find_best_hir_starting_source(
         let score = source_work
             * build_self_constraint_selectivity(&constraints[position], position)
             * multipliers[position];
-        if best.is_none_or(|(_, best_score)| score < best_score) {
-            best = Some((position, score));
-        }
+        candidates.push((position, score));
     }
-
-    Ok(best.expect("no valid starting HIR source").0)
+    // Stable, so equal scores keep FROM order as before.
+    candidates.sort_by(|(_, left), (_, right)| left.total_cmp(right));
+    turso_assert!(!candidates.is_empty(), "no valid starting HIR source");
+    Ok(candidates
+        .into_iter()
+        .map(|(position, _)| position)
+        .collect())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -3227,7 +3589,9 @@ mod tests {
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
-        )?;
+            false,
+        )?
+        .expect("a B-tree source always has a join step");
 
         assert_eq!(step.source_position, 1);
         assert_eq!(
@@ -3327,6 +3691,7 @@ mod tests {
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
+            false,
         )?
         .expect("three HIR sources produce a join plan");
 

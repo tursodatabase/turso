@@ -807,15 +807,37 @@ pub fn program_plan_json(program: &Program) -> String {
     top.num("version", 1);
     top.str("sql", &program.sql);
 
-    let column_names: Vec<String> = program
-        .result_columns
-        .iter()
-        .enumerate()
-        .map(|(i, col)| match col.name(&program.table_references) {
-            Some(name) => name.to_string(),
-            None => format!("column{}", i + 1),
-        })
-        .collect();
+    // A program prepared through HIR names its columns in
+    // `resolved_result_columns` instead.
+    let column_names: Vec<String> = if program.resolved_result_columns.is_empty() {
+        program
+            .result_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| match col.name(&program.table_references) {
+                Some(name) => name.to_string(),
+                None => format!("column{}", i + 1),
+            })
+            .collect()
+    } else {
+        program
+            .resolved_result_columns
+            .iter()
+            .map(|column| match &column.value {
+                crate::translate::semantic_lowering::ResolvedResultValue::Column(source)
+                    if !column.name_is_alias =>
+                {
+                    source.column_name.clone()
+                }
+                crate::translate::semantic_lowering::ResolvedResultValue::RowId(name)
+                    if !column.name_is_alias =>
+                {
+                    name.clone()
+                }
+                _ => column.name.clone(),
+            })
+            .collect()
+    };
     top.str_array("result_columns", &column_names);
 
     let nodes = top.key("nodes");

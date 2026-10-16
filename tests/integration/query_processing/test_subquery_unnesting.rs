@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 
 /// Return the text rows from `EXPLAIN QUERY PLAN`.
 fn explain(connection: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
@@ -13,37 +13,48 @@ fn explain(connection: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Resul
     Ok(details)
 }
 
+/// Whether a correlated aggregate is computed once per key rather than once
+/// per outer row. Legacy joins a grouped subquery table; HIR keeps running
+/// the subquery but caches each result under the outer values it reads.
+fn computes_once_per_key(
+    connection: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> anyhow::Result<bool> {
+    let details = explain(connection, sql)?;
+    if details
+        .iter()
+        .any(|detail| detail.contains("scalar_subquery"))
+        && details.iter().all(|detail| !detail.contains("CORRELATED"))
+    {
+        return Ok(true);
+    }
+    Ok(limbo_exec_rows(connection, &format!("EXPLAIN {sql}"))
+        .iter()
+        .flatten()
+        .any(|value| {
+            matches!(value, rusqlite::types::Value::Text(text)
+                if text.contains("ephemeral_subquery_cache"))
+        }))
+}
+
 /// Compute the same average once per key, not once per outer row.
 #[test]
-fn correlated_average_uses_one_grouped_table() -> anyhow::Result<()> {
+fn correlated_average_is_computed_once_per_key() -> anyhow::Result<()> {
     let database =
         TempDatabase::new_with_rusqlite("CREATE TABLE outer_rows(id INT, key1 INT, amount INT)");
     let connection = database.connect_limbo();
     connection.execute("CREATE TABLE inner_rows(key1 INT, amount INT)")?;
 
-    let details = explain(
-        &connection,
-        "SELECT id FROM outer_rows o
+    let sql = "SELECT id FROM outer_rows o
          WHERE amount < (
              SELECT 0.2 * avg(i.amount)
              FROM inner_rows i
              WHERE i.key1 = o.key1
-         )",
-    )?;
-
+         )";
     assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("scalar_subquery")),
-        "expected a grouped subquery table, got {details:?}"
-    );
-    assert!(
-        details.iter().any(|detail| detail.contains("GROUP BY")),
-        "expected the subquery to group by its outer key, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no subquery call for each outer row, got {details:?}"
+        computes_once_per_key(&connection, sql)?,
+        "expected one average per key, got {:?}",
+        explain(&connection, sql)?
     );
     Ok(())
 }
@@ -82,42 +93,33 @@ fn indexed_average_for_one_outer_row_stays_a_subquery() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A TPC-H Q2 query should compute its minimum values once.
+/// A TPC-H Q2 query should compute its minimum values once per part.
 #[test]
-fn minimum_over_a_join_becomes_a_joined_table() -> anyhow::Result<()> {
+fn minimum_over_a_join_is_computed_once_per_key() -> anyhow::Result<()> {
     let database = TempDatabase::new_with_rusqlite(
         "CREATE TABLE partsupp(partkey INT, suppkey INT, supplycost INT)",
     );
     let connection = database.connect_limbo();
     connection.execute("CREATE TABLE supplier(suppkey INT, region INT)")?;
 
-    let details = explain(
-        &connection,
-        "SELECT ps.partkey, ps.suppkey
+    let sql = "SELECT ps.partkey, ps.suppkey
          FROM partsupp ps JOIN supplier s ON s.suppkey = ps.suppkey
          WHERE ps.supplycost = (
              SELECT min(ps2.supplycost)
              FROM partsupp ps2 JOIN supplier s2 ON s2.suppkey = ps2.suppkey
              WHERE ps2.partkey = ps.partkey AND s2.region = 1
-         )",
-    )?;
-
+         )";
     assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("scalar_subquery")),
-        "expected the minimum-cost subquery to become a joined table, got {details:?}"
-    );
-    assert!(
-        details.iter().all(|detail| !detail.contains("CORRELATED")),
-        "expected no per-row minimum-cost subquery, got {details:?}"
+        computes_once_per_key(&connection, sql)?,
+        "expected one minimum cost per part, got {:?}",
+        explain(&connection, sql)?
     );
     Ok(())
 }
 
-/// A grouped table can use a NULL outer value and a text order.
+/// A NULL outer value and a text order still compute each key once.
 #[test]
-fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
+fn null_and_text_keys_are_computed_once_per_key() -> anyhow::Result<()> {
     let database = TempDatabase::new_with_rusqlite("CREATE TABLE outer_rows(id INT, key1 INT)");
     let connection = database.connect_limbo();
     connection.execute("CREATE TABLE outer_key2(id INT, key2 INT)")?;
@@ -133,16 +135,10 @@ fn grouped_table_can_use_null_and_text_order() -> anyhow::Result<()> {
     ];
 
     for query in queries {
-        let details = explain(&connection, query)?;
         assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("scalar_subquery")),
-            "expected a grouped subquery table: {query}; got {details:?}"
-        );
-        assert!(
-            details.iter().all(|detail| !detail.contains("CORRELATED")),
-            "expected no subquery call for each outer row: {query}; got {details:?}"
+            computes_once_per_key(&connection, query)?,
+            "expected one result per key: {query}; got {:?}",
+            explain(&connection, query)?
         );
     }
     Ok(())

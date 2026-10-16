@@ -177,7 +177,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     InsertValueRules {
                                         without_dqs_fallback: whole_values_only
                                             && !matches!(syntax.as_ref(), ast::Expr::Id(_)),
-                                        unknown_table_as_column: whole_values_only,
                                     },
                                 )?);
                             }
@@ -524,9 +523,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let mut policy = expressions.policies.insert_values();
         if rules.without_dqs_fallback {
             policy = policy.without_dqs_fallback();
-        }
-        if rules.unknown_table_as_column {
-            policy = policy.with_unknown_table_as_column();
         }
         Ok(self
             .analyze_root_expr_with_expected_type(
@@ -892,7 +888,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             );
             scope
         };
-        let policy = policies.upsert_update();
+        let policy = policies.insert_values();
         let mut assignments = Vec::<hir::Assignment>::new();
         for set in sets {
             let values: Vec<&ast::Expr> = match set.expr.as_ref() {
@@ -1003,8 +999,6 @@ struct InsertValueRules {
     /// A double-quoted name falls back to a string only when it is the
     /// whole value.
     without_dqs_fallback: bool,
-    /// `x.y` with no table `x` is reported as "no such column: x.y".
-    unknown_table_as_column: bool,
 }
 
 fn is_simple_values(select: &ast::Select) -> bool {

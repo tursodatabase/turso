@@ -555,7 +555,6 @@ fn hir_errors_match_legacy() {
     for sql in [
         "SELECT * FROM main.nosuch",
         "SELECT * FROM nosuch",
-        "SELECT x.y FROM items",
         "SELECT nosuch FROM items",
     ] {
         let legacy_error = legacy
@@ -565,5 +564,531 @@ fn hir_errors_match_legacy() {
             .to_string();
         let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
         assert_eq!(hir_error, legacy_error, "{sql}");
+    }
+    // Legacy says "no such table: x" here; HIR names the column as SQLite
+    // does.
+    let error = hir
+        .prepare("SELECT x.y FROM items")
+        .err()
+        .expect("HIR rejects")
+        .to_string();
+    assert_eq!(error, "Parse error: no such column: x.y");
+}
+
+#[test]
+fn hir_min_and_max_stop_at_the_first_value_an_index_returns() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE t(x, y)",
+        "CREATE INDEX t_x ON t(x)",
+        "INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (7, 0), (5, 9)",
+        "CREATE TABLE u(a, b)",
+        "CREATE INDEX u_a ON u(a NULLS LAST)",
+        "CREATE INDEX u_b ON u(b DESC NULLS FIRST)",
+        "INSERT INTO u VALUES (NULL, NULL), (2, 8), (9, 1), (4, NULL)",
+        "CREATE TABLE empty(x)",
+        "CREATE INDEX empty_x ON empty(x)",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT min(x) FROM t",
+            vec![vec![rusqlite::types::Value::Integer(1)]],
+        ),
+        (
+            "SELECT max(x) FROM t",
+            vec![vec![rusqlite::types::Value::Integer(7)]],
+        ),
+        (
+            "SELECT max(x) FROM t WHERE y > 1",
+            vec![vec![rusqlite::types::Value::Integer(5)]],
+        ),
+        (
+            "SELECT min(x) FROM t WHERE x > 2",
+            vec![vec![rusqlite::types::Value::Integer(3)]],
+        ),
+        // NULLs sort at the end of these indexes, so the first non-NULL
+        // value is not the first row the scan reads. Legacy returns NULL
+        // for both MAX queries.
+        (
+            "SELECT min(a) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(2)]],
+        ),
+        (
+            "SELECT max(a) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(9)]],
+        ),
+        (
+            "SELECT max(b) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(8)]],
+        ),
+        (
+            "SELECT min(b) FROM u",
+            vec![vec![rusqlite::types::Value::Integer(1)]],
+        ),
+        (
+            "SELECT max(x) FROM empty",
+            vec![vec![rusqlite::types::Value::Null]],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+
+    // The scan ends at the first non-NULL value instead of reading every
+    // row of the index.
+    let opcodes = limbo_exec_rows(&hir, "EXPLAIN SELECT max(x) FROM t")
+        .into_iter()
+        .filter_map(|row| match row.get(1) {
+            Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let step = opcodes
+        .iter()
+        .position(|opcode| opcode == "AggStep")
+        .expect("MAX steps its aggregate");
+    assert_eq!(opcodes[step + 1], "Goto", "{opcodes:?}");
+}
+
+#[test]
+fn hir_seek_keys_from_a_null_row_skip_the_seek() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE a(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, aid)",
+        "CREATE TABLE c(x INTEGER, y)",
+        "CREATE INDEX cx ON c(x)",
+        "INSERT INTO a VALUES (1), (2)",
+        "INSERT INTO b VALUES (10, 1)",
+        "INSERT INTO c VALUES (NULL, 'null'), (10, 'ten')",
+        "INSERT INTO c WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+         SELECT i, 'filler' FROM n",
+        "ANALYZE",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    // b.id is a rowid, but b's NULL row for a = 2 makes it NULL. The range
+    // seek on c must not start from that NULL key; legacy does and returns
+    // every row of c above it.
+    let sql = "SELECT a.id, b.id, c.y FROM a \
+               LEFT JOIN b ON b.id = a.id + 9 \
+               LEFT JOIN c ON c.x > b.id AND c.x < 102";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail)) if detail.starts_with("SEARCH c USING INDEX cx")
+        )),
+        "{plan:?}"
+    );
+    let filler = || rusqlite::types::Value::Text("filler".to_string());
+    assert_eq!(
+        limbo_exec_rows(&hir, sql),
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+                filler(),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+                filler(),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null,
+            ],
+        ]
+    );
+}
+
+#[test]
+fn hir_correlated_subqueries_seek_an_automatic_index() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "CREATE TABLE i(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "INSERT INTO o WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500) \
+         SELECT x, x % 200, x FROM n",
+        "INSERT INTO i WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500) \
+         SELECT x, x % 300, x FROM n",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    // Like SQLite and legacy, the subquery runs once per outer row, so it
+    // builds an index on i(k) once and seeks it on every run instead of
+    // scanning i each time.
+    for (sql, expected) in [
+        (
+            "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)",
+            500,
+        ),
+        (
+            "SELECT count(*) FROM o WHERE o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)",
+            200,
+        ),
+    ] {
+        let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.iter().any(|row| matches!(
+                row.get(3),
+                Some(rusqlite::types::Value::Text(detail))
+                    if detail.starts_with("SEARCH i USING COVERING INDEX ephemeral")
+            )),
+            "{sql}: {plan:?}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            vec![vec![rusqlite::types::Value::Integer(expected)]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn hir_count_star_counts_without_a_loop() {
+    let db = setup();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    let opcodes = |sql: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let program = opcodes("SELECT count(*) FROM items");
+    assert!(
+        program.iter().any(|opcode| opcode == "Count"),
+        "{program:?}"
+    );
+    assert!(
+        program.iter().any(|opcode| opcode == "Transaction"),
+        "{program:?}"
+    );
+    assert!(
+        !program.iter().any(|opcode| opcode == "Next"),
+        "{program:?}"
+    );
+    // A WHERE term needs the loop.
+    let filtered = opcodes("SELECT count(*) FROM items WHERE value > 10");
+    assert!(
+        !filtered.iter().any(|opcode| opcode == "Count"),
+        "{filtered:?}"
+    );
+
+    let count = |sql: &str| limbo_exec_rows(&hir, sql);
+    let six = vec![vec![rusqlite::types::Value::Integer(6)]];
+    assert_eq!(count("SELECT count(*) FROM items"), six);
+    assert_eq!(count("SELECT DISTINCT count(*) FROM items"), six);
+    assert_eq!(
+        count("SELECT count(*) FROM items LIMIT 0"),
+        Vec::<Vec<rusqlite::types::Value>>::new()
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM tags"),
+        vec![vec![rusqlite::types::Value::Integer(4)]]
+    );
+}
+
+#[test]
+fn hir_between_on_a_column_seeks_an_index_range() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    // Like legacy and SQLite, each bound of BETWEEN can drive the seek.
+    let sql = "SELECT id FROM items WHERE value BETWEEN 15 AND 35 ORDER BY id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail))
+                if detail == "SEARCH items USING COVERING INDEX items_value (value>=? AND value<=?)"
+        )),
+        "{plan:?}"
+    );
+    for sql in [
+        sql,
+        "SELECT id FROM items WHERE value NOT BETWEEN 15 AND 35 ORDER BY id",
+        "SELECT id FROM items WHERE value + 0 BETWEEN 15 AND 35 ORDER BY id",
+        "SELECT id FROM items WHERE 20 BETWEEN value AND value + 10 ORDER BY id",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn hir_conditions_jump_on_comparisons_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    let opcodes = |sql: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // `extra = 'b'` is one jump on the comparison, and its constant is
+    // loaded once, after the program's Transaction.
+    let program = opcodes("SELECT id FROM items WHERE extra = 'b'");
+    assert!(program.iter().any(|opcode| opcode == "Ne"), "{program:?}");
+    assert!(
+        !program
+            .iter()
+            .any(|opcode| opcode == "ZeroOrNull" || opcode == "IfNot"),
+        "{program:?}"
+    );
+    let transaction = program
+        .iter()
+        .position(|opcode| opcode == "Transaction")
+        .expect("program reads a table");
+    let constant = program
+        .iter()
+        .rposition(|opcode| opcode == "String8")
+        .expect("the constant is loaded");
+    assert!(constant > transaction, "{program:?}");
+
+    for sql in [
+        "SELECT id FROM items WHERE value = 20 ORDER BY id",
+        "SELECT id FROM items WHERE value != 20 ORDER BY id",
+        "SELECT id FROM items WHERE value < 30 OR extra = 'c' ORDER BY id",
+        "SELECT id FROM items WHERE NOT (value >= 30) ORDER BY id",
+        "SELECT id FROM items WHERE value IS 20 ORDER BY id",
+        "SELECT id FROM items WHERE value IS NOT 20 ORDER BY id",
+        "SELECT id FROM items WHERE value IS NOT NULL AND value <= 30 ORDER BY id",
+        "SELECT id FROM items WHERE (value > 15) IS NULL ORDER BY id",
+        "SELECT id, CASE WHEN value > 25 THEN 'big' ELSE 'small' END FROM items ORDER BY id",
+        "SELECT count(*) FROM items i JOIN tags t ON t.item_id = i.id AND t.tag = 'x'",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn hir_not_in_checks_the_subquery_for_null_once() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE a(x)",
+        "CREATE TABLE b(y)",
+        "CREATE TABLE c(z)",
+        "CREATE TABLE e(w)",
+        "INSERT INTO a VALUES (1), (2), (NULL), (4)",
+        "INSERT INTO b VALUES (2), (NULL), (3)",
+        "INSERT INTO c VALUES (2), (3)",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    use rusqlite::types::Value::{Integer, Null};
+    // A value the subquery lacks is NULL when the subquery holds a NULL,
+    // false or true otherwise; a NULL value is NULL unless it is empty.
+    for (sql, expected) in [
+        (
+            "SELECT x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY rowid",
+            vec![
+                vec![Null, Null],
+                vec![Integer(1), Integer(0)],
+                vec![Null, Null],
+                vec![Null, Null],
+            ],
+        ),
+        (
+            "SELECT x IN (SELECT z FROM c), x NOT IN (SELECT z FROM c) FROM a ORDER BY rowid",
+            vec![
+                vec![Integer(0), Integer(1)],
+                vec![Integer(1), Integer(0)],
+                vec![Null, Null],
+                vec![Integer(0), Integer(1)],
+            ],
+        ),
+        (
+            "SELECT x IN (SELECT w FROM e), x NOT IN (SELECT w FROM e) FROM a ORDER BY rowid",
+            vec![vec![Integer(0), Integer(1)]; 4],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+
+    // The NULL check reads one index entry instead of looping over the
+    // subquery's rows for every outer row.
+    let program = limbo_exec_rows(
+        &hir,
+        "EXPLAIN SELECT count(*) FROM a WHERE x NOT IN (SELECT z FROM c)",
+    )
+    .into_iter()
+    .filter_map(|row| match row.get(1) {
+        Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+        _ => None,
+    })
+    .collect::<Vec<_>>();
+    let nexts = program.iter().filter(|opcode| *opcode == "Next").count();
+    // One Next for the scan of a and one for building the subquery index.
+    assert_eq!(nexts, 2, "{program:?}");
+}
+
+#[test]
+fn hir_lifts_conjuncts_every_or_branch_shares() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    // Like legacy, `value = 20` is in both branches, so it is a WHERE term
+    // of its own and can seek the index on value.
+    let sql = "SELECT id FROM items \
+               WHERE (value = 20 AND extra = 'a') OR (value = 20 AND extra = 'b') \
+               ORDER BY id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail))
+                if detail.starts_with("SEARCH items USING INDEX items_value (value=?)")
+        )),
+        "{plan:?}"
+    );
+    for sql in [
+        sql,
+        "SELECT id FROM items WHERE value = 20 OR (value = 20 AND extra = 'b') ORDER BY id",
+        "SELECT id FROM items WHERE (value > 10 AND extra = 'a') OR (extra = 'a' AND id = 3) \
+         OR (extra = 'a' AND value IS NULL) ORDER BY id",
+        "SELECT id FROM items WHERE (value = 20 AND extra = 'a') OR (value = 30) ORDER BY id",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// A correlated IN that runs like EXISTS and a correlated aggregate whose
+/// result is cached per key return SQLite's rows. Legacy's subquery rewrites
+/// return wrong rows for all three queries.
+#[test]
+fn hir_correlated_in_probe_and_cached_aggregates_match_sqlite() {
+    const SCHEMA: &str = "
+        CREATE TABLE o(id INTEGER PRIMARY KEY, k, a, c TEXT COLLATE NOCASE);
+        CREATE TABLE i(k INT, a, x INT, n INT);
+        CREATE TABLE j(k INT, m INT);
+        CREATE TABLE p(id INTEGER PRIMARY KEY, ok);
+        INSERT INTO o VALUES (1,1,1,'a'),(2,1.0,NULL,'A'),(3,'1','2','b'),(4,2,2.0,NULL),
+            (5,2,5,'B'),(6,NULL,1,'a'),(7,1,7,'a'),(8,x'31',8,'c');
+        INSERT INTO i VALUES (1,1,10,1),(1,NULL,20,2),(2,2,30,3),(2,'2',40,4),(3,7,50,5),
+            (NULL,1,60,6);
+        INSERT INTO j VALUES (1,1),(2,3),(3,5);
+        INSERT INTO p VALUES (1,1),(2,2),(3,NULL);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        // The IN runs like EXISTS over a join inside the subquery.
+        "SELECT id FROM o WHERE a IN (SELECT i.a FROM i JOIN j ON j.k = i.k \
+         WHERE i.k = o.k AND j.m > 0) ORDER BY id",
+        // The subquery reads an outer aggregate, so it is not cached.
+        "SELECT quote(k), (SELECT count(*) + max(o.a) FROM i WHERE i.k = o.k) \
+         FROM o GROUP BY k ORDER BY 1",
+        // The cached aggregate joins two tables of its own.
+        "SELECT id, (SELECT count(*) FROM i, p WHERE i.k = p.ok AND p.id = o.k) \
+         FROM o ORDER BY id",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+}
+
+/// An equality join on columns no index covers looks rows up in a hash table
+/// instead of an automatic index, as legacy's hash join does. The tables are
+/// large enough that a debug build's hash table spills to disk, so the
+/// lookups that wait for spilled rows run too, and every row still matches
+/// SQLite.
+#[test]
+fn hir_equality_joins_without_an_index_use_a_hash_table() {
+    const SCHEMA: &str = "
+        CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT, v INT);
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1500)
+            INSERT INTO a SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 40 END,
+                substr('pppppppppppppppppppppppppppppppppppppppp', 1, i % 40) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1200)
+            INSERT INTO b SELECT i, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 50 END,
+                substr('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq', 1, i % 50), i % 17 FROM s;
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
+        "SELECT a.k, count(*), sum(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.k ORDER BY a.k",
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
+    ] {
+        let opcodes = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for opcode in ["HashBuild", "HashProbe", "HashGraceInit"] {
+            assert!(
+                opcodes.iter().any(|candidate| candidate == opcode),
+                "expected {opcode} for {sql}: {opcodes:?}"
+            );
+        }
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
     }
 }

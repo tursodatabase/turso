@@ -32,15 +32,26 @@ pub(crate) struct ExprPolicy {
     raise: RaisePolicy,
     self_source: Option<hir::SourceId>,
     policies: ExprPolicies,
-    /// Report `x.y` with no table `x` as "no such column: x.y", as legacy
-    /// does in a single VALUES row and in UPSERT.
-    unknown_table_as_column: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExprPolicies {
     dqs_dml: DoubleQuotedDml,
     trigger: Option<TriggerExprContext>,
+    row_values: RowValueChecks,
+}
+
+/// Which row value widths are checked. SQLite checks some of them only
+/// while generating code, so an ORDER BY term it drops skips them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowValueChecks {
+    All,
+    /// Only the width of scalar subqueries, as in the ORDER BY terms SQLite
+    /// drops after a rowid.
+    ScalarSubqueries,
+    /// None, as in the ORDER BY SQLite drops from an aggregate query
+    /// without GROUP BY.
+    None,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +101,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -103,7 +113,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -116,7 +125,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -129,7 +137,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -146,7 +153,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -159,7 +165,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -172,7 +177,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
@@ -185,21 +189,11 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(dqs_dml),
-            unknown_table_as_column: false,
         }
     }
 
     pub(super) const fn returning(dqs_dml: DoubleQuotedDml) -> Self {
         Self::insert_values(dqs_dml)
-    }
-
-    pub(super) const fn upsert_update(dqs_dml: DoubleQuotedDml) -> Self {
-        Self::insert_values(dqs_dml).with_unknown_table_as_column()
-    }
-
-    pub(crate) const fn with_unknown_table_as_column(mut self) -> Self {
-        self.unknown_table_as_column = true;
-        self
     }
 
     pub(super) const fn update(dqs_dml: DoubleQuotedDml) -> Self {
@@ -208,6 +202,11 @@ impl ExprPolicy {
 
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
+        self
+    }
+
+    const fn without_windows(mut self) -> Self {
+        self.allow_windows = false;
         self
     }
 
@@ -220,7 +219,6 @@ impl ExprPolicy {
             raise: RaisePolicy::AbortOnly,
             self_source: None,
             policies: ExprPolicies::statement(DoubleQuotedDml::Disabled),
-            unknown_table_as_column: false,
         }
     }
 
@@ -235,7 +233,13 @@ impl ExprPolicies {
         Self {
             dqs_dml,
             trigger: None,
+            row_values: RowValueChecks::All,
         }
+    }
+
+    pub(super) const fn with_row_value_checks(mut self, checks: RowValueChecks) -> Self {
+        self.row_values = checks;
+        self
     }
 
     pub(super) fn trigger(dqs_dml: DoubleQuotedDml, environment: &hir::TriggerEnvironment) -> Self {
@@ -245,6 +249,7 @@ impl ExprPolicies {
                 new_source: environment.new_source,
                 old_source: environment.old_source,
             }),
+            row_values: RowValueChecks::All,
         }
     }
 
@@ -292,10 +297,6 @@ impl ExprPolicies {
         self.apply(ExprPolicy::returning(self.dqs_dml))
     }
 
-    pub(super) fn upsert_update(self) -> ExprPolicy {
-        self.apply(ExprPolicy::upsert_update(self.dqs_dml))
-    }
-
     pub(super) fn update(self) -> ExprPolicy {
         self.apply(ExprPolicy::update(self.dqs_dml))
     }
@@ -317,6 +318,15 @@ enum FrameValue {
 }
 
 impl FrameValue {
+    /// A value standing for this one in an expression that is never
+    /// evaluated: the first column of a row subquery.
+    fn into_any_value(self) -> ResolvedScopeExpr {
+        match self {
+            Self::Scalar(value) => value,
+            Self::RowSubquery { mut components, .. } => components.swap_remove(0),
+        }
+    }
+
     fn into_scalar(self) -> Result<ResolvedScopeExpr> {
         match self {
             Self::Scalar(value) => Ok(value),
@@ -346,9 +356,9 @@ struct ExprOperand {
     components: ExprChildren,
 }
 
+#[derive(Clone)]
 pub(super) struct QueryFunctionState {
     block: hir::QueryBlockId,
-    aggregate_count: usize,
     window_function_count: usize,
     named_windows: Vec<NamedFunctionWindow>,
     windows: Vec<hir::ResolvedWindow>,
@@ -360,7 +370,6 @@ impl QueryFunctionState {
     pub(super) const fn new(block: hir::QueryBlockId) -> Self {
         Self {
             block,
-            aggregate_count: 0,
             window_function_count: 0,
             named_windows: Vec::new(),
             windows: Vec::new(),
@@ -368,14 +377,8 @@ impl QueryFunctionState {
         }
     }
 
-    fn allocate_aggregate(&mut self) -> hir::AggregateId {
-        let id = hir::AggregateId::new(self.block, self.aggregate_count);
-        self.aggregate_count += 1;
-        id
-    }
-
-    pub(super) const fn aggregate_count(&self) -> usize {
-        self.aggregate_count
+    pub(super) const fn block(&self) -> hir::QueryBlockId {
+        self.block
     }
 
     fn allocate_window(&mut self) -> hir::WindowFunctionId {
@@ -496,7 +499,8 @@ enum FunctionBinding {
 }
 
 struct AggregateBinding {
-    id: hir::AggregateId,
+    /// The block whose expression holds the call.
+    block: hir::QueryBlockId,
 }
 
 struct WindowBinding {
@@ -528,10 +532,15 @@ struct FunctionWindowFrame {
     exclude: Option<ast::FrameExclude>,
 }
 
+/// A WINDOW clause definition, with what it inherits from its base window.
+/// Like SQLite, its expressions are analyzed where a window function uses
+/// it, so they may read the block's aggregates, and a definition no
+/// function uses is never analyzed.
 #[derive(Clone)]
 struct NamedFunctionWindow {
     name: String,
-    window: FunctionWindow,
+    partition_by: Vec<Box<ast::Expr>>,
+    order_by: Vec<ast::SortedColumn>,
     frame: Option<ast::FrameClause>,
 }
 
@@ -593,16 +602,18 @@ impl FunctionWindow {
     }
 }
 
-fn chain_function_window(
-    mut window: FunctionWindow,
-    base: &FunctionWindow,
+/// SQLite's rules for a window that names a base window: it may only add
+/// an ORDER BY the base lacks, and a frame.
+fn check_window_chain(
+    has_partition: bool,
+    both_have_order: bool,
     base_has_frame: bool,
     base_name: &str,
-) -> Result<FunctionWindow> {
-    if !window.partition_by.is_empty() {
+) -> Result<()> {
+    if has_partition {
         crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base_name);
     }
-    if !base.order_by.is_empty() && !window.order_by.is_empty() {
+    if both_have_order {
         crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base_name);
     }
     if base_has_frame {
@@ -611,6 +622,21 @@ fn chain_function_window(
             base_name
         );
     }
+    Ok(())
+}
+
+fn chain_function_window(
+    mut window: FunctionWindow,
+    base: &FunctionWindow,
+    base_has_frame: bool,
+    base_name: &str,
+) -> Result<FunctionWindow> {
+    check_window_chain(
+        !window.partition_by.is_empty(),
+        !base.order_by.is_empty() && !window.order_by.is_empty(),
+        base_has_frame,
+        base_name,
+    )?;
     window.partition_by.clone_from(&base.partition_by);
     if window.order_by.is_empty() {
         window.order_by.clone_from(&base.order_by);
@@ -1599,13 +1625,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ast::Expr::Subquery(_)
                 | ast::Expr::Exists(_)
                 | ast::Expr::InSelect { .. }
-                | ast::Expr::InTable { .. } => self.build_subquery_expr(
-                    frame.syntax,
-                    frame.resolved_children,
-                    scope,
-                    owner,
-                    policy.policies,
-                )?,
+                | ast::Expr::InTable { .. } => {
+                    // An aggregate in the subquery of only this block's
+                    // columns belongs to this block, where aggregates are
+                    // allowed here.
+                    let host = match (&functions, policy.aggregates) {
+                        (FunctionContext::Query(state), AggregatePolicy::Allow) => {
+                            Some(state.block)
+                        }
+                        _ => None,
+                    };
+                    self.aggregate_hosts.push(host);
+                    let value = self.build_subquery_expr(
+                        frame.syntax,
+                        frame.resolved_children,
+                        scope,
+                        owner,
+                        policy.policies,
+                    );
+                    self.aggregate_hosts.pop();
+                    value?
+                }
                 _ => FrameValue::Scalar(self.build_expr_from_frames(
                     frame.syntax,
                     frame.resolved_children,
@@ -1617,8 +1657,62 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             };
             match frames.last_mut() {
                 Some(parent) => parent.resolved_children.push(resolved),
+                None if policy.policies.row_values == RowValueChecks::None => {
+                    return Ok(resolved.into_any_value());
+                }
                 None => return resolved.into_scalar(),
             }
+        }
+    }
+
+    /// The block an aggregate call belongs to. Like SQLite, a call in a
+    /// subquery whose arguments read only columns of the enclosing block
+    /// is an aggregate of that block, which then runs as an aggregate query;
+    /// otherwise it belongs to `block`, the block it is written in.
+    fn aggregate_owner(
+        &self,
+        block: hir::QueryBlockId,
+        input: &FunctionInput,
+        filter: Option<&ResolvedScopeExpr>,
+    ) -> hir::QueryBlockId {
+        let Some(Some(host)) = self.aggregate_hosts.last().copied() else {
+            return block;
+        };
+        if host == block {
+            return block;
+        }
+        let mut reads_host = false;
+        let mut reads_other = false;
+        let mut visit = |expression: &hir::Expr| {
+            expression.for_each(&mut |expression| {
+                let source = match expression {
+                    hir::Expr::Column(column) => column.source,
+                    hir::Expr::RowId(source) => *source,
+                    hir::Expr::Subquery(_) => {
+                        reads_other = true;
+                        return;
+                    }
+                    _ => return,
+                };
+                match self.source(source).map(|source| source.owner) {
+                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == host => reads_host = true,
+                    _ => reads_other = true,
+                }
+            });
+        };
+        for value in input.facts() {
+            visit(&value.expr);
+        }
+        for term in input.order_terms() {
+            visit(&term.value.expr);
+        }
+        if let Some(filter) = filter {
+            visit(&filter.expr);
+        }
+        if reads_host && !reads_other {
+            host
+        } else {
+            block
         }
     }
 
@@ -1660,8 +1754,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::InTable { not, rhs, args, .. } => {
                 let query =
                     self.analyze_named_relation_query(rhs, args, owner.query(), scope, policies)?;
-                self.build_in_query(scalar_frame_children(children)?, query, *not)
-                    .map(FrameValue::Scalar)
+                self.build_in_query(
+                    scalar_frame_children(children)?,
+                    query,
+                    *not,
+                    policies.row_values,
+                )
+                .map(FrameValue::Scalar)
             }
             _ => Err(LimboError::InternalError(
                 "subquery expression builder received a non-subquery".to_string(),
@@ -1679,7 +1778,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policies: ExprPolicies,
     ) -> Result<ResolvedScopeExpr> {
         let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
-        self.build_in_query(lhs, query, negated)
+        self.build_in_query(lhs, query, negated, policies.row_values)
     }
 
     fn build_in_query(
@@ -1687,6 +1786,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         lhs: ExprChildren,
         query: hir::QueryId,
         negated: bool,
+        row_values: RowValueChecks,
     ) -> Result<ResolvedScopeExpr> {
         if lhs.is_empty() {
             return Err(LimboError::InternalError(
@@ -1698,6 +1798,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?
             .output
             .len();
+        // SQLite checks the widths only while generating code.
+        if output_width != lhs.len() && row_values != RowValueChecks::All {
+            return Ok(lhs.into_iter().next().expect("IN query has a left value"));
+        }
         if output_width != lhs.len() {
             crate::bail_parse_error!(
                 "sub-select returns {output_width} columns - expected {}",
@@ -1801,16 +1905,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_named_windows(
         &mut self,
         definitions: &'ast [ast::WindowDef],
-        scope: &Scope,
-        policy: ExprPolicy,
         functions: &mut QueryFunctionState,
     ) -> Result<()> {
-        let parent = functions.block.query;
         for definition in definitions {
-            let name = normalize_ident(definition.name.as_str());
-            let mut window =
-                self.analyze_window_definition(&definition.window, scope, policy, parent)?;
-            if let Some(base) = &definition.window.base {
+            let window = &definition.window;
+            let mut named = NamedFunctionWindow {
+                name: normalize_ident(definition.name.as_str()),
+                partition_by: window.partition_by.clone(),
+                order_by: window.order_by.clone(),
+                frame: window.frame_clause.clone(),
+            };
+            if let Some(base) = &window.base {
                 // SQLite ignores the base on the first WINDOW definition.
                 if !functions.named_windows.is_empty() {
                     let base = normalize_ident(base.as_str());
@@ -1819,48 +1924,71 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .iter()
                         .rfind(|window| window.name == base)
                         .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
-                    window = chain_function_window(
-                        window,
-                        &inherited.window,
+                    check_window_chain(
+                        !named.partition_by.is_empty(),
+                        !inherited.order_by.is_empty() && !named.order_by.is_empty(),
                         inherited.frame.is_some(),
                         &base,
                     )?;
+                    named.partition_by.clone_from(&inherited.partition_by);
+                    if named.order_by.is_empty() {
+                        named.order_by.clone_from(&inherited.order_by);
+                    }
                 }
             }
-            functions.named_windows.push(NamedFunctionWindow {
-                name,
-                window,
-                frame: definition.window.frame_clause.clone(),
-            });
+            functions.named_windows.push(named);
         }
         Ok(())
     }
 
-    fn analyze_window_definition(
+    /// The PARTITION BY and ORDER BY of a named window, analyzed where a
+    /// window function uses it.
+    fn analyze_named_window(
         &mut self,
-        window: &'ast ast::Window,
+        name: &str,
         scope: &Scope,
         policy: ExprPolicy,
-        parent: hir::QueryId,
-    ) -> Result<FunctionWindow> {
+        functions: &mut QueryFunctionState,
+    ) -> Result<(FunctionWindow, NamedFunctionWindow)> {
+        let named = functions
+            .named_windows
+            .iter()
+            .rfind(|window| window.name == name)
+            .cloned()
+            .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
+        let policy = policy.without_windows();
+        let mut context = FunctionContext::Query(functions);
         let mut partition_by = ExprChildren::new();
-        for expression in &window.partition_by {
-            partition_by.push(self.analyze_query_scalar_expr(expression, scope, policy, parent)?);
+        for expression in &named.partition_by {
+            partition_by.push(self.analyze_resolved_expr_with_functions(
+                expression,
+                scope,
+                policy,
+                &mut context,
+                None,
+            )?);
         }
-        let mut order_by = Vec::with_capacity(window.order_by.len());
-        for term in &window.order_by {
+        let mut order_by = Vec::with_capacity(named.order_by.len());
+        for term in &named.order_by {
             order_by.push(FunctionOrderTerm {
-                value: self.analyze_query_scalar_expr(&term.expr, scope, policy, parent)?,
+                value: self.analyze_resolved_expr_with_functions(
+                    &term.expr,
+                    scope,
+                    policy,
+                    &mut context,
+                    None,
+                )?,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
             });
         }
-        Ok(FunctionWindow {
+        let window = FunctionWindow {
             partition_by,
             order_by,
             frame: None,
             name: None,
-        })
+        };
+        Ok((window, named))
     }
 
     fn analyze_window_frame(
@@ -1906,16 +2034,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         function: &Func,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &QueryFunctionState,
+        functions: &mut QueryFunctionState,
     ) -> Result<FunctionWindow> {
         match over {
             FunctionOver::Named(name) => {
-                let named = functions
-                    .named_windows
-                    .iter()
-                    .rfind(|window| window.name == name)
-                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
-                let mut window = named.window.clone();
+                let (mut window, named) =
+                    self.analyze_named_window(&name, scope, policy, functions)?;
                 window.name = Some(name);
                 if !function_ignores_user_frame(function) {
                     window.frame = named
@@ -1931,12 +2055,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 base: Some(base),
                 window,
             } => {
-                let named = functions
-                    .named_windows
-                    .iter()
-                    .rfind(|window| window.name == base)
-                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
-                chain_function_window(window, &named.window, named.frame.is_some(), &base)
+                let (base_window, named) =
+                    self.analyze_named_window(&base, scope, policy, functions)?;
+                chain_function_window(window, &base_window, named.frame.is_some(), &base)
             }
         }
     }
@@ -2013,14 +2134,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 not,
                 ..
             } => self.build_between_expr(lhs, start, end, *not, children),
-            _ => self.build_expr(
-                syntax,
-                scalar_frame_children(children)?,
-                scope,
-                policy,
-                functions,
-                expected_type,
-            ),
+            _ => {
+                let children = if policy.policies.row_values == RowValueChecks::None {
+                    children
+                        .into_iter()
+                        .map(FrameValue::into_any_value)
+                        .collect()
+                } else {
+                    scalar_frame_children(children)?
+                };
+                self.build_expr(syntax, children, scope, policy, functions, expected_type)
+            }
         }
     }
 
@@ -2253,14 +2377,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         return self.build_field_access(base, column.as_str());
                     }
                 }
-                if policy.unknown_table_as_column {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}",
-                        table.as_str(),
-                        column.as_str()
-                    );
-                }
-                crate::bail_parse_error!("no such table: {}", table.as_str());
+                crate::bail_parse_error!("no such column: {}.{}", table.as_str(), column.as_str());
             }
             ast::Expr::DoublyQualified(database, table, column) => {
                 expect_no_expr_children(children)?;
@@ -2361,6 +2478,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
                 Ok(inner)
+            }
+            // A row value that is never evaluated is not checked, as in
+            // SQLite, which only rejects it while generating code.
+            ast::Expr::Parenthesized(expressions)
+                if policy.policies.row_values != RowValueChecks::All =>
+            {
+                expect_no_expr_children(children)?;
+                let mut first = None;
+                for expression in expressions {
+                    let value = self.analyze_resolved_expr_with_functions(
+                        expression, scope, policy, functions, None,
+                    )?;
+                    first.get_or_insert(value);
+                }
+                first.ok_or_else(|| {
+                    LimboError::InternalError("row value has no components".to_string())
+                })
             }
             ast::Expr::Parenthesized(_) => crate::bail_parse_error!("row value misused"),
             ast::Expr::Variable(variable) => {
@@ -2951,10 +3085,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         let evaluation = match binding {
             FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
-            FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate {
-                id: binding.id,
-                filter: filter.map(|filter| Box::new(filter.expr)),
-            },
+            FunctionBinding::Aggregate(binding) => {
+                let block = self.aggregate_owner(binding.block, &input, filter.as_ref());
+                hir::FunctionEvaluation::Aggregate {
+                    id: self.allocate_aggregate(block),
+                    filter: filter.map(|filter| Box::new(filter.expr)),
+                }
+            }
             FunctionBinding::Window(binding) => hir::FunctionEvaluation::Window {
                 id: binding.id,
                 window: match functions {
@@ -4186,7 +4323,7 @@ fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<
             crate::bail_parse_error!("misuse of aggregate function {}()", function)
         }
         FunctionContext::Query(state) => Ok(FunctionBinding::Aggregate(AggregateBinding {
-            id: state.allocate_aggregate(),
+            block: state.block,
         })),
     }
 }
@@ -4819,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_errors_keep_table_and_column_distinction() {
+    fn qualified_names_report_the_missing_column_as_sqlite_does() {
         let source = source();
         let mut scope = Scope::default();
         scope.add_source(&source, true);
@@ -4832,7 +4969,7 @@ mod tests {
         .expect_err("unknown qualifier fails");
         assert_eq!(
             missing_table.to_string(),
-            "Parse error: no such table: absent"
+            "Parse error: no such column: absent.value"
         );
 
         let missing_column = analyze_expression(

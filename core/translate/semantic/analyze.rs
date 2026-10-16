@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     context::SemanticContext,
-    expr::{ExprPolicies, ExprPolicy, QueryFunctionState},
+    expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
         CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
@@ -145,9 +145,42 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
     /// Views whose stored SELECT is being analyzed, to reject circular views.
     pub(super) views_in_progress: Vec<String>,
+    /// How many aggregates each query block has. A subquery's aggregate of
+    /// the enclosing block's columns is counted in that block.
+    pub(super) aggregate_counts: HashMap<QueryBlockId, usize>,
+    /// For each subquery being analyzed, the block of the expression it is
+    /// in, when that expression may hold aggregates.
+    pub(super) aggregate_hosts: Vec<Option<QueryBlockId>>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
+}
+
+/// Everything analysis records, saved so that analyzing an ORDER BY term
+/// SQLite never evaluates leaves no trace.
+struct AnalyzerState<'ast> {
+    queries: Vec<Option<Query>>,
+    sources: Vec<Option<Source>>,
+    ctes: Vec<Option<Cte>>,
+    schema_programs: Vec<Option<BoundSchemaProgram>>,
+    schema_programs_in_progress: HashSet<CatalogObjectId>,
+    catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
+    cte_scopes: Vec<super::cte::CteScope<'ast>>,
+    views_in_progress: Vec<String>,
+    aggregate_counts: HashMap<QueryBlockId, usize>,
+    aggregate_hosts: Vec<Option<QueryBlockId>>,
+}
+
+/// ORDER BY terms of a block that SQLite drops before generating code.
+#[derive(Clone, Copy)]
+enum DroppedOrderTerms {
+    None,
+    /// An aggregate query without GROUP BY returns one row, so its ORDER BY
+    /// does nothing.
+    All,
+    /// Rows of the only table come out once per rowid, so terms after a
+    /// first term that is the rowid never break a tie.
+    AfterRowidOf(SourceId),
 }
 
 pub(super) struct SelectContext<'scope> {
@@ -187,12 +220,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
             views_in_progress: Vec::new(),
+            aggregate_counts: HashMap::default(),
+            aggregate_hosts: Vec::new(),
             _catalog_outlives_ast: std::marker::PhantomData,
         }
     }
 
     pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
         self.context
+    }
+
+    pub(super) fn allocate_aggregate(&mut self, block: QueryBlockId) -> super::hir::AggregateId {
+        let count = self.aggregate_counts.entry(block).or_default();
+        let id = super::hir::AggregateId::new(block, *count);
+        *count += 1;
+        id
+    }
+
+    pub(super) fn aggregate_count(&self, block: QueryBlockId) -> usize {
+        self.aggregate_counts.get(&block).copied().unwrap_or(0)
     }
 
     pub(super) fn reserve_query(&mut self) -> QueryId {
@@ -900,7 +946,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => (None, Scope::new(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
-        self.analyze_named_windows(window_clause, &scope, policies.select(), &mut functions)?;
+        self.analyze_named_windows(window_clause, &mut functions)?;
         let outputs = self.analyze_outputs(
             block_id,
             columns,
@@ -936,11 +982,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )
             })
             .transpose()?;
-        let aggregate_query = grouping.is_some() || functions.aggregate_count() > 0;
+        let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
         // Like legacy, an aggregate that appears only in ORDER BY is a misuse
         // when the block reads a FROM clause; without one it makes the block
         // an aggregate query of one row.
         let order_by_allows_aggregates = aggregate_query || from.is_none();
+        let output_windows = functions.window_function_count() > 0;
+        let dropped_order = if self.aggregate_count(functions.block()) > 0
+            && grouping
+                .as_ref()
+                .is_none_or(|grouping| grouping.keys.is_empty())
+            && !output_windows
+        {
+            DroppedOrderTerms::All
+        } else {
+            match from.as_ref().and_then(|from| self.only_rowid_source(from)) {
+                Some(source) if !aggregate_query && !output_windows => {
+                    DroppedOrderTerms::AfterRowidOf(source)
+                }
+                _ => DroppedOrderTerms::None,
+            }
+        };
         let order_by = order_by
             .map(|order_by| {
                 self.analyze_order_by(
@@ -949,13 +1011,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &outputs,
                     block_id,
                     order_by_allows_aggregates,
+                    dropped_order,
                     &mut functions,
                     policies,
                 )
             })
             .transpose()?
             .unwrap_or_default();
-        let aggregate_count = functions.aggregate_count();
+        let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
@@ -1034,7 +1097,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .into_iter()
             .map(|row| row.into_iter().map(|resolved| resolved.expr).collect())
             .collect();
-        let aggregate_count = functions.aggregate_count();
+        let aggregate_count = self.aggregate_count(functions.block());
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
@@ -1094,7 +1157,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         // Aggregates that appear only in ORDER BY are analyzed later and do
         // not count, as in legacy planning.
-        if syntax.exprs.is_empty() && having.is_some() && functions.aggregate_count() == 0 {
+        if syntax.exprs.is_empty()
+            && having.is_some()
+            && self.aggregate_count(functions.block()) == 0
+        {
             crate::bail_parse_error!("HAVING clause on a non-aggregate query");
         }
         Ok(super::hir::Grouping {
@@ -1105,6 +1171,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_order_by(
         &mut self,
         syntax: &'ast [ast::SortedColumn],
@@ -1112,31 +1179,158 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outputs: &[Output],
         block: QueryBlockId,
         aggregate_query: bool,
+        dropped: DroppedOrderTerms,
         functions: &mut QueryFunctionState,
         policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let mut order_scope = scope.clone();
         order_scope.set_outputs(outputs);
-        syntax
-            .iter()
-            .map(|syntax| {
-                let resolved = match self.resolve_output_ordinal_expr(
+        let mut terms: Vec<OrderTerm> = Vec::with_capacity(syntax.len());
+        for syntax in syntax {
+            let checks = match dropped {
+                DroppedOrderTerms::None => RowValueChecks::All,
+                DroppedOrderTerms::All => RowValueChecks::None,
+                DroppedOrderTerms::AfterRowidOf(source) => {
+                    if terms
+                        .first()
+                        .is_some_and(|first| self.is_rowid_of(&first.expr, source, outputs))
+                    {
+                        RowValueChecks::ScalarSubqueries
+                    } else {
+                        RowValueChecks::All
+                    }
+                }
+            };
+            if checks != RowValueChecks::All {
+                // Like SQLite, a dropped term still has its names resolved,
+                // but checks SQLite only makes while generating code, such
+                // as the width of a row value, are skipped, and analyzing it
+                // records nothing.
+                let state = self.save_state();
+                let saved_functions = functions.clone();
+                let checked = match self.resolve_output_ordinal_expr(
                     &syntax.expr,
                     &order_scope,
                     "1st ORDER BY",
-                )? {
-                    Some(resolved) => resolved,
-                    None => self.analyze_query_expr(
-                        &syntax.expr,
-                        &order_scope,
-                        policies.order_by(aggregate_query),
-                        functions,
-                    )?,
+                ) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => self
+                        .analyze_query_expr(
+                            &syntax.expr,
+                            &order_scope,
+                            policies
+                                .with_row_value_checks(checks)
+                                .order_by(aggregate_query),
+                            functions,
+                        )
+                        .and_then(|resolved| {
+                            reject_aliased_aggregates(&resolved.expr, block, outputs)
+                        })
+                        .and_then(|()| {
+                            // SQLite moves window functions out of the ORDER
+                            // BY before dropping it, so their arguments keep
+                            // every check.
+                            for call in window_calls(&syntax.expr)? {
+                                self.analyze_query_expr(
+                                    call,
+                                    &order_scope,
+                                    policies.order_by(aggregate_query),
+                                    functions,
+                                )?;
+                            }
+                            Ok(())
+                        }),
+                    Err(error) => Err(error),
                 };
-                reject_aliased_aggregates(&resolved.expr, block, outputs)?;
-                Ok(order_term(syntax, resolved))
-            })
-            .collect()
+                self.restore_state(state);
+                *functions = saved_functions;
+                checked?;
+                continue;
+            }
+            let resolved = match self.resolve_output_ordinal_expr(
+                &syntax.expr,
+                &order_scope,
+                "1st ORDER BY",
+            )? {
+                Some(resolved) => resolved,
+                None => self.analyze_query_expr(
+                    &syntax.expr,
+                    &order_scope,
+                    policies.order_by(aggregate_query),
+                    functions,
+                )?,
+            };
+            reject_aliased_aggregates(&resolved.expr, block, outputs)?;
+            terms.push(order_term(syntax, resolved));
+        }
+        Ok(terms)
+    }
+
+    /// The source of a FROM clause that is a single table with rowids.
+    fn only_rowid_source(&self, from: &super::hir::From) -> Option<SourceId> {
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let source = self.source(from.first)?;
+        let SourceKind::Table(table) = &source.kind else {
+            return None;
+        };
+        table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_rowid)
+            .then_some(source.id)
+    }
+
+    /// Whether `expr`, or the result column it names, is the rowid of
+    /// `source`.
+    fn is_rowid_of(&self, expr: &Expr, source: SourceId, outputs: &[Output]) -> bool {
+        let expr = match expr {
+            Expr::Output(id) => match outputs.iter().find(|output| output.id == *id) {
+                Some(output) => &output.expr,
+                None => return false,
+            },
+            expr => expr,
+        };
+        match expr {
+            Expr::RowId(rowid_source) => *rowid_source == source,
+            Expr::Column(column) => {
+                column.source == source
+                    && self
+                        .source(source)
+                        .and_then(|source| source.columns.get(column.column))
+                        .is_some_and(|column| column.rowid_alias)
+            }
+            _ => false,
+        }
+    }
+
+    fn save_state(&self) -> AnalyzerState<'ast> {
+        AnalyzerState {
+            queries: self.queries.clone(),
+            sources: self.sources.clone(),
+            ctes: self.ctes.clone(),
+            schema_programs: self.schema_programs.clone(),
+            schema_programs_in_progress: self.schema_programs_in_progress.clone(),
+            catalog_ids: self.catalog_ids.clone(),
+            cte_scopes: self.cte_scopes.clone(),
+            views_in_progress: self.views_in_progress.clone(),
+            aggregate_counts: self.aggregate_counts.clone(),
+            aggregate_hosts: self.aggregate_hosts.clone(),
+        }
+    }
+
+    fn restore_state(&mut self, state: AnalyzerState<'ast>) {
+        self.queries = state.queries;
+        self.sources = state.sources;
+        self.ctes = state.ctes;
+        self.schema_programs = state.schema_programs;
+        self.schema_programs_in_progress = state.schema_programs_in_progress;
+        self.catalog_ids = state.catalog_ids;
+        self.cte_scopes = state.cte_scopes;
+        self.views_in_progress = state.views_in_progress;
+        self.aggregate_counts = state.aggregate_counts;
+        self.aggregate_hosts = state.aggregate_hosts;
     }
 
     pub(super) fn analyze_limit(
@@ -1199,7 +1393,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// matches the arm's output with the same expression: `ORDER BY t1.b`
     /// matches `SELECT t1.b FROM t1`. A term that does not resolve in the arm
     /// does not match it.
-    fn compound_order_by_arm_match(
+    pub(super) fn compound_order_by_arm_match(
         &mut self,
         term: &'ast ast::Expr,
         block: &QueryBlock,
@@ -1589,6 +1783,24 @@ pub(super) fn compound_order_by_position<'syntax>(
 
 /// Whether analyzing `term` could record a subquery or a parameter in the
 /// document. Unknown shapes count as yes.
+/// The window function calls in an expression, outside its subqueries.
+fn window_calls(expression: &ast::Expr) -> Result<Vec<&ast::Expr>> {
+    let mut calls = Vec::new();
+    crate::translate::expr::walk_expr(expression, &mut |expression| {
+        let over = match expression {
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. } => &filter_over.over_clause,
+            _ => return Ok(crate::translate::expr::WalkControl::Continue),
+        };
+        if over.is_none() {
+            return Ok(crate::translate::expr::WalkControl::Continue);
+        }
+        calls.push(expression);
+        Ok(crate::translate::expr::WalkControl::SkipChildren)
+    })?;
+    Ok(calls)
+}
+
 fn term_may_record_state(term: &ast::Expr) -> bool {
     let mut pending = vec![term];
     while let Some(term) = pending.pop() {
@@ -3087,7 +3299,10 @@ mod tests {
              JOIN (SELECT outer_items.id AS captured) AS derived",
         )
         .expect_err("FROM subquery cannot capture the outer source scope");
-        assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: outer_items.id"
+        );
     }
 
     #[test]
@@ -3599,7 +3814,7 @@ mod tests {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
             &schema,
-            "SELECT count(*) FROM items \
+            "SELECT count(*) FROM items GROUP BY value \
              ORDER BY min(score), row_number() OVER (ORDER BY id)",
         )
         .expect("aggregate SELECT accepts ORDER-BY-only aggregate and window functions");
@@ -3877,7 +4092,7 @@ mod tests {
             ),
             (
                 "SELECT (SELECT 1 LIMIT outer_items.id) FROM items AS outer_items",
-                "Parse error: no such table: outer_items",
+                "Parse error: no such column: outer_items.id",
             ),
             (
                 "SELECT id FROM items LIMIT sum(1)",
@@ -4798,7 +5013,10 @@ mod tests {
              ) FROM items AS outer_items",
         )
         .expect_err("CTE cannot see sibling sources from its owning SELECT");
-        assert_eq!(error.to_string(), "Parse error: no such table: local_items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: local_items.id"
+        );
     }
 
     #[test]
@@ -5109,7 +5327,10 @@ mod tests {
             "SELECT items.value FROM (items JOIN categories USING (id)) AS grouped",
         )
         .expect_err("group alias hides inner table qualifiers");
-        assert_eq!(error.to_string(), "Parse error: no such table: items");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: items.value"
+        );
     }
 
     #[test]
@@ -7080,7 +7301,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT guarded.id))",
-                "Parse error: no such table: guarded",
+                "Parse error: no such column: guarded.id",
             ),
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT 1, 2))",
@@ -10282,6 +10503,128 @@ mod tests {
     }
 
     #[test]
+    fn order_by_terms_sqlite_drops_skip_row_value_checks() {
+        let schema = schema_with_items();
+        let root_order = |document: &HirDocument| {
+            document
+                .validate()
+                .expect("dropped ORDER BY terms leave closed HIR");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            (query.order_by.len(), query.blocks[0].aggregate_count)
+        };
+
+        for (sql, kept) in [
+            // One row comes out, so the whole ORDER BY is dropped.
+            (
+                "SELECT count(id) FROM items ORDER BY id IN (SELECT id, value FROM items)",
+                0,
+            ),
+            ("SELECT count(id) FROM items ORDER BY (1, 2), sum(score)", 0),
+            ("SELECT count(id) FROM items ORDER BY (SELECT 1, 2)", 0),
+            // Terms after the rowid never break a tie.
+            ("SELECT value FROM items ORDER BY id, (1, 2)", 1),
+            (
+                "SELECT value FROM items ORDER BY rowid DESC, id IN (SELECT 1, 2)",
+                1,
+            ),
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(
+                root_order(&document),
+                (kept, usize::from(kept == 0)),
+                "{sql}"
+            );
+        }
+
+        for (sql, expected) in [
+            (
+                "SELECT count(id) FROM items ORDER BY (SELECT missing)",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT value FROM items ORDER BY id, (missing, 1)",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT count(id) FROM items ORDER BY (1, 2) = (1, 2, 3)",
+                "Parse error: row value misused",
+            ),
+            // SQLite checks scalar subqueries after a rowid, but not in the
+            // ORDER BY of an aggregate query without GROUP BY.
+            (
+                "SELECT value FROM items ORDER BY rowid DESC, (SELECT 1, 2)",
+                "Parse error: sub-select returns 2 columns - expected 1",
+            ),
+            // Only terms after a rowid are dropped.
+            (
+                "SELECT value FROM items ORDER BY score, (1, 2)",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT count(id) FROM items GROUP BY value ORDER BY (1, 2)",
+                "Parse error: row value misused",
+            ),
+            // SQLite moves window functions out before dropping the ORDER BY,
+            // so their arguments are still checked.
+            (
+                "SELECT count(id) FROM items \
+                 ORDER BY sum(CASE WHEN score THEN 1 ELSE (1, 1) END) OVER ()",
+                "Parse error: row value misused",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("SQLite rejects it too");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn named_windows_are_analyzed_where_a_function_uses_them() {
+        let schema = schema_with_items();
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT rank() OVER ranked FROM items WINDOW ranked AS (ORDER BY sum(score))",
+        )
+        .expect("a named window may read the block's aggregates");
+        document
+            .validate()
+            .expect("named window aggregates produce closed HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 1);
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items WINDOW unused AS (ORDER BY sum(missing))",
+        )
+        .expect("like SQLite, a window no function uses is not analyzed");
+        document
+            .validate()
+            .expect("named window aggregates produce closed HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 0);
+
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT rank() OVER nested FROM items WINDOW nested AS (ORDER BY rank() OVER ())",
+        )
+        .expect_err("a named window cannot hold a window function");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of window function rank()"
+        );
+    }
+
+    #[test]
     fn ordered_set_aggregates_keep_direct_and_ordered_inputs_separate() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
@@ -11056,7 +11399,7 @@ mod tests {
             "UPDATE writable AS old SET value = 'changed' RETURNING old.value",
         )
         .expect_err("UPDATE alias is hidden from RETURNING");
-        assert_eq!(alias.to_string(), "Parse error: no such table: old");
+        assert_eq!(alias.to_string(), "Parse error: no such column: old.value");
     }
 
     #[test]
@@ -11250,7 +11593,7 @@ mod tests {
              JOIN writable AS right_side ON target.id = right_side.id",
         )
         .expect_err("JOIN constraints cannot see the UPDATE target");
-        assert_eq!(error.to_string(), "Parse error: no such table: target");
+        assert_eq!(error.to_string(), "Parse error: no such column: target.id");
     }
 
     #[test]
@@ -11316,7 +11659,10 @@ mod tests {
              FROM writable AS source RETURNING source.value",
         )
         .expect_err("RETURNING cannot see UPDATE FROM sources");
-        assert_eq!(returning.to_string(), "Parse error: no such table: source");
+        assert_eq!(
+            returning.to_string(),
+            "Parse error: no such column: source.value"
+        );
     }
 
     #[test]
@@ -11661,7 +12007,7 @@ mod tests {
         .expect_err("DELETE alias hides the original table name");
         assert_eq!(
             hidden_name.to_string(),
-            "Parse error: no such table: writable"
+            "Parse error: no such column: writable.value"
         );
     }
 

@@ -1924,7 +1924,6 @@ fn hir_delete_errors_match_legacy() {
         "DELETE FROM main.nosuch",
         "DELETE FROM nosuch.t",
         "DELETE FROM t WHERE nosuch = 1",
-        "DELETE FROM t WHERE x.b = 1",
         "DELETE FROM sqlite_schema",
         "DELETE FROM t INDEXED BY nosuch",
         "DELETE FROM t RETURNING t.*",
@@ -1942,8 +1941,9 @@ fn hir_delete_errors_match_legacy() {
         assert_eq!(hir_error, legacy_error, "{sql}");
     }
     // Legacy differs from SQLite on these: it reports a missing constraint
-    // for an unknown column and accepts COLLATE on the INTEGER PRIMARY KEY.
-    // HIR follows SQLite.
+    // for an unknown column, accepts COLLATE on the INTEGER PRIMARY KEY and
+    // reports a column of an unknown table as "no such table". HIR follows
+    // SQLite.
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite
         .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)", ())
@@ -1957,6 +1957,7 @@ fn hir_delete_errors_match_legacy() {
             "INSERT INTO t VALUES (1, 2) ON CONFLICT(a COLLATE nocase) DO NOTHING",
             "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
         ),
+        ("DELETE FROM t WHERE x.b = 1", "no such column: x.b"),
     ] {
         let sqlite_error = sqlite
             .prepare(sql)
