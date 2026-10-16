@@ -115,9 +115,14 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
     Ok(definitions)
 }
 
-/// Collect all table names referenced in a SELECT's FROM clause.
-/// Used to determine which earlier CTEs a CTE directly depends on.
+/// Collect the table names that a SELECT, its subqueries, and its nested WITH
+/// clauses read in a FROM clause. Used to find the CTEs that a query reads.
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            collect_from_clause_table_refs(&cte.select, out);
+        }
+    }
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
@@ -439,6 +444,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
             columns,
             where_clause,
             group_by,
+            window_clause,
             ..
         } => {
             for column in columns {
@@ -457,6 +463,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
                     collect_subquery_table_refs_in_expr(having, out);
                 }
             }
+            collect_subquery_table_refs_in_window_clause(window_clause, out);
             if let ast::OneSelect::Select {
                 from: Some(from), ..
             } = one
@@ -478,7 +485,21 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+pub fn collect_subquery_table_refs_in_window_clause(
+    window_clause: &[ast::WindowDef],
+    out: &mut Vec<String>,
+) {
+    for window_def in window_clause {
+        for expr in &window_def.window.partition_by {
+            collect_subquery_table_refs_in_expr(expr, out);
+        }
+        for sorted in &window_def.window.order_by {
+            collect_subquery_table_refs_in_expr(&sorted.expr, out);
+        }
+    }
+}
+
+pub fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
             Expr::Exists(select) | Expr::Subquery(select) => {
@@ -1526,6 +1547,7 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
 #[turso_macros::trace_stack]
 pub fn plan_ctes_as_outer_refs(
     with: Option<With>,
+    subquery_table_refs: &[String],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
@@ -1536,36 +1558,14 @@ pub fn plan_ctes_as_outer_refs(
     };
 
     let cte_definitions = collect_cte_definitions(with, program)?;
-
-    let base_outer_query_refs =
-        base_outer_refs_for_cte_planning(table_references.outer_query_refs(), &cte_definitions);
-    for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-        let joined_table = plan_cte(
-            cte_definition_index,
-            &cte_definitions,
-            &base_outer_query_refs,
-            resolver,
-            program,
-            connection,
-            false,
-        )?;
-        table_references.add_outer_query_reference(OuterQueryReference {
-            identifier: cte_definition.name.clone(),
-            internal_id: joined_table.internal_id,
-            table: joined_table.table,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
-            cte_explicit_columns: cte_definition.explicit_columns.clone(),
-            cte_id: Some(cte_definition.cte_id),
-            cte_definition_only: true,
-            rowid_referenced: false,
-            outer_join_may_null_extend: false,
-            scope_depth: 0,
-        });
-    }
-
-    Ok(())
+    add_ctes_read_by_subqueries_as_outer_refs(
+        &cte_definitions,
+        subquery_table_refs,
+        resolver,
+        program,
+        table_references,
+        connection,
+    )
 }
 
 fn parse_from_clause_table(
@@ -1608,7 +1608,13 @@ fn parse_from_clause_table(
                 table_references.outer_query_refs(),
                 cte_definitions,
             );
+            let mut subquery_table_refs = Vec::new();
+            collect_from_clause_table_refs(&subselect, &mut subquery_table_refs);
+            let ctes_read = ctes_read_by(cte_definitions, &subquery_table_refs);
             for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
+                if !ctes_read[cte_definition_index] {
+                    continue;
+                }
                 let name_used_by_table_on_the_left = outer_query_refs_for_subquery
                     .iter()
                     .any(|reference| reference.identifier == cte_definition.name);
@@ -2392,7 +2398,7 @@ pub fn parse_from(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     with: Option<With>,
-    preplan_ctes_for_non_from_subqueries: bool,
+    table_refs_outside_from: &[String],
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
@@ -2413,40 +2419,14 @@ pub fn parse_from(
             .collect::<Vec<_>>();
         shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
-        if preplan_ctes_for_non_from_subqueries {
-            // Make these CTE names available to subqueries outside the FROM clause.
-            let base_outer_query_refs = base_outer_refs_for_cte_planning(
-                table_references.outer_query_refs(),
-                &cte_definitions,
-            );
-            for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-                let cte_table = plan_cte(
-                    cte_definition_index,
-                    &cte_definitions,
-                    &base_outer_query_refs,
-                    resolver,
-                    program,
-                    connection,
-                    false,
-                )?;
-                table_references.add_outer_query_reference(OuterQueryReference {
-                    identifier: cte_definition.name.clone(),
-                    internal_id: cte_table.internal_id,
-                    table: cte_table.table,
-                    join_info: None,
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: (!cte_definition.references_itself)
-                        .then(|| cte_definition.select.clone()),
-                    cte_explicit_columns: cte_definition.explicit_columns.clone(),
-                    cte_id: Some(cte_definition.cte_id),
-                    // This entry only lets a nested FROM clause find the CTE name.
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    outer_join_may_null_extend: false,
-                    scope_depth: 0,
-                });
-            }
-        }
+        add_ctes_read_by_subqueries_as_outer_refs(
+            &cte_definitions,
+            table_refs_outside_from,
+            resolver,
+            program,
+            table_references,
+            connection,
+        )?;
     }
 
     // Process FROM clause if present
@@ -2491,6 +2471,72 @@ pub fn parse_from(
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
     Ok(())
+}
+
+/// Plans the CTEs that subqueries read and adds them as outer query references.
+/// Like SQLite, a CTE that nothing reads is never planned, so errors in its body
+/// are not reported.
+fn add_ctes_read_by_subqueries_as_outer_refs(
+    cte_definitions: &[CteDefinition],
+    subquery_table_refs: &[String],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let base_outer_query_refs =
+        base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
+    let ctes_read = ctes_read_by(cte_definitions, subquery_table_refs);
+    for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
+        if !ctes_read[cte_definition_index] {
+            continue;
+        }
+        let joined_table = plan_cte(
+            cte_definition_index,
+            cte_definitions,
+            &base_outer_query_refs,
+            resolver,
+            program,
+            connection,
+            false,
+        )?;
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: cte_definition.name.clone(),
+            internal_id: joined_table.internal_id,
+            table: joined_table.table,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
+            cte_explicit_columns: cte_definition.explicit_columns.clone(),
+            cte_id: Some(cte_definition.cte_id),
+            // This entry only lets a nested FROM clause find the CTE name.
+            cte_definition_only: true,
+            rowid_referenced: false,
+            outer_join_may_null_extend: false,
+            scope_depth: 0,
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns, for each CTE, whether a query that reads the tables named in
+/// `table_refs` reads it, either directly or through another CTE.
+fn ctes_read_by(cte_definitions: &[CteDefinition], table_refs: &[String]) -> Vec<bool> {
+    let mut read = vec![false; cte_definitions.len()];
+    let mut pending: Vec<usize> = cte_definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| table_refs.contains(&definition.name))
+        .map(|(index, _)| index)
+        .collect();
+    while let Some(index) = pending.pop() {
+        if !read[index] {
+            read[index] = true;
+            pending.extend_from_slice(&cte_definitions[index].referenced_cte_indices);
+        }
+    }
+    read
 }
 
 fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {

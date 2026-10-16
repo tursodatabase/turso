@@ -1028,10 +1028,144 @@ test cte-unreferenced-qualified-column-orderby-exists {
     CREATE TABLE t(a);
     WITH cte AS (SELECT 1 y)
     SELECT cte.y FROM t
-    ORDER BY EXISTS (SELECT 1);
+    ORDER BY EXISTS (SELECT 1 FROM cte);
 }
 expect error {
     no such column: cte\.y
+}
+
+# A CTE that nothing reads is never resolved, so errors in its body are not
+# reported, even when the statement has subqueries.
+setup cte_unused_with_errors {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-scalar-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-in-subquery {
+    WITH x AS (SELECT * FROM nosuchtab) SELECT a FROM t WHERE a IN (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-order-by-limit-having-subqueries {
+    WITH x AS (SELECT nosuch FROM t) SELECT a FROM t ORDER BY (SELECT 1);
+    WITH x AS (SELECT nosuch FROM t) SELECT a FROM t LIMIT (SELECT 1);
+    WITH x AS (SELECT nosuch FROM t) SELECT count(*) FROM t HAVING (SELECT 1);
+}
+expect {
+    1
+    1
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-from-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT * FROM t, (SELECT 2);
+}
+expect {
+    1|2
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-values-subquery {
+    WITH x AS (SELECT nosuch FROM t) VALUES ((SELECT 3));
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-nested-with {
+    SELECT (WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 3));
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-read-only-by-another-unused-cte {
+    WITH x AS (SELECT nosuch FROM t), y AS (SELECT * FROM x) SELECT (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-update {
+    WITH x AS (SELECT nosuch FROM t) UPDATE t SET a = (SELECT 2);
+    WITH x AS (SELECT nosuch FROM t) UPDATE t SET a = a + 1;
+    SELECT a FROM t;
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-insert {
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t SELECT (SELECT 5);
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t VALUES (6);
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t VALUES (7) RETURNING (SELECT 8);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    8
+    1
+    5
+    6
+    7
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-delete {
+    WITH x AS (SELECT nosuch FROM t) DELETE FROM t WHERE a IN (SELECT 7);
+    WITH x AS (SELECT nosuch FROM t) DELETE FROM t WHERE a = 7;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-view {
+    CREATE VIEW v AS WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1) AS c;
+    SELECT c FROM v;
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-used-with-errors-in-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1 FROM x);
+}
+expect error {
+    no such column: nosuch
+}
+
+# A CTE read through another CTE, a nested WITH, or a WINDOW clause subquery is
+# still visible.
+test cte-read-by-subqueries-through-other-ctes {
+    WITH x AS (SELECT 1 a), y AS (SELECT a FROM x) SELECT (SELECT a FROM y);
+    WITH x AS (SELECT 2 a) SELECT (WITH z AS (SELECT a FROM x) SELECT a FROM z);
+    WITH x AS (SELECT 3 a), y AS (SELECT (WITH z AS (SELECT a FROM x) SELECT a FROM z) b) SELECT * FROM y;
+    WITH x AS (SELECT 4 a) SELECT sum(a) OVER w FROM x WINDOW w AS (ORDER BY (SELECT a FROM x));
+}
+expect {
+    1
+    2
+    3
+    4
 }
 
 @cross-check-integrity

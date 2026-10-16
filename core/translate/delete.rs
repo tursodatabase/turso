@@ -7,7 +7,9 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{
+    collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
+};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -223,7 +225,23 @@ pub fn prepare_delete_plan(
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
     // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+    let mut subquery_table_refs = Vec::new();
+    if let Some(where_clause) = &where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut subquery_table_refs);
+    }
+    for column in &returning {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+        }
+    }
+    plan_ctes_as_outer_refs(
+        with,
+        &subquery_table_refs,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
 
     let mut where_predicates = vec![];
 
