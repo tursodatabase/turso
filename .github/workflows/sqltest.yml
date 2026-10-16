@@ -70,9 +70,9 @@ jobs:
       - name: Build test runner
         run: make -C sqlite/conformance build-runner
       - name: Run tests
-        run: make -C sqlite/conformance run-rust
+        run: CI=1 make -C sqlite/conformance run-rust
       - name: Run tests (MVCC)
-        run: make -C sqlite/conformance run-rust MVCC=1
+        run: CI=1 make -C sqlite/conformance run-rust MVCC=1
 
   sqltest-js:
     name: Run SQL tests (JS backend, ${{ matrix.mode }})
