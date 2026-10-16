@@ -2339,10 +2339,11 @@ fn emit_update_insns<'a>(
             let cdc_before_reg = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                ))
+                )?)
             } else {
                 None
             };
