@@ -4037,23 +4037,20 @@ pub fn validate_frame_clause(
         exclude,
     } = clause;
 
-    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
-    let end_bound = match end {
-        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
-        // No END clause means CURRENT ROW per SQL standard.
-        None => FrameBoundary::CurrentRow,
-    };
+    let start_bound = start.clone();
+    // No END clause means CURRENT ROW per SQL standard.
+    let end_bound = end.clone().unwrap_or(FrameBound::CurrentRow);
 
     // Combinations that can never describe a real frame (start past
     // the end, etc.). SQLite rejects the same set at
     // `window.c:1217-1221`.
     let illegal = matches!(
         (&start_bound, &end_bound),
-        (FrameBoundary::UnboundedFollowing, _)
-            | (_, FrameBoundary::UnboundedPreceding)
-            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+        (FrameBound::UnboundedFollowing, _)
+            | (_, FrameBound::UnboundedPreceding)
+            | (FrameBound::CurrentRow, FrameBound::Preceding(_))
+            | (FrameBound::Following(_), FrameBound::Preceding(_))
+            | (FrameBound::Following(_), FrameBound::CurrentRow)
     );
     if illegal {
         crate::bail_parse_error!("unsupported frame specification");
@@ -4065,10 +4062,10 @@ pub fn validate_frame_clause(
     if *mode == FrameMode::Range
         && (matches!(
             &start_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+            FrameBound::Preceding(_) | FrameBound::Following(_)
         ) || matches!(
             &end_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+            FrameBound::Preceding(_) | FrameBound::Following(_)
         ))
         && order_by_len != 1
     {
@@ -4083,35 +4080,6 @@ pub fn validate_frame_clause(
         end: end_bound,
         exclude: exclude.clone(),
     }))
-}
-
-/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
-/// cloning any offset expression out of the AST for the emit code to
-/// evaluate.
-fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
-    // The parser enforces start/end orientation: TK_PRECEDING is only
-    // emitted as a start bound, TK_FOLLOWING only as an end bound
-    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
-    // SQLite's parser-level guarantee at window.c:1213-1215.
-    match bound {
-        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
-        FrameBound::UnboundedPreceding => {
-            debug_assert!(
-                is_start,
-                "parser only emits UNBOUNDED PRECEDING as a start bound"
-            );
-            Ok(FrameBoundary::UnboundedPreceding)
-        }
-        FrameBound::UnboundedFollowing => {
-            debug_assert!(
-                !is_start,
-                "parser only emits UNBOUNDED FOLLOWING as an end bound"
-            );
-            Ok(FrameBoundary::UnboundedFollowing)
-        }
-        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
-        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
-    }
 }
 
 /// A named WINDOW clause definition, captured before any function references
@@ -4145,16 +4113,6 @@ pub struct NamedWindowBound {
     pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
 }
 
-/// One bound of a window function's effective frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameBoundary {
-    UnboundedPreceding,
-    Preceding(Box<Expr>),
-    CurrentRow,
-    Following(Box<Expr>),
-    UnboundedFollowing,
-}
-
 /// A window function's effective frame. The bounds are interpreted per `mode`:
 /// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
 /// the window's ORDER BY values.
@@ -4163,8 +4121,8 @@ pub enum FrameBoundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub mode: ast::FrameMode,
-    pub start: FrameBoundary,
-    pub end: FrameBoundary,
+    pub start: FrameBound,
+    pub end: FrameBound,
     /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
@@ -4180,8 +4138,8 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             mode: ast::FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
             exclude: None,
         }
     }

@@ -588,8 +588,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
+        use crate::translate::plan::Frame;
+        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -598,40 +598,40 @@ impl WindowFunc {
             // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                start: FrameBound::Following(Box::new(Expr::Literal(Literal::Numeric(
                     "1".to_string(),
                 )))),
-                end: FrameBoundary::UnboundedFollowing,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
