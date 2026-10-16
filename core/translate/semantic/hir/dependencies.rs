@@ -216,6 +216,46 @@ impl HirDocument {
         dependencies
     }
 
+    /// Whether every use of `child` in its parent query only asks whether
+    /// rows exist or match, as EXISTS and IN do, so the order its rows come
+    /// in cannot change the answer.
+    pub(crate) fn subquery_uses_ignore_row_order(&self, child: QueryId) -> bool {
+        let Some(parent) = self
+            .query(child)
+            .and_then(|query| query.parent)
+            .and_then(|parent| self.query(parent))
+        else {
+            return false;
+        };
+        let mut found = false;
+        let mut ignores_order = true;
+        visit_query_parts(self, parent, &mut |part| {
+            let QueryPart::Expression(expression) = part else {
+                return;
+            };
+            expression.for_each(&mut |expression| {
+                let Expr::Subquery(subquery) = expression else {
+                    return;
+                };
+                match subquery {
+                    SubqueryExpr::In { query, .. } | SubqueryExpr::Exists(query)
+                        if *query == child =>
+                    {
+                        found = true;
+                    }
+                    SubqueryExpr::Scalar { query, .. } | SubqueryExpr::Row { query }
+                        if *query == child =>
+                    {
+                        found = true;
+                        ignores_order = false;
+                    }
+                    _ => {}
+                }
+            });
+        });
+        found && ignores_order
+    }
+
     /// Visit every source needed to evaluate one expression in its owning
     /// query. Output references follow their resolved expression; subqueries
     /// contribute their validated outer captures rather than their local

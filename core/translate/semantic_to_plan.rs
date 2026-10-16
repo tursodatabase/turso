@@ -26,6 +26,49 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+/// Whether a query's result is the same whatever order its rows are read
+/// in: one ungrouped aggregate block whose aggregates are all count, sum,
+/// total, avg, min or max.
+fn query_ignores_row_order(query: &hir::Query) -> bool {
+    use crate::function::{AggFunc, Func};
+    let [block] = query.blocks.as_slice() else {
+        return false;
+    };
+    if block.aggregate_count == 0
+        || block.window_function_count != 0
+        || !matches!(
+            &block.body,
+            hir::QueryBlockBody::Select { grouping: None, .. }
+        )
+    {
+        return false;
+    }
+    let mut ignores_order = true;
+    for output in &block.outputs {
+        output.expr.for_each(&mut |expression| {
+            let hir::Expr::Function(call) = expression else {
+                return;
+            };
+            if !matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) {
+                return;
+            }
+            ignores_order &= matches!(
+                call.function.value(),
+                Func::Agg(
+                    AggFunc::Count
+                        | AggFunc::Count0
+                        | AggFunc::Sum
+                        | AggFunc::Total
+                        | AggFunc::Avg
+                        | AggFunc::Min
+                        | AggFunc::Max
+                )
+            );
+        });
+    }
+    ignores_order
+}
+
 /// For a block that is `SELECT min(x) FROM t` or `SELECT max(x) FROM t`
 /// with nothing else, the order that puts the answer first: x ascending for
 /// MIN and descending for MAX. Like legacy and SQLite, a scan in that order
@@ -677,12 +720,24 @@ impl<'a> HirPlanContext<'a> {
 
     /// How many times a query runs: once, or for a correlated subquery,
     /// about once per row of the largest outer table it reads.
+    ///
+    /// Planning for many runs lets the subquery build an automatic index
+    /// once. It is only used where that index cannot change the answer: a
+    /// statement that writes tables could change them between runs, and an
+    /// index returns rows sharing a key in a different order than the table,
+    /// which matters to `group_concat` or to a scalar subquery's first row.
     fn correlated_runs(
         &self,
         query: &hir::Query,
         schema: &Schema,
         params: &CostModelParams,
     ) -> f64 {
+        if !matches!(self.document.root, hir::HirRoot::Query(_))
+            || !(self.document.subquery_uses_ignore_row_order(query.id)
+                || query_ignores_row_order(query))
+        {
+            return 1.0;
+        }
         query
             .captures
             .iter()
