@@ -1272,27 +1272,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like SQLite, the type name keeps the source text from its first word to
+    /// its last one, comments and quotes included: both affect the affinity.
     fn parse_type(&mut self) -> Result<Option<Type>> {
-        let mut type_name = if let Some(tok) = self.peek()? {
-            match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING => {
-                    let tok = eat_assert!(self, TK_ID, TK_STRING);
-                    from_bytes(tok.as_bytes())
-                }
-                TK_LBRACKET if !self.peeked_empty_brackets() => {
-                    self.parse_bracket_quoted_name()?.as_str().to_owned()
-                }
-                _ => return Ok(None),
-            }
-        } else {
+        let Some(token_type) = self.peek()?.map(|tok| tok.token_type) else {
             return Ok(None);
         };
+        let start = self.offset();
+        let first_word = match token_type.fallback_id_if_ok() {
+            TK_ID | TK_STRING => {
+                let tok = eat_assert!(self, TK_ID, TK_STRING);
+                from_bytes(tok.as_bytes())
+            }
+            TK_LBRACKET if !self.peeked_empty_brackets() => {
+                self.parse_bracket_quoted_name()?.as_str().to_owned()
+            }
+            _ => return Ok(None),
+        };
+        let mut end = self.offset();
 
         // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
         // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
         // In column definitions and CAST expressions, reject them.
-        let is_struct = type_name.eq_ignore_ascii_case("STRUCT");
-        let is_union = type_name.eq_ignore_ascii_case("UNION");
+        let is_struct = first_word.eq_ignore_ascii_case("STRUCT");
+        let is_union = first_word.eq_ignore_ascii_case("UNION");
         if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
             if self.type_nesting_depth == 0 {
                 return Err(Error::ParseError(
@@ -1309,18 +1312,16 @@ impl<'a> Parser<'a> {
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
                 TK_ID | TK_STRING => {
-                    let tok = eat_assert!(self, TK_ID, TK_STRING);
-                    type_name.push(' ');
-                    type_name.push_str(from_bytes_as_str(tok.value));
+                    eat_assert!(self, TK_ID, TK_STRING);
                 }
                 TK_LBRACKET if !self.peeked_empty_brackets() => {
-                    let name = self.parse_bracket_quoted_name()?;
-                    type_name.push(' ');
-                    type_name.push_str(name.as_str());
+                    self.parse_bracket_quoted_name()?;
                 }
                 _ => break,
             }
+            end = self.offset();
         }
+        let type_name = from_bytes(&self.lexer.input[start..end]);
 
         let size = if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LP {

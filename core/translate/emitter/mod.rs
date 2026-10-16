@@ -2326,7 +2326,7 @@ fn emit_check_constraint_bytecode(
         // expression's source text exactly as the user wrote it.
         let constraint_name = match (&check_constraint.name, &check_constraint.source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{}", check_constraint.expr),
         };
 

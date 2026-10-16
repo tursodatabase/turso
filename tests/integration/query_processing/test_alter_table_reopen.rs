@@ -348,3 +348,125 @@ fn test_alter_table_add_column_preserves_unique_constraint_desc_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// ALTER TABLE rewrites the schema from the table metadata. Type names must be
+/// written as the user wrote them: the dequoted declared type of `[x] INT` is
+/// `x] IN`, which is not valid SQL.
+#[test]
+fn test_alter_table_keeps_type_names_as_written_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_table_type_names_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t (z, e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\")",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE t DROP COLUMN z").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN f \"c\"\"d\" TEXT")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(
+            schema,
+            vec![(
+                "CREATE TABLE t (e [x] INT, d \"a\"\"b\" INT, b \"BLOB\" INTEGER, a BLOB/*INT*/REAL, g \"\", f \"c\"\"d\" TEXT)"
+                    .to_string(),
+            )]
+        );
+
+        let declared_types: Vec<(String,)> =
+            conn.exec_rows("SELECT type FROM pragma_table_info('t')");
+        assert_eq!(
+            declared_types,
+            vec![
+                ("x] IN".to_string(),),
+                ("a\"b".to_string(),),
+                ("BLOB".to_string(),),
+                ("BLOB/*INT*/REAL".to_string(),),
+                ("".to_string(),),
+                ("c\"d".to_string(),),
+            ]
+        );
+
+        conn.execute("INSERT INTO t (g) VALUES ('12')").unwrap();
+        let stored_types: Vec<(String,)> = conn.exec_rows("SELECT typeof(g) FROM t");
+        assert_eq!(stored_types, vec![("integer".to_string(),)]);
+        conn.close().unwrap();
+    }
+}
+
+/// Older Turso versions kept the quotes in `a "INTEGER" PRIMARY KEY`, so the
+/// column was not a rowid alias and the table got an automatic index for the
+/// primary key. Such a database must still open, and `a` must keep its stored
+/// values instead of reading the rowid.
+#[test]
+fn test_quoted_integer_primary_key_with_automatic_index_reopen() {
+    let quoted_types = ["\"INTEGER\"", "'INTEGER'", "`INTEGER`"];
+    let column_constraints = ["PRIMARY KEY", "PRIMARY KEY UNIQUE"];
+    for (quoted_type, constraints) in quoted_types
+        .into_iter()
+        .flat_map(|t| column_constraints.map(|c| (t, c)))
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("quoted_integer_primary_key.db");
+
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(&format!(
+                "CREATE TABLE t(a INT {constraints}, b TEXT);
+                 INSERT INTO t VALUES (10, 'x'), (20, 'y');
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a {} {constraints}, b TEXT)'
+                  WHERE name = 't';",
+                quoted_type.replace('\'', "''")
+            ))
+            .unwrap();
+        drop(sqlite);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT rowid, a, b FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1, 10, "x".into()), (2, 20, "y".into())]);
+
+        assert!(conn.execute("INSERT INTO t VALUES (10, 'z')").is_err());
+        conn.execute("INSERT INTO t VALUES (30, 'z')").unwrap();
+
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t WHERE a = 30");
+        assert_eq!(rows, vec![(30, "z".into())]);
+
+        conn.execute("ALTER TABLE t ADD COLUMN c").unwrap();
+        conn.execute("INSERT INTO t VALUES (40, 'w', 1)").unwrap();
+        conn.close().unwrap();
+        drop(db);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT rowid, a, b FROM t ORDER BY a");
+        assert_eq!(
+            rows,
+            vec![
+                (1, 10, "x".into()),
+                (2, 20, "y".into()),
+                (3, 30, "z".into()),
+                (4, 40, "w".into()),
+            ]
+        );
+        assert!(conn.execute("INSERT INTO t VALUES (40, 'v', 2)").is_err());
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        conn.close().unwrap();
+    }
+}

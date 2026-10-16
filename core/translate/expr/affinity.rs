@@ -70,7 +70,7 @@ pub(crate) fn get_expr_affinity(
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                Affinity::affinity(&type_name.name)
+                Affinity::of_written_type(&crate::util::dequote(&type_name.name))
             } else {
                 Affinity::None
             }
