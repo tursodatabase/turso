@@ -946,3 +946,36 @@ fn hir_not_in_checks_the_subquery_for_null_once() {
     // One Next for the scan of a and one for building the subquery index.
     assert_eq!(nexts, 2, "{program:?}");
 }
+
+#[test]
+fn hir_lifts_conjuncts_every_or_branch_shares() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    // Like legacy, `value = 20` is in both branches, so it is a WHERE term
+    // of its own and can seek the index on value.
+    let sql = "SELECT id FROM items \
+               WHERE (value = 20 AND extra = 'a') OR (value = 20 AND extra = 'b') \
+               ORDER BY id";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail))
+                if detail.starts_with("SEARCH items USING INDEX items_value (value=?)")
+        )),
+        "{plan:?}"
+    );
+    for sql in [
+        sql,
+        "SELECT id FROM items WHERE value = 20 OR (value = 20 AND extra = 'b') ORDER BY id",
+        "SELECT id FROM items WHERE (value > 10 AND extra = 'a') OR (extra = 'a' AND id = 3) \
+         OR (extra = 'a' AND value IS NULL) ORDER BY id",
+        "SELECT id FROM items WHERE (value = 20 AND extra = 'a') OR (value = 30) ORDER BY id",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

@@ -1928,6 +1928,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
+    or_union: bool,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.is_empty() {
         return Ok(None);
@@ -1974,6 +1975,7 @@ pub(crate) fn compute_hir_greedy_join_order(
             schema,
             analyze_stats,
             params,
+            or_union,
         )?;
         if first.is_some() {
             break;
@@ -2059,6 +2061,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 schema,
                 analyze_stats,
                 params,
+                or_union,
             )?
             else {
                 continue;
@@ -2134,6 +2137,7 @@ fn hir_join_step(
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
+    or_union: bool,
 ) -> Result<Option<HirJoinStep>> {
     let source = &sources[source_position];
     let mut joined_mask = lhs_mask.try_clone()?;
@@ -2151,24 +2155,57 @@ fn hir_join_step(
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
     let mut access_method = match source {
         HirPlanSource::BTree(source) => match &source.table {
-            Table::BTree(_) => choose_single_btree_access_method(
-                &HirAccessSource::new(
-                    source,
-                    document
-                        .source(source.internal_id)
-                        .expect("validated HIR contains referenced source"),
-                ),
-                &constraints[source_position],
-                lhs_mask,
-                source_position,
-                order_target,
-                &ready_where,
-                schema,
-                analyze_stats,
-                input_cardinality,
-                base_row_count,
-                params,
-            )?,
+            Table::BTree(_) => {
+                let mut method = choose_single_btree_access_method(
+                    &HirAccessSource::new(
+                        source,
+                        document
+                            .source(source.internal_id)
+                            .expect("validated HIR contains referenced source"),
+                    ),
+                    &constraints[source_position],
+                    lhs_mask,
+                    source_position,
+                    order_target,
+                    &ready_where,
+                    schema,
+                    analyze_stats,
+                    input_cardinality,
+                    base_row_count,
+                    params,
+                )?;
+                // A scan may later become one seek per branch of an OR term,
+                // so the join order weighs that union's cost, as legacy
+                // weighs its multi-index OR.
+                let scans = matches!(
+                    &method.params,
+                    AccessMethodParams::BTreeTable {
+                        build_index: false,
+                        constraint_refs,
+                        ..
+                    } if constraint_refs.is_empty()
+                );
+                if or_union && scans {
+                    if let Some((_, union_cost, union_rows)) = super::hir_or_union_with_cost(
+                        document,
+                        layout,
+                        source,
+                        source_position,
+                        where_clause,
+                        lhs_mask,
+                        base_row_count,
+                        schema,
+                        params,
+                    )? {
+                        let union_cost = Cost(union_cost.0 * input_cardinality);
+                        if union_cost.0 < method.cost.0 {
+                            method.cost = union_cost;
+                            method.estimated_rows_per_outer_row = union_rows;
+                        }
+                    }
+                }
+                method
+            }
             Table::Virtual(vtab) => {
                 // The virtual table cannot be read after these tables, for
                 // example when an argument it needs reads a later table.
@@ -3254,6 +3291,7 @@ mod tests {
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
+            false,
         )?
         .expect("a B-tree source always has a join step");
 
@@ -3355,6 +3393,7 @@ mod tests {
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
+            false,
         )?
         .expect("three HIR sources produce a join plan");
 

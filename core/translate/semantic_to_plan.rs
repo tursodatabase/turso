@@ -1618,6 +1618,7 @@ impl<'a> HirPlanContext<'a> {
             schema,
             &schema.analyze_stats,
             params,
+            or_union,
         )?;
 
         let Some(result) = result else {

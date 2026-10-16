@@ -323,15 +323,132 @@ impl PredicateExpr for crate::translate::semantic::hir::Expr {
     }
 }
 
-/// The conjuncts of an HIR predicate for planning. Like legacy and SQLite,
-/// `x BETWEEN a AND b` on a column becomes `x >= a` and `x <= b`, so each
-/// bound can drive an index seek and be consumed on its own.
+/// The conjuncts of an HIR predicate for planning, rewritten like legacy so
+/// that each can drive an index seek and be consumed on its own:
+///
+/// - `x BETWEEN a AND b` on a column becomes `x >= a` and `x <= b`, as
+///   SQLite also does;
+/// - a conjunct every branch of an OR has is lifted out of it:
+///   `(x = 1 AND a) OR (x = 1 AND b)` becomes `x = 1` and `a OR b`, and
+///   `x = 1 OR (x = 1 AND b)` becomes `x = 1`.
 pub(crate) fn hir_planning_conjuncts(
     expression: &crate::translate::semantic::hir::Expr,
 ) -> Vec<crate::translate::semantic::hir::Expr> {
-    use crate::translate::semantic::hir::Expr;
-    let mut conjuncts = Vec::new();
+    let mut lifted = Vec::new();
     for conjunct in expression.conjuncts() {
+        match lift_or_common_conjuncts(conjunct) {
+            Some((common, rest)) => {
+                lifted.extend(common);
+                lifted.extend(rest);
+            }
+            None => lifted.push(conjunct.clone()),
+        }
+    }
+    let mut conjuncts = Vec::with_capacity(lifted.len());
+    for conjunct in &lifted {
+        split_column_between(conjunct, &mut conjuncts);
+    }
+    conjuncts
+}
+
+fn hir_operands<'a>(
+    expression: &'a crate::translate::semantic::hir::Expr,
+    operator: ast::Operator,
+    operands: &mut Vec<&'a crate::translate::semantic::hir::Expr>,
+) {
+    use crate::translate::semantic::hir::Expr;
+    match expression {
+        Expr::Binary {
+            lhs,
+            operator: found,
+            rhs,
+            custom: None,
+            ..
+        } if *found == operator => {
+            hir_operands(lhs, operator, operands);
+            hir_operands(rhs, operator, operands);
+        }
+        _ => operands.push(expression),
+    }
+}
+
+fn hir_chain(
+    mut operands: Vec<crate::translate::semantic::hir::Expr>,
+    operator: ast::Operator,
+) -> crate::translate::semantic::hir::Expr {
+    use crate::translate::semantic::hir::Expr;
+    let first = operands.remove(0);
+    operands.into_iter().fold(first, |lhs, rhs| Expr::Binary {
+        lhs: Box::new(lhs),
+        operator,
+        rhs: Box::new(rhs),
+        array_concat: false,
+        custom: None,
+        comparison: None,
+    })
+}
+
+/// The conjuncts every branch of an OR shares, and the OR without them, or
+/// none when it is no longer needed. `None` when nothing is shared.
+#[allow(clippy::type_complexity)]
+fn lift_or_common_conjuncts(
+    expression: &crate::translate::semantic::hir::Expr,
+) -> Option<(
+    Vec<crate::translate::semantic::hir::Expr>,
+    Option<crate::translate::semantic::hir::Expr>,
+)> {
+    let mut disjuncts = Vec::new();
+    hir_operands(expression, ast::Operator::Or, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return None;
+    }
+    let branches = disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            let mut conjuncts = Vec::new();
+            hir_operands(disjunct, ast::Operator::And, &mut conjuncts);
+            conjuncts
+        })
+        .collect::<Vec<_>>();
+    let mut common: Vec<&crate::translate::semantic::hir::Expr> = Vec::new();
+    for candidate in &branches[0] {
+        if !common.iter().any(|found| found.equivalent(candidate))
+            && branches[1..]
+                .iter()
+                .all(|branch| branch.iter().any(|other| other.equivalent(candidate)))
+        {
+            common.push(candidate);
+        }
+    }
+    if common.is_empty() {
+        return None;
+    }
+    let mut rest = Vec::with_capacity(branches.len());
+    for branch in &branches {
+        let remaining = branch
+            .iter()
+            .filter(|conjunct| !common.iter().any(|found| found.equivalent(conjunct)))
+            .map(|conjunct| (*conjunct).clone())
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            // One branch is the shared conjuncts alone, so the OR adds
+            // nothing to them.
+            return Some((common.into_iter().cloned().collect(), None));
+        }
+        rest.push(hir_chain(remaining, ast::Operator::And));
+    }
+    Some((
+        common.into_iter().cloned().collect(),
+        Some(hir_chain(rest, ast::Operator::Or)),
+    ))
+}
+
+fn split_column_between(
+    conjunct: &crate::translate::semantic::hir::Expr,
+    conjuncts: &mut Vec<crate::translate::semantic::hir::Expr>,
+) {
+    use crate::translate::semantic::hir::Expr;
+    {
         match conjunct {
             Expr::Between {
                 expr,
@@ -358,7 +475,6 @@ pub(crate) fn hir_planning_conjuncts(
             conjunct => conjuncts.push(conjunct.clone()),
         }
     }
-    conjuncts
 }
 
 impl From<ast::Expr> for PredicateTerm<ast::Expr, TableInternalId> {

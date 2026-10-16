@@ -3461,6 +3461,35 @@ pub(crate) fn plan_hir_or_union(
     schema: &Schema,
     params: &cost_params::CostModelParams,
 ) -> Result<Option<HirOrUnion>> {
+    Ok(hir_or_union_with_cost(
+        document,
+        layout,
+        source,
+        source_position,
+        predicates,
+        prior_sources,
+        base_row_count,
+        schema,
+        params,
+    )?
+    .map(|(union, _, _)| union))
+}
+
+/// The OR union [plan_hir_or_union] would choose after `prior_sources`,
+/// with its cost and rows for one outer row, so join ordering can weigh it
+/// against a scan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hir_or_union_with_cost(
+    document: &hir::HirDocument,
+    layout: &crate::translate::plan::HirFromLayout<'_>,
+    source: &HirPlannedSource,
+    source_position: usize,
+    predicates: &[HirWhereTerm],
+    prior_sources: &TableMask,
+    base_row_count: RowCountEstimate,
+    schema: &Schema,
+    params: &cost_params::CostModelParams,
+) -> Result<Option<(HirOrUnion, Cost, f64)>> {
     // An outer join's right side has rows the seeks would not produce.
     if source.join_info.as_ref().is_some_and(|join| {
         matches!(
@@ -3588,7 +3617,7 @@ pub(crate) fn plan_hir_or_union(
         // in the table.
         let union_cost = union_cost + Cost(union_rows * 2.0 * params.cpu_cost_per_seek);
         if union_cost.0 < scan_cost.0 {
-            return Ok(Some(HirOrUnion { branches }));
+            return Ok(Some((HirOrUnion { branches }, union_cost, union_rows)));
         }
     }
     Ok(None)
