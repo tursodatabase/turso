@@ -1225,6 +1225,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         )
                         .and_then(|resolved| {
                             reject_aliased_aggregates(&resolved.expr, block, outputs)
+                        })
+                        .and_then(|()| {
+                            // SQLite moves window functions out of the ORDER
+                            // BY before dropping it, so their arguments keep
+                            // every check.
+                            for call in window_calls(&syntax.expr)? {
+                                self.analyze_query_expr(
+                                    call,
+                                    &order_scope,
+                                    policies.order_by(aggregate_query),
+                                    functions,
+                                )?;
+                            }
+                            Ok(())
                         }),
                     Err(error) => Err(error),
                 };
@@ -1769,6 +1783,24 @@ pub(super) fn compound_order_by_position<'syntax>(
 
 /// Whether analyzing `term` could record a subquery or a parameter in the
 /// document. Unknown shapes count as yes.
+/// The window function calls in an expression, outside its subqueries.
+fn window_calls(expression: &ast::Expr) -> Result<Vec<&ast::Expr>> {
+    let mut calls = Vec::new();
+    crate::translate::expr::walk_expr(expression, &mut |expression| {
+        let over = match expression {
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. } => &filter_over.over_clause,
+            _ => return Ok(crate::translate::expr::WalkControl::Continue),
+        };
+        if over.is_none() {
+            return Ok(crate::translate::expr::WalkControl::Continue);
+        }
+        calls.push(expression);
+        Ok(crate::translate::expr::WalkControl::SkipChildren)
+    })?;
+    Ok(calls)
+}
+
 fn term_may_record_state(term: &ast::Expr) -> bool {
     let mut pending = vec![term];
     while let Some(term) = pending.pop() {
@@ -10534,6 +10566,13 @@ mod tests {
             ),
             (
                 "SELECT count(id) FROM items GROUP BY value ORDER BY (1, 2)",
+                "Parse error: row value misused",
+            ),
+            // SQLite moves window functions out before dropping the ORDER BY,
+            // so their arguments are still checked.
+            (
+                "SELECT count(id) FROM items \
+                 ORDER BY sum(CASE WHEN score THEN 1 ELSE (1, 1) END) OVER ()",
                 "Parse error: row value misused",
             ),
         ] {
