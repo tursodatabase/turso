@@ -207,7 +207,7 @@ export interface CursorResponse {
 }
 
 export interface CursorEntry {
-  type: 'step_begin' | 'step_end' | 'step_error' | 'row' | 'error';
+  type: 'step_begin' | 'step_end' | 'step_error' | 'row' | 'error' | 'replication_index';
   step?: number;
   cols?: Column[];
   row?: Value[];
@@ -370,7 +370,7 @@ export async function executeCursor(
 
       // Continue reading from the stream
       while (true) {
-        let readResult: ReadableStreamReadResult<Uint8Array>;
+        let readResult: Awaited<ReturnType<NonNullable<typeof reader>['read']>>;
         try {
           readResult = await reader!.read();
         } catch (error) {
