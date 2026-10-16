@@ -118,7 +118,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
 #[inline]
-const fn normalized_f64_bits(f: f64) -> u64 {
+pub(crate) const fn normalized_f64_bits(f: f64) -> u64 {
     if f == 0.0 {
         0.0f64.to_bits()
     } else {
