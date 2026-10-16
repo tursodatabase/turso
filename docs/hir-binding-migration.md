@@ -213,8 +213,8 @@ during analysis.
 EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
 legacy does, so simple plans print the same rows with the same ids. Plans
 still differ where the bytecode differs: legacy runs uncorrelated subqueries
-before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
-joins, which HIR does not.
+before the loops, turns EXISTS into semi-joins, and uses hash joins in more
+places than HIR.
 
 Like legacy, a LEFT JOIN outside parentheses whose NULL row a WHERE term
 rejects (a comparison or arithmetic on one of its columns, but not IS,
@@ -231,6 +231,41 @@ legacy, this is decided after the join order, not while choosing it, so it
 may pick a different table of a join than legacy does; the OR term stays in
 WHERE and is checked again on each row. It is used only in SELECT, not yet
 in DELETE or UPDATE loops, and never on the right side of an outer join.
+
+Legacy speeds up correlated subqueries and joins without an index by
+rewriting the plan. HIR gets the same speed without rewriting HIR:
+
+- A correlated subquery that only asks whether rows match (IN, EXISTS, or an
+  order-insensitive aggregate) in a SELECT statement is planned for one run
+  per outer row, so it builds an automatic index once and seeks it each run.
+- A correlated `x IN (SELECT y ...)` that is a whole WHERE term runs like
+  `EXISTS (SELECT ... AND x = y)`: the planner adds `x = y` to the
+  subquery's WHERE terms, so it stops at the first match and can seek `y`.
+  Legacy turns it into a semi-join. Neither is used when an expression of
+  the subquery or `x` can fail, since the probe stops early.
+- A correlated ungrouped aggregate in a SELECT statement caches its result
+  in an ephemeral index keyed by the outer values it reads (each with its
+  `typeof()`), so each key is computed once. Legacy groups the whole inner
+  table first; the cache never computes a key no outer row asks for, so it
+  is used for every built-in aggregate. It is not used when the subquery
+  reads an outer aggregate, calls a function that is not deterministic, or
+  reads a virtual table.
+- An inner join on an equality no index covers looks rows up in a hash
+  table instead of an automatic index, as legacy's hash join does. The
+  lookup is a loop after the loop that supplies its keys, and the table's
+  columns come from registers. A hash table that outgrows its budget moves
+  rows to disk; lookups that need them wait, and after the previous loop
+  ends they run again by that loop's rowid. So the previous loop must read a
+  rowid table directly, the plan must not rely on loop order, and neither
+  table may be in an outer join. Legacy also hashes the right side of LEFT
+  and FULL joins and builds from materialized join prefixes; HIR uses an
+  automatic index there.
+
+Three legacy rewrites return wrong rows that HIR does not (see
+`hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN whose
+subquery joins two tables returns extra rows, and grouped tables for a
+subquery that reads an outer aggregate or joins two tables return wrong
+values.
 
 Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
