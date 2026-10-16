@@ -64,6 +64,20 @@ expect error {
 }
 
 @setup overflow
+test having-hex-zero-still-aggregates {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING 0x0;
+}
+expect error {
+}
+
+@setup overflow
+test having-zero-with-digit-separator-skips-sum {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING 0_0;
+}
+expect {
+}
+
+@setup overflow
 test having-false-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING false;
 }

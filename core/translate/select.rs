@@ -1913,10 +1913,20 @@ fn move_group_by_only_having_terms_to_where(
     Ok(remaining)
 }
 
-/// Matches the terms SQLite keeps in HAVING as always false: `0`, `FALSE` and `x IN ()`.
+/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): integer
+/// literal zero (decimal or hex, without `_` separators), `FALSE` and `x IN ()`.
+/// `Expr::is_always_false()` is not used because it also matches other constant false
+/// expressions such as `0.0`, `'0'` and `NOT 1`, which SQLite moves into WHERE.
+/// SQLite's parser also folds `X AND 0` into `0` when X has no function call, so it
+/// keeps `HAVING g = 2 AND 0` in HAVING, while here `g = 2` is moved.
 fn is_literal_false(expr: &ast::Expr) -> bool {
     match expr {
-        Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<i64>() == Ok(0),
+        Expr::Literal(ast::Literal::Numeric(n)) => {
+            match n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                Some(hex_digits) => u64::from_str_radix(hex_digits, 16) == Ok(0),
+                None => n.parse::<i64>() == Ok(0),
+            }
+        }
         Expr::Literal(ast::Literal::False) => true,
         Expr::InList {
             rhs, not: false, ..
