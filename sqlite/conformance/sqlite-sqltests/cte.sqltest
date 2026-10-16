@@ -1558,3 +1558,80 @@ test cte-read-twice-with-correlated-subquery-next-to-a-window-function {
 expect {
     1|1
 }
+
+# The first reference of x sits in a loop over an empty table, so it never
+# runs. Later references must still fill x before they read it.
+test materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a)
+    SELECT a, (SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0) FROM x;
+}
+expect {
+    0|
+}
+
+test compound-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS (SELECT 0 AS a UNION SELECT 1)
+    SELECT x.a, (SELECT (SELECT y.a FROM x AS y WHERE y.a = t0.c0) FROM t0) FROM x;
+}
+expect {
+    0|
+    1|
+}
+
+test materialized-cte-first-read-in-having-without-groups {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0)
+    SELECT (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x)) IS NULL FROM x;
+}
+expect {
+    1
+}
+
+test materialized-cte-first-read-in-having-of-where-exists {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0)
+    SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x));
+}
+expect {
+    0
+}
+
+test materialized-cte-first-read-in-a-loop-that-does-not-run-then-read-by-a-subquery {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a)
+    SELECT (SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0) IS NULL, (SELECT a FROM x);
+}
+expect {
+    1|0
+}
+
+test materialized-cte-read-by-another-materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a), y AS MATERIALIZED (SELECT a FROM x)
+    SELECT a, (SELECT (SELECT a FROM y WHERE a = t0.c0) FROM t0) IS NULL FROM y;
+}
+expect {
+    0|1
+}
+
+test correlated-materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    CREATE TABLE t1(c);
+    INSERT INTO t1 VALUES (5);
+    SELECT (WITH x AS MATERIALIZED (SELECT t1.c AS a) SELECT quote((SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0)) || a FROM x) FROM t1;
+}
+expect {
+    NULL5
+}
+
+test correlated-materialized-cte-first-read-in-having-of-where-exists {
+    CREATE TABLE t0(c0);
+    CREATE TABLE t1(c);
+    INSERT INTO t1 VALUES (5);
+    SELECT (WITH x AS MATERIALIZED (SELECT t1.c AS a) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x))) FROM t1;
+}
+expect {
+    0
+}

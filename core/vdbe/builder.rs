@@ -503,6 +503,17 @@ pub struct MaterializedCteInfo {
     pub table: Arc<BTreeTable>,
     /// Number of result columns.
     pub num_columns: usize,
+    /// Subroutine that fills the table the first time it runs. A later reference
+    /// calls it before `OpenDup`, because the first reference can be on a path
+    /// that never runs. A CTE that reads an outer row is never shared, so each of
+    /// its references fills its own table.
+    pub fill_subroutine: CteFillSubroutine,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CteFillSubroutine {
+    pub label: BranchOffset,
+    pub return_reg: usize,
 }
 
 #[derive(Debug, Clone)]
