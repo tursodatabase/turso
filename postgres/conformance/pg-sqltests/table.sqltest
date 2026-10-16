@@ -185,3 +185,14 @@ test table-cast-timestamp-column-to-date-and-time {
 expect {
     2024-01-15|10:30:00
 }
+
+test table-delete-row-with-numeric-expression-index {
+    CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX prices_doubled ON prices ((val * 2));
+    INSERT INTO prices VALUES (1, 1.50);
+    DELETE FROM prices WHERE id = 1;
+    SELECT count(*) FROM prices;
+}
+expect {
+    0
+}

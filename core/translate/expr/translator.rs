@@ -2358,7 +2358,7 @@ fn translate_self_table_column_expr(
                     resolver,
                 )
             }
-            Some(SelfTableContext::ForDML { dml_ctx, table }) => {
+            Some(SelfTableContext::ForDML { dml_ctx, table, .. }) => {
                 let Some(table_column) = table.columns().get(*column) else {
                     crate::bail_parse_error!("column index out of bounds");
                 };

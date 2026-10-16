@@ -136,17 +136,21 @@ pub(super) fn expr_custom_type_info(
         ..
     } = expr
     {
-        let tables = referenced_tables?;
-        let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        let type_name = &col.ty_str;
-        let type_def = resolver
-            .schema()
-            .get_type_def(type_name, table.is_strict())?;
+        let (col, is_strict) = match referenced_tables
+            .and_then(|tables| tables.find_table_by_internal_id(*table_ref_id))
+        {
+            Some((_, table)) => (table.get_column_at(*column)?.clone(), table.is_strict()),
+            None if table_ref_id.is_self_table() => {
+                let table = resolver.self_table_with_custom_type_operators()?;
+                (table.columns().get(*column)?.clone(), table.is_strict)
+            }
+            None => return None,
+        };
+        let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict)?;
         return Some(ExprCustomTypeInfo {
-            type_name: type_name.to_lowercase(),
-            column: col.clone(),
+            type_name: col.ty_str.to_lowercase(),
             type_def: Arc::clone(type_def),
+            column: col,
         });
     }
     None
@@ -325,6 +329,10 @@ pub(super) fn find_custom_type_operator(
 ///
 /// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
 /// columns are decoded in-place in `column_regs`.
+///
+/// `uses_custom_type_operators` must be false when `expr` is the expression of a
+/// virtual generated column, see `SelfTableContext::ForDML`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -333,6 +341,7 @@ pub(crate) fn emit_dml_expr_index_value(
     column_regs: &mut [usize],
     table: &Arc<BTreeTable>,
     dest_reg: usize,
+    uses_custom_type_operators: bool,
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
@@ -355,6 +364,7 @@ pub(crate) fn emit_dml_expr_index_value(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
+        uses_custom_type_operators,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
