@@ -149,3 +149,36 @@ test.serial('reconnect works while client is active', async t => {
 
   client.close();
 });
+
+test.serial('execute sends an args object as named args', async t => {
+  // No server needed: record what would go over the wire, then fail the request.
+  const realFetch = globalThis.fetch;
+  const stmts = [];
+  const collect = (node) => {
+    if (node && typeof node === 'object') {
+      if (Object.prototype.hasOwnProperty.call(node, 'named_args')) stmts.push(node);
+      Object.values(node).forEach(collect);
+    }
+  };
+  globalThis.fetch = async (_url, init) => {
+    collect(JSON.parse(init.body));
+    throw new Error('stubbed fetch');
+  };
+  try {
+    const client = createClient({ url: 'http://localhost:1' });
+    await t.throwsAsync(client.execute({ sql: 'select :b as b, :a as a', args: { a: 'A', b: 'B' } }));
+    await t.throwsAsync(client.execute('select :n as v', { n: 'a' }));
+    client.close();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const bySql = Object.fromEntries(stmts.map(s => [s.sql, s]));
+  t.deepEqual(bySql['select :b as b, :a as a'].args, []);
+  t.deepEqual(bySql['select :b as b, :a as a'].named_args, [
+    { name: 'a', value: { type: 'text', value: 'A' } },
+    { name: 'b', value: { type: 'text', value: 'B' } },
+  ]);
+  t.deepEqual(bySql['select :n as v'].args, []);
+  t.deepEqual(bySql['select :n as v'].named_args, [{ name: 'n', value: { type: 'text', value: 'a' } }]);
+});
