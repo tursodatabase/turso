@@ -6,7 +6,7 @@ use crate::types::IOResultOr;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, BtreeLast, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
-    RowVersions, RowidAllocator, SortableIndexKey,
+    RowVersions, RowidAllocator, SortableIndexKey, WalPos,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -2081,7 +2081,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
                 Some(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast)) => {
                     let last = BtreeLast {
-                        read_mark: self.snapshot.read_mark,
+                        read_mark: WalPos::from_pair(self.btree_cursor.get_pager().wal_pos()),
                         rowid: return_if_io!(self.btree_cursor.rowid()),
                     };
                     self.rowid_allocator().record_btree_last(last);
