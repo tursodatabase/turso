@@ -1060,11 +1060,18 @@ pub fn translate_alter_table(
                     .is_none_or(|col| normalize_ident(col) != normalize_ident(column_name))
             });
 
-            // Check if column is used in a foreign key constraint (child side)
-            // SQLite does not allow dropping a column that is part of a FK constraint
-            let column_name_norm = normalize_ident(column_name);
+            // Handle FOREIGN KEY constraints (child side):
+            // - Column-level FOREIGN KEY constraints for the dropped column are silently removed
+            // - Table-level FOREIGN KEY constraints using the dropped column cause an error
+            btree
+                .foreign_keys
+                .retain(|fk| !fk.is_column_constraint_on(column_name));
             for fk in &btree.foreign_keys {
-                if fk.child_columns.contains(&column_name_norm) {
+                if fk
+                    .child_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(column_name))
+                {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
                     )));
@@ -1410,6 +1417,7 @@ pub fn translate_alter_table(
                                 }
                                 None => false,
                             },
+                            is_column_constraint: true,
                             decl_order,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
