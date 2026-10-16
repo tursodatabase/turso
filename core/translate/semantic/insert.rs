@@ -239,6 +239,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 replace_defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_insert_triggers(table, &upserts)?,
                 foreign_keys: self.analyze_dml_foreign_keys(table, target)?,
+                capture_changes: self.analyze_capture_changes(table)?,
             }
         };
 

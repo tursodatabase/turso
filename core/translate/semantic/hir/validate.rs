@@ -286,7 +286,9 @@ impl<'document> HirValidator<'document> {
                 replace_defaults,
                 triggers,
                 foreign_keys,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree INSERT metadata belongs to a non-B-tree target",
@@ -439,7 +441,9 @@ impl<'document> HirValidator<'document> {
                 triggers,
                 foreign_keys,
                 autoincrement,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree UPDATE metadata belongs to a non-B-tree target",
@@ -500,7 +504,9 @@ impl<'document> HirValidator<'document> {
             DeleteTargetKind::BTree {
                 triggers,
                 foreign_keys,
+                capture_changes,
             } => {
+                self.validate_capture_changes(target_table, capture_changes.as_ref())?;
                 self.require(
                     target_table.value().btree().is_some(),
                     "B-tree DELETE metadata belongs to a non-B-tree target",
@@ -2322,6 +2328,32 @@ impl<'document> HirValidator<'document> {
                 )
             }
         }
+    }
+
+    /// The change capture table of a DML target: a table of the main
+    /// database other than the target itself.
+    fn validate_capture_changes(
+        &self,
+        target_table: &ResolvedTable,
+        capture_changes: Option<&CaptureChanges>,
+    ) -> ValidationResult {
+        let Some(capture_changes) = capture_changes else {
+            return Ok(());
+        };
+        self.visit_catalog_object(&capture_changes.table, "change capture table")?;
+        self.require(
+            capture_changes.table.database() == Some(DatabaseId::new(crate::MAIN_DB_ID))
+                && capture_changes.table.value().btree().is_some(),
+            "change capture table is not a table of the main database",
+        )?;
+        self.require(
+            capture_changes.table != *target_table,
+            "a DML target captures its own changes",
+        )?;
+        if let Some(sequence) = &capture_changes.change_ids {
+            self.visit_sequence_operation(sequence)?;
+        }
+        Ok(())
     }
 
     /// The AUTOINCREMENT metadata of an INSERT or UPDATE target: present

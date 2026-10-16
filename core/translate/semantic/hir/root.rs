@@ -98,8 +98,20 @@ pub enum InsertTargetKind {
         replace_defaults: Vec<ResolvedDefault>,
         triggers: InsertTriggers,
         foreign_keys: DmlForeignKeys,
+        capture_changes: Option<CaptureChanges>,
     },
     Virtual,
+}
+
+/// The table change data capture writes the statement's row changes to,
+/// when `PRAGMA capture_data_changes_conn` is on.
+#[derive(Clone, Debug)]
+pub struct CaptureChanges {
+    /// The capture table, in the main database.
+    pub table: ResolvedTable,
+    /// The capture table's hidden AUTOINCREMENT sequence, which hands out
+    /// change ids under MVCC.
+    pub change_ids: Option<super::SequenceOperation>,
 }
 
 /// Trigger identities selected for an INSERT and its possible UPSERT update.
@@ -218,6 +230,7 @@ pub enum UpdateTargetKind {
         /// AUTOINCREMENT: an UPDATE that moves a row also advances the hidden
         /// MVCC sequence.
         autoincrement: Option<ResolvedAutoincrement>,
+        capture_changes: Option<CaptureChanges>,
     },
     Virtual,
 }
@@ -238,6 +251,7 @@ pub enum DeleteTargetKind {
     BTree {
         triggers: Vec<ResolvedTrigger>,
         foreign_keys: DmlForeignKeys,
+        capture_changes: Option<CaptureChanges>,
     },
     Virtual,
 }

@@ -74,6 +74,39 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect())
     }
 
+    /// The table change data capture writes the target's row changes to.
+    /// Like legacy, changes to the capture table itself and to its version
+    /// table are not captured.
+    pub(super) fn analyze_capture_changes(
+        &mut self,
+        target: &hir::ResolvedTable,
+    ) -> Result<Option<hir::CaptureChanges>> {
+        let Some(name) = self.context().capture_changes_table().map(str::to_string) else {
+            return Ok(None);
+        };
+        let target_name = target.value().get_name();
+        if target_name == name
+            || target_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        {
+            return Ok(None);
+        }
+        let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
+        let table = self
+            .context()
+            .schema(database)?
+            .get_table(&name)
+            .filter(|table| table.btree().is_some());
+        let Some(table) = table else {
+            crate::bail_parse_error!("no such table: {}", name);
+        };
+        let id = self.catalog_object_id(Some(database), CatalogObjectKind::Table, name.as_str());
+        let table = hir::CatalogObject::new(id, self.context().snapshot(), Some(database), table);
+        let change_ids = self
+            .analyze_autoincrement(&table)?
+            .and_then(|autoincrement| autoincrement.mvcc_sequence);
+        Ok(Some(hir::CaptureChanges { table, change_ids }))
+    }
+
     pub(super) fn analyze_dml_foreign_keys(
         &mut self,
         target: &hir::ResolvedTable,

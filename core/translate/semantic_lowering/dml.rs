@@ -130,6 +130,8 @@ pub(super) struct DmlTarget<'a> {
     pub(super) source: &'a hir::Source,
     pub(super) table: &'a Arc<BTreeTable>,
     pub(super) database: usize,
+    /// The capture table, when the statement captures its changes.
+    pub(super) capture: Option<super::cdc::Capture<'a>>,
 }
 
 impl<'a> DmlTarget<'a> {
@@ -176,7 +178,26 @@ impl<'a> DmlTarget<'a> {
             source,
             table,
             database: database.index(),
+            capture: None,
         })
+    }
+
+    /// Open the capture table when the statement captures its changes.
+    pub(super) fn with_capture(
+        mut self,
+        program: &mut ProgramBuilder,
+        capture: Option<&'a hir::CaptureChanges>,
+    ) -> Result<Self> {
+        self.capture = super::cdc::Capture::open(program, capture, self.table)?;
+        Ok(self)
+    }
+
+    /// At the end of the statement: the COMMIT row of change data capture.
+    pub(super) fn emit_capture_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
+        match &self.capture {
+            Some(capture) => capture.emit_commit(program),
+            None => Ok(()),
+        }
     }
 
     /// The catalog table the target writes.
@@ -373,6 +394,7 @@ pub(super) fn emit_replace_delete(
         source,
         table,
         database,
+        ..
     } = *target;
     let missing = program.allocate_label();
     program.emit_insn(Insn::SeekRowid {
@@ -433,6 +455,17 @@ pub(super) fn emit_replace_delete(
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
+    }
+    if let Some(capture) = &target.capture {
+        let before = capture.before_record(program, table, table_cursor, conflict);
+        capture.emit_row(
+            program,
+            crate::translate::emitter::OperationMode::DELETE,
+            conflict,
+            before,
+            None,
+            None,
+        )?;
     }
     program.emit_insn(Insn::Delete {
         cursor_id: table_cursor,

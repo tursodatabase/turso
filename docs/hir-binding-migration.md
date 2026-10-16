@@ -215,6 +215,22 @@ returns the values given, and DELETE or UPDATE ... RETURNING fail with
 SQLite's error (legacy panics or returns nothing). `sqlite_dbpage`, which
 legacy writes only in testing builds, still goes to legacy.
 
+Change data capture (`semantic_lowering/cdc.rs`) writes the rows legacy
+writes. Semantic analysis resolves the capture table, and the sequence that
+hands out its change ids under MVCC, onto each INSERT, UPDATE and DELETE
+target (`hir::CaptureChanges`), except the capture table and its version
+table. Each changed row gets an INSERT, UPDATE or DELETE row with the images
+the mode keeps, written where legacy writes it: an INSERT after its AFTER
+triggers, an UPDATE after its foreign-key actions and before its AFTER
+triggers, a DELETE or a REPLACE before the row is deleted. A row an UPDATE
+or UPSERT moves to a new rowid is captured as deleted and inserted. A
+statement in autocommit mode then writes one COMMIT row. Where legacy is
+wrong, HIR is not: legacy also writes a COMMIT row from each trigger and
+foreign-key action it runs, files a moved row's new image under `before`,
+and gives UPSERT DO UPDATE the new row as its before image. The `ALTER
+TABLE` rewrite of `sqlite_schema`, which records its own statement, still
+goes to legacy.
+
 A table with materialized views is written like any other: the VM updates
 the views as rows are inserted and deleted. Only views built by another
 DBSP version, which legacy reports as an error, still go to legacy.
@@ -225,7 +241,7 @@ still go to legacy:
 | DELETE feature | What HIR needs first |
 |---|---|
 | A subquery in RETURNING, on a table with custom types | A copy of the deleted row with decoded values |
-| CDC, `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
+| CDC of a virtual table, `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
 UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`).
@@ -254,7 +270,7 @@ derived table again for each row). These still go to legacy:
 
 | UPDATE feature | What HIR needs first |
 |---|---|
-| CDC, `sqlite_dbpage` | As for DELETE |
+| CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
 | Custom types, array columns | Encoding |
@@ -273,7 +289,7 @@ inserted. These still go to legacy:
 
 | INSERT feature | What HIR needs first |
 |---|---|
-| CDC, `sqlite_dbpage` | As for DELETE |
+| CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | WITHOUT ROWID tables, custom types, array columns | Their lowering |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once

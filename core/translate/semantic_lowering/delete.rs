@@ -34,6 +34,7 @@ use super::query::{
     PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
+use crate::translate::emitter::OperationMode;
 
 /// Whether this DELETE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -57,11 +58,10 @@ pub(super) fn needs_legacy(
             return Ok(true);
         }
     }
-    if program.capture_data_changes_info().table().is_some() {
-        return Ok(true);
-    }
+    // Change data capture of a virtual table is not lowered yet.
     if let Some(table) = super::dml::virtual_target(document, delete.target)? {
-        return Ok(super::dml::virtual_needs_legacy(&table));
+        return Ok(program.capture_data_changes_info().table().is_some()
+            || super::dml::virtual_needs_legacy(&table));
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -119,12 +119,18 @@ pub(super) fn emit_delete(
             "HIR DELETE target does not use a B-tree loop".into(),
         ));
     };
-    let hir::DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind else {
+    let hir::DeleteTargetKind::BTree {
+        foreign_keys,
+        capture_changes,
+        ..
+    } = &delete.target_kind
+    else {
         return Err(LimboError::InternalError(
             "HIR DELETE target is not a B-tree table".into(),
         ));
     };
-    let target = DmlTarget::new(program, document, delete.target, "DELETE")?;
+    let target = DmlTarget::new(program, document, delete.target, "DELETE")?
+        .with_capture(program, capture_changes.as_ref())?;
     // Like legacy, a DELETE that fires triggers or foreign-key actions
     // first collects its rowids, since they can change the table.
     let uses_rowset = uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty();
@@ -167,6 +173,7 @@ pub(super) fn emit_delete(
         )?;
     }
     program.preassign_label_to_next_insn(done);
+    target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
     }
@@ -394,10 +401,6 @@ struct DeletedRow<'a> {
     actions: &'a [CompiledAction<'a>],
 }
 
-/// Delete the row the table cursor is on: its foreign-key checks, its
-/// RETURNING values, its index entries, then the row. `iteration` is the
-/// index the loop reads, whose entry is removed last so the loop can still
-/// advance.
 /// DELETE from a virtual table, as legacy does it: each row the loop finds
 /// is handed to the table with `VUpdate`, with its rowid and a NULL.
 fn emit_virtual_delete(
@@ -441,6 +444,10 @@ fn emit_virtual_delete(
     )
 }
 
+/// Delete the row the table cursor is on: its foreign-key checks, its
+/// RETURNING values, its index entries, then the row. `iteration` is the
+/// index the loop reads, whose entry is removed last so the loop can still
+/// advance.
 fn emit_delete_row(
     program: &mut ProgramBuilder,
     target: &DmlTarget<'_>,
@@ -454,6 +461,7 @@ fn emit_delete_row(
         source,
         table,
         database,
+        ..
     } = *target;
     let table_cursor = row.table_cursor;
     // Foreign-key keys, index keys and RETURNING values are read from the
@@ -549,6 +557,18 @@ fn emit_delete_row(
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
+    }
+    // Like legacy, the captured change reads the row before it is deleted.
+    if let Some(capture) = &target.capture {
+        let before = capture.before_record(program, table, table_cursor, row.rowid);
+        capture.emit_row(
+            program,
+            OperationMode::DELETE,
+            row.rowid,
+            before,
+            None,
+            None,
+        )?;
     }
     program.emit_insn(Insn::Delete {
         cursor_id: table_cursor,

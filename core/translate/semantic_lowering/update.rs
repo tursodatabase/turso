@@ -39,6 +39,7 @@ use super::query::{
     PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
+use crate::translate::emitter::OperationMode;
 
 /// Whether this UPDATE uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -56,11 +57,11 @@ pub(super) fn needs_legacy(
     {
         return Ok(true);
     }
-    if program.capture_data_changes_info().table().is_some() {
-        return Ok(true);
-    }
+    // Change data capture of a virtual table is not lowered yet.
     if let Some(table) = super::dml::virtual_target(document, update.target)? {
-        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
+        return Ok(update.from.is_some()
+            || program.capture_data_changes_info().table().is_some()
+            || super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -173,6 +174,7 @@ pub(super) fn emit_update(
         foreign_keys,
         defaults,
         autoincrement,
+        capture_changes,
         ..
     } = &update.target_kind
     else {
@@ -180,7 +182,8 @@ pub(super) fn emit_update(
             "HIR UPDATE target is not a B-tree table".into(),
         ));
     };
-    let target = DmlTarget::new(program, document, update.target, "UPDATE")?;
+    let target = DmlTarget::new(program, document, update.target, "UPDATE")?
+        .with_capture(program, capture_changes.as_ref())?;
     let table = target.table;
     let new_source = document.source(update.new_source).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -440,6 +443,7 @@ pub(super) fn emit_update(
         Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
     }
     program.preassign_label_to_next_insn(done);
+    target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
     }
@@ -1251,9 +1255,29 @@ impl UpdateRow<'_, '_> {
                 table_cursor: None,
             },
         );
+        // Change data capture in `full` mode records which columns changed:
+        // a flag per column, then the new value of each changed one.
+        let updates = self
+            .target
+            .capture
+            .as_ref()
+            .filter(|_| super::cdc::Capture::records_updates(program))
+            .map(|_| program.alloc_registers(2 * columns));
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
-        self.emit_new_values(program, layout, !has_before)?;
+        self.emit_new_values(program, layout, !has_before, updates)?;
         self.emit_virtual_columns(program, layout, !has_before)?;
+        if let Some(updates) = updates {
+            // Like legacy, a changed virtual column records its value.
+            for &position in layout.assigned {
+                if table.columns()[position].is_virtual_generated() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: self.start() + position,
+                        dst_reg: updates + columns + position,
+                        extra_amount: 0,
+                    });
+                }
+            }
+        }
         let new_row = TriggerRow {
             columns: self.start(),
             rowid: self.written_rowid(),
@@ -1365,6 +1389,10 @@ impl UpdateRow<'_, '_> {
                 super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
             })
             .collect::<Result<Vec<_>>>()?;
+        // The row before the change, for change data capture.
+        let capture_before = self.target.capture.as_ref().and_then(|capture| {
+            capture.before_record(program, table, self.table_cursor, self.rowid)
+        });
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1472,6 +1500,48 @@ impl UpdateRow<'_, '_> {
             });
             program.preassign_label_to_next_insn(back);
         }
+        // Like legacy, a moved row is captured as deleted and inserted.
+        if let Some(capture) = &self.target.capture {
+            let after = capture.after_record(program, table, self.start(), self.written_rowid());
+            if self.new_rowid.is_some() {
+                capture.emit_row(
+                    program,
+                    OperationMode::DELETE,
+                    self.rowid,
+                    capture_before,
+                    None,
+                    None,
+                )?;
+                capture.emit_row(
+                    program,
+                    OperationMode::INSERT,
+                    self.written_rowid(),
+                    None,
+                    after,
+                    None,
+                )?;
+            } else {
+                let updates = updates.map(|updates| {
+                    let record = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(updates),
+                        count: to_u32(2 * columns),
+                        dest_reg: to_u32(record),
+                        index_name: None,
+                        affinity_str: None,
+                    });
+                    record
+                });
+                capture.emit_row(
+                    program,
+                    OperationMode::UPDATE(crate::translate::emitter::UpdateRowSource::Normal),
+                    self.rowid,
+                    capture_before,
+                    after,
+                    updates,
+                )?;
+            }
+        }
         if let Some(returning) = layout.returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1494,6 +1564,7 @@ impl UpdateRow<'_, '_> {
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
+        updates: Option<usize>,
     ) -> Result<()> {
         let table = self.target.table;
         let mut rows = RowValues::default();
@@ -1558,6 +1629,23 @@ impl UpdateRow<'_, '_> {
                     program.emit_null(register, None)
                 }
                 None => program.emit_column_or_rowid(self.table_cursor, position, register),
+            }
+        }
+        // Like legacy, the changed columns record their new values before
+        // affinity is applied; a changed INTEGER PRIMARY KEY records NULL.
+        if let Some(updates) = updates {
+            let columns = table.columns().len();
+            for (position, value) in layout.values.iter().enumerate() {
+                let changed = layout.assigned.contains(&position);
+                program.emit_bool(changed, updates + position);
+                match value {
+                    Some(_) if changed => program.emit_insn(Insn::Copy {
+                        src_reg: self.start() + position,
+                        dst_reg: updates + columns + position,
+                        extra_amount: 0,
+                    }),
+                    _ => program.emit_null(updates + columns + position, None),
+                }
             }
         }
         // Like legacy, apply column affinity to the new row before any index

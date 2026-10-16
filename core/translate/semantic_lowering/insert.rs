@@ -36,6 +36,7 @@ use super::autoincrement::Sequence;
 use super::dml::{DmlTarget, ReturningBuffer, Subprograms};
 use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
+use crate::translate::emitter::OperationMode;
 
 /// Whether this INSERT uses something the HIR lowering does not handle yet.
 /// It is checked before any bytecode is emitted, so legacy can still take
@@ -46,11 +47,10 @@ pub(super) fn needs_legacy(
     program: &ProgramBuilder,
 ) -> Result<bool> {
     let document = &plan.document;
-    if program.capture_data_changes_info().table().is_some() {
-        return Ok(true);
-    }
+    // Change data capture of a virtual table is not lowered yet.
     if let Some(table) = super::dml::virtual_target(document, insert.target)? {
-        return Ok(super::dml::virtual_needs_legacy(&table));
+        return Ok(program.capture_data_changes_info().table().is_some()
+            || super::dml::virtual_needs_legacy(&table));
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(
@@ -100,6 +100,7 @@ pub(super) fn emit_insert(
         replace_defaults,
         foreign_keys,
         autoincrement,
+        capture_changes,
         ..
     } = &insert.target_kind
     else {
@@ -112,7 +113,8 @@ pub(super) fn emit_insert(
         hir::InsertSource::Values(rows) => (rows, None),
         hir::InsertSource::Query(query) => (&[], Some(*query)),
     };
-    let target = DmlTarget::new(program, document, insert.target, "INSERT")?;
+    let target = DmlTarget::new(program, document, insert.target, "INSERT")?
+        .with_capture(program, capture_changes.as_ref())?;
     let table = target.table;
     let or_conflict = insert.conflict.unwrap_or(ResolveType::Abort);
     let has_statement_conflict = insert.conflict.is_some();
@@ -306,6 +308,7 @@ pub(super) fn emit_insert(
         }
     }
     program.preassign_label_to_next_insn(done);
+    target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
     }
@@ -1072,6 +1075,18 @@ impl InsertRow<'_> {
         if let Some(sequence) = &sequence {
             sequence.emit_close(program, self.rowid);
         }
+        // Like legacy, the change is captured after the AFTER triggers ran.
+        if let Some(capture) = &self.target.capture {
+            let after = capture.after_record(program, table, self.columns, self.rowid);
+            capture.emit_row(
+                program,
+                OperationMode::INSERT,
+                self.rowid,
+                None,
+                after,
+                None,
+            )?;
+        }
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1124,6 +1139,7 @@ impl InsertRow<'_> {
             source,
             table,
             database,
+            ..
         } = *self.target;
         let (Some(excluded), Some(new_source)) = (self.excluded, self.upsert_new) else {
             return Err(LimboError::InternalError(
@@ -1391,6 +1407,12 @@ impl InsertRow<'_> {
                 super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
             })
             .collect::<Result<Vec<_>>>()?;
+        // The row before the change, for change data capture. Legacy reads
+        // it after the write, so its before image is the new row.
+        let capture_before =
+            self.target.capture.as_ref().and_then(|capture| {
+                capture.before_record(program, table, self.table_cursor, conflict)
+            });
 
         // Like legacy, every UNIQUE constraint is checked against the new
         // row before any index changes.
@@ -1643,6 +1665,31 @@ impl InsertRow<'_> {
             );
             action.emit_fire(program, old_key, Some(new_key))?;
             program.preassign_label_to_next_insn(unchanged);
+        }
+        // Like legacy, a moved row is captured as deleted and inserted.
+        if let Some(capture) = &self.target.capture {
+            let after = capture.after_record(program, table, new_row, written);
+            match new_rowid {
+                Some(_) => {
+                    capture.emit_row(
+                        program,
+                        OperationMode::DELETE,
+                        conflict,
+                        capture_before,
+                        None,
+                        None,
+                    )?;
+                    capture.emit_row(program, OperationMode::INSERT, written, None, after, None)?;
+                }
+                None => capture.emit_row(
+                    program,
+                    OperationMode::UPDATE(crate::translate::emitter::UpdateRowSource::Normal),
+                    conflict,
+                    capture_before,
+                    after,
+                    None,
+                )?,
+            }
         }
         // RETURNING reads the row as written.
         program.bind_source(

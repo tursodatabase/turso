@@ -1521,6 +1521,94 @@ fn hir_dml_keeps_materialized_views_up_to_date() {
     }
 }
 
+/// Change data capture through HIR writes one row per changed row and one
+/// COMMIT row per statement. Legacy also writes a COMMIT row for each
+/// trigger or foreign-key action it runs, files the new image of a row an
+/// UPDATE moves under `before`, and gives UPSERT DO UPDATE the new row as its
+/// before image.
+#[test]
+fn hir_change_capture_records_each_change_once() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, v)",
+        "CREATE TABLE l(m)",
+        "CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO l VALUES (new.id); END",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    limbo_exec_rows(&conn, "PRAGMA capture_data_changes_conn('full')");
+    for sql in [
+        "INSERT INTO p VALUES (1, 10)",
+        "UPDATE p SET id = 2",
+        "INSERT INTO p VALUES (2, 0) ON CONFLICT(id) DO UPDATE SET v = 30",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let image = |column: &str| {
+        format!(
+            "CASE WHEN table_name IS NULL THEN NULL \
+             ELSE bin_record_json_object(table_columns_json_array(table_name), {column}) END"
+        )
+    };
+    let rows = limbo_exec_rows(
+        &conn,
+        &format!(
+            "SELECT change_type, table_name, id, {}, {} FROM turso_cdc ORDER BY change_id",
+            image("before"),
+            image("after")
+        ),
+    );
+    let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+    let int = rusqlite::types::Value::Integer;
+    let null = rusqlite::types::Value::Null;
+    let commit = vec![
+        int(2),
+        null.clone(),
+        null.clone(),
+        null.clone(),
+        null.clone(),
+    ];
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(1), text("l"), int(1), null.clone(), text(r#"{"m":1}"#)],
+            vec![
+                int(1),
+                text("p"),
+                int(1),
+                null.clone(),
+                text(r#"{"id":1,"v":10}"#)
+            ],
+            commit.clone(),
+            vec![
+                int(-1),
+                text("p"),
+                int(1),
+                text(r#"{"id":1,"v":10}"#),
+                null.clone()
+            ],
+            vec![
+                int(1),
+                text("p"),
+                int(2),
+                null.clone(),
+                text(r#"{"id":2,"v":10}"#)
+            ],
+            commit.clone(),
+            vec![
+                int(0),
+                text("p"),
+                int(2),
+                text(r#"{"id":2,"v":10}"#),
+                text(r#"{"id":2,"v":30}"#),
+            ],
+            commit,
+        ]
+    );
+}
+
 /// RETURNING subqueries of UPDATE ... FROM: a correlated one runs per row,
 /// any other once, as in SQLite. Legacy runs one that reads the target
 /// through a derived table again for each row.

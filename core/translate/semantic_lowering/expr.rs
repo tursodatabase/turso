@@ -4622,6 +4622,7 @@ mod tests {
                 custom_types_enabled: true,
                 dqs_dml: DoubleQuotedDml::Enabled,
                 foreign_keys_enabled: true,
+                capture_changes_table: None,
             },
             SemanticRootInput::Statement(&statement),
         )

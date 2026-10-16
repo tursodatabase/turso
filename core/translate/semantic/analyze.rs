@@ -11370,6 +11370,7 @@ mod tests {
             triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
             autoincrement: None,
+            capture_changes: None,
         };
         assert_eq!(
             invalid
@@ -11417,6 +11418,7 @@ mod tests {
         let hir::DeleteTargetKind::BTree {
             triggers,
             foreign_keys,
+            ..
         } = &delete.target_kind
         else {
             panic!("catalog table DELETE has B-tree metadata");
@@ -11827,6 +11829,7 @@ mod tests {
         delete.target_kind = hir::DeleteTargetKind::BTree {
             triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
+            capture_changes: None,
         };
         assert_eq!(
             invalid

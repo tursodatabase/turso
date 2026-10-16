@@ -20,6 +20,8 @@ pub(crate) struct SemanticOptions {
     pub(crate) custom_types_enabled: bool,
     pub(crate) dqs_dml: context::DoubleQuotedDml,
     pub(crate) foreign_keys_enabled: bool,
+    /// The table change data capture writes to, when it is on.
+    pub(crate) capture_changes_table: Option<String>,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
@@ -51,7 +53,8 @@ pub(crate) fn analyze_root(
         options.dialect,
         options.dqs_dml,
         options.foreign_keys_enabled,
-    )?;
+    )?
+    .with_capture_changes(options.capture_changes_table);
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
         SemanticRootInput::TriggerProgram {
@@ -203,6 +206,7 @@ mod tests {
             custom_types_enabled: true,
             dqs_dml: DoubleQuotedDml::Disabled,
             foreign_keys_enabled: true,
+            capture_changes_table: None,
         };
         let document = analyze_root(
             &catalog,

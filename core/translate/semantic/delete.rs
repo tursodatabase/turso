@@ -69,6 +69,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::DeleteTargetKind::BTree {
                 triggers: self.analyze_delete_triggers(&table)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, target)?,
+                capture_changes: self.analyze_capture_changes(&table)?,
             }
         } else if table.value().virtual_table().is_some() {
             hir::DeleteTargetKind::Virtual

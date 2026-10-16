@@ -1305,19 +1305,28 @@ pub fn emit_cdc_full_record(
 /// mode we keep the cheaper `NewRowid` (max rowid + 1) assignment; the WAL push
 /// loop does not depend on the sequence watermark, so its insert path is
 /// unchanged and pays no per-row sequence cost.
-fn emit_cdc_change_id(
+/// Where the change ids of CDC rows come from.
+pub enum CdcChangeIds<'a> {
+    /// WAL: one more than the CDC table's largest rowid.
+    NewRowid,
+    /// MVCC: the CDC table's AUTOINCREMENT sequence.
+    Sequence {
+        database: usize,
+        backing_table: Arc<BTreeTable>,
+        sqlite_sequence: Option<Arc<BTreeTable>>,
+        name: &'a str,
+        sequence: &'a crate::schema::Sequence,
+    },
+}
+
+/// Run `emit` with the change ids legacy finds through `resolver`.
+fn with_cdc_change_ids<T>(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    cdc_cursor_id: usize,
-    dest_reg: usize,
-) -> Result<()> {
+    emit: impl FnOnce(&mut ProgramBuilder, &CdcChangeIds<'_>) -> Result<T>,
+) -> Result<T> {
     if !program.is_mvcc_enabled() {
-        program.emit_insn(Insn::NewRowid {
-            cursor: cdc_cursor_id,
-            rowid_reg: dest_reg,
-            prev_largest_reg: 0,
-        });
-        return Ok(());
+        return emit(program, &CdcChangeIds::NewRowid);
     }
     let Some(cdc_table) = program
         .capture_data_changes_info()
@@ -1346,16 +1355,50 @@ fn emit_cdc_change_id(
         crate::MAIN_DB_ID,
         &seq_name,
     );
-    crate::translate::sequence::emit_disk_read_nextval(
+    emit(
         program,
-        crate::MAIN_DB_ID,
-        backing_table,
-        sqlite_sequence,
-        &seq_name,
-        &seq,
-        dest_reg,
-        None,
+        &CdcChangeIds::Sequence {
+            database: crate::MAIN_DB_ID,
+            backing_table,
+            sqlite_sequence,
+            name: &seq_name,
+            sequence: &seq,
+        },
     )
+}
+
+fn emit_cdc_change_id(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    cdc_cursor_id: usize,
+    dest_reg: usize,
+) -> Result<()> {
+    match change_ids {
+        CdcChangeIds::NewRowid => {
+            program.emit_insn(Insn::NewRowid {
+                cursor: cdc_cursor_id,
+                rowid_reg: dest_reg,
+                prev_largest_reg: 0,
+            });
+            Ok(())
+        }
+        CdcChangeIds::Sequence {
+            database,
+            backing_table,
+            sqlite_sequence,
+            name,
+            sequence,
+        } => crate::translate::sequence::emit_disk_read_nextval(
+            program,
+            *database,
+            backing_table.clone(),
+            sqlite_sequence.clone(),
+            name,
+            sequence,
+            dest_reg,
+            None,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1370,11 +1413,39 @@ pub fn emit_cdc_insns(
     updates_record_reg: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
+    with_cdc_change_ids(program, resolver, |program, change_ids| {
+        emit_cdc_row(
+            program,
+            change_ids,
+            operation_mode,
+            cdc_cursor_id,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+            updates_record_reg,
+            table_name,
+        )
+    })
+}
+
+/// Write one CDC row for a changed row of `table_name`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_cdc_row(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    operation_mode: OperationMode,
+    cdc_cursor_id: usize,
+    rowid_reg: usize,
+    before_record_reg: Option<usize>,
+    after_record_reg: Option<usize>,
+    updates_record_reg: Option<usize>,
+    table_name: &str,
+) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
     match cdc_info.map(|info| info.cdc_version()) {
         Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
-            resolver,
+            change_ids,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1512,7 +1583,7 @@ fn emit_cdc_insns_v1(
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    change_ids: &CdcChangeIds<'_>,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1546,7 +1617,7 @@ fn emit_cdc_insns_v2(
     // for get-or-set. In MVCC mode this draws from the CDC AUTOINCREMENT sequence
     // (see `emit_cdc_change_id`); in WAL mode it is a plain NewRowid.
     let candidate_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
+    emit_cdc_change_id(program, change_ids, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
@@ -1642,6 +1713,17 @@ pub fn emit_cdc_commit_insns(
     resolver: &Resolver,
     cdc_cursor_id: usize,
 ) -> Result<()> {
+    with_cdc_change_ids(program, resolver, |program, change_ids| {
+        emit_cdc_commit_row(program, change_ids, cdc_cursor_id)
+    })
+}
+
+/// Write a CDC COMMIT record (v2 only).
+fn emit_cdc_commit_row(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    cdc_cursor_id: usize,
+) -> Result<()> {
     // v2 COMMIT record: (NULL, unixepoch(), conn_txn_id(-1), 2, NULL, NULL, NULL, NULL, NULL)
     let regs = program.alloc_registers(9);
     // reg+0: NULL (change_id, autoincrement)
@@ -1693,7 +1775,7 @@ pub fn emit_cdc_commit_insns(
     // (the CDC AUTOINCREMENT sequence in MVCC mode) so COMMIT and row change ids
     // stay in one monotonic, never-reused stream.
     let rowid_reg = program.alloc_register();
-    emit_cdc_change_id(program, resolver, cdc_cursor_id, rowid_reg)?;
+    emit_cdc_change_id(program, change_ids, cdc_cursor_id, rowid_reg)?;
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -1723,6 +1805,18 @@ pub fn emit_cdc_autocommit_commit(
     resolver: &Resolver,
     cdc_cursor_id: usize,
 ) -> Result<()> {
+    with_cdc_change_ids(program, resolver, |program, change_ids| {
+        emit_cdc_statement_commit(program, change_ids, cdc_cursor_id)
+    })
+}
+
+/// At the end of a statement in autocommit mode, write a CDC COMMIT record
+/// (v2 only).
+pub fn emit_cdc_statement_commit(
+    program: &mut ProgramBuilder,
+    change_ids: &CdcChangeIds<'_>,
+    cdc_cursor_id: usize,
+) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
@@ -1746,7 +1840,7 @@ pub fn emit_cdc_autocommit_commit(
             jump_if_null: true,
         });
 
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+        emit_cdc_commit_row(program, change_ids, cdc_cursor_id)?;
 
         program.preassign_label_to_next_insn(skip_label);
     }

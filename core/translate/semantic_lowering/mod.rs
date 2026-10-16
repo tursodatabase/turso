@@ -1,6 +1,7 @@
 //! Bytecode lowering from resolved semantic HIR.
 
 mod autoincrement;
+mod cdc;
 mod delete;
 mod dml;
 mod emit;
@@ -303,6 +304,11 @@ impl<'a> HirSession<'a> {
                 custom_types_enabled: self.custom_types_enabled,
                 dqs_dml: self.dqs_dml,
                 foreign_keys_enabled: self.connection.foreign_keys_enabled(),
+                capture_changes_table: self
+                    .connection
+                    .get_capture_data_changes_info()
+                    .as_ref()
+                    .map(|info| info.table.clone()),
             },
             input,
         )?;
