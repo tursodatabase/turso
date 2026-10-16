@@ -48,16 +48,6 @@ pub(super) fn needs_legacy(
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Ok(true);
     }
-    // RETURNING with a subquery reads a copy of the deleted row. The copy
-    // holds stored values, so it is not built yet for custom types.
-    if returning_has_subquery(delete) {
-        let source = document.source(delete.target).ok_or_else(|| {
-            LimboError::InternalError(format!("HIR DELETE target {} is missing", delete.target))
-        })?;
-        if source.column_type_programs.iter().any(Option::is_some) {
-            return Ok(true);
-        }
-    }
     // Change data capture of a virtual table is not lowered yet.
     if let Some(table) = super::dml::virtual_target(document, delete.target)? {
         return Ok(program.capture_data_changes_info().table().is_some()
@@ -714,6 +704,49 @@ mod tests {
         assert!(
             position(|insn| matches!(insn, Insn::Delete { .. }))
                 < position(|insn| matches!(insn, Insn::BeginSubrtn { .. }))
+        );
+    }
+
+    #[test]
+    fn delete_returning_subquery_decodes_the_copy_of_a_custom_typed_row() {
+        let mut schema = indexed_items_schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                    160,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit(analyze_plan(
+            schema,
+            "DELETE FROM priced RETURNING amount, (SELECT count(*) FROM priced)",
+        ));
+        // The copy of the row is read after the delete and decoded once.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        assert!(
+            position(|insn| matches!(insn, Insn::Delete { .. }))
+                < position(|insn| matches!(insn, Insn::Divide { .. }))
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Divide { .. }))
+                .count(),
+            1
         );
     }
 

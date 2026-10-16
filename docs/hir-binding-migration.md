@@ -265,7 +265,6 @@ still go to legacy:
 
 | DELETE feature | What HIR needs first |
 |---|---|
-| A subquery in RETURNING, on a table with custom types | A copy of the deleted row with decoded values |
 | CDC of a virtual table, `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
 | Automatic indexes chosen by the planner | Building them before the delete loop |
 
