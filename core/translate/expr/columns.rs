@@ -85,12 +85,6 @@ pub(super) fn do_emit_table_column(
     Ok(())
 }
 
-/// Read a stored column, or the rowid for a rowid alias, from a table cursor.
-///
-/// A row written before ALTER TABLE ADD COLUMN has no field for the column, so
-/// the Column instruction returns the raw DEFAULT. A custom type with ENCODE
-/// stores ENCODE(value), so for such a row this computes ENCODE(DEFAULT), the
-/// same value that an INSERT of the default stores.
 pub fn emit_stored_column(
     program: &mut ProgramBuilder,
     cursor_id: CursorID,
