@@ -171,12 +171,12 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     reject_sqlite_catalog_access(sql)?;
 
-    if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(stmt);
     }
 
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -246,45 +246,43 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Option<Statement>> {
-    let parse_result = match turso_pg_parser::parse(sql) {
-        Ok(result) => result,
-        Err(_) => return Ok(None),
-    };
-
-    if let Some(set_stmt) = try_extract_set(&parse_result) {
+fn try_prepare_special(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> Result<Option<Statement>> {
+    if let Some(set_stmt) = try_extract_set(parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(stmt));
     }
 
-    if is_set_transaction(&parse_result) {
+    if is_set_transaction(parse_result) {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(show_stmt) = try_extract_show(&parse_result) {
+    if let Some(show_stmt) = try_extract_show(parse_result) {
         let pragma_sql = format!("PRAGMA {}", show_stmt.name);
         return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
     }
 
-    if let Some(stmt) = try_extract_create_schema(&parse_result) {
+    if let Some(stmt) = try_extract_create_schema(parse_result) {
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_drop_schema(&parse_result) {
+    if let Some(stmt) = try_extract_drop_schema(parse_result) {
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if is_refresh_matview(&parse_result) {
+    if is_refresh_matview(parse_result) {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if is_comment_on(&parse_result) {
+    if is_comment_on(parse_result) {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
+    if let Some(stmt) = try_extract_copy_from(parse_result) {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
