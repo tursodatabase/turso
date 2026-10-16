@@ -273,7 +273,8 @@ derived table again for each row). These still go to legacy:
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
-| Custom types, array columns | Encoding |
+| Array columns | Their lowering |
+| Custom types with a BEFORE trigger or a custom-typed virtual column | Raw values for BEFORE triggers, decoding computed columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -339,7 +340,10 @@ decodes to NULL is rejected; CHECK constraints and foreign-key checks
 compare stored values (`with_stored_values`), while index expressions,
 RETURNING and AFTER triggers see decoded values. Trigger programs decode
 OLD and NEW themselves, so DELETE and UPDATE pass OLD as stored, and
-foreign-key actions get the parent key decoded, as SQL values. The
+foreign-key actions get the parent key decoded, as SQL values. UPDATE does
+the same after NOT NULL, but only for the columns it sets; the others are
+read and written back as stored. Like legacy, its NOT NULL check sees the
+value before it is encoded. The
 STRICT/custom-type tests are skipped by the Rust conformance backend, so
 they were checked with the CLI backend, statement block by block against
 legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so

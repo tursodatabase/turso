@@ -75,9 +75,29 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // Custom types are not lowered yet.
-    if super::dml::strict_needs_legacy(&table, source) || super::dml::has_custom_types(source) {
+    if super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
+    }
+    // Custom types are lowered unless a BEFORE trigger fires: legacy shows
+    // it the new values before they are encoded and the other columns as
+    // stored, which HIR's trigger programs, decoding their rows themselves,
+    // do not do yet.
+    if super::dml::has_custom_types(source) {
+        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+            return Ok(true);
+        };
+        let custom_virtual = table
+            .columns()
+            .iter()
+            .zip(&source.column_type_programs)
+            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
+        if custom_virtual
+            || triggers
+                .iter()
+                .any(|trigger| trigger.value().time == TriggerTime::Before)
+        {
+            return Ok(true);
+        }
     }
     if update.from.is_some() {
         // A RETURNING subquery may read a CTE the FROM clause reads too.
@@ -1347,7 +1367,24 @@ impl UpdateRow<'_, '_> {
         }
         // Like legacy, a STRICT type check and then CHECK constraints run
         // after NOT NULL and before any index is checked.
-        if table.is_strict {
+        if super::dml::has_custom_types(source) {
+            // Like legacy, only the values the UPDATE sets are checked as
+            // input and encoded; the others are read as stored.
+            let set = layout
+                .values
+                .iter()
+                .enumerate()
+                .filter_map(|(position, value)| value.map(|_| position))
+                .collect::<Vec<_>>();
+            super::dml::emit_custom_type_writes(
+                program,
+                document,
+                source,
+                table,
+                self.start(),
+                Some(&set),
+            )?;
+        } else if table.is_strict {
             super::dml::emit_strict_type_check(program, table, self.start());
         }
         super::dml::emit_check_constraints(
@@ -2108,7 +2145,11 @@ mod tests {
     }
 
     fn emit(sql: &str) -> ProgramBuilder {
-        let plan = Arc::new(analyze_plan(schema(), sql));
+        emit_with(schema(), sql)
+    }
+
+    fn emit_with(schema: Schema, sql: &str) -> ProgramBuilder {
+        let plan = Arc::new(analyze_plan(schema, sql));
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
         assert!(
@@ -2343,5 +2384,41 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn update_encodes_only_the_custom_typed_columns_it_sets() {
+        let mut schema = schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents, other cents) STRICT",
+                    140,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE priced SET amount = 20");
+        // The input check, the encoding, then the check of the stored type,
+        // for `amount` only: `other` is written back as stored.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .enumerate()
+                .filter(|(_, (insn, _))| matches(insn))
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>()
+        };
+        let checks = position(|insn| matches!(insn, Insn::TypeCheck { .. }));
+        let encodes = position(|insn| matches!(insn, Insn::Multiply { .. }));
+        assert_eq!(checks.len(), 2);
+        assert_eq!(encodes.len(), 1);
+        assert!(checks[0] < encodes[0] && encodes[0] < checks[1]);
     }
 }

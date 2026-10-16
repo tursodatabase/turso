@@ -1521,12 +1521,12 @@ fn hir_dml_keeps_materialized_views_up_to_date() {
     }
 }
 
-/// INSERT into STRICT tables with custom types, as legacy does it: values are
-/// type checked, encoded and checked again; NOT NULL sees the decoded value;
+/// INSERT and UPDATE on STRICT tables with custom types, as legacy does it:
+/// the values written are type checked, encoded and checked again; NOT NULL sees the decoded value;
 /// CHECK constraints and foreign keys compare stored values; index
 /// expressions, RETURNING and AFTER triggers see decoded values.
 #[test]
-fn hir_custom_type_inserts_match_legacy() {
+fn hir_custom_type_writes_match_legacy() {
     let statements = [
         "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
         "CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value)",
@@ -1548,6 +1548,19 @@ fn hir_custom_type_inserts_match_legacy() {
         "SELECT * FROM p ORDER BY id",
         "SELECT id, hex(name) FROM p ORDER BY id",
         "SELECT * FROM p WHERE substr(name, 1, 1) = 'h'",
+        "SELECT * FROM c ORDER BY id",
+        "SELECT * FROM log",
+        "CREATE TRIGGER tu AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (old.name || '>' || new.name); END",
+        "UPDATE p SET name = 'Again' WHERE id = 2 RETURNING id, name",
+        "SELECT * FROM p WHERE substr(name, 1, 1) = 'a'",
+        "UPDATE p SET id = 'x'",
+        "UPDATE c SET amount = 60 WHERE id = 1",
+        "UPDATE c SET amount = amount + 5 WHERE id = 1 RETURNING amount",
+        "UPDATE c SET pid = 3 WHERE id = 1",
+        "UPDATE c SET t = 42 WHERE id = 1",
+        "UPDATE OR IGNORE c SET t = 42",
+        "UPDATE c SET id = 9 WHERE id = 1 RETURNING *",
+        "SELECT id, hex(name) FROM p ORDER BY id",
         "SELECT * FROM c ORDER BY id",
         "SELECT * FROM log",
         "DELETE FROM p WHERE id = 1",
