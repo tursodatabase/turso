@@ -2361,6 +2361,118 @@ mod tests {
         assert_eq!(PageSize::new(size).map(PageSize::get), expected);
     }
 
+    /// Every size `PageSize::new` accepts has to be expressible in the 2-byte
+    /// DB-header field, so 65536 is stored on disk as the sentinel `1`.
+    #[rstest]
+    #[case(512, 512)]
+    #[case(1024, 1024)]
+    #[case(2048, 2048)]
+    #[case(4096, 4096)]
+    #[case(8192, 8192)]
+    #[case(16384, 16384)]
+    #[case(32768, 32768)]
+    #[case(65536, 1)]
+    fn page_size_get_raw_encodes_oversized_values_as_the_header_sentinel(
+        #[case] size: u32,
+        #[case] expected_raw: u16,
+    ) {
+        assert_eq!(
+            PageSize::new(size).expect("size must be valid").get_raw(),
+            expected_raw
+        );
+    }
+
+    /// The header field is the only way a page size reaches a database that was
+    /// written by something else, so an unreadable value has to surface as a
+    /// corruption instead of silently picking a default.
+    #[rstest]
+    #[case(0)]
+    #[case(2)]
+    #[case(255)]
+    #[case(513)]
+    #[case(1000)]
+    #[case(6144)]
+    #[case(65535)]
+    #[case(u16::MAX)]
+    fn page_size_new_from_header_u16_rejects_unrepresentable_values(#[case] raw: u16) {
+        let decoded = PageSize::new_from_header_u16(raw);
+        assert!(
+            decoded
+                .as_ref()
+                .is_err_and(|e| matches!(e, LimboError::Corrupt(_))),
+            "{raw} must be reported as a corrupt header, got {decoded:?}"
+        );
+    }
+
+    /// The sentinel is only meaningful when reading the header, so the value
+    /// stored and the value reported must not be the same thing for 65536.
+    #[test]
+    fn page_size_decodes_the_header_sentinel_as_65536() {
+        for raw in 1..=u16::MAX {
+            let decoded = PageSize::new_from_header_u16(raw);
+            // `1` is the only legal encoding that is not its own value.
+            let expected = if raw == 1 {
+                PageSize::new(PageSize::MAX)
+            } else {
+                PageSize::new(raw as u32)
+            };
+            match (decoded.map(PageSize::get), expected.map(PageSize::get)) {
+                (Ok(got), Some(want)) => assert_eq!(got, want, "header value {raw}"),
+                (Err(_), None) => {}
+                (got, want) => panic!("header value {raw}: got {got:?}, expected {want:?}"),
+            }
+        }
+    }
+
+    /// Writing a database and reading it back must not move the page size, so
+    /// the raw form produced by `PRAGMA page_size=N` has to decode back to N.
+    #[test]
+    fn page_size_round_trips_through_the_header_encoding() {
+        for size in [
+            PageSize::MIN,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            PageSize::MAX,
+        ] {
+            let page_size = PageSize::new(size).expect("size must be valid");
+            let decoded = PageSize::new_from_header_u16(page_size.get_raw());
+            assert_eq!(
+                decoded.ok().map(PageSize::get),
+                Some(page_size.get()),
+                "round trip of {size}"
+            );
+        }
+    }
+
+    /// A reserved-space region eats into the usable space of the smallest
+    /// legal page. Reserving is a single byte on disk, so 512 is the only size
+    /// whose limit is reachable: 1024 - 255 already stays above the minimum.
+    #[rstest]
+    #[case(512, 0, true)]
+    #[case(512, 32, true)]
+    #[case(512, 33, false)]
+    #[case(512, 255, false)]
+    #[case(1024, 255, true)]
+    #[case(4096, 0, true)]
+    #[case(4096, 255, true)]
+    #[case(65536, 255, true)]
+    fn page_size_has_valid_reserved_space_only_keeps_the_usable_space_minimum(
+        #[case] size: u32,
+        #[case] reserved: u8,
+        #[case] expected: bool,
+    ) {
+        let page_size = PageSize::new(size).expect("size must be valid");
+        assert_eq!(
+            page_size.has_valid_reserved_space(reserved),
+            expected,
+            "{size} with {reserved} reserved bytes"
+        );
+    }
+
     #[rstest]
     #[case(PageType::TableLeaf, 4096, 0, None)]
     #[case(PageType::TableLeaf, 4096, 4061, None)]
