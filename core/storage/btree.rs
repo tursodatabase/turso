@@ -7941,6 +7941,15 @@ pub enum IntegrityCheckError {
         start: usize,
         end: usize,
     },
+    #[error(
+        "Page {page_id} freeblock list not in ascending order at pc={pc} size={size} next={next}"
+    )]
+    FreeBlockOutOfOrder {
+        page_id: i64,
+        pc: usize,
+        size: usize,
+        next: usize,
+    },
     #[error("Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}")]
     CellOverlap {
         page_id: i64,
@@ -8571,6 +8580,18 @@ pub fn integrity_check(
                     break;
                 }
                 coverage_checker.add_free_block(pc, pc + size);
+                if next != 0 && next <= pc + size + 3 {
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreeBlockOutOfOrder {
+                            page_id: page.get().id() as i64,
+                            pc,
+                            size,
+                            next,
+                        },
+                    )?;
+                    break;
+                }
                 pc = next;
             }
         }
