@@ -1711,6 +1711,8 @@ struct StreamingState {
     /// checksum of the last valid commit frame
     last_valid_checksum: (u32, u32),
     last_valid_frame: u64,
+    /// database size in pages recorded by the last valid commit frame
+    last_valid_db_size: u32,
     pending_frames: FxHashMap<u64, Vec<u64>>,
     page_size: usize,
     use_native_endian: bool,
@@ -1737,6 +1739,7 @@ impl StreamingWalReader {
                 cumulative_checksum: (0, 0),
                 last_valid_checksum: (0, 0),
                 last_valid_frame: 0,
+                last_valid_db_size: 0,
                 pending_frames: FxHashMap::default(),
                 page_size: 0,
                 use_native_endian: false,
@@ -1944,6 +1947,7 @@ impl StreamingWalReader {
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
                 st.last_valid_checksum = calc;
+                st.last_valid_db_size = db_size;
                 tracing::debug!(
                     "WAL_SCAN commit frame={} page_no={} db_size={}",
                     st.frame_idx,
@@ -1999,7 +2003,8 @@ impl StreamingWalReader {
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
-            frame_cache.retain(|_, frames| !frames.is_empty());
+            let db_size = st.last_valid_db_size as u64;
+            frame_cache.retain(|&page, frames| page <= db_size && !frames.is_empty());
             let header = wfs.metadata.wal_header.lock();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
@@ -2699,6 +2704,87 @@ mod tests {
         let frame_cache = guard.runtime.frame_cache.lock();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
+    }
+
+    #[test]
+    fn streaming_reader_drops_frames_for_pages_beyond_the_committed_database_size() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file(
+                "streaming-reader-db-size-wal",
+                crate::OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+
+        let page_size: usize = 1024;
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size)
+            .expect("initialize buffer pool");
+
+        let mut wal_header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            file_format: 3007000,
+            page_size: page_size as u32,
+            checkpoint_seq: 0,
+            salt_1: 0x1234_5678,
+            salt_2: 0x9abc_def0,
+            checksum_1: 0,
+            checksum_2: 0,
+        };
+        let header_prefix = &wal_header.as_bytes()[..WAL_HEADER_SIZE - 8];
+        let use_native = (wal_header.magic & 1) != 0;
+        let (c1, c2) = checksum_wal(header_prefix, &wal_header, (0, 0), use_native);
+        wal_header.checksum_1 = c1;
+        wal_header.checksum_2 = c2;
+        io.wait_for_completion(begin_write_wal_header(file.as_ref(), &wal_header, None).unwrap())
+            .unwrap();
+
+        let page = vec![0xAB; page_size];
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let mut offset = WAL_HEADER_SIZE as u64;
+        let mut checksum = (wal_header.checksum_1, wal_header.checksum_2);
+        let mut write_frame = |page_no: u32, db_size: u32| {
+            let (next_checksum, frame) = prepare_wal_frame(
+                &buffer_pool,
+                &wal_header,
+                checksum,
+                wal_header.page_size,
+                page_no,
+                db_size,
+                &page,
+            );
+            let frame_clone = frame.clone();
+            let c = file
+                .pwrite(
+                    offset,
+                    frame,
+                    Completion::new_write(move |res| {
+                        assert_eq!(res.unwrap() as usize, frame_size);
+                        let _keep = frame_clone.clone();
+                    }),
+                )
+                .unwrap();
+            io.wait_for_completion(c).unwrap();
+            offset += frame_size as u64;
+            checksum = next_checksum;
+        };
+
+        write_frame(40, 0);
+        write_frame(1, 40);
+        write_frame(1, 1);
+
+        let shared = build_shared_wal(&file, &io).unwrap();
+        let guard = shared.read();
+        assert_eq!(guard.metadata.max_frame.load(Ordering::Acquire), 3);
+
+        let frame_cache = guard.runtime.frame_cache.lock();
+        assert_eq!(frame_cache.get(&1), Some(&vec![2u64, 3u64]));
+        assert!(
+            frame_cache.get(&40).is_none(),
+            "page 40 is past the database size of the last commit"
+        );
     }
 
     #[quickcheck_macros::quickcheck]
