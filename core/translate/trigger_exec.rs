@@ -14,10 +14,12 @@ use crate::translate::{
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::{Insn, Subprogram};
-use crate::vdbe::BranchOffset;
+use crate::vdbe::{BranchOffset, PreparedProgram};
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
+use std::rc::Rc;
+use std::sync::{OnceLock, Weak};
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -121,6 +123,8 @@ struct ParamAllocator {
     old_rowid: Option<NonZero<usize>>,
     /// Next parameter index to assign (starts at 1).
     next_param: usize,
+    has_new: bool,
+    has_old: bool,
 }
 
 impl ParamAllocator {
@@ -139,7 +143,55 @@ impl ParamAllocator {
             },
             old_rowid: None,
             next_param: 1,
+            has_new,
+            has_old,
         }
+    }
+
+    /// Assign a parameter to every NEW/OLD value.
+    ///
+    /// A call to a trigger program that is still being compiled cannot know
+    /// which values the rest of the body will read, so it passes all of them.
+    /// Indices already handed out keep their numbers.
+    fn alloc_all(&mut self) {
+        if self.has_new {
+            for col_idx in 0..self.new_entries.len() {
+                self.alloc_new(col_idx);
+            }
+            self.alloc_new_rowid();
+        }
+        if self.has_old {
+            for col_idx in 0..self.old_entries.len() {
+                self.alloc_old(col_idx);
+            }
+            self.alloc_old_rowid();
+        }
+    }
+
+    /// Map each parameter index to the parent register that holds its value.
+    fn parent_registers(&self, ctx: &TriggerContext) -> Vec<usize> {
+        let mut param_registers = vec![0usize; self.num_params()];
+        if let Some(new_regs) = &ctx.new_registers {
+            for (col_idx, opt_param) in self.new_entries.iter().enumerate() {
+                if let Some(param_idx) = opt_param {
+                    param_registers[param_idx.get() - 1] = new_regs[col_idx];
+                }
+            }
+            if let Some(param_idx) = self.new_rowid {
+                param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
+            }
+        }
+        if let Some(old_regs) = &ctx.old_registers {
+            for (col_idx, opt_param) in self.old_entries.iter().enumerate() {
+                if let Some(param_idx) = opt_param {
+                    param_registers[param_idx.get() - 1] = old_regs[col_idx];
+                }
+            }
+            if let Some(param_idx) = self.old_rowid {
+                param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
+            }
+        }
+        param_registers
     }
 
     fn alloc_new(&mut self, col_idx: usize) -> NonZero<usize> {
@@ -183,8 +235,10 @@ impl ParamAllocator {
 /// Context for compiling trigger subprograms - maps NEW/OLD to parameter indices
 #[derive(Debug)]
 struct TriggerSubprogramContext {
-    /// Sparse parameter allocator (allocates on demand during AST rewrite)
-    param_alloc: RefCell<ParamAllocator>,
+    /// Sparse parameter allocator (allocates on demand during AST rewrite).
+    /// Shared with the statement's trigger program cache so that a call to
+    /// this program emitted while it is still compiling can see the mapping.
+    param_alloc: Rc<RefCell<ParamAllocator>>,
     /// Whether this trigger has NEW registers
     has_new: bool,
     /// Whether this trigger has OLD registers
@@ -518,7 +572,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
     Ok(())
 }
 
-/// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
+/// Emit a call to the trigger's program, compiling the program the first time
+/// the trigger fires in this statement.
 /// Returns true if there are triggers that will fire.
 #[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
@@ -530,25 +585,55 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
-    struct TriggerCompilationGuard {
-        connection: Arc<crate::Connection>,
-    }
-
-    impl Drop for TriggerCompilationGuard {
-        fn drop(&mut self) {
-            self.connection.end_trigger_compilation();
+    let cache = resolver.trigger_program_cache.clone();
+    let (subprogram, param_alloc) = match cache.find(trigger, database_id, ctx.override_conflict) {
+        Some(TriggerProgramLookup::Compiled {
+            program: compiled,
+            param_alloc,
+        }) => {
+            acquire_subprogram_databases(program, resolver, &compiled)?;
+            (Subprogram::PreparedProgram(compiled), param_alloc)
         }
-    }
-
-    if connection.trigger_is_compiling(trigger) {
-        // Do not recursively compile the same trigger
-        return Ok(false);
-    }
-    connection.start_trigger_compilation(trigger.clone());
-    let _trigger_compilation_guard = TriggerCompilationGuard {
-        connection: connection.clone(),
+        Some(TriggerProgramLookup::Compiling { slot, param_alloc }) => {
+            param_alloc.borrow_mut().alloc_all();
+            (Subprogram::Pending(slot), param_alloc)
+        }
+        None => {
+            let (compiled, param_alloc) = compile_trigger_program(
+                program,
+                resolver,
+                trigger,
+                ctx,
+                connection,
+                database_id,
+                &cache,
+            )?;
+            acquire_subprogram_databases(program, resolver, &compiled)?;
+            (Subprogram::PreparedProgram(compiled), param_alloc)
+        }
     };
 
+    let param_registers = param_alloc.borrow().parent_registers(ctx);
+    program.emit_insn(Insn::Program {
+        param_registers,
+        program: subprogram,
+        ignore_jump_target,
+    });
+
+    Ok(true)
+}
+
+/// Compile the trigger body as a subprogram and store it in the statement's
+/// trigger program cache.
+fn compile_trigger_program(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Arc<Trigger>,
+    ctx: &TriggerContext,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    cache: &TriggerProgramCache,
+) -> Result<(Arc<PreparedProgram>, Rc<RefCell<ParamAllocator>>)> {
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
     let num_cols = ctx.table.columns().len();
@@ -566,8 +651,17 @@ fn execute_trigger_commands(
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
     // reducing bind_at calls from N (all columns) to K (referenced columns).
+    let param_alloc = Rc::new(RefCell::new(ParamAllocator::new(
+        num_cols, has_new, has_old,
+    )));
+    let entry = cache.push(
+        trigger.clone(),
+        database_id,
+        ctx.override_conflict,
+        param_alloc.clone(),
+    );
     let subprogram_ctx = TriggerSubprogramContext {
-        param_alloc: RefCell::new(ParamAllocator::new(num_cols, has_new, has_old)),
+        param_alloc: param_alloc.clone(),
         has_new,
         has_old,
         table: ctx.table.clone(),
@@ -622,12 +716,20 @@ fn execute_trigger_commands(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
-    let subprogram_prepared = built_subprogram.prepared();
+    let compiled = built_subprogram.prepared().clone();
+    entry.finish(compiled.clone());
+    Ok((compiled, param_alloc))
+}
 
-    // Trigger subprograms do not emit Transaction opcodes, so the parent statement
-    // must acquire any attached/temp database transactions the trigger body needs
-    // before OP_Program enters the subprogram.
-    for db_id in &subprogram_prepared.write_databases {
+/// Trigger subprograms do not emit Transaction opcodes, so the parent statement
+/// must acquire any attached/temp database transactions the trigger body needs
+/// before OP_Program enters the subprogram.
+fn acquire_subprogram_databases(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    subprogram: &PreparedProgram,
+) -> Result<()> {
+    for db_id in &subprogram.write_databases {
         if db_id == crate::MAIN_DB_ID {
             program.begin_write_operation()?;
         } else {
@@ -635,8 +737,8 @@ fn execute_trigger_commands(
             program.begin_write_on_database(db_id, schema_cookie)?;
         }
     }
-    for db_id in &subprogram_prepared.read_databases {
-        if subprogram_prepared.write_databases.get(db_id) {
+    for db_id in &subprogram.read_databases {
+        if subprogram.write_databases.get(db_id) {
             continue;
         }
         if db_id == crate::MAIN_DB_ID {
@@ -646,42 +748,140 @@ fn execute_trigger_commands(
             program.begin_read_on_database(db_id, schema_cookie)?;
         }
     }
+    Ok(())
+}
 
-    // Build the param_registers Vec from the sparse allocator: maps each parameter
-    // index to the parent register that holds the value.
-    let alloc = subprogram_ctx.param_alloc.borrow();
-    let total_params = alloc.num_params();
-    let mut param_registers = vec![0usize; total_params];
+/// Trigger programs compiled so far for the statement being translated.
+///
+/// Like SQLite, each trigger body is compiled once per statement and that one
+/// program is called from every place the trigger fires. Compiling a fresh copy
+/// at every firing site would make the program grow factorially when several
+/// triggers on one table fire each other, because the check that stops a
+/// trigger from re-entering itself only prunes one path of that tree.
+///
+/// A trigger that fires again while its own body is still being compiled gets
+/// a call to the unfinished program. At run time that call is skipped when the
+/// trigger is already executing, which is SQLite's behaviour without
+/// `PRAGMA recursive_triggers`.
+///
+/// Shared with forked resolvers because `translate_inner` forks the resolver
+/// while compiling trigger bodies.
+#[derive(Clone, Default)]
+pub(super) struct TriggerProgramCache(Rc<RefCell<Vec<TriggerProgramCacheEntry>>>);
 
-    if let Some(new_regs) = &ctx.new_registers {
-        for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = new_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.new_rowid {
-            param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
+struct TriggerProgramCacheEntry {
+    trigger: Arc<Trigger>,
+    database_id: usize,
+    /// The conflict resolution forced on the body, for example by an UPSERT.
+    /// The same trigger compiles differently under a different override.
+    override_conflict: Option<ast::ResolveType>,
+    /// Which NEW/OLD values the body reads and which parameter carries each.
+    param_alloc: Rc<RefCell<ParamAllocator>>,
+    state: TriggerProgramState,
+}
+
+enum TriggerProgramState {
+    /// The body is still being compiled. Calls emitted meanwhile use the slot,
+    /// which is filled once the program is built.
+    Compiling(Arc<OnceLock<Weak<PreparedProgram>>>),
+    Compiled(Arc<PreparedProgram>),
+}
+
+enum TriggerProgramLookup {
+    Compiling {
+        slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+        param_alloc: Rc<RefCell<ParamAllocator>>,
+    },
+    Compiled {
+        program: Arc<PreparedProgram>,
+        param_alloc: Rc<RefCell<ParamAllocator>>,
+    },
+}
+
+impl TriggerProgramCache {
+    fn find(
+        &self,
+        trigger: &Arc<Trigger>,
+        database_id: usize,
+        override_conflict: Option<ast::ResolveType>,
+    ) -> Option<TriggerProgramLookup> {
+        self.0
+            .borrow()
+            .iter()
+            .find(|entry| {
+                Arc::ptr_eq(&entry.trigger, trigger)
+                    && entry.database_id == database_id
+                    && entry.override_conflict == override_conflict
+            })
+            .map(|entry| match &entry.state {
+                TriggerProgramState::Compiling(slot) => TriggerProgramLookup::Compiling {
+                    slot: slot.clone(),
+                    param_alloc: entry.param_alloc.clone(),
+                },
+                TriggerProgramState::Compiled(program) => TriggerProgramLookup::Compiled {
+                    program: program.clone(),
+                    param_alloc: entry.param_alloc.clone(),
+                },
+            })
+    }
+
+    /// Record that a trigger program is being compiled.
+    ///
+    /// The returned guard removes the entry again if compilation fails before
+    /// `finish` is called.
+    fn push(
+        &self,
+        trigger: Arc<Trigger>,
+        database_id: usize,
+        override_conflict: Option<ast::ResolveType>,
+        param_alloc: Rc<RefCell<ParamAllocator>>,
+    ) -> TriggerProgramCompileGuard {
+        let slot = Arc::new(OnceLock::new());
+        self.0.borrow_mut().push(TriggerProgramCacheEntry {
+            trigger,
+            database_id,
+            override_conflict,
+            param_alloc,
+            state: TriggerProgramState::Compiling(slot.clone()),
+        });
+        TriggerProgramCompileGuard {
+            cache: self.clone(),
+            slot,
         }
     }
-    if let Some(old_regs) = &ctx.old_registers {
-        for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
-            if let Some(param_idx) = opt_param {
-                param_registers[param_idx.get() - 1] = old_regs[col_idx];
-            }
-        }
-        if let Some(param_idx) = alloc.old_rowid {
-            param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
-        }
+}
+
+struct TriggerProgramCompileGuard {
+    cache: TriggerProgramCache,
+    slot: Arc<OnceLock<Weak<PreparedProgram>>>,
+}
+
+impl TriggerProgramCompileGuard {
+    fn finish(self, program: Arc<PreparedProgram>) {
+        self.slot
+            .set(Arc::downgrade(&program))
+            .expect("trigger program should be set exactly once");
+        let mut entries = self.cache.0.borrow_mut();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| self.owns(entry))
+            .expect("trigger program being compiled should be in the cache");
+        entry.state = TriggerProgramState::Compiled(program);
     }
-    drop(alloc);
 
-    program.emit_insn(Insn::Program {
-        param_registers,
-        program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
-        ignore_jump_target,
-    });
+    fn owns(&self, entry: &TriggerProgramCacheEntry) -> bool {
+        matches!(&entry.state, TriggerProgramState::Compiling(slot) if Arc::ptr_eq(slot, &self.slot))
+    }
+}
 
-    Ok(true)
+/// Compilation failed before `finish` ran: forget the unfinished program.
+impl Drop for TriggerProgramCompileGuard {
+    fn drop(&mut self) {
+        if self.slot.get().is_some() {
+            return;
+        }
+        self.cache.0.borrow_mut().retain(|entry| !self.owns(entry));
+    }
 }
 
 /// Check if there are any triggers for a given event (regardless of time).

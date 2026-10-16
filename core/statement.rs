@@ -428,6 +428,14 @@ impl Statement {
         self.program.trigger.clone()
     }
 
+    /// Record the triggers this subprogram statement runs inside, outermost
+    /// first, followed by its own trigger when it is a trigger program.
+    pub(crate) fn set_executing_triggers(&mut self, enclosing: &[Arc<Trigger>]) {
+        let mut chain = enclosing.to_vec();
+        chain.extend(self.program.trigger.clone());
+        self.state.executing_triggers = chain;
+    }
+
     pub fn get_query_mode(&self) -> QueryMode {
         self.query_mode
     }
