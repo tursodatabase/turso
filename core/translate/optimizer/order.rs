@@ -409,9 +409,10 @@ pub fn plan_satisfies_order_target(
     target_col_idx == num_cols_in_order_target
 }
 
-/// Prove that a selected HIR B-tree loop supplies the complete requested
-/// order. Multi-source and non-B-tree plans remain sorter-backed until their
-/// global row order can be proved from equally strong facts.
+/// Prove that the selected HIR B-tree loops supply the complete requested
+/// order, as [plan_satisfies_order_target] does for legacy plans. Plans with
+/// an outer join or a loop that is not a plain B-tree access keep their
+/// sorter.
 pub(crate) fn hir_plan_satisfies_order_target(
     plan: &JoinN,
     access_methods: &[AccessMethod],
@@ -420,46 +421,86 @@ pub(crate) fn hir_plan_satisfies_order_target(
     order_target: &HirOrderTarget<'_>,
     schema: &Schema,
 ) -> Result<bool> {
-    let [(source_position, access_method_position)] = plan.data.as_slice() else {
-        return Ok(false);
+    // An outer join adds NULL-extended rows outside any loop's order.
+    let outer = |source: &HirPlanSource| {
+        source.join_info().is_some_and(|join| {
+            matches!(
+                join.kind,
+                hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+            )
+        })
     };
-    let Some(HirPlanSource::BTree(source)) = sources.get(*source_position) else {
-        return Ok(false);
-    };
-    if source.join_info.is_some() {
+    if plan
+        .data
+        .iter()
+        .any(|(source_position, _)| sources.get(*source_position).is_some_and(outer))
+    {
         return Ok(false);
     }
-    let Some(definition) = document.source(source.internal_id) else {
-        return Err(LimboError::InternalError(format!(
-            "HIR order proof references missing source {}",
-            source.internal_id
-        )));
-    };
-    let Some(access_method) = access_methods.get(*access_method_position) else {
-        return Err(LimboError::InternalError(format!(
-            "HIR order proof references missing access method {access_method_position}"
-        )));
-    };
-    let AccessMethodParams::BTreeTable {
-        iter_dir,
-        index,
-        build_index: false,
-        constraint_refs,
-    } = &access_method.params
-    else {
-        return Ok(false);
-    };
-    let consumed = hir_btree_access_order_consumed(
-        &HirOrderSource::new(source, definition),
-        *iter_dir,
-        index.as_deref(),
-        constraint_refs,
-        order_target,
-        0,
-        schema,
-        EqualityPrefixScope::ConstantEquality,
-    )?;
-    Ok(consumed.consumed == order_target.columns.len())
+    let columns = order_target.columns.len();
+    let mut consumed_columns = 0;
+    for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
+        let Some(HirPlanSource::BTree(source)) = sources.get(*source_position) else {
+            return Ok(false);
+        };
+        let Some(definition) = document.source(source.internal_id) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR order proof references missing source {}",
+                source.internal_id
+            )));
+        };
+        let Some(access_method) = access_methods.get(*access_method_position) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR order proof references missing access method {access_method_position}"
+            )));
+        };
+        let AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index: false,
+            constraint_refs,
+        } = &access_method.params
+        else {
+            return Ok(false);
+        };
+        let consumed = hir_btree_access_order_consumed(
+            &HirOrderSource::new(source, definition),
+            *iter_dir,
+            index.as_deref(),
+            constraint_refs,
+            order_target,
+            consumed_columns,
+            schema,
+            EqualityPrefixScope::ConstantEquality,
+        )?;
+        if consumed.consumed == 0 {
+            return Ok(false);
+        }
+        consumed_columns += consumed.consumed;
+        if consumed_columns == columns {
+            return Ok(true);
+        }
+        // Like legacy: a later loop can supply the next ORDER BY term only
+        // if this loop never repeats the values ordered so far, or the inner
+        // loop would restart its order for each repeat.
+        let next_comes_from_later_loop =
+            order_target
+                .columns
+                .get(consumed_columns)
+                .is_some_and(|column| {
+                    plan.data[loop_position + 1..].iter().any(|(later, _)| {
+                        sources
+                            .get(*later)
+                            .is_some_and(|later| later.source() == column.source)
+                    })
+                });
+        if next_comes_from_later_loop
+            && !access_method_emits_unique_order_prefix(access_method, &consumed)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(consumed_columns == columns)
 }
 
 fn access_method_emits_unique_order_prefix(

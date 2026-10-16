@@ -303,6 +303,33 @@ fn is_with_non_null_literal_key_is_a_point_lookup_for_order_by() {
     );
 }
 
+/// HIR plans skip the sorter in the same join: the one row of t1 lets t2's
+/// rowid order supply the rest of ORDER BY.
+#[test]
+fn hir_skips_the_sorter_after_a_one_row_loop() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    conn.set_experimental_hir(true);
+
+    limbo_exec_rows(&conn, "CREATE TABLE t1(x UNIQUE)");
+    limbo_exec_rows(&conn, "CREATE TABLE t2(y)");
+    limbo_exec_rows(&conn, "INSERT INTO t1 VALUES ('a'), ('b')");
+    limbo_exec_rows(&conn, "INSERT INTO t2 VALUES (2), (1)");
+
+    let query = "SELECT t2.y FROM t1 JOIN t2 WHERE t1.x = 'a' ORDER BY t1.x, t2.rowid";
+    let plan = query_plan(&conn, query);
+    assert!(!plan.contains("USE SORTER"), "{plan}");
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![vec![Value::Integer(2)], vec![Value::Integer(1)]]
+    );
+    let plan = query_plan(
+        &conn,
+        "SELECT t2.y FROM t1 JOIN t2 WHERE t1.x IS NULL ORDER BY t1.x, t2.rowid",
+    );
+    assert!(plan.contains("USE SORTER"), "{plan}");
+}
+
 /// An `IS`-driven seek never probes the bloom filter (the probe treats a NULL
 /// key as "definitely absent", which would skip matching NULL rows), so the
 /// ephemeral autoindex build must not pay for `FilterAdd` on every row either.
