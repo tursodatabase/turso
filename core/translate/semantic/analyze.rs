@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     context::SemanticContext,
-    expr::{ExprPolicies, ExprPolicy, QueryFunctionState},
+    expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
         CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
@@ -154,6 +154,33 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
+}
+
+/// Everything analysis records, saved so that analyzing an ORDER BY term
+/// SQLite never evaluates leaves no trace.
+struct AnalyzerState<'ast> {
+    queries: Vec<Option<Query>>,
+    sources: Vec<Option<Source>>,
+    ctes: Vec<Option<Cte>>,
+    schema_programs: Vec<Option<BoundSchemaProgram>>,
+    schema_programs_in_progress: HashSet<CatalogObjectId>,
+    catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
+    cte_scopes: Vec<super::cte::CteScope<'ast>>,
+    views_in_progress: Vec<String>,
+    aggregate_counts: HashMap<QueryBlockId, usize>,
+    aggregate_hosts: Vec<Option<QueryBlockId>>,
+}
+
+/// ORDER BY terms of a block that SQLite drops before generating code.
+#[derive(Clone, Copy)]
+enum DroppedOrderTerms {
+    None,
+    /// An aggregate query without GROUP BY returns one row, so its ORDER BY
+    /// does nothing.
+    All,
+    /// Rows of the only table come out once per rowid, so terms after a
+    /// first term that is the rowid never break a tie.
+    AfterRowidOf(SourceId),
 }
 
 pub(super) struct SelectContext<'scope> {
@@ -960,6 +987,22 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         // when the block reads a FROM clause; without one it makes the block
         // an aggregate query of one row.
         let order_by_allows_aggregates = aggregate_query || from.is_none();
+        let output_windows = functions.window_function_count() > 0;
+        let dropped_order = if self.aggregate_count(functions.block()) > 0
+            && grouping
+                .as_ref()
+                .is_none_or(|grouping| grouping.keys.is_empty())
+            && !output_windows
+        {
+            DroppedOrderTerms::All
+        } else {
+            match from.as_ref().and_then(|from| self.only_rowid_source(from)) {
+                Some(source) if !aggregate_query && !output_windows => {
+                    DroppedOrderTerms::AfterRowidOf(source)
+                }
+                _ => DroppedOrderTerms::None,
+            }
+        };
         let order_by = order_by
             .map(|order_by| {
                 self.analyze_order_by(
@@ -968,6 +1011,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &outputs,
                     block_id,
                     order_by_allows_aggregates,
+                    dropped_order,
                     &mut functions,
                     policies,
                 )
@@ -1127,6 +1171,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_order_by(
         &mut self,
         syntax: &'ast [ast::SortedColumn],
@@ -1134,31 +1179,144 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outputs: &[Output],
         block: QueryBlockId,
         aggregate_query: bool,
+        dropped: DroppedOrderTerms,
         functions: &mut QueryFunctionState,
         policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let mut order_scope = scope.clone();
         order_scope.set_outputs(outputs);
-        syntax
-            .iter()
-            .map(|syntax| {
-                let resolved = match self.resolve_output_ordinal_expr(
+        let mut terms: Vec<OrderTerm> = Vec::with_capacity(syntax.len());
+        for syntax in syntax {
+            let checks = match dropped {
+                DroppedOrderTerms::None => RowValueChecks::All,
+                DroppedOrderTerms::All => RowValueChecks::None,
+                DroppedOrderTerms::AfterRowidOf(source) => {
+                    if terms
+                        .first()
+                        .is_some_and(|first| self.is_rowid_of(&first.expr, source, outputs))
+                    {
+                        RowValueChecks::ScalarSubqueries
+                    } else {
+                        RowValueChecks::All
+                    }
+                }
+            };
+            if checks != RowValueChecks::All {
+                // Like SQLite, a dropped term still has its names resolved,
+                // but checks SQLite only makes while generating code, such
+                // as the width of a row value, are skipped, and analyzing it
+                // records nothing.
+                let state = self.save_state();
+                let saved_functions = functions.clone();
+                let checked = match self.resolve_output_ordinal_expr(
                     &syntax.expr,
                     &order_scope,
                     "1st ORDER BY",
-                )? {
-                    Some(resolved) => resolved,
-                    None => self.analyze_query_expr(
-                        &syntax.expr,
-                        &order_scope,
-                        policies.order_by(aggregate_query),
-                        functions,
-                    )?,
+                ) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => self
+                        .analyze_query_expr(
+                            &syntax.expr,
+                            &order_scope,
+                            policies
+                                .with_row_value_checks(checks)
+                                .order_by(aggregate_query),
+                            functions,
+                        )
+                        .and_then(|resolved| {
+                            reject_aliased_aggregates(&resolved.expr, block, outputs)
+                        }),
+                    Err(error) => Err(error),
                 };
-                reject_aliased_aggregates(&resolved.expr, block, outputs)?;
-                Ok(order_term(syntax, resolved))
-            })
-            .collect()
+                self.restore_state(state);
+                *functions = saved_functions;
+                checked?;
+                continue;
+            }
+            let resolved = match self.resolve_output_ordinal_expr(
+                &syntax.expr,
+                &order_scope,
+                "1st ORDER BY",
+            )? {
+                Some(resolved) => resolved,
+                None => self.analyze_query_expr(
+                    &syntax.expr,
+                    &order_scope,
+                    policies.order_by(aggregate_query),
+                    functions,
+                )?,
+            };
+            reject_aliased_aggregates(&resolved.expr, block, outputs)?;
+            terms.push(order_term(syntax, resolved));
+        }
+        Ok(terms)
+    }
+
+    /// The source of a FROM clause that is a single table with rowids.
+    fn only_rowid_source(&self, from: &super::hir::From) -> Option<SourceId> {
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let source = self.source(from.first)?;
+        let SourceKind::Table(table) = &source.kind else {
+            return None;
+        };
+        table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_rowid)
+            .then_some(source.id)
+    }
+
+    /// Whether `expr`, or the result column it names, is the rowid of
+    /// `source`.
+    fn is_rowid_of(&self, expr: &Expr, source: SourceId, outputs: &[Output]) -> bool {
+        let expr = match expr {
+            Expr::Output(id) => match outputs.iter().find(|output| output.id == *id) {
+                Some(output) => &output.expr,
+                None => return false,
+            },
+            expr => expr,
+        };
+        match expr {
+            Expr::RowId(rowid_source) => *rowid_source == source,
+            Expr::Column(column) => {
+                column.source == source
+                    && self
+                        .source(source)
+                        .and_then(|source| source.columns.get(column.column))
+                        .is_some_and(|column| column.rowid_alias)
+            }
+            _ => false,
+        }
+    }
+
+    fn save_state(&self) -> AnalyzerState<'ast> {
+        AnalyzerState {
+            queries: self.queries.clone(),
+            sources: self.sources.clone(),
+            ctes: self.ctes.clone(),
+            schema_programs: self.schema_programs.clone(),
+            schema_programs_in_progress: self.schema_programs_in_progress.clone(),
+            catalog_ids: self.catalog_ids.clone(),
+            cte_scopes: self.cte_scopes.clone(),
+            views_in_progress: self.views_in_progress.clone(),
+            aggregate_counts: self.aggregate_counts.clone(),
+            aggregate_hosts: self.aggregate_hosts.clone(),
+        }
+    }
+
+    fn restore_state(&mut self, state: AnalyzerState<'ast>) {
+        self.queries = state.queries;
+        self.sources = state.sources;
+        self.ctes = state.ctes;
+        self.schema_programs = state.schema_programs;
+        self.schema_programs_in_progress = state.schema_programs_in_progress;
+        self.catalog_ids = state.catalog_ids;
+        self.cte_scopes = state.cte_scopes;
+        self.views_in_progress = state.views_in_progress;
+        self.aggregate_counts = state.aggregate_counts;
+        self.aggregate_hosts = state.aggregate_hosts;
     }
 
     pub(super) fn analyze_limit(
@@ -3624,7 +3782,7 @@ mod tests {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
             &schema,
-            "SELECT count(*) FROM items \
+            "SELECT count(*) FROM items GROUP BY value \
              ORDER BY min(score), row_number() OVER (ORDER BY id)",
         )
         .expect("aggregate SELECT accepts ORDER-BY-only aggregate and window functions");
@@ -10309,6 +10467,78 @@ mod tests {
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid chain fails");
             assert_eq!(error.to_string(), expected, "SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn order_by_terms_sqlite_drops_skip_row_value_checks() {
+        let schema = schema_with_items();
+        let root_order = |document: &HirDocument| {
+            document
+                .validate()
+                .expect("dropped ORDER BY terms leave closed HIR");
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            (query.order_by.len(), query.blocks[0].aggregate_count)
+        };
+
+        for (sql, kept) in [
+            // One row comes out, so the whole ORDER BY is dropped.
+            (
+                "SELECT count(id) FROM items ORDER BY id IN (SELECT id, value FROM items)",
+                0,
+            ),
+            ("SELECT count(id) FROM items ORDER BY (1, 2), sum(score)", 0),
+            ("SELECT count(id) FROM items ORDER BY (SELECT 1, 2)", 0),
+            // Terms after the rowid never break a tie.
+            ("SELECT value FROM items ORDER BY id, (1, 2)", 1),
+            (
+                "SELECT value FROM items ORDER BY rowid DESC, id IN (SELECT 1, 2)",
+                1,
+            ),
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(
+                root_order(&document),
+                (kept, usize::from(kept == 0)),
+                "{sql}"
+            );
+        }
+
+        for (sql, expected) in [
+            (
+                "SELECT count(id) FROM items ORDER BY (SELECT missing)",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT value FROM items ORDER BY id, (missing, 1)",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT count(id) FROM items ORDER BY (1, 2) = (1, 2, 3)",
+                "Parse error: row value misused",
+            ),
+            // SQLite checks scalar subqueries after a rowid, but not in the
+            // ORDER BY of an aggregate query without GROUP BY.
+            (
+                "SELECT value FROM items ORDER BY rowid DESC, (SELECT 1, 2)",
+                "Parse error: sub-select returns 2 columns - expected 1",
+            ),
+            // Only terms after a rowid are dropped.
+            (
+                "SELECT value FROM items ORDER BY score, (1, 2)",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT count(id) FROM items GROUP BY value ORDER BY (1, 2)",
+                "Parse error: row value misused",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("SQLite rejects it too");
+            assert_eq!(error.to_string(), expected, "{sql}");
         }
     }
 

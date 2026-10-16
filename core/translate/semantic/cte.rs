@@ -15,6 +15,7 @@ use crate::{
     LimboError, Result,
 };
 
+#[derive(Clone)]
 pub(super) struct CteScope<'ast> {
     entries: Vec<PendingCte<'ast>>,
 }
@@ -425,12 +426,14 @@ fn recursive_comparison_collations(
     Ok(collations)
 }
 
+#[derive(Clone)]
 struct PendingCte<'ast> {
     name: String,
     syntax: &'ast ast::CommonTableExpr,
     state: CteState,
 }
 
+#[derive(Clone)]
 enum CteState {
     Unbound,
     BindingSeed(Option<CteId>),
@@ -439,6 +442,7 @@ enum CteState {
     Failed(String),
 }
 
+#[derive(Clone)]
 struct RecursiveBinding {
     id: CteId,
     columns: Vec<CteColumn>,

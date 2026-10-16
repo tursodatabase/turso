@@ -38,6 +38,20 @@ pub(crate) struct ExprPolicy {
 pub(crate) struct ExprPolicies {
     dqs_dml: DoubleQuotedDml,
     trigger: Option<TriggerExprContext>,
+    row_values: RowValueChecks,
+}
+
+/// Which row value widths are checked. SQLite checks some of them only
+/// while generating code, so an ORDER BY term it drops skips them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowValueChecks {
+    All,
+    /// Only the width of scalar subqueries, as in the ORDER BY terms SQLite
+    /// drops after a rowid.
+    ScalarSubqueries,
+    /// None, as in the ORDER BY SQLite drops from an aggregate query
+    /// without GROUP BY.
+    None,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,7 +233,13 @@ impl ExprPolicies {
         Self {
             dqs_dml,
             trigger: None,
+            row_values: RowValueChecks::All,
         }
+    }
+
+    pub(super) const fn with_row_value_checks(mut self, checks: RowValueChecks) -> Self {
+        self.row_values = checks;
+        self
     }
 
     pub(super) fn trigger(dqs_dml: DoubleQuotedDml, environment: &hir::TriggerEnvironment) -> Self {
@@ -229,6 +249,7 @@ impl ExprPolicies {
                 new_source: environment.new_source,
                 old_source: environment.old_source,
             }),
+            row_values: RowValueChecks::All,
         }
     }
 
@@ -297,6 +318,15 @@ enum FrameValue {
 }
 
 impl FrameValue {
+    /// A value standing for this one in an expression that is never
+    /// evaluated: the first column of a row subquery.
+    fn into_any_value(self) -> ResolvedScopeExpr {
+        match self {
+            Self::Scalar(value) => value,
+            Self::RowSubquery { mut components, .. } => components.swap_remove(0),
+        }
+    }
+
     fn into_scalar(self) -> Result<ResolvedScopeExpr> {
         match self {
             Self::Scalar(value) => Ok(value),
@@ -326,6 +356,7 @@ struct ExprOperand {
     components: ExprChildren,
 }
 
+#[derive(Clone)]
 pub(super) struct QueryFunctionState {
     block: hir::QueryBlockId,
     window_function_count: usize,
@@ -1626,6 +1657,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             };
             match frames.last_mut() {
                 Some(parent) => parent.resolved_children.push(resolved),
+                None if policy.policies.row_values == RowValueChecks::None => {
+                    return Ok(resolved.into_any_value());
+                }
                 None => return resolved.into_scalar(),
             }
         }
@@ -1720,8 +1754,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::InTable { not, rhs, args, .. } => {
                 let query =
                     self.analyze_named_relation_query(rhs, args, owner.query(), scope, policies)?;
-                self.build_in_query(scalar_frame_children(children)?, query, *not)
-                    .map(FrameValue::Scalar)
+                self.build_in_query(
+                    scalar_frame_children(children)?,
+                    query,
+                    *not,
+                    policies.row_values,
+                )
+                .map(FrameValue::Scalar)
             }
             _ => Err(LimboError::InternalError(
                 "subquery expression builder received a non-subquery".to_string(),
@@ -1739,7 +1778,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policies: ExprPolicies,
     ) -> Result<ResolvedScopeExpr> {
         let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
-        self.build_in_query(lhs, query, negated)
+        self.build_in_query(lhs, query, negated, policies.row_values)
     }
 
     fn build_in_query(
@@ -1747,6 +1786,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         lhs: ExprChildren,
         query: hir::QueryId,
         negated: bool,
+        row_values: RowValueChecks,
     ) -> Result<ResolvedScopeExpr> {
         if lhs.is_empty() {
             return Err(LimboError::InternalError(
@@ -1758,6 +1798,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?
             .output
             .len();
+        // SQLite checks the widths only while generating code.
+        if output_width != lhs.len() && row_values != RowValueChecks::All {
+            return Ok(lhs.into_iter().next().expect("IN query has a left value"));
+        }
         if output_width != lhs.len() {
             crate::bail_parse_error!(
                 "sub-select returns {output_width} columns - expected {}",
@@ -2090,14 +2134,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 not,
                 ..
             } => self.build_between_expr(lhs, start, end, *not, children),
-            _ => self.build_expr(
-                syntax,
-                scalar_frame_children(children)?,
-                scope,
-                policy,
-                functions,
-                expected_type,
-            ),
+            _ => {
+                let children = if policy.policies.row_values == RowValueChecks::None {
+                    children
+                        .into_iter()
+                        .map(FrameValue::into_any_value)
+                        .collect()
+                } else {
+                    scalar_frame_children(children)?
+                };
+                self.build_expr(syntax, children, scope, policy, functions, expected_type)
+            }
         }
     }
 
@@ -2431,6 +2478,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
                 Ok(inner)
+            }
+            // A row value that is never evaluated is not checked, as in
+            // SQLite, which only rejects it while generating code.
+            ast::Expr::Parenthesized(expressions)
+                if policy.policies.row_values != RowValueChecks::All =>
+            {
+                expect_no_expr_children(children)?;
+                let mut first = None;
+                for expression in expressions {
+                    let value = self.analyze_resolved_expr_with_functions(
+                        expression, scope, policy, functions, None,
+                    )?;
+                    first.get_or_insert(value);
+                }
+                first.ok_or_else(|| {
+                    LimboError::InternalError("row value has no components".to_string())
+                })
             }
             ast::Expr::Parenthesized(_) => crate::bail_parse_error!("row value misused"),
             ast::Expr::Variable(variable) => {
