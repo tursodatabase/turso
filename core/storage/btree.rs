@@ -203,12 +203,12 @@ struct DestroyInfo {
 #[derive(Debug)]
 enum DeleteState {
     Start,
-    DeterminePostBalancingSeekKey,
-    LoadPage {
-        post_balancing_seek_key: Option<CursorContext>,
-    },
-    FindCell {
-        post_balancing_seek_key: Option<CursorContext>,
+    LoadPage,
+    FindCell,
+    DeterminePostBalancingSeekKey {
+        cell_idx: usize,
+        cell: BTreeCell,
+        original_child_pointer: Option<u32>,
     },
     ClearOverflowPages {
         cell_idx: usize,
@@ -6940,9 +6940,9 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     /// Delete state machine flow:
     /// 1. Start -> check if the rowid to be delete is present in the page or not. If not we early return
-    /// 2. DeterminePostBalancingSeekKey -> determine the key to seek to after balancing.
-    /// 3. LoadPage -> load the page.
-    /// 4. FindCell -> find the cell to be deleted in the page.
+    /// 2. LoadPage -> load the page.
+    /// 3. FindCell -> find the cell to be deleted in the page.
+    /// 4. DeterminePostBalancingSeekKey -> if the deletion will cause balancing, determine the key to seek to after balancing.
     /// 5. ClearOverflowPages -> Clear the overflow pages if there are any before dropping the cell, then if we are in a leaf page we just drop the cell in place.
     /// if we are in interior page, we need to rotate keys in order to replace current cell (InteriorNodeReplacement).
     /// 6. InteriorNodeReplacement -> we copy the left subtree leaf node into the deleted interior node's place.
@@ -6987,51 +6987,14 @@ impl CursorTrait for BTreeCursor {
                         return Ok(IOResult::Done(()));
                     }
 
-                    self.state = CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey);
+                    self.state = CursorState::Delete(DeleteState::LoadPage);
                 }
 
-                DeleteState::DeterminePostBalancingSeekKey => {
-                    // FIXME: skip this work if we determine deletion wont result in balancing
-                    // Right now we calculate the key every time for simplicity/debugging
-                    // since it won't affect correctness which is more important
-                    let page = self.stack.top_ref();
-                    let target_key = if page.is_index()? {
-                        let record = match return_if_io!(self.record()) {
-                            Some(record) => record.clone(),
-                            None => unreachable!("there should've been a record"),
-                        };
-                        CursorContext {
-                            key: CursorContextKey::IndexKeyRowId(
-                                ImmutableRecordRef::from_owned_record(record),
-                            ),
-                            seek_op: SeekOp::GE { eq_only: true },
-                        }
-                    } else {
-                        let Some(rowid) = return_if_io!(self.rowid()) else {
-                            panic!("cursor should be pointing to a record with a rowid");
-                        };
-                        CursorContext {
-                            key: CursorContextKey::TableRowId(rowid),
-                            seek_op: SeekOp::GE { eq_only: true },
-                        }
-                    };
-
-                    self.state = CursorState::Delete(DeleteState::LoadPage {
-                        post_balancing_seek_key: Some(target_key),
-                    });
+                DeleteState::LoadPage => {
+                    self.state = CursorState::Delete(DeleteState::FindCell);
                 }
 
-                DeleteState::LoadPage {
-                    post_balancing_seek_key,
-                } => {
-                    self.state = CursorState::Delete(DeleteState::FindCell {
-                        post_balancing_seek_key: post_balancing_seek_key.take(),
-                    });
-                }
-
-                DeleteState::FindCell {
-                    post_balancing_seek_key,
-                } => {
+                DeleteState::FindCell => {
                     let page = self.stack.top_ref();
                     let cell_idx = self.stack.current_cell_index() as usize;
                     let contents = page.get_contents();
@@ -7057,11 +7020,54 @@ impl CursorTrait for BTreeCursor {
                         _ => None,
                     };
 
+                    self.state = CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey {
+                        cell_idx,
+                        cell,
+                        original_child_pointer,
+                    });
+                }
+
+                DeleteState::DeterminePostBalancingSeekKey { cell_idx, .. } => {
+                    let cell_idx = *cell_idx;
+                    let page = self.stack.top_ref();
+                    let target_key =
+                        if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)?
+                        {
+                            None
+                        } else if page.is_index()? {
+                            let record = match return_if_io!(self.record()) {
+                                Some(record) => record.clone(),
+                                None => unreachable!("there should've been a record"),
+                            };
+                            Some(CursorContext {
+                                key: CursorContextKey::IndexKeyRowId(
+                                    ImmutableRecordRef::from_owned_record(record),
+                                ),
+                                seek_op: SeekOp::GE { eq_only: true },
+                            })
+                        } else {
+                            let Some(rowid) = return_if_io!(self.rowid()) else {
+                                panic!("cursor should be pointing to a record with a rowid");
+                            };
+                            Some(CursorContext {
+                                key: CursorContextKey::TableRowId(rowid),
+                                seek_op: SeekOp::GE { eq_only: true },
+                            })
+                        };
+
+                    let CursorState::Delete(DeleteState::DeterminePostBalancingSeekKey {
+                        cell_idx,
+                        cell,
+                        original_child_pointer,
+                    }) = std::mem::replace(&mut self.state, CursorState::None)
+                    else {
+                        unreachable!("expected determine post balancing seek key state");
+                    };
                     self.state = CursorState::Delete(DeleteState::ClearOverflowPages {
                         cell_idx,
                         cell,
                         original_child_pointer,
-                        post_balancing_seek_key: post_balancing_seek_key.take(),
+                        post_balancing_seek_key: target_key,
                     });
                 }
 
@@ -10569,6 +10575,21 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
     ((usable_space - 12) * 32 / 255) - 23
 }
 
+/// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
+/// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
+fn delete_may_need_balancing(
+    page: &PageContent,
+    cell_idx: usize,
+    usable_space: usize,
+) -> Result<bool> {
+    if !page.is_leaf() || page.cell_count() == 1 || !page.overflow_cells.is_empty() {
+        return Ok(true);
+    }
+    let (_, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
+    let free_space_after_delete = compute_free_space(page, usable_space)? + cell_len + 2;
+    Ok(free_space_after_delete * 3 > usable_space * 2)
+}
+
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
 #[inline]
@@ -12451,6 +12472,56 @@ mod tests {
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page_contents, i, &cell.payload);
         }
+    }
+
+    #[test]
+    fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
+        let (db, _temp_dir) = get_database();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let usable_space = 4096;
+        let mut rng = ChaCha8Rng::seed_from_u64(1700);
+        let mut predicted_no_balancing = 0;
+        let mut predicted_balancing = 0;
+
+        for _ in 0..1000 {
+            let page = get_page(2);
+            let page_contents = page.get_contents();
+            let mut rowid = 0;
+            loop {
+                let blob_len = rng.random_range(1..300);
+                if compute_free_space(page_contents, usable_space).unwrap() < blob_len + 20 {
+                    break;
+                }
+                let regs = &[Register::Value(Value::from_blob(vec![0xab; blob_len]))];
+                let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+                add_record(
+                    rowid,
+                    page_contents.cell_count(),
+                    page.clone(),
+                    record,
+                    &conn,
+                );
+                rowid += 1;
+            }
+
+            while page_contents.cell_count() > 1 {
+                let cell_idx = rng.random_range(0..page_contents.cell_count());
+                let predicted =
+                    delete_may_need_balancing(page_contents, cell_idx, usable_space).unwrap();
+                drop_cell(page_contents, cell_idx, usable_space).unwrap();
+                let free_space = compute_free_space(page_contents, usable_space).unwrap();
+                assert_eq!(predicted, free_space * 3 > usable_space * 2);
+                if predicted {
+                    predicted_balancing += 1;
+                } else {
+                    predicted_no_balancing += 1;
+                }
+            }
+            assert!(delete_may_need_balancing(page_contents, 0, usable_space).unwrap());
+        }
+
+        assert!(predicted_no_balancing > 0);
+        assert!(predicted_balancing > 0);
     }
 
     #[test]
