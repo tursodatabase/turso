@@ -1,7 +1,7 @@
 //! Runtime destination preparation for resolved HIR queries.
 
 use std::ops::ControlFlow;
-use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
+use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, SortOrder};
 
 use crate::translate::collate::CollationSeq;
 use crate::{
@@ -1022,8 +1022,9 @@ pub(crate) fn emit_planned_query_body(
     // order, so a scan that already follows ORDER BY needs no sorter.
     let scan_order_is_output_order =
         hir_grouping(block).is_none() && block.aggregate_count == 0 && block.windows.is_empty();
-    let sort_elided =
-        exists || (scan_order_is_output_order && planned_query.blocks[0].order_sort_elided);
+    let sort_elided = exists
+        || (scan_order_is_output_order && planned_query.blocks[0].order_sort_elided)
+        || hir_window_rows_follow_order_by(document, query, block)?;
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;
@@ -1054,6 +1055,51 @@ pub(crate) fn emit_planned_query_body(
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
+}
+
+/// Whether rows leave the block's windows already in ORDER BY order. The
+/// outermost window layer returns rows sorted by its PARTITION BY and then
+/// its ORDER BY, so like legacy and SQLite, an ORDER BY that starts those
+/// keys needs no sorter, and LIMIT can stop before later rows are computed.
+fn hir_window_rows_follow_order_by(
+    document: &HirDocument,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+) -> Result<bool> {
+    let Some(window) = block.windows.first() else {
+        return Ok(false);
+    };
+    if query.order_by.is_empty() {
+        return Ok(false);
+    }
+    let plan = super::window::plan_hir_window_buffer(query, block, window.id)?;
+    let keys = plan.input_sort_keys();
+    if keys.len() < query.order_by.len() {
+        return Ok(false);
+    }
+    let nulls_first = |order: SortOrder, nulls: Option<NullsOrder>| match nulls {
+        Some(NullsOrder::First) => true,
+        Some(NullsOrder::Last) => false,
+        None => order == SortOrder::Asc,
+    };
+    Ok(query.order_by.iter().zip(&keys).all(|(term, key)| {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(id) = expression {
+            match document.output(*id) {
+                Some(output) => expression = &output.expr,
+                None => return false,
+            }
+        }
+        expression.equivalent(key.expression)
+            && term.order == key.order
+            && nulls_first(term.order, term.nulls) == nulls_first(key.order, key.nulls)
+            && term
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default()
+                == key.collation.unwrap_or_default()
+    }))
 }
 
 fn emit_planned_query_block(
@@ -8212,7 +8258,7 @@ pub(super) mod tests {
                         == [(
                             SortOrder::Desc,
                             Some(CollationSeq::NoCase),
-                            Some(turso_parser::ast::NullsOrder::First),
+                            Some(NullsOrder::First),
                         )]
                 }
                 _ => false,
@@ -8289,11 +8335,7 @@ pub(super) mod tests {
             window_sorter.order_collations_nulls,
             [
                 (SortOrder::Asc, Some(CollationSeq::NoCase), None),
-                (
-                    SortOrder::Desc,
-                    None,
-                    Some(turso_parser::ast::NullsOrder::First)
-                ),
+                (SortOrder::Desc, None, Some(NullsOrder::First)),
             ]
         );
         let table_scan = insn_positions(&program, |insn| matches!(insn, Insn::Next { .. }));
