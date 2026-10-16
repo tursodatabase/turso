@@ -652,3 +652,59 @@ fn hir_min_and_max_stop_at_the_first_value_an_index_returns() {
         .expect("MAX steps its aggregate");
     assert_eq!(opcodes[step + 1], "Goto", "{opcodes:?}");
 }
+
+#[test]
+fn hir_seek_keys_from_a_null_row_skip_the_seek() {
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in [
+        "CREATE TABLE a(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, aid)",
+        "CREATE TABLE c(x INTEGER, y)",
+        "CREATE INDEX cx ON c(x)",
+        "INSERT INTO a VALUES (1), (2)",
+        "INSERT INTO b VALUES (10, 1)",
+        "INSERT INTO c VALUES (NULL, 'null'), (10, 'ten')",
+        "INSERT INTO c WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+         SELECT i, 'filler' FROM n",
+        "ANALYZE",
+    ] {
+        hir.execute(statement).unwrap();
+    }
+    // b.id is a rowid, but b's NULL row for a = 2 makes it NULL. The range
+    // seek on c must not start from that NULL key; legacy does and returns
+    // every row of c above it.
+    let sql = "SELECT a.id, b.id, c.y FROM a \
+               LEFT JOIN b ON b.id = a.id + 9 \
+               LEFT JOIN c ON c.x > b.id AND c.x < 102";
+    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter().any(|row| matches!(
+            row.get(3),
+            Some(rusqlite::types::Value::Text(detail)) if detail.starts_with("SEARCH c USING INDEX cx")
+        )),
+        "{plan:?}"
+    );
+    let filler = || rusqlite::types::Value::Text("filler".to_string());
+    assert_eq!(
+        limbo_exec_rows(&hir, sql),
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+                filler(),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+                filler(),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null,
+            ],
+        ]
+    );
+}

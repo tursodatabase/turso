@@ -519,6 +519,25 @@ fn open_hir_in_seek_source_cursor(
     }
 }
 
+/// Whether no outer join can give `source` a NULL row: it sits directly in
+/// its block's FROM, not inside parentheses, and no LEFT, RIGHT or FULL JOIN
+/// can NULL-extend it.
+fn source_is_never_null_extended(document: &HirDocument, source: SourceId) -> bool {
+    let Some(hir::SourceOwner::QueryBlock(block)) =
+        document.source(source).map(|source| source.owner)
+    else {
+        return false;
+    };
+    let Some(from) = document
+        .query(block.query)
+        .and_then(|query| query.blocks.get(block.index))
+        .and_then(|block| block.from.as_ref())
+    else {
+        return false;
+    };
+    from.source_position(source).is_some() && !from.outer_join_may_null_extend(source)
+}
+
 struct HirSeekExpressionLowering<'a> {
     document: &'a HirDocument,
     source: &'a hir::Source,
@@ -536,16 +555,36 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
     }
 
     fn is_nonnull(&self, expression: &hir::Expr) -> bool {
-        matches!(
-            expression,
+        match expression {
             hir::Expr::Literal(
                 Literal::Numeric(_)
-                    | Literal::String(_)
-                    | Literal::Blob(_)
-                    | Literal::True
-                    | Literal::False
-            )
-        )
+                | Literal::String(_)
+                | Literal::Blob(_)
+                | Literal::True
+                | Literal::False,
+            ) => true,
+            hir::Expr::RowId(source) => source_is_never_null_extended(self.document, *source),
+            hir::Expr::Column(column) => {
+                let Some(source) = self.document.source(column.source) else {
+                    return false;
+                };
+                let rowid_alias = source
+                    .columns
+                    .get(column.column)
+                    .is_some_and(|column| column.rowid_alias);
+                let not_null = match &source.kind {
+                    hir::SourceKind::Table(table) => table
+                        .value()
+                        .columns()
+                        .get(column.column)
+                        .is_some_and(|column| column.notnull()),
+                    _ => false,
+                };
+                (rowid_alias || not_null)
+                    && source_is_never_null_extended(self.document, column.source)
+            }
+            _ => false,
+        }
     }
 
     fn is_null_matching(
@@ -556,10 +595,29 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
         operator == turso_parser::ast::Operator::Is && !self.is_nonnull(expression)
     }
 
-    fn affinity(&self, affinity: Affinity, _expression: &hir::Expr) -> Affinity {
-        // HIR constraint planning already removes affinity work that cannot
-        // change the resolved key expression.
-        affinity
+    fn affinity(&self, affinity: Affinity, expression: &hir::Expr) -> Affinity {
+        // Like legacy, skip the affinity a key value already has: a number
+        // under numeric affinity, text under TEXT, any blob, and a rowid.
+        let unchanged = match expression {
+            hir::Expr::Literal(Literal::Numeric(_)) => affinity.is_numeric(),
+            hir::Expr::Literal(Literal::String(_)) => affinity == Affinity::Text,
+            hir::Expr::Literal(Literal::Blob(_)) => true,
+            hir::Expr::RowId(_) => affinity.is_numeric(),
+            hir::Expr::Column(column) => {
+                affinity.is_numeric()
+                    && self
+                        .document
+                        .source(column.source)
+                        .and_then(|source| source.columns.get(column.column))
+                        .is_some_and(|column| column.rowid_alias)
+            }
+            _ => false,
+        };
+        if unchanged || matches!(affinity, Affinity::Blob | Affinity::None) {
+            Affinity::Blob
+        } else {
+            affinity
+        }
     }
 
     fn encode_index_keys(
@@ -6078,22 +6136,33 @@ fn hir_order_output_position(block: &hir::QueryBlock, expression: &hir::Expr) ->
         .position(|output| expression.equivalent(&output.expr))
 }
 
+/// Insert one row into the ORDER BY sorter. `outputs_start` holds the
+/// row's outputs side by side; without it they are already in their sorter
+/// columns.
 fn emit_hir_sorter_insert(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     outputs: &[hir::Output],
-    output_start: usize,
+    outputs_start: Option<usize>,
     sorter: &HirSorterOutput<'_>,
     inputs: &[super::expr::ExprRegisterInput<'_>],
 ) -> Result<()> {
+    let output_register = |output: usize| match outputs_start {
+        Some(start) => start + output,
+        None => sorter.row + sorter.output_columns[output],
+    };
     for (key, (term, source)) in sorter.order_by.iter().zip(&sorter.key_sources).enumerate() {
         let target = sorter.row + key;
         match source {
-            HirSortKeySource::Output(output) => program.emit_insn(Insn::Copy {
-                src_reg: output_start + output,
-                dst_reg: target,
-                extra_amount: 0,
-            }),
+            HirSortKeySource::Output(output) => {
+                if output_register(*output) != target {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: output_register(*output),
+                        dst_reg: target,
+                        extra_amount: 0,
+                    });
+                }
+            }
             HirSortKeySource::EncodedOutput(output) => emit_hir_sort_key(
                 program,
                 document,
@@ -6113,11 +6182,11 @@ fn emit_hir_sorter_insert(
         }
     }
     for (output, column) in sorter.output_columns.iter().enumerate() {
-        if *column < sorter.order_by.len() {
+        if *column < sorter.order_by.len() || outputs_start.is_none() {
             continue;
         }
         program.emit_insn(Insn::Copy {
-            src_reg: output_start + output,
+            src_reg: output_register(output),
             dst_reg: sorter.row + column,
             extra_amount: 0,
         });
@@ -6463,20 +6532,30 @@ fn emit_query_row_with_inputs<'expr>(
             outputs.len()
         )));
     }
+    // Without DISTINCT, which hashes the outputs side by side, a sorted row
+    // computes each output straight into its sorter column, as legacy does.
+    let sorter_in_place = match output.target {
+        HirRowTarget::Sorter(sorter) if output.distinct.is_none() => Some(sorter),
+        _ => None,
+    };
     if !output.needs_values() {
         for expression in expressions {
             super::expr::register_parameters(program, expression);
         }
     } else {
         for (position, expression) in expressions.enumerate() {
+            let register = match sorter_in_place {
+                Some(sorter) => sorter.row + sorter.output_columns[position],
+                None => start + position,
+            };
             super::expr::translate_expr_with_inputs_no_constant_opt(
                 program,
                 document,
                 expression,
-                start + position,
+                register,
                 inputs.values,
             )?;
-            program.bind_output(outputs[position].id, start + position);
+            program.bind_output(outputs[position].id, register);
         }
     }
 
@@ -6512,7 +6591,15 @@ fn emit_query_row_with_inputs<'expr>(
             );
         }
         HirRowTarget::Sorter(sorter) => {
-            emit_hir_sorter_insert(program, document, outputs, start, sorter, inputs.sort_keys)?;
+            let outputs_start = sorter_in_place.is_none().then_some(start);
+            emit_hir_sorter_insert(
+                program,
+                document,
+                outputs,
+                outputs_start,
+                sorter,
+                inputs.sort_keys,
+            )?;
         }
         HirRowTarget::Window(_) => {
             unreachable!("window input rows return before output evaluation")
