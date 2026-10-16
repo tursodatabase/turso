@@ -893,6 +893,34 @@ fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+/// HIR rejects too many joined tables and too many result columns, as legacy
+/// does.
+fn hir_checks_join_and_column_limits(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for i in 0..64 {
+        conn.execute(format!("CREATE TABLE t{i} (id INTEGER)"))
+            .unwrap();
+    }
+    let joins = (1..64)
+        .map(|i| format!(" JOIN t{i} ON t{i}.id = t0.id"))
+        .collect::<String>();
+    let Err(LimboError::ParseError(error)) = conn.prepare(format!("SELECT * FROM t0{joins}"))
+    else {
+        panic!("64 joined tables must be rejected");
+    };
+    assert!(
+        error.contains("Only up to 63 tables can be joined"),
+        "{error}"
+    );
+    let columns = std::iter::repeat_n("1", 2001).collect::<Vec<_>>().join(",");
+    let Err(LimboError::ParseError(error)) = conn.prepare(format!("SELECT {columns}")) else {
+        panic!("2001 result columns must be rejected");
+    };
+    assert!(error.contains("too many columns"), "{error}");
+}
+
+#[turso_macros::test]
 /// Test that we can create and select from a table with 1000 columns.
 fn test_many_columns(tmp_db: TempDatabase) {
     let mut create_sql = String::from("CREATE TABLE test (");

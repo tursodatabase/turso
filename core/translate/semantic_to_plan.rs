@@ -225,6 +225,10 @@ struct HirQueryEstimate {
     cost: Cost,
 }
 
+/// The most result columns a query block may have, SQLite's default
+/// SQLITE_MAX_COLUMN.
+const MAX_RESULT_COLUMNS: usize = 2000;
+
 /// State shared while one HIR document is converted into plan nodes.
 pub(crate) struct HirPlanContext<'a> {
     document: &'a HirDocument,
@@ -944,6 +948,10 @@ impl<'a> HirPlanContext<'a> {
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirQueryBlockPlan> {
+        // Like legacy and SQLite's SQLITE_MAX_COLUMN.
+        if block.outputs.len() > MAX_RESULT_COLUMNS {
+            crate::bail_parse_error!("too many columns in result set");
+        }
         let query = self
             .document
             .query(block.id.query)
@@ -970,6 +978,13 @@ impl<'a> HirPlanContext<'a> {
         }
 
         let mut input = self.query_block_input(block, order_by, &usage)?;
+        // Join planning tracks tables in a 64-bit mask.
+        if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
+            crate::bail_parse_error!(
+                "Only up to {} tables can be joined",
+                crate::translate::plan::TableReferences::MAX_JOINED_TABLES
+            );
+        }
         let where_start = input.where_start;
         if let Some(plan) = self.plan_index_method(block, order_by, limit, &mut input)? {
             return Ok(plan);
