@@ -2759,3 +2759,31 @@ test datetime-accepts-vertical-tab-whitespace {
 expect {
     '2024-01-01'|'2000-01-01 12:00:00'|'2023-02-25'|'-4713-11-24 12:00:00'|'2024-01-01'|'2024-01-01 12:00:00'|'2024-01-01 11:00:00'
 }
+
+test datetime-modifier-rejects-text-after-unit-or-date {
+    SELECT quote(date('2024-01-01', '+1 day ')), quote(date('2024-01-01', '+1 day x')), quote(date('2024-01-01', '+1 month ')), quote(date('2024-01-01', '+0001-00-01 ')), quote(date(0, '+1 day ')), quote(date('2024-01-01', '+1 day' || char(9))), quote(date('2024-01-01', '+1 day' || char(10))), quote(date('2024-01-01', '+0001-00-01' || char(9))), quote(datetime('2024-01-01', '+0001-00-01  12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-allows-whitespace-inside {
+    SELECT quote(date('2024-01-01', '+1  day')), quote(date('2024-01-01', '+1' || char(9) || 'days')), quote(datetime('2024-01-01', '+0001-00-01 12:00 ')), quote(datetime('2024-01-01', '+0001-00-01' || char(9) || '12:00'));
+}
+expect {
+    '2024-01-02'|'2024-01-02'|'2025-01-02 12:00:00'|'2025-01-02 12:00:00'
+}
+
+test datetime-modifier-date-offset-requires-sign {
+    SELECT quote(datetime('2024-03-15 10:20:30', '0001-00-01')), quote(datetime('2024-03-15 10:20:30', '0001-00-01 12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(9) || '12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(10) || '12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-date-offset-five-digit-year {
+    SELECT quote(datetime('2024-03-15 10:20:30', '+00001-00-01')), quote(datetime('2024-03-15 10:20:30', '-00001-02-03 01:00')), quote(datetime('2024-03-15 10:20:30', '+000001-00-01'));
+}
+expect {
+    '2025-03-16 10:20:30'|'2023-01-12 09:20:30'|NULL
+}

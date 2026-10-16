@@ -646,7 +646,6 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
 }
 
 fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
-    let z = z.trim();
     let is_neg = z.starts_with('-');
     let sign = if is_neg { -1 } else { 1 };
 
@@ -656,28 +655,15 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
         z
     };
 
-    // Case 1: YYYY-MM-DD Arithmetic
-    if clean_z.len() >= 10
-        && clean_z.as_bytes().get(4) == Some(&b'-')
-        && clean_z.as_bytes().get(7) == Some(&b'-')
-        && clean_z.is_char_boundary(4)
-        && clean_z.is_char_boundary(5)
-        && clean_z.is_char_boundary(7)
-        && clean_z.is_char_boundary(8)
-        && clean_z.is_char_boundary(10)
-    {
-        let y_res = get_digits(&clean_z[0..4], 4, 0, 9999);
-        let m_res = get_digits(&clean_z[5..7], 2, 0, 11);
-        let d_res = get_digits(&clean_z[8..10], 2, 0, 30);
-
-        if let (Some((y, _)), Some((m, _)), Some((d, _))) = (y_res, m_res, d_res) {
-            let rem = &clean_z[10..];
+    // Case 1: (+|-)YYYY-MM-DD Arithmetic
+    if z.starts_with(['+', '-']) {
+        if let Some((y, m, d, rem)) = parse_ymd_offset(clean_z) {
             let mut valid_format = true;
             let mut time_str = None;
 
             if !rem.is_empty() {
-                if rem.starts_with(' ') {
-                    time_str = Some(rem.trim_start());
+                if is_space(rem.as_bytes()[0]) {
+                    time_str = Some(&rem[1..]);
                 } else {
                     valid_format = false;
                 }
@@ -750,115 +736,120 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     }
 
     // Case 3: NNN Units
-    let mut parts = z.split_whitespace();
-    if let Some(val_str) = parts.next() {
+    let is_sqlite_space = |c: char| u8::try_from(c).is_ok_and(is_space);
+    if let Some((val_str, rest)) = z.split_once(is_sqlite_space) {
         if let Ok(val) = val_str.parse::<f64>() {
-            if let Some(unit) = parts.next() {
-                let limit_check = |v: f64, limit: f64| v.abs() < limit;
-                if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
-                    if !limit_check(val, 5373485.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_jd();
-                    let ms = val * 86400000.0;
-                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    p.n_floor = 0;
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
-                    if !limit_check(val, 1.2897e+11) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_jd();
-                    let ms = val * 3600000.0;
-                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    p.n_floor = 0;
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("minute")
-                    || unit.eq_ignore_ascii_case("minutes")
-                {
-                    if !limit_check(val, 7.7379e+12) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_jd();
-                    let ms = val * 60000.0;
-                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    p.n_floor = 0;
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("second")
-                    || unit.eq_ignore_ascii_case("seconds")
-                {
-                    if !limit_check(val, 4.6427e+14) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_jd();
-                    let ms = val * 1000.0;
-                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    p.n_floor = 0;
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months")
-                {
-                    if !limit_check(val, 176546.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_ymd_hms();
-                    let int_months = val as i64;
-                    let frac_months = val - int_months as f64;
-
-                    let total_months = (p.m as i64) + int_months;
-                    let x = if total_months > 0 {
-                        (total_months - 1) / 12
-                    } else {
-                        (total_months - 12) / 12
-                    };
-                    p.y = p.y.wrapping_add(x as i32);
-                    p.m = (total_months - x * 12) as i32;
-
-                    p.compute_floor();
-                    p.valid_jd = false;
-                    p.compute_jd();
-
-                    if frac_months.abs() > f64::EPSILON {
-                        let ms = frac_months * 30.0 * JD_TO_MS as f64;
-                        let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                        p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    }
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
-                } else if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-                    if !limit_check(val, 14713.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
-                    }
-                    p.compute_ymd_hms();
-                    let int_years = val as i64;
-                    let frac_years = val - int_years as f64;
-
-                    p.y = p.y.wrapping_add(int_years as i32);
-
-                    p.compute_floor();
-                    p.valid_jd = false;
-                    p.compute_jd();
-
-                    if frac_years.abs() > f64::EPSILON {
-                        let ms = frac_years * 365.0 * JD_TO_MS as f64;
-                        let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
-                        p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
-                    }
-                    p.clear_ymd_hms_tz();
-                    return Ok(());
+            let unit = rest.trim_start_matches(is_sqlite_space);
+            let limit_check = |v: f64, limit: f64| v.abs() < limit;
+            if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
+                if !limit_check(val, 5373485.0) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                 }
+                p.compute_jd();
+                let ms = val * 86400000.0;
+                let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                p.n_floor = 0;
+                p.clear_ymd_hms_tz();
+                return Ok(());
+            } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
+                if !limit_check(val, 1.2897e+11) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                }
+                p.compute_jd();
+                let ms = val * 3600000.0;
+                let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                p.n_floor = 0;
+                p.clear_ymd_hms_tz();
+                return Ok(());
+            } else if unit.eq_ignore_ascii_case("minute") || unit.eq_ignore_ascii_case("minutes") {
+                if !limit_check(val, 7.7379e+12) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                }
+                p.compute_jd();
+                let ms = val * 60000.0;
+                let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                p.n_floor = 0;
+                p.clear_ymd_hms_tz();
+                return Ok(());
+            } else if unit.eq_ignore_ascii_case("second") || unit.eq_ignore_ascii_case("seconds") {
+                if !limit_check(val, 4.6427e+14) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                }
+                p.compute_jd();
+                let ms = val * 1000.0;
+                let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                p.n_floor = 0;
+                p.clear_ymd_hms_tz();
+                return Ok(());
+            } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
+                if !limit_check(val, 176546.0) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                }
+                p.compute_ymd_hms();
+                let int_months = val as i64;
+                let frac_months = val - int_months as f64;
+
+                let total_months = (p.m as i64) + int_months;
+                let x = if total_months > 0 {
+                    (total_months - 1) / 12
+                } else {
+                    (total_months - 12) / 12
+                };
+                p.y = p.y.wrapping_add(x as i32);
+                p.m = (total_months - x * 12) as i32;
+
+                p.compute_floor();
+                p.valid_jd = false;
+                p.compute_jd();
+
+                if frac_months.abs() > f64::EPSILON {
+                    let ms = frac_months * 30.0 * JD_TO_MS as f64;
+                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                }
+                p.clear_ymd_hms_tz();
+                return Ok(());
+            } else if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
+                if !limit_check(val, 14713.0) {
+                    return Err(InvalidModifier(format!("Modifier out of range: {z}")));
+                }
+                p.compute_ymd_hms();
+                let int_years = val as i64;
+                let frac_years = val - int_years as f64;
+
+                p.y = p.y.wrapping_add(int_years as i32);
+
+                p.compute_floor();
+                p.valid_jd = false;
+                p.compute_jd();
+
+                if frac_years.abs() > f64::EPSILON {
+                    let ms = frac_years * 365.0 * JD_TO_MS as f64;
+                    let rounder = if ms < 0.0 { -0.5 } else { 0.5 };
+                    p.i_jd = p.i_jd.wrapping_add((ms + rounder) as i64);
+                }
+                p.clear_ymd_hms_tz();
+                return Ok(());
             }
         }
     }
 
     Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
+}
+
+fn parse_ymd_offset(z: &str) -> Option<(i32, i32, i32, &str)> {
+    let year_digits = z
+        .bytes()
+        .position(|b| b == b'-')
+        .filter(|&n| n == 4 || n == 5)?;
+    let (y, rest) = get_digits(z, year_digits, 0, 99999)?;
+    let (m, rest) = get_digits(rest.strip_prefix('-')?, 2, 0, 11)?;
+    let (d, rest) = get_digits(rest.strip_prefix('-')?, 2, 0, 30)?;
+    Some((y, m, d, rest))
 }
 
 /// Parses `HH:MM[:SS[.SSS]]` and returns it as milliseconds since midnight.
