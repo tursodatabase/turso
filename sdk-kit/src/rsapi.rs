@@ -761,6 +761,9 @@ impl From<LimboError> for TursoError {
     }
 }
 
+/// Size of the header that precedes each page in a WAL frame.
+const WAL_FRAME_HEADER_SIZE: usize = 24;
+
 fn sync_busy_error() -> TursoError {
     TursoError::Busy("database is locked".to_string())
 }
@@ -1195,6 +1198,76 @@ impl TursoConnection {
     }
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
+    }
+
+    /// Fail unless the database keeps its changes in the WAL. In MVCC mode
+    /// recent changes live in the logical log, so WAL frames alone would
+    /// describe an incomplete database.
+    fn require_wal_journal(&self) -> Result<(), TursoError> {
+        if self.connection.mvcc_enabled() {
+            return Err(TursoError::Misuse(
+                "raw WAL access needs WAL journal mode; this database uses MVCC, which keeps recent changes in its logical log".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stop this connection from checkpointing or restarting the WAL on its own,
+    /// so the caller decides when frames leave the WAL.
+    pub fn wal_disable_auto_actions(&self) -> Result<(), TursoError> {
+        self.require_wal_journal()?;
+        self.connection.wal_auto_actions_disable();
+        Ok(())
+    }
+
+    /// Return the last frame number in the WAL and the checkpoint sequence number.
+    pub fn wal_state(&self) -> Result<(u64, u32), TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        self.require_wal_journal()?;
+        let state = self.connection.wal_state()?;
+        Ok((state.max_frame, state.checkpoint_seq_no))
+    }
+
+    /// Copy WAL frame `frame_no` (header included) into `frame` and return its
+    /// page number and database size (non-zero only for commit frames).
+    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<(u32, u32), TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        self.require_wal_journal()?;
+        let info = self.connection.wal_get_frame(frame_no, frame)?;
+        Ok((info.page_no, info.db_size))
+    }
+
+    /// Start a session that appends raw frames to the WAL.
+    pub fn wal_insert_begin(&self) -> Result<(), TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        self.require_wal_journal()?;
+        self.connection.wal_insert_begin()?;
+        Ok(())
+    }
+
+    /// Write `frame` (header included) at position `frame_no` in the WAL.
+    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<(), TursoError> {
+        if frame.len() <= WAL_FRAME_HEADER_SIZE {
+            return Err(TursoError::Misuse(format!(
+                "WAL frame must be longer than its {WAL_FRAME_HEADER_SIZE}-byte header, got {} bytes",
+                frame.len()
+            )));
+        }
+        self.require_wal_journal()?;
+        self.connection.wal_insert_frame(frame_no, frame)?;
+        Ok(())
+    }
+
+    /// End the session started by [Self::wal_insert_begin].
+    pub fn wal_insert_end(&self, force_commit: bool) -> Result<(), TursoError> {
+        self.connection.wal_insert_end(force_commit)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1826,8 +1899,8 @@ mod tests {
     use super::{c, CApiPageCodec};
     use crate::{
         rsapi::{
-            OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
-            FINALIZED_ERR,
+            OpenFlags, TursoConnection, TursoDatabase, TursoDatabaseConfig, TursoError,
+            TursoStatusCode, FINALIZED_ERR,
         },
         IoBackend,
     };
@@ -2932,5 +3005,187 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    fn open_file_database(path: &std::path::Path) -> Arc<TursoDatabase> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        let _ = db.open().unwrap();
+        db
+    }
+
+    fn exec(conn: &TursoConnection, sql: &str) {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    fn query_i64(conn: &TursoConnection, sql: &str) -> i64 {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        match stmt.row_value(0).unwrap() {
+            Value::Numeric(turso_core::Numeric::Integer(v)) => v,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    const TEST_FRAME_LEN: usize = super::WAL_FRAME_HEADER_SIZE + 4096;
+
+    fn read_all_frames(conn: &TursoConnection) -> Vec<Vec<u8>> {
+        let (max_frame, _) = conn.wal_state().unwrap();
+        (1..=max_frame)
+            .map(|frame_no| {
+                let mut frame = vec![0u8; TEST_FRAME_LEN];
+                conn.wal_get_frame(frame_no, &mut frame).unwrap();
+                frame
+            })
+            .collect()
+    }
+
+    #[test]
+    pub fn wal_frames_copied_between_databases_reproduce_the_data() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_db = open_file_database(&tmp_dir.path().join("source.db"));
+        let source = source_db.connect().unwrap();
+        source.wal_disable_auto_actions().unwrap();
+        exec(&source, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
+        exec(&source, "BEGIN");
+        for _ in 0..200 {
+            exec(&source, "INSERT INTO t(v) VALUES (randomblob(300))");
+        }
+        exec(&source, "COMMIT");
+
+        let frames = read_all_frames(&source);
+        assert!(!frames.is_empty());
+        let (page_no, db_size) = source
+            .wal_get_frame(frames.len() as u64, &mut vec![0u8; TEST_FRAME_LEN])
+            .unwrap();
+        assert!(page_no > 0);
+        assert!(
+            db_size > 0,
+            "the last frame of a committed WAL is a commit frame"
+        );
+
+        let target_db = open_file_database(&tmp_dir.path().join("target.db"));
+        let target = target_db.connect().unwrap();
+        target.wal_insert_begin().unwrap();
+        for (i, frame) in frames.iter().enumerate() {
+            target.wal_insert_frame(i as u64 + 1, frame).unwrap();
+        }
+        target.wal_insert_end(false).unwrap();
+
+        let sql = "SELECT count(*) * 1000000 + sum(length(v)) FROM t";
+        assert_eq!(query_i64(&target, sql), query_i64(&source, sql));
+        assert_eq!(query_i64(&target, "SELECT count(*) FROM t"), 200);
+    }
+
+    #[test]
+    pub fn wal_disable_auto_actions_keeps_frames_until_the_caller_checkpoints() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        conn.wal_disable_auto_actions().unwrap();
+        exec(&conn, "CREATE TABLE t(v BLOB)");
+        let (_, seq_before) = conn.wal_state().unwrap();
+        // Well past the default auto-checkpoint threshold of 1000 frames.
+        for _ in 0..1200 {
+            exec(&conn, "INSERT INTO t(v) VALUES (randomblob(2000))");
+        }
+        let (max_frame, seq) = conn.wal_state().unwrap();
+        assert_eq!(seq, seq_before);
+        assert!(max_frame > 1200, "max_frame={max_frame}");
+
+        exec(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let (max_frame, seq_after) = conn.wal_state().unwrap();
+        assert_eq!(max_frame, 0);
+        // The restart shows in the sequence number as soon as the checkpoint
+        // returns, so a replicator can tell a restarted WAL from a new one.
+        assert_ne!(seq_after, seq_before);
+        exec(&conn, "INSERT INTO t(v) VALUES (randomblob(2000))");
+        let (max_frame, seq) = conn.wal_state().unwrap();
+        assert!(max_frame > 0);
+        assert_eq!(
+            seq, seq_after,
+            "writes after a restart keep the sequence number"
+        );
+    }
+
+    #[test]
+    pub fn wal_raw_api_rejects_bad_frames() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        conn.wal_disable_auto_actions().unwrap();
+        exec(&conn, "CREATE TABLE t(x)");
+        let frames = read_all_frames(&conn);
+
+        let mut short = vec![0u8; TEST_FRAME_LEN - 1];
+        assert!(conn.wal_get_frame(1, &mut short).is_err());
+
+        let other_db = open_file_database(&tmp_dir.path().join("other.db"));
+        let other = other_db.connect().unwrap();
+        other.wal_insert_begin().unwrap();
+        assert!(matches!(
+            other.wal_insert_frame(1, &frames[0][..super::WAL_FRAME_HEADER_SIZE]),
+            Err(TursoError::Misuse(_))
+        ));
+        assert!(
+            other.wal_insert_frame(2, &frames[0]).is_err(),
+            "a gap in frame numbers must fail"
+        );
+        other.wal_insert_end(false).unwrap();
+    }
+
+    #[test]
+    pub fn capi_wal_state_rejects_null_outputs() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap().to_capi();
+        let mut seq = 0u32;
+        let status = crate::capi::turso_connection_wal_state(
+            conn,
+            std::ptr::null_mut(),
+            &mut seq,
+            std::ptr::null_mut(),
+        );
+        assert!(matches!(status, c::turso_status_code_t::TURSO_MISUSE));
+        drop(unsafe { TursoConnection::arc_from_capi(conn) });
+    }
+
+    #[test]
+    pub fn wal_raw_api_refuses_mvcc_databases() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        exec(&conn, "PRAGMA journal_mode = 'mvcc'");
+        exec(&conn, "CREATE TABLE t(x)");
+        exec(&conn, "INSERT INTO t VALUES (1)");
+
+        let misuse = |result: Result<(), TursoError>, call: &str| match result {
+            Err(TursoError::Misuse(message)) => {
+                assert!(message.contains("MVCC"), "{call}: {message}")
+            }
+            other => panic!("{call} on an MVCC database = {other:?}, want Misuse"),
+        };
+        misuse(conn.wal_disable_auto_actions(), "wal_disable_auto_actions");
+        misuse(conn.wal_state().map(|_| ()), "wal_state");
+        misuse(
+            conn.wal_get_frame(1, &mut vec![0u8; TEST_FRAME_LEN])
+                .map(|_| ()),
+            "wal_get_frame",
+        );
+        misuse(conn.wal_insert_begin(), "wal_insert_begin");
+        misuse(
+            conn.wal_insert_frame(1, &vec![0u8; TEST_FRAME_LEN]),
+            "wal_insert_frame",
+        );
     }
 }
