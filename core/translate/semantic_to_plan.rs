@@ -977,6 +977,16 @@ impl<'a> HirPlanContext<'a> {
         for term in order_by {
             self.register_expression_index_usage(&mut input.sources, &term.expr)?;
         }
+        // A WHERE term equal to a partial index's predicate is not evaluated
+        // when the index is read, so the columns only it reads need not be
+        // in the index.
+        let where_terms = input.predicates[input.where_start..]
+            .iter()
+            .map(|term| term.expr.clone())
+            .collect::<Vec<_>>();
+        for term in &where_terms {
+            self.register_expression_index_usage(&mut input.sources, term)?;
+        }
 
         Ok(input)
     }
@@ -1740,7 +1750,7 @@ impl<'a> HirPlanContext<'a> {
             .definition(source)
             .index_expressions
             .iter()
-            .any(|index| index.columns.iter().any(Option::is_some));
+            .any(|index| index.columns.iter().any(Option::is_some) || index.predicate.is_some());
         if !has_expression_key {
             return Ok(());
         }
