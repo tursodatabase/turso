@@ -26,6 +26,35 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+/// Whether a block is `SELECT count(*) FROM t` with nothing else, which
+/// SQLite answers without a loop over the table.
+fn is_simple_count(
+    block: &hir::QueryBlock,
+    input: &HirQueryBlockPlanInput,
+    limit: Option<&hir::Limit>,
+) -> bool {
+    let [output] = block.outputs.as_slice() else {
+        return false;
+    };
+    let hir::Expr::Function(call) = &output.expr else {
+        return false;
+    };
+    matches!(
+        call.function.value(),
+        crate::function::Func::Agg(crate::function::AggFunc::Count0)
+    ) && matches!(
+        call.evaluation,
+        hir::FunctionEvaluation::Aggregate { filter: None, .. }
+    ) && block.aggregate_count == 1
+        && matches!(
+            &block.body,
+            hir::QueryBlockBody::Select { grouping: None, .. }
+        )
+        && limit.is_none()
+        && input.sources.len() == 1
+        && input.predicates.is_empty()
+}
+
 enum HirFromItem<'a> {
     Source(SourceId),
     Group {
@@ -436,10 +465,19 @@ impl<'a> HirPlanContext<'a> {
             append_predicates(&mut input.predicates, predicate, None);
         }
 
-        self.plan_source_access(input, None, false, 1.0, schema, params, query_estimate)?
-            .ok_or_else(|| {
-                LimboError::InternalError("UPDATE target produced no access plan".to_string())
-            })
+        self.plan_source_access(
+            input,
+            None,
+            false,
+            false,
+            1.0,
+            schema,
+            params,
+            query_estimate,
+        )?
+        .ok_or_else(|| {
+            LimboError::InternalError("UPDATE target produced no access plan".to_string())
+        })
     }
 
     fn plan_delete(
@@ -477,6 +515,7 @@ impl<'a> HirPlanContext<'a> {
         self.plan_source_access(
             input,
             order_target.as_ref(),
+            false,
             false,
             1.0,
             schema,
@@ -1090,11 +1129,13 @@ impl<'a> HirPlanContext<'a> {
                 OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
             )
         };
+        let simple_count = is_simple_count(block, &input, limit);
         let access = self
             .plan_source_access(
                 input,
                 order_target.as_ref(),
                 true,
+                simple_count,
                 initial_cardinality,
                 schema,
                 params,
@@ -1268,6 +1309,7 @@ impl<'a> HirPlanContext<'a> {
                 rest,
                 None,
                 true,
+                false,
                 initial_cardinality,
                 schema,
                 params,
@@ -1314,6 +1356,8 @@ impl<'a> HirPlanContext<'a> {
         // Whether a table may be read through one seek per branch of an OR
         // term, which DELETE and UPDATE loops do not do yet.
         or_union: bool,
+        // Whether the block is a plain `SELECT count(*) FROM t`.
+        simple_count: bool,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
@@ -1362,7 +1406,32 @@ impl<'a> HirPlanContext<'a> {
                 }
             }
         }
-        let constraints = self.constraints(&input, &base_rows, schema, params, &query_rows)?;
+        let mut constraints = self.constraints(&input, &base_rows, schema, params, &query_rows)?;
+        for (source, table_constraints) in input.sources.iter().zip(&mut constraints) {
+            let HirPlanSource::BTree(source) = source else {
+                continue;
+            };
+            let hir::IndexHint::Indexed(index) = &source.indexed else {
+                continue;
+            };
+            if index.value().where_clause.is_none() || !table_constraints.candidates.is_empty() {
+                continue;
+            }
+            // INDEXED BY names a partial index whose WHERE the query does
+            // not imply, so no plan reads the table through it.
+            if !simple_count {
+                crate::bail_parse_error!("no query solution");
+            }
+            // Like SQLite, `SELECT count(*) FROM t` counts the rows without
+            // a loop, so the index does not matter.
+            table_constraints.candidates.push(
+                super::optimizer::constraints::ConstraintUseCandidate {
+                    index: None,
+                    refs: Vec::new(),
+                    partial_index: None,
+                },
+            );
+        }
         let mut access_methods = Vec::new();
         let result = compute_hir_greedy_join_order(
             self.document,
