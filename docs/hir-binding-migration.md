@@ -316,7 +316,7 @@ inserted. These still go to legacy:
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
-| WITHOUT ROWID tables, array columns | Their lowering |
+| Array columns | Their lowering |
 | A custom-typed virtual column | Decoding computed columns |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
@@ -382,6 +382,13 @@ they were checked with the CLI backend, statement block by block against
 legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so
 aggregates decode them once, and BETWEEN on a custom type is `x >= a AND
 x <= b` with the type's operators, as in legacy.
+
+INSERT into a WITHOUT ROWID table is lowered too. As in legacy, only the
+primary key is checked (`NoConflict` on the table) and the record holds the
+key columns first; foreign keys, REPLACE, UPSERT, change data capture,
+materialized views and secondary indexes give legacy's errors. HIR also
+checks every column of a composite key, where legacy let a duplicate in, and
+accepts INSERT OR IGNORE, which legacy rejects.
 
 A hidden column, as legacy treats it, takes no position in VALUES without a
 column list and gets NULL rather than its DEFAULT.

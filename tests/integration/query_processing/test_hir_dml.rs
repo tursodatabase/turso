@@ -2032,3 +2032,56 @@ fn hir_dml_writes_fts_indexes() {
     assert_eq!(matching("cherry"), ids(&[3]));
     assert_eq!(matching("fromtrigger"), ids(&[4]));
 }
+
+/// INSERT into a WITHOUT ROWID table through HIR checks the whole primary
+/// key and stores its columns first. Legacy lets a duplicate composite key
+/// in and rejects INSERT OR IGNORE.
+#[test]
+fn hir_inserts_into_without_rowid_tables() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_without_rowid(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TABLE w(b, a TEXT PRIMARY KEY) WITHOUT ROWID",
+        "CREATE TABLE w2(a INTEGER, b TEXT, c, PRIMARY KEY (b, a)) WITHOUT ROWID",
+        "INSERT INTO w VALUES (3, 'z'), (1, 'a')",
+        "INSERT OR IGNORE INTO w VALUES (5, 'z'), (6, 'm')",
+        "INSERT INTO w2 VALUES (1, 'x', 'p'), (2, 'x', 'q'), (1, 'y', 'r')",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let error = |sql| {
+        limbo_exec_rows_fallible(&db, &conn, sql)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(error("INSERT INTO w VALUES (5, 'z')").contains("UNIQUE constraint failed: w.a"));
+    assert!(error("INSERT INTO w VALUES (5, NULL)").contains("NOT NULL constraint failed: w.a"));
+    assert!(error("INSERT INTO w2 VALUES (1, 'x', 'dup')")
+        .contains("UNIQUE constraint failed: w2.b, w2.a"));
+    assert!(error("INSERT OR REPLACE INTO w VALUES (7, 'q')").contains("not supported"));
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT * FROM w"),
+        [
+            "[Integer(1), Text(\"a\")]",
+            "[Integer(6), Text(\"m\")]",
+            "[Integer(3), Text(\"z\")]",
+        ]
+    );
+    assert_eq!(
+        rows("SELECT a, b FROM w2"),
+        [
+            "[Integer(1), Text(\"x\")]",
+            "[Integer(2), Text(\"x\")]",
+            "[Integer(1), Text(\"y\")]",
+        ]
+    );
+}

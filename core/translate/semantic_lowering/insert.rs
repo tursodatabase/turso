@@ -64,8 +64,10 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // WITHOUT ROWID tables are not lowered yet.
-    if !table.has_rowid || super::dml::strict_needs_legacy(&table, source) {
+    if !table.has_rowid {
+        without_rowid_errors(program, insert, source)?;
+    }
+    if super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
     }
     // Custom types are lowered unless a virtual column has one.
@@ -78,6 +80,30 @@ pub(super) fn needs_legacy(
         return Ok(custom_virtual);
     }
     Ok(false)
+}
+
+/// What an INSERT into a WITHOUT ROWID table cannot do yet, with legacy's
+/// errors: only the primary key may be checked and written.
+fn without_rowid_errors(
+    program: &ProgramBuilder,
+    insert: &hir::Insert,
+    source: &hir::Source,
+) -> Result<()> {
+    if let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind {
+        if !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty() {
+            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
+        }
+    }
+    if insert.conflict == Some(ResolveType::Replace) || !insert.upserts.is_empty() {
+        crate::bail_parse_error!("UPSERT and REPLACE on WITHOUT ROWID tables are not supported");
+    }
+    if program.capture_data_changes_info().table().is_some() {
+        crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
+    }
+    if !source.index_expressions.is_empty() {
+        crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
+    }
+    Ok(())
 }
 
 /// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
@@ -899,6 +925,9 @@ impl InsertRow<'_> {
         program.preassign_label_to_next_insn(generate);
         match &sequence {
             Some(sequence) => sequence.emit_new_rowid(program, self.table_cursor, self.rowid)?,
+            // A WITHOUT ROWID table has no rowid; its primary key is checked
+            // with the other constraints.
+            None if !table.has_rowid => program.emit_null(self.rowid, None),
             None => program.emit_insn(Insn::NewRowid {
                 cursor: self.table_cursor,
                 rowid_reg: self.rowid,
@@ -979,6 +1008,9 @@ impl InsertRow<'_> {
                 let rowid = constraints.remove(position);
                 constraints.push(rowid);
             }
+        }
+        if !table.has_rowid {
+            self.emit_primary_key_check(program, row_done)?;
         }
         let catch_all = self
             .upserts
@@ -2023,6 +2055,83 @@ impl InsertRow<'_> {
                     conflict,
                     self.has_statement_conflict,
                 );
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description,
+                    on_error,
+                    description_reg: None,
+                });
+            }
+        }
+        program.preassign_label_to_next_insn(unique);
+        Ok(())
+    }
+
+    /// Like legacy, check that no row of a WITHOUT ROWID table has the new
+    /// row's primary key.
+    fn emit_primary_key_check(
+        &self,
+        program: &mut ProgramBuilder,
+        row_done: BranchOffset,
+    ) -> Result<()> {
+        let table = self.target.table;
+        let positions = table
+            .primary_key_columns
+            .iter()
+            .map(|(name, _)| {
+                table
+                    .get_column(name)
+                    .map(|(position, _)| position)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "WITHOUT ROWID table {} has no primary key column {name}",
+                            table.name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let key = program.alloc_registers(positions.len());
+        for (offset, position) in positions.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: self.columns + position,
+                dst_reg: key + offset,
+                extra_amount: 0,
+            });
+        }
+        if let Some(count) = NonZeroUsize::new(positions.len()) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: key,
+                count,
+                affinities: positions
+                    .iter()
+                    .map(|position| {
+                        table.columns()[*position]
+                            .affinity_with_strict(table.is_strict)
+                            .aff_mask()
+                    })
+                    .collect(),
+            });
+        }
+        let unique = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: self.table_cursor,
+            target_pc: unique,
+            record_reg: key,
+            num_regs: positions.len(),
+        });
+        match self.conflict(None) {
+            ResolveType::Ignore => program.emit_insn(Insn::Goto {
+                target_pc: row_done,
+            }),
+            conflict => {
+                let columns = table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(name, _)| format!("{}.{name}", table.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (description, on_error) =
+                    halt_desc_and_on_error(&columns, conflict, self.has_statement_conflict);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,

@@ -987,7 +987,8 @@ pub(super) fn emit_row_record(
     table: &BTreeTable,
     start: usize,
 ) -> usize {
-    let stored = if table.has_virtual_columns() {
+    // A WITHOUT ROWID table stores its primary key columns first.
+    let stored = if table.has_virtual_columns() || !table.has_rowid {
         let mut stored = table
             .columns()
             .iter()
