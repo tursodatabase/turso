@@ -64,12 +64,27 @@ pub(super) fn needs_legacy(
     let Some(table) = table.value().btree() else {
         return Ok(true);
     };
-    // WITHOUT ROWID tables and custom types are not lowered yet.
-    if !table.has_rowid
-        || super::dml::strict_needs_legacy(&table)
-        || source.column_type_programs.iter().any(Option::is_some)
-    {
+    // WITHOUT ROWID tables are not lowered yet.
+    if !table.has_rowid || super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
+    }
+    // Custom types are lowered for a plain INSERT. Legacy shows a BEFORE
+    // trigger the values before they are encoded, and an UPSERT decodes the
+    // row it updates, which HIR does not yet.
+    if super::dml::has_custom_types(source) {
+        let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+            return Ok(true);
+        };
+        let before_triggers = triggers
+            .insert
+            .iter()
+            .any(|trigger| trigger.value().time == TriggerTime::Before);
+        let custom_virtual = table
+            .columns()
+            .iter()
+            .zip(&source.column_type_programs)
+            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
+        return Ok(before_triggers || custom_virtual || !insert.upserts.is_empty());
     }
     Ok(false)
 }
@@ -892,7 +907,16 @@ impl InsertRow<'_> {
             }),
         }
         program.preassign_label_to_next_insn(ready);
-        if table.is_strict {
+        if super::dml::has_custom_types(self.target.source) {
+            super::dml::emit_custom_type_writes(
+                program,
+                document,
+                self.target.source,
+                table,
+                self.columns,
+                None,
+            )?;
+        } else if table.is_strict {
             super::dml::emit_strict_type_check(program, table, self.columns);
         }
         if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
@@ -1301,17 +1325,22 @@ impl InsertRow<'_> {
         let old_row = (!self.upsert_triggers.is_empty())
             .then(|| -> Result<TriggerRow> {
                 let start = program.alloc_registers(columns);
-                for column in 0..columns {
-                    super::expr::translate_expr_no_constant_opt(
-                        program,
-                        document,
-                        &hir::Expr::Column(hir::ColumnRef {
-                            source: source.id,
-                            column,
-                        }),
-                        start + column,
-                    )?;
-                }
+                // The trigger program decodes custom-typed values itself, so it is
+                // given them as stored.
+                super::dml::with_stored_values(program, |program| {
+                    for column in 0..columns {
+                        super::expr::translate_expr_no_constant_opt(
+                            program,
+                            document,
+                            &hir::Expr::Column(hir::ColumnRef {
+                                source: source.id,
+                                column,
+                            }),
+                            start + column,
+                        )?;
+                    }
+                    Ok(())
+                })?;
                 Ok(TriggerRow {
                     columns: start,
                     rowid: conflict,
@@ -1825,6 +1854,35 @@ impl InsertRow<'_> {
                 program.preassign_label_to_next_insn(not_null);
             }
         }
+        // Like legacy, a custom-typed value is checked as decoded, so an
+        // encoding that decodes to NULL is rejected too.
+        let register = match self.target.source.column_type_programs[position]
+            .as_ref()
+            .filter(|programs| !programs.decode.is_empty())
+        {
+            Some(programs) => {
+                let decoded = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: decoded,
+                    extra_amount: 0,
+                });
+                let null = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: decoded,
+                    target_pc: null,
+                });
+                super::expr::translate_schema_calls_in_place(
+                    program,
+                    self.target.document,
+                    &programs.decode,
+                    decoded,
+                )?;
+                program.preassign_label_to_next_insn(null);
+                decoded
+            }
+            None => register,
+        };
         match conflict {
             ResolveType::Ignore => program.emit_insn(Insn::IsNull {
                 reg: register,
@@ -2230,6 +2288,62 @@ mod tests {
             panic!("hc is a B-tree table");
         };
         assert!(defaults.is_empty());
+    }
+
+    #[test]
+    fn custom_typed_values_are_checked_encoded_and_checked_again() {
+        let mut schema = schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                crate::schema::BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents NOT NULL) STRICT",
+                    140,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = {
+            let plan = Arc::new(analyze_plan(schema, "INSERT INTO priced VALUES (1, 20)"));
+            let insert = insert_root(&plan).unwrap();
+            assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+            let mut program = program();
+            program.set_hir_plan(plan.clone());
+            emit_insert(
+                &mut program,
+                &plan,
+                insert,
+                &Subprograms::default(),
+                false,
+                true,
+            )
+            .unwrap();
+            program
+        };
+        // The input check, the encoding, then the check of the stored type.
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .enumerate()
+                .filter(|(_, (insn, _))| matches(insn))
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>()
+        };
+        let checks = position(&|insn| matches!(insn, Insn::TypeCheck { .. }));
+        let encodes = position(&|insn| matches!(insn, Insn::Multiply { .. }));
+        assert_eq!(checks.len(), 2);
+        assert_eq!(encodes.len(), 1);
+        assert!(checks[0] < encodes[0] && encodes[0] < checks[1]);
+        // NOT NULL is checked on the decoded value.
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::Divide { .. })),
+            1
+        );
     }
 
     #[test]

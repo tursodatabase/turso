@@ -320,6 +320,17 @@ pub(super) fn emit_index_key(
     table_cursor: CursorID,
     expressions: &hir::IndexExpressions,
 ) -> Result<(usize, usize)> {
+    emit_index_key_values(program, document, source, table, table_cursor, expressions)
+}
+
+fn emit_index_key_values(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &BTreeTable,
+    table_cursor: CursorID,
+    expressions: &hir::IndexExpressions,
+) -> Result<(usize, usize)> {
     let index = expressions.index.value();
     let count = index.columns.len() + 1;
     let start = program.alloc_registers(count);
@@ -725,7 +736,32 @@ impl<'a> ReturningBuffer<'a> {
 /// source must be bound to. Like SQLite, a NULL result passes. A failure
 /// skips the row under IGNORE and stops the statement otherwise; REPLACE
 /// does not apply to CHECK.
+/// Run `emit` reading custom-typed columns as stored, not decoded. Like
+/// legacy, CHECK constraints compare stored values.
+pub(super) fn with_stored_values<T>(
+    program: &mut ProgramBuilder,
+    emit: impl FnOnce(&mut ProgramBuilder) -> Result<T>,
+) -> Result<T> {
+    let previous = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(true);
+    let result = emit(program);
+    program.flags.set_suppress_custom_type_decode(previous);
+    result
+}
+
 pub(super) fn emit_check_constraints<'c>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    or_conflict: ast::ResolveType,
+    skip_row: BranchOffset,
+) -> Result<()> {
+    with_stored_values(program, |program| {
+        emit_check_constraint_list(program, document, constraints, or_conflict, skip_row)
+    })
+}
+
+fn emit_check_constraint_list<'c>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
@@ -777,16 +813,21 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// Whether the target is a STRICT table HIR does not lower yet: one with a
-/// custom type or array column, whose type check needs the resolved types.
-pub(super) fn strict_needs_legacy(table: &BTreeTable) -> bool {
+/// Whether the target is a STRICT table HIR does not lower yet: one with an
+/// array column, or a type name that is neither built in nor custom.
+pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
     table.is_strict
-        && table.columns().iter().any(|column| {
-            column.is_array()
-                || !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-                    .iter()
-                    .any(|name| column.ty_str.eq_ignore_ascii_case(name))
-        })
+        && table
+            .columns()
+            .iter()
+            .enumerate()
+            .any(|(position, column)| {
+                column.is_array()
+                    || (custom_chain(source, position).is_none()
+                        && !["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
+                            .iter()
+                            .any(|name| column.ty_str.eq_ignore_ascii_case(name)))
+            })
 }
 
 /// STRICT: check each value of the row in `start..` against its column's
@@ -815,6 +856,96 @@ pub(super) fn emit_strict_type_check(
         check_generated: true,
         table_reference,
     });
+}
+
+/// The custom type of `column` of `source`: its definitions from the
+/// declared type through its ancestors.
+fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedType]> {
+    source.columns[column]
+        .type_fact
+        .declared
+        .as_ref()
+        .map(|declared| declared.custom_chain.as_slice())
+        .filter(|chain| !chain.is_empty())
+}
+
+/// Whether a column of the target has a custom type.
+pub(super) fn has_custom_types(source: &hir::Source) -> bool {
+    source.column_type_programs.iter().any(Option::is_some)
+}
+
+/// STRICT with custom types, as legacy does it: check each value in
+/// `start..` against the type its column accepts as input, encode it, then
+/// check the encoded value against the column's base type. Only the columns
+/// at `only` are checked as input and encoded; `None` means all of them.
+pub(super) fn emit_custom_type_writes(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table: &Arc<BTreeTable>,
+    start: usize,
+    only: Option<&[usize]>,
+) -> Result<()> {
+    let written = |column: usize| only.is_none_or(|only| only.contains(&column));
+    let check_table = |input: bool| {
+        let mut checked = (**table).clone();
+        for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+            if column.is_virtual_generated() || (input && !written(position)) {
+                column.ty_str = "ANY".to_string();
+                if input {
+                    column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
+                }
+                continue;
+            }
+            let Some(chain) = custom_chain(source, position) else {
+                continue;
+            };
+            if input {
+                column.ty_str = chain[0].value().value_input_type().to_uppercase();
+            } else {
+                let base = chain.last().expect("a custom chain is not empty");
+                column.ty_str = base.value().base().to_uppercase();
+                column.override_affinity(crate::vdbe::affinity::Affinity::None);
+            }
+        }
+        Arc::new(checked)
+    };
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(true),
+    });
+    for (position, programs) in source.column_type_programs.iter().enumerate() {
+        let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
+            continue;
+        };
+        let register = start + position;
+        let skip = (!programs.encode_nulls).then(|| {
+            let skip = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: register,
+                target_pc: skip,
+            });
+            skip
+        });
+        super::expr::translate_schema_calls_in_place(
+            program,
+            document,
+            &programs.encode,
+            register,
+        )?;
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: check_table(false),
+    });
+    Ok(())
 }
 
 /// Compute each virtual generated column of the row in registers

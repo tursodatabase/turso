@@ -1521,6 +1521,55 @@ fn hir_dml_keeps_materialized_views_up_to_date() {
     }
 }
 
+/// INSERT into STRICT tables with custom types, as legacy does it: values are
+/// type checked, encoded and checked again; NOT NULL sees the decoded value;
+/// CHECK constraints and foreign keys compare stored values; index
+/// expressions, RETURNING and AFTER triggers see decoded values.
+#[test]
+fn hir_custom_type_inserts_match_legacy() {
+    let statements = [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value)",
+        "CREATE TYPE tricky BASE integer ENCODE value DECODE CASE WHEN value = 42 THEN NULL ELSE value END",
+        "CREATE TABLE p(id cents PRIMARY KEY, name rev) STRICT",
+        "CREATE INDEX p_initial ON p(substr(name, 1, 1))",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid cents REFERENCES p(id) ON DELETE CASCADE, \
+         amount cents CHECK (amount < CAST(50 AS cents)), t tricky NOT NULL) STRICT",
+        "CREATE TABLE log(m TEXT) STRICT",
+        "CREATE TRIGGER tl AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.name || ':' || new.id); END",
+        "PRAGMA foreign_keys = ON",
+        "INSERT INTO p VALUES (1, 'Hello'), (2, 'world') RETURNING id, name",
+        "INSERT INTO p VALUES ('x', 'bad')",
+        "INSERT INTO c VALUES (1, 1, 20, 7)",
+        "INSERT INTO c VALUES (2, 3, 20, 7)",
+        "INSERT INTO c VALUES (3, 2, 60, 7)",
+        "INSERT INTO c VALUES (4, 2, 10, 42)",
+        "INSERT OR IGNORE INTO c VALUES (5, 2, 10, 42)",
+        "SELECT * FROM p ORDER BY id",
+        "SELECT id, hex(name) FROM p ORDER BY id",
+        "SELECT * FROM p WHERE substr(name, 1, 1) = 'h'",
+        "SELECT * FROM c ORDER BY id",
+        "SELECT * FROM log",
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM c",
+    ];
+    let run = |hir: bool| {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        statements
+            .iter()
+            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let (legacy, hir) = (run(false), run(true));
+    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
+        assert_eq!(legacy, hir, "{sql}");
+    }
+}
+
 /// Change data capture through HIR writes one row per changed row and one
 /// COMMIT row per statement. Legacy also writes a COMMIT row for each
 /// trigger or foreign-key action it runs, files the new image of a row an

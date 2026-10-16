@@ -83,8 +83,8 @@ pub(super) fn emit_delete_checks(
         let kept = match keeps_key {
             Some(replacement) => {
                 let width = foreign_key.parent_positions.len();
-                let old_key = emit_parent_key(program, document, foreign_key, target)?;
-                let new_key = emit_parent_key(program, document, foreign_key, replacement)?;
+                let old_key = emit_stored_parent_key(program, document, foreign_key, target)?;
+                let new_key = emit_stored_parent_key(program, document, foreign_key, replacement)?;
                 let kept = program.allocate_label();
                 emit_skip_if_same_key(program, old_key, new_key, width, kept);
                 Some(kept)
@@ -121,7 +121,7 @@ fn emit_children_still_point_here(
     database: usize,
 ) -> Result<()> {
     let width = foreign_key.parent_columns.len();
-    let key = emit_parent_key(program, document, foreign_key, target)?;
+    let key = emit_stored_parent_key(program, document, foreign_key, target)?;
     let skip = program.allocate_label();
     emit_skip_if_any_null(program, key, width, skip);
 
@@ -318,7 +318,7 @@ pub(super) fn emit_insert_parent_repairs(
             deferred,
             target_pc: skip,
         });
-        let key = emit_parent_key(program, document, foreign_key, target)?;
+        let key = emit_stored_parent_key(program, document, foreign_key, target)?;
         let parent_table = btree(&foreign_key.parent_table)?;
         // The key is compared as the parent stores it.
         let affinities = if foreign_key.parent_uses_rowid {
@@ -410,8 +410,8 @@ pub(super) fn emit_update_checks<'a>(
             continue;
         }
         let width = foreign_key.parent_positions.len();
-        let old_key = emit_parent_key(program, document, foreign_key, old)?;
-        let new_key = emit_parent_key(program, document, foreign_key, new)?;
+        let old_key = emit_stored_parent_key(program, document, foreign_key, old)?;
+        let new_key = emit_stored_parent_key(program, document, foreign_key, new)?;
         let deferred = foreign_key.declaration.deferred;
         // Set when the key changes, for the repairs after the write.
         let changed = (replaces && deferred).then(|| {
@@ -716,7 +716,7 @@ fn emit_own_parent_check(
     child_key: usize,
     ok: BranchOffset,
 ) -> Result<()> {
-    let parent_key = emit_parent_key(program, document, foreign_key, row)?;
+    let parent_key = emit_stored_parent_key(program, document, foreign_key, row)?;
     let mismatch = program.allocate_label();
     for offset in 0..foreign_key.child_positions.len() {
         program.emit_insn(Insn::Ne {
@@ -733,7 +733,8 @@ fn emit_own_parent_check(
 }
 
 /// Read the parent key of `row`, in the constraint's column order, into new
-/// registers and return the first.
+/// registers and return the first. Custom-typed columns are decoded, as a
+/// foreign-key action takes the key as SQL values.
 pub(super) fn emit_parent_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -760,9 +761,34 @@ pub(super) fn emit_parent_key(
     Ok(start)
 }
 
+/// Like [`emit_parent_key`], with custom-typed columns as stored: like
+/// legacy, the checks compare stored keys.
+fn emit_stored_parent_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_parent_key(program, document, foreign_key, row)
+    })
+}
+
 /// Read the child key of `row`, in the constraint's column order, into new
-/// registers and return the first.
+/// registers and return the first. Custom-typed columns are read as stored,
+/// as the checks compare stored keys.
 fn emit_child_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    foreign_key: &hir::ResolvedForeignKey,
+    row: SourceId,
+) -> Result<usize> {
+    super::dml::with_stored_values(program, |program| {
+        emit_child_key_values(program, document, foreign_key, row)
+    })
+}
+
+fn emit_child_key_values(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     foreign_key: &hir::ResolvedForeignKey,

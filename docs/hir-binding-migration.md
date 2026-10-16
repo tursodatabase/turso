@@ -290,7 +290,8 @@ inserted. These still go to legacy:
 | INSERT feature | What HIR needs first |
 |---|---|
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
-| WITHOUT ROWID tables, custom types, array columns | Their lowering |
+| WITHOUT ROWID tables, array columns | Their lowering |
+| Custom types with a BEFORE trigger or an UPSERT | Raw values for BEFORE triggers, decoding the updated row |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -329,6 +330,19 @@ VALUES).
 
 A STRICT table checks the type of each stored column once the rowid is
 known; like SQLite, a virtual generated column is not checked.
+
+INSERT into a table with custom types follows legacy: once the rowid is
+known, each value is checked against the type its column accepts as input,
+encoded with the column's type programs, and checked again against the
+stored base type. NOT NULL checks the decoded value, so an encoding that
+decodes to NULL is rejected; CHECK constraints and foreign-key checks
+compare stored values (`with_stored_values`), while index expressions,
+RETURNING and AFTER triggers see decoded values. Trigger programs decode
+OLD and NEW themselves, so DELETE and UPDATE pass OLD as stored, and
+foreign-key actions get the parent key decoded, as SQL values. The
+STRICT/custom-type tests are skipped by the Rust conformance backend, so
+they were checked with the CLI backend, statement block by block against
+legacy.
 
 A hidden column, as legacy treats it, takes no position in VALUES without a
 column list and gets NULL rather than its DEFAULT.

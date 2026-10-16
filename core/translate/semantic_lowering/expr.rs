@@ -3059,6 +3059,29 @@ impl ExprLowerer<'_, '_, '_> {
                 "HIR custom-type default cannot be read from a rowid alias".to_string(),
             ));
         }
+        // A row in registers always holds the column, so its DEFAULT is
+        // never read.
+        if let Some(SourceBinding::Registers { start, .. }) =
+            self.program.source_binding(reference.source).copied()
+        {
+            self.program.flags.set_suppress_column_default(true);
+            self.program.emit_insn(Insn::Copy {
+                src_reg: start + reference.column,
+                dst_reg: context.target,
+                extra_amount: 0,
+            });
+            let stored_value = self.program.allocate_label();
+            self.program.emit_insn(Insn::Goto {
+                target_pc: stored_value,
+            });
+            context.registers = ExprRegisters::ColumnPrograms(ColumnProgramRegisters {
+                call: None,
+                arguments_start: 0,
+                stored_value: Some(stored_value),
+                decode_done: None,
+            });
+            return Ok(());
+        }
         let read = self.resolve_btree_column(reference)?;
         self.program.flags.set_suppress_column_default(true);
         self.program

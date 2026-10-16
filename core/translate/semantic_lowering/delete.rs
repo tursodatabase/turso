@@ -336,17 +336,22 @@ fn emit_rowset_delete(
                 },
             );
             let start = program.alloc_registers(columns);
-            for column in 0..columns {
-                super::expr::translate_expr_no_constant_opt(
-                    program,
-                    document,
-                    &hir::Expr::Column(hir::ColumnRef {
-                        source: target.source.id,
-                        column,
-                    }),
-                    start + column,
-                )?;
-            }
+            // The trigger program decodes custom-typed values itself, so it is
+            // given them as stored.
+            super::dml::with_stored_values(program, |program| {
+                for column in 0..columns {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: target.source.id,
+                            column,
+                        }),
+                        start + column,
+                    )?;
+                }
+                Ok(())
+            })?;
             Ok(TriggerRow {
                 columns: start,
                 rowid,

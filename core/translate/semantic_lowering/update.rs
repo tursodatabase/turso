@@ -76,9 +76,7 @@ pub(super) fn needs_legacy(
         return Ok(true);
     };
     // Custom types are not lowered yet.
-    if super::dml::strict_needs_legacy(&table)
-        || source.column_type_programs.iter().any(Option::is_some)
-    {
+    if super::dml::strict_needs_legacy(&table, source) || super::dml::has_custom_types(source) {
         return Ok(true);
     }
     if update.from.is_some() {
@@ -1286,17 +1284,22 @@ impl UpdateRow<'_, '_> {
         let old_row = (!layout.triggers.is_empty())
             .then(|| -> Result<TriggerRow> {
                 let start = program.alloc_registers(columns);
-                for column in 0..columns {
-                    super::expr::translate_expr_no_constant_opt(
-                        program,
-                        document,
-                        &hir::Expr::Column(hir::ColumnRef {
-                            source: source.id,
-                            column,
-                        }),
-                        start + column,
-                    )?;
-                }
+                // The trigger program decodes custom-typed values itself, so it is
+                // given them as stored.
+                super::dml::with_stored_values(program, |program| {
+                    for column in 0..columns {
+                        super::expr::translate_expr_no_constant_opt(
+                            program,
+                            document,
+                            &hir::Expr::Column(hir::ColumnRef {
+                                source: source.id,
+                                column,
+                            }),
+                            start + column,
+                        )?;
+                    }
+                    Ok(())
+                })?;
                 Ok(TriggerRow {
                     columns: start,
                     rowid: self.rowid,
