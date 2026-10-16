@@ -585,7 +585,8 @@ fn single_condition(
         .with_columns(table.columns.clone())
         .with_max_depth(expr_profile.condition_expression_max_depth)
         .with_aggregates(false)
-        .with_profile(expr_profile.clone().with_subqueries_disabled());
+        .with_profile(expr_profile.clone().with_subqueries_disabled())
+        .with_values(profile.generation.value.clone());
 
     // Simple column comparisons
     let comparison_strategies: Vec<BoxedStrategy<Expression>> = filterable
@@ -603,7 +604,8 @@ fn single_condition(
             .with_columns(table.columns.clone())
             .with_max_depth(1)
             .with_aggregates(false)
-            .with_profile(expr_profile.clone().for_where_clause());
+            .with_profile(expr_profile.clone().for_where_clause())
+            .with_values(profile.generation.value.clone());
 
         let subquery_condition = crate::expression::expression(&subquery_ctx)
             .prop_filter("must be a condition", |e| e.is_condition())
