@@ -106,7 +106,10 @@ fn is_simple_count(
             hir::QueryBlockBody::Select { grouping: None, .. }
         )
         && limit.is_none()
-        && input.sources.len() == 1
+        && matches!(
+            input.sources.as_slice(),
+            [HirPlanSource::BTree(source)] if matches!(source.table, Table::BTree(_))
+        )
         && input.predicates.is_empty()
 }
 
@@ -247,6 +250,9 @@ pub(crate) struct HirQueryBlockPlan {
     /// The block is `SELECT min(x)` or `SELECT max(x)` and the loop reads x
     /// in that aggregate's order, so the first non-NULL x is the answer.
     pub(crate) min_max_first_value: bool,
+    /// The block is `SELECT count(*) FROM t`, which counts the entries of
+    /// the table or its chosen index without a loop.
+    pub(crate) simple_count: bool,
     /// LEFT JOINs run as inner joins, because a WHERE term rejects the NULL
     /// row they would add.
     pub(crate) inner_joins: Vec<SourceId>,
@@ -1190,6 +1196,7 @@ impl<'a> HirPlanContext<'a> {
                 order_sort_elided: false,
                 limit_applied: false,
                 min_max_first_value: false,
+                simple_count: false,
                 inner_joins: Vec::new(),
                 output_cardinality,
                 cost: Cost(0.0),
@@ -1259,6 +1266,7 @@ impl<'a> HirPlanContext<'a> {
             order_sort_elided: access.order_sort_elided,
             limit_applied: false,
             min_max_first_value: access.min_max_first_value,
+            simple_count,
             inner_joins,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
@@ -1336,6 +1344,7 @@ impl<'a> HirPlanContext<'a> {
             order_sort_elided: matched.applies_order_by,
             limit_applied: matched.applies_limit,
             min_max_first_value: false,
+            simple_count: false,
             inner_joins: Vec::new(),
             output_cardinality: 1.0,
             cost: Cost(1.0),
@@ -1445,6 +1454,7 @@ impl<'a> HirPlanContext<'a> {
             order_sort_elided: false,
             limit_applied: false,
             min_max_first_value: false,
+            simple_count: false,
             inner_joins: Vec::new(),
             output_cardinality: access.output_cardinality,
             cost: access.cost,

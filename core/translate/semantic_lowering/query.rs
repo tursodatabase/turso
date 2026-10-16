@@ -1322,6 +1322,11 @@ fn emit_hir_ungrouped_aggregate(
     output: &HirRowOutput<'_>,
     block_done: BranchOffset,
 ) -> Result<()> {
+    if block_plan.simple_count
+        && emit_hir_simple_count(program, plan, block, block_plan, output, block_done)?
+    {
+        return Ok(());
+    }
     let state = initialize_hir_aggregates(program, &plan.document, query, block)?;
     let first_value_done = block_plan
         .min_max_first_value
@@ -1337,6 +1342,87 @@ fn emit_hir_ungrouped_aggregate(
         program.preassign_label_to_next_insn(done);
     }
     emit_hir_aggregate_result(program, &plan.document, block, output, block_done, &state)
+}
+
+/// `SELECT count(*) FROM t`: like legacy and SQLite, count the entries of
+/// the table, or of the index the planner chose to scan, without a loop.
+/// Returns false, having emitted nothing, for a materialized view, whose
+/// rows are not a plain B-tree.
+fn emit_hir_simple_count(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
+) -> Result<bool> {
+    let document = &plan.document;
+    let [planned_loop] = block_plan.loops.as_slice() else {
+        return Err(LimboError::InternalError(
+            "HIR count(*) shortcut needs exactly one loop".to_string(),
+        ));
+    };
+    let source = document.source(planned_loop.source).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR count(*) shortcut references missing source {}",
+            planned_loop.source
+        ))
+    })?;
+    let (hir::SourceKind::Table(table), Some(database)) = (&source.kind, source.database) else {
+        return Err(LimboError::InternalError(format!(
+            "HIR count(*) shortcut source {} is not a stored table",
+            source.id
+        )));
+    };
+    let Some(btree) = table.value().btree() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR count(*) shortcut source {} is not a B-tree table",
+            source.id
+        )));
+    };
+    if plan.materialized_view(source.id).is_some() {
+        return Ok(false);
+    }
+    let database_snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR count(*) shortcut source {} references missing database {database:?}",
+            source.id
+        ))
+    })?;
+    program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    let index = match &planned_loop.access {
+        HirSourceAccess::BTree { operation, .. } => selected_hir_btree_index(operation),
+        _ => None,
+    };
+    let cursor = match index {
+        Some(index) => super::emit::open_read_index(program, index, database.index()),
+        None => super::emit::open_read_table(program, &btree, database.index()),
+    };
+    let count = program.alloc_register();
+    program.emit_insn(Insn::Count {
+        cursor_id: cursor,
+        target_reg: count,
+        exact: true,
+    });
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    let [count_output] = block.outputs.as_slice() else {
+        return Err(LimboError::InternalError(
+            "HIR count(*) shortcut needs exactly one output".to_string(),
+        ));
+    };
+    program.bind_expression_register(&count_output.expr, count);
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+    emit_query_row(
+        program,
+        document,
+        output,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+        block_done,
+    )?;
+    program.clear_expression_registers();
+    Ok(true)
 }
 
 fn emit_hir_grouped_aggregate<'a>(

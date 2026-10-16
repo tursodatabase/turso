@@ -753,3 +753,51 @@ fn hir_correlated_subqueries_seek_an_automatic_index() {
         );
     }
 }
+
+#[test]
+fn hir_count_star_counts_without_a_loop() {
+    let db = setup();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    let opcodes = |sql: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(rusqlite::types::Value::Text(opcode)) => Some(opcode.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let program = opcodes("SELECT count(*) FROM items");
+    assert!(
+        program.iter().any(|opcode| opcode == "Count"),
+        "{program:?}"
+    );
+    assert!(
+        program.iter().any(|opcode| opcode == "Transaction"),
+        "{program:?}"
+    );
+    assert!(
+        !program.iter().any(|opcode| opcode == "Next"),
+        "{program:?}"
+    );
+    // A WHERE term needs the loop.
+    let filtered = opcodes("SELECT count(*) FROM items WHERE value > 10");
+    assert!(
+        !filtered.iter().any(|opcode| opcode == "Count"),
+        "{filtered:?}"
+    );
+
+    let count = |sql: &str| limbo_exec_rows(&hir, sql);
+    let six = vec![vec![rusqlite::types::Value::Integer(6)]];
+    assert_eq!(count("SELECT count(*) FROM items"), six);
+    assert_eq!(count("SELECT DISTINCT count(*) FROM items"), six);
+    assert_eq!(
+        count("SELECT count(*) FROM items LIMIT 0"),
+        Vec::<Vec<rusqlite::types::Value>>::new()
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM tags"),
+        vec![vec![rusqlite::types::Value::Integer(4)]]
+    );
+}
