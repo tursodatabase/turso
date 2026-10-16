@@ -43,6 +43,7 @@ Welcome to Turso database manual!
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [Full-Text Search](#full-text-search-experimental)
+    - [Where FTS is available](#where-fts-is-available)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Page Codecs](#page-codecs-experimental)
@@ -879,6 +880,33 @@ LIMIT 5;
 Turso provides full-text search (FTS) capabilities powered by the [Tantivy](https://github.com/quickwit-oss/tantivy) search engine library. FTS enables efficient text search with relevance ranking, boolean queries, phrase matching, and more.
 
 > **Note:** Full-text search is an experimental feature and requires the `fts` feature to be enabled at compile time.
+
+### Where FTS is available
+
+FTS requires the `fts` Cargo feature on `turso_core` and a non-WebAssembly target.
+It is not part of `turso_core`'s default features. The module in
+`core/index_method/mod.rs` is guarded by
+`#[cfg(all(feature = "fts", not(target_family = "wasm")))]`, so enabling the feature
+does not make FTS available on WebAssembly.
+
+At this repository revision, the source build configuration is:
+
+| Build | FTS configuration |
+| --- | --- |
+| `tursodb` CLI | Enables `turso_core/fts` |
+| `turso_core` on a native target | Enable it in the dependency's `features = ["fts"]` |
+| `turso` Rust binding on a native target | Includes `fts` in its default features |
+| `@tursodatabase/database` native addon built from this source | Enables `turso_core/fts` |
+| `@tursodatabase/database-wasm` | Excluded on WebAssembly |
+
+The native addon's build script in `bindings/javascript/packages/native/package.json`
+uses `bindings/javascript/Cargo.toml`, which enables `turso_core/fts`. This describes
+the repository's build configuration; it does not establish whether a particular published npm version
+contains FTS. Check the release version you use.
+
+When the module is absent, preparing `CREATE INDEX ... USING fts` fails at module lookup
+with an unknown-module-name error. A WebAssembly build has the same limitation even
+when the `fts` Cargo feature is requested.
 
 ### Creating an FTS Index
 
