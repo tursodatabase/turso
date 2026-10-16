@@ -9,8 +9,11 @@ use crate::translate::emitter::{
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
+use crate::translate::plan::{
+    CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
+};
 use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
@@ -49,6 +52,16 @@ pub fn emit_program_for_compound_select(
         false,
     ));
 
+    emit_non_from_clause_subqueries_for_eval_at(
+        program,
+        &right_most_ctx.resolver,
+        &mut right_most.non_from_clause_subqueries,
+        &[],
+        None,
+        EvalAt::BeforeLoop,
+        |subquery| matches!(subquery.origin, SubqueryOrigin::SelectLimitOffset),
+    )?;
+
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
     // When ORDER BY is present, LIMIT/OFFSET apply to the final sorted output, not intermediate results.
@@ -77,7 +90,7 @@ pub fn emit_program_for_compound_select(
                         }
                     }
                     _ => {
-                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+                        _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver)?;
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg,
@@ -115,7 +128,7 @@ pub fn emit_program_for_compound_select(
                             offset_expr,
                             reg,
                             &right_most_ctx.resolver,
-                        );
+                        )?;
                     }
                 }
                 program.add_comment(program.offset(), "OFFSET counter");
@@ -1031,7 +1044,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
+                    _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver)?;
                     program.add_comment(program.offset(), "LIMIT counter");
                     program.emit_insn(Insn::MustBeInt {
                         reg,
@@ -1058,7 +1071,7 @@ fn emit_compound_order_by(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver)?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
