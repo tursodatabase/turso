@@ -570,7 +570,7 @@ set test_files {
   temptable2           fail
   temptable3           fail
   temptrigger          fail
-  timediff1            fail
+  timediff1            pass
   tkt-02a8e81d44       pass
   tkt-18458b1a         pass
   tkt-26ff0c2d1e       pass
