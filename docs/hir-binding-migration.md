@@ -342,7 +342,9 @@ OLD and NEW themselves, so DELETE and UPDATE pass OLD as stored, and
 foreign-key actions get the parent key decoded, as SQL values. The
 STRICT/custom-type tests are skipped by the Rust conformance backend, so
 they were checked with the CLI backend, statement block by block against
-legacy.
+legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so
+aggregates decode them once, and BETWEEN on a custom type is `x >= a AND
+x <= b` with the type's operators, as in legacy.
 
 A hidden column, as legacy treats it, takes no position in VALUES without a
 column list and gets NULL rather than its DEFAULT.

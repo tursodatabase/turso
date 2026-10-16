@@ -1570,6 +1570,37 @@ fn hir_custom_type_inserts_match_legacy() {
     }
 }
 
+/// Queries over custom-typed columns: GROUP BY keeps the grouped columns as
+/// stored so aggregates decode them once, and BETWEEN uses the type's own
+/// comparison operators, as legacy does.
+#[test]
+fn hir_custom_type_queries_match_legacy() {
+    let statements = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2), grp TEXT, flag INTEGER) STRICT",
+        "INSERT INTO t VALUES (1, 100, 'a', 1), (2, 9, 'a', 0), (3, 50, 'b', 1), (4, -5, 'b', 0)",
+        "SELECT grp, sum(val), max(val) FROM t GROUP BY grp ORDER BY grp",
+        "SELECT grp, sum(val) FILTER (WHERE flag = 1) AS s FROM t GROUP BY grp HAVING s > 0",
+        "SELECT id, val FROM t WHERE val BETWEEN 9 AND 50 ORDER BY id",
+        "SELECT id FROM t WHERE val NOT BETWEEN 9 AND 50 ORDER BY id",
+    ];
+    let run = |hir: bool| {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        statements
+            .iter()
+            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let (legacy, hir) = (run(false), run(true));
+    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
+        assert!(legacy.is_ok(), "{sql}: {legacy:?}");
+        assert_eq!(legacy, hir, "{sql}");
+    }
+}
+
 /// Change data capture through HIR writes one row per changed row and one
 /// COMMIT row per statement. Legacy also writes a COMMIT row for each
 /// trigger or foreign-key action it runs, files the new image of a row an

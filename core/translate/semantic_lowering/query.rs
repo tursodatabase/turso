@@ -1529,16 +1529,20 @@ fn emit_hir_group_input(
                     &runtime.grouping.keys[*index],
                     runtime.state.current_keys + index,
                 )?,
+                // The group's row registers hold columns as stored; reading
+                // them through the bound source decodes them once.
                 HirGroupInput::Column {
                     reference,
                     row_register,
                     ..
-                } => super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::Column(*reference),
-                    *row_register,
-                )?,
+                } => super::dml::with_stored_values(program, |program| {
+                    super::expr::translate_expr(
+                        program,
+                        document,
+                        &hir::Expr::Column(*reference),
+                        *row_register,
+                    )
+                })?,
                 HirGroupInput::RowId {
                     source,
                     row_register,
@@ -1558,12 +1562,14 @@ fn emit_hir_group_input(
         let expression = match input {
             HirGroupInput::Key(index) => &runtime.grouping.keys[*index],
             HirGroupInput::Column { reference, .. } => {
-                super::expr::translate_expr(
-                    program,
-                    document,
-                    &hir::Expr::Column(*reference),
-                    target,
-                )?;
+                super::dml::with_stored_values(program, |program| {
+                    super::expr::translate_expr(
+                        program,
+                        document,
+                        &hir::Expr::Column(*reference),
+                        target,
+                    )
+                })?;
                 continue;
             }
             HirGroupInput::RowId { source, .. } => {
