@@ -5267,6 +5267,9 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
+            if conn.defer_foreign_keys() {
+                conn.set_defer_foreign_keys(false);
+            }
             if !*rollback {
                 conn.index_methods_on_transaction_committed();
             }
@@ -5422,6 +5425,9 @@ pub fn op_auto_commit(
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
     if fk_on {
         conn.clear_deferred_foreign_key_violations();
+    }
+    if conn.defer_foreign_keys() {
+        conn.set_defer_foreign_keys(false);
     }
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.

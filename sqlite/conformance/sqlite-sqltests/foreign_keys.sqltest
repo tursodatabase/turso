@@ -15,6 +15,104 @@ expect {
 }
 
 @cross-check-integrity
+test fk-defer-foreign-keys-allows-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO child VALUES (7);
+    INSERT INTO parent VALUES (7);
+    COMMIT;
+    PRAGMA defer_foreign_keys;
+    SELECT child.parent_id FROM child;
+}
+expect {
+    0
+    7
+}
+
+@cross-check-integrity
+test fk-defer-foreign-keys-still-checks-at-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO child VALUES (7);
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-defer-foreign-keys-allows-restrict-repair {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    UPDATE parent SET id=2 WHERE id=1;
+    INSERT INTO parent VALUES (1);
+    COMMIT;
+    SELECT parent_id FROM child;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-defer-foreign-keys-savepoint-rollback-restores-count {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    SAVEPOINT before_child;
+    INSERT INTO child VALUES (7);
+    ROLLBACK TO before_child;
+    INSERT INTO parent VALUES (7);
+    COMMIT;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-defer-foreign-keys-resets-after-rollback {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    ROLLBACK;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    0
+}
+
+test fk-defer-foreign-keys-off-clears-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent(id));
+    BEGIN;
+    PRAGMA defer_foreign_keys=ON;
+    INSERT INTO child VALUES (7);
+    PRAGMA defer_foreign_keys=OFF;
+    PRAGMA defer_foreign_keys;
+    COMMIT;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+    1
+}
+
+@cross-check-integrity
 test fk-column-constraint-multi-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(a, c);
