@@ -22,7 +22,7 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{emit_type_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -703,6 +703,63 @@ fn emit_column_constraints_validation(
         fullscan: false,
         is_index: false,
     });
+
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
+/// Run the column type's ENCODE on the DEFAULT of a newly added column when the
+/// table has rows, so a DEFAULT that ENCODE rejects (e.g. too long for a
+/// `varchar(n)`) fails the ALTER TABLE instead of every later read of the column.
+fn emit_add_column_encode_validation(
+    program: &mut ProgramBuilder,
+    btree: &BTreeTable,
+    original_btree: &Arc<BTreeTable>,
+    column: &Column,
+    default_expr: Option<&ast::Expr>,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let Some(default_expr) = default_expr.filter(|e| !crate::util::expr_contains_null(e)) else {
+        return Ok(());
+    };
+    let Some(type_def) = resolver
+        .schema()
+        .get_type_def(&column.ty_str, btree.is_strict)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(encode_expr) = type_def.encode() else {
+        return Ok(());
+    };
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: skip_label,
+    });
+
+    // Table has rows: they would read the encoded DEFAULT, so encode it now and
+    // let any error raised by ENCODE abort the statement.
+    let default_reg = program.alloc_register();
+    translate_expr(program, None, default_expr, default_reg, resolver)?;
+    let encoded_reg = program.alloc_register();
+    emit_type_expr(
+        program,
+        encode_expr,
+        default_reg,
+        encoded_reg,
+        column,
+        &type_def,
+        resolver,
+    )?;
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
@@ -1539,6 +1596,16 @@ pub fn translate_alter_table(
                     &new_column_name,
                     &column,
                     &constraints,
+                    resolver,
+                    database_id,
+                )?;
+
+                emit_add_column_encode_validation(
+                    program,
+                    &btree,
+                    &original_btree,
+                    &column,
+                    effective_default,
                     resolver,
                     database_id,
                 )?;
