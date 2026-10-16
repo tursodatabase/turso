@@ -28,6 +28,7 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
+use super::autoincrement::Sequence;
 use super::dml::{
     emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
     DmlTarget, ReturningBuffer, Subprograms,
@@ -47,7 +48,6 @@ pub(super) fn needs_legacy(
     update: &hir::Update,
     access: &HirAccessPlan,
     program: &ProgramBuilder,
-    mvcc: bool,
 ) -> Result<bool> {
     let document = &plan.document;
     if !update.order_by.is_empty()
@@ -78,16 +78,6 @@ pub(super) fn needs_legacy(
     if super::dml::strict_needs_legacy(&table)
         || source.column_type_programs.iter().any(Option::is_some)
     {
-        return Ok(true);
-    }
-    let assigned = with_generated_dependents(&table, assigned_columns(update)?)?;
-    let sets_rowid = assigned
-        .iter()
-        .filter(|column| is_rowid_target(&table, column))
-        .count();
-    // Under MVCC, a new rowid of an AUTOINCREMENT table also advances its
-    // hidden sequence, which is not lowered yet.
-    if sets_rowid > 0 && table.has_autoincrement && mvcc {
         return Ok(true);
     }
     if update.from.is_some() {
@@ -179,6 +169,7 @@ pub(super) fn emit_update(
     let hir::UpdateTargetKind::BTree {
         foreign_keys,
         defaults,
+        autoincrement,
         ..
     } = &update.target_kind
     else {
@@ -381,6 +372,12 @@ pub(super) fn emit_update(
             Ok(program.alloc_cursor_id(CursorType::BTreeTable(table)))
         })
         .transpose()?;
+    let sequence = match (autoincrement, rowid_value) {
+        (Some(autoincrement), Some(_)) => {
+            Some(Sequence::new(autoincrement, target.database, table, mvcc)?)
+        }
+        _ => None,
+    };
     let row_layout = UpdateRowLayout {
         values: &values,
         scratch: scratch.map(|cursor| (cursor, scratch_columns.as_slice())),
@@ -397,6 +394,7 @@ pub(super) fn emit_update(
         mvcc,
         actions,
         replace_actions,
+        sequence: sequence.as_ref(),
     };
     let done = program.allocate_label();
     // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
@@ -533,6 +531,8 @@ struct UpdateRowLayout<'a> {
     actions: &'a [CompiledAction<'a>],
     /// The ON DELETE actions of a row REPLACE deletes.
     replace_actions: &'a [CompiledAction<'a>],
+    /// AUTOINCREMENT, when the UPDATE sets the rowid: the target's sequence.
+    sequence: Option<&'a Sequence>,
 }
 
 /// Registers and conflict settings of an UPDATE's row, before the cursor
@@ -1323,6 +1323,9 @@ impl UpdateRow<'_, '_> {
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
+        if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
+            sequence.emit_moved_row(program, self.written_rowid())?;
+        }
         // Like legacy and SQLite, the actions run once the row is written,
         // for a parent key that changed, before RETURNING reads the row.
         for (action, old_key) in layout.actions.iter().zip(action_keys) {
@@ -1902,7 +1905,7 @@ mod tests {
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
         assert!(
-            !needs_legacy(&plan, update, access, &program, false).unwrap(),
+            !needs_legacy(&plan, update, access, &program).unwrap(),
             "{sql}"
         );
         program.set_hir_plan(plan.clone());
@@ -2113,7 +2116,7 @@ mod tests {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
             assert!(
-                !needs_legacy(&plan, update, access, &program(), false).unwrap(),
+                !needs_legacy(&plan, update, access, &program()).unwrap(),
                 "{sql}"
             );
         }

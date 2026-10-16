@@ -44,18 +44,10 @@ pub(super) fn needs_legacy(
     plan: &HirPlan,
     insert: &hir::Insert,
     program: &ProgramBuilder,
-    mvcc: bool,
 ) -> Result<bool> {
     let document = &plan.document;
-    match &insert.target_kind {
-        hir::InsertTargetKind::BTree { autoincrement, .. } => {
-            // AUTOINCREMENT under MVCC uses a hidden sequence, not lowered
-            // yet. Like legacy, outside MVCC that sequence is not used.
-            if mvcc && autoincrement.is_some() {
-                return Ok(true);
-            }
-        }
-        hir::InsertTargetKind::Virtual => return Ok(true),
+    if matches!(insert.target_kind, hir::InsertTargetKind::Virtual) {
+        return Ok(true);
     }
     if program.capture_data_changes_info().table().is_some() {
         return Ok(true);
@@ -90,6 +82,7 @@ pub(super) fn emit_insert(
     plan: &HirPlan,
     insert: &hir::Insert,
     subprograms: &Subprograms<'_>,
+    mvcc: bool,
     enforce_checks: bool,
 ) -> Result<()> {
     let triggers = &subprograms.triggers[..];
@@ -191,13 +184,7 @@ pub(super) fn emit_insert(
 
     let sequence = autoincrement
         .as_ref()
-        .map(|autoincrement| -> Result<Sequence> {
-            Ok(Sequence {
-                table: autoincrement.sqlite_sequence.value().require_btree()?,
-                database: target.database,
-                name: table.name.clone(),
-            })
-        })
+        .map(|autoincrement| Sequence::new(autoincrement, target.database, table, mvcc))
         .transpose()?;
     if several_rows {
         if let Some(sequence) = &sequence {
@@ -628,7 +615,7 @@ struct InsertRow<'a> {
     conflict_rowid: usize,
     /// False under `PRAGMA ignore_check_constraints`.
     enforce_checks: bool,
-    /// AUTOINCREMENT: the target's `sqlite_sequence` row.
+    /// AUTOINCREMENT: the target's sequence.
     sequence: Option<&'a Sequence>,
     /// The UPDATE triggers an UPSERT's DO UPDATE fires.
     upsert_triggers: &'a [CompiledTrigger],
@@ -794,7 +781,7 @@ impl InsertRow<'_> {
         }
         program.preassign_label_to_next_insn(generate);
         match &sequence {
-            Some(sequence) => sequence.emit_new_rowid(program, self.table_cursor, self.rowid),
+            Some(sequence) => sequence.emit_new_rowid(program, self.table_cursor, self.rowid)?,
             None => program.emit_insn(Insn::NewRowid {
                 cursor: self.table_cursor,
                 rowid_reg: self.rowid,
@@ -806,7 +793,7 @@ impl InsertRow<'_> {
             super::dml::emit_strict_type_check(program, table, self.columns);
         }
         if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
-            sequence.emit_given_rowid(program, self.rowid);
+            sequence.emit_given_rowid(program, self.rowid)?;
         }
 
         // CHECK constraints, index expressions, partial-index WHERE terms
@@ -1538,6 +1525,9 @@ impl InsertRow<'_> {
             table_name: table.name.clone(),
         });
         super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
+            sequence.emit_moved_row(program, written)?;
+        }
         // Like UPDATE, the actions run once the row is written, for a parent
         // key that changed.
         for (action, old_key) in actions.iter().zip(action_keys) {
@@ -2046,11 +2036,11 @@ mod tests {
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, "INSERT INTO sv(a, c) VALUES (1, 'q')"));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
+        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms::default();
-        emit_insert(&mut program, &plan, insert, &subprograms, true).unwrap();
+        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
         let checked = program
             .insns
             .iter()
@@ -2078,7 +2068,7 @@ mod tests {
         schema.add_btree_table(Arc::new(table)).unwrap();
         let plan = analyze_plan(schema, "INSERT INTO hc VALUES (1, 2)");
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
+        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
         // Like legacy, the values go to `a` and `c`, and `b` stays NULL.
         let targets = insert
             .columns
@@ -2096,11 +2086,47 @@ mod tests {
     }
 
     #[test]
-    fn autoincrement_needs_legacy_only_under_mvcc() {
-        let plan = analyze_plan(schema(), "INSERT INTO counted(b) VALUES (1)");
-        let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program(), false).unwrap());
-        assert!(needs_legacy(&plan, insert, &program(), true).unwrap());
+    fn autoincrement_uses_the_hidden_sequence_only_under_mvcc() {
+        // `counted` with the hidden sequence every AUTOINCREMENT table has.
+        let schema = || {
+            let mut schema = schema();
+            let name = crate::schema::autoincrement_sequence_name("counted");
+            let sequence =
+                crate::schema::Sequence::new(name.clone(), None, None, None, None, false).unwrap();
+            schema.sequences.insert(name.clone(), Arc::new(sequence));
+            schema
+                .add_btree_table(Arc::new(
+                    crate::schema::BTreeTable::from_sql(
+                        &crate::translate::sequence::sequence_backing_table_sql(&name),
+                        130,
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            schema
+        };
+        for sql in [
+            "INSERT INTO counted(b) VALUES (1)",
+            "INSERT INTO counted VALUES (5, 1)",
+            "INSERT INTO counted VALUES (5, 1) ON CONFLICT DO UPDATE SET id = 9",
+        ] {
+            let plan = Arc::new(analyze_plan(schema(), sql));
+            let insert = insert_root(&plan).unwrap();
+            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            let subprograms = Subprograms {
+                upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
+                ..Subprograms::default()
+            };
+            for mvcc in [false, true] {
+                let mut program = program();
+                program.set_hir_plan(plan.clone());
+                emit_insert(&mut program, &plan, insert, &subprograms, mvcc, true).unwrap();
+                let sequence_writes = count(&program, |insn| {
+                    matches!(insn, Insn::SequenceBeginInnerTx { .. })
+                });
+                assert_eq!(sequence_writes > 0, mvcc, "{sql}");
+            }
+        }
     }
 
     #[test]
@@ -2129,10 +2155,7 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
-            assert!(
-                !needs_legacy(&plan, insert, &program(), false).unwrap(),
-                "{sql}"
-            );
+            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
         }
     }
 
@@ -2140,16 +2163,13 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
-        assert!(
-            !needs_legacy(&plan, insert, &program, false).unwrap(),
-            "{sql}"
-        );
+        assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
             ..Subprograms::default()
         };
-        emit_insert(&mut program, &plan, insert, &subprograms, true).unwrap();
+        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
         program
     }
 

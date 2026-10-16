@@ -120,7 +120,7 @@ pub(crate) fn translate_update(
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
     let mvcc = uses_mvcc(connection, &plan.document, update.target);
-    if update::needs_legacy(&plan, update, access, program, mvcc)? {
+    if update::needs_legacy(&plan, update, access, program)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
@@ -164,8 +164,7 @@ pub(crate) fn translate_insert(
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
-    let mvcc = uses_mvcc(connection, &plan.document, insert.target);
-    if insert::needs_legacy(&plan, insert, program, mvcc)? {
+    if insert::needs_legacy(&plan, insert, program)? {
         return Ok(false);
     }
     let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
@@ -177,6 +176,7 @@ pub(crate) fn translate_insert(
         &plan,
         insert,
         &subprograms,
+        uses_mvcc(connection, &plan.document, insert.target),
         !connection.check_constraints_ignored(),
     )?;
     if let Some(returning) = &insert.returning {

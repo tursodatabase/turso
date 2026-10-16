@@ -316,40 +316,7 @@ impl<'document> HirValidator<'document> {
                     &upsert_assignments,
                 )?;
                 self.visit_dml_foreign_keys(insert.target, insert.target, foreign_keys)?;
-                let target_has_autoincrement = target_table
-                    .value()
-                    .btree()
-                    .is_some_and(|table| table.has_autoincrement);
-                self.require(
-                    target_has_autoincrement == autoincrement.is_some(),
-                    "INSERT AUTOINCREMENT metadata disagrees with its target",
-                )?;
-                if let Some(autoincrement) = autoincrement {
-                    self.visit_catalog_object(
-                        &autoincrement.sqlite_sequence,
-                        "AUTOINCREMENT sqlite_sequence table",
-                    )?;
-                    self.require(
-                        autoincrement.sqlite_sequence.database() == target_table.database(),
-                        "INSERT target and sqlite_sequence belong to different databases",
-                    )?;
-                    self.require(
-                        autoincrement
-                            .sqlite_sequence
-                            .value()
-                            .get_name()
-                            .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
-                        "INSERT AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
-                    )?;
-                    if let Some(sequence) = &autoincrement.mvcc_sequence {
-                        self.visit_sequence_operation(sequence)?;
-                        self.require(
-                            sequence.sqlite_sequence.as_ref()
-                                == Some(&autoincrement.sqlite_sequence),
-                            "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
-                        )?;
-                    }
-                }
+                self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults.iter().chain(replace_defaults) {
                     self.validate_column_position(insert.target, default.column)?;
                     self.visit_expr(&default.value)?;
@@ -471,6 +438,7 @@ impl<'document> HirValidator<'document> {
                 defaults,
                 triggers,
                 foreign_keys,
+                autoincrement,
             } => {
                 self.require(
                     target_table.value().btree().is_some(),
@@ -487,6 +455,7 @@ impl<'document> HirValidator<'document> {
                     &update.assignments,
                 )?;
                 self.visit_dml_foreign_keys(update.target, update.new_source, foreign_keys)?;
+                self.validate_autoincrement(target_table, autoincrement.as_ref())?;
                 for default in defaults {
                     self.validate_column_position(update.new_source, default.column)?;
                     self.visit_expr(&default.value)?;
@@ -2351,6 +2320,51 @@ impl<'document> HirValidator<'document> {
                 )
             }
         }
+    }
+
+    /// The AUTOINCREMENT metadata of an INSERT or UPDATE target: present
+    /// exactly for an AUTOINCREMENT table, with its database's
+    /// `sqlite_sequence` and, under MVCC, the hidden sequence that keeps it.
+    fn validate_autoincrement(
+        &self,
+        target_table: &ResolvedTable,
+        autoincrement: Option<&ResolvedAutoincrement>,
+    ) -> ValidationResult {
+        let target_has_autoincrement = target_table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_autoincrement);
+        self.require(
+            target_has_autoincrement == autoincrement.is_some(),
+            "AUTOINCREMENT metadata disagrees with its target",
+        )?;
+        let Some(autoincrement) = autoincrement else {
+            return Ok(());
+        };
+        self.visit_catalog_object(
+            &autoincrement.sqlite_sequence,
+            "AUTOINCREMENT sqlite_sequence table",
+        )?;
+        self.require(
+            autoincrement.sqlite_sequence.database() == target_table.database(),
+            "DML target and sqlite_sequence belong to different databases",
+        )?;
+        self.require(
+            autoincrement
+                .sqlite_sequence
+                .value()
+                .get_name()
+                .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+            "AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
+        )?;
+        if let Some(sequence) = &autoincrement.mvcc_sequence {
+            self.visit_sequence_operation(sequence)?;
+            self.require(
+                sequence.sqlite_sequence.as_ref() == Some(&autoincrement.sqlite_sequence),
+                "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
+            )?;
+        }
+        Ok(())
     }
 
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {

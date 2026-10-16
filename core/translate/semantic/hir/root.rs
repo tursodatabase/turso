@@ -215,6 +215,9 @@ pub enum UpdateTargetKind {
         defaults: Vec<ResolvedDefault>,
         triggers: Vec<ResolvedTrigger>,
         foreign_keys: DmlForeignKeys,
+        /// AUTOINCREMENT: an UPDATE that moves a row also advances the hidden
+        /// MVCC sequence.
+        autoincrement: Option<ResolvedAutoincrement>,
     },
     Virtual,
 }

@@ -92,7 +92,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let autoincrement = if table.value().btree().is_some() {
             self.analyze_btree_write_metadata(target, &table)?;
-            self.analyze_insert_autoincrement(&table)?
+            self.analyze_autoincrement(&table)?
         } else {
             None
         };
@@ -270,7 +270,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         )
     }
 
-    fn analyze_insert_autoincrement(
+    pub(super) fn analyze_autoincrement(
         &mut self,
         table: &hir::ResolvedTable,
     ) -> Result<Option<hir::ResolvedAutoincrement>> {

@@ -142,16 +142,14 @@ fn compile_trigger(
                 Some(Subprograms::default())
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                let mvcc = super::uses_mvcc(connection, &plan.document, insert.target);
-                if super::insert::needs_legacy(&plan, insert, &builder, mvcc)? {
+                if super::insert::needs_legacy(&plan, insert, &builder)? {
                     None
                 } else {
                     Subprograms::for_insert(session, &builder, &plan, insert)?
                 }
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                let mvcc = super::uses_mvcc(connection, &plan.document, update.target);
-                if super::update::needs_legacy(&plan, update, access, &builder, mvcc)? {
+                if super::update::needs_legacy(&plan, update, access, &builder)? {
                     None
                 } else {
                     Subprograms::for_update(session, &builder, &plan, update)?
@@ -235,6 +233,7 @@ fn compile_trigger(
                     &plan,
                     insert,
                     subprograms,
+                    super::uses_mvcc(connection, &plan.document, insert.target),
                     !connection.check_constraints_ignored(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);

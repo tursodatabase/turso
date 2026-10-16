@@ -11369,6 +11369,7 @@ mod tests {
             defaults: Vec::new(),
             triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
+            autoincrement: None,
         };
         assert_eq!(
             invalid

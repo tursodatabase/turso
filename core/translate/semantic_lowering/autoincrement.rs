@@ -1,26 +1,187 @@
 //! AUTOINCREMENT for HIR INSERT: like SQLite and legacy, the largest rowid a
 //! table has ever used is kept in its `sqlite_sequence` row, and a new rowid
 //! is always larger than it.
+//!
+//! Under MVCC, like legacy, the table's hidden sequence hands out new rowids
+//! instead and keeps `sqlite_sequence` itself; a rowid from the statement, or
+//! one an UPDATE or UPSERT moves a row to, advances it.
 
 use crate::{
     error::SQLITE_FULL,
     schema::{BTreeTable, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
+    translate::semantic::hir,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, InsertFlags, Insn},
     },
+    LimboError, Result,
 };
+
+/// Where an AUTOINCREMENT table's sequence is kept.
+pub(super) enum Sequence {
+    Table(TableSequence),
+    /// Under MVCC: the hidden sequence.
+    Mvcc(hir::SequenceOperation),
+}
+
+impl Sequence {
+    /// The sequence of an INSERT or UPDATE target. `mvcc` says whether its
+    /// database runs MVCC.
+    pub(super) fn new(
+        autoincrement: &hir::ResolvedAutoincrement,
+        database: usize,
+        table: &BTreeTable,
+        mvcc: bool,
+    ) -> Result<Self> {
+        if mvcc {
+            let operation = autoincrement.mvcc_sequence.clone().ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                    table.name
+                ))
+            })?;
+            return Ok(Self::Mvcc(operation));
+        }
+        Ok(Self::Table(TableSequence {
+            table: autoincrement.sqlite_sequence.value().require_btree()?,
+            database,
+            name: table.name.clone(),
+        }))
+    }
+
+    /// Before an INSERT of several rows: add the target's row to
+    /// `sqlite_sequence` with 0 when it has none, as legacy does.
+    pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
+        if let Self::Table(sequence) = self {
+            sequence.ensure_row(program);
+        }
+    }
+
+    /// At the start of a row.
+    pub(super) fn open(&self, program: &mut ProgramBuilder) -> SequenceCursor<'_> {
+        match self {
+            Self::Table(sequence) => SequenceCursor::Table(sequence.open(program)),
+            Self::Mvcc(operation) => SequenceCursor::Mvcc(operation),
+        }
+    }
+
+    /// After a row was moved to the rowid in `rowid`: under MVCC, advance the
+    /// hidden sequence past it, as legacy does. `sqlite_sequence` is left
+    /// alone, as in SQLite: the next new rowid is larger than every rowid
+    /// anyway.
+    pub(super) fn emit_moved_row(&self, program: &mut ProgramBuilder, rowid: usize) -> Result<()> {
+        match self {
+            Self::Table(_) => Ok(()),
+            Self::Mvcc(operation) => emit_advance_past(program, operation, rowid),
+        }
+    }
+}
+
+/// The sequence of a row being inserted.
+pub(super) enum SequenceCursor<'a> {
+    Table(TableSequenceCursor<'a>),
+    Mvcc(&'a hir::SequenceOperation),
+}
+
+impl SequenceCursor<'_> {
+    /// Generate the rowid of a new row into `rowid`.
+    pub(super) fn emit_new_rowid(
+        &self,
+        program: &mut ProgramBuilder,
+        table_cursor: usize,
+        rowid: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Table(cursor) => {
+                cursor.emit_new_rowid(program, table_cursor, rowid);
+                Ok(())
+            }
+            Self::Mvcc(operation) => {
+                let (database, backing_table, sqlite_sequence) = mvcc_tables(operation)?;
+                crate::translate::sequence::emit_disk_read_nextval(
+                    program,
+                    database,
+                    backing_table,
+                    sqlite_sequence,
+                    &operation.normalized_name,
+                    operation.sequence.value(),
+                    rowid,
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Once the rowid is known, before any constraint is checked: a rowid
+    /// from the statement raises the sequence. Like SQLite, this happens
+    /// even when the row is then skipped.
+    pub(super) fn emit_given_rowid(
+        &self,
+        program: &mut ProgramBuilder,
+        rowid: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Table(cursor) => {
+                cursor.emit_given_rowid(program, rowid);
+                Ok(())
+            }
+            Self::Mvcc(operation) => emit_advance_past(program, operation, rowid),
+        }
+    }
+
+    /// After the row and its triggers.
+    pub(super) fn emit_close(&self, program: &mut ProgramBuilder, rowid: usize) {
+        if let Self::Table(cursor) = self {
+            cursor.emit_close(program, rowid);
+        }
+    }
+}
+
+/// The database, backing table and `sqlite_sequence` of a hidden sequence.
+fn mvcc_tables(
+    operation: &hir::SequenceOperation,
+) -> Result<(usize, Arc<BTreeTable>, Option<Arc<BTreeTable>>)> {
+    let database = operation
+        .sequence
+        .database()
+        .ok_or_else(|| LimboError::InternalError("HIR sequence has no owning database".into()))?;
+    let backing_table = operation.backing_table.value().require_btree()?;
+    let sqlite_sequence = operation
+        .sqlite_sequence
+        .as_ref()
+        .map(|table| table.value().require_btree())
+        .transpose()?;
+    Ok((database.index(), backing_table, sqlite_sequence))
+}
+
+/// Under MVCC: raise the hidden sequence past the rowid in `value`.
+fn emit_advance_past(
+    program: &mut ProgramBuilder,
+    operation: &hir::SequenceOperation,
+    value: usize,
+) -> Result<()> {
+    let (database, backing_table, sqlite_sequence) = mvcc_tables(operation)?;
+    crate::translate::sequence::emit_disk_advance_past(
+        program,
+        database,
+        backing_table,
+        sqlite_sequence,
+        &operation.normalized_name,
+        operation.sequence.value(),
+        value,
+    )
+}
 
 /// The `sqlite_sequence` table of the target's database and the name of the
 /// target's row in it.
-pub(super) struct Sequence {
+pub(super) struct TableSequence {
     pub(super) table: Arc<BTreeTable>,
     pub(super) database: usize,
     pub(super) name: String,
 }
 
-impl Sequence {
+impl TableSequence {
     /// Before an INSERT of several rows: add the target's row with 0 when
     /// it has none, as legacy does.
     pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
@@ -74,10 +235,10 @@ impl Sequence {
 
     /// At the start of a row: open `sqlite_sequence` and read the target's
     /// row.
-    pub(super) fn open(&self, program: &mut ProgramBuilder) -> SequenceCursor<'_> {
+    pub(super) fn open(&self, program: &mut ProgramBuilder) -> TableSequenceCursor<'_> {
         let cursor = self.open_write(program);
         let name = program.emit_string8_new_reg(self.name.clone());
-        let sequence = SequenceCursor {
+        let sequence = TableSequenceCursor {
             sequence: self,
             cursor,
             name,
@@ -132,15 +293,15 @@ impl Sequence {
 
 /// `sqlite_sequence` open for one row: the target's sequence value and the
 /// rowid of its row, NULL while there is none.
-pub(super) struct SequenceCursor<'a> {
-    sequence: &'a Sequence,
+pub(super) struct TableSequenceCursor<'a> {
+    sequence: &'a TableSequence,
     cursor: usize,
     name: usize,
     value: usize,
     rowid: usize,
 }
 
-impl SequenceCursor<'_> {
+impl TableSequenceCursor<'_> {
     /// Generate the rowid of a new row into `rowid`: one more than the
     /// largest of the sequence value and the table's largest rowid, then
     /// store it in the sequence.
