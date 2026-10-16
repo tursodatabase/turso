@@ -1840,6 +1840,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 expression,
             },
@@ -1865,6 +1866,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 select,
             },
@@ -1902,6 +1904,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 insert: crate::translate::semantic::TriggerInsert {
                     command_conflict: *or_conflict,
@@ -1946,6 +1949,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 update: crate::translate::semantic::TriggerUpdate {
                     command_conflict: *or_conflict,
@@ -1985,6 +1989,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 delete: crate::translate::semantic::TriggerDelete {
                     table: tbl_name,
@@ -2030,6 +2035,7 @@ mod tests {
                     database: DatabaseId::new(MAIN_DB_ID),
                     table: schema.get_table("writable").expect("writable table exists"),
                     event,
+                    new_is_decoded: false,
                 },
                 command_database: Some(DatabaseId::new(MAIN_DB_ID)),
                 predicate: when_clause.as_deref(),

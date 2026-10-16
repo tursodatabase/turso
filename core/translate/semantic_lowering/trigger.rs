@@ -120,6 +120,7 @@ fn compile_trigger(
             .then(|| hir::DatabaseId::new(database)),
         table_name: &table.name,
         event: definition.event.clone(),
+        new_is_decoded: definition.time == TriggerTime::Before,
         predicate: definition.when_clause.as_ref(),
         commands: &definition.commands,
         conflict_override,

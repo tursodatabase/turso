@@ -78,24 +78,17 @@ pub(super) fn needs_legacy(
     if super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
     }
-    // Custom types are lowered unless a BEFORE trigger fires: legacy shows
-    // it the new values before they are encoded and the other columns as
-    // stored, which HIR's trigger programs, decoding their rows themselves,
-    // do not do yet.
+    // Custom types are lowered unless a virtual column has one.
     if super::dml::has_custom_types(source) {
-        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+        if !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. }) {
             return Ok(true);
-        };
+        }
         let custom_virtual = table
             .columns()
             .iter()
             .zip(&source.column_type_programs)
             .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        if custom_virtual
-            || triggers
-                .iter()
-                .any(|trigger| trigger.value().time == TriggerTime::Before)
-        {
+        if custom_virtual {
             return Ok(true);
         }
     }
@@ -1218,6 +1211,22 @@ impl UpdateRow<'_, '_> {
         layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
     ) -> Result<()> {
+        let table = self.target.table;
+        if table.has_virtual_columns() && super::dml::has_custom_types(self.target.source) {
+            // The new row holds the values the UPDATE sets as SQL values and
+            // the others as stored, so the virtual columns are computed from
+            // a copy of it as SQL values.
+            let row = self.emit_sql_values(program, layout)?;
+            for (position, column) in table.columns().iter().enumerate() {
+                if column.is_virtual_generated() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: row + position,
+                        dst_reg: self.start() + position,
+                        extra_amount: 0,
+                    });
+                }
+            }
+        }
         program.bind_source(
             layout.new_source,
             SourceBinding::Registers {
@@ -1225,14 +1234,15 @@ impl UpdateRow<'_, '_> {
                 rowid: Some(self.written_rowid()),
             },
         );
-        let table = self.target.table;
-        super::dml::emit_virtual_columns(
-            program,
-            self.target.document,
-            layout.new_source,
-            table,
-            self.start(),
-        )?;
+        if !super::dml::has_custom_types(self.target.source) {
+            super::dml::emit_virtual_columns(
+                program,
+                self.target.document,
+                layout.new_source,
+                table,
+                self.start(),
+            )?;
+        }
         if check_notnull {
             for (position, column) in table.columns().iter().enumerate() {
                 if column.is_virtual_generated()
@@ -1244,6 +1254,62 @@ impl UpdateRow<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    /// A copy of the new row as SQL values, with its virtual columns
+    /// computed: the values the UPDATE sets as they are, and the other
+    /// columns, which hold stored values, decoded.
+    fn emit_sql_values(
+        &self,
+        program: &mut ProgramBuilder,
+        layout: &UpdateRowLayout<'_>,
+    ) -> Result<usize> {
+        let DmlTarget {
+            document,
+            source,
+            table,
+            ..
+        } = *self.target;
+        let columns = table.columns().len();
+        let row = program.alloc_registers(columns);
+        program.emit_insn(Insn::Copy {
+            src_reg: self.start(),
+            dst_reg: row,
+            extra_amount: columns - 1,
+        });
+        for (position, value) in layout.values.iter().enumerate() {
+            if value.is_some() {
+                continue;
+            }
+            if let Some(programs) = source.column_type_programs[position]
+                .as_ref()
+                .filter(|programs| !programs.decode.is_empty())
+            {
+                let null = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: row + position,
+                    target_pc: null,
+                });
+                super::expr::translate_schema_calls_in_place(
+                    program,
+                    document,
+                    &programs.decode,
+                    row + position,
+                )?;
+                program.preassign_label_to_next_insn(null);
+            }
+        }
+        program.bind_source(
+            layout.new_source,
+            SourceBinding::Registers {
+                start: row,
+                rowid: Some(self.written_rowid()),
+            },
+        );
+        super::dml::with_stored_values(program, |program| {
+            super::dml::emit_virtual_columns(program, document, layout.new_source, table, row)
+        })?;
+        Ok(row)
     }
 
     /// Rewrite the row the table cursor is on.
@@ -1327,6 +1393,15 @@ impl UpdateRow<'_, '_> {
             })
             .transpose()?;
         if has_before {
+            // A BEFORE trigger reads NEW as SQL values.
+            let new_row = if super::dml::has_custom_types(source) {
+                TriggerRow {
+                    columns: self.emit_sql_values(program, layout)?,
+                    rowid: self.written_rowid(),
+                }
+            } else {
+                new_row
+            };
             for trigger in fires(TriggerTime::Before) {
                 // RAISE(IGNORE) skips the rest of this row.
                 trigger.emit_fire(program, old_row, Some(new_row), columns, self.skip_row)?;

@@ -274,7 +274,7 @@ derived table again for each row). These still go to legacy:
 | A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
 | A loop over an index built for the statement | Its lowering |
 | Array columns | Their lowering |
-| Custom types with a BEFORE trigger or a custom-typed virtual column | Raw values for BEFORE triggers, decoding computed columns |
+| A custom-typed virtual column | Decoding computed columns |
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -292,7 +292,7 @@ inserted. These still go to legacy:
 |---|---|
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | WITHOUT ROWID tables, array columns | Their lowering |
-| Custom types with a BEFORE INSERT trigger or a custom-typed virtual column | Raw values for BEFORE triggers, decoding computed columns |
+| A custom-typed virtual column | Decoding computed columns |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -345,7 +345,13 @@ the same after NOT NULL, but only for the columns it sets; the others are
 read and written back as stored. Like legacy, its NOT NULL check sees the
 value before it is encoded. An UPSERT DO UPDATE reads the conflicting row
 and `excluded` decoded, so, like legacy, it checks, encodes and checks every
-column of the updated row, not only those it sets. The
+column of the updated row, not only those it sets. A BEFORE trigger is
+compiled to read NEW without decoding it, and is given NEW as SQL values:
+the INSERT row before it is encoded, the UPDATE row with the columns it
+does not set decoded, and a decoded copy of the UPSERT row. Virtual columns
+of an UPDATE are computed from that decoded copy too. Legacy instead shows a
+BEFORE UPDATE trigger the unchanged columns as stored, and computes virtual
+columns from values decoded twice or not at all. The
 STRICT/custom-type tests are skipped by the Rust conformance backend, so
 they were checked with the CLI backend, statement block by block against
 legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so

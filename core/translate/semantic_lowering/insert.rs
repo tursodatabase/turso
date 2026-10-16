@@ -68,22 +68,14 @@ pub(super) fn needs_legacy(
     if !table.has_rowid || super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
     }
-    // Custom types are lowered unless a BEFORE INSERT trigger fires: legacy
-    // shows it the values before they are encoded, which HIR does not do yet.
+    // Custom types are lowered unless a virtual column has one.
     if super::dml::has_custom_types(source) {
-        let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
-            return Ok(true);
-        };
-        let before_triggers = triggers
-            .insert
-            .iter()
-            .any(|trigger| trigger.value().time == TriggerTime::Before);
         let custom_virtual = table
             .columns()
             .iter()
             .zip(&source.column_type_programs)
             .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        return Ok(before_triggers || custom_virtual);
+        return Ok(custom_virtual);
     }
     Ok(false)
 }
@@ -847,14 +839,18 @@ impl InsertRow<'_> {
             });
             program.preassign_label_to_next_insn(known);
             // Like legacy, a BEFORE trigger sees the virtual columns of NEW.
+            // Custom-typed values are not encoded yet, so they are read as
+            // they are.
             self.bind_new_row(program);
-            super::dml::emit_virtual_columns(
-                program,
-                document,
-                self.target.source.id,
-                table,
-                self.columns,
-            )?;
+            super::dml::with_stored_values(program, |program| {
+                super::dml::emit_virtual_columns(
+                    program,
+                    document,
+                    self.target.source.id,
+                    table,
+                    self.columns,
+                )
+            })?;
             for trigger in self
                 .triggers
                 .iter()
@@ -1355,6 +1351,28 @@ impl InsertRow<'_> {
             rowid: written,
         };
         if fires(TriggerTime::Before).next().is_some() {
+            // A BEFORE trigger reads NEW as SQL values, and the new row is
+            // encoded already, so it gets a decoded copy.
+            let new_trigger_row = if super::dml::has_custom_types(source) {
+                let start = program.alloc_registers(columns);
+                for column in 0..columns {
+                    super::expr::translate_expr_no_constant_opt(
+                        program,
+                        document,
+                        &hir::Expr::Column(hir::ColumnRef {
+                            source: new_source.id,
+                            column,
+                        }),
+                        start + column,
+                    )?;
+                }
+                TriggerRow {
+                    columns: start,
+                    rowid: written,
+                }
+            } else {
+                new_trigger_row
+            };
             for trigger in fires(TriggerTime::Before) {
                 trigger.emit_fire(program, old_row, Some(new_trigger_row), columns, row_done)?;
             }

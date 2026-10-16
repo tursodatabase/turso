@@ -1114,6 +1114,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         table: &hir::ResolvedTable,
     ) -> Result<Vec<AnalyzedSourceColumn>> {
+        self.source_columns_with(table, true)
+    }
+
+    /// The columns of `table`; with `type_programs` false, custom-typed
+    /// columns get no programs, for a row that is never decoded.
+    pub(super) fn source_columns_with(
+        &mut self,
+        table: &hir::ResolvedTable,
+        type_programs: bool,
+    ) -> Result<Vec<AnalyzedSourceColumn>> {
         let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
         let database = table.database().ok_or_else(|| {
             LimboError::InternalError("table source has no owning database".to_string())
@@ -1125,6 +1135,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .schema(database)?
                 .resolve_type(&column.ty_str, is_strict)?;
             let (type_fact, programs) = match resolved_type {
+                Some(resolved) if !type_programs => {
+                    let (type_fact, _) =
+                        self.freeze_type_fact(&column.ty_str, resolved, column.array_dimensions());
+                    (type_fact, None)
+                }
                 Some(resolved) => {
                     let (type_fact, _) =
                         self.freeze_type_fact(&column.ty_str, resolved, column.array_dimensions());

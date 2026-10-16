@@ -34,6 +34,9 @@ pub(crate) enum SemanticRootInput<'ast> {
         command_database: Option<hir::DatabaseId>,
         table_name: &'ast str,
         event: turso_parser::ast::TriggerEvent,
+        /// Whether NEW is handed over as SQL values rather than as stored
+        /// values: a BEFORE trigger runs before custom types are encoded.
+        new_is_decoded: bool,
         predicate: Option<&'ast turso_parser::ast::Expr>,
         commands: &'ast [turso_parser::ast::TriggerCmd],
         conflict_override: Option<turso_parser::ast::ResolveType>,
@@ -62,6 +65,7 @@ pub(crate) fn analyze_root(
             command_database,
             table_name,
             event,
+            new_is_decoded,
             predicate,
             commands,
             conflict_override,
@@ -78,6 +82,7 @@ pub(crate) fn analyze_root(
                     database,
                     table,
                     event,
+                    new_is_decoded,
                 },
                 command_database,
                 predicate,
@@ -152,6 +157,9 @@ pub(crate) struct TriggerAnalysis {
     pub(crate) database: hir::DatabaseId,
     pub(crate) table: crate::sync::Arc<crate::schema::Table>,
     pub(crate) event: turso_parser::ast::TriggerEvent,
+    /// Whether NEW holds SQL values, so reading it does not decode custom
+    /// types.
+    pub(crate) new_is_decoded: bool,
 }
 
 #[cfg(test)]
@@ -249,6 +257,7 @@ mod tests {
                 command_database: Some(hir::DatabaseId::new(MAIN_DB_ID)),
                 table_name: "items",
                 event: event.clone(),
+                new_is_decoded: false,
                 predicate: when_clause.as_deref(),
                 commands: &commands,
                 conflict_override: None,
@@ -273,6 +282,7 @@ mod tests {
                 command_database: Some(hir::DatabaseId::new(MAIN_DB_ID)),
                 table_name: "missing",
                 event,
+                new_is_decoded: false,
                 predicate: None,
                 commands: &commands,
                 conflict_override: None,

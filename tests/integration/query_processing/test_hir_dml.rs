@@ -1595,6 +1595,61 @@ fn hir_custom_type_writes_match_legacy() {
     }
 }
 
+/// BEFORE triggers and virtual columns of a table with custom types read
+/// SQL values: NEW holds the values a statement writes and the decoded
+/// values of the columns an UPDATE leaves alone. Legacy shows a BEFORE
+/// UPDATE trigger those columns as stored, and decodes the values a virtual
+/// column reads twice or not at all.
+#[test]
+fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
+    let db = TempDatabase::builder()
+        .with_opts(
+            turso_core::DatabaseOpts::new()
+                .with_custom_types(true)
+                .with_generated_columns(true),
+        )
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a cents, b cents, v INTEGER AS (a + b)) STRICT",
+        "CREATE TABLE log(m TEXT)",
+        "CREATE TRIGGER bi BEFORE INSERT ON t BEGIN \
+         INSERT INTO log VALUES ('bi ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN \
+         INSERT INTO log VALUES ('bu ' || old.a || ' ' || old.b || ' > ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+         INSERT INTO log VALUES ('au ' || new.a || ' ' || new.b || ' ' || new.v); END",
+        "INSERT INTO t VALUES (1, 2, 3)",
+        "UPDATE t SET a = 7 WHERE id = 1",
+        "INSERT INTO t VALUES (1, 9, 9) ON CONFLICT DO UPDATE SET b = excluded.b",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT a, b, v FROM t"),
+        ["[Integer(7), Integer(9), Integer(16)]"]
+    );
+    assert_eq!(
+        rows("SELECT m FROM log"),
+        [
+            "[Text(\"bi 2 3 5\")]",
+            "[Text(\"bu 2 3 > 7 3 10\")]",
+            "[Text(\"au 7 3 10\")]",
+            "[Text(\"bi 9 9 18\")]",
+            "[Text(\"bu 7 3 > 7 9 16\")]",
+            "[Text(\"au 7 9 16\")]",
+        ]
+    );
+}
+
 /// Queries over custom-typed columns: GROUP BY keeps the grouped columns as
 /// stored so aggregates decode them once, and BETWEEN uses the type's own
 /// comparison operators, as legacy does.
