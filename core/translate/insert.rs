@@ -2835,22 +2835,38 @@ fn translate_column(
             dest: column_register,
             dest_end: None,
         });
-    } else if let Some(default_expr) = column.default.as_ref() {
-        translate_expr(program, None, default_expr, column_register, resolver)?;
-    } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if let Some(default_expr) = resolved.default_expr() {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
-        } else {
+    } else {
+        let resolved = resolver
+            .schema()
+            .resolve_type(&column.ty_str, is_strict)
+            .ok()
+            .flatten();
+        let default_expr = column
+            .default
+            .as_deref()
+            .or_else(|| resolved.as_ref().and_then(|r| r.default_expr()));
+        let Some(default_expr) = default_expr else {
             program.emit_insn(Insn::Null {
                 dest: column_register,
                 dest_end: None,
             });
+            return Ok(());
+        };
+        let has_custom_encode = resolved
+            .as_ref()
+            .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+        if has_custom_encode {
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                default_expr,
+                column_register,
+                resolver,
+                NoConstantOptReason::CustomTypeEncode,
+            )?;
+        } else {
+            translate_expr(program, None, default_expr, column_register, resolver)?;
         }
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: column_register,
-            dest_end: None,
-        });
     }
     Ok(())
 }
