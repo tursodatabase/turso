@@ -806,7 +806,8 @@ pub enum Insn {
     /// `ColumnHasField` lets us detect short records at runtime and branch to
     /// bytecode that computes the encoded default dynamically, without
     /// restricting what expressions ENCODE (or future non-constant defaults)
-    /// may contain.
+    /// may contain.  It also jumps when the cursor is on a null row, so an
+    /// unmatched LEFT JOIN row reads NULL rather than the default.
     ColumnHasField {
         cursor_id: CursorID,
         column: usize,

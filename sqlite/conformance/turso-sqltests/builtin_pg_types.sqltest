@@ -104,6 +104,30 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test left-join-unmatched-encoded-column-with-default-is-null {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, v date DEFAULT '2000-01-01') STRICT;
+    INSERT INTO a VALUES (1);
+    SELECT a.id, b.v, b.v IS NULL FROM a LEFT JOIN b ON b.id = a.id;
+}
+expect {
+    1||1
+}
+
+@requires strict "uses STRICT tables"
+test left-join-unmatched-encoded-column-with-default-is-null-hash-join {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, v date DEFAULT '2000-01-01') STRICT;
+    INSERT INTO a VALUES (1, 10), (2, 20);
+    INSERT INTO b VALUES (1, 10, '2024-01-15');
+    SELECT a.id, b.v, b.v IS NULL FROM a LEFT JOIN b ON b.k = a.k ORDER BY a.id;
+}
+expect {
+    1|2024-01-15|0
+    2||1
+}
+
+@requires strict "uses STRICT tables"
 test date-plus-minus-days {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
     INSERT INTO t1 VALUES (1, '2025-01-05'), (2, '2024-03-01'), (3, NULL);
