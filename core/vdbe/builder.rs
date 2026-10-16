@@ -267,6 +267,8 @@ pub struct ProgramBuilder {
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
+    /// Connection setting captured when this program is translated.
+    defer_foreign_keys: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -704,6 +706,18 @@ impl ProgramBuilder {
         ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
     }
 
+    pub fn set_defer_foreign_keys(&mut self, enabled: bool) {
+        self.defer_foreign_keys = enabled;
+    }
+
+    pub fn is_fk_deferred(&self, fk: &crate::schema::ForeignKey) -> bool {
+        fk.deferred || self.defer_foreign_keys
+    }
+
+    pub fn defer_foreign_keys_enabled(&self) -> bool {
+        self.defer_foreign_keys
+    }
+
     #[turso_macros::trace_stack]
     fn _new(
         query_mode: QueryMode,
@@ -734,6 +748,7 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             mvcc_enabled: false,
+            defer_foreign_keys: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),

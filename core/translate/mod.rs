@@ -107,6 +107,7 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.set_defer_foreign_keys(connection.defer_foreign_keys());
 
     program.prologue();
     let mut resolver = Resolver::new(

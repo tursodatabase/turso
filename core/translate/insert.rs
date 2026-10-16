@@ -4037,7 +4037,7 @@ pub fn emit_fk_child_insert_checks(
             // Missing parent: immediate → Halt before Insert; deferred → counter
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred {
+            if program.is_fk_deferred(&fk_ref.fk) {
                 emit_fk_violation(program, &fk_ref.fk)?;
             } else {
                 emit_fk_restrict_halt(program)?;
@@ -4137,7 +4137,7 @@ pub fn emit_fk_child_insert_checks(
                 |_p| Ok(()),
                 // on_not_found: immediate → Halt; deferred → counter
                 |p| {
-                    if fk_ref.fk.deferred {
+                    if p.is_fk_deferred(&fk_ref.fk) {
                         emit_fk_violation(p, &fk_ref.fk)?;
                     } else {
                         emit_fk_restrict_halt(p)?;
@@ -4246,13 +4246,14 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             .name
             .eq_ignore_ascii_case(&parent_table.name);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
+        let is_deferred = program.is_fk_deferred(&pref.fk);
+        if !force_immediate && !is_deferred && !is_self_ref {
             continue;
         }
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
+            deferred: is_deferred,
             target_pc: skip_fk,
         });
 
@@ -4299,7 +4300,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Decrement once per matching child row
             index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
                 let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                let deferred = p.is_fk_deferred(&pref.fk);
+                emit_guarded_fk_decrement(p, next, deferred);
                 p.preassign_label_to_next_insn(next);
                 Ok(())
             })?;
@@ -4346,7 +4348,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.preassign_label_to_next_insn(cont);
             }
             // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
+            let deferred = program.is_fk_deferred(&pref.fk);
+            emit_guarded_fk_decrement(program, next_row, deferred);
             program.preassign_label_to_next_insn(next_row);
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
