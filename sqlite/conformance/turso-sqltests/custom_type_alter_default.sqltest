@@ -123,3 +123,28 @@ test alter-column-custom-type-parameter-change-runs-encode {
 expect error {
     value too long for varchar
 }
+
+@requires strict "uses STRICT tables"
+test alter-column-to-different-array-element-type-converts-each-element {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (1, '{5}'), (2, '{1,-2,3}'), (3, '{}');
+    ALTER TABLE t ALTER COLUMN a TO a2 smallint[];
+    SELECT id, a2 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|{5}
+    2|{1,-2,3}
+    3|{}
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-to-different-array-element-type-checks-each-element {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (1, '{5,40000}');
+    ALTER TABLE t ALTER COLUMN a TO a2 smallint[];
+}
+expect error {
+    integer out of range for smallint
+}
