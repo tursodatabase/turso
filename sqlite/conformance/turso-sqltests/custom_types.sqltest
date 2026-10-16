@@ -1161,6 +1161,36 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test automatic-index-range-join-numeric {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, v numeric(10,2)) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, v numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1, 2);
+    INSERT INTO b VALUES (1, -5), (2, 3), (3, 10), (4, 100), (5, 2.5), (6, 0);
+    SELECT b.id, b.v FROM a JOIN b ON b.v > a.v ORDER BY b.id;
+}
+expect {
+    2|3.00
+    3|10.00
+    4|100.00
+    5|2.50
+}
+
+@requires strict "uses STRICT tables"
+test automatic-index-range-constant-numeric {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, v numeric(10,2)) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, v numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1, 2);
+    INSERT INTO b VALUES (1, -5), (2, 3), (3, 10), (4, 100), (5, 2.5), (6, 0);
+    SELECT b.id, b.v FROM a, b WHERE b.v > 2 ORDER BY b.id;
+}
+expect {
+    2|3.00
+    3|10.00
+    4|100.00
+    5|2.50
+}
+
+@requires strict "uses STRICT tables"
 test index-equality-seek-numeric-no-match {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);

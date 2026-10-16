@@ -296,12 +296,25 @@ pub struct TableConstraints {
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
+    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
+    let can_use_term = |term: &Constraint| {
+        if !term.can_drive_index_seek(columns) {
+            return false;
+        }
+        let column = &columns[term
+            .table_col_pos
+            .expect("a term that can drive an index seek has a column")];
+        let has_custom_type = schema
+            .get_type_def(&column.ty_str, table.table.is_strict())
+            .is_some();
+        !has_custom_type || term.operator == ast::Operator::Equals.into()
+    };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| can_use_term(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -309,7 +322,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| can_use_term(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1355,7 +1368,7 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema)
             .into_iter()
             .filter(|term| {
                 let constraint = &cs.constraints[term.constraint_vec_pos];
