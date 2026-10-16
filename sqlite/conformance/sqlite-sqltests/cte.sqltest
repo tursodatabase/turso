@@ -1518,3 +1518,43 @@ expect {
     1|10
     2|20
 }
+
+test materialized-cte-with-correlated-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT (SELECT c0) AS c0 FROM t0)
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    7
+}
+
+test materialized-cte-with-in-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT t0.c0 IN (SELECT c0) AS c0 FROM t0)
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    1
+}
+
+test materialized-cte-with-exists-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT c0 FROM t0 WHERE EXISTS (SELECT t0.c0))
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    7
+}
+
+test cte-read-twice-with-correlated-subquery-next-to-a-window-function {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS (SELECT (SELECT c0) AS c0 FROM t0)
+    SELECT max(1) OVER (), (SELECT count(*) FROM x AS a, x AS b);
+}
+expect {
+    1|1
+}

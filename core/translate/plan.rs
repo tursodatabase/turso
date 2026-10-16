@@ -4554,8 +4554,22 @@ fn eval_at_for_select_plan(
         }
     }
     for subquery in plan.non_from_clause_subqueries.iter() {
-        let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
-        eval_at = eval_at.max(eval_at_inner);
+        match &subquery.state {
+            SubqueryState::Unevaluated { .. } => {
+                eval_at = eval_at.max(subquery.get_eval_at(join_order, table_references)?);
+            }
+            // A nested subquery is already emitted when it is inside a pre-materialized CTE.
+            // Its `evaluated_at` is a loop of the nested plan, not of `join_order`.
+            SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                for outer_ref_id in outer_ref_ids {
+                    if let Some(loop_idx) =
+                        resolve_outer_ref_loop(*outer_ref_id, join_order, table_references)
+                    {
+                        eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+                    }
+                }
+            }
+        }
     }
     for joined_table in plan.table_references.joined_tables().iter() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
