@@ -275,6 +275,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         }
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
+            // Drop the sign of a zero: SQLite writes `-0.0` as `0.0` in JSON (#9840)
+            let float = if float == 0.0 { 0.0 } else { float };
             // SQLite writes an infinite REAL as 9e999 when it converts a
             // function argument to JSON, but json_array, json_object and
             // json_quote print it as 9.0e+999 (#4196).
