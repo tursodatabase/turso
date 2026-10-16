@@ -168,7 +168,10 @@ pub(super) fn emit_insert(
         .upserts
         .iter()
         .any(|upsert| matches!(upsert.action, hir::UpsertAction::Update { .. }));
-    if !several_rows && triggers.is_empty() && !any_replace && !has_upsert {
+    // AUTOINCREMENT writes sqlite_sequence before the row's constraints are
+    // checked, and with several rows a later row may run out of rowids.
+    let has_autoincrement = table.has_autoincrement;
+    if !several_rows && triggers.is_empty() && !any_replace && !has_upsert && !has_autoincrement {
         program.set_multi_write(false);
     }
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
@@ -176,6 +179,7 @@ pub(super) fn emit_insert(
         !triggers.is_empty()
             || has_foreign_keys
             || has_do_update
+            || (has_autoincrement && several_rows)
             || constraint_may_abort(
                 has_statement_conflict,
                 or_conflict,
