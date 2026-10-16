@@ -884,8 +884,8 @@ fn resolve_effective_frame(
     func: &AccumulatorFunc,
     user_frame: Option<crate::translate::plan::Frame>,
 ) -> Result<crate::translate::plan::Frame> {
-    use crate::translate::plan::{Frame, FrameBoundary};
-    use turso_parser::ast::FrameMode;
+    use crate::translate::plan::Frame;
+    use turso_parser::ast::{FrameBound, FrameMode};
 
     // Built-ins with a coerced frame ignore the user clause entirely
     // (`Some(_)` from `coerced_frame()`). The rest honor it.
@@ -898,8 +898,8 @@ fn resolve_effective_frame(
     let Some(frame) = user_frame else {
         return Ok(Frame {
             mode: FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
             exclude: None,
         });
     };
@@ -940,10 +940,7 @@ fn resolve_effective_frame(
         );
     // Anything but an UNBOUNDED PRECEDING start makes the frame shrink
     // from the left, firing xInverse.
-    let moving_start = !matches!(
-        frame.start,
-        crate::translate::plan::FrameBoundary::UnboundedPreceding
-    );
+    let moving_start = !matches!(frame.start, FrameBound::UnboundedPreceding);
     if moving_start && frame.exclude.is_none() && !supports_sliding {
         crate::bail_parse_error!(
             "{}() does not yet support window frames with a moving start; \
