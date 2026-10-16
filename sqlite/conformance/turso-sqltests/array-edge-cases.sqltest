@@ -762,7 +762,7 @@ test negative-zero-float-display {
     SELECT vals FROM nz1;
 }
 expect {
-    {0.0}
+    {-0.0}
 }
 
 test negative-zero-integer-display {
@@ -790,7 +790,7 @@ test negative-zero-in-mixed-array {
     SELECT vals FROM nz4;
 }
 expect {
-    {1.0,0.0,2.0}
+    {1.0,-0.0,2.0}
 }
 
 test negative-zero-round-trip {
@@ -800,8 +800,8 @@ test negative-zero-round-trip {
     SELECT id, vals FROM nz5 ORDER BY id;
 }
 expect {
-    1|{0.0,0.0}
-    2|{0.0,0.0}
+    1|{-0.0,0.0}
+    2|{-0.0,0.0}
 }
 
 test negative-zero-remove {

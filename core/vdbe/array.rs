@@ -72,14 +72,14 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
                 match bytes[pos] {
                     b'\\' => {
                         pos += 1;
-                        if pos >= bytes.len() {
-                            return None;
-                        }
-                        match bytes[pos] {
-                            b'n' => s.push('\n'),
-                            b't' => s.push('\t'),
-                            b'r' => s.push('\r'),
-                            other => s.push(other as char),
+                        let escaped = inner[pos..].chars().next()?;
+                        pos += escaped.len_utf8();
+                        match escaped {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            'u' => s.push(parse_pg_unicode_escape(inner, &mut pos)?),
+                            other => s.push(other),
                         }
                     }
                     b'"' => {
@@ -91,10 +91,8 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
                         let ch = remaining.chars().next().unwrap_or('\u{FFFD}');
                         s.push(ch);
                         pos += ch.len_utf8();
-                        continue;
                     }
                 }
-                pos += 1;
             }
             elements.push(Value::build_text(s));
         } else {
@@ -106,11 +104,19 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
             let token = &inner[start..pos];
             if token.eq_ignore_ascii_case("null") {
                 elements.push(Value::Null);
+            } else if let Some(hex) = token
+                .strip_prefix("X'")
+                .or_else(|| token.strip_prefix("x'"))
+            {
+                let hex = hex.strip_suffix('\'')?;
+                let mut bytes = crate::alloc::vec![0; hex.len() / 2];
+                hex::decode_to_slice(hex, &mut bytes).ok()?;
+                elements.push(Value::Blob(bytes));
             } else if let Ok(i) = token.parse::<i64>() {
                 elements.push(Value::from_i64(i));
             } else if let Ok(f) = token.parse::<f64>() {
-                if !f.is_finite() {
-                    return None; // reject Infinity and NaN
+                if !f.is_finite() && !matches!(token, "inf" | "-inf") {
+                    return None;
                 }
                 elements.push(Value::from_f64(f));
             } else {
@@ -141,6 +147,33 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
     }
 
     Some(elements)
+}
+
+fn parse_pg_unicode_escape(text: &str, pos: &mut usize) -> Option<char> {
+    let first = parse_pg_hex_escape(text, pos)?;
+    let scalar = if (0xd800..=0xdbff).contains(&first) {
+        if text.get(*pos..*pos + 2)? != "\\u" {
+            return None;
+        }
+        *pos += 2;
+        let second = parse_pg_hex_escape(text, pos)?;
+        if !(0xdc00..=0xdfff).contains(&second) {
+            return None;
+        }
+        0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00)
+    } else {
+        u32::from(first)
+    };
+    char::from_u32(scalar)
+}
+
+fn parse_pg_hex_escape(text: &str, pos: &mut usize) -> Option<u16> {
+    let digits = text.get(*pos..*pos + 4)?;
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    *pos += 4;
+    u16::from_str_radix(digits, 16).ok()
 }
 
 /// Pack values into a record-format array blob.
@@ -179,8 +212,6 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
         }
         crate::ValueRef::Numeric(Numeric::Float(f)) => {
             let fval: f64 = (*f).into();
-            // Normalize -0.0 to 0.0 for display
-            let fval = if fval == 0.0 { 0.0 } else { fval };
             if fval.fract() == 0.0 && fval.is_finite() {
                 let _ = write!(result, "{fval:.1}");
             } else {
@@ -191,11 +222,11 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
             write_pg_text_element(result, t.as_str());
         }
         crate::ValueRef::Blob(b) => {
-            result.push_str("\"X'");
+            result.push_str("X'");
             for byte in *b {
                 let _ = write!(result, "{byte:02X}");
             }
-            result.push_str("'\"");
+            result.push('\'');
         }
     }
 }
@@ -205,6 +236,9 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
 fn write_pg_text_element(result: &mut String, s: &str) {
     let needs_quoting = s.is_empty()
         || s.eq_ignore_ascii_case("null")
+        || s.parse::<f64>().is_ok()
+        || s.starts_with("X'")
+        || s.starts_with("x'")
         || s.contains(|c: char| {
             c == ','
                 || c == '{'
@@ -617,6 +651,7 @@ pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoIteratorExt;
 
     #[test]
     fn test_parse_text_array_multibyte_utf8() {
@@ -825,6 +860,177 @@ mod tests {
         };
         let text = serialize_array_from_blob(blob).unwrap();
         assert_eq!(text, "{1,hello,NULL}");
+    }
+
+    #[test]
+    fn test_array_text_roundtrip() {
+        for text in [
+            "001",
+            "+12",
+            "1e2",
+            "1.0",
+            "1e309",
+            "NaN",
+            "Infinity",
+            "null",
+            "",
+            "X'00FF'",
+            "x'41'",
+            "X'not hex'",
+            "X'GG'",
+            "X'",
+            "hello",
+            "a,b",
+            "{nested}",
+            "say \"hello\"",
+            "back\\slash",
+            "\\u0000",
+            "\\uD800\\uDC00",
+            "你好 🌍",
+            "\0\u{1}\u{8}\t\n\u{c}\r\u{1f}\u{7f}\u{85}",
+        ] {
+            assert_array_roundtrip(&[Value::build_text(text)]);
+        }
+    }
+
+    #[test]
+    fn test_array_float_roundtrip() {
+        for value in [
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+        ] {
+            assert_array_roundtrip(&[Value::from_f64(value)]);
+        }
+    }
+
+    #[test]
+    fn test_parse_text_array_rejects_noncanonical_nonfinite_values() {
+        for input in [
+            "{NaN}",
+            "{nan}",
+            "{Infinity}",
+            "{-Infinity}",
+            "{+inf}",
+            "{INF}",
+        ] {
+            assert!(parse_text_array(input).is_none(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn test_array_blob_roundtrip() {
+        assert_array_roundtrip(&[
+            Value::Blob(crate::alloc::vec![]),
+            Value::Blob(
+                (0..=255)
+                    .try_collect()
+                    .expect("blob allocation must succeed"),
+            ),
+            values_to_record_blob(&[Value::build_text("001"), Value::Null])
+                .expect("nested array must encode"),
+        ]);
+    }
+
+    #[test]
+    fn test_parse_text_array_unicode_escapes() {
+        assert_eq!(
+            parse_text_array(r#"{"\u0000\u0008\u007f\u0085\u00E9\u4f60\uD83C\uDF0D"}"#),
+            Some(vec![Value::build_text("\0\u{8}\u{7f}\u{85}é你🌍")])
+        );
+        assert_eq!(
+            parse_text_array(r#"{"\uD800\uDC00\uDBFF\uDFFF"}"#),
+            Some(vec![Value::build_text("\u{10000}\u{10ffff}")])
+        );
+        assert_eq!(
+            parse_text_array(r#"{"\é\你\🌍"}"#),
+            Some(vec![Value::build_text("é你🌍")])
+        );
+    }
+
+    #[test]
+    fn test_parse_text_array_invalid_unicode_escapes() {
+        for input in [
+            r#"{"\u"}"#,
+            r#"{"\u0"}"#,
+            r#"{"\u000"}"#,
+            r#"{"\u+001"}"#,
+            r#"{"\u00gg"}"#,
+            r#"{"\uD800"}"#,
+            r#"{"\uDC00"}"#,
+            r#"{"\uD800\u0041"}"#,
+            r#"{"\uD800\uD800"}"#,
+            r#"{"\uD800x\uDC00"}"#,
+            r#"{"\u你ab"}"#,
+        ] {
+            assert!(parse_text_array(input).is_none(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn test_parse_text_array_blob_literals() {
+        assert_eq!(
+            parse_text_array(r#"{X'',x'00fF',"X'00FF'",NULL}"#),
+            Some(vec![
+                Value::Blob(crate::alloc::vec![]),
+                Value::Blob(crate::alloc::vec![0, 255]),
+                Value::build_text("X'00FF'"),
+                Value::Null,
+            ])
+        );
+        for input in ["{X'0'}", "{X'GG'}", "{X'00}", "{X'00'extra}"] {
+            assert!(parse_text_array(input).is_none(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn test_array_roundtrip_generated_values() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(9452);
+        for _ in 0..256 {
+            let values: Vec<Value> = (0..rng.random_range(0..32))
+                .map(|_| match rng.random_range(0..6) {
+                    0 => Value::Null,
+                    1 => Value::from_i64(rng.random()),
+                    2 => {
+                        let value = f64::from_bits(rng.random());
+                        Value::from_f64(if value.is_finite() { value } else { 0.0 })
+                    }
+                    3 => Value::build_text(rng.random::<i64>().to_string()),
+                    4 => Value::build_text(
+                        (0..rng.random_range(0..32))
+                            .map(|_| char::from_u32(rng.random_range(0..0x110000)).unwrap_or('\0'))
+                            .collect::<String>(),
+                    ),
+                    _ => Value::Blob(
+                        (0..rng.random_range(0..32))
+                            .map(|_| rng.random())
+                            .try_collect()
+                            .expect("blob allocation must succeed"),
+                    ),
+                })
+                .collect();
+            assert_array_roundtrip(&values);
+        }
+    }
+
+    fn assert_array_roundtrip(values: &[Value]) {
+        let original = values_to_record_blob(values).expect("array must encode");
+        let Value::Blob(blob) = &original else {
+            panic!("array must be a blob");
+        };
+        let text = serialize_array_from_blob(blob).expect("array must serialize");
+        let parsed = parse_text_array(&text).expect("serialized array must parse");
+        let restored = values_to_record_blob(&parsed).expect("parsed array must encode");
+        assert_eq!(restored, original, "array changed after parsing {text}");
     }
 
     #[test]
