@@ -1803,59 +1803,52 @@ impl StreamingWalReader {
             return;
         }
 
-        let (page_sz, c1, c2, use_native, ok) = {
-            let mut h = self.header.lock();
-            let s = buf.as_slice();
-            h.magic = u32::from_be_bytes(s[0..4].try_into().unwrap());
-            h.file_format = u32::from_be_bytes(s[4..8].try_into().unwrap());
-            h.page_size = u32::from_be_bytes(s[8..12].try_into().unwrap());
-            h.checkpoint_seq = u32::from_be_bytes(s[12..16].try_into().unwrap());
-            h.salt_1 = u32::from_be_bytes(s[16..20].try_into().unwrap());
-            h.salt_2 = u32::from_be_bytes(s[20..24].try_into().unwrap());
-            h.checksum_1 = u32::from_be_bytes(s[24..28].try_into().unwrap());
-            h.checksum_2 = u32::from_be_bytes(s[28..32].try_into().unwrap());
-            tracing::debug!("WAL header: {:?}", *h);
-
-            let use_native = cfg!(target_endian = "big") == ((h.magic & 1) != 0);
-            let calc = checksum_wal(&s[0..24], &h, (0, 0), use_native);
-            (
-                h.page_size,
-                h.checksum_1,
-                h.checksum_2,
-                use_native,
-                calc == (h.checksum_1, h.checksum_2),
-            )
+        let s = buf.as_slice();
+        let h = WalHeader {
+            magic: u32::from_be_bytes(s[0..4].try_into().unwrap()),
+            file_format: u32::from_be_bytes(s[4..8].try_into().unwrap()),
+            page_size: u32::from_be_bytes(s[8..12].try_into().unwrap()),
+            checkpoint_seq: u32::from_be_bytes(s[12..16].try_into().unwrap()),
+            salt_1: u32::from_be_bytes(s[16..20].try_into().unwrap()),
+            salt_2: u32::from_be_bytes(s[20..24].try_into().unwrap()),
+            checksum_1: u32::from_be_bytes(s[24..28].try_into().unwrap()),
+            checksum_2: u32::from_be_bytes(s[28..32].try_into().unwrap()),
         };
+        tracing::debug!("WAL header: {:?}", h);
+        let use_native = cfg!(target_endian = "big") == ((h.magic & 1) != 0);
+        let calc = checksum_wal(&s[0..24], &h, (0, 0), use_native);
+        let ok = calc == (h.checksum_1, h.checksum_2);
         #[cfg(debug_assertions)]
         {
-            let header = self.header.lock();
             tracing::debug!(
                 "WAL_SCAN header page_size={} checkpoint_seq={} salts=({}, {}) checksum=({}, {}) use_native={} valid={}",
-                page_sz,
-                header.checkpoint_seq,
-                header.salt_1,
-                header.salt_2,
-                c1,
-                c2,
+                h.page_size,
+                h.checkpoint_seq,
+                h.salt_1,
+                h.salt_2,
+                h.checksum_1,
+                h.checksum_2,
                 use_native,
                 ok
             );
         }
-        if PageSize::new(page_sz).is_none() || !ok {
+        if PageSize::new(h.page_size).is_none() || !ok {
             self.finalize_loading();
             return;
         }
+        *self.header.lock() = h;
         {
             let mut st = self.state.write();
-            st.page_size = page_sz as usize;
+            st.page_size = h.page_size as usize;
             st.use_native_endian = use_native;
-            st.cumulative_checksum = (c1, c2);
-            st.last_valid_checksum = (c1, c2);
+            st.cumulative_checksum = (h.checksum_1, h.checksum_2);
+            st.last_valid_checksum = (h.checksum_1, h.checksum_2);
             st.header_valid = true;
         }
         self.off_atomic
             .store(WAL_HEADER_SIZE as u64, Ordering::Release);
-        self.page_atomic.store(page_sz as u64, Ordering::Release);
+        self.page_atomic
+            .store(h.page_size as u64, Ordering::Release);
     }
 
     fn handle_chunk_read(self: Arc<Self>, res: Result<(Arc<Buffer>, i32), CompletionError>) {
