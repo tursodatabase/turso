@@ -2597,16 +2597,13 @@ fn translate_column_expr(
                         // default, suppress the Column instruction's default.
                         // We handle short records (ALTER TABLE ADD COLUMN) via
                         // ColumnHasField after the Column instruction.
-                        let col_ref = table.get_column_at(column);
-                        if let Some(col) = col_ref {
-                            if col.default.is_some() {
-                                if let Ok(Some(resolved)) = resolver
-                                    .schema()
-                                    .resolve_type(&col.ty_str, table.is_strict())
-                                {
-                                    if resolved.chain.iter().any(|td| td.encode().is_some()) {
-                                        program.flags.set_suppress_column_default(true);
-                                    }
+                        if table_column.default.is_some() {
+                            if let Ok(Some(resolved)) = resolver
+                                .schema()
+                                .resolve_type(&table_column.ty_str, table.is_strict())
+                            {
+                                if resolved.chain.iter().any(|td| td.encode().is_some()) {
+                                    program.flags.set_suppress_column_default(true);
                                 }
                             }
                         }
@@ -2647,15 +2644,12 @@ fn translate_column_expr(
                         .get_type_def(&column.ty_str, table.is_strict())
                     {
                         if type_def.encode().is_some() {
-                            if let Some(ref default_expr) = column.default {
-                                // Reconstruct the cursor id used for reading
-                                let read_cursor = if read_from_index {
-                                    index_cursor_id.expect("index cursor should be opened")
-                                } else {
-                                    table_cursor_id
-                                        .or(index_cursor_id)
-                                        .expect("cursor should be opened")
-                                };
+                            if let Some(default_expr) =
+                                column.default.as_ref().filter(|_| !read_from_index)
+                            {
+                                let read_cursor = table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened");
                                 let done_label = program.allocate_label();
                                 // Jump past the default block if the record
                                 // actually has this column (not a short record).
