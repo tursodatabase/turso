@@ -1344,6 +1344,26 @@ fn initialize_hir_group_runtime<'a>(
             usage.push(reference);
         }
     }
+    // A virtual generated column read from the group row is computed again
+    // from the columns it depends on, so the group row keeps those too.
+    let mut position = 0;
+    while let Some(reference) = usage.get(position).copied() {
+        position += 1;
+        let Some(hir::ColumnReadExpression::Planned(expression)) = plan
+            .document
+            .source(reference.source)
+            .and_then(|source| source.generated_expressions.get(reference.column))
+        else {
+            continue;
+        };
+        expression.for_each(&mut |expression| {
+            if let hir::Expr::Column(dependency) = expression {
+                if !usage.contains(dependency) {
+                    usage.push(*dependency);
+                }
+            }
+        });
+    }
     let rowids = hir_group_rowids(query, block);
     let mut inputs = (0..grouping.keys.len())
         .map(HirGroupInput::Key)
