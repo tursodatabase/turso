@@ -292,7 +292,7 @@ inserted. These still go to legacy:
 |---|---|
 | CDC of a virtual table, `sqlite_dbpage` | As for DELETE |
 | WITHOUT ROWID tables, array columns | Their lowering |
-| Custom types with a BEFORE trigger or an UPSERT | Raw values for BEFORE triggers, decoding the updated row |
+| Custom types with a BEFORE INSERT trigger or a custom-typed virtual column | Raw values for BEFORE triggers, decoding computed columns |
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -343,7 +343,9 @@ OLD and NEW themselves, so DELETE and UPDATE pass OLD as stored, and
 foreign-key actions get the parent key decoded, as SQL values. UPDATE does
 the same after NOT NULL, but only for the columns it sets; the others are
 read and written back as stored. Like legacy, its NOT NULL check sees the
-value before it is encoded. The
+value before it is encoded. An UPSERT DO UPDATE reads the conflicting row
+and `excluded` decoded, so, like legacy, it checks, encodes and checks every
+column of the updated row, not only those it sets. The
 STRICT/custom-type tests are skipped by the Rust conformance backend, so
 they were checked with the CLI backend, statement block by block against
 legacy. In queries, GROUP BY keeps the grouped rows' columns as stored, so

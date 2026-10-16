@@ -1521,10 +1521,10 @@ fn hir_dml_keeps_materialized_views_up_to_date() {
     }
 }
 
-/// INSERT and UPDATE on STRICT tables with custom types, as legacy does it:
-/// the values written are type checked, encoded and checked again; NOT NULL sees the decoded value;
-/// CHECK constraints and foreign keys compare stored values; index
-/// expressions, RETURNING and AFTER triggers see decoded values.
+/// INSERT, UPSERT and UPDATE on STRICT tables with custom types, as legacy
+/// does them: the values written are type checked, encoded and checked
+/// again; CHECK constraints and foreign keys compare stored values; index
+/// expressions, RETURNING, `excluded` and triggers see decoded values.
 #[test]
 fn hir_custom_type_writes_match_legacy() {
     let statements = [
@@ -1563,6 +1563,18 @@ fn hir_custom_type_writes_match_legacy() {
         "SELECT id, hex(name) FROM p ORDER BY id",
         "SELECT * FROM c ORDER BY id",
         "SELECT * FROM log",
+        "CREATE TABLE u(k rev PRIMARY KEY, v cents, w cents NOT NULL) STRICT",
+        "CREATE TRIGGER uu BEFORE UPDATE ON u BEGIN INSERT INTO log VALUES (old.k || old.v || '>' || new.k || new.v); END",
+        "INSERT INTO u VALUES ('A', 1, 2)",
+        "INSERT INTO u VALUES ('a', 5, 6) ON CONFLICT(k) DO UPDATE SET v = excluded.v + v RETURNING *",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = excluded.w WHERE v < excluded.v RETURNING k, v, w",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = NULL",
+        "INSERT INTO u VALUES ('a', 7, 8) ON CONFLICT DO UPDATE SET w = 'x'",
+        "INSERT INTO u VALUES ('b', 1, 1), ('B', 2, 2) ON CONFLICT DO UPDATE SET k = 'c'",
+        "SELECT k, hex(k), v, w FROM u",
+        "SELECT * FROM log",
+        "INSERT INTO p VALUES (2, 'x') ON CONFLICT DO UPDATE SET id = 5",
+        "SELECT * FROM c",
         "DELETE FROM p WHERE id = 1",
         "SELECT count(*) FROM c",
     ];

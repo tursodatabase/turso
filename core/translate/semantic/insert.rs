@@ -963,6 +963,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             LimboError::InternalError(format!("missing INSERT target source {target}"))
         })?;
         let columns = target_source.columns.clone();
+        // EXCLUDED holds the row as it would have been written, so reading
+        // it decodes custom-typed values like reading the target does.
+        let column_type_programs = target_source.column_type_programs.clone();
         let rowid_available = target_source.rowid_available;
         let width = columns.len();
         let excluded = self.reserve_source();
@@ -981,7 +984,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 columns,
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
-                column_type_programs: vec![None; width],
+                column_type_programs,
                 check_constraints: None,
                 rowid_available,
                 index_hint: hir::IndexHint::None,

@@ -68,9 +68,8 @@ pub(super) fn needs_legacy(
     if !table.has_rowid || super::dml::strict_needs_legacy(&table, source) {
         return Ok(true);
     }
-    // Custom types are lowered for a plain INSERT. Legacy shows a BEFORE
-    // trigger the values before they are encoded, and an UPSERT decodes the
-    // row it updates, which HIR does not yet.
+    // Custom types are lowered unless a BEFORE INSERT trigger fires: legacy
+    // shows it the values before they are encoded, which HIR does not do yet.
     if super::dml::has_custom_types(source) {
         let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
             return Ok(true);
@@ -84,7 +83,7 @@ pub(super) fn needs_legacy(
             .iter()
             .zip(&source.column_type_programs)
             .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        return Ok(before_triggers || custom_virtual || !insert.upserts.is_empty());
+        return Ok(before_triggers || custom_virtual);
     }
     Ok(false)
 }
@@ -1279,7 +1278,11 @@ impl InsertRow<'_> {
             .iter()
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
-        if table.is_strict {
+        if super::dml::has_custom_types(source) {
+            // Like legacy, every column was read decoded, so every column is
+            // checked as input, encoded and checked again.
+            super::dml::emit_custom_type_writes(program, document, source, table, new_row, None)?;
+        } else if table.is_strict {
             super::dml::emit_strict_type_check(program, table, new_row);
         } else if affinities
             .iter()
@@ -2290,8 +2293,9 @@ mod tests {
         assert!(defaults.is_empty());
     }
 
-    #[test]
-    fn custom_typed_values_are_checked_encoded_and_checked_again() {
+    /// `priced(id INTEGER PRIMARY KEY, amount cents NOT NULL)`, where `cents`
+    /// stores a value times 100.
+    fn emit_priced(sql: &str) -> ProgramBuilder {
         let mut schema = schema();
         schema
             .add_type_from_sql(
@@ -2307,23 +2311,22 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let program = {
-            let plan = Arc::new(analyze_plan(schema, "INSERT INTO priced VALUES (1, 20)"));
-            let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap());
-            let mut program = program();
-            program.set_hir_plan(plan.clone());
-            emit_insert(
-                &mut program,
-                &plan,
-                insert,
-                &Subprograms::default(),
-                false,
-                true,
-            )
-            .unwrap();
-            program
+        let plan = Arc::new(analyze_plan(schema, sql));
+        let insert = insert_root(&plan).unwrap();
+        assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+        let mut program = program();
+        program.set_hir_plan(plan.clone());
+        let subprograms = Subprograms {
+            upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
+            ..Subprograms::default()
         };
+        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        program
+    }
+
+    #[test]
+    fn custom_typed_values_are_checked_encoded_and_checked_again() {
+        let program = emit_priced("INSERT INTO priced VALUES (1, 20)");
         // The input check, the encoding, then the check of the stored type.
         let position = |matches: &dyn Fn(&Insn) -> bool| {
             program
@@ -2343,6 +2346,29 @@ mod tests {
         assert_eq!(
             count(&program, |insn| matches!(insn, Insn::Divide { .. })),
             1
+        );
+    }
+
+    #[test]
+    fn upsert_decodes_the_row_it_updates_and_encodes_it_again() {
+        let program = emit_priced(
+            "INSERT INTO priced VALUES (1, 20) \
+             ON CONFLICT DO UPDATE SET amount = excluded.amount + amount",
+        );
+        // The new row and the updated row are each checked, encoded and
+        // checked again.
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::TypeCheck { .. })),
+            4
+        );
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::Multiply { .. })),
+            2
+        );
+        // NOT NULL of the new row, then `excluded.amount` and `amount`.
+        assert_eq!(
+            count(&program, |insn| matches!(insn, Insn::Divide { .. })),
+            3
         );
     }
 
