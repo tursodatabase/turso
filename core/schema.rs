@@ -4862,7 +4862,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let ty = match col_type {
                     Some(data_type) => {
                         let (ty, ei) = type_from_name(&data_type.name);
-                        typename_exactly_integer = ei;
+                        typename_exactly_integer = ei && data_type.size.is_none();
                         ty
                     }
                     None => Type::Null,
@@ -5638,7 +5638,10 @@ impl Column {
         }
 
         let (ty, typename_exactly_integer) = match value.col_type {
-            Some(ref data_type) => type_from_name(&data_type.name),
+            Some(ref data_type) => {
+                let (ty, ei) = type_from_name(&data_type.name);
+                (ty, ei && data_type.size.is_none())
+            }
             None => (Type::Null, false),
         };
 
@@ -6610,6 +6613,19 @@ mod tests {
             column.is_rowid_alias(),
             "column 'a´ should be a rowid alias"
         );
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_column_is_rowid_alias_single_integer_with_size() -> Result<()> {
+        for sql in [
+            r#"CREATE TABLE t1 (a INTEGER(10) PRIMARY KEY, b TEXT);"#,
+            r#"CREATE TABLE t1 (a INTEGER(10), b TEXT, PRIMARY KEY(a));"#,
+        ] {
+            let table = BTreeTable::from_sql(sql, 0)?;
+            let column = table.get_column("a").unwrap().1;
+            assert!(!column.is_rowid_alias(), "{sql}");
+        }
         Ok(())
     }
 
