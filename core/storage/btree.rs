@@ -6991,10 +6991,14 @@ impl CursorTrait for BTreeCursor {
                 }
 
                 DeleteState::DeterminePostBalancingSeekKey => {
-                    // FIXME: skip this work if we determine deletion wont result in balancing
-                    // Right now we calculate the key every time for simplicity/debugging
-                    // since it won't affect correctness which is more important
                     let page = self.stack.top_ref();
+                    let cell_idx = self.stack.current_cell_index() as usize;
+                    if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)? {
+                        self.state = CursorState::Delete(DeleteState::LoadPage {
+                            post_balancing_seek_key: None,
+                        });
+                        continue;
+                    }
                     let target_key = if page.is_index()? {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
@@ -10569,6 +10573,21 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
     ((usable_space - 12) * 32 / 255) - 23
 }
 
+/// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
+/// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
+fn delete_may_need_balancing(
+    page: &PageContent,
+    cell_idx: usize,
+    usable_space: usize,
+) -> Result<bool> {
+    if !page.is_leaf() || page.cell_count() == 1 || !page.overflow_cells.is_empty() {
+        return Ok(true);
+    }
+    let (_, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
+    let free_space_after_delete = compute_free_space(page, usable_space)? + cell_len + 2;
+    Ok(free_space_after_delete * 3 > usable_space * 2)
+}
+
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
 #[inline]
@@ -12451,6 +12470,58 @@ mod tests {
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page_contents, i, &cell.payload);
         }
+    }
+
+    #[test]
+    fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
+        let (db, _temp_dir) = get_database();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let usable_space = 4096;
+        let mut rng = ChaCha8Rng::seed_from_u64(1700);
+        let mut predicted_no_balancing = 0;
+        let mut predicted_balancing = 0;
+
+        for _ in 0..1000 {
+            let page = get_page(2);
+            let page_contents = page.get_contents();
+            let mut rowid = 0;
+            loop {
+                let blob_len = rng.random_range(1..300);
+                if compute_free_space(page_contents, usable_space).unwrap() < blob_len + 20 {
+                    break;
+                }
+                let regs = &[Register::Value(Value::from_blob(
+                    crate::alloc::vec![0xab; blob_len],
+                ))];
+                let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+                add_record(
+                    rowid,
+                    page_contents.cell_count(),
+                    page.clone(),
+                    record,
+                    &conn,
+                );
+                rowid += 1;
+            }
+
+            while page_contents.cell_count() > 1 {
+                let cell_idx = rng.random_range(0..page_contents.cell_count());
+                let predicted =
+                    delete_may_need_balancing(page_contents, cell_idx, usable_space).unwrap();
+                drop_cell(page_contents, cell_idx, usable_space).unwrap();
+                let free_space = compute_free_space(page_contents, usable_space).unwrap();
+                assert_eq!(predicted, free_space * 3 > usable_space * 2);
+                if predicted {
+                    predicted_balancing += 1;
+                } else {
+                    predicted_no_balancing += 1;
+                }
+            }
+            assert!(delete_may_need_balancing(page_contents, 0, usable_space).unwrap());
+        }
+
+        assert!(predicted_no_balancing > 0);
+        assert!(predicted_balancing > 0);
     }
 
     #[test]
