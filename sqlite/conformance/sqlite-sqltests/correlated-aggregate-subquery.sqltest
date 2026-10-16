@@ -1,0 +1,289 @@
+@database :memory:
+
+# A correlated aggregate subquery gives the same result for the same outer
+# values, so it can be computed once per key. These cases cover keys that
+# compare equal but differ (1, 1.0, '1', NOCASE text), NULL keys, rows a
+# LEFT JOIN fills with NULL, nested subqueries reading the outer row, and
+# subqueries that read an outer aggregate.
+
+setup result-cache-schema {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, k, a, c TEXT COLLATE NOCASE);
+    CREATE TABLE i(k INT, t TEXT, x INT, c TEXT COLLATE NOCASE, b BLOB);
+    CREATE TABLE p(id INTEGER PRIMARY KEY, ok);
+    INSERT INTO o VALUES (1,1,1,'a'),(2,1.0,2,'A'),(3,'1',3,'b'),(4,NULL,4,NULL),(5,2,5,'B'),(6,NULL,6,'a'),(7,1,7,'a'),(8,x'31',8,'c');
+    INSERT INTO i VALUES (1,'1',10,'a',x'31'),(1,'1.0',20,'A',NULL),(2,'2',30,'b',NULL),(NULL,NULL,40,NULL,NULL),(1,'x',50,'B',x'31');
+    INSERT INTO p VALUES (1,1),(2,2),(3,NULL);
+}
+
+@setup result-cache-schema
+test correlated-aggregate-count-by-untyped-key {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-sum-by-text-column {
+    SELECT id, (SELECT sum(x) FROM i WHERE i.t = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|10
+    4|
+    5|
+    6|
+    7|
+    8|
+}
+
+@setup result-cache-schema
+test correlated-aggregate-group-concat-by-nocase-key {
+    SELECT id, (SELECT group_concat(x) FROM i WHERE i.c = o.c) FROM o ORDER BY id;
+}
+expect {
+    1|10,20
+    2|10,20
+    3|30,50
+    4|
+    5|30,50
+    6|10,20
+    7|10,20
+    8|
+}
+
+@setup result-cache-schema
+test correlated-aggregate-max-by-is-key {
+    SELECT id, (SELECT max(x) FROM i WHERE i.k IS o.k) FROM o ORDER BY id;
+}
+expect {
+    1|50
+    2|50
+    3|50
+    4|40
+    5|30
+    6|40
+    7|50
+    8|
+}
+
+@setup result-cache-schema
+test correlated-aggregate-two-outer-columns {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k AND i.x > o.a) FROM o ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-total-by-blob-column {
+    SELECT id, (SELECT total(x) FROM i WHERE i.b = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|0.0
+    2|0.0
+    3|0.0
+    4|0.0
+    5|0.0
+    6|0.0
+    7|0.0
+    8|60.0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-left-join-null-key {
+    SELECT o.id, p.id, (SELECT count(*) FROM i WHERE i.k = p.ok) FROM o LEFT JOIN p ON p.id = o.a ORDER BY o.id;
+}
+expect {
+    1|1|3
+    2|2|1
+    3|3|0
+    4||0
+    5||0
+    6||0
+    7||0
+    8||0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-average-in-where {
+    SELECT id FROM o WHERE a < (SELECT avg(x) FROM i WHERE i.k = o.k) / 10 ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup result-cache-schema
+test correlated-aggregate-nested-exists-reads-outer-row {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k AND EXISTS (SELECT 1 FROM p WHERE p.ok = i.k AND p.id <> o.id)) FROM o ORDER BY id;
+}
+expect {
+    1|0
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-grouped-outer-query {
+    SELECT quote(k), count(*), (SELECT count(*) FROM i WHERE i.k = o.k) FROM o GROUP BY k ORDER BY 2, 1;
+}
+expect {
+    '1'|1|3
+    2|1|1
+    X'31'|1|0
+    NULL|2|0
+    1|3|3
+}
+
+@setup result-cache-schema
+test correlated-aggregate-order-by-subquery-value {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k) AS n FROM o ORDER BY n, id;
+}
+expect {
+    4|0
+    6|0
+    8|0
+    5|1
+    1|3
+    2|3
+    3|3
+    7|3
+}
+
+@setup result-cache-schema
+test correlated-aggregate-same-subquery-twice {
+    SELECT id, (SELECT min(x) FROM i WHERE i.k = o.k) + (SELECT min(x) FROM i WHERE i.k = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|20
+    2|20
+    3|20
+    4|
+    5|60
+    6|
+    7|20
+    8|
+}
+
+@setup result-cache-schema
+test correlated-aggregate-aggregate-of-outer-column-only {
+    SELECT id, (SELECT typeof(min(o.k)) FROM i) FROM o ORDER BY id;
+}
+expect {
+    1|integer
+}
+
+@setup result-cache-schema
+test correlated-aggregate-limit-one {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k LIMIT 1) FROM o ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-key-expression {
+    SELECT id, (SELECT count(*) FROM i WHERE i.k = o.k + 0) FROM o ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|3
+}
+
+@setup result-cache-schema
+test correlated-aggregate-result-uses-outer-text {
+    SELECT id, (SELECT max(x) || o.k FROM i WHERE i.k = o.k) FROM o ORDER BY id;
+}
+expect {
+    1|501
+    2|501.0
+    3|501
+    4|
+    5|302
+    6|
+    7|501
+    8|
+}
+
+@setup result-cache-schema
+test correlated-aggregate-from-subquery-reads-outer-row {
+    SELECT id, (SELECT count(*) FROM (SELECT x FROM i WHERE i.k = o.k)) FROM o ORDER BY id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+    4|0
+    5|1
+    6|0
+    7|3
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-filtered-outer-rows {
+    SELECT id, (SELECT sum(x) FROM i WHERE i.k = o.k) FROM o WHERE id IN (1,2,7) ORDER BY id;
+}
+expect {
+    1|80
+    2|80
+    7|80
+}
+
+@setup result-cache-schema
+test correlated-aggregate-text-key-against-nocase-column {
+    SELECT id, (SELECT count(*) FROM i WHERE i.t = o.c) FROM o ORDER BY id;
+}
+expect {
+    1|0
+    2|0
+    3|0
+    4|0
+    5|0
+    6|0
+    7|0
+    8|0
+}
+
+@setup result-cache-schema
+test correlated-aggregate-count-in-where {
+    SELECT count(*) FROM o WHERE (SELECT count(*) FROM i WHERE i.k = o.k) > 1;
+}
+expect {
+    4
+}
+

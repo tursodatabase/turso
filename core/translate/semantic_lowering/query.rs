@@ -902,9 +902,179 @@ pub(crate) fn emit_expression_subquery(
     expression: &SubqueryExpr,
 ) -> Result<()> {
     let prepared = prepare_subquery(program, &plan.document, expression)?;
+    let cache_keys = plan
+        .planned_query(prepared.query)
+        .map(|planned| planned.result_cache_keys.as_slice())
+        .unwrap_or_default();
+    if let QueryDestination::RowValueSubqueryResult {
+        result_reg_start,
+        num_regs,
+    } = prepared.destination
+    {
+        if prepared.correlated && !cache_keys.is_empty() && !program.reruns_subquery(prepared.query)
+        {
+            return emit_cached_subquery(
+                program,
+                plan,
+                &prepared,
+                cache_keys,
+                result_reg_start,
+                num_regs,
+            );
+        }
+    }
     emit_prepared_subquery(program, &prepared, |program, query, destination| {
         emit_planned_query_body(program, plan, query, destination)
     })
+}
+
+/// Run a correlated subquery through a cache of its results, keyed by the
+/// outer values it reads. A run whose values were seen before reads the
+/// stored result; any other run runs the subquery and stores its result.
+///
+/// Each value is stored with its `typeof()`, because an index treats 1 and
+/// 1.0 as equal while the subquery may not, as in `t.text_column = o.value`.
+/// Every key column matches NULL, since a NULL outer value is a key like any
+/// other.
+fn emit_cached_subquery(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    prepared: &PreparedSubquery,
+    keys: &[hir::Expr],
+    result_start: usize,
+    width: usize,
+) -> Result<()> {
+    let key_width = keys.len() * 2;
+    let columns = (0..key_width + width)
+        .map(|position| IndexColumn {
+            name: format!("c{position}"),
+            order: SortOrder::Asc,
+            nulls_order: None,
+            pos_in_table: position,
+            collation: None,
+            default: None,
+            expr: None,
+        })
+        .collect();
+    let index = Arc::new(Index {
+        columns,
+        name: format!("ephemeral_subquery_cache_{}", prepared.query.index()),
+        table_name: String::new(),
+        root_page: 0,
+        unique: false,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+    let opened = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: opened,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: false,
+    });
+    program.preassign_label_to_next_insn(opened);
+
+    let record_start = program.alloc_registers(key_width + width);
+    for (position, key) in keys.iter().enumerate() {
+        let value = record_start + position * 2;
+        super::expr::translate_expr_no_constant_opt(program, &plan.document, key, value)?;
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: value,
+            dest: value + 1,
+            func: crate::function::FuncCtx {
+                func: crate::function::Func::Scalar(crate::function::ScalarFunc::Typeof),
+                arg_count: 1,
+            },
+        });
+    }
+    let mut every_key = crate::translate::plan::BitSet::default();
+    for position in 0..key_width {
+        every_key.set(position)?;
+    }
+
+    let miss = program.allocate_label();
+    let done = program.allocate_label();
+    program.emit_insn(Insn::SeekGE {
+        is_index: true,
+        cursor_id: cursor,
+        start_reg: record_start,
+        num_regs: key_width,
+        target_pc: miss,
+        eq_only: true,
+        null_matching_mask: every_key.into(),
+    });
+    program.emit_insn(Insn::IdxGT {
+        cursor_id: cursor,
+        start_reg: record_start,
+        num_regs: key_width,
+        target_pc: miss,
+    });
+    for position in 0..width {
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column: key_width + position,
+            dest: result_start + position,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc: done });
+
+    program.preassign_label_to_next_insn(miss);
+    emit_prepared_subquery(program, prepared, |program, query, destination| {
+        emit_planned_query_body(program, plan, query, destination)
+    })?;
+    program.emit_insn(Insn::Copy {
+        src_reg: result_start,
+        dst_reg: record_start + key_width,
+        extra_amount: width - 1,
+    });
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(record_start),
+        count: to_u32(key_width + width),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: cursor,
+        record_reg: record,
+        unpacked_start: Some(record_start),
+        unpacked_count: Some(to_u32(key_width + width)),
+        flags: crate::vdbe::insn::IdxInsertFlags::new(),
+    });
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+/// Run a correlated IN subquery that the planner turned into a probe: like
+/// EXISTS, with the planned `lhs = value` term in its block, so it stops at
+/// the first match. Return the register that holds 1 on a match and 0
+/// otherwise.
+pub(crate) fn emit_in_probe_subquery(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: QueryId,
+) -> Result<usize> {
+    let register = program.alloc_register();
+    program.bind_subquery(query, SubqueryBinding::Exists { register });
+    let prepared = PreparedSubquery {
+        query,
+        destination: QueryDestination::ExistsSubqueryResult {
+            result_reg: register,
+        },
+        correlated: true,
+    };
+    emit_prepared_subquery(program, &prepared, |program, query, destination| {
+        emit_planned_query_body(program, plan, query, destination)
+    })?;
+    Ok(register)
 }
 
 /// Emit SELECT and VALUES bodies that do not read a row source.

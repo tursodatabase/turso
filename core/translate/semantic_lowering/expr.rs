@@ -454,6 +454,15 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         super::query::emit_expression_subquery(self.program, &plan, subquery)
     }
 
+    /// Whether the planner chose to run this correlated IN subquery like
+    /// EXISTS with an extra `lhs = value` term.
+    fn runs_in_as_probe(&self, query: hir::QueryId) -> bool {
+        self.program.hir_plan().is_some_and(|plan| {
+            plan.planned_query(query)
+                .is_some_and(|planned| planned.in_probe)
+        })
+    }
+
     fn input_register(&self, expression: &hir::Expr) -> Option<usize> {
         self.inputs
             .iter()
@@ -627,6 +636,12 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             } => self
                 .binary_child(lhs, rhs, custom.as_ref(), index)
                 .map(|child| child.expression()),
+            // A probe evaluates the left side inside the subquery.
+            hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. })
+                if self.runs_in_as_probe(*query) =>
+            {
+                None
+            }
             hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => match lhs.as_ref() {
                 hir::Expr::Row(values) => values.get(index),
                 expression => (index == 0).then_some(expression),
@@ -1826,6 +1841,21 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                         "HIR EXISTS subquery {query:?} has no EXISTS runtime binding"
                     )));
                 };
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. })
+                if self.runs_in_as_probe(*query) =>
+            {
+                let plan = self
+                    .program
+                    .hir_plan()
+                    .expect("an IN probe is only planned with a statement plan");
+                let register = super::query::emit_in_probe_subquery(self.program, &plan, *query)?;
                 self.program.emit_insn(Insn::Copy {
                     src_reg: register,
                     dst_reg: target,

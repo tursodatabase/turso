@@ -979,3 +979,56 @@ fn hir_lifts_conjuncts_every_or_branch_shares() {
         );
     }
 }
+
+/// A correlated IN that runs like EXISTS and a correlated aggregate whose
+/// result is cached per key return SQLite's rows. Legacy's subquery rewrites
+/// return wrong rows for all three queries.
+#[test]
+fn hir_correlated_in_probe_and_cached_aggregates_match_sqlite() {
+    const SCHEMA: &str = "
+        CREATE TABLE o(id INTEGER PRIMARY KEY, k, a, c TEXT COLLATE NOCASE);
+        CREATE TABLE i(k INT, a, x INT, n INT);
+        CREATE TABLE j(k INT, m INT);
+        CREATE TABLE p(id INTEGER PRIMARY KEY, ok);
+        INSERT INTO o VALUES (1,1,1,'a'),(2,1.0,NULL,'A'),(3,'1','2','b'),(4,2,2.0,NULL),
+            (5,2,5,'B'),(6,NULL,1,'a'),(7,1,7,'a'),(8,x'31',8,'c');
+        INSERT INTO i VALUES (1,1,10,1),(1,NULL,20,2),(2,2,30,3),(2,'2',40,4),(3,7,50,5),
+            (NULL,1,60,6);
+        INSERT INTO j VALUES (1,1),(2,3),(3,5);
+        INSERT INTO p VALUES (1,1),(2,2),(3,NULL);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        // The IN runs like EXISTS over a join inside the subquery.
+        "SELECT id FROM o WHERE a IN (SELECT i.a FROM i JOIN j ON j.k = i.k \
+         WHERE i.k = o.k AND j.m > 0) ORDER BY id",
+        // The subquery reads an outer aggregate, so it is not cached.
+        "SELECT quote(k), (SELECT count(*) + max(o.a) FROM i WHERE i.k = o.k) \
+         FROM o GROUP BY k ORDER BY 1",
+        // The cached aggregate joins two tables of its own.
+        "SELECT id, (SELECT count(*) FROM i, p WHERE i.k = p.ok AND p.id = o.k) \
+         FROM o ORDER BY id",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+}

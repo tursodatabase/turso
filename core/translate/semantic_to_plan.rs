@@ -14,7 +14,7 @@ use super::{
     },
     plan::{
         ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirFromLayout, HirJoinInfo,
-        HirPlanSource, HirPlannedSource, HirWhereTerm,
+        HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
@@ -67,6 +67,79 @@ fn query_ignores_row_order(query: &hir::Query) -> bool {
         });
     }
     ignores_order
+}
+
+/// Whether evaluating `expression` could return an error for some input,
+/// as legacy's `expression_can_fail_on_input` decides. Function calls,
+/// LIKE, RAISE, JSON and array operators, custom types, casts and nested
+/// subqueries all count; plain columns, literals, parameters, arithmetic and
+/// comparisons do not.
+fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
+    let mut can_fail = false;
+    expression.for_each(&mut |expression| {
+        can_fail |= match expression {
+            hir::Expr::Function(_)
+            | hir::Expr::Like { .. }
+            | hir::Expr::Raise { .. }
+            | hir::Expr::Cast { .. }
+            | hir::Expr::Subquery(_)
+            | hir::Expr::Output(_)
+            | hir::Expr::Row(_)
+            | hir::Expr::Array(_)
+            | hir::Expr::Subscript { .. }
+            | hir::Expr::FieldAccess(_)
+            | hir::Expr::MergedColumn(_) => true,
+            hir::Expr::Binary {
+                operator,
+                array_concat,
+                custom,
+                ..
+            } => {
+                *array_concat
+                    || custom.is_some()
+                    || matches!(
+                        operator,
+                        turso_parser::ast::Operator::ArrowRight
+                            | turso_parser::ast::Operator::ArrowRightShift
+                            | turso_parser::ast::Operator::ArrayContains
+                            | turso_parser::ast::Operator::ArrayOverlap
+                    )
+            }
+            hir::Expr::Column(reference) => {
+                // Reading a column can run its generated expression or
+                // decode a custom type.
+                document.source(reference.source).is_none_or(|source| {
+                    !matches!(
+                        source.generated_expressions.get(reference.column),
+                        None | Some(hir::ColumnReadExpression::Absent)
+                            | Some(hir::ColumnReadExpression::NotRequired)
+                    ) || source
+                        .column_type_programs
+                        .get(reference.column)
+                        .is_none_or(Option::is_some)
+                })
+            }
+            _ => false,
+        };
+    });
+    can_fail
+}
+
+/// Whether a join constraint or table-function argument of `from` could
+/// return an error, by the rules of [hir_expr_can_fail].
+fn hir_from_can_fail(document: &HirDocument, from: &hir::From) -> bool {
+    core::iter::once(from.first)
+        .chain(from.joins.iter().map(|join| join.right))
+        .any(|source| {
+            document
+                .source(source)
+                .is_none_or(|source| !matches!(source.kind, hir::SourceKind::Table(_)))
+        })
+        || from.joins.iter().any(|join| match &join.constraint {
+            hir::JoinConstraint::None => false,
+            hir::JoinConstraint::On(expression) => hir_expr_can_fail(document, expression),
+            hir::JoinConstraint::Using(_) | hir::JoinConstraint::Natural(_) => true,
+        })
 }
 
 /// For a block that is `SELECT min(x) FROM t` or `SELECT max(x) FROM t`
@@ -213,6 +286,17 @@ pub(crate) enum HirTriggerCommandPlan {
 pub(crate) struct HirPlannedQuery {
     pub(crate) query: QueryId,
     pub(crate) blocks: Vec<HirQueryBlockPlan>,
+    /// The query is the subquery of a correlated `x IN (SELECT y ...)` that
+    /// runs like `EXISTS (SELECT ... AND x = y)`: its block plan holds the
+    /// extra `x = y` term, so it stops at the first match and can seek it.
+    pub(crate) in_probe: bool,
+    /// The outer values a correlated aggregate subquery reads. When not
+    /// empty, each run stores its result under these values, and a later
+    /// run with the same values reads the stored result instead of running
+    /// again. This gives what legacy's grouped-table rewrite gives: the
+    /// aggregate is computed once per key. Unlike that rewrite, it never
+    /// computes keys no outer row asks for.
+    pub(crate) result_cache_keys: Vec<hir::Expr>,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -689,6 +773,7 @@ impl<'a> HirPlanContext<'a> {
         // reads, so like SQLite it may build an automatic index once and
         // seek it on every run. Its estimates stay per run.
         let runs = self.correlated_runs(query, schema, params);
+        let in_probe = self.in_probe_equality(query);
         let blocks = query
             .blocks
             .iter()
@@ -697,6 +782,7 @@ impl<'a> HirPlanContext<'a> {
                     block,
                     block_order_by,
                     block_limit,
+                    in_probe.as_ref(),
                     runs,
                     schema,
                     params,
@@ -711,11 +797,130 @@ impl<'a> HirPlanContext<'a> {
         planned.push(HirPlannedQuery {
             query: query_id,
             blocks,
+            in_probe: in_probe.is_some(),
+            result_cache_keys: self.result_cache_keys(query),
             output_cardinality: estimate.output_cardinality,
             cost: estimate.cost,
         });
         active.remove(&query_id);
         Ok(estimate)
+    }
+
+    /// The outer values to cache a correlated subquery's result under, or
+    /// none to run it every time.
+    ///
+    /// Only a SELECT statement caches: a statement that writes tables could
+    /// change what the subquery reads between runs. Only an ungrouped
+    /// aggregate caches, as legacy's rewrite does: such a subquery reads many
+    /// rows to produce one, so a repeated key saves real work.
+    fn result_cache_keys(&self, query: &hir::Query) -> Vec<hir::Expr> {
+        let [block] = query.blocks.as_slice() else {
+            return Vec::new();
+        };
+        if !matches!(self.document.root, hir::HirRoot::Query(_))
+            || !query.compounds.is_empty()
+            || block.aggregate_count == 0
+            || block.window_function_count != 0
+            || !matches!(
+                &block.body,
+                hir::QueryBlockBody::Select { grouping: None, .. }
+            )
+        {
+            return Vec::new();
+        }
+        self.document
+            .repeatable_outer_values(query.id)
+            .unwrap_or_default()
+    }
+
+    /// The `x = y` term that lets a correlated `x IN (SELECT y ...)` run like
+    /// `EXISTS (SELECT ... AND x = y)`, as legacy's semi-join rewrite does.
+    /// The subquery then stops at its first match and can seek `y` through
+    /// an index, instead of collecting every `y` into a list for each outer
+    /// row.
+    ///
+    /// The two forms differ in three ways, so the probe is only used where
+    /// none of them can change the result:
+    ///
+    /// - IN is NULL instead of false when nothing matches and `x` or some `y`
+    ///   is NULL. The IN must be a whole term of a WHERE clause, where NULL
+    ///   and false both reject the row.
+    /// - IN reads every row of the subquery, and the probe stops at the first
+    ///   match. An expression that fails on a later row would fail only in
+    ///   the IN form, so no expression of the subquery may fail.
+    /// - IN evaluates `x` once per outer row, and the probe once per inner
+    ///   row it tests, so `x` may not fail either.
+    fn in_probe_equality(&self, query: &hir::Query) -> Option<hir::Expr> {
+        let [block] = query.blocks.as_slice() else {
+            return None;
+        };
+        if !query.compounds.is_empty()
+            || query.limit.is_some()
+            || query.captures.is_empty()
+            || block.from.is_none()
+            || block.aggregate_count != 0
+            || block.window_function_count != 0
+            || block.outputs.len() != 1
+        {
+            return None;
+        }
+        let hir::QueryBlockBody::Select {
+            filter,
+            grouping: None,
+            ..
+        } = &block.body
+        else {
+            return None;
+        };
+        let parent = self.document.query(query.parent?)?;
+        let mut probe = None;
+        for parent_block in &parent.blocks {
+            if let hir::QueryBlockBody::Select {
+                filter: Some(parent_filter),
+                ..
+            } = &parent_block.body
+            {
+                for conjunct in parent_filter.conjuncts() {
+                    if let hir::Expr::Subquery(hir::SubqueryExpr::In {
+                        lhs,
+                        query: in_query,
+                        negated: false,
+                        comparison,
+                    }) = conjunct
+                    {
+                        if *in_query == query.id && comparison.components.len() == 1 {
+                            probe = Some((lhs, comparison));
+                        }
+                    }
+                }
+            }
+        }
+        let (lhs, comparison) = probe?;
+        if self.document.subquery_use_count(parent.id, query.id) != 1
+            || hir_expr_can_fail(self.document, lhs)
+        {
+            return None;
+        }
+        let output = &block.outputs[0].expr;
+        if hir_expr_can_fail(self.document, output)
+            || filter
+                .as_ref()
+                .is_some_and(|filter| hir_expr_can_fail(self.document, filter))
+            || block
+                .from
+                .as_ref()
+                .is_some_and(|from| hir_from_can_fail(self.document, from))
+        {
+            return None;
+        }
+        Some(hir::Expr::Binary {
+            lhs: lhs.clone(),
+            operator: turso_parser::ast::Operator::Equals,
+            rhs: Box::new(output.clone()),
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison.clone()),
+        })
     }
 
     /// How many times a query runs: once, or for a correlated subquery,
@@ -1221,6 +1426,7 @@ impl<'a> HirPlanContext<'a> {
         block: &hir::QueryBlock,
         order_by: &[hir::OrderTerm],
         limit: Option<&hir::Limit>,
+        extra_predicate: Option<&hir::Expr>,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
@@ -1259,6 +1465,9 @@ impl<'a> HirPlanContext<'a> {
         }
 
         let mut input = self.query_block_input(block, order_by, &usage)?;
+        if let Some(predicate) = extra_predicate {
+            append_predicates(&mut input.predicates, predicate, None);
+        }
         // Join planning tracks tables in a 64-bit mask.
         if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
             crate::bail_parse_error!(
@@ -3173,6 +3382,7 @@ mod tests {
             .plan_query_block(
                 &block,
                 &[],
+                None,
                 None,
                 7.0,
                 &Schema::default(),

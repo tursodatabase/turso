@@ -3,6 +3,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::*;
+use crate::function::Deterministic;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnUsage {
@@ -254,6 +255,123 @@ impl HirDocument {
             });
         });
         found && ignores_order
+    }
+
+    /// The outer values that `query`, or any query it runs, reads: one
+    /// `Column` or `RowId` expression per outer column, so the same values
+    /// always give the same result.
+    ///
+    /// `None` when that is not true or not known: an outer value is read some
+    /// other way, such as through an outer aggregate or output; a function
+    /// is not deterministic; or a source is a virtual table or table
+    /// function, whose rows may change between calls.
+    pub(crate) fn repeatable_outer_values(&self, query: QueryId) -> Option<Vec<Expr>> {
+        let mut pending = vec![query];
+        let mut tree = HashSet::default();
+        while let Some(id) = pending.pop() {
+            if tree.insert(id) {
+                pending.extend(self.direct_query_dependencies(id));
+            }
+        }
+        let in_tree = |source: SourceId| {
+            matches!(
+                self.source(source).map(|source| source.owner),
+                Some(SourceOwner::QueryBlock(block)) if tree.contains(&block.query)
+            )
+        };
+        let mut values = Vec::new();
+        let mut repeatable = true;
+        for id in &tree {
+            let definition = self.query(*id)?;
+            visit_query_parts(self, definition, &mut |part| match part {
+                QueryPart::Source(source) => {
+                    repeatable &= match &source.kind {
+                        SourceKind::Table(table) => {
+                            !matches!(table.value(), crate::schema::Table::Virtual(_))
+                        }
+                        kind => matches!(
+                            kind,
+                            SourceKind::Cte(_)
+                                | SourceKind::Derived(_)
+                                | SourceKind::FromGroup(_)
+                                | SourceKind::RecursiveInput(_)
+                        ),
+                    };
+                }
+                QueryPart::Expression(expression) => {
+                    expression.for_each(&mut |expression| match expression {
+                        Expr::Column(reference) if !in_tree(reference.source) => {
+                            let value = Expr::Column(*reference);
+                            if !values.iter().any(|known: &Expr| known.equivalent(&value)) {
+                                values.push(value);
+                            }
+                        }
+                        Expr::RowId(source) if !in_tree(*source) => {
+                            let value = Expr::RowId(*source);
+                            if !values.iter().any(|known: &Expr| known.equivalent(&value)) {
+                                values.push(value);
+                            }
+                        }
+                        Expr::Function(call) => {
+                            // Built-in aggregates call themselves not
+                            // deterministic because their result depends on
+                            // the rows they read; the same rows give the
+                            // same result.
+                            let function = call.function.value();
+                            repeatable &= (function.is_deterministic()
+                                || matches!(
+                                    function,
+                                    crate::function::Func::Agg(_)
+                                        | crate::function::Func::Window(_)
+                                ))
+                                && matches!(call.operation, FunctionOperation::Ordinary);
+                            match &call.evaluation {
+                                FunctionEvaluation::Aggregate { id, .. } => {
+                                    repeatable &= tree.contains(&id.block.query);
+                                }
+                                FunctionEvaluation::Window { id, .. } => {
+                                    repeatable &= tree.contains(&id.block.query);
+                                }
+                                FunctionEvaluation::Scalar => {}
+                            }
+                        }
+                        Expr::Output(id) => {
+                            repeatable &= matches!(
+                                id.owner,
+                                OutputOwner::QueryBlock(block) if tree.contains(&block.query)
+                            );
+                        }
+                        _ => {}
+                    });
+                }
+            });
+        }
+        repeatable.then_some(values)
+    }
+
+    /// How many subquery expressions of `parent` itself run `child`.
+    pub(crate) fn subquery_use_count(&self, parent: QueryId, child: QueryId) -> usize {
+        let Some(parent) = self.query(parent) else {
+            return 0;
+        };
+        let mut uses = 0;
+        visit_query_parts(self, parent, &mut |part| {
+            let QueryPart::Expression(expression) = part else {
+                return;
+            };
+            expression.for_each(&mut |expression| {
+                if let Expr::Subquery(
+                    SubqueryExpr::Scalar { query, .. }
+                    | SubqueryExpr::Row { query }
+                    | SubqueryExpr::In { query, .. }
+                    | SubqueryExpr::Exists(query),
+                ) = expression
+                {
+                    uses += usize::from(*query == child);
+                }
+            });
+        });
+        uses
     }
 
     /// Visit every source needed to evaluate one expression in its owning
