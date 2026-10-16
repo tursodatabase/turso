@@ -12490,7 +12490,9 @@ mod tests {
                 if compute_free_space(page_contents, usable_space).unwrap() < blob_len + 20 {
                     break;
                 }
-                let regs = &[Register::Value(Value::from_blob(vec![0xab; blob_len]))];
+                let regs = &[Register::Value(Value::from_blob(
+                    crate::alloc::vec![0xab; blob_len],
+                ))];
                 let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 add_record(
                     rowid,
