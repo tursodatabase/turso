@@ -3558,7 +3558,6 @@ impl BTreeTable {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
                 col.override_affinity(Affinity::Blob);
-                continue;
             }
             col.resolve_custom_type(schema);
         }
@@ -5539,12 +5538,15 @@ impl Column {
 
     pub fn resolve_custom_type(&mut self, schema: &Schema) {
         self.custom_type = None;
-        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
+        let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) else {
+            return;
+        };
+        if !self.is_array() {
             let (base_ty, _) = type_from_name(&resolved.primitive);
             self.set_ty(base_ty);
             self.override_affinity(Affinity::affinity(&resolved.primitive));
-            self.custom_type = Some(Arc::new(resolved));
         }
+        self.custom_type = Some(Arc::new(resolved));
     }
 
     pub fn new_default_text(

@@ -17268,7 +17268,7 @@ pub fn op_alter_column(
         definition.as_ref(),
         FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
     )?;
-    if is_strict && !new_column.is_array() {
+    if is_strict {
         conn.with_schema(*db, |schema| new_column.resolve_custom_type(schema));
     }
     let new_name = definition.col_name.as_str().to_owned();

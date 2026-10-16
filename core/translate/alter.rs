@@ -1270,7 +1270,7 @@ pub fn translate_alter_table(
                 FromDefinitionFlags::empty()
                     .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
             )?;
-            if btree.is_strict && !column.is_array() {
+            if btree.is_strict {
                 resolver.with_schema(database_id, |schema| column.resolve_custom_type(schema));
             }
 

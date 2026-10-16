@@ -245,6 +245,52 @@ mod tests {
     }
 
     #[test]
+    fn test_attached_array_column_uses_type_from_its_own_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("custom_types_attached_array_aux.db");
+        let main_path = temp_dir.path().join("custom_types_attached_array_main.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_attach(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, amounts cents[]) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO p VALUES (1, '{5,6}')").unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 10 DECODE value / 10")
+                .unwrap();
+            conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+                .unwrap();
+            let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, amounts FROM aux.p");
+            assert_eq!(rows, vec![(1, "{5,6}".to_string())]);
+            conn.execute("INSERT INTO aux.p VALUES (2, '{7}')").unwrap();
+            conn.execute("CREATE TABLE aux.q(id INTEGER PRIMARY KEY) STRICT")
+                .unwrap();
+            conn.execute("ALTER TABLE aux.q ADD COLUMN amounts cents[]")
+                .unwrap();
+            conn.execute("INSERT INTO aux.q VALUES (1, '{8}')").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&aux_path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, amounts FROM p ORDER BY id");
+        assert_eq!(rows, vec![(1, "{5,6}".to_string()), (2, "{7}".to_string())]);
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, amounts FROM q");
+        assert_eq!(rows, vec![(1, "{8}".to_string())]);
+    }
+
+    #[test]
     fn test_index_on_attached_table_with_type_only_in_attached_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("custom_types_index_attached_aux.db");
