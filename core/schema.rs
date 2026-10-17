@@ -3680,8 +3680,8 @@ impl BTreeTable {
             }
 
             if let Some(default) = &column.default {
-                sql.push_str(" DEFAULT ");
-                sql.push_str(&default.to_string());
+                sql.push(' ');
+                sql.push_str(&ast::ColumnConstraint::Default(default.clone()).to_string());
             }
 
             push_collation(&mut sql, column.collation_opt());

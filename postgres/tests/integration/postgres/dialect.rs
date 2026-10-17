@@ -490,6 +490,52 @@ fn test_postgres_alter_table_add_column(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_alter_table_reopens(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE altered (id SERIAL PRIMARY KEY, label TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO altered (label) VALUES ('first')")
+        .unwrap();
+    conn.execute("ALTER TABLE altered ADD COLUMN active BOOLEAN DEFAULT true")
+        .unwrap();
+    conn.execute("ALTER TABLE altered RENAME COLUMN label TO note")
+        .unwrap();
+    conn.execute("ALTER TABLE altered RENAME TO persisted")
+        .unwrap();
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+    let (_, db) = turso_pg::open_database(
+        path.to_str().unwrap(),
+        None,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    conn.execute("INSERT INTO persisted (note, active) VALUES ('second', false)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT id, note, active FROM persisted ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![
+                Value::from_i64(1),
+                Value::build_text("first"),
+                Value::from_i64(1)
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::build_text("second"),
+                Value::from_i64(0)
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_alter_table_drop_column(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -3608,6 +3654,10 @@ mod nonblocking {
             "SET search_path TO missing_schema",
         ] {
             let stmt = conn.prepare(sql).unwrap();
+            assert_eq!(stmt.get_sql(), sql);
+            if !sql.starts_with("SET ") {
+                assert!(!stmt.readonly(), "{sql}");
+            }
             drop(stmt);
         }
         assert!(conn.inner().current_schema().get_table("future").is_none());
@@ -3894,9 +3944,17 @@ mod nonblocking {
         let mut stmt = conn
             .prepare("EXPLAIN INSERT INTO explained SELECT 7 UNION ALL SELECT 19")
             .unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        assert!(!rows.is_empty());
         io.allow_step.store(true, Ordering::SeqCst);
+        conn.execute("ALTER TABLE explained ADD COLUMN note TEXT")
+            .unwrap();
+        let rows = drive(&io, &mut stmt).0;
+        assert!(!rows.is_empty());
+        assert_eq!(
+            stmt.get_query_mode(),
+            turso_core::QueryMode::ExplainQueryPlan {
+                format: turso_parser::ast::EqpFormat::Text,
+            }
+        );
         let mut count = conn.prepare("SELECT COUNT(*) FROM explained").unwrap();
         assert_eq!(drive(&io, &mut count).0, vec![vec![Value::from_i64(0)]]);
     }
@@ -3916,7 +3974,20 @@ mod nonblocking {
                 .with_views(true),
         )
         .unwrap();
-        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        let mut state = turso_core::ConnectAsyncState::new();
+        let conn = loop {
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = turso_pg::PgConnection::connect_async(
+                &db,
+                turso_core::ConnectOpts::new(),
+                &mut state,
+            );
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result.unwrap() {
+                IOResult::Done(conn) => break conn,
+                IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
+            }
+        };
         if mvcc {
             conn.pragma_update("journal_mode", "'mvcc'").unwrap();
         }
@@ -3937,6 +4008,19 @@ mod nonblocking {
                 IOResult::Done(()) => return (rows, yields),
                 IOResult::IO(completion) => {
                     yields += 1;
+                    if !completion.finished() {
+                        io.allow_step.store(false, Ordering::SeqCst);
+                        let row_count = rows.len();
+                        for _ in 0..8 {
+                            let result = stmt.run_with_row_callback_nonblock(|row| {
+                                rows.push(row.get_values().cloned().collect());
+                                Ok(())
+                            });
+                            assert!(matches!(result.unwrap(), IOResult::IO(_)));
+                            assert_eq!(rows.len(), row_count);
+                        }
+                        io.allow_step.store(true, Ordering::SeqCst);
+                    }
                     completion.wait(io).unwrap();
                 }
             }
