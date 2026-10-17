@@ -1092,3 +1092,50 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
         );
     }
 }
+
+/// Like legacy and SQLite, an ORDER BY whose terms are all GROUP BY keys
+/// reuses the GROUP BY sort, comparing those keys first, instead of sorting
+/// the groups again.
+#[test]
+fn hir_order_by_group_keys_sorts_once() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    let sorters = |conn: &std::sync::Arc<turso_core::Connection>, sql: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter(|row| {
+                matches!(row.get(1), Some(rusqlite::types::Value::Text(opcode)) if opcode == "SorterOpen")
+            })
+            .count()
+    };
+    for (sql, expected) in [
+        (
+            "SELECT extra, count(*) FROM items GROUP BY extra ORDER BY extra",
+            1,
+        ),
+        (
+            "SELECT extra, count(*) FROM items GROUP BY extra ORDER BY 1 DESC",
+            1,
+        ),
+        (
+            "SELECT extra, id, count(*) FROM items GROUP BY extra, id ORDER BY extra",
+            1,
+        ),
+        (
+            "SELECT extra, id, count(*) FROM items GROUP BY extra, id ORDER BY id",
+            1,
+        ),
+        (
+            "SELECT extra, count(*) FROM items GROUP BY extra ORDER BY count(*)",
+            2,
+        ),
+    ] {
+        assert_eq!(sorters(&hir, sql), expected, "{sql}");
+        assert_eq!(sorters(&legacy, sql), expected, "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

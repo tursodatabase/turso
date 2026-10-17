@@ -1256,7 +1256,8 @@ pub(crate) fn emit_planned_query_body(
         hir_grouping(block).is_none() && block.aggregate_count == 0 && block.windows.is_empty();
     let sort_elided = exists
         || (scan_order_is_output_order && planned_query.blocks[0].order_sort_elided)
-        || hir_window_rows_follow_order_by(document, query, block)?;
+        || hir_window_rows_follow_order_by(document, query, block)?
+        || hir_group_rows_follow_order_by(document, query, block, &planned_query.blocks[0]);
     let sorter = (!query.order_by.is_empty() && !sort_elided)
         .then(|| initialize_hir_sorter(program, query, block))
         .transpose()?;
@@ -1287,6 +1288,68 @@ pub(crate) fn emit_planned_query_body(
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
+}
+
+/// Whether grouped rows already leave in ORDER BY order, as legacy and
+/// SQLite find: when every ORDER BY term is a GROUP BY key, the GROUP BY
+/// sorter orders groups by those keys first, in ORDER BY order and with each
+/// term's direction, so no second sorter is needed.
+fn hir_group_rows_follow_order_by(
+    document: &HirDocument,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+) -> bool {
+    let Some(grouping) = hir_grouping(block) else {
+        return false;
+    };
+    !block_plan.group_sort_elided
+        && block.windows.is_empty()
+        && hir_group_key_order(document, query, grouping).is_some()
+}
+
+/// The order the GROUP BY sorter compares its keys in, when every ORDER BY
+/// term is a GROUP BY key with that key's collation: the keys the ORDER BY
+/// names, in its order, then the others. Like legacy, which reorders its
+/// GROUP BY keys the same way. Which rows form a group does not depend on
+/// this order.
+fn hir_group_key_order(
+    document: &HirDocument,
+    query: &hir::Query,
+    grouping: &hir::Grouping,
+) -> Option<Vec<usize>> {
+    if query.order_by.is_empty() {
+        return None;
+    }
+    let collation = |collation: Option<&hir::ResolvedCollation>| match collation
+        .map(|collation| *collation.value())
+    {
+        None | Some(CollationSeq::Unset) => CollationSeq::Binary,
+        Some(collation) => collation,
+    };
+    let mut order = Vec::with_capacity(grouping.keys.len());
+    for term in &query.order_by {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(output) = expression {
+            expression = &document.output(*output)?.expr;
+        }
+        let key = grouping
+            .keys
+            .iter()
+            .zip(&grouping.key_collations)
+            .position(|(key, key_collation)| {
+                expression.equivalent(key)
+                    && collation(term.collation.as_ref()) == collation(key_collation.as_ref())
+            })?;
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    }
+    let rest = (0..grouping.keys.len())
+        .filter(|key| !order.contains(key))
+        .collect::<Vec<_>>();
+    order.extend(rest);
+    Some(order)
 }
 
 /// Whether rows leave the block's windows already in ORDER BY order. The
@@ -1735,7 +1798,11 @@ fn initialize_hir_group_runtime<'a>(
         });
     }
     let rowids = hir_group_rowids(query, block);
-    let mut inputs = (0..grouping.keys.len())
+    let key_order = hir_group_key_order(&plan.document, query, grouping)
+        .unwrap_or_else(|| (0..grouping.keys.len()).collect());
+    let mut inputs = key_order
+        .iter()
+        .copied()
         .map(HirGroupInput::Key)
         .collect::<Vec<_>>();
     let mut sources = Vec::with_capacity(block_plan.loops.len());
@@ -1802,21 +1869,23 @@ fn initialize_hir_group_runtime<'a>(
     let rows = if block_plan.group_sort_elided {
         HirGroupRows::InputOrdered
     } else {
-        let order_collations_nulls = hir_group_key_orders(&plan.document, query, grouping)
-            .into_iter()
-            .zip(&grouping.key_collations)
-            .map(|((order, nulls), collation)| {
+        let orders = hir_group_key_orders(&plan.document, query, grouping);
+        let order_collations_nulls = key_order
+            .iter()
+            .map(|key| {
+                let (order, nulls) = orders[*key];
                 (
                     order,
-                    collation.as_ref().map(|collation| *collation.value()),
+                    grouping.key_collations[*key]
+                        .as_ref()
+                        .map(|collation| *collation.value()),
                     nulls,
                 )
             })
             .collect();
-        let comparators = grouping
-            .key_type_facts
+        let comparators = key_order
             .iter()
-            .map(custom_type_comparator_from_type_fact)
+            .map(|key| custom_type_comparator_from_type_fact(&grouping.key_type_facts[*key]))
             .collect();
         let cursor = program.alloc_cursor_id(CursorType::Sorter);
         program.emit_insn(Insn::SorterOpen {
