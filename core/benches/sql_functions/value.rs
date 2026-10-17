@@ -834,7 +834,11 @@ fn min_integers(bencher: Bencher) {
         Value::from_i64(1),
         Value::from_i64(9),
     ];
-    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
+    bencher.bench_local(|| {
+        black_box(Value::exec_min(black_box(values.iter()), |a, b| {
+            Ok(a.cmp(b))
+        }))
+    });
 }
 
 #[cfg(feature = "nanosecond-bench")]
@@ -847,7 +851,11 @@ fn max_integers(bencher: Bencher) {
         Value::from_i64(1),
         Value::from_i64(9),
     ];
-    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()))));
+    bencher.bench_local(|| {
+        black_box(Value::exec_max(black_box(values.iter()), |a, b| {
+            Ok(a.cmp(b))
+        }))
+    });
 }
 
 #[turso_macros::divan_bench]
@@ -857,7 +865,11 @@ fn min_strings(bencher: Bencher) {
         Value::build_text("apple"),
         Value::build_text("cherry"),
     ];
-    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
+    bencher.bench_local(|| {
+        black_box(Value::exec_min(black_box(values.iter()), |a, b| {
+            Ok(a.cmp(b))
+        }))
+    });
 }
 
 #[turso_macros::divan_bench]
@@ -867,7 +879,11 @@ fn max_strings(bencher: Bencher) {
         Value::build_text("apple"),
         Value::build_text("cherry"),
     ];
-    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()))));
+    bencher.bench_local(|| {
+        black_box(Value::exec_max(black_box(values.iter()), |a, b| {
+            Ok(a.cmp(b))
+        }))
+    });
 }
 
 // =============================================================================
