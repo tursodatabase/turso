@@ -53,8 +53,8 @@ impl Dialect for PostgresDialect {
             None => sql.len(),
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
+        match translator.translate_with_prereqs(&parse_result) {
+            Ok(translated) => Ok((Some(translated.cmd), consumed)),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
     }
@@ -144,6 +144,10 @@ impl Dialect for PostgresDialect {
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
         Ok(encode_pg_schema_sql(input))
+    }
+
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        turso_core::SqliteDialect.format_rewritten_table_sql(stmt)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {

@@ -1844,7 +1844,16 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                match expr.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) | Expr::Unary(_, _) => {
+                        expr.to_tokens(s, context)
+                    }
+                    _ => {
+                        s.append(TK_LP, None)?;
+                        expr.to_tokens(s, context)?;
+                        s.append(TK_RP, None)
+                    }
+                }
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;

@@ -77,6 +77,19 @@ impl PgConnection {
         })
     }
 
+    pub fn connect_async(
+        db: &Arc<turso_core::Database>,
+        opts: turso_core::ConnectOpts,
+        state: &mut turso_core::ConnectAsyncState,
+    ) -> turso_core::types::IOResultOr<Self> {
+        let opts = opts.with_context(Arc::new(PgSessionState::default()));
+        db.connect_async(opts, state).map(|result| {
+            result.map(|conn| Self {
+                inner: Arc::new(PgConnectionInner { conn }),
+            })
+        })
+    }
+
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
     }
@@ -170,6 +183,73 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     }
 }
 
+#[derive(Debug)]
+pub enum StatementKind {
+    Sql(Box<ast::Cmd>),
+    Session,
+    Schema,
+    ExternalStorage,
+    CopyOut,
+}
+
+pub fn inspect(sql: &str) -> Result<Option<StatementKind>> {
+    let parsed =
+        turso_pg_parser::parse(sql).map_err(|error| LimboError::ParseError(error.to_string()))?;
+    match parsed.protobuf.stmts.len() {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(LimboError::InvalidArgument("expected one statement".into())),
+    }
+    reject_sqlite_catalog_access(sql)?;
+    if let Some(set) = try_extract_set(&parsed) {
+        if set.name == "search_path" {
+            return Ok(Some(StatementKind::Session));
+        }
+        return Err(LimboError::InvalidArgument(format!(
+            "setting '{}' requires host configuration access",
+            set.name
+        )));
+    }
+    if let Some(show) = try_extract_show(&parsed) {
+        let (cmd, _) = turso_core::dialect::sqlite::parse(&format!("PRAGMA {}", show.name))?;
+        return Ok(cmd.map(|cmd| StatementKind::Sql(Box::new(cmd))));
+    }
+    if is_set_transaction(&parsed) {
+        return Ok(Some(StatementKind::Session));
+    }
+    if let Some(schema) = try_extract_create_schema(&parsed) {
+        return Ok(Some(if schema.name.eq_ignore_ascii_case("public") {
+            StatementKind::Schema
+        } else {
+            StatementKind::ExternalStorage
+        }));
+    }
+    if let Some(schema) = try_extract_drop_schema(&parsed) {
+        return Ok(Some(if schema.name.eq_ignore_ascii_case("public") {
+            StatementKind::Schema
+        } else {
+            StatementKind::ExternalStorage
+        }));
+    }
+    if try_extract_copy_from(&parsed).is_some() {
+        return Ok(Some(StatementKind::ExternalStorage));
+    }
+    if turso_pg_parser::copy::parse_copy_to_stdout(sql)
+        .map_err(|error| LimboError::ParseError(error.to_string()))?
+        .is_some()
+    {
+        return Ok(Some(StatementKind::CopyOut));
+    }
+    if is_comment_on(&parsed) || is_refresh_matview(&parsed) {
+        return Ok(Some(StatementKind::Schema));
+    }
+    let translated = PostgreSQLTranslator::new()
+        .translate_with_prereqs(&parsed)
+        .map_err(|error| LimboError::ParseError(error.to_string()))?;
+    reject_catalog_dml(translated.cmd.stmt())?;
+    Ok(Some(StatementKind::Sql(Box::new(translated.cmd))))
+}
+
 fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
@@ -180,7 +260,8 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     reject_sqlite_catalog_access(sql)?;
 
-    if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
+    if let Some(mut stmt) = try_prepare_special(pg_conn, sql)? {
+        sql.clone_into(&mut stmt.sql);
         return Ok(stmt);
     }
 
