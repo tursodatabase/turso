@@ -237,7 +237,7 @@ struct GroupCompletionInner {
     outstanding: AtomicUsize,
     /// Callback to invoke when all completions finish
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
-    /// First error from a child, passed to the callback when all completions finish
+    /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
 }
 
