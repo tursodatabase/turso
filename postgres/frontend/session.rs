@@ -185,7 +185,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
 
 #[derive(Debug)]
 pub enum StatementKind {
-    Sql(ast::Cmd),
+    Sql(Box<ast::Cmd>),
     Session,
     Schema,
     ExternalStorage,
@@ -212,7 +212,7 @@ pub fn inspect(sql: &str) -> Result<Option<StatementKind>> {
     }
     if let Some(show) = try_extract_show(&parsed) {
         let (cmd, _) = turso_core::dialect::sqlite::parse(&format!("PRAGMA {}", show.name))?;
-        return Ok(cmd.map(StatementKind::Sql));
+        return Ok(cmd.map(|cmd| StatementKind::Sql(Box::new(cmd))));
     }
     if is_set_transaction(&parsed) {
         return Ok(Some(StatementKind::Session));
@@ -247,7 +247,7 @@ pub fn inspect(sql: &str) -> Result<Option<StatementKind>> {
         .translate_with_prereqs(&parsed)
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
-    Ok(Some(StatementKind::Sql(translated.cmd)))
+    Ok(Some(StatementKind::Sql(Box::new(translated.cmd))))
 }
 
 fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
@@ -261,7 +261,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     reject_sqlite_catalog_access(sql)?;
 
     if let Some(mut stmt) = try_prepare_special(pg_conn, sql)? {
-        stmt.sql = sql.to_owned();
+        sql.clone_into(&mut stmt.sql);
         return Ok(stmt);
     }
 
