@@ -5791,7 +5791,7 @@ impl WalFileShared {
         db_file: &Arc<dyn DatabaseStorage>,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let snapshot = authority.snapshot();
-        let file = match io.open_file(path, flags, false) {
+        let file = match io.open_file(path, Self::wal_open_flags(flags), false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
@@ -5926,7 +5926,7 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<OpenSharedWal> {
-        let file = match io.open_file(path, flags, false) {
+        let file = match io.open_file(path, Self::wal_open_flags(flags), false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
@@ -5941,6 +5941,14 @@ impl WalFileShared {
         Ok(OpenSharedWal::Build(sqlite3_ondisk::BuildSharedWal::begin(
             &file,
         )?))
+    }
+
+    fn wal_open_flags(flags: crate::OpenFlags) -> crate::OpenFlags {
+        if flags.contains(crate::OpenFlags::ReadOnly) {
+            flags
+        } else {
+            flags | crate::OpenFlags::Create
+        }
     }
 
     pub fn is_initialized(&self) -> Result<bool> {

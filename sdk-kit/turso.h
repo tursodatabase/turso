@@ -206,6 +206,7 @@ typedef enum
 {
     TURSO_DATABASE_OPEN_DEFAULT = 0,
     TURSO_DATABASE_OPEN_READONLY = 1,
+    TURSO_DATABASE_OPEN_READWRITE = 2,
 } turso_database_open_flags_t;
 
 typedef struct
