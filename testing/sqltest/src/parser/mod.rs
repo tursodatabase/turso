@@ -221,8 +221,8 @@ impl Parser {
                     false
                 };
                 const DEFAULT_PATH:&str="database/";
-                let path=if path.starts_with(DEFAULT_PATH){
-                    PathBuf::from("sqlite/conformance").join(path)
+                let path=if !path.starts_with(DEFAULT_PATH){
+                    PathBuf::from("../..").join(path)
                 }else{
                     PathBuf::from(path)
                 };
