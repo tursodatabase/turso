@@ -265,10 +265,14 @@ rewriting the plan. HIR gets the same speed without rewriting HIR:
   columns come from registers. A hash table that outgrows its budget moves
   rows to disk; lookups that need them wait, and after the previous loop
   ends they run again by that loop's rowid. So the previous loop must read a
-  rowid table directly, the plan must not rely on loop order, and neither
-  table may be in an outer join. Legacy also hashes the right side of LEFT
-  and FULL joins and builds from materialized join prefixes; HIR uses an
-  automatic index there.
+  rowid table directly and must not be NULL-extended, and the plan must not
+  rely on loop order. The table may be the right side of a LEFT JOIN: a row
+  without a match gets its NULL row, in the waiting pass if its lookup
+  waited. Only the root query's blocks use hash lookups, since a hash table
+  that moved rows to disk cannot be probed again after its waiting lookups
+  ran; a subquery that may run again seeks an automatic index built once.
+  Legacy also hashes FULL joins and builds from materialized join prefixes;
+  HIR uses an automatic index there.
 
 Three legacy rewrites return wrong rows that HIR does not (see
 `hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN whose
