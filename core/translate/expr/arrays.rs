@@ -133,7 +133,7 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+    if let Some(type_def) = resolver.schema().column_type_def(col, true) {
         if let Some(encode_expr) = type_def.encode() {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
@@ -189,7 +189,7 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+    if let Some(type_def) = resolver.schema().column_type_def(col, true) {
         if let Some(decode_expr) = type_def.decode() {
             emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
         }
@@ -240,7 +240,7 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_column_type(col, true) else {
             continue;
         };
 
@@ -311,7 +311,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_column_type(col, true) else {
             continue;
         };
 

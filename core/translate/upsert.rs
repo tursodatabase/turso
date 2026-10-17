@@ -675,7 +675,7 @@ pub fn emit_upsert(
         let col = &table.columns()[*col_idx];
         let union_td = resolver
             .schema()
-            .get_type_def_unchecked(&col.ty_str)
+            .column_type_def(col, true)
             .filter(|td| td.is_union())
             .cloned();
         let prev_union = program.target_union_type.take();

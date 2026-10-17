@@ -164,10 +164,7 @@ pub fn translate_create_index(
         if col.expr.is_none() {
             // Simple column reference (not expression index)
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
-                if let Some(type_def) = resolver
-                    .schema()
-                    .get_type_def(&column.ty_str, tbl.is_strict)
-                {
+                if let Some(type_def) = resolver.schema().column_type_def(column, tbl.is_strict) {
                     if type_def.is_struct() || type_def.is_union() {
                         bail_parse_error!(
                             "cannot create index on STRUCT/UNION column '{}'",

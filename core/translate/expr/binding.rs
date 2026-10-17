@@ -455,8 +455,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             });
                             if let Some(col_idx) = col_idx {
                                 let col = &tbl.columns()[col_idx];
-                                let type_def =
-                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
+                                let type_def = resolver.schema().column_type_def(col, true);
                                 let is_struct_or_union = type_def
                                     .map(|td| td.is_struct() || td.is_union())
                                     .unwrap_or(false);
@@ -969,15 +968,17 @@ pub(super) fn resolve_typedef_from_column(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Option<Arc<TypeDef>> {
-    let ty_str = match expr {
+    match expr {
         ast::Expr::Column { table, column, .. } => {
-            resolve_column_type_str(*table, *column, referenced_tables, resolver)?
+            let column = resolve_column(*table, *column, referenced_tables, resolver)?;
+            resolver.schema().column_type_def(&column, true).cloned()
         }
-        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
-        _ => return None,
-    };
-    let td = resolver.schema().get_type_def_unchecked(&ty_str)?;
-    Some(Arc::clone(td))
+        ast::Expr::Variable(var) => resolver
+            .schema()
+            .get_type_def_unchecked(var.col_type.as_ref()?)
+            .cloned(),
+        _ => None,
+    }
 }
 
 pub(super) fn resolve_union_from_column(
@@ -1041,20 +1042,20 @@ pub(super) fn resolve_struct_from_expr(
     }
 }
 
-/// Get the type string for a column
-pub(super) fn resolve_column_type_str(
+/// Get a column from the referenced tables or from the DML self table
+pub(super) fn resolve_column(
     table: ast::TableInternalId,
     column: usize,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
-) -> Option<String> {
+) -> Option<Column> {
     if let Some(rt) = referenced_tables {
         if let Some((_, tbl)) = rt.find_table_by_internal_id(table) {
-            return Some(tbl.columns().get(column)?.ty_str.clone());
+            return tbl.columns().get(column).cloned();
         }
     }
     if table.is_self_table() {
-        return resolver.self_table_column_type_str(column);
+        return resolver.self_table_column(column);
     }
     None
 }
@@ -1071,7 +1072,7 @@ pub(super) struct CustomTypeColumnMatch<'a> {
 /// Errors on ambiguity (>1 match). Returns `None` if no match.
 #[turso_macros::trace_stack]
 pub(super) fn find_custom_type_column<'a>(
-    referenced_tables: &TableReferences,
+    referenced_tables: &'a TableReferences,
     col_name: &str,
     resolver: &'a Resolver<'a>,
 ) -> crate::Result<Option<CustomTypeColumnMatch<'a>>> {
@@ -1085,7 +1086,7 @@ pub(super) fn find_custom_type_column<'a>(
                 .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
         }) {
             let col = &cols[col_idx];
-            let type_def = resolver.schema().get_type_def_unchecked(&col.ty_str);
+            let type_def = resolver.schema().column_type_def(col, true);
             let is_struct_or_union = type_def
                 .map(|td| td.is_struct() || td.is_union())
                 .unwrap_or(false);
@@ -1208,7 +1209,7 @@ pub(super) fn resolve_field_access(
 /// Returns `None` for expressions that don't produce a known custom type.
 pub(super) fn resolve_expr_output_type<'a>(
     expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
+    referenced_tables: Option<&'a TableReferences>,
     resolver: &'a Resolver<'a>,
 ) -> crate::Result<&'a crate::schema::TypeDef> {
     match expr {
@@ -1220,7 +1221,7 @@ pub(super) fn resolve_expr_output_type<'a>(
                 crate::bail_parse_error!("cannot resolve type: table not found");
             };
             let col = &tbl.columns()[*column];
-            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
+            let Some(td) = resolver.schema().column_type_def(col, true) else {
                 crate::bail_parse_error!(
                     "column '{}' has type '{}' which is not a known struct or union type",
                     col.name.as_deref().unwrap_or("?"),

@@ -17279,10 +17279,13 @@ pub fn op_alter_column(
             .clone();
         (old_column_name, table.is_strict())
     });
-    let new_column = crate::schema::Column::from_definition(
+    let mut new_column = crate::schema::Column::from_definition(
         definition.as_ref(),
         FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
     )?;
+    if is_strict {
+        conn.with_schema(*db, |schema| new_column.resolve_custom_type(schema));
+    }
     let new_name = definition.col_name.as_str().to_owned();
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?

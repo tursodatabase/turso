@@ -284,9 +284,8 @@ fn copy_cached_expr_reg(
                 if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
                 {
                     if let Some(col) = table.get_column_at(*column) {
-                        if let Some(type_def) = resolver
-                            .schema()
-                            .get_type_def(&col.ty_str, table.is_strict())
+                        if let Some(type_def) =
+                            resolver.schema().column_type_def(col, table.is_strict())
                         {
                             if let Some(decode_expr) = type_def.decode() {
                                 let skip_label = program.allocate_label();
@@ -2602,7 +2601,7 @@ fn translate_column_expr(
                             if col.default.is_some() {
                                 if let Ok(Some(resolved)) = resolver
                                     .schema()
-                                    .resolve_type(&col.ty_str, table.is_strict())
+                                    .resolve_column_type(col, table.is_strict())
                                 {
                                     if resolved.chain.iter().any(|td| td.encode().is_some()) {
                                         program.flags.set_suppress_column_default(true);
@@ -2628,7 +2627,7 @@ fn translate_column_expr(
                 if !(virtual_already_applied
                     || resolver
                         .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
+                        .column_type_def(column, table.is_strict())
                         .is_some())
                 {
                     maybe_apply_affinity(column.ty(), target_register, program);
@@ -2642,9 +2641,8 @@ fn translate_column_expr(
                     // (ALTER TABLE ADD COLUMN) return NULL.  Use
                     // ColumnHasField to detect short records and compute
                     // ENCODE(DEFAULT) at runtime via bytecode.
-                    if let Some(type_def) = resolver
-                        .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
+                    if let Some(type_def) =
+                        resolver.schema().column_type_def(column, table.is_strict())
                     {
                         if type_def.encode().is_some() {
                             if let Some(ref default_expr) = column.default {
