@@ -142,6 +142,9 @@ pub fn translate(
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
+            let hir = connection
+                .experimental_hir_enabled()
+                .then_some((schema, &hir_settings));
             pragma::translate_pragma(
                 &resolver,
                 &name,
@@ -149,6 +152,7 @@ pub fn translate(
                 pager,
                 connection.clone(),
                 &mut program,
+                hir,
             )?;
         }
         stmt @ ast::Stmt::Select(_) if connection.experimental_hir_enabled() => {

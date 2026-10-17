@@ -2297,3 +2297,50 @@ fn hir_attach_evaluates_its_arguments() {
         vec![vec![rusqlite::types::Value::Integer(1)]]
     );
 }
+
+/// PRAGMA integrity_check and quick_check read each table's rows through a
+/// SELECT planned by HIR, and find the same broken NOT NULL and CHECK
+/// constraints and missing or repeated index entries as legacy.
+#[test]
+fn hir_integrity_check_finds_what_legacy_finds() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sqlite/conformance/database");
+    let check = |hir: bool, fixture: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(fixture);
+        std::fs::copy(fixtures.join(fixture), &path).unwrap();
+        let db = TempDatabase::new_with_existent_with_opts(
+            &path,
+            turso_core::DatabaseOpts::new().with_generated_columns(true),
+        );
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        [
+            "PRAGMA integrity_check",
+            "PRAGMA quick_check",
+            "EXPLAIN PRAGMA integrity_check",
+        ]
+        .map(|sql| limbo_exec_rows(&conn, sql))
+    };
+    for fixture in [
+        "integrity_check_constraint_violation.db",
+        "integrity_gencol_not_null_violation.db",
+        "integrity_missing_expression_index_entry.db",
+        "integrity_missing_index_entry.db",
+        "integrity_missing_partial_index_entry.db",
+        "integrity_missing_unique_index_entry.db",
+        "integrity_non_unique_index_entry.db",
+        "integrity_not_null_violation.db",
+    ] {
+        let [hir_check, hir_quick, hir_program] = check(true, fixture);
+        let [check, quick, program] = check(false, fixture);
+        assert_eq!(hir_check, check, "{fixture}");
+        assert_eq!(hir_quick, quick, "{fixture}");
+        assert_ne!(
+            hir_check,
+            vec![vec![rusqlite::types::Value::Text("ok".into())]],
+            "{fixture} is broken"
+        );
+        assert_ne!(hir_program, program, "{fixture}: HIR reads the rows");
+    }
+}
