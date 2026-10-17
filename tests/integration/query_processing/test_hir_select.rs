@@ -1166,3 +1166,44 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
         assert_eq!(limbo_exec_rows(&hir, sql), limbo_exec_rows(&legacy, sql), "{sql}");
     }
 }
+
+/// Like legacy, a grouped row keeps only the columns read after grouping:
+/// the GROUP BY keys and aggregate arguments, not the columns only a join
+/// or WHERE reads. The rows still match legacy.
+#[test]
+fn hir_grouped_rows_keep_only_columns_read_after_grouping() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    let sorter_columns = |conn: &std::sync::Arc<turso_core::Connection>, sql: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .find_map(|row| match (row.get(1), row.get(3)) {
+                (
+                    Some(rusqlite::types::Value::Text(opcode)),
+                    Some(rusqlite::types::Value::Integer(columns)),
+                ) if opcode == "SorterOpen" => Some(*columns),
+                _ => None,
+            })
+            .expect("the GROUP BY sorter is opened")
+    };
+    for (sql, columns) in [
+        (
+            "SELECT t.tag, count(*), sum(i.value) FROM items i JOIN tags t ON t.item_id = i.id \
+             WHERE i.extra <> 'z' GROUP BY t.tag",
+            2,
+        ),
+        (
+            "SELECT i.extra, max(i.value) FROM items i WHERE i.id > 1 GROUP BY i.extra \
+             HAVING min(i.id) > 0",
+            3,
+        ),
+    ] {
+        assert_eq!(sorter_columns(&hir, sql), columns, "{sql}");
+        assert_eq!(sorter_columns(&legacy, sql), columns, "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

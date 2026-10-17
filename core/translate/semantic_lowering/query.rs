@@ -1767,11 +1767,7 @@ fn initialize_hir_group_runtime<'a>(
         )));
     }
     let aggregates = initialize_hir_aggregates(program, &plan.document, query, block)?;
-    let mut usage = query
-        .direct_column_usage(|source| plan.document.source(source))
-        .into_iter()
-        .map(|usage| usage.reference)
-        .collect::<Vec<_>>();
+    let mut usage = hir_group_row_columns(&plan.document, query, block, grouping);
     for reference in hir_nested_outer_column_reads(&plan.document, query) {
         if !usage.contains(&reference) {
             usage.push(reference);
@@ -1945,6 +1941,74 @@ fn initialize_hir_group_runtime<'a>(
         sources,
         state,
     })
+}
+
+/// The columns a grouped row keeps: those read after the rows are grouped.
+/// Like legacy, a column only WHERE or a join reads is not kept. A part of
+/// an output, HAVING, ORDER BY or window expression equal to a GROUP BY key
+/// is read from the key's register, so its columns are not kept for it; an
+/// aggregate's arguments are read from each grouped row, so all of theirs
+/// are.
+fn hir_group_row_columns(
+    document: &HirDocument,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    grouping: &hir::Grouping,
+) -> Vec<hir::ColumnRef> {
+    fn add(columns: &mut Vec<hir::ColumnRef>, reference: hir::ColumnRef) {
+        if !columns.contains(&reference) {
+            columns.push(reference);
+        }
+    }
+    fn visit(
+        document: &HirDocument,
+        keys: &[hir::Expr],
+        expression: &hir::Expr,
+        columns: &mut Vec<hir::ColumnRef>,
+    ) {
+        if keys.iter().any(|key| key.equivalent(expression)) {
+            return;
+        }
+        match expression {
+            hir::Expr::Column(reference) => add(columns, *reference),
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Aggregate { .. },
+                ..
+            }) => expression.for_each(&mut |expression| {
+                if let hir::Expr::Column(reference) = expression {
+                    add(columns, *reference);
+                }
+            }),
+            hir::Expr::Output(output) => {
+                if let Some(output) = document.output(*output) {
+                    visit(document, keys, &output.expr, columns);
+                }
+            }
+            _ => {
+                let mut index = 0;
+                while let Some(child) = expression.child(index) {
+                    visit(document, keys, child, columns);
+                    index += 1;
+                }
+            }
+        }
+    }
+    let mut columns = Vec::new();
+    for output in &block.outputs {
+        visit(document, &grouping.keys, &output.expr, &mut columns);
+    }
+    if let Some(having) = &grouping.having {
+        visit(document, &grouping.keys, having, &mut columns);
+    }
+    for term in &query.order_by {
+        visit(document, &grouping.keys, &term.expr, &mut columns);
+    }
+    for window in &block.windows {
+        for expression in hir_window_expressions(window) {
+            visit(document, &grouping.keys, expression, &mut columns);
+        }
+    }
+    columns
 }
 
 fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId> {
