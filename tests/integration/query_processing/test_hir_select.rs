@@ -1139,3 +1139,30 @@ fn hir_order_by_group_keys_sorts_once() {
         );
     }
 }
+
+/// Like legacy, a correlated subquery opens its table cursors on its first
+/// run only, instead of once for every outer row, and gives the same rows.
+#[test]
+fn hir_correlated_subqueries_open_their_cursors_once() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for sql in [
+        "SELECT count(*) FROM items i WHERE NOT EXISTS (SELECT 1 FROM tags t WHERE t.item_id = i.id)",
+        "SELECT i.id, (SELECT count(*) FROM tags t WHERE t.item_id = i.id) FROM items i ORDER BY 1",
+    ] {
+        let program = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"));
+        let opcode = |row: &Vec<rusqlite::types::Value>| match row.get(1) {
+            Some(rusqlite::types::Value::Text(opcode)) => opcode.clone(),
+            _ => String::new(),
+        };
+        let open = program
+            .iter()
+            .position(|row| {
+                opcode(row) == "OpenRead"
+                    && matches!(row.get(7), Some(rusqlite::types::Value::Text(comment)) if comment.contains("tags"))
+            })
+            .expect("the subquery opens tags");
+        assert_eq!(opcode(&program[open - 1]), "Once", "{sql}: {program:?}");
+        assert_eq!(limbo_exec_rows(&hir, sql), limbo_exec_rows(&legacy, sql), "{sql}");
+    }
+}

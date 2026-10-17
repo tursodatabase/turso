@@ -6184,6 +6184,16 @@ pub(super) fn prepare_hir_btree_loop<'a>(
             table_cursor,
         },
     );
+    // A correlated subquery's loop is emitted inside the loops that run it,
+    // so like legacy it opens its cursors on the first run only; each run
+    // positions them again.
+    let opened = program.is_nested().then(|| {
+        let opened = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: opened,
+        });
+        opened
+    });
     if index.is_none_or(|index| !index.ephemeral) {
         program.emit_insn(Insn::OpenRead {
             cursor_id: cursor,
@@ -6197,6 +6207,9 @@ pub(super) fn prepare_hir_btree_loop<'a>(
             root_page: table.root_page,
             db: database.index(),
         });
+    }
+    if let Some(opened) = opened {
+        program.preassign_label_to_next_insn(opened);
     }
 
     // An index read without its table supplies the expressions it keys,
