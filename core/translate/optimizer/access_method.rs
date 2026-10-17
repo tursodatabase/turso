@@ -117,6 +117,11 @@ pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
     fn allows_alternative_access(&self) -> bool;
     fn is_full_outer_join(&self) -> bool;
     fn used_column_count(&self) -> usize;
+    /// Whether the first table of a block that runs more than once may be
+    /// read through a temporary index. Only HIR builds that index once for
+    /// every run; legacy's hash join over such a table would rescan it
+    /// without the index's terms.
+    fn indexes_first_table_of_rerun_block(&self) -> bool;
 }
 
 impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
@@ -144,6 +149,10 @@ impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
 impl BtreeAccessSource<TableInternalId, *const ast::Expr> for JoinedTable {
     fn allows_alternative_access(&self) -> bool {
         self.indexed.is_none()
+    }
+
+    fn indexes_first_table_of_rerun_block(&self) -> bool {
+        false
     }
 
     fn is_full_outer_join(&self) -> bool {
@@ -204,6 +213,10 @@ impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a>
             .enumerate()
             .filter(|(column_idx, _)| self.planned.col_used_mask.get(*column_idx))
             .count()
+    }
+
+    fn indexes_first_table_of_rerun_block(&self) -> bool {
+        true
     }
 }
 
@@ -969,7 +982,8 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
     // row. It is built once either way.
     if source.allows_alternative_access()
         && uses_full_table_scan
-        && (!lhs_mask.is_empty() || input_cardinality > 1.0)
+        && (!lhs_mask.is_empty()
+            || (input_cardinality > 1.0 && source.indexes_first_table_of_rerun_block()))
         && !source.is_full_outer_join()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
