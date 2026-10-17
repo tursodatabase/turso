@@ -591,7 +591,6 @@ fn populate_until_page_count(
     }
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
 fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -955,7 +954,6 @@ fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -1184,7 +1182,6 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
 
 /// Test VACUUM INTO preserves and bumps meta values like SQLite.
 /// Note: Some pragmas don't work correctly with MVCC yet
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -3423,8 +3420,6 @@ fn test_vacuum_into_column_name_with_comma(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
-// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
 fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4495,7 +4490,6 @@ fn test_plain_vacuum_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow
 }
 
 /// Plain VACUUM preserves indexes (queries using them still work).
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4691,7 +4685,6 @@ fn test_plain_vacuum_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Res
 }
 
 /// Plain VACUUM preserves views.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(views, init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4714,7 +4707,6 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// Plain VACUUM works on empty databases.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
 fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4749,7 +4741,6 @@ fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Plain VACUUM preserves an empty table after heavy insert/update/delete churn.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")]
 fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4803,7 +4794,6 @@ fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::
 }
 
 /// Multiple VACUUMs in a row work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4824,7 +4814,6 @@ fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Writes after VACUUM work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4870,7 +4859,6 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
 
 /// Plain VACUUM reduces page_count when rows are deleted, and a subsequent
 /// checkpoint truncates the .db file to the compacted size.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -6068,7 +6056,6 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[test]
 fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks(
 ) -> anyhow::Result<()> {
