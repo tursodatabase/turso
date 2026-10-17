@@ -151,9 +151,7 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt @ ast::Stmt::Select(_)
-            if connection.experimental_hir_enabled() && !connection.is_nested_stmt() =>
-        {
+        stmt @ ast::Stmt::Select(_) if connection.experimental_hir_enabled() => {
             semantic_lowering::translate_select(
                 &stmt,
                 schema,
@@ -165,7 +163,8 @@ pub fn translate(
         stmt => {
             // DML that HIR lowers today goes through it; everything else,
             // and DML it does not lower yet, stays on legacy.
-            let hir = (connection.experimental_hir_enabled() && !connection.is_nested_stmt())
+            let hir = connection
+                .experimental_hir_enabled()
                 .then_some((schema, &hir_settings));
             translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?
         }

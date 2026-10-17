@@ -236,7 +236,12 @@ fn target_needs_legacy(
     name: &ast::QualifiedName,
 ) -> Result<bool> {
     let table_name = crate::util::normalize_ident(name.name.as_str());
-    if !connection.is_mvcc_bootstrap_connection() && !crate::schema::allow_user_dml(&table_name) {
+    // Like legacy, the statements the engine runs itself, such as VACUUM's,
+    // may write its internal tables.
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && !crate::schema::allow_user_dml(&table_name)
+    {
         crate::bail_parse_error!("table {table_name} may not be modified");
     }
     if schema.is_materialized_view(&table_name) {
