@@ -310,7 +310,7 @@ impl SnapshotRows for PgClassTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -331,41 +331,42 @@ impl SnapshotRows for PgClassTable {
                 0
             };
             let relchecks = btree.check_constraints.len() as i64;
+            let placement = Placement::of(table_name, schemas);
 
             rows.push(vec![
-                Value::from_i64(table_oid),                // oid
-                Value::Text((*table_name).clone().into()), // relname
-                Value::from_i64(2200),                     // relnamespace (public schema)
-                Value::from_i64(0),                        // reltype
-                Value::from_i64(0),                        // reloftype
-                Value::from_i64(10),                       // relowner
-                Value::from_i64(2),                        // relam (heap)
-                Value::from_i64(0),                        // relfilenode
-                Value::from_i64(0),                        // reltablespace
-                Value::from_i64(1),                        // relpages
-                Value::from_f64(0.0),                      // reltuples
-                Value::from_i64(0),                        // relallvisible
-                Value::from_i64(0),                        // reltoastrelid
-                Value::from_i64(relhasindex),              // relhasindex
-                Value::from_i64(0),                        // relisshared
-                Value::Text("p".into()),                   // relpersistence (permanent)
-                Value::build_text(relkind),                // relkind (regular table)
-                Value::from_i64(relnatts),                 // relnatts
-                Value::from_i64(relchecks),                // relchecks
-                Value::from_i64(0),                        // relhasrules
-                Value::from_i64(0),                        // relhastriggers
-                Value::from_i64(0),                        // relhassubclass
-                Value::from_i64(0),                        // relrowsecurity
-                Value::from_i64(0),                        // relforcerowsecurity
-                Value::from_i64(1),                        // relispopulated
-                Value::Text("d".into()),                   // relreplident
-                Value::from_i64(0),                        // relispartition
-                Value::from_i64(0),                        // relrewrite
-                Value::from_i64(0),                        // relfrozenxid
-                Value::from_i64(0),                        // relminmxid
-                Value::Null,                               // relacl
-                Value::Null,                               // reloptions
-                Value::Null,                               // relpartbound
+                Value::from_i64(table_oid),                    // oid
+                Value::build_text(placement.name.to_string()), // relname
+                Value::from_i64(placement.namespace_oid),      // relnamespace
+                Value::from_i64(0),                            // reltype
+                Value::from_i64(0),                            // reloftype
+                Value::from_i64(10),                           // relowner
+                Value::from_i64(2),                            // relam (heap)
+                Value::from_i64(0),                            // relfilenode
+                Value::from_i64(0),                            // reltablespace
+                Value::from_i64(1),                            // relpages
+                Value::from_f64(0.0),                          // reltuples
+                Value::from_i64(0),                            // relallvisible
+                Value::from_i64(0),                            // reltoastrelid
+                Value::from_i64(relhasindex),                  // relhasindex
+                Value::from_i64(0),                            // relisshared
+                Value::Text("p".into()),                       // relpersistence (permanent)
+                Value::build_text(relkind),                    // relkind (regular table)
+                Value::from_i64(relnatts),                     // relnatts
+                Value::from_i64(relchecks),                    // relchecks
+                Value::from_i64(0),                            // relhasrules
+                Value::from_i64(0),                            // relhastriggers
+                Value::from_i64(0),                            // relhassubclass
+                Value::from_i64(0),                            // relrowsecurity
+                Value::from_i64(0),                            // relforcerowsecurity
+                Value::from_i64(1),                            // relispopulated
+                Value::Text("d".into()),                       // relreplident
+                Value::from_i64(0),                            // relispartition
+                Value::from_i64(0),                            // relrewrite
+                Value::from_i64(0),                            // relfrozenxid
+                Value::from_i64(0),                            // relminmxid
+                Value::Null,                                   // relacl
+                Value::Null,                                   // reloptions
+                Value::Null,                                   // relpartbound
             ]);
         }
 
@@ -378,40 +379,41 @@ impl SnapshotRows for PgClassTable {
                     continue;
                 }
                 let indnatts = idx.columns.len() as i64;
+                let placement = Placement::of(&idx.name, schemas);
                 rows.push(vec![
-                    Value::from_i64(index_oid),           // oid
-                    Value::Text(idx.name.clone().into()), // relname
-                    Value::from_i64(2200),                // relnamespace (public)
-                    Value::from_i64(0),                   // reltype
-                    Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
-                    Value::from_i64(403),                 // relam (btree)
-                    Value::from_i64(0),                   // relfilenode
-                    Value::from_i64(0),                   // reltablespace
-                    Value::from_i64(1),                   // relpages
-                    Value::from_f64(0.0),                 // reltuples
-                    Value::from_i64(0),                   // relallvisible
-                    Value::from_i64(0),                   // reltoastrelid
-                    Value::from_i64(0),                   // relhasindex
-                    Value::from_i64(0),                   // relisshared
-                    Value::Text("p".into()),              // relpersistence
-                    Value::build_text(relkind),           // relkind (index)
-                    Value::from_i64(indnatts),            // relnatts
-                    Value::from_i64(0),                   // relchecks
-                    Value::from_i64(0),                   // relhasrules
-                    Value::from_i64(0),                   // relhastriggers
-                    Value::from_i64(0),                   // relhassubclass
-                    Value::from_i64(0),                   // relrowsecurity
-                    Value::from_i64(0),                   // relforcerowsecurity
-                    Value::from_i64(1),                   // relispopulated
-                    Value::Text("d".into()),              // relreplident
-                    Value::from_i64(0),                   // relispartition
-                    Value::from_i64(0),                   // relrewrite
-                    Value::from_i64(0),                   // relfrozenxid
-                    Value::from_i64(0),                   // relminmxid
-                    Value::Null,                          // relacl
-                    Value::Null,                          // reloptions
-                    Value::Null,                          // relpartbound
+                    Value::from_i64(index_oid),                    // oid
+                    Value::build_text(placement.name.to_string()), // relname
+                    Value::from_i64(placement.namespace_oid),      // relnamespace
+                    Value::from_i64(0),                            // reltype
+                    Value::from_i64(0),                            // reloftype
+                    Value::from_i64(10),                           // relowner
+                    Value::from_i64(403),                          // relam (btree)
+                    Value::from_i64(0),                            // relfilenode
+                    Value::from_i64(0),                            // reltablespace
+                    Value::from_i64(1),                            // relpages
+                    Value::from_f64(0.0),                          // reltuples
+                    Value::from_i64(0),                            // relallvisible
+                    Value::from_i64(0),                            // reltoastrelid
+                    Value::from_i64(0),                            // relhasindex
+                    Value::from_i64(0),                            // relisshared
+                    Value::Text("p".into()),                       // relpersistence
+                    Value::build_text(relkind),                    // relkind (index)
+                    Value::from_i64(indnatts),                     // relnatts
+                    Value::from_i64(0),                            // relchecks
+                    Value::from_i64(0),                            // relhasrules
+                    Value::from_i64(0),                            // relhastriggers
+                    Value::from_i64(0),                            // relhassubclass
+                    Value::from_i64(0),                            // relrowsecurity
+                    Value::from_i64(0),                            // relforcerowsecurity
+                    Value::from_i64(1),                            // relispopulated
+                    Value::Text("d".into()),                       // relreplident
+                    Value::from_i64(0),                            // relispartition
+                    Value::from_i64(0),                            // relrewrite
+                    Value::from_i64(0),                            // relfrozenxid
+                    Value::from_i64(0),                            // relminmxid
+                    Value::Null,                                   // relacl
+                    Value::Null,                                   // reloptions
+                    Value::Null,                                   // relpartbound
                 ]);
                 index_oid += 1;
             }
@@ -440,9 +442,9 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         // PostgreSQL standard namespaces
-        let rows = vec![
+        let mut rows = vec![
             vec![
                 Value::from_i64(11),              // oid
                 Value::Text("pg_catalog".into()), // nspname
@@ -450,10 +452,10 @@ impl SnapshotRows for PgNamespaceTable {
                 Value::Null,                      // nspacl
             ],
             vec![
-                Value::from_i64(2200),        // oid
-                Value::Text("public".into()), // nspname
-                Value::from_i64(10),          // nspowner
-                Value::Null,                  // nspacl
+                Value::from_i64(PUBLIC_NAMESPACE_OID), // oid
+                Value::Text("public".into()),          // nspname
+                Value::from_i64(10),                   // nspowner
+                Value::Null,                           // nspacl
             ],
             vec![
                 Value::from_i64(11394),                   // oid
@@ -462,13 +464,6 @@ impl SnapshotRows for PgNamespaceTable {
                 Value::Null,                              // nspacl
             ],
         ];
-        rows
-    }
-
-    const NEEDS_SCHEMAS: bool = true;
-
-    fn load_rows_with_schemas(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
-        let mut rows = Self::load_rows(conn);
         for schema in schemas {
             rows.push(vec![
                 Value::from_i64(schema.oid),
@@ -499,15 +494,9 @@ impl SnapshotRows for SchemataTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        Self::load_rows_with_schemas(conn, &[])
-    }
-
-    const NEEDS_SCHEMAS: bool = true;
-
-    fn load_rows_with_schemas(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
-        PgNamespaceTable::load_rows_with_schemas(conn, schemas)
+        PgNamespaceTable::load_rows(conn, schemas)
             .into_iter()
             .map(|namespace| {
                 vec![
@@ -562,7 +551,7 @@ impl SnapshotRows for PgAttributeTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -645,7 +634,7 @@ impl SnapshotRows for PgRolesTable {
 
     /// Stub: returns a single default superuser role.
     /// Replace this method with real role lookup when auth is implemented.
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         vec![vec![
             Value::from_i64(10),        // oid
             Value::build_text("turso"), // rolname
@@ -706,7 +695,7 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         use crate::Func;
 
         let mut rows = Vec::new();
@@ -826,7 +815,7 @@ impl SnapshotRows for PgDatabaseTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
         vec![vec![
             Value::from_i64(16384),           // oid
@@ -878,7 +867,7 @@ impl SnapshotRows for PgAmTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         vec![
             vec![
                 Value::from_i64(2),                        // oid
@@ -991,20 +980,21 @@ impl SnapshotRows for PgTablesTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
         for (table_name, _) in user_tables_sorted(&schema) {
+            let placement = Placement::of(table_name, schemas);
             rows.push(vec![
-                Value::Text("public".into()),           // schemaname
-                Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
-                Value::Null,                            // tablespace
-                Value::from_i64(0),                     // hasindexes
-                Value::from_i64(0),                     // hasrules
-                Value::from_i64(0),                     // hastriggers
-                Value::from_i64(0),                     // rowsecurity
+                Value::build_text(placement.schema.to_string()), // schemaname
+                Value::build_text(placement.name.to_string()),   // tablename
+                Value::Text("turso".into()),                     // tableowner
+                Value::Null,                                     // tablespace
+                Value::from_i64(0),                              // hasindexes
+                Value::from_i64(0),                              // hasrules
+                Value::from_i64(0),                              // hastriggers
+                Value::from_i64(0),                              // rowsecurity
             ]);
         }
 
@@ -1027,7 +1017,7 @@ impl SnapshotRows for PgIndexesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1036,12 +1026,14 @@ impl SnapshotRows for PgIndexesTable {
                 if idx.ephemeral {
                     continue;
                 }
+                let table = Placement::of(table_name, schemas);
+                let index = Placement::of(&idx.name, schemas);
                 rows.push(vec![
-                    Value::Text("public".into()),
-                    Value::Text(table_name.clone().into()),
-                    Value::Text(idx.name.clone().into()),
+                    Value::build_text(table.schema.to_string()),
+                    Value::build_text(table.name.to_string()),
+                    Value::build_text(index.name.to_string()),
                     Value::Null,
-                    Value::build_text(index_definition(table_name, idx)),
+                    Value::build_text(index_definition(table.schema, table.name, index.name, idx)),
                 ]);
             }
         }
@@ -1359,7 +1351,7 @@ impl SnapshotRows for PgTypeTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
 
         // Static base types
@@ -1502,7 +1494,7 @@ impl SnapshotRows for PgIndexTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1615,7 +1607,7 @@ impl SnapshotRows for PgConstraintTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1644,11 +1636,12 @@ impl SnapshotRows for PgConstraintTable {
                 _ => continue,
             };
             let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let placement = Placement::of(table_name, schemas);
 
             // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
             let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
             if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-                let conname = format!("{table_name}_pkey");
+                let conname = format!("{}_pkey", placement.name);
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -1664,7 +1657,7 @@ impl SnapshotRows for PgConstraintTable {
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
-                    Value::from_i64(2200),
+                    Value::from_i64(placement.namespace_oid),
                     Value::build_text(contype),
                     Value::from_i64(0),
                     Value::from_i64(0),
@@ -1700,10 +1693,10 @@ impl SnapshotRows for PgConstraintTable {
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
-                    format!("{table_name}_pkey")
+                    format!("{}_pkey", placement.name)
                 } else {
                     let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
+                    format!("{}_{cols_str}_key", placement.name)
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -1740,31 +1733,31 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace (public)
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(conindid),       // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
-                    Value::build_text(conkey),       // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::Null,                     // conbin
+                    Value::from_i64(constraint_oid),          // oid
+                    Value::build_text(conname),               // conname
+                    Value::from_i64(placement.namespace_oid), // connamespace
+                    Value::build_text(contype),               // contype
+                    Value::from_i64(0),                       // condeferrable
+                    Value::from_i64(0),                       // condeferred
+                    Value::from_i64(1),                       // convalidated
+                    Value::from_i64(table_oid),               // conrelid
+                    Value::from_i64(0),                       // contypid
+                    Value::from_i64(conindid),                // conindid
+                    Value::from_i64(0),                       // conparentid
+                    Value::from_i64(0),                       // confrelid
+                    Value::Null,                              // confupdtype
+                    Value::Null,                              // confdeltype
+                    Value::Null,                              // confmatchtype
+                    Value::from_i64(1),                       // conislocal
+                    Value::from_i64(0),                       // coninhcount
+                    Value::from_i64(0),                       // connoinherit
+                    Value::build_text(conkey),                // conkey
+                    Value::Null,                              // confkey
+                    Value::Null,                              // conpfeqop
+                    Value::Null,                              // conppeqop
+                    Value::Null,                              // conffeqop
+                    Value::Null,                              // conexclop
+                    Value::Null,                              // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -1772,7 +1765,7 @@ impl SnapshotRows for PgConstraintTable {
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
                 let child_cols = fk.child_columns.join("_");
-                let conname = format!("{table_name}_{child_cols}_fkey");
+                let conname = format!("{}_{child_cols}_fkey", placement.name);
 
                 let conkey: String = fk
                     .child_columns
@@ -1808,7 +1801,7 @@ impl SnapshotRows for PgConstraintTable {
                 rows.push(vec![
                     Value::from_i64(constraint_oid),                   // oid
                     Value::build_text(conname),                        // conname
-                    Value::from_i64(2200),                             // connamespace
+                    Value::from_i64(placement.namespace_oid),          // connamespace
                     Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
@@ -1840,7 +1833,7 @@ impl SnapshotRows for PgConstraintTable {
                 let conname = chk
                     .name
                     .clone()
-                    .unwrap_or_else(|| format!("{table_name}_check"));
+                    .unwrap_or_else(|| format!("{}_check", placement.name));
 
                 let conkey = chk
                     .column
@@ -1854,35 +1847,35 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = ConstraintKind::Check.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(0),              // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
+                    Value::from_i64(constraint_oid),          // oid
+                    Value::build_text(conname),               // conname
+                    Value::from_i64(placement.namespace_oid), // connamespace
+                    Value::build_text(contype),               // contype
+                    Value::from_i64(0),                       // condeferrable
+                    Value::from_i64(0),                       // condeferred
+                    Value::from_i64(1),                       // convalidated
+                    Value::from_i64(table_oid),               // conrelid
+                    Value::from_i64(0),                       // contypid
+                    Value::from_i64(0),                       // conindid
+                    Value::from_i64(0),                       // conparentid
+                    Value::from_i64(0),                       // confrelid
+                    Value::Null,                              // confupdtype
+                    Value::Null,                              // confdeltype
+                    Value::Null,                              // confmatchtype
+                    Value::from_i64(1),                       // conislocal
+                    Value::from_i64(0),                       // coninhcount
+                    Value::from_i64(0),                       // connoinherit
                     if conkey.is_empty() {
                         Value::Null
                     } else {
                         Value::build_text(conkey)
                     }, // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::Null,                              // confkey
+                    Value::Null,                              // conpfeqop
+                    Value::Null,                              // conppeqop
+                    Value::Null,                              // conffeqop
+                    Value::Null,                              // conexclop
+                    Value::build_text(chk.expr.to_string()),  // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -1909,7 +1902,7 @@ impl SnapshotRows for PgAttrdefTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1966,7 +1959,7 @@ impl SnapshotRows for PgSequencesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let schema = conn.current_schema();
         let mut names: Vec<_> = schema.sequences.keys().cloned().collect();
@@ -1979,16 +1972,17 @@ impl SnapshotRows for PgSequencesTable {
                 let last_val = conn
                     .get_sequence_currval(&seq_name)
                     .unwrap_or(seq.start_value);
+                let placement = Placement::of(&seq_name, schemas);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
-                    Value::from_i64(i64::from(seq.cycle)), // cycle
+                    Value::build_text(placement.schema.to_string()), // schemaname
+                    Value::build_text(placement.name.to_string()),   // sequencename
+                    Value::build_text("turso"),                      // sequenceowner
+                    Value::build_text("bigint"),                     // data_type
+                    Value::from_i64(seq.start_value),                // start_value
+                    Value::from_i64(seq.min_value),                  // min_value
+                    Value::from_i64(seq.max_value),                  // max_value
+                    Value::from_i64(seq.increment_by),               // increment_by
+                    Value::from_i64(i64::from(seq.cycle)),           // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
                     Value::from_i64(last_val), // last_value
                 ]);
@@ -2379,7 +2373,7 @@ impl SnapshotRows for PgLanguageTable {
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         [(12, "internal"), (13, "c")]
             .into_iter()
             .map(|(oid, name)| {
@@ -2426,7 +2420,7 @@ impl SnapshotRows for PgSettingsTable {
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
         use crate::session::{search_path_setting, DEFAULT_SEARCH_PATH};
 
         let setting = search_path_setting(conn);
@@ -2520,16 +2514,16 @@ impl SnapshotRows for PgDependTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
-        let constraint_rows = PgConstraintTable::load_rows(conn);
+        let constraint_rows = PgConstraintTable::load_rows(conn, schemas);
         let constraints = constraint_rows
             .iter()
             .map(Vec::as_slice)
             .map(ConstraintRow::from_row);
-        let index_rows = PgIndexTable::load_rows(conn);
+        let index_rows = PgIndexTable::load_rows(conn, schemas);
         let indexes = index_rows.iter().map(Vec::as_slice).map(IndexRow::from_row);
-        let relation_rows = PgClassTable::load_rows(conn);
+        let relation_rows = PgClassTable::load_rows(conn, schemas);
         let relations = relation_rows
             .iter()
             .map(Vec::as_slice)
@@ -2629,7 +2623,7 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
-        let default_rows = PgAttrdefTable::load_rows(conn);
+        let default_rows = PgAttrdefTable::load_rows(conn, schemas);
         let defaults = default_rows
             .iter()
             .map(Vec::as_slice)
@@ -2821,22 +2815,46 @@ trait SnapshotRows: Debug + Send + Sync + 'static {
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>>;
-
-    /// Whether the rows depend on the schemas other than public. The cursor
-    /// then reads them from the schema table and calls
-    /// [`Self::load_rows_with_schemas`] instead of [`Self::load_rows`].
-    const NEEDS_SCHEMAS: bool = false;
-
-    fn load_rows_with_schemas(conn: &Connection, _schemas: &[Namespace]) -> Vec<Vec<Value>> {
-        Self::load_rows(conn)
-    }
+    /// The rows of the catalog, given the schemas other than public.
+    fn load_rows(conn: &Connection, schemas: &[Namespace]) -> Vec<Vec<Value>>;
 }
 
 /// A schema other than public, as listed in the schema table.
 struct Namespace {
     oid: i64,
     name: String,
+}
+
+/// OID of the public schema.
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+
+/// Where a main-database object is in PostgreSQL: its schema, its name in
+/// the schema, and the OID of the schema.
+struct Placement<'a> {
+    schema: &'a str,
+    name: &'a str,
+    namespace_oid: i64,
+}
+
+impl<'a> Placement<'a> {
+    /// The placement of main-database object `table_name`. A name whose part
+    /// before the first `.` is not a schema is an object of the public
+    /// schema with a `.` in its name.
+    fn of(table_name: &'a str, schemas: &'a [Namespace]) -> Self {
+        let (schema, name) = turso_pg_parser::translator::split_relation_table_name(table_name);
+        match schemas.iter().find(|namespace| namespace.name == schema) {
+            Some(namespace) => Self {
+                schema: &namespace.name,
+                name,
+                namespace_oid: namespace.oid,
+            },
+            None => Self {
+                schema: "public",
+                name: table_name,
+                namespace_oid: PUBLIC_NAMESPACE_OID,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2864,8 +2882,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
-            load_rows: T::load_rows_with_schemas,
-            needs_schemas: T::NEEDS_SCHEMAS,
+            load_rows: T::load_rows,
             schemas_statement: None,
             schemas: Vec::new(),
             table_oid: T::TABLE_OID,
@@ -2901,9 +2918,8 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 struct SnapshotCursor {
     conn: Arc<Connection>,
     load_rows: fn(&Connection, &[Namespace]) -> Vec<Vec<Value>>,
-    needs_schemas: bool,
-    /// Reads the schema table, when the rows need the schemas. It runs
-    /// across `filter` calls that return IO.
+    /// Reads the schema table. It runs across `filter` calls that return
+    /// IO.
     schemas_statement: Option<Statement>,
     schemas: Vec<Namespace>,
     table_oid: Option<i64>,
@@ -2982,10 +2998,8 @@ impl VirtualTableCursor for SnapshotCursor {
         _idx_str: Option<&str>,
         _idx_num: i32,
     ) -> turso_core::types::IOResultOr<bool> {
-        if self.needs_schemas {
-            if let IOResult::IO(completions) = self.read_schemas()? {
-                return Ok(IOResult::IO(completions));
-            }
+        if let IOResult::IO(completions) = self.read_schemas()? {
+            return Ok(IOResult::IO(completions));
         }
         self.current_row = 0;
         self.rows = (self.load_rows)(&self.conn, &self.schemas);
@@ -3225,11 +3239,7 @@ impl PgGetTableDefCursor {
         self.rows.clear();
 
         for (table_name, table) in &schema.tables {
-            // Skip system tables
-            if table_name.starts_with("sqlite_")
-                || table_name == "sqlite_master"
-                || table_name == "sqlite_schema"
-            {
+            if is_system_table_name(table_name) {
                 continue;
             }
 
@@ -3245,9 +3255,11 @@ impl PgGetTableDefCursor {
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
 
+            let (schema_name, name) =
+                turso_pg_parser::translator::split_relation_table_name(table_name);
             self.rows.push(vec![
-                Value::Text("public".into()),
-                Value::Text(table_name.clone().into()),
+                Value::build_text(schema_name.to_string()),
+                Value::build_text(name.to_string()),
                 Value::Text(postgres_ddl.into()),
             ]);
         }
@@ -3483,7 +3495,13 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
                 continue;
             }
             if index_oid == target_oid {
-                return Some(index_definition(table_name, idx));
+                let (table_schema, table_name) =
+                    turso_pg_parser::translator::split_relation_table_name(table_name);
+                let index_name = idx
+                    .name
+                    .strip_prefix(&format!("{table_schema}."))
+                    .unwrap_or(&idx.name);
+                return Some(index_definition(table_schema, table_name, index_name, idx));
             }
             index_oid += 1;
         }
@@ -3492,7 +3510,9 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
     None
 }
 
-fn index_definition(table_name: &str, idx: &Index) -> String {
+/// The CREATE INDEX statement of index `idx`, named `index_name` in its
+/// schema, of table `table_name` of schema `table_schema`.
+fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx: &Index) -> String {
     let unique = if idx.unique { "UNIQUE " } else { "" };
     let cols: Vec<String> = idx
         .columns
@@ -3506,8 +3526,7 @@ fn index_definition(table_name: &str, idx: &Index) -> String {
         })
         .collect();
     let mut def = format!(
-        "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-        idx.name,
+        "CREATE {unique}INDEX {index_name} ON {table_schema}.{table_name} USING btree ({})",
         cols.join(", ")
     );
     if let Some(where_clause) = &idx.where_clause {

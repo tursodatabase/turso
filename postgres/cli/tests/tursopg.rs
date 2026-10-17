@@ -443,6 +443,37 @@ fn df_lists_functions() {
 }
 
 // ---------------------------------------------------------------------------
+#[test]
+fn d_describes_table_of_schema() {
+    let output = run_tursopg(
+        b"CREATE TABLE t (public_column int);\nCREATE SCHEMA app;\nCREATE TABLE app.t (app_column int);\n\\d app.t\n\\d t\n",
+    );
+    let out = stdout(&output);
+    let (app_table, public_table) = out
+        .split_once("Table: t")
+        .unwrap_or_else(|| panic!("expected both tables described, got: {out}"));
+    assert!(
+        app_table.contains("app_column") && !app_table.contains("public_column"),
+        "\\d app.t should show only the columns of app.t, got: {app_table}"
+    );
+    assert!(
+        public_table.contains("public_column") && !public_table.contains("app_column"),
+        "\\d t should show only the columns of public.t, got: {public_table}"
+    );
+}
+
+#[test]
+fn d_plus_describes_indexes_of_table_of_schema() {
+    let output = run_tursopg(
+        b"CREATE TABLE t (x int);\nCREATE INDEX public_index ON t (x);\nCREATE SCHEMA app;\nCREATE TABLE app.t (x int);\nCREATE INDEX app_index ON app.t (x);\n\\d+ app.t\n",
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("app_index") && !out.contains("public_index"),
+        "\\d+ app.t should show only the indexes of app.t, got: {out}"
+    );
+}
+
 // Meta-commands: \d+ (extended describe)
 // ---------------------------------------------------------------------------
 
