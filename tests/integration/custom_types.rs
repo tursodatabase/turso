@@ -276,6 +276,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_add_column_with_non_literal_type_default_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_add_column_default.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN dm AS text DEFAULT lower('X')")
+                .unwrap();
+            conn.execute("CREATE TYPE ty BASE text ENCODE value DECODE value DEFAULT lower('Y')")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a INTEGER) STRICT").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN b dm").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN c ty").unwrap();
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+            assert_eq!(
+                rows,
+                vec![(
+                    "CREATE TABLE t (a INTEGER, b dm DEFAULT (lower ('X')), c ty DEFAULT (lower ('Y'))) STRICT"
+                        .to_string(),
+                )]
+            );
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t(a) VALUES (1)").unwrap();
+            let rows: Vec<(i64, String, String)> = conn.exec_rows("SELECT a, b, c FROM t");
+            assert_eq!(rows, vec![(1, "x".to_string(), "y".to_string())]);
+            conn.close().unwrap();
+        }
+    }
+
     /// A new connection on the same database must see custom types that were
     /// created by another connection, even without reopening the database file.
     #[test]

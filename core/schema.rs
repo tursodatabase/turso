@@ -3681,7 +3681,21 @@ impl BTreeTable {
 
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
-                sql.push_str(&default.to_string());
+                let parses_without_parens = match default.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) => true,
+                    Expr::Unary(
+                        ast::UnaryOperator::Positive | ast::UnaryOperator::Negative,
+                        operand,
+                    ) => matches!(operand.as_ref(), Expr::Literal(_)),
+                    _ => false,
+                };
+                if parses_without_parens {
+                    sql.push_str(&default.to_string());
+                } else {
+                    sql.push('(');
+                    sql.push_str(&default.to_string());
+                    sql.push(')');
+                }
             }
 
             push_collation(&mut sql, column.collation_opt());

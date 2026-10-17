@@ -601,6 +601,49 @@ fn test_postgres_alter_table_drop_column(db: TempDatabase) {
     assert_eq!(name.value, "alice");
 }
 
+#[turso_macros::test]
+fn test_postgres_alter_table_keeps_non_literal_defaults_readable_after_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE t (id serial PRIMARY KEY, a int, c timestamp DEFAULT now(), \
+         d text DEFAULT lower('X'), e int DEFAULT 1+2, f int DEFAULT 5, \
+         g int DEFAULT (1+2)*3, h int DEFAULT -(1+2), m int DEFAULT 10-(4-1), \
+         i boolean DEFAULT ((true OR false) IS NULL), j boolean DEFAULT ((true OR false) IS FALSE), \
+         k boolean DEFAULT ((true OR false) BETWEEN false AND false))",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN b int").unwrap();
+    conn.execute("ALTER TABLE t DROP COLUMN a").unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    conn.execute("INSERT INTO t (b) VALUES (7)").unwrap();
+    let mut rows = conn
+        .query("SELECT id, d, e, f, g, h, m, i, j, k, b FROM t")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let values: Vec<String> = (0..11).map(|i| row.get_value(i).to_string()).collect();
+    assert_eq!(
+        values,
+        vec!["1", "x", "3", "5", "9", "-3", "7", "0", "0", "0", "7"]
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_alter_table_rename_column(db: TempDatabase) {
     let conn = db.connect_postgres();
