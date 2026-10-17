@@ -69,6 +69,14 @@ impl PgConnection {
                         .map(|v| v.unwrap_or_default())
                         .collect::<Vec<String>>(),
                 ),
+                BackendEvent::CopyData(data) => {
+                    let text = String::from_utf8(data)
+                        .map_err(|e| BackendError::Execute(e.to_string()))?;
+                    let row = text.strip_suffix('\n').ok_or_else(|| {
+                        BackendError::Execute("COPY text row has no final newline".into())
+                    })?;
+                    rows.push(row.split('\t').map(str::to_owned).collect());
+                }
                 BackendEvent::ErrorResponse(fields) => {
                     return Ok(QueryResult::error(error_message(&fields).to_string()));
                 }

@@ -6,6 +6,7 @@ use crate::catalog::{self, PostgresDialect};
 use crate::statement::{with_execution, Plan, Statement};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Value};
 use turso_parser::ast::{self};
+use turso_pg_parser::copy::CopyToStdout;
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
@@ -82,6 +83,16 @@ impl PgConnection {
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         prepare_statement(&self.inner, sql.as_ref())
+    }
+
+    pub fn prepare_copy_to_stdout(&self, copy: &CopyToStdout) -> Result<Statement> {
+        noop_statement(
+            &self.inner,
+            Some(Plan::CopyTo {
+                spec: copy.clone(),
+                options: prepare_options(&self.inner.conn),
+            }),
+        )
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
@@ -181,17 +192,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 
-    let options = {
-        let state = pg_conn
-            .conn
-            .context::<PgSessionState>()
-            .expect("PostgreSQL connections have session state")
-            .lock()
-            .unwrap();
-        PrepareOptions {
-            unqualified_database_search_path: state.search_path.clone(),
-        }
-    };
+    let options = prepare_options(&pg_conn.conn);
     let plan = (!translated.prereqs.is_empty() && matches!(translated.cmd, ast::Cmd::Stmt(_)))
         .then(|| Plan::Prerequisites {
             statements: translated.prereqs,
@@ -205,6 +206,17 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?;
     Ok(with_execution(pg_conn.clone(), stmt, plan))
+}
+
+fn prepare_options(conn: &Connection) -> PrepareOptions {
+    let state = conn
+        .context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+        .lock()
+        .unwrap();
+    PrepareOptions {
+        unqualified_database_search_path: state.search_path.clone(),
+    }
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
