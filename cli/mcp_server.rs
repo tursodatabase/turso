@@ -267,6 +267,12 @@ impl TursoMcpServer {
 
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({})),
+                error: None,
+            },
             "tools/list" => self.handle_list_tools(request),
             "tools/call" => self.handle_call_tool(request),
             _ => JsonRpcResponse {
@@ -788,6 +794,22 @@ mod tests {
 
     fn query_arg(sql: &str) -> Option<Value> {
         Some(json!({ "query": sql }))
+    }
+
+    #[test]
+    fn ping_returns_empty_result() {
+        let server = memory_server();
+
+        let response = server.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "ping".to_string(),
+            params: None,
+        });
+
+        assert_eq!(response.id, Some(json!(1)));
+        assert_eq!(response.result, Some(json!({})));
+        assert!(response.error.is_none());
     }
 
     fn seed_bench_orders(server: &TursoMcpServer) {
