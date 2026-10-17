@@ -283,7 +283,7 @@ fn translate_statement(
     match stmt {
         _ if lowered_by_hir => {}
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
+            translate_alter_table(alter, resolver, program, connection, input, hir)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {

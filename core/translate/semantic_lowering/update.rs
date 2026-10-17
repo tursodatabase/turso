@@ -50,10 +50,7 @@ pub(super) fn needs_legacy(
     access: &HirAccessPlan,
 ) -> Result<bool> {
     let document = &plan.document;
-    if !update.order_by.is_empty()
-        || update.limit.is_some()
-        || update.cdc_updates_override.is_some()
-    {
+    if !update.order_by.is_empty() || update.limit.is_some() {
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
@@ -145,6 +142,7 @@ pub(super) fn emit_update(
     subprograms: &Subprograms<'_>,
     mvcc: bool,
     enforce_checks: bool,
+    schema_change: Option<&str>,
 ) -> Result<()> {
     let triggers = &subprograms.triggers[..];
     let actions = &subprograms.actions[..];
@@ -409,6 +407,17 @@ pub(super) fn emit_update(
         actions,
         replace_actions,
         sequence: sequence.as_ref(),
+        // ALTER TABLE rewrites a schema row with a generated UPDATE; like
+        // legacy, change data capture records the user's DDL as the new
+        // `sql` value instead.
+        schema_change: schema_change.and_then(|ddl| {
+            table
+                .columns()
+                .iter()
+                .position(|column| column.name.as_deref() == Some("sql"))
+                .filter(|position| assigned.contains(position))
+                .map(|position| (position, ddl))
+        }),
     };
     let done = program.allocate_label();
     // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
@@ -657,6 +666,9 @@ struct UpdateRowLayout<'a> {
     mvcc: bool,
     /// The ON UPDATE actions to run once the row is written.
     actions: &'a [CompiledAction<'a>],
+    /// For ALTER TABLE's schema-row UPDATE: the `sql` column, and the DDL
+    /// change data capture records as its new value.
+    schema_change: Option<(usize, &'a str)>,
     /// The ON DELETE actions of a row REPLACE deletes.
     replace_actions: &'a [CompiledAction<'a>],
     /// AUTOINCREMENT, when the UPDATE sets the rowid: the target's sequence.
@@ -1350,6 +1362,12 @@ impl UpdateRow<'_, '_> {
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before, updates)?;
         self.emit_virtual_columns(program, layout, !has_before)?;
+        if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
+            program.emit_insn(Insn::String8 {
+                value: ddl.to_string(),
+                dest: updates + columns + position,
+            });
+        }
         if let Some(updates) = updates {
             // Like legacy, a changed virtual column records its value.
             for &position in layout.assigned {
@@ -2237,6 +2255,7 @@ mod tests {
             &Subprograms::default(),
             false,
             true,
+            None,
         )
         .unwrap();
         program

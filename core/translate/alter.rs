@@ -858,6 +858,10 @@ pub fn translate_alter_table(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
+    hir: Option<(
+        &Arc<crate::schema::Schema>,
+        &crate::translate::semantic_lowering::HirSettings<'_>,
+    )>,
 ) -> Result<()> {
     let ast::AlterTable {
         name: qualified_name,
@@ -1202,6 +1206,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
+                hir,
                 |program| {
                     if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
@@ -1536,6 +1541,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
+                hir,
                 |program| {
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1768,6 +1774,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
+                    hir,
                     |_program| {},
                 )?;
             }
@@ -2183,6 +2190,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
+                    hir,
                     |_program| {},
                 )?;
             }
@@ -2217,6 +2225,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
+                    hir,
                     |_program| {},
                 )?;
             }

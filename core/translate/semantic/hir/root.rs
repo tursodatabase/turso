@@ -213,9 +213,6 @@ pub struct Update {
     pub limit: Option<Limit>,
     pub conflict: Option<ResolveType>,
     pub returning: Option<Returning>,
-    /// For an internal sqlite_schema update, CDC stores the user's DDL text in
-    /// the changed `sql` field instead of the generated UPDATE statement.
-    pub cdc_updates_override: Option<(usize, String)>,
 }
 
 /// Metadata required by the concrete kind of UPDATE destination.

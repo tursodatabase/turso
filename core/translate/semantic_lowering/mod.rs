@@ -109,12 +109,38 @@ pub(crate) fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
+    translate_update_with(statement, schema, settings, program, connection, None)
+}
+
+/// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
+/// legacy, it may write the schema table, and change data capture records
+/// `ddl`, the ALTER statement, as the new `sql` value. Returns `false`, with
+/// nothing emitted, when the update needs legacy.
+pub(crate) fn translate_schema_update(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    ddl: &str,
+) -> Result<bool> {
+    translate_update_with(statement, schema, settings, program, connection, Some(ddl))
+}
+
+fn translate_update_with(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    schema_change: Option<&str>,
+) -> Result<bool> {
     let ast::Stmt::Update(syntax) = statement else {
         return Err(LimboError::InternalError(
             "HIR UPDATE got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, &syntax.tbl_name)? {
+    if schema_change.is_none() && target_needs_legacy(schema, connection, &syntax.tbl_name)? {
         return Ok(false);
     }
     let session = HirSession::new(schema, settings, connection)?;
@@ -136,6 +162,7 @@ pub(crate) fn translate_update(
         &subprograms,
         mvcc,
         !connection.check_constraints_ignored(),
+        schema_change,
     )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =

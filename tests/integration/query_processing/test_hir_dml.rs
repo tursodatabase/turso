@@ -2102,3 +2102,42 @@ fn hir_inserts_into_without_rowid_tables() {
         ]
     );
 }
+
+/// ALTER TABLE rewrites its schema row with a generated UPDATE of
+/// sqlite_schema. With HIR on, HIR lowers that UPDATE, and change data
+/// capture still records the ALTER statement as the new `sql` value, so the
+/// schema, the rows and the captured changes match legacy.
+#[test]
+fn hir_alter_table_schema_updates_match_legacy() {
+    let statements = [
+        "PRAGMA capture_data_changes_conn('full')",
+        "CREATE TABLE w(a INTEGER PRIMARY KEY, b TEXT, c INT)",
+        "INSERT INTO w VALUES (1, 'x', 10), (2, 'y', 20)",
+        "CREATE INDEX w_b ON w(b)",
+        "ALTER TABLE w ADD COLUMN d TEXT DEFAULT 'z'",
+        "ALTER TABLE w RENAME COLUMN b TO bb",
+        "ALTER TABLE w DROP COLUMN c",
+        "ALTER TABLE w RENAME TO w2",
+        "SELECT * FROM w2 ORDER BY a",
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name",
+        "SELECT change_type, table_name, id, \
+         bin_record_json_object(table_columns_json_array('sqlite_schema'), updates) \
+         FROM turso_cdc WHERE table_name = 'sqlite_schema' ORDER BY change_id",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA capture_data_changes_conn('full')")
+            .unwrap();
+        conn.execute("CREATE TABLE w(a, b, c)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(&conn, "EXPLAIN ALTER TABLE w DROP COLUMN b")
+    };
+    assert_ne!(
+        program(true),
+        program(false),
+        "HIR lowers the schema-row UPDATE itself"
+    );
+}

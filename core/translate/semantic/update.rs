@@ -143,7 +143,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             limit: None,
             conflict: syntax.conflict,
             returning,
-            cdc_updates_override: None,
         }))
     }
 
