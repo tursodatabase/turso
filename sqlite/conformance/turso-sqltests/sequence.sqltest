@@ -319,3 +319,19 @@ test create-sequence-rejects-autoincrement-internal-prefix {
 expect error {
     sequence name "__turso_internal_autoincrement_pwned" is reserved for internal AUTOINCREMENT use
 }
+
+test qualified-sequence-name-may-contain-a-dot {
+    CREATE SEQUENCE "a.b" START WITH 5;
+    SELECT nextval('main.a.b');
+    SELECT nextval('main.a.b');
+    SELECT setval('main.a.b', 20);
+    SELECT nextval('main.a.b');
+    SELECT currval('main.a.b');
+}
+expect {
+    5
+    6
+    20
+    21
+    21
+}

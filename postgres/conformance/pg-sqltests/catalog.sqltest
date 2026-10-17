@@ -807,3 +807,72 @@ expect {
     pg_catalog
     public
 }
+
+test pg-class-reports-schema-of-relations {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    CREATE TABLE t (x int);
+    SELECT c.relname, c.relkind, n.nspname
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('app', 'public') AND c.relname IN ('t', 't_x')
+    ORDER BY n.nspname, c.relname;
+}
+expect {
+    t|r|app
+    t_x|i|app
+    t|r|public
+}
+
+test pg-tables-reports-schema-of-tables {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    SELECT schemaname, tablename FROM pg_tables
+    WHERE schemaname IN ('app', 'public') ORDER BY schemaname, tablename;
+}
+expect {
+    app|t
+    public|t
+}
+
+test pg-indexes-reports-schema-of-indexes {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes
+    WHERE schemaname = 'app';
+}
+expect {
+    app|t|t_x|CREATE INDEX t_x ON app.t USING btree (x)
+}
+
+test pg-sequences-reports-schema-of-sequences {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s;
+    SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname = 'app';
+}
+expect {
+    app|s
+}
+
+test pg-constraint-names-constraint-after-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id int PRIMARY KEY);
+    SELECT c.conname, n.nspname
+    FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace
+    WHERE n.nspname = 'app';
+}
+expect {
+    t_pkey|app
+}
+
+test pg-get-indexdef-agrees-with-pg-indexes-for-automatic-index-of-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id int, u text UNIQUE);
+    SELECT count(*) FROM pg_indexes x JOIN pg_class c ON c.relname = x.indexname
+    WHERE x.schemaname = 'app' AND pg_get_indexdef(c.oid) = x.indexdef;
+}
+expect {
+    1
+}
