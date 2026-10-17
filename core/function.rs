@@ -7,6 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
+use crate::translate::collate::CollationSeq;
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -1604,6 +1605,9 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
+    /// Collation used to compare text arguments, for functions that compare
+    /// their arguments (multi-argument min() and max()). `None` means BINARY.
+    pub collation: Option<CollationSeq>,
 }
 
 impl Deterministic for Func {

@@ -373,10 +373,10 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
             match func {
                 VariadicFunc::Min => {
-                    let _ = CoreValue::exec_min(vals.iter());
+                    let _ = CoreValue::exec_min(vals.iter(), |a, b| Ok(a.cmp(b)));
                 }
                 VariadicFunc::Max => {
-                    let _ = CoreValue::exec_max(vals.iter());
+                    let _ = CoreValue::exec_max(vals.iter(), |a, b| Ok(a.cmp(b)));
                 }
                 VariadicFunc::ConcatStrings => {
                     let _ = CoreValue::exec_concat_strings(vals.iter());

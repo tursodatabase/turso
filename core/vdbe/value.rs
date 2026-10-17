@@ -1406,36 +1406,46 @@ impl Value {
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
     }
 
-    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    /// Multi-argument min(). `compare` orders two values; it applies the
+    /// collation of the call to text values.
+    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(
+        regs: T,
+        mut compare: impl FnMut(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Value> {
         // SQLite: multi-arg min() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;
         for v in regs {
             if matches!(v, Value::Null) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             result = Some(match result {
                 None => v,
-                Some(cur) if v <= cur => v,
+                Some(cur) if compare(v, cur)?.is_le() => v,
                 Some(cur) => cur,
             });
         }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+        Ok(result.map(|v| v.to_owned()).unwrap_or(Value::Null))
     }
 
-    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    /// Multi-argument max(). `compare` orders two values; it applies the
+    /// collation of the call to text values.
+    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(
+        regs: T,
+        mut compare: impl FnMut(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Value> {
         // SQLite: multi-arg max() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;
         for v in regs {
             if matches!(v, Value::Null) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             result = Some(match result {
                 None => v,
-                Some(cur) if v > cur => v,
+                Some(cur) if compare(v, cur)?.is_gt() => v,
                 Some(cur) => cur,
             });
         }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+        Ok(result.map(|v| v.to_owned()).unwrap_or(Value::Null))
     }
 
     /// Fallibly concatenate another value onto this Text value, converting it to a string.
@@ -2554,16 +2564,17 @@ mod tests {
 
     #[test]
     fn test_min_max() {
+        let binary = |a: &Value, b: &Value| Ok(a.cmp(b));
         let input_int_vec = [
             Register::Value(Value::from_i64(-1)),
             Register::Value(Value::from_i64(10)),
         ];
         assert_eq!(
-            Value::exec_min(input_int_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_int_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(-1)
         );
         assert_eq!(
-            Value::exec_max(input_int_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_int_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(10)
         );
 
@@ -2571,31 +2582,31 @@ mod tests {
         let str2 = Register::Value(Value::build_text("z"));
         let input_str_vec = [&str2, &str1];
         assert_eq!(
-            Value::exec_min(input_str_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_str_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("A")
         );
         assert_eq!(
-            Value::exec_max(input_str_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_str_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("z")
         );
 
         let input_null_vec = [Register::Value(Value::Null), Register::Value(Value::Null)];
         assert_eq!(
-            Value::exec_min(input_null_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_null_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::exec_max(input_null_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_null_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
 
         let input_mixed_vec = [Register::Value(Value::from_i64(10)), str1];
         assert_eq!(
-            Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(10)
         );
         assert_eq!(
-            Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("A")
         );
 
@@ -2605,11 +2616,11 @@ mod tests {
             Register::Value(Value::Null),
         ];
         assert_eq!(
-            Value::exec_min(input_with_null.iter().map(|v| v.get_value())),
+            Value::exec_min(input_with_null.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::exec_max(input_with_null.iter().map(|v| v.get_value())),
+            Value::exec_max(input_with_null.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
     }

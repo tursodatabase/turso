@@ -900,6 +900,7 @@ fn translate_function_call_expr(
     let func_ctx = FuncCtx {
         func: func_type.unwrap(),
         arg_count: args_count,
+        collation: None,
     };
 
     match &func_ctx.func {
@@ -1639,37 +1640,42 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Min => {
+                ScalarFunc::Min | ScalarFunc::Max => {
                     if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
+                        crate::bail_parse_error!("{} function with no arguments", srf.to_string());
                     }
                     let start_reg = program.alloc_registers(args.len());
+                    // Text arguments are compared with the collation of the leftmost
+                    // argument that has one: a COLLATE operator, or a column (BINARY
+                    // when the column declares none). If no argument has one, BINARY
+                    // is used.
+                    let mut collation = None;
+                    let mut explicit_collation = None;
                     for (i, arg) in args.iter().enumerate() {
+                        program.reset_collation();
                         translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+                        let arg_collation = match program.curr_collation_ctx() {
+                            Some((c, true)) => {
+                                explicit_collation = explicit_collation.or(Some(c));
+                                Some(c)
+                            }
+                            Some((c, false)) if is_column_reference(arg) => Some(c),
+                            _ => None,
+                        };
+                        collation = collation.or(arg_collation);
                     }
+                    // Like in SQLite, a COLLATE operator in an argument also applies to
+                    // comparisons with the result, but a column's collation does not.
+                    program.set_collation(explicit_collation.map(|c| (c, true)));
 
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg,
                         dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Max => {
-                    if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
-                    }
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
+                        func: FuncCtx {
+                            collation,
+                            ..func_ctx
+                        },
                     });
                     Ok(target_register)
                 }
@@ -3433,6 +3439,20 @@ fn translate_fts_score(
     };
     program.emit_column_or_rowid(cursor_id, score_column, target_register);
     Ok(target_register)
+}
+
+/// Whether `expr` is a column reference, possibly wrapped in CAST or unary `+`.
+/// Such an expression has the column's collation even without a COLLATE
+/// operator, while an expression like `col || ''` does not.
+fn is_column_reference(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Column { .. } | ast::Expr::MergedColumn(_) => true,
+        ast::Expr::Cast { expr, .. } | ast::Expr::Unary(ast::UnaryOperator::Positive, expr) => {
+            is_column_reference(expr)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => is_column_reference(&exprs[0]),
+        _ => false,
+    }
 }
 
 /// Emit the value of a merged USING column (see [ast::Expr::MergedColumn]).

@@ -52,6 +52,7 @@ pub(super) fn translate_like_base(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count,
+                    collation: None,
                 },
             });
         }
@@ -80,7 +81,11 @@ pub(super) fn translate_like_base(
                 constant_mask: 0,
                 start_reg,
                 dest: target_register,
-                func: FuncCtx { func, arg_count },
+                func: FuncCtx {
+                    func,
+                    arg_count,
+                    collation: None,
+                },
             });
         }
     }
