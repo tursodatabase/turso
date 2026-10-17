@@ -1312,7 +1312,17 @@ fn hir_constant_operands_are_computed_once() {
                 && matches!(row.get(5), Some(rusqlite::types::Value::Text(name)) if name == "upper")
         })
         .expect("upper is called");
-    assert_eq!(opcode(&program[upper - 1]), "Once", "{program:?}");
+    // A Once before the call jumps past it after the first row.
+    let integer = |row: &Vec<rusqlite::types::Value>, column: usize| match row.get(column) {
+        Some(rusqlite::types::Value::Integer(value)) => *value,
+        _ => -1,
+    };
+    assert!(
+        program[..upper]
+            .iter()
+            .any(|row| opcode(row) == "Once" && integer(row, 2) > integer(&program[upper], 0)),
+        "{program:?}"
+    );
 }
 
 /// Like SQLite, a query with exactly one min() or max() aggregate reads its
