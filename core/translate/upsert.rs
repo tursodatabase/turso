@@ -26,9 +26,7 @@ use crate::{
     error::SQLITE_CONSTRAINT_NOTNULL,
     schema::{Index, Schema, Table},
     translate::{
-        emitter::{
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
-        },
+        emitter::{emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver},
         expr::{
             emit_returning_results, emit_table_column, translate_expr,
             translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
@@ -1415,13 +1413,13 @@ pub fn emit_upsert(
     if let Some((cdc_id, _)) = ctx.cdc_table {
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
-            // DELETE (before)
             let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
+                Some(emit_cdc_before_record(
                     program,
-                    table.columns(),
-                    ctx.cursor_id,
+                    table,
+                    before_start,
                     ctx.conflict_rowid_reg,
+                    &layout,
                 ))
             } else {
                 None
@@ -1471,11 +1469,12 @@ pub fn emit_upsert(
                 None
             };
             let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
+                Some(emit_cdc_before_record(
                     program,
-                    table.columns(),
-                    ctx.cursor_id,
+                    table,
+                    before_start,
                     ctx.conflict_rowid_reg,
+                    &layout,
                 ))
             } else {
                 None
@@ -1573,6 +1572,19 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+fn emit_cdc_before_record(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    before_start: Option<usize>,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> usize {
+    let before_start = before_start.expect("upsert must snapshot the old row when CDC is enabled");
+    let record_reg = program.alloc_register();
+    emit_make_record(program, table.columns().iter(), before_start, record_reg);
+    emit_cdc_patch_record(program, table, before_start, record_reg, rowid_reg, layout)
 }
 
 fn compute_new_row_virtual_columns(
