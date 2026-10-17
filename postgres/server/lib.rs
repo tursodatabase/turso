@@ -63,7 +63,6 @@ impl TursoPgServer {
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
             }),
         });
@@ -104,54 +103,7 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: Arc<Mutex<PgConnection>>,
-    db_file: String,
     query_parser: Arc<NoopQueryParser>,
-}
-
-impl TursoPgHandler {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
-    }
 }
 
 struct TursoPgFactory {
@@ -191,8 +143,6 @@ impl SimpleQueryHandler for TursoPgHandler {
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-            self.cleanup_dropped_schema_file(sql);
-
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
@@ -229,9 +179,6 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let mut stmt = conn
             .prepare(query)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
-
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;

@@ -6,6 +6,7 @@
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
+use std::cell::RefCell;
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
@@ -20,48 +21,460 @@ pub struct TranslateResult {
     pub cmd: ast::Cmd,
 }
 
-/// Translates a PostgreSQL query into Turso's AST
-#[derive(Default)]
-pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+/// The kinds of objects that a name can refer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A table, view or materialized view.
+    Relation,
+    Index,
+    Sequence,
 }
 
-impl PostgreSQLTranslator {
+impl ObjectKind {
+    fn noun(self) -> &'static str {
+        match self {
+            ObjectKind::Relation => "relation",
+            ObjectKind::Index => "index",
+            ObjectKind::Sequence => "sequence",
+        }
+    }
+}
+
+/// The schemas and objects that exist, which the translator needs to look
+/// up unqualified names through `search_path`. Without one, an unqualified
+/// name refers to the public schema.
+pub trait SchemaLookup {
+    /// The schemas to search for unqualified names, in order.
+    fn search_path(&self) -> Vec<String>;
+    /// Whether schema `schema` exists.
+    fn schema_exists(&self, schema: &str) -> Result<bool, ParseError>;
+    /// Whether an object of `kind` is stored in the main database under
+    /// `table_name` (see [`relation_table_name`]).
+    fn object_exists(&self, kind: ObjectKind, table_name: &str) -> bool;
+}
+
+/// Name of the main-database object that stores object `name` of schema
+/// `schema`. Objects of the public schema keep their name, and objects of
+/// other schemas are named `schema.name`.
+pub fn relation_table_name(schema: &str, name: &str) -> String {
+    if schema == "public" {
+        name.to_string()
+    } else {
+        format!("{schema}.{name}")
+    }
+}
+
+/// Splits the name of a main-database object into its schema and its name
+/// in that schema; the reverse of [`relation_table_name`].
+pub fn split_relation_table_name(table_name: &str) -> (&str, &str) {
+    table_name.split_once('.').unwrap_or(("public", table_name))
+}
+
+/// Where `search_path` finds an unqualified name.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchPathMatch {
+    /// In a schema other than public.
+    Schema(String),
+    /// Core looks the name up itself: the name is in the public schema, or
+    /// refers to a CTE, or the translator has no [`SchemaLookup`]. Core then
+    /// also reports a missing public object.
+    LeftToCore,
+    /// In no schema of `search_path`.
+    Nowhere,
+}
+
+/// Translates a PostgreSQL query into Turso's AST
+#[derive(Default)]
+pub struct PostgreSQLTranslator<'lookup> {
+    lookup: Option<&'lookup dyn SchemaLookup>,
+    /// Names of the CTEs that the statement being translated can refer to.
+    /// An unqualified name that matches one refers to the CTE.
+    cte_names: RefCell<Vec<String>>,
+    tables_named_in_full: RefCell<Vec<String>>,
+}
+
+/// Keeps the names that a clause added to a list until it is dropped.
+struct NameScope<'t> {
+    names: &'t RefCell<Vec<String>>,
+    outer_len: usize,
+}
+
+impl Drop for NameScope<'_> {
+    fn drop(&mut self) {
+        self.names.borrow_mut().truncate(self.outer_len);
+    }
+}
+
+impl<'lookup> PostgreSQLTranslator<'lookup> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
+    /// A translator that looks up unqualified names through the
+    /// `search_path` of `lookup`.
+    pub fn with_lookup(lookup: &'lookup dyn SchemaLookup) -> Self {
+        Self {
+            lookup: Some(lookup),
+            cte_names: RefCell::default(),
+            tables_named_in_full: RefCell::default(),
+        }
+    }
+
+    /// Makes the CTEs of `with_clause` visible to the names translated until
+    /// the returned scope is dropped.
+    fn enter_cte_scope(
+        &self,
+        with_clause: &Option<pg_query::protobuf::WithClause>,
+    ) -> NameScope<'_> {
+        let outer_len = self.cte_names.borrow().len();
+        if let Some(with_clause) = with_clause {
+            let mut cte_names = self.cte_names.borrow_mut();
+            for cte_node in &with_clause.ctes {
+                if let Some(pg_query::protobuf::node::Node::CommonTableExpr(cte)) = &cte_node.node {
+                    cte_names.push(cte.ctename.clone());
+                }
+            }
+        }
+        NameScope {
+            names: &self.cte_names,
+            outer_len,
+        }
+    }
+
+    fn enter_from_scope(
+        &self,
+        target: Option<&pg_query::protobuf::RangeVar>,
+        from_items: &[pg_query::protobuf::Node],
+    ) -> Result<NameScope<'_>, ParseError> {
+        let mut tables = Vec::new();
+        if let Some(target) = target {
+            let name = self.dml_target_name(target)?.name.as_str().to_string();
+            tables.push((target.relname.clone(), name));
+        }
+        for item in from_items {
+            self.collect_unaliased_tables(item, &mut tables)?;
+        }
+        let outer_len = self.tables_named_in_full.borrow().len();
+        let mut names = self.tables_named_in_full.borrow_mut();
+        for (relname, name) in &tables {
+            let shares_name = tables.iter().filter(|(other, _)| other == relname).count() > 1;
+            if name != relname && shares_name {
+                names.push(name.clone());
+            }
+        }
+        Ok(NameScope {
+            names: &self.tables_named_in_full,
+            outer_len,
+        })
+    }
+
+    fn collect_unaliased_tables(
+        &self,
+        from_item: &pg_query::protobuf::Node,
+        tables: &mut Vec<(String, String)>,
+    ) -> Result<(), ParseError> {
+        match &from_item.node {
+            Some(pg_query::protobuf::node::Node::RangeVar(range_var))
+                if range_var.alias.is_none() =>
+            {
+                let name = self.qualified_name_from_range_var(range_var)?;
+                tables.push((range_var.relname.clone(), name.name.as_str().to_string()));
+            }
+            Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
+                for side in [&join_expr.larg, &join_expr.rarg].into_iter().flatten() {
+                    self.collect_unaliased_tables(side, tables)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn is_named_in_full(&self, name: &ast::QualifiedName) -> bool {
+        self.tables_named_in_full
+            .borrow()
+            .iter()
+            .any(|table| table == name.name.as_str())
+    }
+
+    /// Name of the relation that `range_var` refers to.
     fn qualified_name_from_range_var(
         &self,
         range_var: &pg_query::protobuf::RangeVar,
-    ) -> ast::QualifiedName {
-        let is_schemata = range_var
-            .schemaname
-            .eq_ignore_ascii_case("information_schema")
-            && range_var.relname.eq_ignore_ascii_case("schemata");
-        let mapped_name = if is_schemata {
-            "pg_information_schema_schemata".to_string()
-        } else {
-            self.map_table_name(&range_var.relname)
-        };
-        let name = ast::Name::from_string(mapped_name);
-        let alias = range_var
+    ) -> Result<ast::QualifiedName, ParseError> {
+        let mut qn = self.object_name(
+            ObjectKind::Relation,
+            &range_var.schemaname,
+            &range_var.relname,
+        )?;
+        qn.alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let schema = if range_var.schemaname.is_empty() {
-            is_catalog_table_name(name.as_str()).then_some("main")
-        } else {
-            Some(map_schema_name(&range_var.schemaname))
+        Ok(qn)
+    }
+
+    /// Name of the table that an INSERT, UPDATE or DELETE writes to. A table
+    /// of a schema other than public is renamed, so it gets its name in the
+    /// schema as alias, for column references such as `t.col`. The target is
+    /// always a table, so the names of CTEs do not hide it.
+    fn dml_target_name(
+        &self,
+        range_var: &pg_query::protobuf::RangeVar,
+    ) -> Result<ast::QualifiedName, ParseError> {
+        let cte_names = self.cte_names.take();
+        let qn = self.qualified_name_from_range_var(range_var);
+        self.cte_names.replace(cte_names);
+        let mut qn = qn?;
+        if qn.alias.is_none()
+            && qn.name.as_str() != range_var.relname
+            && !self.is_named_in_full(&qn)
+        {
+            qn.alias = Some(ast::Name::from_string(&range_var.relname));
+        }
+        Ok(qn)
+    }
+
+    /// Name of the object of `kind` that a statement refers to as `name` of
+    /// `schema`, where `schema` is empty if the statement does not name one.
+    fn object_name(
+        &self,
+        kind: ObjectKind,
+        schema: &str,
+        name: &str,
+    ) -> Result<ast::QualifiedName, ParseError> {
+        let is_schemata = schema.eq_ignore_ascii_case("information_schema")
+            && name.eq_ignore_ascii_case("schemata");
+        if kind == ObjectKind::Relation && is_schemata {
+            return Ok(main_name("pg_information_schema_schemata"));
+        }
+        let mapped_name = match kind {
+            ObjectKind::Relation => self.map_table_name(name),
+            ObjectKind::Index | ObjectKind::Sequence => name.to_string(),
         };
-        let mut qn = match schema {
-            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
-            None => ast::QualifiedName::single(name),
+        if schema.is_empty() {
+            if kind == ObjectKind::Relation && is_catalog_table_name(&mapped_name) {
+                return Ok(main_name(&mapped_name));
+            }
+            return match self.find_in_search_path(kind, name) {
+                SearchPathMatch::Schema(schema) => {
+                    Ok(main_name(&relation_table_name(&schema, name)))
+                }
+                SearchPathMatch::LeftToCore => Ok(ast::QualifiedName::single(
+                    ast::Name::from_string(mapped_name),
+                )),
+                SearchPathMatch::Nowhere => Err(ParseError::ParseError(format!(
+                    "{} \"{name}\" does not exist",
+                    kind.noun()
+                ))),
+            };
+        }
+        if is_system_schema(schema) {
+            return Ok(main_name(&mapped_name));
+        }
+        if names_database(schema, name) {
+            return Ok(ast::QualifiedName::fullname(
+                ast::Name::from_string(schema),
+                ast::Name::from_string(mapped_name),
+            ));
+        }
+        Ok(main_name(&relation_table_name(
+            &schema.to_lowercase(),
+            name,
+        )))
+    }
+
+    /// Like [`Self::object_name`] for unqualified name `name`, but returns
+    /// None if no schema in `search_path` has such an object, for
+    /// `DROP ... IF EXISTS`.
+    fn object_name_if_exists(
+        &self,
+        kind: ObjectKind,
+        name: &str,
+    ) -> Result<Option<ast::QualifiedName>, ParseError> {
+        if self.find_in_search_path(kind, name) == SearchPathMatch::Nowhere {
+            return Ok(None);
+        }
+        self.object_name(kind, "", name).map(Some)
+    }
+
+    /// Where `search_path` finds unqualified name `name` of an object of
+    /// `kind`: in the first schema that has such an object.
+    fn find_in_search_path(&self, kind: ObjectKind, name: &str) -> SearchPathMatch {
+        let Some(lookup) = self.lookup else {
+            return SearchPathMatch::LeftToCore;
         };
-        qn.alias = alias;
-        qn
+        if kind == ObjectKind::Relation && self.cte_names.borrow().iter().any(|cte| cte == name) {
+            return SearchPathMatch::LeftToCore;
+        }
+        let search_path = lookup.search_path();
+        for schema in &search_path {
+            if lookup.object_exists(kind, &relation_table_name(schema, name)) {
+                if schema == "public" {
+                    return SearchPathMatch::LeftToCore;
+                }
+                return SearchPathMatch::Schema(schema.clone());
+            }
+        }
+        if search_path.iter().any(|schema| schema == "public") {
+            return SearchPathMatch::LeftToCore;
+        }
+        SearchPathMatch::Nowhere
+    }
+
+    /// Name of the main-database table that stores the relation that a
+    /// statement refers to as `name` of `schema`, where `schema` is empty if
+    /// the statement does not name one.
+    pub fn resolve_relation_name(&self, schema: &str, name: &str) -> Result<String, ParseError> {
+        Ok(self
+            .object_name(ObjectKind::Relation, schema, name)?
+            .name
+            .as_str()
+            .to_string())
+    }
+
+    /// If `parse_result` is a CREATE TABLE statement, writes into it the
+    /// schemas that `search_path` picks for its unqualified table name and
+    /// for the tables that its foreign keys reference, and returns its new
+    /// text. The text of CREATE TABLE is stored and translated again without
+    /// `search_path` when the schema is loaded, so it must name every schema
+    /// other than public. Returns None if nothing changed.
+    pub fn write_schemas_into_create_table(
+        &self,
+        parse_result: &mut ParseResult,
+    ) -> Result<Option<String>, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(Node::CreateStmt(create)) = parse_result
+            .protobuf
+            .stmts
+            .first_mut()
+            .and_then(|stmt| stmt.stmt.as_mut())
+            .and_then(|stmt| stmt.node.as_mut())
+        else {
+            return Ok(None);
+        };
+        if !self.write_schemas_into_create_stmt(create)? {
+            return Ok(None);
+        }
+        pg_query::deparse(&parse_result.protobuf)
+            .map(Some)
+            .map_err(|e| ParseError::ParseError(e.to_string()))
+    }
+
+    /// Writes into `create` the schemas for
+    /// [`Self::write_schemas_into_create_table`]. Returns whether anything
+    /// changed.
+    fn write_schemas_into_create_stmt(
+        &self,
+        create: &mut pg_query::protobuf::CreateStmt,
+    ) -> Result<bool, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(lookup) = self.lookup else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        if let Some(relation) = create.relation.as_mut() {
+            if relation.schemaname.is_empty() && relation.relpersistence != "t" {
+                let schema = creation_schema(lookup)?;
+                if schema != "public" {
+                    relation.schemaname = schema;
+                    changed = true;
+                }
+            }
+        }
+        for elt in &mut create.table_elts {
+            match elt.node.as_mut() {
+                Some(Node::Constraint(constraint)) => {
+                    changed |= self.write_schema_into_reference(constraint)?;
+                }
+                Some(Node::ColumnDef(column)) => {
+                    for constraint in &mut column.constraints {
+                        if let Some(Node::Constraint(constraint)) = constraint.node.as_mut() {
+                            changed |= self.write_schema_into_reference(constraint)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Writes into the table that foreign key `constraint` references the
+    /// schema that `search_path` finds it in. Returns whether it changed.
+    fn write_schema_into_reference(
+        &self,
+        constraint: &mut pg_query::protobuf::Constraint,
+    ) -> Result<bool, ParseError> {
+        let Some(pktable) = constraint.pktable.as_mut() else {
+            return Ok(false);
+        };
+        if !pktable.schemaname.is_empty() {
+            return Ok(false);
+        }
+        match self.find_in_search_path(ObjectKind::Relation, &pktable.relname) {
+            SearchPathMatch::Schema(schema) => {
+                pktable.schemaname = schema;
+                Ok(true)
+            }
+            SearchPathMatch::LeftToCore => Ok(false),
+            SearchPathMatch::Nowhere => Err(ParseError::ParseError(format!(
+                "relation \"{}\" does not exist",
+                pktable.relname
+            ))),
+        }
+    }
+
+    /// Name of the relation that a statement creates as `range_var`.
+    fn created_relation_name(
+        &self,
+        range_var: &pg_query::protobuf::RangeVar,
+    ) -> Result<ast::QualifiedName, ParseError> {
+        let temporary = range_var.relpersistence == "t";
+        self.created_object_name(&range_var.schemaname, &range_var.relname, temporary)
+    }
+
+    /// Name of an object that a statement creates as `name` of `schema`,
+    /// where `schema` is empty if the statement does not name one. An
+    /// unqualified object goes to the first existing schema in
+    /// `search_path`, except a temporary one, which core places itself.
+    fn created_object_name(
+        &self,
+        schema: &str,
+        name: &str,
+        temporary: bool,
+    ) -> Result<ast::QualifiedName, ParseError> {
+        let Some(lookup) = self.lookup else {
+            return self.object_name(ObjectKind::Relation, schema, name);
+        };
+        if name.contains('.') {
+            return Err(ParseError::ParseError(format!(
+                "names containing \".\" are not supported: \"{name}\""
+            )));
+        }
+        if !schema.is_empty() {
+            let schema = schema.to_lowercase();
+            if !is_system_schema(&schema)
+                && !names_database(&schema, name)
+                && !lookup.schema_exists(&schema)?
+            {
+                return Err(ParseError::ParseError(format!(
+                    "schema \"{schema}\" does not exist"
+                )));
+            }
+            return self.object_name(ObjectKind::Relation, &schema, name);
+        }
+        if temporary {
+            return Ok(ast::QualifiedName::single(ast::Name::from_string(name)));
+        }
+        let schema = creation_schema(lookup)?;
+        if schema == "public" {
+            return Ok(ast::QualifiedName::single(ast::Name::from_string(name)));
+        }
+        Ok(main_name(&relation_table_name(&schema, name)))
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.
@@ -269,7 +682,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE missing table name".into()))?;
 
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.created_relation_name(relation)?;
 
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
@@ -355,7 +768,7 @@ impl PostgreSQLTranslator {
                             });
                         }
                         ConstrType::ConstrForeign => {
-                            if let Some(fk) = extract_foreign_key(constraint) {
+                            if let Some(fk) = self.extract_foreign_key(constraint)? {
                                 table_constraints.push(
                                     self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs),
                                 );
@@ -483,7 +896,7 @@ impl PostgreSQLTranslator {
                     }
                 }
                 ConstrType::ConstrForeign => {
-                    foreign_key = extract_foreign_key(constraint);
+                    foreign_key = self.extract_foreign_key(constraint)?;
                 }
                 _ => {}
             }
@@ -521,7 +934,8 @@ impl PostgreSQLTranslator {
                 name: ast::Name::from_string("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{seq_name}'"
+                    "'{}'",
+                    sequence_function_argument(&seq_name)
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -590,6 +1004,25 @@ impl PostgreSQLTranslator {
             col_type,
             constraints,
         })
+    }
+
+    /// Extract a foreign key constraint from a PG Constraint node, with the
+    /// name of the referenced table looked up like any other table name.
+    fn extract_foreign_key(
+        &self,
+        constraint: &pg_query::protobuf::Constraint,
+    ) -> Result<Option<PgForeignKey>, ParseError> {
+        let Some(mut fk) = extract_foreign_key(constraint) else {
+            return Ok(None);
+        };
+        if let Some(pktable) = &constraint.pktable {
+            fk.ref_table = self
+                .qualified_name_from_range_var(pktable)?
+                .name
+                .as_str()
+                .to_string();
+        }
+        Ok(Some(fk))
     }
 
     /// Convert a PgForeignKey to an AST ForeignKeyClause.
@@ -696,7 +1129,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
-        let name = self.qualified_name_from_range_var(relation);
+        let name = self.qualified_name_from_range_var(relation)?;
 
         let cmd_node = alter
             .cmds
@@ -805,11 +1238,14 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("RENAME missing relation".into()))?;
-        let name = self.qualified_name_from_range_var(relation);
+        let name = self.qualified_name_from_range_var(relation)?;
 
         match rename_type {
             ObjectType::ObjectTable => {
-                let new_name = ast::Name::from_string(&rename.newname);
+                // The table stays in its schema.
+                let (schema, _) = split_relation_table_name(name.name.as_str());
+                let new_name = self.created_object_name(schema, &rename.newname, false)?;
+                let new_name = ast::Name::from_string(new_name.name.as_str());
                 Ok(ast::Stmt::AlterTable(ast::AlterTable {
                     name,
                     body: ast::AlterTableBody::RenameTo(new_name),
@@ -910,9 +1346,12 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
-        let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
+        let tbl_name = self.qualified_name_from_range_var(relation)?.name;
 
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // An index belongs to the schema of its table.
+        let (schema, _) = split_relation_table_name(tbl_name.as_str());
+        let idx_name = self.created_object_name(schema, &idx.idxname, false)?;
+        let idx_name = ast::QualifiedName::single(idx_name.name);
 
         let mut columns = Vec::new();
         for param_node in &idx.index_params {
@@ -987,13 +1426,19 @@ impl PostgreSQLTranslator {
                         _ => None,
                     })
                     .collect();
-                match names.len() {
-                    0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
-                    1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
-                    _ => ast::QualifiedName::fullname(
-                        ast::Name::from_string(names[0].clone()),
-                        ast::Name::from_string(names[1].clone()),
-                    ),
+                let kind = match remove_type {
+                    ObjectType::ObjectIndex => ObjectKind::Index,
+                    ObjectType::ObjectSequence => ObjectKind::Sequence,
+                    _ => ObjectKind::Relation,
+                };
+                match names.as_slice() {
+                    [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
+                    [name] if drop.missing_ok => match self.object_name_if_exists(kind, name)? {
+                        Some(name) => name,
+                        None => return Ok(statement_that_does_nothing()),
+                    },
+                    [name] => self.object_name(kind, "", name)?,
+                    [.., schema, name] => self.object_name(kind, schema, name)?,
                 }
             }
             Some(Node::String(s)) => {
@@ -1064,7 +1509,7 @@ impl PostgreSQLTranslator {
                 _ => None,
             })
             .ok_or_else(|| ParseError::ParseError("TRUNCATE: missing table name".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
         Ok(ast::Stmt::Delete {
             with: None,
             tbl_name,
@@ -1082,7 +1527,7 @@ impl PostgreSQLTranslator {
             .view
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE VIEW: missing view name".into()))?;
-        let view_name = self.qualified_name_from_range_var(relation);
+        let view_name = self.created_relation_name(relation)?;
 
         // Translate column aliases
         let columns: Vec<ast::IndexedColumn> = view
@@ -1168,7 +1613,7 @@ impl PostgreSQLTranslator {
         let relation = into_clause.rel.as_ref().ok_or_else(|| {
             ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
         })?;
-        let view_name = self.qualified_name_from_range_var(relation);
+        let view_name = self.created_relation_name(relation)?;
 
         // Column aliases from the INTO clause
         let columns: Vec<ast::IndexedColumn> = into_clause
@@ -1208,7 +1653,7 @@ impl PostgreSQLTranslator {
             .rel
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE AS: missing table name".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.created_relation_name(relation)?;
 
         // The engine names the new table's columns after the SELECT's output
         // columns and has no way to override them, so reject an explicit
@@ -1259,13 +1704,14 @@ impl PostgreSQLTranslator {
         insert: &pg_query::protobuf::InsertStmt,
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
+        let _ctes = self.enter_cte_scope(&insert.with_clause);
 
         // Extract table name
         let relation = insert
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("INSERT missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.dml_target_name(relation)?;
 
         // Extract column names (empty means "all columns" in positional INSERT)
         let columns: Vec<ast::Name> = insert
@@ -1408,13 +1854,15 @@ impl PostgreSQLTranslator {
         update: &pg_query::protobuf::UpdateStmt,
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
+        let _ctes = self.enter_cte_scope(&update.with_clause);
 
         // Extract table name
         let relation = update
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("UPDATE missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let _tables = self.enter_from_scope(Some(relation), &update.from_clause)?;
+        let tbl_name = self.dml_target_name(relation)?;
 
         // Extract SET assignments from target_list
         // Each ResTarget has name (column) and val (expression)
@@ -1476,12 +1924,13 @@ impl PostgreSQLTranslator {
         &self,
         delete: &pg_query::protobuf::DeleteStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        let _ctes = self.enter_cte_scope(&delete.with_clause);
         // Extract table name
         let relation = delete
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.dml_target_name(relation)?;
 
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &delete.where_clause {
@@ -1507,6 +1956,7 @@ impl PostgreSQLTranslator {
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
         use pg_query::protobuf::SetOperation;
+        let _ctes = self.enter_cte_scope(&select.with_clause);
 
         // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
         // before translation, so an INTO seen here is in a nested position,
@@ -1553,6 +2003,7 @@ impl PostgreSQLTranslator {
         }
 
         // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
+        let _tables = self.enter_from_scope(None, &select.from_clause)?;
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
@@ -1709,6 +2160,7 @@ impl PostgreSQLTranslator {
             ));
         }
 
+        let _tables = self.enter_from_scope(None, &select.from_clause)?;
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
@@ -1842,10 +2294,12 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
-        let qualified_name = self.qualified_name_from_range_var(range_var);
+        let qualified_name = self.qualified_name_from_range_var(range_var)?;
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
-            None if qualified_name.name.as_str() != range_var.relname => {
+            None if qualified_name.name.as_str() != range_var.relname
+                && !self.is_named_in_full(&qualified_name) =>
+            {
                 Some(range_var.relname.clone())
             }
             None => None,
@@ -2149,10 +2603,13 @@ impl PostgreSQLTranslator {
                                     if col_ref.fields.len() == 1 {
                                         // SELECT *
                                         result_columns.push(ast::ResultColumn::Star);
-                                    } else if let Some(first) = col_ref.fields.first() {
-                                        // SELECT table.* or alias.*
+                                    } else if let Some(table) =
+                                        col_ref.fields.get(col_ref.fields.len() - 2)
+                                    {
+                                        // SELECT table.*, alias.* or schema.table.*. FROM
+                                        // aliases a renamed table with its name in the schema.
                                         if let Some(pg_query::protobuf::node::Node::String(s)) =
-                                            &first.node
+                                            &table.node
                                         {
                                             result_columns.push(ast::ResultColumn::TableStar(
                                                 ast::Name::from_string(&s.sval),
@@ -2218,12 +2675,38 @@ impl PostgreSQLTranslator {
                                     }
                                 }
                                 match parts.len() {
-                                    3 => {
+                                    3 if is_system_schema(&parts[0])
+                                        || names_database(&parts[0], &parts[1]) =>
+                                    {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
+                                        let database = if is_system_schema(&parts[0]) {
+                                            "main"
+                                        } else {
+                                            &parts[0]
+                                        };
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(map_schema_name(&parts[0])),
+                                            ast::Name::from_string(database),
                                             ast::Name::from_string(parts[1].clone()),
+                                            ast::Name::from_string(parts[2].clone()),
+                                        ))
+                                    }
+                                    3 => {
+                                        // A table of another schema is renamed, and FROM
+                                        // aliases it with its name in the schema, unless
+                                        // another table of the FROM has that name.
+                                        let table = self.object_name(
+                                            ObjectKind::Relation,
+                                            &parts[0],
+                                            &parts[1],
+                                        )?;
+                                        let table = if self.is_named_in_full(&table) {
+                                            table.name.as_str().to_string()
+                                        } else {
+                                            parts[1].clone()
+                                        };
+                                        Ok(ast::Expr::Qualified(
+                                            ast::Name::from_string(table),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
                                     }
@@ -3224,11 +3707,15 @@ impl PostgreSQLTranslator {
         }
 
         // Translate function arguments
-        let args = func_call
+        let mut args = func_call
             .args
             .iter()
             .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
+
+        if is_sequence_function(&func_name) {
+            write_stored_sequence_name(&mut args);
+        }
 
         let distinctness = if func_call.agg_distinct {
             Some(ast::Distinctness::Distinct)
@@ -3951,7 +4438,7 @@ impl PostgreSQLTranslator {
             .sequence
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE SEQUENCE missing name".into()))?;
-        let seq_name = self.qualified_name_from_range_var(relation);
+        let seq_name = self.created_relation_name(relation)?;
 
         let mut start = None;
         let mut increment = None;
@@ -4102,11 +4589,87 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
-fn map_schema_name(schema: &str) -> &str {
-    match schema.to_ascii_lowercase().as_str() {
-        "pg_catalog" | "public" | "information_schema" => "main",
-        _ => schema,
+/// The schema that an unqualified CREATE puts a new object in: the first
+/// schema in `search_path` that exists.
+fn creation_schema(lookup: &dyn SchemaLookup) -> Result<String, ParseError> {
+    for schema in lookup.search_path() {
+        if lookup.schema_exists(&schema)? {
+            return Ok(schema);
+        }
     }
+    Err(ParseError::ParseError(
+        "no schema has been selected to create in".to_string(),
+    ))
+}
+
+/// Whether `schema` is a schema whose objects are stored in the main
+/// database under their own name.
+fn is_system_schema(schema: &str) -> bool {
+    matches!(
+        schema.to_ascii_lowercase().as_str(),
+        "pg_catalog" | "public" | "information_schema"
+    )
+}
+
+/// Whether qualifier `schema` of object `name` names a database rather than
+/// a schema: `main` and `temp` are the names of databases, and the engine's
+/// `sqlite_` tables belong to a database. Core qualifies the SQL that it
+/// runs itself, such as `SELECT * FROM temp.sqlite_schema`, with database
+/// names.
+fn names_database(schema: &str, name: &str) -> bool {
+    schema.eq_ignore_ascii_case("main")
+        || schema.eq_ignore_ascii_case("temp")
+        || name.to_ascii_lowercase().starts_with("sqlite_")
+}
+
+fn is_sequence_function(func_name: &str) -> bool {
+    matches!(
+        func_name.to_ascii_lowercase().as_str(),
+        "nextval" | "currval" | "setval"
+    )
+}
+
+fn write_stored_sequence_name(args: &mut [Box<ast::Expr>]) {
+    let Some(first) = args.first_mut() else {
+        return;
+    };
+    let ast::Expr::Literal(ast::Literal::String(quoted)) = first.as_ref() else {
+        return;
+    };
+    let written = quoted[1..quoted.len() - 1].replace("''", "'");
+    let Some((schema, name)) = written.split_once('.') else {
+        return;
+    };
+    let schema = schema.to_lowercase();
+    if is_system_schema(&schema) || names_database(&schema, name) {
+        return;
+    }
+    let argument = sequence_function_argument(&relation_table_name(&schema, name));
+    **first = ast::Expr::Literal(ast::Literal::String(format!(
+        "'{}'",
+        argument.replace('\'', "''")
+    )));
+}
+
+fn sequence_function_argument(stored_name: &str) -> String {
+    if stored_name.contains('.') {
+        format!("main.{stored_name}")
+    } else {
+        stored_name.to_string()
+    }
+}
+
+/// A statement that does nothing, for `DROP ... IF EXISTS` of a missing
+/// object.
+fn statement_that_does_nothing() -> ast::Stmt {
+    match turso_parser::parser::Parser::new(b"SELECT 0 WHERE 0").next() {
+        Some(Ok(ast::Cmd::Stmt(stmt))) => stmt,
+        other => panic!("SELECT 0 WHERE 0 parses as a statement, got {other:?}"),
+    }
+}
+
+fn main_name(name: &str) -> ast::QualifiedName {
+    ast::QualifiedName::fullname(ast::Name::from_string("main"), ast::Name::from_string(name))
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {
@@ -4948,15 +5511,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
 
     let relation = copy.relation.as_ref()?;
     let table_name = relation.relname.clone();
-    let schema_name = if relation.schemaname.is_empty()
-        || matches!(
-            relation.schemaname.to_lowercase().as_str(),
-            "public" | "pg_catalog"
-        ) {
-        None
-    } else {
-        Some(relation.schemaname.clone())
-    };
+    let schema_name = (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone());
 
     let columns = if copy.attlist.is_empty() {
         None

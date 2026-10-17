@@ -171,11 +171,6 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct PrepareOptions {
-    pub unqualified_database_search_path: Option<Vec<String>>,
-}
-
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
 /// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
 /// `Start` is the fresh state (cookie not yet read / schema build not yet
@@ -1004,7 +999,6 @@ impl Connection {
         cmd: Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -1022,7 +1016,6 @@ impl Connection {
             mode,
             input,
             origin,
-            prepare_options,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1054,7 +1047,6 @@ impl Connection {
                     mode,
                     input,
                     origin,
-                    prepare_options,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1118,8 +1110,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1151,15 +1142,6 @@ impl Connection {
         self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
-    pub fn prepare_translated_stmt_with_options(
-        self: &Arc<Connection>,
-        stmt: ast::Stmt,
-        input: &str,
-        prepare_options: &PrepareOptions,
-    ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
-    }
-
     /// Prepare an already-translated command while keeping the original SQL
     /// text.
     pub fn prepare_translated_cmd(
@@ -1167,16 +1149,7 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
-    }
-
-    pub fn prepare_translated_cmd_with_options(
-        self: &Arc<Connection>,
-        cmd: ast::Cmd,
-        input: &str,
-        prepare_options: &PrepareOptions,
-    ) -> Result<Statement> {
-        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root)
     }
 
     #[turso_macros::trace_stack]
@@ -1185,7 +1158,6 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1195,7 +1167,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1739,13 +1711,11 @@ impl Connection {
         tracing::trace!("Preparing and executing batch: {}", sql);
 
         let mut remaining = sql;
-        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1779,9 +1749,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1800,13 +1768,11 @@ impl Connection {
         }
         let sql = sql.as_ref();
         let mut remaining = sql;
-        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1828,9 +1794,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
