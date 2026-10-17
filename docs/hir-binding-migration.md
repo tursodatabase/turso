@@ -121,8 +121,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
 calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
 statements through HIR: the owned semantic catalog, `analyze_root`,
-`HirPlan::build`, and HIR lowering. Nested engine statements still use the
-legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
+`HirPlan::build`, and HIR lowering. Statements the engine prepares inside
+another one, such as the copy statements of VACUUM, take the same path; like
+legacy, they may write internal tables. There is no fallback: a SELECT that HIR cannot lower fails to
 prepare, so running the test suites with the variable set lists the remaining
 gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
 cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
@@ -250,6 +251,14 @@ rewriting the plan. HIR gets the same speed without rewriting HIR:
   is used for every built-in aggregate. It is not used when the subquery
   reads an outer aggregate, calls a function that is not deterministic, or
   reads a virtual table.
+- When every ORDER BY term is a GROUP BY key with the same collation, the
+  group sorter orders its keys that way, and no second sorter runs for
+  ORDER BY.
+- Grouped rows keep only the columns read after grouping: the keys, the
+  aggregate arguments, and columns that outputs, HAVING, ORDER BY or windows
+  read outside a key.
+- A correlated subquery opens its cursors once, under `Once`, instead of on
+  every run.
 - An inner join on an equality no index covers looks rows up in a hash
   table instead of an automatic index, as legacy's hash join does. The
   lookup is a loop after the loop that supplies its keys, and the table's
@@ -599,6 +608,24 @@ small bytecode helpers it shares with legacy (foreign-key probes, UNIQUE
 error text, statement journal flags) are copied into
 `semantic_lowering/emit.rs`. It still shares plain types with HIR SELECT
 lowering, such as `ConditionMetadata` and `QueryDestination`.
+
+### Schema statements through HIR
+
+Schema statements still go through legacy's translators, but the parts that
+read or write table rows use HIR:
+
+- The UPDATE of `sqlite_schema` that ALTER TABLE generates is lowered from
+  HIR, writing the new CREATE statement into the `sql` column.
+- The SELECT of `CREATE TABLE ... AS SELECT` is planned through HIR
+  (`PlannedSelect`) and runs as a coroutine. Column names follow the alias
+  rules (a plain column read keeps its own name), and types come from each
+  output's affinity.
+- CREATE INDEX and REINDEX fill the index from `SELECT <index columns>,
+  rowid FROM <table> NOT INDEXED [WHERE <partial condition>]`, planned
+  through HIR. NOT INDEXED keeps REINDEX reading the table, not an index it
+  rebuilds. Legacy still fills the index when the table has a custom type or
+  array column (the SELECT would decode the stored value), or when real
+  columns take all of `rowid`, `_rowid_` and `oid`.
 
 ### Non-lowering phase complete
 
