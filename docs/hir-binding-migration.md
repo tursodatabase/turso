@@ -343,8 +343,8 @@ statement in autocommit mode then writes one COMMIT row. Where legacy is
 wrong, HIR is not: legacy also writes a COMMIT row from each trigger and
 foreign-key action it runs, files a moved row's new image under `before`,
 and gives UPSERT DO UPDATE the new row as its before image. The `ALTER
-TABLE` rewrite of `sqlite_schema`, which records its own statement, still
-goes to legacy.
+TABLE` rewrite of `sqlite_schema` records the ALTER statement as the new
+`sql` value, as legacy does.
 
 Writes to a virtual table record no change data. Legacy records none
 either, but writes a COMMIT row after each UPDATE and DELETE of one.
