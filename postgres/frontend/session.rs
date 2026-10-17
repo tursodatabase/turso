@@ -235,22 +235,7 @@ impl<'c> SessionSchemaLookup<'c> {
 
 impl SchemaLookup for SessionSchemaLookup<'_> {
     fn search_path(&self) -> Vec<String> {
-        let state = self
-            .conn
-            .context::<PgSessionState>()
-            .expect("PostgreSQL connections have session state")
-            .lock()
-            .unwrap();
-        match &state.search_path {
-            Some(search_path) => search_path
-                .iter()
-                .map(|schema| match schema.as_str() {
-                    "$user" => SESSION_USER.to_string(),
-                    _ => schema.to_lowercase(),
-                })
-                .collect(),
-            None => vec![SESSION_USER.to_string(), "public".to_string()],
-        }
+        search_path(self.conn)
     }
 
     fn schema_exists(&self, schema: &str) -> std::result::Result<bool, ParseError> {
@@ -283,6 +268,24 @@ impl SchemaLookup for SessionSchemaLookup<'_> {
                 .any(|index| index.name.eq_ignore_ascii_case(table_name)),
             ObjectKind::Sequence => self.schema.get_sequence(table_name).is_some(),
         }
+    }
+}
+
+pub(crate) fn search_path(conn: &Connection) -> Vec<String> {
+    let state = conn
+        .context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+        .lock()
+        .unwrap();
+    match &state.search_path {
+        Some(search_path) => search_path
+            .iter()
+            .map(|schema| match schema.as_str() {
+                "$user" => SESSION_USER.to_string(),
+                _ => schema.to_lowercase(),
+            })
+            .collect(),
+        None => vec![SESSION_USER.to_string(), "public".to_string()],
     }
 }
 

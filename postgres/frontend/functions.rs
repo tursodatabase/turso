@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Statement, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -18,7 +18,15 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
             .expect("PostgreSQL function declarations have valid argument counts"),
         );
     }
-    options
+    options.extension_function(
+        ExternalFunc::new_native_scalar(
+            "current_schema".to_string(),
+            FunctionArity::Exact(0),
+            true,
+            CurrentSchemaFunction,
+        )
+        .expect("current_schema has a valid argument count"),
+    )
 }
 
 macro_rules! scalar_functions {
@@ -74,7 +82,6 @@ scalar_functions! {
     SetConfig(FunctionArity::Exact(3), false),
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
-    CurrentSchema(FunctionArity::Exact(0), true),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
@@ -122,7 +129,6 @@ impl ScalarCall for PgScalarFunction {
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
-            Self::CurrentSchema => Value::build_text("public"),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -145,6 +151,75 @@ impl ScalarCall for PgScalarFunction {
             }
         };
         Ok(IOResult::Done(value))
+    }
+}
+
+#[derive(Debug)]
+struct CurrentSchemaFunction;
+
+impl ScalarFunction for CurrentSchemaFunction {
+    type Call = CurrentSchemaCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(CurrentSchemaCall {
+            schemas_statement: None,
+            schemas: Vec::new(),
+        })
+    }
+}
+
+struct CurrentSchemaCall {
+    schemas_statement: Option<Statement>,
+    schemas: Vec<String>,
+}
+
+impl ScalarCall for CurrentSchemaCall {
+    fn step(&mut self, connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+        let search_path = crate::session::search_path(connection);
+        if search_path.iter().any(|schema| schema != "public") {
+            if let IOResult::IO(completions) = self.read_schemas(connection)? {
+                return Ok(IOResult::IO(completions));
+            }
+        }
+        let schema = search_path
+            .into_iter()
+            .find(|schema| schema == "public" || self.schemas.contains(schema));
+        Ok(IOResult::Done(
+            schema.map_or(Value::Null, Value::build_text),
+        ))
+    }
+}
+
+impl CurrentSchemaCall {
+    fn read_schemas(&mut self, connection: &Arc<Connection>) -> IOResultOr<()> {
+        if self.schemas_statement.is_none() {
+            if connection
+                .current_schema()
+                .get_table(crate::session::SCHEMAS_TABLE)
+                .is_none()
+            {
+                return Ok(IOResult::Done(()));
+            }
+            self.schemas_statement = Some(connection.prepare_internal(format!(
+                "SELECT nspname FROM {}",
+                crate::session::SCHEMAS_TABLE
+            ))?);
+        }
+        let schemas = &mut self.schemas;
+        let statement = self
+            .schemas_statement
+            .as_mut()
+            .expect("the schema table is being read");
+        if let IOResult::IO(completions) = statement.run_with_row_callback_nonblock(|row| {
+            if let Value::Text(name) = row.get_value(0) {
+                schemas.push(name.as_str().to_string());
+            }
+            Ok(())
+        })? {
+            return Ok(IOResult::IO(completions));
+        }
+        self.schemas_statement = None;
+        Ok(IOResult::Done(()))
     }
 }
 

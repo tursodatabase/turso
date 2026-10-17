@@ -62,3 +62,41 @@ test public-schema-qualified-column-reference {
 expect {
     b
 }
+
+test current-schema-follows-search-path {
+    CREATE SCHEMA app;
+    SET search_path TO app, public;
+    SELECT current_schema(), current_schema;
+    SELECT * FROM current_schema();
+}
+expect {
+    app|app
+    app
+}
+
+test current-schema-skips-missing-schemas {
+    SET search_path TO missing_schema, public;
+    SELECT current_schema();
+}
+expect {
+    public
+}
+
+test current-schema-without-existing-schema-is-null {
+    SET search_path TO missing_schema;
+    SELECT coalesce(current_schema(), 'none');
+}
+expect {
+    none
+}
+
+test current-schema-in-view-follows-search-path-of-query {
+    CREATE SCHEMA app;
+    SET search_path TO app, public;
+    CREATE VIEW public.v AS SELECT current_schema() AS s;
+    SET search_path TO public;
+    SELECT s FROM v;
+}
+expect {
+    public
+}
