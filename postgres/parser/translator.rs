@@ -90,17 +90,18 @@ pub struct PostgreSQLTranslator<'lookup> {
     /// Names of the CTEs that the statement being translated can refer to.
     /// An unqualified name that matches one refers to the CTE.
     cte_names: RefCell<Vec<String>>,
+    tables_named_in_full: RefCell<Vec<String>>,
 }
 
-/// Keeps the CTEs of a WITH clause visible until it is dropped.
-struct CteScope<'t> {
-    cte_names: &'t RefCell<Vec<String>>,
+/// Keeps the names that a clause added to a list until it is dropped.
+struct NameScope<'t> {
+    names: &'t RefCell<Vec<String>>,
     outer_len: usize,
 }
 
-impl Drop for CteScope<'_> {
+impl Drop for NameScope<'_> {
     fn drop(&mut self) {
-        self.cte_names.borrow_mut().truncate(self.outer_len);
+        self.names.borrow_mut().truncate(self.outer_len);
     }
 }
 
@@ -115,6 +116,7 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
         Self {
             lookup: Some(lookup),
             cte_names: RefCell::default(),
+            tables_named_in_full: RefCell::default(),
         }
     }
 
@@ -123,7 +125,7 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
     fn enter_cte_scope(
         &self,
         with_clause: &Option<pg_query::protobuf::WithClause>,
-    ) -> CteScope<'_> {
+    ) -> NameScope<'_> {
         let outer_len = self.cte_names.borrow().len();
         if let Some(with_clause) = with_clause {
             let mut cte_names = self.cte_names.borrow_mut();
@@ -133,10 +135,66 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
                 }
             }
         }
-        CteScope {
-            cte_names: &self.cte_names,
+        NameScope {
+            names: &self.cte_names,
             outer_len,
         }
+    }
+
+    fn enter_from_scope(
+        &self,
+        target: Option<&pg_query::protobuf::RangeVar>,
+        from_items: &[pg_query::protobuf::Node],
+    ) -> Result<NameScope<'_>, ParseError> {
+        let mut tables = Vec::new();
+        if let Some(target) = target {
+            let name = self.dml_target_name(target)?.name.as_str().to_string();
+            tables.push((target.relname.clone(), name));
+        }
+        for item in from_items {
+            self.collect_unaliased_tables(item, &mut tables)?;
+        }
+        let outer_len = self.tables_named_in_full.borrow().len();
+        let mut names = self.tables_named_in_full.borrow_mut();
+        for (relname, name) in &tables {
+            let shares_name = tables.iter().filter(|(other, _)| other == relname).count() > 1;
+            if name != relname && shares_name {
+                names.push(name.clone());
+            }
+        }
+        Ok(NameScope {
+            names: &self.tables_named_in_full,
+            outer_len,
+        })
+    }
+
+    fn collect_unaliased_tables(
+        &self,
+        from_item: &pg_query::protobuf::Node,
+        tables: &mut Vec<(String, String)>,
+    ) -> Result<(), ParseError> {
+        match &from_item.node {
+            Some(pg_query::protobuf::node::Node::RangeVar(range_var))
+                if range_var.alias.is_none() =>
+            {
+                let name = self.qualified_name_from_range_var(range_var)?;
+                tables.push((range_var.relname.clone(), name.name.as_str().to_string()));
+            }
+            Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
+                for side in [&join_expr.larg, &join_expr.rarg].into_iter().flatten() {
+                    self.collect_unaliased_tables(side, tables)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn is_named_in_full(&self, name: &ast::QualifiedName) -> bool {
+        self.tables_named_in_full
+            .borrow()
+            .iter()
+            .any(|table| table == name.name.as_str())
     }
 
     /// Name of the relation that `range_var` refers to.
@@ -169,7 +227,10 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
         let qn = self.qualified_name_from_range_var(range_var);
         self.cte_names.replace(cte_names);
         let mut qn = qn?;
-        if qn.alias.is_none() && qn.name.as_str() != range_var.relname {
+        if qn.alias.is_none()
+            && qn.name.as_str() != range_var.relname
+            && !self.is_named_in_full(&qn)
+        {
             qn.alias = Some(ast::Name::from_string(&range_var.relname));
         }
         Ok(qn)
@@ -1800,6 +1861,7 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("UPDATE missing target table".into()))?;
+        let _tables = self.enter_from_scope(Some(relation), &update.from_clause)?;
         let tbl_name = self.dml_target_name(relation)?;
 
         // Extract SET assignments from target_list
@@ -1941,6 +2003,7 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
         }
 
         // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
+        let _tables = self.enter_from_scope(None, &select.from_clause)?;
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
@@ -2097,6 +2160,7 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
             ));
         }
 
+        let _tables = self.enter_from_scope(None, &select.from_clause)?;
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
@@ -2233,7 +2297,9 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
         let qualified_name = self.qualified_name_from_range_var(range_var)?;
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
-            None if qualified_name.name.as_str() != range_var.relname => {
+            None if qualified_name.name.as_str() != range_var.relname
+                && !self.is_named_in_full(&qualified_name) =>
+            {
                 Some(range_var.relname.clone())
             }
             None => None,
@@ -2627,9 +2693,20 @@ impl<'lookup> PostgreSQLTranslator<'lookup> {
                                     }
                                     3 => {
                                         // A table of another schema is renamed, and FROM
-                                        // aliases it with its name in the schema.
+                                        // aliases it with its name in the schema, unless
+                                        // another table of the FROM has that name.
+                                        let table = self.object_name(
+                                            ObjectKind::Relation,
+                                            &parts[0],
+                                            &parts[1],
+                                        )?;
+                                        let table = if self.is_named_in_full(&table) {
+                                            table.name.as_str().to_string()
+                                        } else {
+                                            parts[1].clone()
+                                        };
                                         Ok(ast::Expr::Qualified(
-                                            ast::Name::from_string(parts[1].clone()),
+                                            ast::Name::from_string(table),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
                                     }

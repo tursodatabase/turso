@@ -219,6 +219,47 @@ expect {
     public|1
 }
 
+test columns-of-tables-of-two-schemas-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v int);
+    CREATE TABLE b.t (v int);
+    INSERT INTO a.t VALUES (1);
+    INSERT INTO b.t VALUES (2);
+    SELECT a.t.v, b.t.v FROM a.t, b.t;
+    SELECT a.t.v, b.t.v FROM a.t JOIN b.t ON a.t.v < b.t.v;
+}
+expect {
+    1|2
+    1|2
+}
+
+test columns-of-public-table-and-table-of-schema-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE TABLE t (v int);
+    CREATE TABLE a.t (v int);
+    INSERT INTO t VALUES (0);
+    INSERT INTO a.t VALUES (1);
+    SELECT public.t.v, a.t.v FROM t, a.t;
+}
+expect {
+    0|1
+}
+
+test update-from-table-of-other-schema-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v int);
+    CREATE TABLE b.t (v int);
+    INSERT INTO a.t VALUES (1);
+    INSERT INTO b.t VALUES (2);
+    UPDATE a.t SET v = b.t.v + 10 FROM b.t;
+    SELECT v FROM a.t;
+}
+expect {
+    12
+}
+
 test view-keeps-the-table-it-was-created-with {
     CREATE SCHEMA app;
     CREATE TABLE app.t (v text);
