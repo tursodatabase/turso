@@ -2261,6 +2261,16 @@ impl HashTable {
     }
 
     /// Check if a specific partition is loaded and ready for probing.
+    /// Whether a partition's build rows wait on disk, so a probe into it is
+    /// buffered for grace processing. A partition without build rows has
+    /// nothing to wait for: a probe into it misses at once.
+    pub fn partition_waits_on_disk(&self, partition_idx: usize) -> bool {
+        self.spill_state
+            .as_ref()
+            .and_then(|s| s.find_partition(partition_idx))
+            .is_some_and(|p| !p.is_loaded() && !p.chunks.is_empty())
+    }
+
     pub fn is_partition_loaded(&self, partition_idx: usize) -> bool {
         self.spill_state
             .as_ref()

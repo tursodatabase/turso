@@ -1058,10 +1058,56 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
     }
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SCHEMA).unwrap();
-    for sql in [
-        "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
-        "SELECT a.k, count(*), sum(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.k ORDER BY a.k",
-        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
+    // A LEFT JOIN row without a match, including one whose lookup waited
+    // for a partition on disk, reads NULL. A subquery may run again, so it
+    // seeks an automatic index instead: a hash table that moved rows to
+    // disk cannot be probed again after its waiting lookups ran.
+    for (sql, hashes) in [
+        (
+            "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
+            true,
+        ),
+        (
+            "SELECT a.k, count(*), sum(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.k ORDER BY a.k",
+            true,
+        ),
+        (
+            "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
+            true,
+        ),
+        (
+            "SELECT count(*), count(b.id), sum(b.v) FROM a LEFT JOIN b ON b.k = a.k",
+            true,
+        ),
+        (
+            "SELECT count(*), count(b.id) FROM a LEFT JOIN b ON b.k = a.k AND b.v <> 3",
+            true,
+        ),
+        (
+            "SELECT count(*), sum(a.id) FROM a LEFT JOIN b ON b.k = a.k WHERE b.id IS NULL",
+            true,
+        ),
+        (
+            "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k + 45 WHERE a.id < 20 \
+             ORDER BY a.id, b.id",
+            true,
+        ),
+        // b.v has 17 values, so most lookups land in a part of the hash
+        // table with no rows, which never waits for the disk.
+        (
+            "SELECT count(*), count(b.id) FROM a LEFT JOIN b ON b.v = a.k + 100",
+            true,
+        ),
+        (
+            "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) \
+             FROM a WHERE a.id < 300",
+            false,
+        ),
+        (
+            "SELECT count(*), sum(s.n) FROM a, (SELECT a2.id AS i, b.id AS n FROM a a2 \
+             JOIN b ON b.k = a2.k WHERE a2.id < 40) s WHERE a.id < 4 AND s.i = a.id + 3",
+            false,
+        ),
     ] {
         let opcodes = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
             .into_iter()
@@ -1071,9 +1117,10 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
             })
             .collect::<Vec<_>>();
         for opcode in ["HashBuild", "HashProbe", "HashGraceInit"] {
-            assert!(
+            assert_eq!(
                 opcodes.iter().any(|candidate| candidate == opcode),
-                "expected {opcode} for {sql}: {opcodes:?}"
+                hashes,
+                "{opcode} for {sql}: {opcodes:?}"
             );
         }
         let mut stmt = sqlite.prepare(sql).unwrap();

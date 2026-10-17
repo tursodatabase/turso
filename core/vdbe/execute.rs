@@ -17289,13 +17289,17 @@ pub fn op_hash_probe(
         };
 
         // Main probe loop: buffer probe rows targeting spilled build partitions.
+        // A buffered row jumps like a miss with NULL in `dest_reg`, so a LEFT
+        // JOIN can tell it from a row without matches, which keeps the value
+        // its caller put there.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
+                state.registers[dest_reg].set_null();
                 state.pc = target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
-            if !hash_table.is_partition_loaded(partition_idx) {
+            if hash_table.partition_waits_on_disk(partition_idx) {
                 // Partition is on disk: buffer this probe row for grace processing
                 let probe_rowid = match state.registers[rowid_reg].get_value() {
                     Value::Numeric(Numeric::Integer(i)) => *i,
@@ -17318,6 +17322,7 @@ pub fn op_hash_probe(
                     }
                 }
                 // Jump to target_pc: this row is deferred to grace processing.
+                state.registers[dest_reg].set_null();
                 state.pc = target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);

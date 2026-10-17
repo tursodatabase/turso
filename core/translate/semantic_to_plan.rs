@@ -1597,27 +1597,40 @@ impl<'a> HirPlanContext<'a> {
         let Some(from) = &block.from else {
             return;
         };
-        if !matches!(self.document.root, hir::HirRoot::Query(_))
+        // The root query's blocks run once. A subquery may run again, and
+        // a hash table that moved rows to disk cannot be probed again
+        // after its waiting lookups ran; an automatic index serves it.
+        if !matches!(&self.document.root, hir::HirRoot::Query(root) if root.query == block.id.query)
             || plan.order_sort_elided
             || plan.group_sort_elided
             || plan.min_max_first_value
             || plan.simple_count
             || plan.limit_applied
             || !plan.groups.is_empty()
-            || plan
-                .predicates
+            || from
+                .joins
                 .iter()
-                .any(|predicate| predicate.from_outer_join.is_some())
-            || from.joins.iter().any(|join| match join.kind {
-                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
-                hir::JoinKind::Left => !plan.inner_joins.contains(&join.right),
-                hir::JoinKind::Right | hir::JoinKind::Full => true,
-            })
+                .any(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
         {
             return;
         }
+        // The right side of each LEFT JOIN that stays one: it reads NULL
+        // when its table has no match.
+        let null_extended: Vec<SourceId> = from
+            .joins
+            .iter()
+            .filter(|join| {
+                join.kind == hir::JoinKind::Left && !plan.inner_joins.contains(&join.right)
+            })
+            .map(|join| join.right)
+            .collect();
         for position in 1..plan.loops.len() {
-            if !self.reads_rowid_table_directly(&plan.loops[position - 1], schema) {
+            // A waiting lookup goes back to its row of the previous loop by
+            // rowid, which a NULL row does not have.
+            let previous = &plan.loops[position - 1];
+            if null_extended.contains(&previous.source)
+                || !self.reads_rowid_table_directly(previous, schema)
+            {
                 continue;
             }
             if let Some(lookup) = self.hash_lookup(&plan.loops[position], schema) {
@@ -3516,33 +3529,18 @@ mod tests {
         assert_eq!(left_loop.source_position, 0);
         assert_eq!(right_loop.source, right);
         assert_eq!(right_loop.source_position, 1);
-        let HirSourceAccess::BTree {
-            operation:
-                HirBtreeOperation::Seek {
-                    index: Some(index),
-                    seek_def,
-                },
-            ..
-        } = &right_loop.access
-        else {
-            panic!("right source uses its selected automatic-index seek");
+        // The automatic index the join equality seeks becomes a hash lookup
+        // keyed on the same equality.
+        let HirSourceAccess::Hash(lookup) = &right_loop.access else {
+            panic!("right source looks rows up by the join equality");
         };
-        assert!(index.ephemeral);
-        assert_eq!(
-            index
-                .columns
-                .iter()
-                .map(|column| column.pos_in_table)
-                .collect::<Vec<_>>(),
-            [0]
-        );
-        let Some((operator, expression, affinity)) = &seek_def.prefix[0].eq else {
-            panic!("join equality becomes the seek prefix");
+        let [key] = lookup.keys.as_slice() else {
+            panic!("one join equality gives one hash key");
         };
-        assert_eq!(*operator, Operator::Equals);
-        assert_eq!(*affinity, Affinity::Integer);
+        assert_eq!(key.column, 0);
+        assert_eq!(key.affinity, Affinity::Integer);
         assert!(matches!(
-            expression,
+            &key.value,
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
         assert!(plan.predicates[0].consumed);

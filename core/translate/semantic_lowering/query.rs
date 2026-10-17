@@ -4149,7 +4149,14 @@ impl HirLoopNest<'_, '_> {
                 let previous_cursor = self.prepared_loops[first + position]
                     .cursor()
                     .expect("a hash lookup follows a table loop");
-                emit_hir_hash_waiting_lookups(program, prepared, hash_loop, previous_cursor);
+                let left_join = hash_loop.left_join.map(|index| &left_joins[index]);
+                emit_hir_hash_waiting_lookups(
+                    program,
+                    prepared,
+                    hash_loop,
+                    previous_cursor,
+                    left_join,
+                );
             }
         }
         Ok(())
@@ -5142,11 +5149,6 @@ fn start_hir_hash_loop(
     previous_cursor: CursorID,
     left_join: Option<usize>,
 ) -> Result<HirBtreeLoop> {
-    if left_join.is_some() {
-        return Err(LimboError::InternalError(
-            "HIR hash lookup cannot NULL-extend an outer join".into(),
-        ));
-    }
     let keys = &prepared.lookup.keys;
     let affinities = keys
         .iter()
@@ -5268,6 +5270,14 @@ fn start_hir_hash_loop(
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
     let exhausted = program.allocate_label();
+    if left_join.is_some() {
+        // A lookup that waits for a partition on disk sets the rowid to
+        // NULL; one without matches keeps this 0 and gets its NULL row.
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: prepared.rowid,
+        });
+    }
     program.emit_insn(Insn::HashProbe {
         hash_table_id: to_u32(prepared.hash_table),
         key_start_reg: to_u32(prepared.probe_keys),
@@ -5301,11 +5311,15 @@ fn start_hir_hash_loop(
 /// goes back to its row of the previous loop by rowid and joins the shared
 /// loop body at the lookup's first match. Nothing runs when the hash table
 /// stayed in memory.
+///
+/// In a LEFT JOIN, a waiting lookup whose matches all fail, or that has
+/// none, gets its NULL row here.
 fn emit_hir_hash_waiting_lookups(
     program: &mut ProgramBuilder,
     prepared: &PreparedHirHashLoop<'_>,
     hash_loop: &HirBtreeLoop,
     previous_cursor: CursorID,
+    left_join: Option<&HirLeftJoin>,
 ) {
     let hash_table = to_u32(prepared.hash_table);
     let column_count = prepared.source.columns.len().max(1);
@@ -5314,6 +5328,12 @@ fn emit_hir_hash_waiting_lookups(
     let next_lookup = program.allocate_label();
     let partition_done = program.allocate_label();
     let finished = program.allocate_label();
+    // Where a lookup goes when it runs out of matches.
+    let unmatched = if left_join.is_some() {
+        program.allocate_label()
+    } else {
+        next_lookup
+    };
     program.emit_insn(Insn::HashGraceInit {
         hash_table_id: hash_table,
         target_pc: done,
@@ -5340,12 +5360,15 @@ fn emit_hir_hash_waiting_lookups(
         src_reg: prepared.probe_rowid,
         target_pc: next_lookup,
     });
+    if let Some(left_join) = left_join {
+        left_join.metadata.reset(program);
+    }
     program.emit_insn(Insn::HashProbe {
         hash_table_id: hash_table,
         key_start_reg: to_u32(prepared.probe_keys),
         num_keys: to_u32(prepared.lookup.keys.len()),
         dest_reg: to_u32(prepared.rowid),
-        target_pc: next_lookup,
+        target_pc: unmatched,
         payload_dest_reg: Some(to_u32(prepared.payload)),
         num_payload: to_u32(column_count),
         probe_rowid_reg: None,
@@ -5354,16 +5377,35 @@ fn emit_hir_hash_waiting_lookups(
         target_pc: hash_loop.loop_start,
     });
     program.preassign_label_to_next_insn(prepared.waiting_next);
+    if left_join.is_some() {
+        // After its NULL row, the lookup has no match to advance.
+        program.emit_insn(Insn::IsNull {
+            reg: prepared.rowid,
+            target_pc: unmatched,
+        });
+    }
     program.emit_insn(Insn::HashNext {
         hash_table_id: prepared.hash_table,
         dest_reg: prepared.rowid,
-        target_pc: next_lookup,
+        target_pc: unmatched,
         payload_dest_reg: Some(prepared.payload),
         num_payload: column_count,
     });
     program.emit_insn(Insn::Goto {
         target_pc: hash_loop.loop_start,
     });
+    if let Some(left_join) = left_join {
+        program.preassign_label_to_next_insn(unmatched);
+        program.emit_insn(Insn::IfPos {
+            reg: left_join.metadata.reg_match_flag,
+            target_pc: next_lookup,
+            decrement_by: 0,
+        });
+        emit_hir_hash_null_row(program, prepared.payload, column_count, prepared.rowid);
+        program.emit_insn(Insn::Goto {
+            target_pc: left_join.metadata.label_match_flag_set_true,
+        });
+    }
     program.preassign_label_to_next_insn(partition_done);
     program.emit_insn(Insn::HashGraceAdvancePartition {
         hash_table_id: hash_table,
@@ -5378,6 +5420,24 @@ fn emit_hir_hash_waiting_lookups(
         dest: prepared.waiting_pass,
     });
     program.preassign_label_to_next_insn(done);
+}
+
+/// Read NULL for every column and the rowid of a hash lookup's table, for
+/// a LEFT JOIN row without a match.
+fn emit_hir_hash_null_row(
+    program: &mut ProgramBuilder,
+    payload: usize,
+    columns: usize,
+    rowid: usize,
+) {
+    program.emit_insn(Insn::Null {
+        dest: payload,
+        dest_end: (columns > 1).then_some(payload + columns - 1),
+    });
+    program.emit_insn(Insn::Null {
+        dest: rowid,
+        dest_end: None,
+    });
 }
 
 fn prepare_hir_recursive_input_loop<'a>(
@@ -6813,6 +6873,13 @@ pub(super) fn close_hir_btree_loop(
                 target_pc: *waiting_next,
                 decrement_by: 0,
             });
+            // After its NULL row, a LEFT JOIN lookup has no match to advance.
+            if hir_loop.left_join.is_some() {
+                program.emit_insn(Insn::IsNull {
+                    reg: *rowid,
+                    target_pc: hir_loop.exhausted,
+                });
+            }
             program.emit_insn(Insn::HashNext {
                 hash_table_id: *hash_table,
                 dest_reg: *rowid,
@@ -6828,6 +6895,21 @@ pub(super) fn close_hir_btree_loop(
     program.preassign_label_to_next_insn(hir_loop.exhausted);
     if let Some(left_join) = hir_loop.left_join.map(|index| &left_joins[index]) {
         let finished = left_join.metadata.begin_unmatched_row(program);
+        if let HirLoopAdvance::Hash {
+            rowid,
+            payload,
+            columns,
+            ..
+        } = &hir_loop.advance
+        {
+            // A lookup waiting for a partition on disk gets its NULL row,
+            // if it has no match, in the waiting pass.
+            program.emit_insn(Insn::IsNull {
+                reg: *rowid,
+                target_pc: finished,
+            });
+            emit_hir_hash_null_row(program, *payload, *columns, *rowid);
+        }
         for cursor in &left_join.null_cursors {
             program.emit_insn(Insn::NullRow { cursor_id: *cursor });
         }
