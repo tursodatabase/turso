@@ -1,7 +1,7 @@
 //! Top-level SELECT prepared through semantic HIR must return the same rows
 //! and column metadata as the legacy planner.
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 
 const SETUP: &str = "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, extra TEXT);
 CREATE INDEX items_value ON items(value);
@@ -1253,4 +1253,64 @@ fn hir_grouped_rows_keep_only_columns_read_after_grouping() {
             "{sql}"
         );
     }
+}
+
+/// Like legacy, an operand with the same value on every row is computed
+/// once: a literal before the loops, anything else, such as `upper('x')`,
+/// the first time it is reached. A constant that fails, such as
+/// `abs(-9223372036854775808)`, fails only where SQLite's does: not in a
+/// CASE branch, COALESCE argument or WHERE term no row reaches.
+#[test]
+fn hir_constant_operands_are_computed_once() {
+    const SCHEMA: &str = "
+        CREATE TABLE t(a INT, b TEXT);
+        INSERT INTO t VALUES (1, 'p'), (2, 'q'), (3, NULL);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT max(upper('x') || b), sum(a * 2 + length('abc')) FROM t",
+        "SELECT a + 1, substr('abcdef', 1, a) || b FROM t ORDER BY a",
+        "SELECT CASE WHEN a > 5 THEN a + abs(-9223372036854775808) ELSE a END FROM t ORDER BY a",
+        "SELECT coalesce(a, 1 + abs(-9223372036854775808)) FROM t ORDER BY a",
+        "SELECT a FROM t WHERE a > 5 AND a + abs(-9223372036854775808) > 0",
+        "SELECT a + abs(-9223372036854775808) FROM t WHERE a > 5",
+        "SELECT a + abs(-9223372036854775808) FROM t",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Result<Vec<Vec<rusqlite::types::Value>>, _> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect();
+        match expected {
+            Ok(expected) => assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}"),
+            Err(_) => assert!(
+                limbo_exec_rows_fallible(&db, &hir, sql).is_err(),
+                "{sql} fails in SQLite"
+            ),
+        }
+    }
+
+    let program = limbo_exec_rows(&hir, "EXPLAIN SELECT max(upper('x') || b) FROM t");
+    let opcode = |row: &Vec<rusqlite::types::Value>| match row.get(1) {
+        Some(rusqlite::types::Value::Text(opcode)) => opcode.clone(),
+        _ => String::new(),
+    };
+    let upper = program
+        .iter()
+        .position(|row| {
+            opcode(row) == "Function"
+                && matches!(row.get(5), Some(rusqlite::types::Value::Text(name)) if name == "upper")
+        })
+        .expect("upper is called");
+    assert_eq!(opcode(&program[upper - 1]), "Once", "{program:?}");
 }
