@@ -2141,3 +2141,48 @@ fn hir_alter_table_schema_updates_match_legacy() {
         "HIR lowers the schema-row UPDATE itself"
     );
 }
+
+/// CREATE TABLE ... AS SELECT plans its SELECT through HIR when HIR is on:
+/// the new table's column names and types come from HIR's outputs, and its
+/// rows from HIR's SELECT, matching legacy.
+#[test]
+fn hir_create_table_as_select_matches_legacy() {
+    let statements = [
+        "CREATE TABLE s(a INTEGER PRIMARY KEY, b TEXT, c REAL, d, e NUMERIC, f BLOB)",
+        "INSERT INTO s VALUES (1, 'x', 1.5, NULL, 10, x'01'), (2, 'y', 2.5, 'q', 20, NULL), \
+         (3, NULL, NULL, 3, 30, x'02')",
+        "CREATE TABLE c1 AS SELECT * FROM s",
+        "CREATE TABLE c2 AS SELECT a, b AS bee, c * 2, 1, 'lit', a + 1, a || b, \
+         count(*) OVER () FROM s",
+        "CREATE TABLE c3 AS SELECT b, count(*), sum(c), max(a) FROM s GROUP BY b ORDER BY b",
+        "CREATE TABLE c4 AS SELECT a, a, b AS a FROM s",
+        "CREATE TABLE c5 AS SELECT x.a, y.b FROM s x JOIN s y ON y.a = x.a + 1",
+        "CREATE TABLE c6 AS SELECT a FROM s UNION SELECT c FROM s ORDER BY 1",
+        "CREATE TABLE c7 AS WITH w AS (SELECT a, e FROM s WHERE a > 1) SELECT * FROM w",
+        "CREATE TABLE c8 AS SELECT CAST(a AS TEXT) AS t, (SELECT max(c) FROM s) AS m, e FROM s",
+        "CREATE TABLE c9 AS SELECT * FROM s WHERE 0",
+        "CREATE TABLE c10 AS VALUES (1, 'a'), (2, 'b')",
+        "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'c%' ORDER BY name",
+        "SELECT * FROM c2 ORDER BY a",
+        "SELECT * FROM c3 ORDER BY b",
+        "SELECT * FROM c4 ORDER BY 1",
+        "SELECT * FROM c5 ORDER BY 1",
+        "SELECT * FROM c6 ORDER BY 1",
+        "SELECT * FROM c8 ORDER BY 1",
+        "SELECT * FROM c10 ORDER BY 1",
+        "SELECT typeof(a), typeof(b), typeof(e) FROM c1 ORDER BY a",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE s(a, b)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(
+            &conn,
+            "EXPLAIN CREATE TABLE c AS SELECT a, count(*) FROM s GROUP BY a",
+        )
+    };
+    assert_ne!(program(true), program(false), "HIR plans the SELECT itself");
+}

@@ -890,9 +890,15 @@ fn validate(
     Ok(())
 }
 
+/// How a CTAS SELECT runs: planned by legacy, or through HIR.
+enum CtasPlan {
+    Legacy(Plan),
+    Hir(crate::translate::semantic_lowering::CtasSelect),
+}
+
 /// Schema information derived from a CTAS SELECT.
 struct CtasInfo {
-    plan: Plan,
+    plan: CtasPlan,
     schema_sql: String,
 }
 
@@ -904,7 +910,18 @@ fn derive_ctas_schema(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
+    hir: Option<(
+        &Arc<crate::schema::Schema>,
+        &crate::translate::semantic_lowering::HirSettings<'_>,
+    )>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
+    if let Some((schema, settings)) = hir {
+        let select = crate::translate::semantic_lowering::CtasSelect::new(
+            select, schema, settings, connection,
+        )?;
+        let columns = select.columns()?;
+        return Ok(ctas_schema(CtasPlan::Hir(select), table_name, columns));
+    }
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -924,11 +941,22 @@ fn derive_ctas_schema(
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
 
-    // Collect names first, then deduplicate using SQLite's :N suffix convention.
-    let mut names: Vec<String> = result_columns
+    let columns = result_columns
         .iter()
-        .map(|col| col.name_or_expr(table_refs))
+        .map(|col| (col.name_or_expr(table_refs), col.declared_type(table_refs)))
         .collect();
+    Ok(ctas_schema(CtasPlan::Legacy(plan), table_name, columns))
+}
+
+/// The CREATE TABLE text and column definitions of a CTAS table, from each
+/// SELECT output's name and declared type.
+fn ctas_schema(
+    plan: CtasPlan,
+    table_name: &str,
+    columns: Vec<(String, &'static str)>,
+) -> (CtasInfo, Vec<ColumnDefinition>) {
+    // Collect names first, then deduplicate using SQLite's :N suffix convention.
+    let (mut names, types): (Vec<String>, Vec<&'static str>) = columns.into_iter().unzip();
 
     let mut seen: HashMap<String, usize> = HashMap::default();
     for name in &mut names {
@@ -940,12 +968,10 @@ fn derive_ctas_schema(
         *count += 1;
     }
 
-    let mut sql_parts = Vec::with_capacity(result_columns.len());
-    let mut col_defs = Vec::with_capacity(result_columns.len());
+    let mut sql_parts = Vec::with_capacity(names.len());
+    let mut col_defs = Vec::with_capacity(names.len());
 
-    for (col, name) in result_columns.iter().zip(names) {
-        let ty = col.declared_type(table_refs);
-
+    for (ty, name) in types.into_iter().zip(names) {
         let quoted = quote_identifier(&name);
         if ty.is_empty() {
             sql_parts.push(quoted);
@@ -973,7 +999,7 @@ fn derive_ctas_schema(
         plan,
         schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
     };
-    Ok((info, col_defs))
+    (info, col_defs)
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -983,7 +1009,7 @@ fn derive_ctas_schema(
 fn emit_ctas_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    mut plan: Plan,
+    plan: CtasPlan,
     body: &ast::CreateTableBody,
     table_root_reg: usize,
     col_count: usize,
@@ -1011,25 +1037,33 @@ fn emit_ctas_insert(
     });
     program.preassign_label_to_next_insn(start_offset_label);
 
-    // Switch the plan's destination to coroutine yield mode.
-    let dest = plan.select_query_destination_mut().ok_or_else(|| {
-        crate::LimboError::InternalError("CTAS plan must be a SELECT or CompoundSelect".into())
-    })?;
-    *dest = QueryDestination::CoroutineYield {
-        yield_reg,
-        coroutine_implementation_start: halt_label,
+    let hir_rows = match plan {
+        CtasPlan::Legacy(mut plan) => {
+            // Switch the plan's destination to coroutine yield mode.
+            let dest = plan.select_query_destination_mut().ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "CTAS plan must be a SELECT or CompoundSelect".into(),
+                )
+            })?;
+            *dest = QueryDestination::CoroutineYield {
+                yield_reg,
+                coroutine_implementation_start: halt_label,
+            };
+
+            let num_result_cols =
+                program.nested(|program| emit_select_plan(plan, resolver, program, connection))?;
+
+            if num_result_cols != col_count {
+                bail_parse_error!(
+                    "CTAS internal error: expected {} columns from SELECT but got {}",
+                    col_count,
+                    num_result_cols
+                );
+            }
+            None
+        }
+        CtasPlan::Hir(select) => Some(select.emit_rows(program, yield_reg, start_offset_label)?),
     };
-
-    let num_result_cols =
-        program.nested(|program| emit_select_plan(plan, resolver, program, connection))?;
-
-    if num_result_cols != col_count {
-        bail_parse_error!(
-            "CTAS internal error: expected {} columns from SELECT but got {}",
-            col_count,
-            num_result_cols
-        );
-    }
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(jump_on_definition_label);
@@ -1055,11 +1089,14 @@ fn emit_ctas_insert(
         subtype_clear_count: 0,
     });
 
-    let result_start_reg = program.reg_result_cols_start.ok_or_else(|| {
-        crate::LimboError::InternalError(
-            "CTAS internal error: result column start register not set".into(),
-        )
-    })?;
+    let result_start_reg = match hir_rows {
+        Some(values) => values,
+        None => program.reg_result_cols_start.ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "CTAS internal error: result column start register not set".into(),
+            )
+        })?,
+    };
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(result_start_reg),
@@ -1106,6 +1143,10 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    hir: Option<(
+        &Arc<crate::schema::Schema>,
+        &crate::translate::semantic_lowering::HirSettings<'_>,
+    )>,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
@@ -1117,6 +1158,7 @@ pub fn translate_create_table(
                 resolver,
                 program,
                 connection,
+                hir,
             )?;
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,

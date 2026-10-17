@@ -309,6 +309,7 @@ fn translate_statement(
             program,
             connection,
             input,
+            hir,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,

@@ -58,6 +58,90 @@ pub(crate) fn translate_select(
     Ok(())
 }
 
+/// The SELECT of `CREATE TABLE ... AS SELECT`, planned through HIR.
+pub(crate) struct CtasSelect {
+    plan: Arc<HirPlan>,
+    query: hir::QueryId,
+}
+
+impl CtasSelect {
+    pub(crate) fn new(
+        select: ast::Select,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let plan = analyze_and_plan(&ast::Stmt::Select(select), schema, settings, connection)?;
+        let HirRoot::Query(root) = &plan.document.root else {
+            return Err(LimboError::InternalError(
+                "HIR CTAS analysis did not produce a query root".into(),
+            ));
+        };
+        let query = root.query;
+        Ok(Self { plan, query })
+    }
+
+    /// Each column of the new table: the SELECT's output name, and the type
+    /// SQLite derives from the output's affinity, as legacy does.
+    pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR CTAS query is missing".into()))?;
+        let names = resolved_result_columns(document, self.query)?;
+        query
+            .output
+            .iter()
+            .zip(names)
+            .map(|(output, column)| {
+                let output = document.output(*output).ok_or_else(|| {
+                    LimboError::InternalError("HIR CTAS output is missing".into())
+                })?;
+                // Like legacy, a column read keeps its own name, without the
+                // table that qualifies it, unless it has an alias.
+                let name = match column.value {
+                    ResolvedResultValue::Column(source) if !column.name_is_alias => {
+                        source.column_name
+                    }
+                    ResolvedResultValue::RowId(name) if !column.name_is_alias => name,
+                    _ => column.name,
+                };
+                Ok((name, output.schema_affinity.short_type_name()))
+            })
+            .collect()
+    }
+
+    /// Run the SELECT as a coroutine that yields each row into the returned
+    /// registers, one per column.
+    pub(crate) fn emit_rows(
+        &self,
+        program: &mut ProgramBuilder,
+        yield_reg: usize,
+        start: crate::vdbe::BranchOffset,
+    ) -> Result<usize> {
+        let width = self
+            .plan
+            .document
+            .query(self.query)
+            .map_or(0, |query| query.output.len());
+        let values = program.alloc_registers(width.max(1));
+        program.bind_coroutine_row(yield_reg, values);
+        program.set_hir_plan(self.plan.clone());
+        program.nested(|program| {
+            query::emit_planned_query_body(
+                program,
+                &self.plan,
+                self.query,
+                &QueryDestination::CoroutineYield {
+                    yield_reg,
+                    coroutine_implementation_start: start,
+                },
+            )
+        })?;
+        Ok(values)
+    }
+}
+
 /// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
 /// nothing emitted, when the statement uses something only legacy lowers
 /// today; the caller then hands it to legacy.
