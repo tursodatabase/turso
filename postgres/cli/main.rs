@@ -172,7 +172,9 @@ fn cmd_help(w: &mut dyn Write) {
 }
 
 fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
-    let sql = "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename";
+    let sql = "SELECT CASE WHEN schemaname = 'public' THEN tablename \
+               ELSE schemaname || '.' || tablename END AS name \
+               FROM pg_tables ORDER BY name";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
             let mut table = Table::new();
@@ -199,14 +201,14 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
 }
 
 fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
-    let safe_name = table_name.replace('\'', "''");
+    let relation = relation_condition("c", table_name);
     let sql = format!(
         "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
          LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
-         WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
+         WHERE {relation} AND a.attnum > 0 AND a.attisdropped = 0 \
          ORDER BY a.attnum"
     );
     match conn.query(&sql) {
@@ -476,7 +478,8 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
     // First show the regular column description
     cmd_describe_table(conn, table_name, w);
 
-    let safe_name = table_name.replace('\'', "''");
+    let table = relation_condition("c2", table_name);
+    let constrained_table = relation_condition("c", table_name);
 
     // Show indexes
     let idx_sql = format!(
@@ -484,7 +487,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
          FROM pg_index i \
          JOIN pg_class c ON i.indexrelid = c.oid \
          JOIN pg_class c2 ON i.indrelid = c2.oid \
-         WHERE c2.relname = '{safe_name}' \
+         WHERE {table} \
          ORDER BY c.relname"
     );
     if let Ok(Some(mut rows)) = conn.query(&idx_sql) {
@@ -506,7 +509,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
         "SELECT conname, contype \
          FROM pg_constraint con \
          JOIN pg_class c ON con.conrelid = c.oid \
-         WHERE c.relname = '{safe_name}' \
+         WHERE {constrained_table} \
          ORDER BY conname"
     );
     if let Ok(Some(mut rows)) = conn.query(&con_sql) {
@@ -533,12 +536,23 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
     }
 }
 
+fn relation_condition(alias: &str, table_name: &str) -> String {
+    let (schema, name) = table_name.split_once('.').unwrap_or(("public", table_name));
+    format!(
+        "{alias}.relname = '{}' AND {alias}.relnamespace = \
+         (SELECT oid FROM pg_namespace WHERE nspname = '{}')",
+        name.replace('\'', "''"),
+        schema.replace('\'', "''")
+    )
+}
+
 fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) {
-    let sql = "SELECT c.relname, c.reltuples \
+    let sql = "SELECT CASE WHEN n.nspname = 'public' THEN c.relname \
+               ELSE n.nspname || '.' || c.relname END AS name, c.reltuples \
                FROM pg_class c \
                JOIN pg_namespace n ON c.relnamespace = n.oid \
-               WHERE c.relkind = 'r' AND n.nspname = 'public' \
-               ORDER BY c.relname";
+               WHERE c.relkind = 'r' \
+               ORDER BY name";
     match conn.query(sql) {
         Ok(Some(mut rows)) => {
             let mut table = Table::new();

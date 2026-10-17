@@ -101,6 +101,24 @@ fn dt_lists_multiple_tables() {
 }
 
 #[test]
+fn dt_lists_tables_of_schemas() {
+    let output = run_tursopg(
+        b"CREATE TABLE p (x int);\nCREATE SCHEMA app;\nSET search_path TO app;\nCREATE TABLE t (x int);\n\\dt\n\\dt+\n",
+    );
+    let out = stdout(&output);
+    assert_eq!(
+        out.matches("app.t").count(),
+        2,
+        "\\dt and \\dt+ should both list app.t, got: {out}"
+    );
+    assert_eq!(
+        out.matches("| p ").count(),
+        2,
+        "\\dt and \\dt+ should both list p, got: {out}"
+    );
+}
+
+#[test]
 fn dt_empty_database() {
     let output = run_tursopg(b"\\dt\n");
     assert_eq!(output.status.code(), Some(0));
@@ -443,6 +461,37 @@ fn df_lists_functions() {
 }
 
 // ---------------------------------------------------------------------------
+#[test]
+fn d_describes_table_of_schema() {
+    let output = run_tursopg(
+        b"CREATE TABLE t (public_column int);\nCREATE SCHEMA app;\nCREATE TABLE app.t (app_column int);\n\\d app.t\n\\d t\n",
+    );
+    let out = stdout(&output);
+    let (app_table, public_table) = out
+        .split_once("Table: t")
+        .unwrap_or_else(|| panic!("expected both tables described, got: {out}"));
+    assert!(
+        app_table.contains("app_column") && !app_table.contains("public_column"),
+        "\\d app.t should show only the columns of app.t, got: {app_table}"
+    );
+    assert!(
+        public_table.contains("public_column") && !public_table.contains("app_column"),
+        "\\d t should show only the columns of public.t, got: {public_table}"
+    );
+}
+
+#[test]
+fn d_plus_describes_indexes_of_table_of_schema() {
+    let output = run_tursopg(
+        b"CREATE TABLE t (x int);\nCREATE INDEX public_index ON t (x);\nCREATE SCHEMA app;\nCREATE TABLE app.t (x int);\nCREATE INDEX app_index ON app.t (x);\n\\d+ app.t\n",
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("app_index") && !out.contains("public_index"),
+        "\\d+ app.t should show only the indexes of app.t, got: {out}"
+    );
+}
+
 // Meta-commands: \d+ (extended describe)
 // ---------------------------------------------------------------------------
 
