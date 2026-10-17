@@ -3627,8 +3627,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         != Some(tx_header.schema_cookie.get());
                 self.did_commit_schema_change = schema_did_change;
                 if schema_did_change {
-                    let schema = self.connection.schema.read().clone();
-                    self.connection.db.update_schema_if_newer(schema);
+                    if self.db_id == crate::MAIN_DB_ID {
+                        let schema = self.connection.schema.read().clone();
+                        self.connection.db.update_schema_if_newer(schema);
+                    } else {
+                        self.connection.publish_database_schema(self.db_id);
+                    }
                 }
                 // Guard the global_header write against out-of-order
                 // completion. An exclusive tx can bypass `pager_commit_lock`
