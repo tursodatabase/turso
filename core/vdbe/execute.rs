@@ -14444,7 +14444,7 @@ pub fn op_sequence_compute_next(
     // schema's sequences map is keyed by the bare name. The opcode's
     // `db` field already encodes the target database.
     let bare_seq_name = seq_name
-        .rsplit_once('.')
+        .split_once('.')
         .map(|(_, n)| n)
         .unwrap_or(&seq_name);
     let seq = program
@@ -14602,7 +14602,7 @@ pub fn op_sequence_track_allocation(
         })?;
 
     let bare_seq_name = seq_name
-        .rsplit_once('.')
+        .split_once('.')
         .map(|(_, n)| n)
         .unwrap_or(&seq_name);
     let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
@@ -14695,7 +14695,7 @@ pub fn op_sequence_register_allocation(
         })?;
 
     let bare_seq_name = seq_name
-        .rsplit_once('.')
+        .split_once('.')
         .map(|(_, n)| n)
         .unwrap_or(&seq_name);
     let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
