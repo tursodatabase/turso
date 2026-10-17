@@ -348,6 +348,19 @@ struct HirAggregateState<'a> {
     aggregates: Vec<HirAggregateRuntime<'a>>,
     bare_columns: Vec<hir::ColumnRef>,
     bare_rowids: Vec<SourceId>,
+    min_max_row: Option<HirMinMaxRow>,
+}
+
+/// SQLite's bare-column rule: in a query with exactly one min() or max()
+/// aggregate, bare columns come from a row that holds the aggregate's
+/// value. A row is kept when the value changes; NULL to a value counts, a
+/// tie or a value equal under the collation does not.
+struct HirMinMaxRow {
+    accumulator: usize,
+    function: AggFunc,
+    collation: CollationSeq,
+    /// The aggregate's value when a row was last kept.
+    previous: usize,
 }
 
 enum HirLoopBody<'a> {
@@ -2247,11 +2260,12 @@ fn emit_hir_group_row(
     program.preassign_label_to_next_insn(aggregate_step);
     bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Row);
     emit_hir_aggregate_steps(program, document, &runtime.aggregates)?;
-    program.emit_insn(Insn::If {
-        reg: runtime.state.data_in_group,
-        target_pc: captured,
-        jump_if_null: false,
-    });
+    emit_hir_bare_row_test(
+        program,
+        runtime.state.data_in_group,
+        runtime.aggregates.min_max_row.as_ref(),
+        captured,
+    );
     for input in &runtime.inputs {
         match input {
             HirGroupInput::Key(_) => {}
@@ -3605,11 +3619,115 @@ fn initialize_hir_aggregates<'a>(
     bare.columns
         .sort_unstable_by_key(|reference| (reference.source.index(), reference.column));
     bare.rowids.sort_unstable();
+    let min_max_row = if bare.columns.is_empty() && bare.rowids.is_empty() {
+        None
+    } else {
+        hir_min_max_row(program, &aggregates)?
+    };
     Ok(HirAggregateState {
         aggregates,
         bare_columns: bare.columns,
         bare_rowids: bare.rowids,
+        min_max_row,
     })
+}
+
+/// The one min() or max() aggregate whose row bare columns come from, as in
+/// SQLite. With two or more, SQLite's choice is arbitrary, and bare columns
+/// come from the first row; so they do when a custom type orders the values.
+fn hir_min_max_row(
+    program: &mut ProgramBuilder,
+    aggregates: &[HirAggregateRuntime<'_>],
+) -> Result<Option<HirMinMaxRow>> {
+    let mut min_max = Vec::new();
+    for aggregate in aggregates {
+        let function = hir_aggregate_function(aggregate.call)?;
+        if matches!(function, AggFunc::Min | AggFunc::Max) {
+            min_max.push((aggregate, function));
+        }
+    }
+    let [(aggregate, function)] = min_max.as_slice() else {
+        return Ok(None);
+    };
+    let hir::FunctionArguments::Expressions { values, facts, .. } = &aggregate.call.arguments
+    else {
+        return Ok(None);
+    };
+    let ([_], [fact]) = (values.as_slice(), facts.as_slice()) else {
+        return Ok(None);
+    };
+    if crate::translate::order_by::custom_type_comparator_from_type_fact(&fact.type_fact).is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(HirMinMaxRow {
+        accumulator: aggregate.accumulator,
+        function: function.clone(),
+        collation: fact
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value())
+            .unwrap_or(CollationSeq::Binary),
+        previous: program.alloc_register(),
+    }))
+}
+
+/// After the aggregates stepped: jump to `skip` unless this row's bare
+/// columns are kept. `kept` is nonzero once a row was kept. Without a
+/// min() or max() row, only the first row is kept.
+fn emit_hir_bare_row_test(
+    program: &mut ProgramBuilder,
+    kept: usize,
+    min_max_row: Option<&HirMinMaxRow>,
+    skip: BranchOffset,
+) {
+    let Some(row) = min_max_row else {
+        program.emit_insn(Insn::If {
+            reg: kept,
+            target_pc: skip,
+            jump_if_null: false,
+        });
+        return;
+    };
+    let current = program.alloc_register();
+    program.emit_insn(Insn::AggValue {
+        acc_reg: row.accumulator,
+        dest_reg: current,
+        func: AccumulatorFunc::Agg(row.function.clone()),
+    });
+    let take = program.allocate_label();
+    let compare = program.allocate_label();
+    let previous_null = program.allocate_label();
+    program.emit_insn(Insn::If {
+        reg: kept,
+        target_pc: compare,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Goto { target_pc: take });
+    program.preassign_label_to_next_insn(compare);
+    program.emit_insn(Insn::IsNull {
+        reg: row.previous,
+        target_pc: previous_null,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: row.previous,
+        rhs: current,
+        target_pc: skip,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: Some(row.collation),
+    });
+    program.emit_insn(Insn::Goto { target_pc: take });
+    program.preassign_label_to_next_insn(previous_null);
+    program.emit_insn(Insn::IsNull {
+        reg: current,
+        target_pc: skip,
+    });
+    program.preassign_label_to_next_insn(take);
+    program.emit_insn(Insn::Copy {
+        src_reg: current,
+        dst_reg: row.previous,
+        extra_amount: 0,
+    });
 }
 
 fn validate_hir_percentile_fraction(
@@ -3766,17 +3884,14 @@ fn emit_hir_aggregate_capture(
     document: &HirDocument,
     first_row: usize,
     captures: &[HirAggregateCapture],
+    min_max_row: Option<&HirMinMaxRow>,
 ) -> Result<()> {
     // With no bare column to keep, there is nothing to capture per row.
     if captures.is_empty() {
         return Ok(());
     }
     let captured = program.allocate_label();
-    program.emit_insn(Insn::If {
-        reg: first_row,
-        target_pc: captured,
-        jump_if_null: false,
-    });
+    emit_hir_bare_row_test(program, first_row, min_max_row, captured);
     program.emit_insn(Insn::Integer {
         value: 1,
         dest: first_row,
@@ -4128,8 +4243,14 @@ impl HirLoopNest<'_, '_> {
                 let (first_row, captures) = self
                     .aggregate_captures
                     .expect("aggregate loop initializes first-row captures");
-                emit_hir_aggregate_capture(program, self.document, *first_row, captures)?;
                 emit_hir_aggregate_steps(program, self.document, state)?;
+                emit_hir_aggregate_capture(
+                    program,
+                    self.document,
+                    *first_row,
+                    captures,
+                    state.min_max_row.as_ref(),
+                )?;
                 if let Some(done) = first_value_done {
                     program.emit_insn(Insn::Goto { target_pc: *done });
                 }
@@ -11107,7 +11228,7 @@ pub(super) mod tests {
                     index: Some(index), ..
                 },
             ..
-        } = &block_plan.loops[1].access
+        } = &block_plan.loops[2].access
         else {
             panic!("right join source uses an automatic-index seek");
         };
@@ -11233,7 +11354,7 @@ pub(super) mod tests {
                     index: Some(index), ..
                 },
             ..
-        } = &block_plan.loops[2].access
+        } = &block_plan.loops[1].access
         else {
             panic!("right join source uses an automatic-index seek");
         };

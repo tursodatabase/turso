@@ -1347,7 +1347,10 @@ collations, custom comparators, and final calls use semantic HIR facts. HIR and
 legacy paths share one aggregate-step opcode switch, so this adds no second
 copy of function behavior. Bare columns and rowid reads capture only values
 needed after the scan, preserving SQLite first-row and empty-input behavior
-without forcing unused columns into covering-index plans. Ordered-set
+without forcing unused columns into covering-index plans. As in SQLite, and
+unlike legacy, a query with exactly one min() or max() aggregate, grouped or
+not, takes its bare columns from a row holding the aggregate's value: the
+first row, then each row whose value changes the aggregate. Ordered-set
 percentile aggregates evaluate their direct fraction once before opening the
 input scan, reject local-row and subquery dependencies with the legacy error,
 and reuse the same range-check and aggregate-step opcode helpers as legacy

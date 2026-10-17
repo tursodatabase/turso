@@ -1314,3 +1314,57 @@ fn hir_constant_operands_are_computed_once() {
         .expect("upper is called");
     assert_eq!(opcode(&program[upper - 1]), "Once", "{program:?}");
 }
+
+/// Like SQLite, a query with exactly one min() or max() aggregate reads its
+/// bare columns from a row that holds the aggregate's value: the first row
+/// until a value is held, then each row with a new value. A tie, or a value
+/// equal under the collation, keeps the earlier row. Legacy reads them from
+/// the first row.
+#[test]
+fn hir_bare_columns_come_from_the_min_or_max_row() {
+    const SCHEMA: &str = "
+        CREATE TABLE t(g INT, a INT, b TEXT);
+        INSERT INTO t VALUES (1, 5, 'x'), (1, 9, 'y'), (1, 2, 'z'), (2, 1, 'p'), (2, 7, 'q'),
+            (2, 7, 'r');
+        CREATE TABLE n(a, b);
+        INSERT INTO n VALUES (NULL, 'r1'), (NULL, 'r2'), (3, 'r3'), (NULL, 'r4'), (3, 'r5');
+        CREATE TABLE c(a TEXT, b INT);
+        INSERT INTO c VALUES ('A', 1), ('a', 2), ('B', 3), ('b', 4);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT max(a), b FROM t",
+        "SELECT min(a), b, rowid FROM t",
+        "SELECT g, max(a), b FROM t GROUP BY g ORDER BY g",
+        "SELECT g, min(a), b FROM t GROUP BY g ORDER BY g",
+        "SELECT g, b FROM t GROUP BY g HAVING max(a) > 0 ORDER BY g",
+        "SELECT max(a), count(*), b FROM t",
+        "SELECT count(*), b FROM t",
+        "SELECT max(a), b FROM n",
+        "SELECT min(a), b FROM n WHERE a IS NULL",
+        "SELECT max(a) + 1, b || '!' FROM t",
+        "SELECT max(a COLLATE NOCASE), b FROM c",
+        "SELECT max(a) FILTER (WHERE g = 2), b FROM t",
+        "SELECT max(DISTINCT a), b FROM t",
+        "SELECT max(a), (SELECT b) FROM t",
+        "SELECT max(t.a), n.b FROM t JOIN n ON n.a = 3",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+}
