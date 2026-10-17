@@ -142,7 +142,10 @@ pub fn emit_sequence_backing_table(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -289,7 +292,10 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -557,7 +563,10 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
     let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
@@ -778,7 +787,10 @@ pub(crate) fn emit_sqlite_sequence_sync(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {
