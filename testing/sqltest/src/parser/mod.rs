@@ -220,9 +220,14 @@ impl Parser {
                 } else {
                     false
                 };
-
+                const DEFAULT_PATH:&str="database/";
+                let path=if !path.starts_with(DEFAULT_PATH){
+                    PathBuf::from("../..").join(path)
+                }else{
+                    PathBuf::from(path)
+                };
                 Ok(DatabaseConfig {
-                    location: DatabaseLocation::Path(PathBuf::from(path)),
+                    location: DatabaseLocation::Path(path),
                     readonly,
                 })
             }

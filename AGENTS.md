@@ -14,7 +14,7 @@ cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --rel
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
+CI=1 make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
 CI=1 make -C sqlite/conformance run-rust  # use only if snapshot tests are required
 
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
@@ -27,7 +27,7 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `cargo test` - Rust unit and integration tests
 - `make test` - broad compatibility suite (TCL, sqlite3, extensions, MVCC)
 - `make test-single TEST=foo.test` - single legacy TCL test
-- `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
+- `CI=1 make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
 - `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
