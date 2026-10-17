@@ -293,7 +293,7 @@ fn translate_statement(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, hir)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -473,7 +473,7 @@ fn translate_statement(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection, hir)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }

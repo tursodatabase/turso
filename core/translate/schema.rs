@@ -893,7 +893,7 @@ fn validate(
 /// How a CTAS SELECT runs: planned by legacy, or through HIR.
 enum CtasPlan {
     Legacy(Plan),
-    Hir(crate::translate::semantic_lowering::CtasSelect),
+    Hir(crate::translate::semantic_lowering::PlannedSelect),
 }
 
 /// Schema information derived from a CTAS SELECT.
@@ -916,7 +916,7 @@ fn derive_ctas_schema(
     )>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
     if let Some((schema, settings)) = hir {
-        let select = crate::translate::semantic_lowering::CtasSelect::new(
+        let select = crate::translate::semantic_lowering::PlannedSelect::new(
             select, schema, settings, connection,
         )?;
         let columns = select.columns()?;

@@ -58,13 +58,15 @@ pub(crate) fn translate_select(
     Ok(())
 }
 
-/// The SELECT of `CREATE TABLE ... AS SELECT`, planned through HIR.
-pub(crate) struct CtasSelect {
+/// A SELECT that a schema statement runs to read rows, planned through HIR:
+/// the SELECT of `CREATE TABLE ... AS SELECT`, or the scan that fills a new
+/// or rebuilt index.
+pub(crate) struct PlannedSelect {
     plan: Arc<HirPlan>,
     query: hir::QueryId,
 }
 
-impl CtasSelect {
+impl PlannedSelect {
     pub(crate) fn new(
         select: ast::Select,
         schema: &Arc<Schema>,
@@ -79,6 +81,19 @@ impl CtasSelect {
         };
         let query = root.query;
         Ok(Self { plan, query })
+    }
+
+    /// Whether the SELECT reads a column whose stored value it would decode:
+    /// a custom type or an array. An index stores the encoded value, so its
+    /// refill cannot read such a column through a SELECT.
+    pub(crate) fn decodes_stored_values(&self) -> bool {
+        self.plan.document.sources.iter().any(|source| {
+            source.column_type_programs.iter().any(Option::is_some)
+                || source
+                    .columns
+                    .iter()
+                    .any(|column| column.type_fact.is_array())
+        })
     }
 
     /// Each column of the new table: the SELECT's output name, and the type

@@ -87,6 +87,7 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     let sql = canonical_create_index_sql(&stmt);
     let ast::Stmt::CreateIndex {
@@ -281,6 +282,8 @@ pub fn translate_create_index(
     emit_refill_index(
         program,
         resolver,
+        connection,
+        hir,
         database_id,
         &tbl,
         &idx,
@@ -312,6 +315,233 @@ pub fn translate_create_index(
     Ok(())
 }
 
+/// The HIR settings a schema statement plans its SELECTs with, when HIR is on.
+type HirContext<'a> = Option<(
+    &'a Arc<crate::schema::Schema>,
+    &'a crate::translate::semantic_lowering::HirSettings<'a>,
+)>;
+
+/// How a refill reads the rows of the indexed table.
+enum RefillRows {
+    /// Scan the table cursor, and check and compute each index column with
+    /// the legacy expression translator.
+    Legacy {
+        table_cursor_id: usize,
+        table_references: Box<TableReferences>,
+        where_clause: Option<Box<ast::Expr>>,
+    },
+    /// Run `SELECT <index columns>, rowid FROM <table> NOT INDEXED [WHERE
+    /// <partial index condition>]`, planned through HIR.
+    Hir(crate::translate::semantic_lowering::PlannedSelect),
+}
+
+/// Plan the rows that fill `idx` through HIR. Returns `None` when the table
+/// stores values a SELECT would decode, or when every rowid name is taken by
+/// a real column; legacy fills the index then.
+fn hir_refill_select(
+    connection: &Arc<crate::Connection>,
+    hir: HirContext<'_>,
+    database_id: usize,
+    tbl: &BTreeTable,
+    idx: &Index,
+) -> crate::Result<Option<crate::translate::semantic_lowering::PlannedSelect>> {
+    let Some((schema, settings)) = hir else {
+        return Ok(None);
+    };
+    let Some(rowid_name) = ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
+        !tbl.columns().iter().any(|column| {
+            column
+                .name
+                .as_deref()
+                .is_some_and(|column| column.eq_ignore_ascii_case(name))
+        })
+    }) else {
+        return Ok(None);
+    };
+    let Some(database) = connection.get_database_name_by_index(database_id) else {
+        return Ok(None);
+    };
+    let table = || ast::Name::exact(tbl.name.clone());
+    let mut columns = Vec::with_capacity(idx.columns.len() + 1);
+    for column in &idx.columns {
+        // A virtual generated column's index entry holds its bound
+        // expression; name the column instead, and the SELECT computes it.
+        let value = if column.pos_in_table == EXPR_INDEX_SENTINEL {
+            let Some(expr) = &column.expr else {
+                return Err(LimboError::InternalError(format!(
+                    "expression index column of {} has no expression",
+                    idx.name
+                )));
+            };
+            expr.clone()
+        } else {
+            let Some(name) = tbl.columns()[column.pos_in_table].name.clone() else {
+                return Ok(None);
+            };
+            Box::new(Expr::Qualified(table(), ast::Name::exact(name)))
+        };
+        columns.push(ast::ResultColumn::Expr(value, None));
+    }
+    columns.push(ast::ResultColumn::Expr(
+        Box::new(Expr::Qualified(
+            table(),
+            ast::Name::exact(rowid_name.into()),
+        )),
+        None,
+    ));
+    // NOT INDEXED: REINDEX must read the table, never an index it rebuilds.
+    let select = ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns,
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        QualifiedName {
+                            db_name: Some(ast::Name::exact(database)),
+                            name: table(),
+                            alias: None,
+                        },
+                        None,
+                        Some(ast::Indexed::NotIndexed),
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: idx.where_clause.clone(),
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+    let select = crate::translate::semantic_lowering::PlannedSelect::new(
+        select, schema, settings, connection,
+    )?;
+    if select.decodes_stored_values() {
+        return Ok(None);
+    }
+    Ok(Some(select))
+}
+
+/// Emit a loop over the rows that fill `idx`. For each row, `body` gets the
+/// first of `idx.columns.len() + 1` registers: the index columns, then the
+/// rowid.
+#[allow(clippy::too_many_arguments)]
+fn emit_refill_rows(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    tbl: &Arc<BTreeTable>,
+    idx: &Index,
+    rows: &mut RefillRows,
+    mut body: impl FnMut(&mut ProgramBuilder, usize) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let columns = &idx.columns;
+    match rows {
+        RefillRows::Hir(select) => {
+            let yield_reg = program.alloc_register();
+            let after_definition = program.allocate_label();
+            let start = program.allocate_label();
+            program.emit_insn(Insn::InitCoroutine {
+                yield_reg,
+                jump_on_definition: after_definition,
+                start_offset: start,
+            });
+            program.preassign_label_to_next_insn(start);
+            let values = select.emit_rows(program, yield_reg, start)?;
+            program.emit_insn(Insn::EndCoroutine { yield_reg });
+            program.preassign_label_to_next_insn(after_definition);
+
+            let loop_start = program.allocate_label();
+            let loop_end = program.allocate_label();
+            program.preassign_label_to_next_insn(loop_start);
+            program.emit_insn(Insn::Yield {
+                yield_reg,
+                end_offset: loop_end,
+                subtype_clear_start_reg: 0,
+                subtype_clear_count: 0,
+            });
+            body(program, values)?;
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_start,
+            });
+            program.preassign_label_to_next_insn(loop_end);
+        }
+        RefillRows::Legacy {
+            table_cursor_id,
+            table_references,
+            where_clause,
+        } => {
+            let table_cursor_id = *table_cursor_id;
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: table_cursor_id,
+                root_page: tbl.root_page,
+                db: database_id,
+            });
+
+            let loop_start_label = program.allocate_label();
+            let loop_end_label = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: table_cursor_id,
+                pc_if_empty: loop_end_label,
+            });
+            program.preassign_label_to_next_insn(loop_start_label);
+
+            let mut skip_row_label = None;
+            if let Some(where_clause) = where_clause {
+                let label = program.allocate_label();
+                let condition_true_label = program.allocate_label();
+                translate_condition_expr(
+                    program,
+                    table_references,
+                    where_clause,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: label,
+                        jump_target_when_true: condition_true_label,
+                        jump_target_when_null: label,
+                    },
+                    resolver,
+                )?;
+                program.preassign_label_to_next_insn(condition_true_label);
+                skip_row_label = Some(label);
+            }
+
+            let start_reg = program.alloc_registers(columns.len() + 1);
+            for (i, col) in columns.iter().enumerate() {
+                emit_index_column_value_from_cursor(
+                    program,
+                    resolver,
+                    table_references,
+                    table_cursor_id,
+                    tbl,
+                    col,
+                    start_reg + i,
+                )?;
+            }
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: start_reg + columns.len(),
+            });
+            body(program, start_reg)?;
+
+            if let Some(skip_row_label) = skip_row_label {
+                program.preassign_label_to_next_insn(skip_row_label);
+            }
+            program.emit_insn(Insn::Next {
+                cursor_id: table_cursor_id,
+                pc_if_next: loop_start_label,
+                fullscan: false,
+            });
+            program.preassign_label_to_next_insn(loop_end_label);
+        }
+    }
+    Ok(())
+}
+
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
 ///
 /// `CREATE INDEX` calls this with a newly allocated root page. `REINDEX` calls it with
@@ -322,6 +552,8 @@ pub fn translate_create_index(
 fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    hir: HirContext<'_>,
     database_id: usize,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
@@ -329,127 +561,92 @@ fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let table_ref = program.table_reference_counter.next();
-    let table_cursor_id = program.alloc_cursor_id_keyed(
-        CursorKey::table(table_ref),
-        CursorType::BTreeTable(tbl.clone()),
-    );
-    let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
-    let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: tbl.columns().len(),
-    }));
+    let mut rows = match hir_refill_select(connection, hir, database_id, tbl, idx)? {
+        Some(select) => RefillRows::Hir(select),
+        None => {
+            let table_ref = program.table_reference_counter.next();
+            let table_cursor_id = program.alloc_cursor_id_keyed(
+                CursorKey::table(table_ref),
+                CursorType::BTreeTable(tbl.clone()),
+            );
+            let mut table_references = TableReferences::new(
+                vec![JoinedTable {
+                    op: Operation::Scan(Scan::BTreeTable {
+                        iter_dir: IterationDirection::Forwards,
+                        index: None,
+                    }),
+                    table: Table::BTree(tbl.clone()),
+                    identifier: normalize_ident(tbl.name.as_str()),
+                    internal_id: table_ref,
+                    join_info: None,
+                    col_used_mask: ColumnUsedMask::default(),
+                    column_use_counts: Vec::new(),
+                    expression_index_usages: Vec::new(),
+                    database_id,
+                    indexed: None,
+                }],
+                vec![],
+            );
+            let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
+            RefillRows::Legacy {
+                table_cursor_id,
+                table_references: Box::new(table_references),
+                where_clause: where_clause.map(Box::new),
+            }
+        }
+    };
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
-
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            op: Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
-            internal_id: table_ref,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id,
-            indexed: None,
-        }],
-        vec![],
-    );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
+    let mut cursors = vec![index_cursor_id];
+    if let RefillRows::Legacy {
+        table_cursor_id, ..
+    } = &rows
+    {
+        cursors.push(*table_cursor_id);
+    }
 
     if idx
         .index_method
         .as_ref()
         .is_some_and(|m| !m.definition().backing_btree)
     {
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor_id,
-            root_page: tbl.root_page,
-            db: database_id,
-        });
-
         program.emit_insn(Insn::OpenWrite {
             cursor_id: index_cursor_id,
             root_page: index_root_page,
             db: database_id,
         });
-
-        let loop_start_label = program.allocate_label();
-        let loop_end_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-        program.preassign_label_to_next_insn(loop_start_label);
-
-        let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
-            skip_row_label = Some(label);
-        }
-
-        let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
-            emit_index_column_value_from_cursor(
-                program,
-                resolver,
-                &mut table_references,
-                table_cursor_id,
-                tbl,
-                col,
-                start_reg + i,
-            )?;
-        }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
-            dest_reg: to_u32(record_reg),
-            index_name: Some(idx.name.clone()),
-            affinity_str: None,
-        });
-
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: index_cursor_id,
-            record_reg,
-            unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u32),
-            flags: IdxInsertFlags::new().use_seek(false),
-        });
-
-        if let Some(skip_row_label) = skip_row_label {
-            program.preassign_label_to_next_insn(skip_row_label);
-        }
-        program.emit_insn(Insn::Next {
-            cursor_id: table_cursor_id,
-            pc_if_next: loop_start_label,
-            fullscan: false,
-        });
-        program.preassign_label_to_next_insn(loop_end_label);
+        emit_refill_rows(
+            program,
+            resolver,
+            database_id,
+            tbl,
+            idx,
+            &mut rows,
+            |program, start_reg| {
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(start_reg),
+                    count: to_u32(columns.len() + 1),
+                    dest_reg: to_u32(record_reg),
+                    index_name: Some(idx.name.clone()),
+                    affinity_str: None,
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: index_cursor_id,
+                    record_reg,
+                    unpacked_start: Some(start_reg),
+                    unpacked_count: Some((columns.len() + 1) as u32),
+                    flags: IdxInsertFlags::new().use_seek(false),
+                });
+                Ok(())
+            },
+        )?;
     } else {
+        let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
+        let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: tbl.columns().len(),
+        }));
+        cursors.push(sorter_cursor_id);
         let order_collations_nulls = idx
             .columns
             .iter()
@@ -472,79 +669,29 @@ fn emit_refill_index(
             num_fields: columns.len() + 1,
         });
 
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor_id,
-            root_page: tbl.root_page,
-            db: database_id,
-        });
-
-        let loop_start_label = program.allocate_label();
-        let loop_end_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-        program.preassign_label_to_next_insn(loop_start_label);
-
-        let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
-            skip_row_label = Some(label);
-        }
-
-        let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
-            emit_index_column_value_from_cursor(
-                program,
-                resolver,
-                &mut table_references,
-                table_cursor_id,
-                tbl,
-                col,
-                start_reg + i,
-            )?;
-        }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
-            dest_reg: to_u32(record_reg),
-            index_name: Some(idx.name.clone()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::SorterInsert {
-            cursor_id: sorter_cursor_id,
-            record_reg,
-        });
-
-        if let Some(skip_row_label) = skip_row_label {
-            program.preassign_label_to_next_insn(skip_row_label);
-        }
-        program.emit_insn(Insn::Next {
-            cursor_id: table_cursor_id,
-            pc_if_next: loop_start_label,
-            fullscan: false,
-        });
-        program.preassign_label_to_next_insn(loop_end_label);
+        emit_refill_rows(
+            program,
+            resolver,
+            database_id,
+            tbl,
+            idx,
+            &mut rows,
+            |program, start_reg| {
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(start_reg),
+                    count: to_u32(columns.len() + 1),
+                    dest_reg: to_u32(record_reg),
+                    index_name: Some(idx.name.clone()),
+                    affinity_str: None,
+                });
+                program.emit_insn(Insn::SorterInsert {
+                    cursor_id: sorter_cursor_id,
+                    record_reg,
+                });
+                Ok(())
+            },
+        )?;
 
         if let Some(root) = clear_existing_root {
             program.emit_insn(Insn::ClearBtree {
@@ -614,7 +761,7 @@ fn emit_refill_index(
         program.preassign_label_to_next_insn(sorted_loop_end);
     }
 
-    program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
+    program.close_cursors(&cursors);
     Ok(())
 }
 
@@ -631,6 +778,7 @@ pub fn translate_reindex(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
+    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     if connection.mvcc_enabled() {
         bail_parse_error!("REINDEX is not supported in MVCC mode");
@@ -673,6 +821,8 @@ pub fn translate_reindex(
         emit_refill_index(
             program,
             resolver,
+            connection,
+            hir,
             database_id,
             &table,
             &index,

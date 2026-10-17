@@ -2186,3 +2186,49 @@ fn hir_create_table_as_select_matches_legacy() {
     };
     assert_ne!(program(true), program(false), "HIR plans the SELECT itself");
 }
+
+/// CREATE INDEX and REINDEX fill the index from a SELECT planned through
+/// HIR: plain, expression, partial and generated-column indexes, collations,
+/// a table whose `rowid` name is taken, and a UNIQUE index that fails.
+#[test]
+fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
+    let statements = [
+        "CREATE TABLE x(id INTEGER PRIMARY KEY, a TEXT, b INT, c REAL, v INT AS (a || '') VIRTUAL)",
+        "INSERT INTO x(id, a, b, c) VALUES (1, 'B', 3, 1.5), (2, 'a', 1, NULL), (3, NULL, 2, 2.5), \
+         (4, '12', NULL, 0), (5, 'A', 5, 9)",
+        "CREATE INDEX x1 ON x(a COLLATE NOCASE)",
+        "CREATE INDEX x2 ON x(b * 10 + 1) WHERE c > 1",
+        "CREATE INDEX x3 ON x(v, id)",
+        "CREATE INDEX x4 ON x(id, b DESC)",
+        "CREATE INDEX x5 ON x(lower(a)) WHERE a IS NOT NULL AND x.b < 4",
+        "CREATE TABLE r(rowid TEXT, z)",
+        "INSERT INTO r VALUES ('r1', 10), ('r2', 20)",
+        "CREATE INDEX r1 ON r(z, rowid)",
+        "REINDEX",
+        "REINDEX NOCASE",
+        "REINDEX x2",
+        "CREATE UNIQUE INDEX bad ON x(b % 2)",
+        "SELECT a FROM x INDEXED BY x1 WHERE a > 'a' ORDER BY a COLLATE NOCASE",
+        "SELECT id FROM x INDEXED BY x2 WHERE b * 10 + 1 > 0 AND c > 1",
+        "SELECT v, typeof(v), id FROM x INDEXED BY x3 WHERE v IS NOT NULL",
+        "SELECT id, b FROM x INDEXED BY x4 WHERE id > 0",
+        "SELECT lower(a) FROM x INDEXED BY x5 WHERE lower(a) > '' AND a IS NOT NULL AND x.b < 4",
+        "SELECT z, rowid FROM r INDEXED BY r1 WHERE z > 0",
+        "SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name",
+        "PRAGMA integrity_check",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE s(a, b)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(&conn, "EXPLAIN CREATE INDEX s2 ON s(a + 1) WHERE b > 0")
+    };
+    assert_ne!(
+        program(true),
+        program(false),
+        "HIR plans the SELECT that fills the index"
+    );
+}
