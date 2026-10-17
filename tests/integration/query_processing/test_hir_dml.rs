@@ -2232,3 +2232,68 @@ fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
         "HIR plans the SELECT that fills the index"
     );
 }
+
+/// ALTER TABLE ADD COLUMN checks the new column's CHECK constraints against
+/// every existing row, through a SELECT planned by HIR: the new column reads
+/// its default, and other columns read the row, as in SQLite. Legacy reads
+/// another column's name as text, so `c > b` compares 3 with 'b'.
+#[test]
+fn hir_alter_add_column_checks_each_row_like_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(a, b)",
+        "INSERT INTO t VALUES (1, 1), (2, 2)",
+        "ALTER TABLE t ADD COLUMN c INT DEFAULT 3 CHECK (c > b)",
+        "ALTER TABLE t ADD COLUMN d INT DEFAULT 3 CHECK (d < 10) CHECK (t.d + b > 4)",
+        "ALTER TABLE t ADD COLUMN e INT DEFAULT 3 CHECK (e + b < 5)",
+        "INSERT INTO t(a, b) VALUES (3, 9)",
+        "ALTER TABLE t ADD COLUMN f INT DEFAULT 3 CHECK (f > b)",
+        "CREATE TABLE empty(a)",
+        "ALTER TABLE empty ADD COLUMN c INT DEFAULT 3 CHECK (c > 4)",
+        "SELECT * FROM t ORDER BY a",
+        "SELECT * FROM empty",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// ATTACH and DETACH evaluate their arguments through HIR, so an argument
+/// may be any expression, a subquery too (legacy rejects one).
+#[test]
+fn hir_attach_evaluates_its_arguments() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_attach(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let dir = db
+        .path
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .replace('\'', "''");
+    for sql in [
+        format!("ATTACH '{dir}/' || 'aux1.db' AS 'a' || '1'"),
+        format!("ATTACH (SELECT '{dir}/aux2.db') AS a2"),
+        "CREATE TABLE a1.x(v)".to_string(),
+        "INSERT INTO a1.x VALUES (1)".to_string(),
+        "DETACH 'a' || '2'".to_string(),
+    ] {
+        conn.execute(&sql).unwrap();
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT name FROM pragma_database_list ORDER BY seq"),
+        vec![
+            vec![rusqlite::types::Value::Text("main".into())],
+            vec![rusqlite::types::Value::Text("a1".into())],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT v FROM a1.x"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}

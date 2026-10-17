@@ -362,7 +362,7 @@ fn hir_refill_select(
         return Ok(None);
     };
     let table = || ast::Name::exact(tbl.name.clone());
-    let mut columns = Vec::with_capacity(idx.columns.len() + 1);
+    let mut values = Vec::with_capacity(idx.columns.len() + 1);
     for column in &idx.columns {
         // A virtual generated column's index entry holds its bound
         // expression; name the column instead, and the SELECT computes it.
@@ -373,52 +373,27 @@ fn hir_refill_select(
                     idx.name
                 )));
             };
-            expr.clone()
+            *expr.clone()
         } else {
             let Some(name) = tbl.columns()[column.pos_in_table].name.clone() else {
                 return Ok(None);
             };
-            Box::new(Expr::Qualified(table(), ast::Name::exact(name)))
+            Expr::Qualified(table(), ast::Name::exact(name))
         };
-        columns.push(ast::ResultColumn::Expr(value, None));
+        values.push(value);
     }
-    columns.push(ast::ResultColumn::Expr(
-        Box::new(Expr::Qualified(
-            table(),
-            ast::Name::exact(rowid_name.into()),
-        )),
-        None,
+    values.push(Expr::Qualified(
+        table(),
+        ast::Name::exact(rowid_name.into()),
     ));
-    // NOT INDEXED: REINDEX must read the table, never an index it rebuilds.
-    let select = ast::Select {
-        with: None,
-        body: ast::SelectBody {
-            select: ast::OneSelect::Select {
-                distinctness: None,
-                columns,
-                from: Some(ast::FromClause {
-                    select: Box::new(ast::SelectTable::Table(
-                        QualifiedName {
-                            db_name: Some(ast::Name::exact(database)),
-                            name: table(),
-                            alias: None,
-                        },
-                        None,
-                        Some(ast::Indexed::NotIndexed),
-                    )),
-                    joins: vec![],
-                }),
-                where_clause: idx.where_clause.clone(),
-                group_by: None,
-                window_clause: vec![],
-            },
-            compounds: vec![],
-        },
-        order_by: vec![],
-        limit: None,
-    };
-    let select = crate::translate::semantic_lowering::PlannedSelect::new(
-        select, schema, settings, connection,
+    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+        values,
+        database,
+        tbl.name.clone(),
+        idx.where_clause.clone(),
+        schema,
+        settings,
+        connection,
     )?;
     if select.decodes_stored_values() {
         return Ok(None);
@@ -437,39 +412,11 @@ fn emit_refill_rows(
     tbl: &Arc<BTreeTable>,
     idx: &Index,
     rows: &mut RefillRows,
-    mut body: impl FnMut(&mut ProgramBuilder, usize) -> crate::Result<()>,
+    body: impl FnOnce(&mut ProgramBuilder, usize) -> crate::Result<()>,
 ) -> crate::Result<()> {
     let columns = &idx.columns;
     match rows {
-        RefillRows::Hir(select) => {
-            let yield_reg = program.alloc_register();
-            let after_definition = program.allocate_label();
-            let start = program.allocate_label();
-            program.emit_insn(Insn::InitCoroutine {
-                yield_reg,
-                jump_on_definition: after_definition,
-                start_offset: start,
-            });
-            program.preassign_label_to_next_insn(start);
-            let values = select.emit_rows(program, yield_reg, start)?;
-            program.emit_insn(Insn::EndCoroutine { yield_reg });
-            program.preassign_label_to_next_insn(after_definition);
-
-            let loop_start = program.allocate_label();
-            let loop_end = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_start);
-            program.emit_insn(Insn::Yield {
-                yield_reg,
-                end_offset: loop_end,
-                subtype_clear_start_reg: 0,
-                subtype_clear_count: 0,
-            });
-            body(program, values)?;
-            program.emit_insn(Insn::Goto {
-                target_pc: loop_start,
-            });
-            program.preassign_label_to_next_insn(loop_end);
-        }
+        RefillRows::Hir(select) => select.emit_each_row(program, body)?,
         RefillRows::Legacy {
             table_cursor_id,
             table_references,

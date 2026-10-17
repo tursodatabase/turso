@@ -134,6 +134,7 @@ pub(super) fn needs_legacy(
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
 /// root or one command of a trigger in it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_update(
     program: &mut ProgramBuilder,
     plan: &HirPlan,

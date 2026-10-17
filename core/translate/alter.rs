@@ -727,6 +727,11 @@ fn emit_add_column_check_validation(
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    hir: Option<(
+        &Arc<crate::schema::Schema>,
+        &crate::translate::semantic_lowering::HirSettings<'_>,
+    )>,
     database_id: usize,
 ) -> Result<()> {
     // Determine the effective default value. If no DEFAULT, existing rows get NULL,
@@ -775,6 +780,99 @@ fn emit_add_column_check_validation(
     let table_name = &btree.name;
     let col_name_lower = normalize_ident(new_column_name);
 
+    // Each CHECK with references to the new column replaced by the default.
+    let substituted: Vec<ast::Expr> = all_checks
+        .iter()
+        .map(|(_, _, check_expr)| {
+            let mut substituted = *check_expr.clone();
+            let _ = walk_expr_mut(
+                &mut substituted,
+                &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+                    match e {
+                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
+                            *e = default_expr.clone();
+                            Ok(WalkControl::SkipChildren)
+                        }
+                        ast::Expr::Qualified(tbl, col)
+                            if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
+                                && normalize_ident(col.as_str()) == col_name_lower =>
+                        {
+                            *e = default_expr.clone();
+                            Ok(WalkControl::SkipChildren)
+                        }
+                        _ => Ok(WalkControl::Continue),
+                    }
+                },
+            );
+            substituted
+        })
+        .collect();
+
+    // CHECK passes if the result is NULL or non-zero (truthy); otherwise halt
+    // with a constraint error. SQLite reports the constraint name, or the
+    // expression's source text as written.
+    let emit_check = |program: &mut ProgramBuilder,
+                      result_reg: usize,
+                      (constraint_name, check_source, check_expr): &(
+        Option<String>,
+        Option<String>,
+        Box<ast::Expr>,
+    )| {
+        let check_passed_label = program.allocate_label();
+
+        program.emit_insn(Insn::IsNull {
+            reg: result_reg,
+            target_pc: check_passed_label,
+        });
+
+        program.emit_insn(Insn::If {
+            reg: result_reg,
+            target_pc: check_passed_label,
+            jump_if_null: false,
+        });
+
+        let name = match (constraint_name, check_source) {
+            (Some(name), _) => name.clone(),
+            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, None) => format!("{check_expr}"),
+        };
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: name,
+            on_error: None,
+            description_reg: None,
+        });
+
+        program.preassign_label_to_next_insn(check_passed_label);
+    };
+
+    // With HIR, every existing row is checked, with its other columns read
+    // from the row, as SQLite's check of the altered table does.
+    if let Some((schema, settings)) = hir {
+        let database = connection
+            .get_database_name_by_index(database_id)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!("no database with id {database_id}"))
+            })?;
+        let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+            substituted.clone(),
+            database,
+            original_btree.name.clone(),
+            None,
+            schema,
+            settings,
+            connection,
+        )?;
+        if !select.decodes_stored_values() {
+            return select.emit_each_row(program, |program, values| {
+                for (i, check) in all_checks.iter().enumerate() {
+                    emit_check(program, values + i, check);
+                }
+                Ok(())
+            });
+        }
+    }
+
     // Open the table to check if it has rows.
     let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -790,62 +888,10 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_source, check_expr) in &all_checks {
-        let mut substituted = *check_expr.clone();
-
-        // Replace references to the new column with the default value expression.
-        let _ = walk_expr_mut(
-            &mut substituted,
-            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                match e {
-                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    ast::Expr::Qualified(tbl, col)
-                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                            && normalize_ident(col.as_str()) == col_name_lower =>
-                    {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            },
-        );
-
+    for (check, substituted) in all_checks.iter().zip(&substituted) {
         let result_reg = program.alloc_register();
-        translate_expr(program, None, &substituted, result_reg, resolver)?;
-
-        // CHECK passes if the result is NULL or non-zero (truthy).
-        let check_passed_label = program.allocate_label();
-
-        program.emit_insn(Insn::IsNull {
-            reg: result_reg,
-            target_pc: check_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: result_reg,
-            target_pc: check_passed_label,
-            jump_if_null: false,
-        });
-
-        // CHECK failed -- halt with constraint error. SQLite reports the
-        // constraint name, or the expression's source text as written.
-        let name = match (constraint_name, check_source) {
-            (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
-            (None, None) => format!("{check_expr}"),
-        };
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: name,
-            on_error: None,
-            description_reg: None,
-        });
-
-        program.preassign_label_to_next_insn(check_passed_label);
+        translate_expr(program, None, substituted, result_reg, resolver)?;
+        emit_check(program, result_reg, check);
     }
 
     program.preassign_label_to_next_insn(skip_check_label);
@@ -1531,6 +1577,8 @@ pub fn translate_alter_table(
                     &column,
                     &constraints,
                     resolver,
+                    connection,
+                    hir,
                     database_id,
                 )?;
             }

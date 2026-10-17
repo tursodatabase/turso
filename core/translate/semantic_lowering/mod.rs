@@ -83,6 +83,138 @@ impl PlannedSelect {
         Ok(Self { plan, query })
     }
 
+    /// `SELECT <values>`, without FROM: how a schema statement evaluates
+    /// expressions that read no table, such as the arguments of ATTACH.
+    pub(crate) fn values(
+        values: Vec<ast::Expr>,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let select = Self::select(values, None, None);
+        Self::new(select, schema, settings, connection)
+    }
+
+    /// `SELECT <values> FROM <database>.<table> NOT INDEXED [WHERE <filter>]`:
+    /// how a schema statement reads every row of a table. NOT INDEXED keeps
+    /// it reading the table itself, never one of its indexes.
+    pub(crate) fn scan(
+        values: Vec<ast::Expr>,
+        database: String,
+        table: String,
+        filter: Option<Box<ast::Expr>>,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let from = ast::FromClause {
+            select: Box::new(ast::SelectTable::Table(
+                ast::QualifiedName {
+                    db_name: Some(ast::Name::exact(database)),
+                    name: ast::Name::exact(table),
+                    alias: None,
+                },
+                None,
+                Some(ast::Indexed::NotIndexed),
+            )),
+            joins: vec![],
+        };
+        let select = Self::select(values, Some(from), filter);
+        Self::new(select, schema, settings, connection)
+    }
+
+    fn select(
+        values: Vec<ast::Expr>,
+        from: Option<ast::FromClause>,
+        where_clause: Option<Box<ast::Expr>>,
+    ) -> ast::Select {
+        ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: values
+                        .into_iter()
+                        .map(|value| ast::ResultColumn::Expr(Box::new(value), None))
+                        .collect(),
+                    from,
+                    where_clause,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Emit a loop over the SELECT's rows, which runs as a coroutine. For
+    /// each row, `body` gets the first of the registers holding its columns.
+    pub(crate) fn emit_each_row(
+        &self,
+        program: &mut ProgramBuilder,
+        body: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
+    ) -> Result<()> {
+        use crate::vdbe::insn::Insn;
+        let yield_reg = program.alloc_register();
+        let after_definition = program.allocate_label();
+        let start = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition: after_definition,
+            start_offset: start,
+        });
+        program.preassign_label_to_next_insn(start);
+        let values = self.emit_rows(program, yield_reg, start)?;
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(after_definition);
+
+        let loop_start = program.allocate_label();
+        let loop_end = program.allocate_label();
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: loop_end,
+            subtype_clear_start_reg: 0,
+            subtype_clear_count: 0,
+        });
+        body(program, values)?;
+        program.emit_insn(Insn::Goto {
+            target_pc: loop_start,
+        });
+        program.preassign_label_to_next_insn(loop_end);
+        Ok(())
+    }
+
+    /// Run the SELECT once and write its first row into the returned
+    /// registers, one per column; they are NULL when it returns no row.
+    pub(crate) fn emit_values(&self, program: &mut ProgramBuilder) -> Result<usize> {
+        let width = self
+            .plan
+            .document
+            .query(self.query)
+            .map_or(0, |query| query.output.len());
+        let values = program.alloc_registers(width.max(1));
+        program.emit_insn(crate::vdbe::insn::Insn::Null {
+            dest: values,
+            dest_end: (width > 1).then(|| values + width - 1),
+        });
+        program.set_hir_plan(self.plan.clone());
+        program.nested(|program| {
+            query::emit_planned_query_body(
+                program,
+                &self.plan,
+                self.query,
+                &QueryDestination::RowValueSubqueryResult {
+                    result_reg_start: values,
+                    num_regs: width,
+                },
+            )
+        })?;
+        Ok(values)
+    }
+
     /// Whether the SELECT reads a column whose stored value it would decode:
     /// a custom type or an array. An index stores the encoded value, so its
     /// refill cannot read such a column through a SELECT.
