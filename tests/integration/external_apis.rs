@@ -977,6 +977,18 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     assert!(err
         .to_string()
         .contains("custom collations are not supported"));
+    let err = conn
+        .execute("CREATE TABLE bad(value TEXT, UNIQUE(value COLLATE dotnet_nocase))")
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("custom collations are not supported"));
+    let err = conn
+        .execute("CREATE TABLE bad(value TEXT, PRIMARY KEY(value COLLATE dotnet_nocase))")
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("custom collations are not supported"));
 
     conn.execute("CREATE TABLE left_values(value TEXT)")?;
     conn.execute("CREATE TABLE right_values(value TEXT)")?;

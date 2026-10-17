@@ -321,7 +321,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ... OVER (...)            | 🚧 Partial | Supported for aggregate functions and ROW_NUMBER() |
 | (expr)                    | ✅ Yes     |                                          |
 | CAST (expr AS type)       | ✅ Yes     |                                          |
-| COLLATE                   | 🚧 Partial | Custom collations not supported. **Bug:** unknown collation names are silently treated as the default instead of erroring (SQLite errors with "no such collation sequence"). |
+| COLLATE                   | 🚧 Partial | `CREATE TABLE` and `CREATE INDEX` reject custom collations on columns. A database created elsewhere with one opens, but indexes and WITHOUT ROWID tables using it cannot be used. |
 | (NOT) LIKE                | ✅ Yes     |                                          |
 | (NOT) GLOB                | ✅ Yes     |                                          |
 | (NOT) REGEXP              | ✅ Yes     |                                          |

@@ -871,6 +871,7 @@ fn join_lhs_and_rhs<'a>(
                     subqueries,
                     joined_tables,
                     params,
+                    table_references,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -4528,6 +4529,7 @@ mod tests {
             &[],
             table_references.joined_tables(),
             &DEFAULT_PARAMS,
+            &table_references,
         )
         .unwrap()
         .unwrap();
