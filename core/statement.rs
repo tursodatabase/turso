@@ -953,9 +953,10 @@ impl Statement {
                 vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions(crate::io::Completion::new_yield())
-                    });
+                    let io = self.state.io_completions.as_ref().map_or_else(
+                        || crate::types::IOCompletions(crate::io::Completion::new_yield()),
+                        |io| crate::types::IOCompletions(io.0.clone()),
+                    );
                     return Ok(crate::IOResult::IO(io));
                 }
                 vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
@@ -986,9 +987,10 @@ impl Statement {
                     func(self.row().expect("row should be present"))?;
                 }
                 vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions(crate::io::Completion::new_yield())
-                    });
+                    let io = self.state.io_completions.as_ref().map_or_else(
+                        || crate::types::IOCompletions(crate::io::Completion::new_yield()),
+                        |io| crate::types::IOCompletions(io.0.clone()),
+                    );
                     return Ok(crate::IOResult::IO(io));
                 }
                 vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt.into()),

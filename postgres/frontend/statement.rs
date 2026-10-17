@@ -38,6 +38,7 @@ pub(crate) fn with_execution(
 ) -> Statement {
     Statement {
         conn,
+        sql: stmt.get_sql().to_owned(),
         inner: stmt,
         execution_done: plan.is_none(),
         plan,
@@ -50,6 +51,7 @@ pub(crate) fn with_execution(
 
 pub struct Statement {
     conn: Arc<PgConnectionInner>,
+    pub(crate) sql: String,
     inner: CoreStatement,
     plan: Option<Plan>,
     operation: Option<Operation>,
@@ -60,6 +62,22 @@ pub struct Statement {
 }
 
 impl Statement {
+    pub fn get_sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub fn readonly(&self) -> bool {
+        match &self.plan {
+            Some(Plan::CopyTo { .. }) => true,
+            Some(_) => false,
+            None => self.inner.get_program().is_readonly(),
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        self.operation.is_some() || self.inner.execution_state().is_running()
+    }
+
     pub fn step(&mut self) -> Result<StepResult> {
         self.step_inner(None)
     }
@@ -159,11 +177,11 @@ impl Statement {
     }
 
     fn prepare_execution(&mut self) -> IOResultOr<()> {
-        if self.interrupted || self.conn.conn.is_interrupted() {
-            return Err(LimboError::Interrupt.into());
-        }
         if self.execution_done {
             return Ok(IOResult::Done(()));
+        }
+        if self.interrupted || self.conn.conn.is_interrupted() {
+            return Err(LimboError::Interrupt.into());
         }
         if self.operation.is_none() {
             self.operation = Some(Operation::new(&self.conn, self.plan.as_ref().unwrap())?);
