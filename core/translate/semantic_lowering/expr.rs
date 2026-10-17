@@ -257,6 +257,8 @@ struct LoweringContext {
     registers: ExprRegisters,
     /// How this expression avoids being computed again on every row.
     hoisted: Option<Hoisted>,
+    /// Whether an enclosing operand is computed once already.
+    in_hoisted: bool,
 }
 
 impl LoweringContext {
@@ -265,6 +267,7 @@ impl LoweringContext {
             target,
             registers: ExprRegisters::None,
             hoisted: None,
+            in_hoisted: false,
         }
     }
 }
@@ -272,7 +275,8 @@ impl LoweringContext {
 /// A constant operand computed once, as legacy computes it.
 #[derive(Clone, Copy)]
 enum Hoisted {
-    /// A literal, moved before the loops by this constant span.
+    /// An operand without a function call, moved before the loops by this
+    /// constant span.
     Span(usize),
     /// Anything else, which might fail, computed the first time it is
     /// reached and kept in its own register: `Once` jumps here after that.
@@ -1731,6 +1735,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             _ => return Ok(ControlFlow::Break(())),
         };
         let mut child_context = LoweringContext::new(target);
+        child_context.in_hoisted = context.in_hoisted || context.hoisted.is_some();
         // The operands of an ordinary operator or function each have their
         // own register, which nothing else writes.
         let own_register = match parent {
@@ -1742,7 +1747,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             }
             _ => false,
         };
-        if own_register {
+        if own_register && !child_context.in_hoisted {
             child_context.hoisted = self.begin_hoisted_constant(child);
         }
         Ok(ControlFlow::Continue(child_context))
@@ -1768,25 +1773,37 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// Like legacy, an operand with the same value on every row, such as
     /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
-    /// computed again for each row. A literal moves before the loops. Any
-    /// other constant might fail, as `abs(-9223372036854775808)` does, so it
-    /// still runs only where it is first reached, as SQLite's does.
+    /// computed again for each row. Without a function call or a CAST to a
+    /// custom type it cannot fail, so it moves before the loops. A function
+    /// might fail, as `abs(-9223372036854775808)` does, so an operand that
+    /// calls one still runs only where it is first reached, as SQLite's does.
     fn begin_hoisted_constant(&mut self, operand: &hir::Expr) -> Option<Hoisted> {
-        if self.program.constant_span_is_open() || !hir_expr_is_constant(self.program, operand) {
+        if self.program.constant_span_is_open()
+            || matches!(operand, hir::Expr::Parameter(_))
+            || !hir_expr_is_constant(self.program, operand)
+        {
             return None;
         }
-        match operand {
-            hir::Expr::Literal(_) => Some(Hoisted::Span(self.program.constant_span_start())),
-            // One instruction either way.
-            hir::Expr::Parameter(_) => None,
-            _ => {
-                let done = self.program.allocate_label();
-                self.program.emit_insn(Insn::Once {
-                    target_pc_when_reentered: done,
-                });
-                Some(Hoisted::Once(done))
-            }
+        // A CAST to a custom type runs its encoder and domain checks, which
+        // may fail like a function.
+        let mut may_fail = false;
+        operand.for_each(&mut |expression| {
+            may_fail |= match expression {
+                hir::Expr::Function(_) => true,
+                hir::Expr::Cast { target, .. } => {
+                    !target.programs.encode.is_empty() || target.programs.domain.is_some()
+                }
+                _ => false,
+            };
+        });
+        if !may_fail {
+            return Some(Hoisted::Span(self.program.constant_span_start()));
         }
+        let done = self.program.allocate_label();
+        self.program.emit_insn(Insn::Once {
+            target_pc_when_reentered: done,
+        });
+        Some(Hoisted::Once(done))
     }
 
     fn post_order_value(

@@ -11087,13 +11087,14 @@ pub(super) mod tests {
 
     #[test]
     fn planned_left_join_builds_and_probes_automatic_index() {
-        // An outer join keeps the automatic index; an inner join would look
-        // its rows up in a hash table instead.
+        // `r` follows a NULL-extended loop, so it seeks an automatic index;
+        // `m`, after a plain scan, looks its rows up in a hash table.
         let plan = analyze_plan(
             automatic_join_schema(),
             "SELECT l.value, r.extra \
              FROM left_items AS l NOT INDEXED \
-             LEFT JOIN right_items AS r ON r.value = l.value",
+             LEFT JOIN right_items AS m ON m.value = l.value \
+             LEFT JOIN right_items AS r ON r.value = m.value",
         );
         let query = root_query(&plan.document);
         let block_plan = &plan
@@ -11120,7 +11121,7 @@ pub(super) mod tests {
             scan_cursor,
             table_cursor,
         } = program
-            .source_binding(block_plan.loops[1].source)
+            .source_binding(block_plan.loops[2].source)
             .copied()
             .expect("automatic-index source is bound")
         else {
@@ -11232,7 +11233,7 @@ pub(super) mod tests {
                     index: Some(index), ..
                 },
             ..
-        } = &block_plan.loops[1].access
+        } = &block_plan.loops[2].access
         else {
             panic!("right join source uses an automatic-index seek");
         };
@@ -11459,11 +11460,13 @@ pub(super) mod tests {
 
     #[test]
     fn left_join_uses_automatic_index_and_null_extends_its_scan_cursor() {
+        // `r` follows a NULL-extended loop, so it seeks an automatic index.
         let plan = analyze_plan(
             automatic_join_schema(),
             "SELECT l.value, r.extra \
              FROM left_items AS l NOT INDEXED \
-             LEFT JOIN right_items AS r ON r.value = l.value",
+             LEFT JOIN right_items AS m ON m.value = l.value \
+             LEFT JOIN right_items AS r ON r.value = m.value",
         );
         let query = root_query(&plan.document);
         let block_plan = &plan
@@ -11476,7 +11479,7 @@ pub(super) mod tests {
                     index: Some(index), ..
                 },
             ..
-        } = &block_plan.loops[1].access
+        } = &block_plan.loops[2].access
         else {
             panic!("right source uses an automatic-index seek");
         };
@@ -11487,7 +11490,7 @@ pub(super) mod tests {
             .expect("automatic-index LEFT JOIN emits");
 
         let SourceBinding::BTree { scan_cursor, .. } = program
-            .source_binding(block_plan.loops[1].source)
+            .source_binding(block_plan.loops[2].source)
             .copied()
             .expect("right source is bound")
         else {
