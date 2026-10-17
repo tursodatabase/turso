@@ -1093,6 +1093,16 @@ impl ProgramBuilder {
             .push((std::ptr::from_ref(expression) as usize, register));
     }
 
+    /// How many expression registers are bound, to drop the ones bound
+    /// after this point with [Self::truncate_expression_registers].
+    pub(crate) fn expression_register_count(&self) -> usize {
+        self.expression_registers.len()
+    }
+
+    pub(crate) fn truncate_expression_registers(&mut self, count: usize) {
+        self.expression_registers.truncate(count);
+    }
+
     pub(crate) fn expression_register(
         &self,
         expression: &crate::translate::semantic::hir::Expr,

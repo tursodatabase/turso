@@ -1350,7 +1350,13 @@ needed after the scan, preserving SQLite first-row and empty-input behavior
 without forcing unused columns into covering-index plans. As in SQLite, and
 unlike legacy, a query with exactly one min() or max() aggregate, grouped or
 not, takes its bare columns from a row holding the aggregate's value: the
-first row, then each row whose value changes the aggregate. Ordered-set
+first row, then each row whose value changes the aggregate. Also unlike
+legacy, which rejects it, an aggregate's arguments may have an ORDER BY, as
+in SQLite: `group_concat(a ORDER BY b)` keeps each row's ORDER BY values, a
+sequence number and its arguments in an ephemeral index, and steps through
+it in order when it is finalized, per group in a grouped query. Tied rows
+keep their order, and DISTINCT keeps the first of equal arguments in that
+order. A window call still rejects it, with legacy's error. Ordered-set
 percentile aggregates evaluate their direct fraction once before opening the
 input scan, reject local-row and subquery dependencies with the legacy error,
 and reuse the same range-check and aggregate-step opcode helpers as legacy

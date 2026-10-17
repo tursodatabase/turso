@@ -342,6 +342,18 @@ struct HirAggregateRuntime<'a> {
     accumulator: usize,
     distinct: Option<HirAggregateDistinctSet>,
     percentile_fraction: Option<usize>,
+    ordered: Option<HirOrderedArguments>,
+}
+
+/// The rows of an aggregate with an argument ORDER BY, as SQLite keeps them:
+/// an ephemeral index of each row's ORDER BY values, a sequence number that
+/// keeps tied rows in the order they came, and the arguments. The aggregate
+/// steps through it in order when it is finalized.
+struct HirOrderedArguments {
+    cursor: CursorID,
+    terms: usize,
+    values: usize,
+    sequence: usize,
 }
 
 struct HirAggregateState<'a> {
@@ -2160,6 +2172,13 @@ fn reset_hir_group_aggregates(program: &mut ProgramBuilder, state: &HirAggregate
             dest: aggregate.accumulator,
             dest_end: None,
         });
+        if let Some(ordered) = &aggregate.ordered {
+            // Opening the open index again empties it.
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: ordered.cursor,
+                is_table: false,
+            });
+        }
         if let Some(distinct) = &aggregate.distinct {
             program.emit_insn(Insn::HashClear {
                 hash_table_id: distinct.hash_table,
@@ -2356,7 +2375,7 @@ fn emit_hir_group_result(
     });
 
     program.preassign_label_to_next_insn(runtime.state.finalize_group);
-    finalize_hir_aggregates(program, &runtime.aggregates)?;
+    finalize_hir_aggregates(program, document, &runtime.aggregates)?;
     bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Group);
     bind_hir_group_key_registers(program, query, block, runtime);
     if let Some(having) = &runtime.grouping.having {
@@ -2412,7 +2431,7 @@ fn emit_hir_aggregate_result(
     block_done: BranchOffset,
     state: &HirAggregateState<'_>,
 ) -> Result<()> {
-    finalize_hir_aggregates(program, state)?;
+    finalize_hir_aggregates(program, document, state)?;
     let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
         unreachable!("aggregate block is a SELECT")
     };
@@ -3579,11 +3598,23 @@ fn initialize_hir_aggregates<'a>(
         } else {
             None
         };
+        let ordered = match &call.arguments {
+            hir::FunctionArguments::Expressions {
+                values, order_by, ..
+            } if !order_by.is_empty() => Some(open_hir_ordered_arguments(
+                program,
+                index,
+                values.len(),
+                order_by,
+            )?),
+            _ => None,
+        };
         aggregates.push(HirAggregateRuntime {
             call,
             accumulator,
             distinct,
             percentile_fraction,
+            ordered,
         });
     }
     let mut bare = HirBareAggregateColumnCollector {
@@ -3649,6 +3680,10 @@ fn hir_min_max_row(
     let [(aggregate, function)] = min_max.as_slice() else {
         return Ok(None);
     };
+    // Its value is known only once its kept rows are stepped.
+    if aggregate.ordered.is_some() {
+        return Ok(None);
+    }
     let hir::FunctionArguments::Expressions { values, facts, .. } = &aggregate.call.arguments
     else {
         return Ok(None);
@@ -3730,6 +3765,186 @@ fn emit_hir_bare_row_test(
     });
 }
 
+fn open_hir_ordered_arguments(
+    program: &mut ProgramBuilder,
+    aggregate: usize,
+    values: usize,
+    order_by: &[hir::OrderTerm],
+) -> Result<HirOrderedArguments> {
+    // An index orders by collation only, not by a custom type's order.
+    if order_by.iter().any(|term| {
+        crate::translate::order_by::custom_type_comparator_from_type_fact(&term.type_fact).is_some()
+    }) {
+        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
+    }
+    let column = |position: usize, order: SortOrder, nulls_order, collation| IndexColumn {
+        name: format!("c{position}"),
+        order,
+        nulls_order,
+        pos_in_table: position,
+        collation,
+        default: None,
+        expr: None,
+    };
+    let mut columns = order_by
+        .iter()
+        .enumerate()
+        .map(|(position, term)| {
+            column(
+                position,
+                term.order,
+                term.nulls,
+                term.collation.as_ref().map(|collation| *collation.value()),
+            )
+        })
+        .collect::<Vec<_>>();
+    for position in order_by.len()..order_by.len() + 1 + values {
+        columns.push(column(position, SortOrder::Asc, None, None));
+    }
+    let index = Arc::new(Index {
+        columns,
+        name: format!("ephemeral_aggregate_order_{aggregate}"),
+        table_name: String::new(),
+        root_page: 0,
+        unique: false,
+        ephemeral: true,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: false,
+    });
+    let sequence = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: sequence,
+    });
+    Ok(HirOrderedArguments {
+        cursor,
+        terms: order_by.len(),
+        values,
+        sequence,
+    })
+}
+
+/// Keep one row of an aggregate with an argument ORDER BY for later.
+fn emit_hir_ordered_argument_row(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    call: &hir::FunctionCall,
+    ordered: &HirOrderedArguments,
+) -> Result<()> {
+    let hir::FunctionArguments::Expressions {
+        values, order_by, ..
+    } = &call.arguments
+    else {
+        return Err(LimboError::InternalError(
+            "HIR ordered aggregate has no argument expressions".into(),
+        ));
+    };
+    let width = ordered.terms + 1 + ordered.values;
+    let start = program.alloc_registers(width);
+    for (position, term) in order_by.iter().enumerate() {
+        super::expr::translate_expr(program, document, &term.expr, start + position)?;
+    }
+    program.emit_insn(Insn::AddImm {
+        register: ordered.sequence,
+        value: 1,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: ordered.sequence,
+        dst_reg: start + ordered.terms,
+        extra_amount: 0,
+    });
+    for (position, value) in values.iter().enumerate() {
+        super::expr::translate_expr(
+            program,
+            document,
+            value,
+            start + ordered.terms + 1 + position,
+        )?;
+    }
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(start),
+        count: to_u32(width),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: ordered.cursor,
+        record_reg: record,
+        unpacked_start: Some(start),
+        unpacked_count: Some(to_u32(width)),
+        flags: crate::vdbe::insn::IdxInsertFlags::new(),
+    });
+    Ok(())
+}
+
+/// Step an aggregate with an argument ORDER BY through its kept rows, in
+/// order. DISTINCT keeps the first of equal arguments in that order.
+fn emit_hir_ordered_aggregate_steps(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    aggregate: &HirAggregateRuntime<'_>,
+    ordered: &HirOrderedArguments,
+) -> Result<()> {
+    let hir::FunctionArguments::Expressions { values, .. } = &aggregate.call.arguments else {
+        return Err(LimboError::InternalError(
+            "HIR ordered aggregate has no argument expressions".into(),
+        ));
+    };
+    let done = program.allocate_label();
+    let row = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: ordered.cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(row);
+    let bound = program.expression_register_count();
+    let start = program.alloc_registers(ordered.values.max(1));
+    for (position, value) in values.iter().enumerate() {
+        program.emit_insn(Insn::Column {
+            cursor_id: ordered.cursor,
+            column: ordered.terms + 1 + position,
+            dest: start + position,
+            default: None,
+        });
+        program.bind_expression_register(value, start + position);
+    }
+    let distinct = aggregate
+        .distinct
+        .as_ref()
+        .map(|distinct| HirAggregateDistinct {
+            hash_table: distinct.hash_table,
+            collation: distinct.collation,
+            on_conflict: program.allocate_label(),
+        });
+    crate::translate::aggregation::translate_hir_sorted_aggregation_step(
+        program,
+        document,
+        aggregate.call,
+        aggregate.accumulator,
+        distinct.as_ref(),
+    )?;
+    if let Some(distinct) = &distinct {
+        program.preassign_label_to_next_insn(distinct.on_conflict);
+    }
+    program.truncate_expression_registers(bound);
+    program.emit_insn(Insn::Next {
+        cursor_id: ordered.cursor,
+        pc_if_next: row,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
 fn validate_hir_percentile_fraction(
     document: &HirDocument,
     block: &hir::QueryBlock,
@@ -3762,6 +3977,23 @@ fn emit_hir_aggregate_steps(
 ) -> Result<()> {
     for aggregate in &state.aggregates {
         let filter = aggregate.call.evaluation.filter();
+        if let Some(ordered) = &aggregate.ordered {
+            let skip = filter.map(|_| program.allocate_label());
+            if let (Some(filter), Some(skip)) = (filter, skip) {
+                let register = program.alloc_register();
+                super::expr::translate_expr(program, document, filter, register)?;
+                program.emit_insn(Insn::IfNot {
+                    reg: register,
+                    target_pc: skip,
+                    jump_if_null: true,
+                });
+            }
+            emit_hir_ordered_argument_row(program, document, aggregate.call, ordered)?;
+            if let Some(skip) = skip {
+                program.preassign_label_to_next_insn(skip);
+            }
+            continue;
+        }
         let distinct = aggregate
             .distinct
             .as_ref()
@@ -3800,8 +4032,14 @@ fn emit_hir_aggregate_steps(
 
 fn finalize_hir_aggregates(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     state: &HirAggregateState<'_>,
 ) -> Result<()> {
+    for aggregate in &state.aggregates {
+        if let Some(ordered) = &aggregate.ordered {
+            emit_hir_ordered_aggregate_steps(program, document, aggregate, ordered)?;
+        }
+    }
     for aggregate in &state.aggregates {
         program.emit_insn(Insn::AggFinal {
             register: aggregate.accumulator,

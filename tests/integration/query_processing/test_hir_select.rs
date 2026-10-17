@@ -1368,3 +1368,51 @@ fn hir_bare_columns_come_from_the_min_or_max_row() {
         assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
     }
 }
+
+/// Like SQLite, an aggregate's arguments may be ordered: `group_concat(a
+/// ORDER BY b)` keeps each row's ORDER BY values and arguments in an
+/// ephemeral index and steps through it in order when it is finalized, per
+/// group in a grouped query. Tied rows keep their order, and DISTINCT keeps
+/// the first of equal arguments in that order. Legacy rejects it.
+#[test]
+fn hir_aggregate_arguments_follow_their_order_by() {
+    const SCHEMA: &str = "
+        CREATE TABLE t(g, a, b, c TEXT);
+        INSERT INTO t VALUES (1, 'x', 3, 'B'), (1, 'y', 1, 'a'), (2, 'z', 2, 'A'),
+            (1, 'w', 2, 'b'), (2, 'v', NULL, 'c'), (1, 'x', 1, 'C');
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT group_concat(a ORDER BY b) FROM t",
+        "SELECT g, group_concat(a, '-' ORDER BY b DESC) FROM t GROUP BY g ORDER BY g",
+        "SELECT json_group_array(a ORDER BY b, a DESC) FROM t",
+        "SELECT group_concat(a ORDER BY b NULLS LAST) FROM t",
+        "SELECT group_concat(c ORDER BY c COLLATE NOCASE) FROM t",
+        "SELECT group_concat(DISTINCT a ORDER BY a DESC) FROM t",
+        "SELECT group_concat(a ORDER BY b) FILTER (WHERE g = 1) FROM t",
+        "SELECT group_concat(a ORDER BY g) FROM t",
+        "SELECT count(*), group_concat(a ORDER BY b), sum(b) FROM t",
+        "SELECT group_concat(a ORDER BY b) FROM t WHERE 0",
+        "SELECT g FROM t GROUP BY g HAVING group_concat(a ORDER BY b) LIKE 'y%' ORDER BY g",
+        "SELECT (SELECT group_concat(a ORDER BY b) FROM t t2 WHERE t2.g = t.g) FROM t \
+         GROUP BY g ORDER BY g",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+}
