@@ -38,7 +38,7 @@ addr  opcode            p1  p2  p3  p4            p5  comment
   14  Next               4   9   0                 1
   15  OpenRead           3  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
   16  NullRow            0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
-  17  Rewind             0  27   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  17  Rewind             0  27   0                 0  Rewind index ephemeral(ephemeral_index_where_sub_t2)
   18    Column           0   0   8                 0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
   19    IsNull           8  26   0                 0  if (r[8]==NULL) goto 26
   20    SeekGE           3  26   8                 0  key=[8..8]

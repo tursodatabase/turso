@@ -43,7 +43,7 @@ addr  opcode          p1  p2  p3  p4      p5  comment
   25    Insert         0  18  19           4  intkey=r[19] data=r[18]
   26  Next             1   5   0           1
   27  FkCheck          0   0   0           0
-  28  Rewind           0  32   0           0  Rewind  ephemeral(t1)
+  28  Rewind           0  32   0           0  Rewind table ephemeral(t1)
   29    ColumnRange    0   0  20  2        0  r[20..21]=ephemeral(t1).id..name
   30    ResultRow     20   2   0           0  output=r[20..21]
   31  Next             0  29   0           0

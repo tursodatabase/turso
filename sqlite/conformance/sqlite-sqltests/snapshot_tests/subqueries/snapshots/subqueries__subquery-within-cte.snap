@@ -46,7 +46,7 @@ addr  opcode             p1  p2  p3  p4              p5  comment
   12  OpenRead            2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   13  OpenRead            3   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   14  NullRow             0   0   0                   0  Set cursor 0 to a (pseudo) NULL row
-  15  Rewind              0  28   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  15  Rewind              0  28   0                   0  Rewind index ephemeral(ephemeral_index_where_sub_t2)
   16    Column            0   0   8                   0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
   17    IsNull            8  27   0                   0  if (r[8]==NULL) goto 27
   18    SeekGE            3  27   8                   0  key=[8..8]

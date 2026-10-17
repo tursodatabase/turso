@@ -26,9 +26,9 @@ addr  opcode         p1   p2   p3  p4                                       p5  
    9  IfPos           2   11    1                                            0  r[2]>0 -> r[2]-=1, goto 11
   10  Halt            0    0    0                                            0
   11  OpenRead        0    2    0  k(2,B,B)                                  0  table=t1, root=2, iDb=0
-  12  OpenRead        1    4    0  k(2,B)                                    0  =idx_t1_b_u, root=4, iDb=0
+  12  OpenRead        1    4    0  k(2,B)                                    0  index=idx_t1_b_u, root=4, iDb=0
   13  Integer         0    6    0                                            0  r[6]=0
-  14  OpenRead        2    3    0  k(2,B)                                    0  =idx_t1_b, root=3, iDb=0
+  14  OpenRead        2    3    0  k(2,B)                                    0  index=idx_t1_b, root=3, iDb=0
   15  Integer         0    7    0                                            0  r[7]=0
   16  Integer         0    8    0                                            0  r[8]=0
   17  Rewind          0   63    0                                            0  Rewind table t1
@@ -95,9 +95,9 @@ addr  opcode         p1   p2   p3  p4                                       p5  
   78  Close           2    0    0                                            0
   79  Close           0    0    0                                            0
   80  OpenRead        3    5    0  k(3,B,B,B)                                0  table=t2, root=5, iDb=0
-  81  OpenRead        4    7    0  k(2,B)                                    0  =idx_t2_expr, root=7, iDb=0
+  81  OpenRead        4    7    0  k(2,B)                                    0  index=idx_t2_expr, root=7, iDb=0
   82  Integer         0   16    0                                            0  r[16]=0
-  83  OpenRead        5    6    0  k(2,B)                                    0  =idx_t2_y, root=6, iDb=0
+  83  OpenRead        5    6    0  k(2,B)                                    0  index=idx_t2_y, root=6, iDb=0
   84  Integer         0   17    0                                            0  r[17]=0
   85  Integer         0   18    0                                            0  r[18]=0
   86  Rewind          3  136    0                                            0  Rewind table t2

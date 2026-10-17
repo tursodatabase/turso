@@ -26,11 +26,11 @@ addr  opcode         p1   p2   p3  p4                                   p5  comm
    9  IfPos           2   11    1                                        0  r[2]>0 -> r[2]-=1, goto 11
   10  Halt            0    0    0                                        0
   11  OpenRead        0    2    0  k(4,B,B,B,B)                          0  table=t, root=2, iDb=0
-  12  OpenRead        1    5    0  k(2,B)                                0  =idx_t_expr_partial, root=5, iDb=0
+  12  OpenRead        1    5    0  k(2,B)                                0  index=idx_t_expr_partial, root=5, iDb=0
   13  Integer         0    6    0                                        0  r[6]=0
-  14  OpenRead        2    4    0  k(2,B)                                0  =idx_t_c, root=4, iDb=0
+  14  OpenRead        2    4    0  k(2,B)                                0  index=idx_t_c, root=4, iDb=0
   15  Integer         0    7    0                                        0  r[7]=0
-  16  OpenRead        3    3    0  k(2,B)                                0  =idx_t_b, root=3, iDb=0
+  16  OpenRead        3    3    0  k(2,B)                                0  index=idx_t_b, root=3, iDb=0
   17  Integer         0    8    0                                        0  r[8]=0
   18  Integer         0    9    0                                        0  r[9]=0
   19  Rewind          0   94    0                                        0  Rewind table t
