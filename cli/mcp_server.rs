@@ -593,7 +593,8 @@ impl TursoMcpServer {
         };
 
         // Use table_xinfo to include generated columns (table_info hides them)
-        let query = format!("PRAGMA table_xinfo({table_name})");
+        let escaped_table_name = table_name.replace('"', "\"\"");
+        let query = format!("PRAGMA table_xinfo(\"{escaped_table_name}\")");
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(&query) {
@@ -788,6 +789,19 @@ mod tests {
 
     fn query_arg(sql: &str) -> Option<Value> {
         Some(json!({ "query": sql }))
+    }
+
+    #[test]
+    fn describe_table_handles_quoted_table_names() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute("CREATE TABLE \"order items\" (id INTEGER, label TEXT)")
+            .unwrap();
+
+        let result = server.describe_table(&Some(json!({ "table_name": "order items" })));
+
+        assert!(result.contains("id INTEGER"), "{result}");
+        assert!(result.contains("label TEXT"), "{result}");
     }
 
     fn seed_bench_orders(server: &TursoMcpServer) {
