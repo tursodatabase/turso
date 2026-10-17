@@ -194,6 +194,11 @@ int64_t sqlite3_last_insert_rowid(sqlite3 *_db);
 
 void sqlite3_interrupt(sqlite3 *_db);
 
+/* Turso extension: set a per-statement CPU/execution deadline in milliseconds.
+ * Zero disables the deadline. This is independent of sqlite3_busy_timeout(),
+ * which only controls lock-wait retries. */
+int turso_set_query_timeout(sqlite3 *_db, uint64_t _milliseconds);
+
 int sqlite3_db_config(sqlite3 *db, int op, ...);
 
 #define SQLITE_DBCONFIG_MAINDBNAME            1000

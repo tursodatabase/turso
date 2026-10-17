@@ -5,6 +5,7 @@ using Turso.Data.Sqlite;
 
 namespace Turso.Tests;
 
+[NonParallelizable]
 public class SqliteFacadeTests
 {
     [Test]
@@ -1323,6 +1324,222 @@ public class SqliteFacadeTests
         var schema = reader.GetSchemaTable();
 
         schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(string));
+    }
+
+    [Test]
+    public async Task LocalExecuteScalarAsyncCancellationInterruptsCpuBoundNativeWork()
+    {
+        using var connection = OpenCpuBoundConnection();
+        using var started = new ManualResetEventSlim();
+        connection.CreateFunction("mark_started", () =>
+        {
+            started.Set();
+            return 1L;
+        });
+        using var command = connection.CreateCommand();
+        command.CommandText = CpuBoundScalarSql(7);
+        using var cancellation = new CancellationTokenSource();
+
+        var execution = Task.Run(() => command.ExecuteScalarAsync(cancellation.Token));
+        started.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+        await cancellation.CancelAsync();
+
+        var exception = Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await execution.WaitAsync(TimeSpan.FromSeconds(15)));
+        exception!.CancellationToken.Should().Be(cancellation.Token);
+        execution.IsCanceled.Should().BeTrue();
+    }
+
+    [Test]
+    public void LocalCommandTimeoutInterruptsCpuBoundNativeWorkWithCodeNine()
+    {
+        using var connection = OpenCpuBoundConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = CpuBoundScalarSql(8);
+        command.CommandTimeout = 1;
+
+        var exception = Assert.Throws<SqliteException>(() => command.ExecuteScalar());
+
+        exception!.SqliteErrorCode.Should().Be(9);
+    }
+
+    [Test]
+    public async Task NativeInterruptionCompletesTransactionWithoutAutocommittingWrite()
+    {
+        using var connection = OpenCpuBoundConnection();
+        using var started = new ManualResetEventSlim();
+        connection.CreateFunction("mark_started", () =>
+        {
+            started.Set();
+            return 1L;
+        });
+        var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            CREATE TABLE interrupted_write AS
+            {CpuBoundScalarSql(7)}
+            """;
+        using var cancellation = new CancellationTokenSource();
+
+        var execution = Task.Run(() => command.ExecuteNonQueryAsync(cancellation.Token));
+        started.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+        await cancellation.CancelAsync();
+
+        var cancellationError = Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await execution.WaitAsync(TimeSpan.FromSeconds(15)));
+        cancellationError!.CancellationToken.Should().Be(cancellation.Token);
+        Assert.DoesNotThrow(transaction.Rollback);
+        Assert.Throws<InvalidOperationException>(() => transaction.Save("after_interrupt"))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.TransactionCompleted);
+        Assert.DoesNotThrow(transaction.Dispose);
+        connection.ExecuteScalar<long>(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'interrupted_write';").Should().Be(0);
+        connection.ExecuteNonQuery("CREATE TABLE interrupted_write(value INTEGER);")
+            .Should().Be(0);
+    }
+
+    [Test]
+    public async Task CloseRacingCancellationOfActiveNativeWorkDoesNotDeadlock()
+    {
+        using var connection = OpenCpuBoundConnection();
+        using var started = new ManualResetEventSlim();
+        connection.CreateFunction("mark_started", () =>
+        {
+            started.Set();
+            return 1L;
+        });
+        using var command = connection.CreateCommand();
+        command.CommandText = CpuBoundScalarSql(7);
+        using var cancellation = new CancellationTokenSource();
+
+        var execution = Task.Run(() => command.ExecuteScalarAsync(cancellation.Token));
+        started.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+        var close = Task.Run(connection.Close);
+        await cancellation.CancelAsync();
+
+        var cancellationError = Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await execution.WaitAsync(TimeSpan.FromSeconds(15)));
+        cancellationError!.CancellationToken.Should().Be(cancellation.Token);
+        await close.WaitAsync(TimeSpan.FromSeconds(15));
+        connection.State.Should().Be(ConnectionState.Closed);
+    }
+
+    [Test]
+    public async Task DisposeRacingCancellationOfActiveNativeWorkDoesNotDeadlock()
+    {
+        var connection = OpenCpuBoundConnection();
+        using var started = new ManualResetEventSlim();
+        connection.CreateFunction("mark_started", () =>
+        {
+            started.Set();
+            return 1L;
+        });
+        using var command = connection.CreateCommand();
+        command.CommandText = CpuBoundScalarSql(7);
+        using var cancellation = new CancellationTokenSource();
+
+        var execution = Task.Run(() => command.ExecuteScalarAsync(cancellation.Token));
+        started.Wait(TimeSpan.FromSeconds(5)).Should().BeTrue();
+        var dispose = Task.Run(connection.Dispose);
+        await cancellation.CancelAsync();
+
+        var cancellationError = Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await execution.WaitAsync(TimeSpan.FromSeconds(15)));
+        cancellationError!.CancellationToken.Should().Be(cancellation.Token);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(15));
+        connection.State.Should().Be(ConnectionState.Closed);
+    }
+
+    [Test]
+    public async Task CompletedUndisposedReaderTokenCannotInterruptLaterQuery()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using var cancellation = new CancellationTokenSource();
+        using var firstCommand = connection.CreateCommand();
+        firstCommand.CommandText = "SELECT 1;";
+        var reader = await firstCommand.ExecuteReaderAsync(cancellation.Token);
+        (await reader.ReadAsync(cancellation.Token)).Should().BeTrue();
+        (await reader.NextResultAsync(cancellation.Token)).Should().BeFalse();
+        await cancellation.CancelAsync();
+
+        using var secondCommand = connection.CreateCommand();
+        secondCommand.CommandText = "SELECT 2;";
+        (await secondCommand.ExecuteScalarAsync(CancellationToken.None)).Should().Be(2L);
+
+        reader.Dispose();
+    }
+
+    [Test]
+    public void CommandTimeoutIsCapturedBeforeAnotherCommandChangesItsTimeout()
+    {
+        using var connection = OpenCpuBoundConnection();
+        using var first = connection.CreateCommand();
+        first.CommandText = CpuBoundScalarSql(8);
+        first.CommandTimeout = 1;
+        using var reader = first.ExecuteReader();
+        using var second = connection.CreateCommand();
+        second.CommandText = "SELECT 1;";
+        second.CommandTimeout = 0;
+
+        var exception = Assert.Throws<SqliteException>(() => reader.Read());
+
+        exception!.SqliteErrorCode.Should().Be(9);
+    }
+
+    [Test]
+    public async Task CancellationAfterReaderCreationBeforeFirstReadPreventsExecution()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE effects(value INTEGER);");
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO effects VALUES (1) RETURNING value;";
+        using var cancellation = new CancellationTokenSource();
+        await using var reader = await command.ExecuteReaderAsync(cancellation.Token);
+
+        await cancellation.CancelAsync();
+
+        var exception = Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await reader.ReadAsync());
+        exception!.CancellationToken.Should().Be(cancellation.Token);
+        await reader.DisposeAsync();
+        connection.ExecuteScalar<long>("SELECT count(*) FROM effects;").Should().Be(0);
+    }
+
+    [Test]
+    public async Task NonInterruptFailureRemainsFaultedSqliteException()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM missing_table;";
+
+        var execution = command.ExecuteScalarAsync(CancellationToken.None);
+        var exception = Assert.ThrowsAsync<SqliteException>(async () => await execution);
+
+        exception!.SqliteErrorCode.Should().Be(1);
+        execution.IsFaulted.Should().BeTrue();
+        execution.IsCanceled.Should().BeFalse();
+    }
+
+    private static SqliteConnection OpenCpuBoundConnection()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            "CREATE TABLE numbers(value INTEGER);"
+            + "INSERT INTO numbers VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);");
+        connection.CreateFunction("mark_started", () => 1L);
+        return connection;
+    }
+
+    private static string CpuBoundScalarSql(int dimensions)
+    {
+        var aliases = Enumerable.Range(0, dimensions)
+            .Select(index => $"numbers AS n{index}");
+        return $"SELECT count(*) FROM {string.Join(", ", aliases)} WHERE mark_started() = 1";
     }
 
     private sealed class TemporaryDirectory : IDisposable
