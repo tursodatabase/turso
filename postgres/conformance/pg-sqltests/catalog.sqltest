@@ -595,6 +595,18 @@ test pg-tables-no-internal-tables {
 }
 expect {}
 
+test pg-tables-and-pg-class-hide-tables-of-sequences {
+    CREATE SEQUENCE s;
+    CREATE TABLE t (id serial);
+    SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+    UNION ALL
+    SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname <> 't';
+}
+expect {
+    t
+}
+
 test pg-type-builtin-oids {
     SELECT typname, oid FROM pg_type
     WHERE typname IN ('int4', 'text', 'bool', 'uuid') ORDER BY typname;
@@ -627,6 +639,18 @@ test pg-indexes-lists-index-definitions {
 expect {
     public|items|items_name_idx||CREATE INDEX items_name_idx ON items USING btree (name)
     public|items|items_price_idx||CREATE UNIQUE INDEX items_price_idx ON items USING btree (price) WHERE price > 0
+}
+
+test pg-indexes-and-pg-get-indexdef-name-the-schema-of-the-table {
+    CREATE TABLE items (id int, name text);
+    CREATE INDEX items_name_idx ON items (name);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'items_name_idx'
+    UNION ALL
+    SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'items_name_idx';
+}
+expect {
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
 }
 
 test pg-index-columns {
