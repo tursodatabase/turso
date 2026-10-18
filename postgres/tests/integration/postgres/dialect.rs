@@ -457,6 +457,28 @@ fn test_postgres_drop_schema_cascade(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_postgres_drop_schema_cascade_drops_tables_that_reference_each_other(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.a (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.z (a_id int REFERENCES app.a (id))")
+        .unwrap();
+    conn.execute("INSERT INTO app.a VALUES (1)").unwrap();
+    conn.execute("INSERT INTO app.z VALUES (1)").unwrap();
+
+    conn.execute("DROP SCHEMA app CASCADE").unwrap();
+
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.a (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.z (a_id int REFERENCES app.a (id))")
+        .unwrap();
+    assert!(conn.execute("INSERT INTO app.z VALUES (1)").is_err());
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -485,6 +507,38 @@ fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");
     };
+}
+
+#[test]
+fn test_postgres_drop_schema_public_cascade_drops_autoincrement_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    let path = path.to_str().unwrap();
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let sqlite_db = turso_core::Database::open_file(
+        io.clone(),
+        path,
+        std::sync::Arc::new(turso_core::SqliteDialect),
+    )
+    .unwrap();
+    sqlite_db
+        .connect(turso_core::ConnectOpts::new())
+        .unwrap()
+        .execute("CREATE TABLE counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    drop(sqlite_db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::PgConnection::connect(&db).unwrap();
+
+    conn.execute("DROP SCHEMA public CASCADE").unwrap();
+
+    assert!(conn.query("SELECT * FROM counted").is_err());
 }
 
 #[turso_macros::test]
