@@ -2183,6 +2183,9 @@ impl<'a> HirPlanContext<'a> {
                         };
                         match union {
                             Some(union) => {
+                                if union.covers_term {
+                                    input.predicates[union.term].consumed = true;
+                                }
                                 // The union reads rows in rowid order, not
                                 // the scan's, so an order the plan proved
                                 // from this table's loop no longer holds.

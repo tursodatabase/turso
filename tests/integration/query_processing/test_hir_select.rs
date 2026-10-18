@@ -1325,6 +1325,59 @@ fn hir_is_null_seeks_an_index_like_legacy() {
     );
 }
 
+/// When one seek per OR branch applies every condition of the OR term, the
+/// rows it finds are exactly the rows the term accepts, so like legacy the
+/// term is not checked again and a subquery in it fills its list once. A
+/// branch with a condition its seek does not apply keeps the check.
+#[test]
+fn hir_or_union_runs_each_in_subquery_once() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE v(id INTEGER PRIMARY KEY, a INT, b INT, c INT)",
+        "CREATE INDEX va ON v(a)",
+        "CREATE INDEX vb ON v(b)",
+        "CREATE TABLE ra(x INT)",
+        "CREATE TABLE rb(x INT)",
+        "INSERT INTO v VALUES (1,1,0,5),(2,0,3,6),(3,5,5,7),(4,1,3,8),(5,NULL,NULL,9),(6,2,NULL,1)",
+        "INSERT INTO ra VALUES (1),(2),(NULL)",
+        "INSERT INTO rb VALUES (3)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    let opens = |sql: &str, table: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter(|row| {
+                matches!(row.get(1), Some(rusqlite::types::Value::Text(opcode)) if opcode == "OpenRead")
+                    && matches!(row.last(), Some(rusqlite::types::Value::Text(comment))
+                        if comment.starts_with(&format!("table={table},")))
+            })
+            .count()
+    };
+    let sql =
+        "SELECT id FROM v WHERE a IN (SELECT x FROM ra) OR b IN (SELECT x FROM rb) ORDER BY id";
+    assert!(
+        query_plan(&hir, sql).contains(&"MULTI-INDEX OR v (va, vb)".to_string()),
+        "{sql}"
+    );
+    assert_eq!(opens(sql, "ra"), 1, "{sql}");
+    assert_eq!(opens(sql, "rb"), 1, "{sql}");
+    for sql in [
+        sql,
+        "SELECT id FROM v WHERE (a = 1 AND c > 6) OR b = 3 ORDER BY id",
+        "SELECT id FROM v WHERE a = 1 OR b = 3 ORDER BY id",
+        "SELECT id FROM v WHERE a = '1' OR b = 3.0 ORDER BY id",
+        "SELECT id FROM v WHERE a IN (1, 2) OR b > 4 ORDER BY id",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]
