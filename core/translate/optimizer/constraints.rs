@@ -1029,7 +1029,10 @@ fn hir_in_query_constraint_for_term(
             "HIR IN constraint references missing query {query}"
         ))
     })?;
-    if !query_definition.captures.is_empty() {
+    // A subquery that reads the outer row cannot supply seek keys for it,
+    // even when only a query it runs reads that row, such as a FROM
+    // subquery: `id IN (SELECT a FROM (SELECT a FROM i WHERE i.k = o.k))`.
+    if document.reads_outer_sources(query_definition.id) {
         return Ok(None);
     }
     let Some((comparison_affinity, comparison_collation)) = hir_scalar_comparison(comparison)

@@ -1033,6 +1033,46 @@ fn hir_correlated_in_probe_and_cached_aggregates_match_sqlite() {
     }
 }
 
+/// An IN subquery that reads the outer row only inside its own FROM
+/// subquery still depends on that row, so it cannot drive a seek on it.
+#[test]
+fn hir_in_subquery_reading_the_outer_row_through_a_from_subquery_matches_sqlite() {
+    const SCHEMA: &str = "
+        CREATE TABLE o(id INTEGER PRIMARY KEY, k INT);
+        CREATE TABLE i(k INT, amount INT);
+        INSERT INTO o VALUES (1,1),(2,1),(3,2),(4,3),(5,NULL),(6,2);
+        INSERT INTO i VALUES (1,10),(1,20),(2,6),(2,3),(3,4),(NULL,5);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for sql in [
+        "SELECT id FROM o WHERE id IN \
+         (SELECT amount FROM (SELECT amount FROM i WHERE i.k = o.k)) ORDER BY id",
+        "SELECT id FROM o WHERE id IN \
+         (SELECT amount FROM (SELECT DISTINCT amount FROM i WHERE i.k = o.k)) ORDER BY id",
+        "SELECT id FROM o WHERE id NOT IN \
+         (SELECT amount FROM (SELECT amount FROM i WHERE i.k = o.k)) ORDER BY id",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| Ok(vec![row.get(0)?]))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+}
+
 /// An equality join on columns no index covers looks rows up in a hash table
 /// instead of an automatic index, as legacy's hash join does. The tables are
 /// large enough that a debug build's hash table spills to disk, so the
