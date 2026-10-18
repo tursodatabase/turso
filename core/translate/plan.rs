@@ -17,6 +17,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    turso_assert,
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
@@ -4305,7 +4306,9 @@ impl NonFromClauseSubquery {
         let required_eval_at = eval_at_for_plan(plan, join_order, table_references)?;
         let preferred_eval_at = self
             .preferred_eval_after_table
-            .and_then(|table_id| resolve_outer_ref_loop(table_id, join_order, table_references))
+            .and_then(|table_id| {
+                loop_of_table_or_its_hash_probe(table_id, join_order, table_references)
+            })
             .map(EvalAt::Loop)
             .unwrap_or(EvalAt::BeforeLoop);
         Ok(required_eval_at.max(preferred_eval_at))
@@ -4544,8 +4547,39 @@ fn eval_at_for_select_plan(
 /// Resolves the loop index for an outer-table reference.
 ///
 /// If the table is not present in the join order, we look for a hash join
-/// where that table is the build side and map it to the probe loop.
+/// where that table is the build side and map it to the probe loop. A table
+/// of a materialized hash build input maps to the probe loop of that join.
 fn resolve_outer_ref_loop(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    if let Some(loop_idx) = loop_of_table_or_its_hash_probe(table_id, join_order, table_references)
+    {
+        return Some(loop_idx);
+    }
+    let tables = table_references?;
+    let table_is_in_this_query = tables
+        .joined_tables()
+        .iter()
+        .any(|table| table.internal_id == table_id);
+    if !table_is_in_this_query {
+        return None;
+    }
+    let probe_loop_of_materialized_build_input = join_order.iter().position(|member| {
+        matches!(
+            &tables.joined_tables()[member.original_idx].op,
+            Operation::HashJoin(hj) if hj.materialize_build_input
+        )
+    });
+    turso_assert!(
+        probe_loop_of_materialized_build_input.is_some(),
+        "a table of the query can leave the join order only inside a materialized hash build input"
+    );
+    probe_loop_of_materialized_build_input
+}
+
+fn loop_of_table_or_its_hash_probe(
     table_id: TableInternalId,
     join_order: &[JoinOrderMember],
     table_references: Option<&TableReferences>,
@@ -4554,16 +4588,13 @@ fn resolve_outer_ref_loop(
         return Some(loop_idx);
     }
     let tables = table_references?;
-    for (probe_idx, member) in join_order.iter().enumerate() {
-        let probe_table = &tables.joined_tables()[member.original_idx];
-        if let Operation::HashJoin(ref hj) = probe_table.op {
-            let build_table = &tables.joined_tables()[hj.build_table_idx];
-            if build_table.internal_id == table_id {
-                return Some(probe_idx);
-            }
-        }
-    }
-    None
+    join_order.iter().position(|member| {
+        matches!(
+            &tables.joined_tables()[member.original_idx].op,
+            Operation::HashJoin(hj)
+                if tables.joined_tables()[hj.build_table_idx].internal_id == table_id
+        )
+    })
 }
 
 #[cfg(test)]
