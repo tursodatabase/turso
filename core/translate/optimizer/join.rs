@@ -2383,7 +2383,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
@@ -2394,10 +2394,12 @@ mod tests {
         },
         stats::AnalyzeStats,
         translate::{
+            collate::CollationSeq,
             optimizer::{
                 access_method::AccessMethodParams,
                 constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
                 cost_params::DEFAULT_PARAMS,
+                order::{ColumnOrder, ColumnTarget, EliminatesSortBy, OrderTargetPurpose},
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
@@ -2981,6 +2983,75 @@ mod tests {
         let (iter_dir, _, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
+    }
+
+    #[test]
+    fn full_rowid_scan_costs_the_same_with_and_without_order_by() {
+        let t1 = _create_btree_table(
+            "t1",
+            vec![
+                _create_column_rowid_alias("id"),
+                _create_column_of_type("a", Type::Integer),
+            ],
+        );
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
+        let order_by_id = OrderTarget {
+            columns: vec![ColumnOrder {
+                table_id: joined_tables[0].internal_id,
+                target: ColumnTarget::Column(0),
+                order: SortOrder::Asc,
+                collation: CollationSeq::default(),
+                nulls_order: None,
+            }],
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let schema = empty_schema();
+        let table_constraints = constraints_from_where_clause(
+            &[],
+            &table_references,
+            &available_indexes,
+            &[],
+            &schema,
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let base_table_rows = default_base_rows(1);
+
+        let plan_cost = |order_target: Option<&OrderTarget>| {
+            let mut access_methods_arena = Vec::new();
+            let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
+                table_references.joined_tables(),
+                1.0,
+                order_target,
+                &table_constraints,
+                &base_table_rows,
+                &mut access_methods_arena,
+                &mut [],
+                &[],
+                &[],
+                &DEFAULT_PARAMS,
+                &AnalyzeStats::default(),
+                &available_indexes,
+                &table_references,
+                &schema,
+            )
+            .unwrap()
+            .unwrap();
+            let (_, index, constraint_refs) = _as_btree(&access_methods_arena[best_plan.data[0].1]);
+            assert!(index.is_none());
+            assert!(constraint_refs.is_empty());
+            best_plan.cost.0
+        };
+
+        let unordered_cost = plan_cost(None);
+        let ordered_cost = plan_cost(Some(&order_by_id));
+        assert!(
+            (ordered_cost - unordered_cost).abs() < 1e-9,
+            "ordered full rowid scan costs {ordered_cost}, unordered costs {unordered_cost}"
+        );
     }
 
     #[test]
