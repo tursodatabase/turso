@@ -1840,6 +1840,7 @@ impl StreamingWalReader {
             );
         }
         if PageSize::new(page_sz).is_none() || !ok {
+            *self.header.lock() = WalHeader::default();
             self.finalize_loading();
             return;
         }
