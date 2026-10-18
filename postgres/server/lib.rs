@@ -805,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn test_integer_case_and_function_results_are_int4_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        for sql in [
+            "SELECT x * 2 FROM t",
+            "SELECT coalesce(x, 2) * coalesce(x, 3) FROM t",
+            "SELECT abs(x) * 2 FROM t",
+            "SELECT CASE WHEN x = 1 THEN x ELSE 0 END - 1 FROM t",
+            "SELECT coalesce(x, 2) FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
+        }
+    }
+
+    #[test]
     fn test_set_transaction_is_non_query() {
         assert!(is_pg_non_query(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"

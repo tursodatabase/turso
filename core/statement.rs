@@ -182,6 +182,7 @@ fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
 ) -> Option<&'static str> {
+    use crate::function::ScalarFunc;
     use turso_parser::ast::{Expr, Operator, UnaryOperator};
 
     match expr {
@@ -250,6 +251,34 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => common_primitive(
+            when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref()),
+            referenced_tables,
+        ),
+        Expr::FunctionCall { name, args, .. } => {
+            match crate::function::Func::resolve_function(name.as_str(), args.len()) {
+                Ok(Some(crate::function::Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
+                ))) => common_primitive(args.iter().map(|arg| arg.as_ref()), referenced_tables),
+                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Nullif))) => {
+                    infer_expression_primitive(&args[0], referenced_tables)
+                }
+                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Abs))) => {
+                    Some(combine_arithmetic_primitive(
+                        Some("INTEGER"),
+                        infer_expression_primitive(&args[0], referenced_tables),
+                    ))
+                }
+                _ => None,
+            }
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
@@ -258,6 +287,31 @@ fn infer_expression_primitive(
             None,
         )),
     }
+}
+
+/// The type that every non-NULL expression can be converted to, following
+/// PostgreSQL's rule for CASE branches and COALESCE arguments: mixed numeric
+/// types widen the way arithmetic does, any other mix has no common type.
+fn common_primitive<'a>(
+    exprs: impl Iterator<Item = &'a turso_parser::ast::Expr>,
+    referenced_tables: Option<&translate::plan::TableReferences>,
+) -> Option<&'static str> {
+    use turso_parser::ast::{Expr, Literal};
+
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let mut common = None;
+    for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
+        let primitive = infer_expression_primitive(expr, referenced_tables)?;
+        common = match common {
+            None => Some(primitive),
+            Some(common) if common == primitive => Some(common),
+            Some(common) if is_numeric(common) && is_numeric(primitive) => {
+                Some(combine_arithmetic_primitive(Some(common), Some(primitive)))
+            }
+            Some(_) => return None,
+        };
+    }
+    common
 }
 
 /// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
