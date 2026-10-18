@@ -229,9 +229,12 @@ instead read through one seek per branch of a WHERE OR term (`v = 5 OR w =
 rowid and together they cost less than the scan. The branches add the rowids
 they find to a row set, and the loop reads each of those rows once. Unlike
 legacy, this is decided after the join order, not while choosing it, so it
-may pick a different table of a join than legacy does; the OR term stays in
-WHERE and is checked again on each row. It is used only in SELECT, not yet
-in DELETE or UPDATE loops, and never on the right side of an outer join.
+may pick a different table of a join than legacy does. When every condition
+of every branch is applied by that branch's seek, the OR term is dropped from
+WHERE, as legacy drops it, so a subquery in it fills its list once; otherwise
+it stays in WHERE and is checked again on each row (HIR has no per-branch
+filters like legacy's). It is used only in SELECT, not yet in DELETE or
+UPDATE loops, and never on the right side of an outer join.
 
 Legacy speeds up correlated subqueries and joins without an index by
 rewriting the plan. HIR gets the same speed without rewriting HIR:
@@ -272,7 +275,34 @@ rewriting the plan. HIR gets the same speed without rewriting HIR:
   that moved rows to disk cannot be probed again after its waiting lookups
   ran; a subquery that may run again seeks an automatic index built once.
   Legacy also hashes FULL joins and builds from materialized join prefixes;
-  HIR uses an automatic index there.
+  HIR uses an automatic index there. The shared access code builds no
+  automatic index for a legacy FULL JOIN, but HIR's nested-loop FULL JOIN
+  may seek one on its right side, as its RIGHT JOIN does.
+
+These planning rules are ports of legacy's, sharing its cost formulas and
+order checks where the code allows:
+
+- A grouped block aims for its GROUP BY order even with an ORDER BY
+  (`compute_order_target`), so an index on the keys replaces the GROUP BY
+  sorter; when every ORDER BY term is a key, the keys in ORDER BY order and
+  directions replace both sorters.
+- `x IS NULL` (and `x ISNULL`) seeks an index on x, with `IS`'s outer-join
+  rule.
+- A FROM subquery or CTE that earlier loops constrain is stored once and read
+  through a temporary index on those columns when that costs less
+  (`find_best_access_method_for_subquery`), except when it reads an outer row
+  or is the right side of a RIGHT or FULL JOIN. HIR builds the index from the
+  stored table, so setup costs two passes. A correlated subquery counts the
+  rows of an outer FROM subquery or CTE as its number of runs.
+- A scanned FROM subquery or CTE returns its rows in the order of its ORDER
+  BY, its GROUP BY keys, or the one subquery it passes through
+  (`subquery_intrinsic_order_consumed`), so an outer ORDER BY in that order
+  needs no sort; a CTE stored once is read backwards for the opposite order.
+  Not ported: the order of a plain table scan inside the subquery, and using
+  a temporary index's order.
+- A block with windows aims for the innermost window's PARTITION BY and
+  ORDER BY order, like legacy's window source subquery, so an index or an
+  ordered CTE replaces that window's sorter.
 
 Three legacy rewrites return wrong rows that HIR does not (see
 `hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN whose
