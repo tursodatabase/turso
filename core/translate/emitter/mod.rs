@@ -1218,6 +1218,7 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
+    database_id: usize,
     changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
@@ -1225,6 +1226,11 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
+    // Temp tables exist only for this connection and are never synced, so their changes are
+    // not captured. Otherwise the sync engine would replay them into the main database.
+    if database_id == crate::TEMP_DB_ID {
+        return Ok(None);
+    }
     // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
     // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
     // gets the cursor.
@@ -1858,7 +1864,9 @@ pub fn emit_cdc_explicit_commit_insns(
     });
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
-    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+    if let Some((cdc_cursor_id, _)) =
+        prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
+    {
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
     }
 

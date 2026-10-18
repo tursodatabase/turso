@@ -583,6 +583,66 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test()]
+fn test_cdc_update_cdc_table_in_full_mode(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("UPDATE turso_cdc SET table_name = 'u' WHERE change_type = 1")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("u".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
+#[turso_macros::test()]
+fn test_cdc_ignore_changes_in_temp_tables(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE m (x)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    for sql in [
+        "CREATE TEMP TABLE X AS SELECT 1 AS a",
+        "INSERT INTO X VALUES (2)",
+        "CREATE TABLE temp.Y (b PRIMARY KEY, c)",
+        "CREATE INDEX temp.y_c ON Y (c)",
+        "INSERT INTO Y VALUES (3, 3)",
+        "INSERT INTO Y VALUES (3, 3) ON CONFLICT (b) DO UPDATE SET c = 4",
+        "INSERT OR REPLACE INTO Y VALUES (3, 5)",
+        "UPDATE Y SET c = 6",
+        "ALTER TABLE Y ADD COLUMN d",
+        "ALTER TABLE Y RENAME TO Z",
+        "DELETE FROM Z",
+        "DROP INDEX y_c",
+        "DROP TABLE X",
+        "DROP TABLE temp.Z",
+        "INSERT INTO m VALUES (1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("m".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
 // TODO: cannot use mvcc because of indexes
 #[turso_macros::test()]
 fn test_cdc_transaction(db: TempDatabase) {

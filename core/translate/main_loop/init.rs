@@ -62,11 +62,18 @@ impl InitLoop {
             OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
         ) {
             turso_assert_eq!(tables.joined_tables().len(), 1);
-            let changed_table = &tables.joined_tables()[0].table;
+            let changed_table = match mode {
+                OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                    target_table,
+                    ..
+                }) => target_table.as_ref(),
+                _ => &tables.joined_tables()[0],
+            };
             let prepared = prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
-                Some(changed_table.get_name()),
+                changed_table.database_id,
+                Some(changed_table.table.get_name()),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
                 t_ctx.cdc_cursor_id = Some(cdc_cursor_id);

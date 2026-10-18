@@ -1285,11 +1285,12 @@ fn emit_update_insns<'a>(
     let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
-    let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
-        Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
-    } else {
-        None
-    };
+    let cdc_updates_register =
+        if t_ctx.cdc_cursor_id.is_some() && program.capture_data_changes_info().has_updates() {
+            Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
+        } else {
+            None
+        };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let target_btree = target_table.table.btree();
@@ -2334,7 +2335,9 @@ fn emit_update_insns<'a>(
             };
 
             // create full CDC record before update if necessary
-            let cdc_before_reg = if program.capture_data_changes_info().has_before() {
+            let cdc_before_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_before()
+            {
                 Some(emit_cdc_full_record(
                     program,
                     target_table.table.columns(),
@@ -2516,7 +2519,9 @@ fn emit_update_insns<'a>(
             }
 
             // create full CDC record after update if necessary
-            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
+            let cdc_after_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_after()
+            {
                 Some(emit_cdc_patch_record(
                     program,
                     &target_table.table,
