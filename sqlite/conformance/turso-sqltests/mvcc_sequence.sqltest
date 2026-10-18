@@ -312,6 +312,19 @@ expect {
     b|7
 }
 
+test mvcc-autoincrement-table-name-may-contain-a-dot {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "x.y" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO "x.y"(v) VALUES ('a');
+    INSERT INTO "x.y"(v) VALUES ('b');
+    SELECT id, v FROM "x.y" ORDER BY id;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+}
+
 test mvcc-autoincrement-checkpoint-compaction-many-tables {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE stress_00(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);

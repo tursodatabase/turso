@@ -1912,7 +1912,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceComputeNext {
                 db,
-                seq_name_reg,
+                seq_name,
                 in_value_reg,
                 in_is_called_reg,
                 was_empty_reg,
@@ -1920,9 +1920,9 @@ pub fn insn_to_row(
             } => (
                 "SequenceComputeNext",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *out_value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
                     "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
@@ -1942,31 +1942,31 @@ pub fn insn_to_row(
             ),
             Insn::SequenceTrackAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
             } => (
                 "SequenceTrackAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
-                *value_reg as i64,
-                Value::Null,
                 0,
-                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+                *value_reg as i64,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("track sequence allocation {seq_name} = r[{value_reg}]"),
             ),
             Insn::SequenceRegisterAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
                 saved_outer_reg,
             } => (
                 "SequenceRegisterAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
-                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                    "register allocation {seq_name} = r[{value_reg}] \
                      against outer mv_tx r[{saved_outer_reg}]"
                 ),
             ),

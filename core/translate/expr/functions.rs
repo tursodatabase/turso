@@ -237,11 +237,10 @@ pub(super) fn translate_sequence_function(
 
     if is_nextval {
         // Reuse `start_reg` (the user's raw arg, possibly schema-qualified
-        // such as `'aux.my_seq'`) as the seq-name register so per-session
+        // such as `'aux.my_seq'`) as the currval register so per-session
         // `currval` stays keyed by the user's original spelling. The
-        // runtime handler strips the schema prefix when looking up the
-        // sequence object; the opcode's `db` field already encodes the
-        // correct database id resolved here.
+        // sequence opcodes get the bare `normalized_name` and the database
+        // id resolved here, so they never parse the user's string.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,

@@ -183,9 +183,9 @@ pub fn emit_disk_read_nextval(
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
-    // Optional caller-supplied register already holding the seq name as
-    // text (e.g. populated by user-arg evaluation in the SQL translator).
-    // When `None` the helper allocates its own.
+    // Optional caller-supplied register holding the name that currval is
+    // keyed by (the user's spelling, e.g. `'main.my_seq'`). When `None`
+    // the helper allocates one holding `seq_name`.
     seq_name_reg: Option<usize>,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
@@ -262,7 +262,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
         was_empty_reg,
@@ -374,7 +374,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
     });
@@ -404,7 +404,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
