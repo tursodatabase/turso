@@ -3817,8 +3817,8 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     conn.execute("INSERT INTO t (val) VALUES ('a')")?;
     conn.execute("INSERT INTO t (val) VALUES ('b')")?;
     conn.execute("INSERT INTO t (val) VALUES ('c')")?;
-    // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
-    conn.execute("DELETE FROM t WHERE id = 2")?;
+    // Delete the newest rows so the counter is above max(id) - AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
     let source_seq: Vec<(String, i64)> =
         conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(source_seq, vec![("t".to_string(), 3)]);
@@ -3836,6 +3836,12 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     let dest_seq: Vec<(String, i64)> =
         dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(dest_seq, source_seq);
+    if tmp_db.enable_mvcc {
+        let dest_counter: Vec<(i64, i64)> = dest_conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(dest_counter, vec![(3, 1)]);
+    }
 
     // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
     conn.execute("INSERT INTO t (val) VALUES ('d')")?;
@@ -3854,6 +3860,34 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
         dest_new, source_new,
         "AUTOINCREMENT counter should produce the same next rowid on both databases"
     );
+
+    Ok(())
+}
+
+/// Plain VACUUM must leave the AUTOINCREMENT counter exactly as it was. On an
+/// MVCC database the counter's backing table must keep a single row.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a'), ('b'), ('c')")?;
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+    assert_eq!(seq, vec![("t".to_string(), 3)]);
+    if tmp_db.enable_mvcc {
+        let counter: Vec<(i64, i64)> = conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(counter, vec![(3, 1)]);
+    }
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT id FROM t WHERE val = 'd'"), 4);
 
     Ok(())
 }
