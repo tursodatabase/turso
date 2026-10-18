@@ -1,0 +1,10 @@
+# Schemas created with CREATE SCHEMA and the objects in them.
+
+@database :memory:
+
+test create-schema-rejects-names-that-start-with-pg {
+    CREATE SCHEMA pg_app;
+}
+expect error {
+    unacceptable schema name "pg_app"
+}

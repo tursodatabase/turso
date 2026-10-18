@@ -404,6 +404,11 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
             "schema \"{name}\" already exists"
         )));
     }
+    if name.starts_with("pg_") {
+        return Err(LimboError::ParseError(format!(
+            "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
+        )));
+    }
 
     let path = schema_file_path(conn, &name);
     execute_sqlite_internal(
