@@ -4,7 +4,9 @@ use crate::error::io_error;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
-use crate::storage::{journal_mode, pager::SavepointResult};
+use crate::storage::{
+    checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, journal_mode, pager::SavepointResult,
+};
 use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
@@ -4759,6 +4761,9 @@ impl Connection {
             }
         }
         pager.set_reserved_space_bytes(reserved_bytes);
+        if reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES {
+            pager.reset_checksum_context();
+        }
         Ok(())
     }
 
