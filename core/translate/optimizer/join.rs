@@ -2408,6 +2408,11 @@ pub(crate) fn compute_hir_greedy_join_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether a source is the right side of a RIGHT or FULL JOIN.
+fn hir_right_or_full_join(join_info: Option<&crate::translate::plan::HirJoinInfo>) -> bool {
+    join_info.is_some_and(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+}
+
 fn hir_join_step(
     document: &HirDocument,
     sources: &[HirPlanSource],
@@ -2528,10 +2533,50 @@ fn hir_join_step(
                 )))
             }
         },
-        HirPlanSource::Derived { .. }
-        | HirPlanSource::Cte { .. }
-        | HirPlanSource::RecursiveCte { .. }
-        | HirPlanSource::RecursiveInput { .. } => {
+        HirPlanSource::Derived {
+            source,
+            query,
+            join_info,
+        } => super::access_method::find_best_hir_access_method_for_subquery(
+            document,
+            *source,
+            *query,
+            false,
+            !hir_right_or_full_join(join_info.as_ref()),
+            &constraints[source_position],
+            lhs_mask,
+            source_position,
+            &ready_where,
+            source_costs[source_position],
+            input_cardinality,
+            base_row_count,
+            params,
+        )?,
+        HirPlanSource::Cte {
+            source,
+            query,
+            materialization,
+            join_info,
+            ..
+        } => super::access_method::find_best_hir_access_method_for_subquery(
+            document,
+            *source,
+            *query,
+            !matches!(
+                materialization,
+                crate::translate::plan::HirCteMaterialization::PerReference
+            ),
+            !hir_right_or_full_join(join_info.as_ref()),
+            &constraints[source_position],
+            lhs_mask,
+            source_position,
+            &ready_where,
+            source_costs[source_position],
+            input_cardinality,
+            base_row_count,
+            params,
+        )?,
+        HirPlanSource::RecursiveCte { .. } | HirPlanSource::RecursiveInput { .. } => {
             let rows = *base_row_count;
             let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
                 None,

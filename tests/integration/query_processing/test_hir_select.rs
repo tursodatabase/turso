@@ -1378,6 +1378,77 @@ fn hir_or_union_runs_each_in_subquery_once() {
     }
 }
 
+/// Like legacy, a FROM subquery or CTE whose columns earlier loops constrain
+/// is stored once and read through a temporary index on those columns,
+/// instead of being scanned again for every outer row, also inside a
+/// correlated subquery. The right side of a RIGHT JOIN is still scanned,
+/// since a second pass looks for its unmatched rows.
+#[test]
+fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INT, day TEXT, total REAL)",
+        "CREATE TABLE points(v INT)",
+        "INSERT INTO customers VALUES (1,'a'),(2,'b'),(3,'c')",
+        "INSERT INTO orders VALUES (10,1,'2024-02-01',50),(11,1,'2023-01-01',2000),\
+         (12,2,'2024-05-01',1500),(13,9,'2024-06-01',7),(14,NULL,'2024-07-01',3)",
+        "INSERT INTO points VALUES (1),(2),(4),(5),(6),(9),(2),(NULL)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for (sql, search) in [
+        (
+            "WITH recent AS (SELECT id, customer_id FROM orders WHERE day >= '2024-01-01') \
+             SELECT c.id FROM customers c \
+             WHERE EXISTS (SELECT 1 FROM recent r WHERE r.customer_id = c.id) ORDER BY 1",
+            Some("SEARCH r USING INDEX ephemeral_subquery_"),
+        ),
+        (
+            "SELECT c.name, s.total FROM customers c JOIN (SELECT customer_id, sum(total) AS total \
+             FROM orders GROUP BY customer_id) AS s ON s.customer_id = c.id \
+             WHERE s.total > 500 ORDER BY 1",
+            Some("SEARCH s USING INDEX ephemeral_subquery_"),
+        ),
+        (
+            "WITH sorted AS (SELECT DISTINCT v FROM points ORDER BY v) \
+             SELECT p1.v, (SELECT max(p2.v) FROM sorted p2 WHERE p2.v < p1.v) \
+             FROM sorted p1 ORDER BY 1",
+            Some("SEARCH p2 USING INDEX ephemeral_subquery_"),
+        ),
+        (
+            "SELECT c.name, s.n FROM customers c LEFT JOIN (SELECT customer_id, count(*) AS n \
+             FROM orders GROUP BY customer_id) AS s ON s.customer_id = c.id ORDER BY 1",
+            None,
+        ),
+        (
+            "SELECT c.name, s.n FROM customers c RIGHT JOIN (SELECT customer_id, count(*) AS n \
+             FROM orders GROUP BY customer_id) AS s ON s.customer_id = c.id ORDER BY 1, 2",
+            None,
+        ),
+    ] {
+        if let Some(search) = search {
+            let plan = query_plan(&hir, sql);
+            assert!(
+                plan.iter().any(|row| row.starts_with(search)),
+                "{sql}: {plan:?}"
+            );
+            assert!(
+                query_plan(&legacy, sql)
+                    .iter()
+                    .any(|row| row.starts_with(search)),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]

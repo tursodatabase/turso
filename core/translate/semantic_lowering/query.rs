@@ -5037,6 +5037,37 @@ pub(super) fn hir_loop_explain(
             recursive,
         }),
     };
+    // Like legacy, a subquery read through a temporary index over its stored
+    // rows is a SEARCH of that index, with the subquery under it.
+    let materialized_search = |cte: Option<hir::CteId>, operation: &HirBtreeOperation| {
+        let HirBtreeOperation::Seek {
+            index: Some(index),
+            seek_def,
+        } = operation
+        else {
+            return Err(LimboError::InternalError(format!(
+                "HIR subquery source {} has a seek without an index",
+                source.id
+            )));
+        };
+        Ok(EqpDetail::Search {
+            table: table.clone(),
+            kind: EqpSearchKind::Seek,
+            index: Some(EqpIndex {
+                name: index.name.clone(),
+                covering: false,
+                ephemeral: true,
+            }),
+            constraints: seek_constraint_parts(index, seek_def),
+            backwards: seek_def.iter_dir == IterationDirection::Backwards,
+            join,
+            subquery: Some(EqpSubquery {
+                exec: EqpSubqueryExec::Materialized,
+                cte_id: cte.map(hir::CteId::index),
+                recursive: false,
+            }),
+        })
+    };
     Ok(match &planned_loop.access {
         HirSourceAccess::BTree {
             operation,
@@ -5129,8 +5160,19 @@ pub(super) fn hir_loop_explain(
             join,
             subquery: None,
         },
-        HirSourceAccess::Derived { .. } => subquery(None, false),
-        HirSourceAccess::Cte { cte, .. } => subquery(Some(*cte), false),
+        HirSourceAccess::Derived {
+            seek: Some(operation),
+            ..
+        } => materialized_search(None, operation)?,
+        HirSourceAccess::Cte {
+            cte,
+            seek: Some(operation),
+            ..
+        } => materialized_search(Some(*cte), operation)?,
+        HirSourceAccess::Derived { seek: None, .. } => subquery(None, false),
+        HirSourceAccess::Cte {
+            cte, seek: None, ..
+        } => subquery(Some(*cte), false),
         HirSourceAccess::RecursiveCte { cte } => subquery(Some(*cte), true),
         HirSourceAccess::RecursiveInput { .. } => EqpDetail::Scan {
             table,
@@ -5198,9 +5240,10 @@ fn hir_loop_streams(
         return false;
     }
     match &planned_loop.access {
-        HirSourceAccess::Derived { .. }
+        HirSourceAccess::Derived { seek: None, .. }
         | HirSourceAccess::Cte {
             materialization: HirCteMaterialization::PerReference,
+            seek: None,
             ..
         } => true,
         HirSourceAccess::RecursiveCte { cte } => {
@@ -5264,7 +5307,7 @@ fn prepare_hir_coroutine_loop<'a>(
         coroutine_implementation_start: start,
     };
     let row = match &planned_loop.access {
-        HirSourceAccess::Derived { query } | HirSourceAccess::Cte { query, .. } => {
+        HirSourceAccess::Derived { query, .. } | HirSourceAccess::Cte { query, .. } => {
             let row = program.alloc_registers(source.columns.len().max(1));
             program.bind_coroutine_row(yield_reg, row);
             emit_planned_query_body(program, plan, *query, &destination)?;
@@ -5327,20 +5370,26 @@ fn prepare_hir_loop_unexplained<'a>(
             planned_loop.source,
             union,
         )?)),
-        HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
-            prepare_hir_materialized_loop(
+        HirSourceAccess::Derived { query, seek } => {
+            let materialized = prepare_hir_materialized_loop(
                 program,
                 plan,
                 planned_loop.source,
                 HirMaterializedQuery::Derived(*query),
-            )?,
-        )),
+            )?;
+            Ok(with_hir_materialized_seek(
+                program,
+                materialized,
+                seek.as_ref(),
+            )?)
+        }
         HirSourceAccess::Cte {
             cte,
             query,
             materialization: HirCteMaterialization::PerReference,
-        } => Ok(PreparedHirLoop::Materialized(
-            prepare_hir_materialized_loop(
+            seek,
+        } => {
+            let materialized = prepare_hir_materialized_loop(
                 program,
                 plan,
                 planned_loop.source,
@@ -5348,19 +5397,27 @@ fn prepare_hir_loop_unexplained<'a>(
                     cte: *cte,
                     query: *query,
                 },
-            )?,
-        )),
+            )?;
+            Ok(with_hir_materialized_seek(
+                program,
+                materialized,
+                seek.as_ref(),
+            )?)
+        }
         HirSourceAccess::Cte {
             cte,
             query,
             materialization: HirCteMaterialization::Shared | HirCteMaterialization::Explicit,
-        } => Ok(PreparedHirLoop::Materialized(prepare_hir_shared_cte_loop(
-            program,
-            plan,
-            planned_loop.source,
-            *cte,
-            *query,
-        )?)),
+            seek,
+        } => {
+            let materialized =
+                prepare_hir_shared_cte_loop(program, plan, planned_loop.source, *cte, *query)?;
+            Ok(with_hir_materialized_seek(
+                program,
+                materialized,
+                seek.as_ref(),
+            )?)
+        }
         HirSourceAccess::RecursiveCte { cte } => Ok(PreparedHirLoop::Materialized(
             prepare_hir_recursive_cte_loop(program, plan, planned_loop.source, *cte)?,
         )),
@@ -6493,6 +6550,47 @@ fn prepare_hir_materialized_loop<'a>(
         cursor,
         table,
     })
+}
+
+/// The loop of a stored FROM subquery or CTE: a scan of its table, or with
+/// `seek`, a seek of a temporary index built from that table when the loop
+/// first starts, like legacy's materialized-subquery seek. The index holds
+/// every column, so the loop reads only the index.
+fn with_hir_materialized_seek<'a>(
+    program: &mut ProgramBuilder,
+    materialized: PreparedHirMaterializedLoop<'a>,
+    seek: Option<&'a HirBtreeOperation>,
+) -> Result<PreparedHirLoop<'a>> {
+    let Some(operation) = seek else {
+        return Ok(PreparedHirLoop::Materialized(materialized));
+    };
+    let HirBtreeOperation::Seek {
+        index: Some(index), ..
+    } = operation
+    else {
+        return Err(LimboError::InternalError(format!(
+            "HIR subquery source {} has a seek without a temporary index",
+            materialized.source.id
+        )));
+    };
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.bind_source(
+        materialized.source.id,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    Ok(PreparedHirLoop::BTree(PreparedHirBtreeLoop {
+        source: materialized.source,
+        operation,
+        index: Some(index),
+        cursor,
+        table_cursor: None,
+        autoindex_source_cursor: Some(materialized.cursor),
+        table_has_rowid: true,
+        index_keys: Vec::new(),
+    }))
 }
 
 fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
@@ -10793,6 +10891,7 @@ pub(super) mod tests {
         };
         let HirSourceAccess::Derived {
             query: derived_query,
+            ..
         } = planned_loop.access
         else {
             panic!("derived source keeps its prepared HIR query");
@@ -10908,7 +11007,7 @@ pub(super) mod tests {
                  SELECT value FROM items NOT INDEXED WHERE value > 1\
              ) \
              SELECT a.value, b.value \
-             FROM chosen AS a JOIN chosen AS b ON b.value = a.value",
+             FROM chosen AS a JOIN chosen AS b",
         );
         let query = root_query(&plan.document);
         let block_plan = &plan

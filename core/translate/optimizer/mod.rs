@@ -3671,6 +3671,48 @@ pub(crate) fn apply_hir_selected_btree_access(
     })
 }
 
+/// The seek of a FROM subquery or CTE that
+/// [`access_method::find_best_hir_access_method_for_subquery`] chose to read
+/// through a temporary index over its stored rows, as legacy applies its
+/// `MaterializedSubquery` access: the seek's constraints are consumed and
+/// its key is built like any index seek. `None` when the subquery is
+/// scanned.
+pub(crate) fn apply_hir_materialized_subquery_access(
+    constraints: &constraints::HirTableConstraints,
+    predicates: &mut [HirWhereTerm],
+    access_method: &AccessMethod,
+    outer_join_source: Option<hir::SourceId>,
+) -> Result<Option<HirBtreeOperation>> {
+    match &access_method.params {
+        AccessMethodParams::Subquery { .. } => Ok(None),
+        AccessMethodParams::MaterializedSubquery {
+            index,
+            constraint_refs,
+            iter_dir,
+        } => {
+            mark_seek_constraints_consumed(
+                &constraints.constraints,
+                constraint_refs,
+                predicates,
+                outer_join_source,
+                false,
+            );
+            Ok(Some(SelectedBtreeOperation::Seek {
+                index: Some(index.clone()),
+                seek_def: HirBtreeOperationBuilder.seek_def(
+                    &constraints.constraints,
+                    constraint_refs,
+                    *iter_dir,
+                    predicates,
+                )?,
+            }))
+        }
+        _ => Err(LimboError::InternalError(
+            "HIR subquery source selected a table access method".into(),
+        )),
+    }
+}
+
 pub(crate) fn apply_hir_selected_virtual_access(
     constraints: &constraints::HirTableConstraints,
     predicates: &mut [HirWhereTerm],

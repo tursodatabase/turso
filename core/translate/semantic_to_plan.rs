@@ -26,6 +26,21 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+/// The source an outer join may NULL-extend, when `source` is the right
+/// side of one: its seek terms must stay checked on the added row.
+fn hir_outer_join_source(
+    source: SourceId,
+    join_info: Option<&crate::translate::plan::HirJoinInfo>,
+) -> Option<SourceId> {
+    join_info.and_then(|join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+        )
+        .then_some(source)
+    })
+}
+
 fn hir_block_grouping(block: &hir::QueryBlock) -> Option<&hir::Grouping> {
     match &block.body {
         hir::QueryBlockBody::Select {
@@ -517,13 +532,19 @@ pub(crate) enum HirSourceAccess {
     /// keyed by the columns that equal values from earlier loops. It replaces
     /// an automatic index, as legacy's hash join does.
     Hash(HirHashLookup),
+    /// A FROM subquery. With `seek`, its rows are stored once and read
+    /// through a temporary index over them, keyed by columns that earlier
+    /// loops constrain, as legacy's materialized-subquery seek.
     Derived {
         query: QueryId,
+        seek: Option<crate::translate::optimizer::HirBtreeOperation>,
     },
+    /// A CTE reference; `seek` as for [`HirSourceAccess::Derived`].
     Cte {
         cte: hir::CteId,
         query: QueryId,
         materialization: HirCteMaterialization,
+        seek: Option<crate::translate::optimizer::HirBtreeOperation>,
     },
     RecursiveCte {
         cte: hir::CteId,
@@ -875,7 +896,7 @@ impl<'a> HirPlanContext<'a> {
         // A correlated subquery runs once per row of the outer tables it
         // reads, so like SQLite it may build an automatic index once and
         // seek it on every run. Its estimates stay per run.
-        let runs = self.correlated_runs(query, schema, params);
+        let runs = self.correlated_runs(query, schema, params, &query_estimate);
         let in_probe = self.in_probe_equality(query);
         let blocks = query
             .blocks
@@ -1027,7 +1048,8 @@ impl<'a> HirPlanContext<'a> {
     }
 
     /// How many times a query runs: once, or for a correlated subquery,
-    /// about once per row of the largest outer table it reads.
+    /// about once per row of the largest outer source it reads, a table or
+    /// a FROM subquery or CTE, as legacy counts the rows that reach it.
     ///
     /// Planning for many runs lets the subquery build an automatic index
     /// once. It is only used where that index cannot change the answer: a
@@ -1039,7 +1061,14 @@ impl<'a> HirPlanContext<'a> {
         query: &hir::Query,
         schema: &Schema,
         params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> f64 {
+        let query_rows = |query: QueryId| {
+            query_estimate(query)
+                .map_or(*RowCountEstimate::hardcoded_fallback(params), |estimate| {
+                    estimate.output_cardinality.max(1.0)
+                })
+        };
         if !matches!(self.document.root, hir::HirRoot::Query(_))
             || !(self.document.subquery_uses_ignore_row_order(query.id)
                 || query_ignores_row_order(query))
@@ -1052,6 +1081,13 @@ impl<'a> HirPlanContext<'a> {
             .filter_map(|source| match &self.definition(*source).kind {
                 hir::SourceKind::Table(table) => {
                     Some(*base_row_estimate(schema, table.value(), params))
+                }
+                hir::SourceKind::Derived(query) => Some(query_rows(*query)),
+                hir::SourceKind::Cte(cte) => {
+                    Some(match self.document.cte(*cte).map(|cte| &cte.body) {
+                        Some(hir::CteBody::Query(query)) => query_rows(*query),
+                        _ => *RowCountEstimate::hardcoded_fallback(params),
+                    })
                 }
                 _ => None,
             })
@@ -2225,37 +2261,40 @@ impl<'a> HirPlanContext<'a> {
                         )))
                     }
                 },
-                HirPlanSource::Derived { query, .. } => {
-                    if !matches!(
-                        access_methods[access_method_position].params,
-                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
-                    ) {
-                        return Err(LimboError::InternalError(
-                            "derived HIR source selected a non-subquery access method".to_string(),
-                        ));
-                    }
-                    HirSourceAccess::Derived { query: *query }
-                }
+                HirPlanSource::Derived {
+                    query, join_info, ..
+                } => HirSourceAccess::Derived {
+                    query: *query,
+                    seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &constraints[source_position],
+                        &mut input.predicates,
+                        &access_methods[access_method_position],
+                        hir_outer_join_source(
+                            input.sources[source_position].source(),
+                            join_info.as_ref(),
+                        ),
+                    )?,
+                },
                 HirPlanSource::Cte {
                     cte,
                     query,
                     materialization,
+                    join_info,
                     ..
-                } => {
-                    if !matches!(
-                        access_methods[access_method_position].params,
-                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
-                    ) {
-                        return Err(LimboError::InternalError(
-                            "CTE HIR source selected a non-subquery access method".to_string(),
-                        ));
-                    }
-                    HirSourceAccess::Cte {
-                        cte: *cte,
-                        query: *query,
-                        materialization: *materialization,
-                    }
-                }
+                } => HirSourceAccess::Cte {
+                    cte: *cte,
+                    query: *query,
+                    materialization: *materialization,
+                    seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &constraints[source_position],
+                        &mut input.predicates,
+                        &access_methods[access_method_position],
+                        hir_outer_join_source(
+                            input.sources[source_position].source(),
+                            join_info.as_ref(),
+                        ),
+                    )?,
+                },
                 HirPlanSource::RecursiveCte { cte, .. } => {
                     if !matches!(
                         access_methods[access_method_position].params,
@@ -3895,7 +3934,7 @@ mod tests {
         assert_eq!(source_loop.source_position, 0);
         assert!(matches!(
             source_loop.access,
-            HirSourceAccess::Derived { query } if query == child_query
+            HirSourceAccess::Derived { query, .. } if query == child_query
         ));
         assert!(root.cost.0 > child.cost.0);
 
@@ -3971,6 +4010,7 @@ mod tests {
                 cte,
                 query,
                 materialization: HirCteMaterialization::Explicit,
+                ..
             } if cte == cte_id && query == child_query
         ));
 
@@ -4188,7 +4228,7 @@ mod tests {
             source_loop.source == source_id
                 && matches!(
                     source_loop.access,
-                    HirSourceAccess::Derived { query } if query == child_query
+                    HirSourceAccess::Derived { query, .. } if query == child_query
                 )
         }));
     }
