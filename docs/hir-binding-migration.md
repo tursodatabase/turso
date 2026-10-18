@@ -281,22 +281,30 @@ What stays a subquery still runs fast:
   read outside a key.
 - A correlated subquery opens its cursors once, under `Once`, instead of on
   every run.
-- An inner join on an equality no index covers looks rows up in a hash
-  table instead of an automatic index, as legacy's hash join does. The
-  lookup is a loop after the loop that supplies its keys, and the table's
-  columns come from registers. A hash table that outgrows its budget moves
-  rows to disk; lookups that need them wait, and after the previous loop
-  ends they run again by that loop's rowid. So the previous loop must read a
-  rowid table directly and must not be NULL-extended, and the plan must not
-  rely on loop order. The table may be the right side of a LEFT JOIN: a row
-  without a match gets its NULL row, in the waiting pass if its lookup
-  waited. Only the root query's blocks use hash lookups, since a hash table
-  that moved rows to disk cannot be probed again after its waiting lookups
-  ran; a subquery that may run again seeks an automatic index built once.
-  Legacy also hashes FULL joins and builds from materialized join prefixes;
-  HIR uses an automatic index there. The shared access code builds no
-  automatic index for a legacy FULL JOIN, but HIR's nested-loop FULL JOIN
-  may seek one on its right side, as its RIGHT JOIN does.
+- Like legacy (`join_lhs_and_rhs`, `try_hash_join_access_method`), the join
+  search may hash-join a table with the one joined before it: that table is
+  built into a hash table, keyed by the `=` terms between the two, and the
+  new table is scanned and probes it, when that costs less than its best
+  nested-loop access, with legacy's eligibility rules (no index on a join
+  column, no index hint, no USING, no table a correlated subquery reads, no
+  probe-to-build chaining). In loop order the probe comes first and the
+  build table's loop looks rows up; EXPLAIN shows `HASH JOIN <probe>` then
+  the build table, as legacy does. A LEFT or FULL join builds from its left
+  table, records the build rows its ON terms match, and after the loops
+  runs the other build rows with the right side NULL, like HIR's RIGHT
+  JOIN; a FULL join also NULL-fills the build row for a probe row without a
+  match, and must hash when it can. A hash table that outgrows its budget
+  moves rows to disk; lookups that need them wait, and after the probe loop
+  ends they run again by its rowid, so both tables must be rowid tables
+  without custom types. Unlike legacy, a hash table is probed by one run of
+  one loop only, since a hash table that moved rows to disk frees its
+  in-memory part when its waiting lookups run: so only the root query's
+  blocks hash, the probe table is the block's first loop (the build table
+  was the only table before it in the join order), and a block with another
+  RIGHT or FULL join does not hash. The build table is always read in full,
+  never through a materialized list of the rows that match earlier tables,
+  so a join legacy builds that way keeps its nested loops, and the build
+  keys need no Bloom filter.
 
 These planning rules are ports of legacy's, sharing its cost formulas and
 order checks where the code allows:

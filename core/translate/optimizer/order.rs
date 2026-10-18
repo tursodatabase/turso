@@ -421,6 +421,17 @@ pub(crate) fn hir_plan_satisfies_order_target(
     order_target: &HirOrderTarget<'_>,
     schema: &Schema,
 ) -> Result<bool> {
+    // A hash join scans its probe table first and looks the build table up,
+    // so its loops do not run in the plan's join order; legacy never keeps a
+    // hash join's order either.
+    if plan.data.iter().any(|(_, method)| {
+        matches!(
+            access_methods.get(*method).map(|method| &method.params),
+            Some(AccessMethodParams::HashJoin { .. })
+        )
+    }) {
+        return Ok(false);
+    }
     // A RIGHT or FULL join adds its unmatched rows after every loop ends.
     let join_kind = |source_position: usize| {
         sources

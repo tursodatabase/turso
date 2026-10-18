@@ -1086,11 +1086,12 @@ fn hir_in_subquery_reading_the_outer_row_through_a_from_subquery_matches_sqlite(
     }
 }
 
-/// An equality join on columns no index covers looks rows up in a hash table
-/// instead of an automatic index, as legacy's hash join does. The tables are
-/// large enough that a debug build's hash table spills to disk, so the
-/// lookups that wait for spilled rows run too, and every row still matches
-/// SQLite.
+/// Like legacy, an equality join on columns no index covers may build a hash
+/// table from the earlier table and scan the later one, probing it; a LEFT
+/// or FULL join also scans the build rows nothing matched. HIR hashes the
+/// same joins as legacy. The tables are large enough that a debug build's
+/// hash table spills to disk, so the lookups that wait for spilled rows run
+/// too, and every row still matches SQLite.
 #[test]
 fn hir_equality_joins_without_an_index_use_a_hash_table() {
     const SCHEMA: &str = "
@@ -1104,17 +1105,17 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
                 substr('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq', 1, i % 50), i % 17 FROM s;
     ";
     let db = TempDatabase::new_empty();
-    let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
+    let [legacy, hir] = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SCHEMA).unwrap();
-    // A LEFT JOIN row without a match, including one whose lookup waited
-    // for a partition on disk, reads NULL. A subquery may run again, so it
-    // seeks an automatic index instead: a hash table that moved rows to
-    // disk cannot be probed again after its waiting lookups ran.
+    // A LEFT or FULL JOIN row without a match, including one whose lookup
+    // waited for a partition on disk, reads NULL. Unlike legacy, a subquery
+    // may run again, so it seeks an automatic index instead: a hash table
+    // that moved rows to disk cannot be probed again after its waiting
+    // lookups ran.
     for (sql, hashes) in [
         (
             "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
@@ -1152,6 +1153,15 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
             true,
         ),
         (
+            "SELECT count(*), count(a.id), count(b.id), sum(b.v) FROM a FULL JOIN b ON b.k = a.k",
+            true,
+        ),
+        (
+            "SELECT count(*), count(a.id), count(b.id) FROM a FULL JOIN b ON b.k = a.k \
+             WHERE a.id IS NULL OR b.v > 10",
+            true,
+        ),
+        (
             "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) \
              FROM a WHERE a.id < 300",
             false,
@@ -1175,6 +1185,11 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
                 hashes,
                 "{opcode} for {sql}: {opcodes:?}"
             );
+        }
+        // The same tables are hashed and scanned as in legacy's plan, where
+        // legacy hashes too.
+        if hashes {
+            assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
         }
         let mut stmt = sqlite.prepare(sql).unwrap();
         let columns = stmt.column_count();
@@ -1615,12 +1630,14 @@ fn hir_window_uses_the_loop_order_like_legacy() {
     }
 }
 
-/// HIR runs a FULL JOIN as nested loops plus a pass for the right table's
-/// unmatched rows, like SQLite. Like a RIGHT JOIN, its right side seeks a
-/// temporary index on the join key instead of being scanned again for every
-/// left row; legacy uses a hash join here.
+/// Like legacy, a FULL JOIN on an equality hashes its left table and scans
+/// its right table, then the left rows nothing matched. A FULL JOIN that
+/// cannot hash, here because two tables are on its left, runs as nested
+/// loops plus a pass for the right table's unmatched rows, like SQLite; like
+/// a RIGHT JOIN, its right side seeks a temporary index on the join key
+/// instead of being scanned again for every left row.
 #[test]
-fn hir_full_join_seeks_a_temporary_index() {
+fn hir_full_join_hashes_like_legacy() {
     const SCHEMA: &str = "
         CREATE TABLE l(id INTEGER PRIMARY KEY, k TEXT, v INT);
         CREATE TABLE r(id INTEGER PRIMARY KEY, k TEXT, w INT);
@@ -1628,8 +1645,7 @@ fn hir_full_join_seeks_a_temporary_index() {
         INSERT INTO r VALUES (10,'a',10),(11,'a',11),(12,'c',12),(13,NULL,13),(14,'d',14);
     ";
     let db = TempDatabase::new_empty();
-    let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
+    let [legacy, hir] = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1637,6 +1653,11 @@ fn hir_full_join_seeks_a_temporary_index() {
     sqlite.execute_batch(SCHEMA).unwrap();
     let sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k ORDER BY 1, 2";
     let plan = query_plan(&hir, sql);
+    assert_eq!(plan, query_plan(&legacy, sql));
+    assert_eq!(plan, ["HASH JOIN r", "SCAN l", "USE SORTER FOR ORDER BY"]);
+    let nested_sql = "SELECT a.id, l.id, r.id FROM l AS a, l FULL JOIN r ON l.k = r.k \
+                      WHERE a.id = 1 ORDER BY 1, 2, 3";
+    let plan = query_plan(&hir, nested_sql);
     assert!(
         plan.iter()
             .any(|row| row.starts_with("SEARCH r USING COVERING INDEX ephemeral_")),
@@ -1644,6 +1665,7 @@ fn hir_full_join_seeks_a_temporary_index() {
     );
     for sql in [
         sql,
+        nested_sql,
         "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k AND r.w > 10 ORDER BY 1, 2",
         "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k WHERE l.v IS NULL OR r.w > 10 \
          ORDER BY 1, 2",
@@ -2298,11 +2320,8 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
     }
     let sum_sql = "SELECT o.id FROM o WHERE o.max_sum > (SELECT sum(i.x) FROM i WHERE i.k = o.k)";
     let plan = query_plan(&hir, sum_sql);
-    assert!(
-        plan.iter()
-            .any(|line| line.starts_with("SEARCH i ") && line.ends_with("LEFT-JOIN")),
-        "{plan:?}"
-    );
+    assert_eq!(plan, query_plan(&legacy, sum_sql));
+    assert_eq!(plan, ["HASH JOIN i", "SCAN o", "USE SORTER FOR GROUP BY"]);
     let shared_sql = "SELECT count(*) FROM o WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) \
                       AND o.x > (SELECT avg(i.q) FROM i WHERE i.k = o.k) - 100";
     let plan = query_plan(&hir, shared_sql);
@@ -2323,6 +2342,100 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
         "SELECT o.id, (SELECT avg(i.q) FROM i WHERE i.k = o.k), \
          (SELECT avg(i.q) FROM i WHERE i.k = o.k) FROM o \
          WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) ORDER BY 1",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// Like legacy's hash join, HIR builds the hash table from the table joined
+/// before and scans the next one, probing it, so both plans hash and scan
+/// the same tables. A LEFT or FULL join builds from its left table and then
+/// emits the left rows nothing matched.
+#[test]
+fn hir_hash_joins_build_and_probe_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE h_orders(order_id INTEGER PRIMARY KEY, customer_name TEXT, amount INT)",
+        "CREATE TABLE h_items(item_id INTEGER PRIMARY KEY, order_name TEXT, product TEXT, \
+         quantity INT)",
+        "INSERT INTO h_orders VALUES (1,'a',10),(2,'b',20),(3,'c',30),(4,NULL,5)",
+        "INSERT INTO h_items VALUES (1,'a','pen',1),(2,'a','cup',2),(3,'b','ink',3),\
+         (4,'z','box',4),(5,NULL,'nil',5)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT h.order_id, i.product FROM h_orders h \
+             JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
+            [
+                "HASH JOIN h_items AS i",
+                "SCAN h_orders AS h",
+                "USE SORTER FOR ORDER BY",
+            ]
+            .as_slice(),
+        ),
+        (
+            "SELECT h.order_id, i.product FROM h_orders h \
+             LEFT JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
+            &[
+                "HASH JOIN h_items AS i",
+                "SCAN h_orders AS h",
+                "USE SORTER FOR ORDER BY",
+            ],
+        ),
+        (
+            "SELECT h.order_id, i.item_id FROM h_orders h \
+             FULL JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
+            &[
+                "HASH JOIN h_items AS i",
+                "SCAN h_orders AS h",
+                "USE SORTER FOR ORDER BY",
+            ],
+        ),
+        (
+            "SELECT h.customer_name, count(i.item_id) FROM h_orders h \
+             LEFT JOIN h_items i ON h.customer_name = i.order_name \
+             GROUP BY h.customer_name ORDER BY 1",
+            &[
+                "HASH JOIN h_items AS i",
+                "SCAN h_orders AS h",
+                "USE SORTER FOR GROUP BY",
+            ],
+        ),
+        (
+            // The key may be an expression of the build table.
+            "SELECT h.order_id, i.item_id FROM h_orders h \
+             JOIN h_items i ON i.quantity = h.amount / 10 ORDER BY 1, 2",
+            &[
+                "HASH JOIN h_items AS i",
+                "SCAN h_orders AS h",
+                "USE SORTER FOR ORDER BY",
+            ],
+        ),
+    ] {
+        let plan = query_plan(&hir, sql);
+        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
+        assert_eq!(plan, expected, "{sql}");
+    }
+    for sql in [
+        "SELECT h.order_id, i.product FROM h_orders h \
+         LEFT JOIN h_items i ON h.customer_name = i.order_name AND i.quantity > 1 ORDER BY 1, 2",
+        "SELECT h.order_id FROM h_orders h \
+         LEFT JOIN h_items i ON h.customer_name = i.order_name WHERE i.item_id IS NULL ORDER BY 1",
+        "SELECT h.order_id, i.item_id FROM h_orders h \
+         FULL JOIN h_items i ON h.customer_name = i.order_name \
+         WHERE h.amount > 5 OR i.quantity > 3 ORDER BY 1, 2",
+        "SELECT h.order_id, i.item_id FROM h_orders h \
+         FULL JOIN h_items i ON h.customer_name = i.order_name \
+         WHERE h.order_id IS NULL OR i.item_id IS NULL ORDER BY 1, 2",
+        "SELECT count(*), count(h.order_id), count(i.item_id) FROM h_orders h \
+         FULL JOIN h_items i ON h.customer_name = i.order_name",
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),

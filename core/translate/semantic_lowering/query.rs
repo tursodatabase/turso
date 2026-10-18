@@ -3182,12 +3182,52 @@ struct HirNullRegisters {
 /// RIGHT JOIN, and keeps legacy's order: matched rows first, then the rest.
 struct HirRightOuterJoin {
     source: SourceId,
+    /// The source whose ON terms decide a match: `source` itself, or the
+    /// probe table of an outer hash join built from `source`.
+    owner: SourceId,
     loop_index: usize,
     matched: CursorID,
     empty_record: usize,
     /// The ephemeral table of a materialized right subquery. Its rowids key
     /// the matched set, and the unmatched pass scans it again.
     materialized: Option<CursorID>,
+}
+
+/// An outer hash join: `build` was built into a hash table, and `probe`,
+/// the right side of a LEFT or FULL join, is scanned and looks it up.
+struct HirHashOuterJoin {
+    probe: SourceId,
+    build: SourceId,
+    build_loop: usize,
+    kind: hir::JoinKind,
+}
+
+/// The block's outer hash join, if any: a hash lookup whose previous loop
+/// reads the right side of a LEFT JOIN that stays one, or of a FULL JOIN.
+fn hash_outer_join(from: &hir::From, loops_plan: HirLoopsPlan<'_>) -> Option<HirHashOuterJoin> {
+    loops_plan
+        .loops
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(build_loop, planned_loop)| {
+            if !matches!(planned_loop.access, HirSourceAccess::Hash(_)) {
+                return None;
+            }
+            let probe = loops_plan.loops[build_loop - 1].source;
+            let kind = from.joins.iter().find(|join| join.right == probe)?.kind;
+            let outer = match kind {
+                hir::JoinKind::Left => !loops_plan.inner_joins.contains(&probe),
+                hir::JoinKind::Full => true,
+                _ => false,
+            };
+            outer.then_some(HirHashOuterJoin {
+                probe,
+                build: planned_loop.source,
+                build_loop,
+                kind,
+            })
+        })
 }
 
 /// Labels of one semi-join or anti-join loop.
@@ -4213,6 +4253,12 @@ fn emit_join_loops(
 ) -> Result<()> {
     let document = &plan.document;
     let mut joins = HirOuterJoins::default();
+    // Like legacy's outer hash join, `b LEFT JOIN p` (or FULL) built from b
+    // and probed by p runs like `p RIGHT JOIN b` in loop order: the ON
+    // terms of p run after each lookup into b, the b rows they match are
+    // recorded, and after the loops the other b rows run with p NULL. A
+    // FULL join also gives each p row without a match a NULL b row.
+    let hash_outer = from.and_then(|from| hash_outer_join(from, loops_plan));
     if let Some(from) = from {
         if !supported_btree_from(document, from, &mut joins) {
             return Err(LimboError::InternalError(
@@ -4223,6 +4269,17 @@ fn emit_join_loops(
         joins
             .owners
             .retain(|(owner, _)| !loops_plan.inner_joins.contains(owner));
+        if let Some(hash_outer) = &hash_outer {
+            for (owner, null_extends) in &mut joins.owners {
+                if *owner == hash_outer.probe {
+                    *null_extends = hash_outer.kind == hir::JoinKind::Full;
+                }
+            }
+            joins
+                .right_outer
+                .retain(|(source, _)| *source != hash_outer.probe);
+            joins.right_outer.push((hash_outer.build, hash_outer.kind));
+        }
     }
     if loops_plan.predicates.iter().any(|predicate| {
         predicate
@@ -4251,8 +4308,20 @@ fn emit_join_loops(
             initialize_hir_aggregate_captures(program, document, loops_plan.loops, state)
         })
         .transpose()?;
-    let left_joins = prepare_hir_left_joins(program, loops_plan, &prepared_loops, &joins.owners)?;
-    let right_outer = prepare_hir_right_outer_join(program, loops_plan, &prepared_loops, &joins)?;
+    let left_joins = prepare_hir_left_joins(
+        program,
+        loops_plan,
+        &prepared_loops,
+        &joins.owners,
+        hash_outer.as_ref(),
+    )?;
+    let right_outer = prepare_hir_right_outer_join(
+        program,
+        loops_plan,
+        &prepared_loops,
+        &joins,
+        hash_outer.as_ref(),
+    )?;
     let semi_anti = loops_plan
         .loops
         .iter()
@@ -4445,7 +4514,7 @@ impl HirLoopNest<'_, '_> {
                 )?;
                 if let Some(right_outer) = self
                     .right_outer
-                    .filter(|right_outer| right_outer.source == left_join.owner)
+                    .filter(|right_outer| right_outer.owner == left_join.owner)
                 {
                     if unmatched_pass {
                         return Err(LimboError::InternalError(
@@ -4688,6 +4757,23 @@ impl HirLoopNest<'_, '_> {
                 );
                 (scan, original)
             }
+            (PreparedHirLoop::Hash(prepared), None) => {
+                let scan = program.alloc_cursor_id(CursorType::BTreeTable(prepared.table.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: scan,
+                    root_page: prepared.table.root_page,
+                    db: prepared.database,
+                });
+                let original = program.source_binding(right_outer.source).cloned();
+                program.bind_source(
+                    right_outer.source,
+                    SourceBinding::BTree {
+                        scan_cursor: scan,
+                        table_cursor: None,
+                    },
+                );
+                (scan, original)
+            }
             _ => {
                 return Err(LimboError::InternalError(
                     "HIR RIGHT or FULL JOIN right loop does not match its matched set".into(),
@@ -4769,6 +4855,7 @@ fn prepare_hir_right_outer_join(
     block_plan: HirLoopsPlan<'_>,
     prepared_loops: &[PreparedHirLoop<'_>],
     joins: &HirOuterJoins,
+    hash_outer: Option<&HirHashOuterJoin>,
 ) -> Result<Option<HirRightOuterJoin>> {
     let source = match joins.right_outer.as_slice() {
         [] => return Ok(None),
@@ -4803,12 +4890,12 @@ fn prepare_hir_right_outer_join(
             (table, None)
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
+        PreparedHirLoop::Hash(prepared) => (prepared.table.clone(), None),
         PreparedHirLoop::Virtual(_)
         | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::OrUnion(_)
         | PreparedHirLoop::Registers(_)
-        | PreparedHirLoop::Coroutine(_)
-        | PreparedHirLoop::Hash(_) => {
+        | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
                 "HIR RIGHT or FULL JOIN source {source} has no rowids"
             )));
@@ -4827,8 +4914,12 @@ fn prepare_hir_right_outer_join(
         index_name: None,
         affinity_str: None,
     });
+    let owner = hash_outer
+        .filter(|hash_outer| hash_outer.build == source)
+        .map_or(source, |hash_outer| hash_outer.probe);
     Ok(Some(HirRightOuterJoin {
         source,
+        owner,
         loop_index,
         matched,
         empty_record,
@@ -4996,11 +5087,19 @@ fn prepare_hir_left_joins(
     block_plan: HirLoopsPlan<'_>,
     prepared_loops: &[PreparedHirLoop<'_>],
     owners: &[(SourceId, bool)],
+    hash_outer: Option<&HirHashOuterJoin>,
 ) -> Result<Vec<HirLeftJoin>> {
     owners
         .iter()
         .map(|(owner, null_extends)| {
-            let loop_indices = if let Some(group) = block_plan
+            // The ON terms of an outer hash join's probe table run after each
+            // lookup into the build table, whose row a FULL join NULL-fills.
+            let hash_loop = hash_outer
+                .filter(|hash_outer| hash_outer.probe == *owner)
+                .map(|hash_outer| hash_outer.build_loop);
+            let loop_indices = if let Some(hash_loop) = hash_loop {
+                vec![hash_loop]
+            } else if let Some(group) = block_plan
                 .groups
                 .iter()
                 .find(|group| group.source == *owner)
@@ -5105,8 +5204,30 @@ fn emit_hir_block_explain(
         emit_explain!(program, false, EqpDetail::ConstantRow);
         return Ok(());
     };
-    for planned_loop in &block_plan.loops {
-        let detail = hir_loop_explain(document, Some(from), &block_plan.inner_joins, planned_loop)?;
+    for (position, planned_loop) in block_plan.loops.iter().enumerate() {
+        let mut detail =
+            hir_loop_explain(document, Some(from), &block_plan.inner_joins, planned_loop)?;
+        // Like legacy, a hash join reads as `HASH JOIN` with the table it
+        // scans, then `SCAN` with the table built into the hash table.
+        let probes = block_plan
+            .loops
+            .get(position + 1)
+            .is_some_and(|next| matches!(next.access, HirSourceAccess::Hash(_)));
+        if probes {
+            if let EqpDetail::Scan {
+                table,
+                join,
+                subquery,
+                ..
+            } = detail
+            {
+                detail = EqpDetail::HashJoin {
+                    table,
+                    join,
+                    subquery,
+                };
+            }
+        }
         program.emit_source_explain(planned_loop.source, detail);
     }
     Ok(())
@@ -5261,10 +5382,30 @@ pub(super) fn hir_loop_explain(
                 ),
             }
         }
-        HirSourceAccess::Hash(_) => EqpDetail::HashJoin {
-            table,
-            join,
-            subquery: None,
+        HirSourceAccess::Hash(lookup) => match &lookup.explain {
+            Some((operation, table_lookup)) => {
+                return hir_loop_explain(
+                    document,
+                    from,
+                    inner_joins,
+                    &HirPlannedLoop {
+                        source: planned_loop.source,
+                        source_position: planned_loop.source_position,
+                        access: HirSourceAccess::BTree {
+                            operation: operation.clone(),
+                            table_lookup: *table_lookup,
+                        },
+                    },
+                );
+            }
+            None => EqpDetail::Scan {
+                table,
+                index: None,
+                source: EqpRowSource::BTreeTable,
+                backwards: false,
+                join,
+                subquery: None,
+            },
         },
         HirSourceAccess::OrUnion(union) => EqpDetail::MultiIndex {
             table,
@@ -5713,10 +5854,7 @@ fn start_hir_hash_loop(
         super::expr::translate_expr_no_constant_opt(
             program,
             document,
-            &hir::Expr::Column(hir::ColumnRef {
-                source: prepared.source.id,
-                column: key.column,
-            }),
+            &key.build,
             prepared.build_keys + position,
         )?;
     }
@@ -11755,12 +11893,17 @@ pub(super) mod tests {
 
     #[test]
     fn planned_inner_join_looks_rows_up_in_a_hash_table() {
+        // Like legacy, a join with an index hint never hashes.
+        let mut schema = automatic_join_schema();
+        schema
+            .analyze_stats
+            .table_stats_mut("right_items")
+            .row_count = Some(100_000);
         let plan = analyze_plan(
-            automatic_join_schema(),
+            schema,
             "SELECT l.value, r.extra \
-             FROM left_items AS l NOT INDEXED \
-             CROSS JOIN right_items AS r \
-             WHERE r.value = l.value",
+             FROM left_items AS l \
+             JOIN right_items AS r ON r.value = l.value",
         );
         let query = root_query(&plan.document);
         let block_plan = &plan
