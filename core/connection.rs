@@ -2756,7 +2756,9 @@ impl Connection {
         };
 
         let pager = self.get_pager_from_database_index(&database_id)?;
-        pager.set_initial_page_size(size)?;
+        if !pager.set_initial_page_size(size)? {
+            return Ok(());
+        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
