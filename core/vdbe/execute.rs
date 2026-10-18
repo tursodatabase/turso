@@ -17161,7 +17161,7 @@ pub fn op_drop_column(
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
-                let index = Arc::get_mut(index).expect("this should be the only strong reference");
+                let index = Arc::make_mut(index);
                 for index_column in index.columns.iter_mut() {
                     if index_column.pos_in_table != EXPR_INDEX_SENTINEL
                         && index_column.pos_in_table > *column_index
