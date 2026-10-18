@@ -115,7 +115,8 @@ pub(super) trait BtreeCandidateSource<I, O>: AccessSource {
 
 pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
     fn allows_alternative_access(&self) -> bool;
-    fn is_full_outer_join(&self) -> bool;
+    /// Whether the table may not be read through a temporary index.
+    fn forbids_automatic_index(&self) -> bool;
     fn used_column_count(&self) -> usize;
     /// Whether the first table of a block that runs more than once may be
     /// read through a temporary index. Only HIR builds that index once for
@@ -155,7 +156,8 @@ impl BtreeAccessSource<TableInternalId, *const ast::Expr> for JoinedTable {
         false
     }
 
-    fn is_full_outer_join(&self) -> bool {
+    /// Legacy runs a FULL JOIN only as a hash join.
+    fn forbids_automatic_index(&self) -> bool {
         self.join_info
             .as_ref()
             .is_some_and(|join_info| join_info.is_full_outer())
@@ -198,11 +200,12 @@ impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a>
         matches!(self.planned.indexed, hir::IndexHint::None)
     }
 
-    fn is_full_outer_join(&self) -> bool {
-        self.planned
-            .join_info
-            .as_ref()
-            .is_some_and(|join_info| join_info.kind == hir::JoinKind::Full)
+    /// HIR runs a FULL JOIN like SQLite, as nested loops plus a pass over
+    /// the right table for its unmatched rows, so like a RIGHT JOIN its
+    /// right side may seek a temporary index instead of being scanned again
+    /// for every left row.
+    fn forbids_automatic_index(&self) -> bool {
+        false
     }
 
     fn used_column_count(&self) -> usize {
@@ -984,7 +987,7 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
         && uses_full_table_scan
         && (!lhs_mask.is_empty()
             || (input_cardinality > 1.0 && source.indexes_first_table_of_rerun_block()))
-        && !source.is_full_outer_join()
+        && !source.forbids_automatic_index()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &constraints.constraints,

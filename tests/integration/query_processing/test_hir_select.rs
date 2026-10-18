@@ -1602,6 +1602,57 @@ fn hir_window_uses_the_loop_order_like_legacy() {
     }
 }
 
+/// HIR runs a FULL JOIN as nested loops plus a pass for the right table's
+/// unmatched rows, like SQLite. Like a RIGHT JOIN, its right side seeks a
+/// temporary index on the join key instead of being scanned again for every
+/// left row; legacy uses a hash join here.
+#[test]
+fn hir_full_join_seeks_a_temporary_index() {
+    const SCHEMA: &str = "
+        CREATE TABLE l(id INTEGER PRIMARY KEY, k TEXT, v INT);
+        CREATE TABLE r(id INTEGER PRIMARY KEY, k TEXT, w INT);
+        INSERT INTO l VALUES (1,'a',1),(2,'b',2),(3,NULL,3),(4,'d',4),(5,'a',5);
+        INSERT INTO r VALUES (10,'a',10),(11,'a',11),(12,'c',12),(13,NULL,13),(14,'d',14);
+    ";
+    let db = TempDatabase::new_empty();
+    let hir = db.connect_limbo();
+    hir.set_experimental_hir(true);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    let sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k ORDER BY 1, 2";
+    let plan = query_plan(&hir, sql);
+    assert!(
+        plan.iter()
+            .any(|row| row.starts_with("SEARCH r USING COVERING INDEX ephemeral_")),
+        "{plan:?}"
+    );
+    for sql in [
+        sql,
+        "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k AND r.w > 10 ORDER BY 1, 2",
+        "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k WHERE l.v IS NULL OR r.w > 10 \
+         ORDER BY 1, 2",
+        "SELECT count(*), count(l.id), count(r.id) FROM l FULL JOIN r ON l.k = r.k",
+    ] {
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            expected,
+            "rows differ for {sql}"
+        );
+    }
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]
