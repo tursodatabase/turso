@@ -90,6 +90,10 @@ fn emit_row_loop_delete(
         None
     };
 
+    for variable in &plan.phantom_params {
+        program.register_variable(variable);
+    }
+
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {

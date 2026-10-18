@@ -305,6 +305,7 @@ pub fn prepare_delete_plan(
         rowset_reg: None,
         non_from_clause_subqueries,
         safety,
+        phantom_params: vec![],
     };
 
     if delete_plan.safety.requires_stable_write_set() {

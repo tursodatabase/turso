@@ -1104,6 +1104,7 @@ fn find_select_plan_form(
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.table_references.has_right_or_full_join(),
+        &mut plan.phantom_params,
     )? {
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
@@ -1276,7 +1277,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause, false)?
+        eliminate_constant_conditions(&mut plan.where_clause, false, &mut plan.phantom_params)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -1327,6 +1328,7 @@ fn optimize_update_plan(
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
         plan.from_tables.has_right_or_full_join(),
+        &mut plan.phantom_params,
     )? {
         plan.contains_constant_false_condition = true;
         if is_update_from {
@@ -3837,6 +3839,7 @@ enum ConstantConditionEliminationResult {
 fn eliminate_constant_conditions(
     where_clause: &mut [WhereTerm],
     has_right_or_full_join: bool,
+    phantom_params: &mut Vec<ast::Variable>,
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
@@ -3844,6 +3847,7 @@ fn eliminate_constant_conditions(
         if predicate.expr.is_always_true()? {
             // true predicates can be removed since they don't affect the result
             where_clause[i].consumed = true;
+            collect_variables(&where_clause[i].expr, phantom_params);
             i += 1;
         } else if predicate.expr.is_always_false()? {
             let join_origin = predicate.origin.join_origin();
@@ -3856,9 +3860,10 @@ fn eliminate_constant_conditions(
                 i += 1;
                 continue;
             }
-            where_clause
-                .iter_mut()
-                .for_each(|term| term.consumed = true);
+            for term in where_clause.iter_mut() {
+                term.consumed = true;
+                collect_variables(&term.expr, phantom_params);
+            }
             return Ok(ConstantConditionEliminationResult::ImpossibleCondition);
         } else {
             i += 1;
@@ -3866,6 +3871,16 @@ fn eliminate_constant_conditions(
     }
 
     Ok(ConstantConditionEliminationResult::Continue)
+}
+
+fn collect_variables(expr: &Expr, variables: &mut Vec<ast::Variable>) {
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Expr::Variable(variable) = expr {
+            variables.push(variable.clone());
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("collecting variables cannot fail");
 }
 
 /// Check if the order target collation matches index column collations.

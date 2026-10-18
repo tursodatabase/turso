@@ -218,6 +218,10 @@ pub fn emit_program_for_update(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
+    for variable in &plan.phantom_params {
+        program.register_variable(variable);
+    }
+
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {

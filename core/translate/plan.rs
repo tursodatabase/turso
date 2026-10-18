@@ -861,10 +861,11 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
-    /// Parameters from EXISTS subquery result columns that were dropped during
-    /// semi/anti-join unnesting. These need to be registered in the program's
-    /// parameter list even though no code is emitted for them, so that bind-time
-    /// validation (`has_slot`) succeeds.
+    /// Parameters in expressions the optimizer dropped: EXISTS subquery result
+    /// columns removed by semi/anti-join unnesting, and constant WHERE terms.
+    /// These need to be registered in the program's parameter list even though
+    /// no code is emitted for them, so that bind-time validation (`has_slot`)
+    /// and the parameter count still see them.
     pub phantom_params: Vec<ast::Variable>,
 }
 
@@ -974,6 +975,8 @@ pub struct DeletePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this DELETE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// Parameters in constant WHERE terms the optimizer dropped. See [SelectPlan::phantom_params].
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 #[derive(Debug, Clone)]
@@ -1046,6 +1049,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// Parameters in constant WHERE terms the optimizer dropped. See [SelectPlan::phantom_params].
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl UpdatePlan {

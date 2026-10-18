@@ -126,6 +126,7 @@ use turso_parser::ast::{
 
 use crate::translate::plan::Plan;
 
+use super::collect_variables;
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -437,16 +438,7 @@ fn rewrite_as_semi_or_anti_join(
         ast::SubqueryType::Exists { .. }
     ) {
         for result_column in &inner_plan.result_columns {
-            walk_expr(
-                &result_column.expr,
-                &mut |expr: &Expr| -> Result<WalkControl> {
-                    if let Expr::Variable(variable) = expr {
-                        plan.phantom_params.push(variable.clone());
-                    }
-                    Ok(WalkControl::Continue)
-                },
-            )
-            .expect("walking a result expression cannot fail");
+            collect_variables(&result_column.expr, &mut plan.phantom_params);
         }
     }
 

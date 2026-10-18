@@ -461,6 +461,7 @@ fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
+        phantom_params: vec![],
     })
 }
 
