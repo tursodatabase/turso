@@ -6451,10 +6451,20 @@ impl BTreeCursor {
 
     /// Drop any pending saved seek-context; used by callers that re-navigate
     /// from the root and don't want restore_context to clobber them.
+    ///
+    /// Also drops skip_advance. That flag says "the next next() must return
+    /// the cell the cursor already sits on" and only describes the position a
+    /// delete or restore left behind. Once the cursor moves somewhere else,
+    /// the flag is wrong: after seek_to_last() it would stop the next() in
+    /// NewRowid from stepping past the last row, and the following insert
+    /// would land before that row. SQLite keeps this "skip" state in eState,
+    /// and moveToRoot() resets eState (btree.c:5619), so sqlite3BtreeFirst()
+    /// and sqlite3BtreeLast() always discard it.
     #[inline]
     fn clear_saved_seek(&mut self) {
         self.context = None;
         self.valid_state = CursorValidState::Valid;
+        self.skip_advance = false;
     }
 
     #[inline]
@@ -6751,6 +6761,12 @@ impl CursorTrait for BTreeCursor {
             match self.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
+                    // skip_advance only tells a forward step to stay put. A
+                    // backward step from the cell after a deleted row is
+                    // already right, and it must consume the flag so a later
+                    // next() advances normally. Matches btreePrevious(),
+                    // which clears CURSOR_SKIPNEXT (btree.c:6439-6442).
+                    self.skip_advance = false;
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
@@ -7578,7 +7594,6 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        self.skip_advance = false;
         loop {
             match self.rewind_state {
                 RewindState::Start => {
@@ -14221,6 +14236,146 @@ mod tests {
             usable_space - page.get_contents().header_size() - total_size
         );
         dbg!(free);
+    }
+
+    /// Does what NewRowid followed by an Insert without a seek do on one
+    /// cursor: move to the last row, read its rowid, step past it, insert.
+    fn append_with_new_rowid(cursor: &mut BTreeCursor, pager: &Arc<Pager>) -> i64 {
+        run_until_done(|| cursor.seek_to_last(), pager.deref()).unwrap();
+        let max = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        let new_rowid = max.map_or(1, |m| m + 1);
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let regs = &[Register::Value(Value::from_i64(new_rowid))];
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(new_rowid, Some(&record))),
+            pager.deref(),
+        )
+        .unwrap();
+        new_rowid
+    }
+
+    fn scan_rowids(pager: &Arc<Pager>, root_page: i64) -> Vec<i64> {
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        let mut out = Vec::new();
+        while cursor.has_record() {
+            out.push(
+                run_until_done(|| cursor.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap(),
+            );
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        }
+        out
+    }
+
+    /// Inserts rows 1..=3 and deletes row 2. The delete underflows the root
+    /// leaf, so the cursor is re-seeked onto row 3 and told that its next
+    /// next() must stay there.
+    fn three_rows_with_middle_deleted() -> (Arc<Pager>, i64, BTreeCursor) {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        for rowid in 1..=3 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
+        }
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+        assert!(cursor.skip_advance);
+        (pager, root_page, cursor)
+    }
+
+    #[test]
+    fn prev_after_delete_lets_next_advance() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.prev(), pager.deref()).unwrap();
+        let after_prev = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let after_next = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        assert_eq!((after_prev, after_next), (Some(1), Some(3)));
+    }
+
+    #[test]
+    fn last_after_delete_then_next_reaches_end() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.last(), pager.deref()).unwrap();
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            Some(3)
+        );
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        assert!(!cursor.has_record());
+    }
+
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row() {
+        let (pager, root_page, mut cursor) = three_rows_with_middle_deleted();
+        let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+        assert_eq!(new_rowid, 4);
+        assert_eq!(scan_rowids(&pager, root_page), vec![1, 3, 4]);
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+    }
+
+    /// Same as above over more tree shapes: one leaf or many, deleting the
+    /// first, middle, or last row, or every row one by one.
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row_in_any_tree_shape() {
+        for n in [1i64, 2, 3, 10, 200] {
+            for large in [false, true] {
+                for target in ["min", "max", "mid", "drain"] {
+                    let (pager, root_page, _, _) = empty_btree();
+                    let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+                    for rowid in 1..=n {
+                        let v = if large {
+                            Value::Text(Text::new("x".repeat(300)))
+                        } else {
+                            Value::from_i64(rowid)
+                        };
+                        insert_record(&mut cursor, &pager, rowid, v).unwrap();
+                    }
+                    let mut expected: Vec<i64> = (1..=n).collect();
+                    let victims: Vec<i64> = match target {
+                        "min" => vec![1],
+                        "max" => vec![n],
+                        "mid" => vec![n / 2 + 1],
+                        _ => (1..=n).collect(),
+                    };
+                    for v in victims {
+                        let found = run_until_done(
+                            || cursor.seek(SeekKey::TableRowId(v), SeekOp::GE { eq_only: true }),
+                            pager.deref(),
+                        )
+                        .unwrap();
+                        assert_eq!(found, SeekResult::Found);
+                        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+                        expected.retain(|r| *r != v);
+                    }
+                    let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+                    expected.push(new_rowid);
+                    expected.sort_unstable();
+                    let ctx = format!("n={n} large={large} target={target} new={new_rowid}");
+                    let found = run_until_done(
+                        || {
+                            cursor
+                                .seek(SeekKey::TableRowId(new_rowid), SeekOp::GE { eq_only: true })
+                        },
+                        pager.deref(),
+                    )
+                    .unwrap();
+                    assert_eq!(found, SeekResult::Found, "{ctx}");
+                    assert_eq!(scan_rowids(&pager, root_page), expected, "{ctx}");
+                }
+            }
+        }
     }
 
     #[test]
