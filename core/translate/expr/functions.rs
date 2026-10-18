@@ -328,7 +328,10 @@ pub(super) fn translate_sequence_function(
             cursor: cursor_id,
             key_reg: start_reg + 1,
             record_reg,
-            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+            flag: InsertFlags::new()
+                .require_seek()
+                .skip_last_rowid()
+                .skip_all_change_counts(),
             table_name: normalized_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {
