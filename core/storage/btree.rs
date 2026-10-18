@@ -5835,52 +5835,59 @@ impl BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Populate the cell-layout tier of `blob_cache` for the cursor's current
-    /// table-leaf cell, unless it is already cached for this (page, cell), and pin
-    /// the cell's rowid for expiry tracking. Restoring a disturbed position may
-    /// yield IO; the layout parse itself reads only the resident leaf page.
+    /// Check that the cursor is on a table row, cache its layout, and remember its
+    /// rowid for expiry tracking. Restoring a disturbed position may yield IO.
     fn blob_ensure_layout(&mut self) -> IOResultOr<()> {
         return_if_io!(self.blob_ensure_position());
-        let usable = self.pager.usable_space();
-        turso_assert!(usable > 4, "usable space must exceed overflow header");
         let cell_idx = self.stack.current_cell_index();
         if cell_idx < 0 {
             return Err(LimboError::BlobHandleExpired.into());
         }
+        let contents = self.stack.top_ref().get_contents();
+        if contents.page_type()? != PageType::TableLeaf {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O requires a table (rowid) row".to_string(),
+            )
+            .into());
+        }
+        let rowid = contents
+            .cell_table_leaf_read_header(cell_idx as usize)?
+            .rowid;
+        self.ensure_payload_layout()?;
+        self.blob_pinned_rowid = Some(rowid);
+        Ok(IOResult::Done(()))
+    }
+
+    /// Populate the cell-layout tier of `blob_cache` for the cell under the
+    /// cursor, in a table or an index b-tree, unless it is already cached for
+    /// this (page, cell). This and `overflow_pages` are SQLite's BtCursor.info
+    /// and BtCursor.aOverflow, which accessPayload (btree.c) uses for both
+    /// column reads and incremental blob I/O.
+    fn ensure_payload_layout(&mut self) -> Result<()> {
+        let usable = self.usable_space();
+        turso_assert!(usable > 4, "usable space must exceed overflow header");
+        let cell_idx = self.stack.current_cell_index();
+        turso_assert!(
+            cell_idx >= 0,
+            "cursor must be on a cell to read its payload"
+        );
         let cell_idx = cell_idx as usize;
         let leaf_id = self.stack.top_ref().get().id();
         if self.blob_cache.valid
             && self.blob_cache.leaf_id == leaf_id
             && self.blob_cache.cell_idx == cell_idx
         {
-            return Ok(IOResult::Done(()));
+            return Ok(());
         }
-        // Extract owned scalars from the cell before mutating the cache (the cell borrows
-        // the page, which borrows `self`).
-        let (rowid, local_off, local_len, payload_size, first_overflow) = {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let base = contents.as_ptr().as_ptr() as usize;
-            let BTreeCell::TableLeafCell(cell) = contents.cell_get(cell_idx, usable)? else {
-                return Err(LimboError::InternalError(
-                    "incremental blob I/O requires a table (rowid) row".to_string(),
-                )
-                .into());
-            };
-            (
-                cell.rowid,
-                cell.payload.as_ptr() as usize - base,
-                cell.payload.len(),
-                cell.payload_size as usize,
-                cell.first_overflow_page,
-            )
-        };
-        if local_len > payload_size {
-            return Err(LimboError::Corrupt(format!(
-                "cell claims {payload_size} payload bytes but holds {local_len} locally"
-            ))
-            .into());
-        }
+        let contents = self.stack.top_ref().get_contents();
+        let (local, local_off, payload_size, first_overflow) =
+            contents.cell_read_payload_at(cell_idx, self.payload_limits)?;
+        let local_len = local.len();
+        let payload_size = payload_size as usize;
+        turso_debug_assert!(
+            local_len <= payload_size,
+            "a cell holds no more payload bytes on the page than the payload has"
+        );
         let c = &mut self.blob_cache;
         c.valid = false;
         c.leaf_id = leaf_id;
@@ -5894,12 +5901,11 @@ impl BTreeCursor {
         if let Some(fo) = first_overflow {
             crate::with_btree_allocation_site!(OverflowRead, c.overflow_pages.try_push(fo))?;
         }
-        self.blob_pinned_rowid = Some(rowid);
         c.valid = true;
         // Moving to a different cell: unpin the previous cell's cached overflow page.
         c.release_pinned_overflow();
         c.col_valid = false;
-        Ok(IOResult::Done(()))
+        Ok(())
     }
 
     /// Fetch the `idx`-th overflow page, reusing the pinned last page on a spatial-
@@ -5973,11 +5979,10 @@ impl BTreeCursor {
             // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
             // IO yield the whole function restarts; every step up to here is a pure
             // cached read, so the restart is cheap and idempotent.
-            let mut header = crate::with_btree_allocation_site!(
-                BlobRecordHeader,
-                crate::alloc::try_vec![0u8; header_size]
-            )?;
-            return_if_io!(self.blob_read_range(0, &mut header));
+            let mut header = crate::alloc::vec![];
+            crate::with_btree_allocation_site!(BlobRecordHeader, header.try_reserve(header_size))?;
+            return_if_io!(self
+                .copy_payload_range(0, header_size, |chunk| { header.extend_from_slice(chunk) }));
             blob_locate_column_in_header(&header, hpos0, payload_size, column)?
         };
         let c = &mut self.blob_cache;
@@ -6030,7 +6035,7 @@ impl BTreeCursor {
                     Some(p) => *p,
                     None => {
                         return Err(LimboError::Corrupt(
-                            "blob value needs overflow pages but has none".to_string(),
+                            "record needs overflow pages but has none".to_string(),
                         )
                         .into())
                     }
@@ -6062,10 +6067,10 @@ impl BTreeCursor {
     /// Map payload offset `pos` (0 = first payload byte) to the physical span that
     /// begins there, yielding at most `remaining` bytes. Pure arithmetic over the
     /// cached cell layout; the caller fetches the page and copies. Requires
-    /// `blob_ensure_layout` to have populated the layout tier.
+    /// `ensure_payload_layout` to have populated the layout tier.
     fn blob_span(&self, pos: usize, remaining: usize) -> BlobSpan {
         // Overflow spans divide by `per` (bytes per overflow page); it is `usable - 4`,
-        // established > 0 by blob_ensure_layout. Assert it so the invariant is explicit.
+        // established > 0 by ensure_payload_layout. Assert it so the invariant is explicit.
         turso_debug_assert!(
             self.blob_cache.per > 0,
             "overflow bytes-per-page must be > 0"
@@ -6090,24 +6095,31 @@ impl BTreeCursor {
         }
     }
 
-    /// Copy `buf.len()` bytes starting at payload offset `off` (0 = first byte of the
-    /// value) into `buf`, spanning the leaf-local payload and the overflow chain. Uses
-    /// the O(1) overflow cache to locate each page. Requires `blob_ensure_layout` first.
-    fn blob_read_range(&mut self, off: usize, buf: &mut [u8]) -> IOResultOr<()> {
-        let len = buf.len();
+    /// Pass the `len` payload bytes starting at payload offset `off` to `sink`, in
+    /// order, one page's worth at a time. Uses the O(1) overflow cache to locate each
+    /// page, and reads the overflow pages before the range only for their next-page
+    /// pointers, as SQLite's accessPayload (btree.c) does. When a page read yields
+    /// for IO, `sink` has received every byte before that page. Requires
+    /// `ensure_payload_layout` first.
+    fn copy_payload_range(
+        &mut self,
+        off: usize,
+        len: usize,
+        mut sink: impl FnMut(&[u8]),
+    ) -> IOResultOr<()> {
         let mut done = 0usize;
         while done < len {
             match self.blob_span(off + done, len - done) {
                 // Local bytes are on the resident leaf page — no IO.
                 BlobSpan::Local { page_off, take } => {
                     let src = self.stack.top_ref().get_contents().as_ptr();
-                    buf[done..done + take].copy_from_slice(&src[page_off..page_off + take]);
+                    sink(&src[page_off..page_off + take]);
                     done += take;
                 }
                 BlobSpan::Overflow { idx, within, take } => {
                     let page = return_if_io!(self.blob_overflow_page(idx));
                     let src = page.get_contents().as_ptr();
-                    buf[done..done + take].copy_from_slice(&src[4 + within..4 + within + take]);
+                    sink(&src[4 + within..4 + within + take]);
                     done += take;
                 }
             }
@@ -6153,7 +6165,7 @@ impl BTreeCursor {
     }
 
     /// Validate the byte range `[off, off+len)` against column `column`'s value and
-    /// return its payload-relative start offset (for `blob_read_range` /
+    /// return its payload-relative start offset (for `copy_payload_range` /
     /// `blob_write_range`). One bounds check backs both read and write.
     fn blob_resolve_range(&mut self, column: usize, off: usize, len: usize) -> IOResultOr<usize> {
         return_if_io!(self.blob_typed_column(column));
@@ -6195,8 +6207,9 @@ impl BTreeCursor {
         if len == 0 {
             return Ok(IOResult::Done(()));
         }
-        out.resize(len, 0);
-        return_if_io!(self.blob_read_range(payload_off, out));
+        return_if_io!(
+            self.copy_payload_range(payload_off, len, |chunk| { out.extend_from_slice(chunk) })
+        );
         Ok(IOResult::Done(()))
     }
 
