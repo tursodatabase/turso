@@ -2057,13 +2057,7 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
-                    // Nested join on the right side: wrap as a subquery-like structure
-                    // For now, flatten it too (handles chained joins)
-                    let mut right_joins = Vec::new();
-                    let right_primary = self.flatten_join_tree(nested_join, &mut right_joins)?;
-                    // Add the right-side joins first, then the right primary becomes a joined table
-                    joins.extend(right_joins);
-                    right_primary
+                    ast::SelectTable::Sub(self.translate_join_expr(nested_join)?, None)
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
