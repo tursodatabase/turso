@@ -447,12 +447,12 @@ pub(crate) fn hir_plan_satisfies_order_target(
             Some(
                 HirPlanSource::Derived {
                     source: subquery_source,
-                    query,
+                    output_order,
                     ..
                 }
                 | HirPlanSource::Cte {
                     source: subquery_source,
-                    query,
+                    output_order,
                     ..
                 },
             ) => {
@@ -464,9 +464,8 @@ pub(crate) fn hir_plan_satisfies_order_target(
                     return Ok(false);
                 };
                 let consumed = hir_subquery_intrinsic_order_consumed(
-                    document,
                     *subquery_source,
-                    *query,
+                    output_order,
                     *iter_dir,
                     &order_target.columns[consumed_columns..],
                 );
@@ -663,150 +662,44 @@ pub fn subquery_intrinsic_order_consumed(
     finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
 }
 
+/// One output column of a planned HIR query, in the order the query returns
+/// its rows: rows are ordered by the first entry, then the second, and so on.
+/// `nulls` is the effective NULLS placement, so a later reversal flips it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HirOutputOrder {
+    pub(crate) column: usize,
+    pub(crate) order: SortOrder,
+    pub(crate) collation: CollationSeq,
+    pub(crate) nulls: ast::NullsOrder,
+}
+
 /// How many leading `target` columns a HIR FROM subquery or CTE returns its
 /// rows in when read in `iter_dir`, as legacy's
-/// [subquery_intrinsic_order_consumed] finds it: from the subquery's ORDER
-/// BY, else from its GROUP BY keys, which leave the GROUP BY sorter in key
-/// order, else from the subquery it reads, when it only passes that one
-/// subquery's rows through.
-///
-/// Not ported yet: legacy also derives the order of a plain scan of one
-/// table from that scan.
+/// [subquery_intrinsic_order_consumed] finds it. `output_order` is the order
+/// the subquery's plan returns its rows in; see `HirPlannedQuery`.
 pub(crate) fn hir_subquery_intrinsic_order_consumed(
-    document: &hir::HirDocument,
     source: hir::SourceId,
-    query: hir::QueryId,
+    output_order: &[HirOutputOrder],
     iter_dir: IterationDirection,
     target: &[ColumnOrder<hir::SourceId, &hir::Expr>],
 ) -> usize {
-    let Some(definition) = document.query(query) else {
-        return 0;
-    };
-    let [block] = definition.blocks.as_slice() else {
-        return 0;
-    };
-    let hir::QueryBlockBody::Select {
-        distinctness,
-        filter,
-        grouping,
-    } = &block.body
-    else {
-        return 0;
-    };
-    let output_position = |expression: &hir::Expr| match expression {
-        hir::Expr::Output(output) => definition.output.iter().position(|id| id == output),
-        expression => definition.output.iter().position(|id| {
-            document
-                .output(*id)
-                .is_some_and(|output| output.expr.equivalent(expression))
-        }),
-    };
-    let collation = |collation: Option<&hir::ResolvedCollation>| {
-        collation
-            .map(|collation| *collation.value())
-            .unwrap_or_default()
-    };
-    let same_column = |intrinsic: &ColumnOrder<hir::SourceId, ()>,
-                       target: &ColumnOrder<hir::SourceId, &hir::Expr>| {
+    let intrinsic = output_order
+        .iter()
+        .map(|column| ColumnOrder {
+            source,
+            target: ColumnTarget::<()>::Column(column.column),
+            order: column.order,
+            collation: column.collation,
+            nulls_order: Some(column.nulls),
+        })
+        .collect::<Vec<_>>();
+    match_intrinsic_order_by(&intrinsic, iter_dir, target, |intrinsic, target| {
         intrinsic.source == target.source
             && matches!(
                 (&intrinsic.target, &target.target),
                 (ColumnTarget::Column(a), ColumnTarget::Column(b)) if a == b
             )
-    };
-    let intrinsic = |terms: &mut dyn Iterator<
-        Item = (&hir::Expr, SortOrder, CollationSeq, Option<ast::NullsOrder>),
-    >| {
-        let mut columns = Vec::new();
-        for (expression, order, collation, nulls_order) in terms {
-            let Some(position) = output_position(expression) else {
-                break;
-            };
-            columns.push(ColumnOrder {
-                source,
-                target: ColumnTarget::<()>::Column(position),
-                order,
-                collation,
-                nulls_order,
-            });
-        }
-        columns
-    };
-    if !definition.order_by.is_empty() {
-        let columns = intrinsic(&mut definition.order_by.iter().map(|term| {
-            (
-                &term.expr,
-                term.order,
-                collation(term.collation.as_ref()),
-                term.nulls,
-            )
-        }));
-        return match_intrinsic_order_by(&columns, iter_dir, target, same_column);
-    }
-    // Windows sort rows again after grouping.
-    if !block.windows.is_empty() {
-        return 0;
-    }
-    if let Some(grouping) = grouping {
-        let columns = intrinsic(&mut grouping.keys.iter().zip(&grouping.key_collations).map(
-            |(key, key_collation)| (key, SortOrder::Asc, collation(key_collation.as_ref()), None),
-        ));
-        return match_intrinsic_order_by(&columns, iter_dir, target, same_column);
-    }
-    // A query that only passes one FROM subquery's rows through returns them
-    // in that subquery's order.
-    let Some(from) = &block.from else {
-        return 0;
-    };
-    if !from.joins.is_empty()
-        || distinctness.is_some()
-        || filter.is_some()
-        || block.aggregate_count != 0
-        || definition.limit.is_some()
-    {
-        return 0;
-    }
-    let Some(inner) = document.source(from.first) else {
-        return 0;
-    };
-    let inner_query = match &inner.kind {
-        hir::SourceKind::Derived(query) => *query,
-        hir::SourceKind::Cte(cte) => match document.cte(*cte).map(|cte| &cte.body) {
-            Some(hir::CteBody::Query(query)) => *query,
-            _ => return 0,
-        },
-        _ => return 0,
-    };
-    let mut mapped = Vec::with_capacity(target.len());
-    for column in target {
-        let ColumnTarget::Column(position) = column.target else {
-            break;
-        };
-        if column.source != source {
-            break;
-        }
-        let Some(output) = definition
-            .output
-            .get(position)
-            .and_then(|id| document.output(*id))
-        else {
-            break;
-        };
-        let hir::Expr::Column(reference) = &output.expr else {
-            break;
-        };
-        if reference.source != inner.id {
-            break;
-        }
-        mapped.push(ColumnOrder {
-            source: inner.id,
-            target: ColumnTarget::Column(reference.column),
-            order: column.order,
-            collation: column.collation,
-            nulls_order: column.nulls_order,
-        });
-    }
-    hir_subquery_intrinsic_order_consumed(document, inner.id, inner_query, iter_dir, &mapped)
+    })
 }
 
 /// Build a `ColumnOrder` list from expressions and sort directions by mapping

@@ -118,11 +118,6 @@ pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
     /// Whether the table may not be read through a temporary index.
     fn forbids_automatic_index(&self) -> bool;
     fn used_column_count(&self) -> usize;
-    /// Whether the first table of a block that runs more than once may be
-    /// read through a temporary index. Only HIR builds that index once for
-    /// every run; legacy's hash join over such a table would rescan it
-    /// without the index's terms.
-    fn indexes_first_table_of_rerun_block(&self) -> bool;
 }
 
 impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
@@ -150,10 +145,6 @@ impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
 impl BtreeAccessSource<TableInternalId, *const ast::Expr> for JoinedTable {
     fn allows_alternative_access(&self) -> bool {
         self.indexed.is_none()
-    }
-
-    fn indexes_first_table_of_rerun_block(&self) -> bool {
-        false
     }
 
     /// Legacy runs a FULL JOIN only as a hash join.
@@ -216,10 +207,6 @@ impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a>
             .enumerate()
             .filter(|(column_idx, _)| self.planned.col_used_mask.get(*column_idx))
             .count()
-    }
-
-    fn indexes_first_table_of_rerun_block(&self) -> bool {
-        true
     }
 }
 
@@ -980,13 +967,12 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
             ..
         } if constraint_refs.is_empty()
     );
-    // A temporary index pays off when its seeks run many times: after other
-    // tables in a join, or in a correlated subquery that runs once per outer
-    // row. It is built once either way.
+    // Like legacy, a temporary index is only built for a table joined after
+    // another one. A correlated subquery's first table is scanned on each
+    // run; legacy speeds those up by turning the subquery into a join.
     if source.allows_alternative_access()
         && uses_full_table_scan
-        && (!lhs_mask.is_empty()
-            || (input_cardinality > 1.0 && source.indexes_first_table_of_rerun_block()))
+        && !lhs_mask.is_empty()
         && !source.forbids_automatic_index()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
@@ -2126,6 +2112,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     table_materialization_required: bool,
     may_seek: bool,
     order_target: Option<&super::order::HirOrderTarget<'_>>,
+    output_order: &[super::order::HirOutputOrder],
     constraints: &TableConstraints<hir::Expr, hir::SourceId>,
     lhs_mask: &TableMask,
     source_position: usize,
@@ -2200,30 +2187,48 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
                 })
         })
         .collect();
-    if usable.is_empty() {
-        // Reading forwards already gives the subquery's own order; only a
-        // stored CTE can be read backwards for the opposite one.
-        let backwards = table_materialization_required
-            && order_target.is_some_and(|target| {
-                let consumed = |direction| {
-                    super::order::hir_subquery_intrinsic_order_consumed(
-                        document,
-                        source,
-                        query,
-                        direction,
-                        &target.columns,
-                    )
-                };
-                consumed(IterationDirection::Forwards) != target.columns.len()
-                    && consumed(IterationDirection::Backwards) == target.columns.len()
-            });
-        let mut method = scan(scan_cost);
-        if backwards {
-            method.params = AccessMethodParams::Subquery {
-                iter_dir: IterationDirection::Backwards,
+    // Like legacy: a MIN or MAX whose seek constraints are all on its own
+    // column can walk the subquery's own order from one end.
+    let extremum_constraints_compatible = order_target.is_some_and(|target| {
+        target.is_extremum()
+            && matches!(
+                target.columns.first(),
+                Some(column) if column.source == source
+                    && matches!(column.target, super::order::ColumnTarget::Column(position)
+                        if usable.iter().all(|(_, constraint)| constraint.table_col_pos == Some(position)))
+            )
+    });
+    if extremum_constraints_compatible || usable.is_empty() {
+        // Legacy's `intrinsic_subquery_scan_direction`: reading forwards
+        // gives the subquery's own order; only a stored CTE can be read
+        // backwards for the opposite one.
+        let direction = order_target.and_then(|target| {
+            let consumed = |direction| {
+                super::order::hir_subquery_intrinsic_order_consumed(
+                    source,
+                    output_order,
+                    direction,
+                    &target.columns,
+                )
             };
+            if consumed(IterationDirection::Forwards) == target.columns.len() {
+                Some(IterationDirection::Forwards)
+            } else if table_materialization_required
+                && consumed(IterationDirection::Backwards) == target.columns.len()
+            {
+                Some(IterationDirection::Backwards)
+            } else {
+                None
+            }
+        });
+        if let Some(iter_dir) = direction {
+            let mut method = scan(scan_cost);
+            method.params = AccessMethodParams::Subquery { iter_dir };
+            return Ok(method);
         }
-        return Ok(method);
+    }
+    if usable.is_empty() {
+        return Ok(scan(scan_cost));
     }
     let usable_constraints: Vec<&Constraint<hir::Expr>> =
         usable.iter().map(|(_, constraint)| *constraint).collect();

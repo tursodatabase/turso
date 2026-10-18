@@ -172,6 +172,36 @@ impl HirDocument {
         false
     }
 
+    /// The scalar, row, IN and EXISTS subqueries written in `query`'s own
+    /// clauses, without the queries of its FROM subqueries and CTEs.
+    pub(crate) fn expression_subqueries(&self, id: QueryId) -> Vec<QueryId> {
+        let Some(query) = self.query(id) else {
+            return Vec::new();
+        };
+        let mut subqueries = Vec::new();
+        visit_query_parts(self, query, &mut |part| {
+            let QueryPart::Expression(expression) = part else {
+                return;
+            };
+            expression.for_each(&mut |expression| {
+                let Expr::Subquery(subquery) = expression else {
+                    return;
+                };
+                let query = match subquery {
+                    SubqueryExpr::Scalar { query, .. }
+                    | SubqueryExpr::Row { query }
+                    | SubqueryExpr::In { query, .. }
+                    | SubqueryExpr::Exists(query) => *query,
+                };
+                if !subqueries.contains(&query) {
+                    subqueries.push(query);
+                }
+            });
+        });
+        subqueries.sort_unstable();
+        subqueries
+    }
+
     pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
         let Some(query) = self.query(id) else {
             return Vec::new();

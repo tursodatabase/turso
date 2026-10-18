@@ -710,7 +710,7 @@ fn hir_seek_keys_from_a_null_row_skip_the_seek() {
 }
 
 #[test]
-fn hir_correlated_subqueries_seek_an_automatic_index() {
+fn hir_correlated_subqueries_match_rows() {
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
     hir.set_experimental_hir(true);
@@ -724,9 +724,9 @@ fn hir_correlated_subqueries_seek_an_automatic_index() {
     ] {
         hir.execute(statement).unwrap();
     }
-    // Like SQLite and legacy, the subquery runs once per outer row, so it
-    // builds an index on i(k) once and seeks it on every run instead of
-    // scanning i each time.
+    // Like legacy, the first table of a correlated subquery gets no
+    // automatic index; legacy reaches i(k) through an index by turning such
+    // subqueries into joins, which HIR does not do yet.
     for (sql, expected) in [
         (
             "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)",
@@ -737,15 +737,6 @@ fn hir_correlated_subqueries_seek_an_automatic_index() {
             200,
         ),
     ] {
-        let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
-        assert!(
-            plan.iter().any(|row| matches!(
-                row.get(3),
-                Some(rusqlite::types::Value::Text(detail))
-                    if detail.starts_with("SEARCH i USING COVERING INDEX ephemeral")
-            )),
-            "{sql}: {plan:?}"
-        );
         assert_eq!(
             limbo_exec_rows(&hir, sql),
             vec![vec![rusqlite::types::Value::Integer(expected)]],
@@ -1649,6 +1640,67 @@ fn hir_full_join_seeks_a_temporary_index() {
             limbo_exec_rows(&hir, sql),
             expected,
             "rows differ for {sql}"
+        );
+    }
+}
+
+/// Like legacy, HIR plans a correlated subquery for the number of times the
+/// outer plan runs it, estimates a grouped query by its groups rather than
+/// the rows it reads, and treats a lone MIN or MAX over a FROM subquery or
+/// CTE like one over a table. The plans then make the same choices.
+#[test]
+fn hir_subquery_estimates_match_legacy_choices() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE emp(id INTEGER PRIMARY KEY, dept TEXT, salary INT)",
+        "CREATE TABLE cust(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE ord(id INTEGER PRIMARY KEY, cust_id INT, total INT)",
+        "CREATE INDEX ord_cust ON ord(cust_id)",
+        "CREATE TABLE prod(id INTEGER PRIMARY KEY, price INT, name TEXT)",
+        "CREATE INDEX prod_price ON prod(price)",
+        "INSERT INTO emp VALUES (1,'a',10),(2,'a',30),(3,'b',5),(4,'b',NULL),(5,NULL,7)",
+        "INSERT INTO cust VALUES (1,'x'),(2,'y'),(3,'z')",
+        "INSERT INTO ord VALUES (1,1,10),(2,1,20),(3,2,5),(4,9,1)",
+        "INSERT INTO prod VALUES (1,5,'a'),(2,50,'b'),(3,500,'c'),(4,NULL,'d'),(5,99,'e')",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for (sql, rows) in [
+        (
+            "WITH da AS (SELECT dept, avg(salary) AS a FROM emp GROUP BY dept) \
+             SELECT e.id FROM emp e WHERE e.salary > \
+             (SELECT da.a FROM da WHERE da.dept = e.dept) ORDER BY 1",
+            ["SEARCH da USING INDEX ephemeral_subquery_"].as_slice(),
+        ),
+        (
+            "WITH t AS (SELECT cust_id, sum(total) AS s FROM ord GROUP BY cust_id) \
+             SELECT c.name, t.s FROM cust c JOIN t ON t.cust_id = c.id \
+             WHERE t.s > (SELECT avg(s) FROM t) ORDER BY 1",
+            ["SCAN cust AS c", "SEARCH t USING INDEX ephemeral_subquery_"].as_slice(),
+        ),
+        (
+            // The CTE reads prod through its price index, so it returns rows
+            // in price order and MAX scans it instead of seeking an index.
+            "WITH p(price) AS MATERIALIZED (SELECT price FROM prod) \
+             SELECT p1.price, (SELECT max(p2.price) FROM p p2 WHERE p2.price < p1.price) \
+             FROM p p1 WHERE p1.price < 100",
+            ["SCAN p AS p2"].as_slice(),
+        ),
+    ] {
+        for (conn, name) in [(&hir, "HIR"), (&legacy, "legacy")] {
+            let plan = query_plan(conn, sql);
+            for row in rows {
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with(row)),
+                    "{name} plan lacks {row}: {sql}: {plan:?}"
+                );
+            }
+        }
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
         );
     }
 }

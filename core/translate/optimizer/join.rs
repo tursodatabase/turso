@@ -276,6 +276,69 @@ pub(super) fn count_subquery_calls_for_plan(
     Ok(calls)
 }
 
+/// Legacy's [count_subquery_calls_for_plan] for a HIR block: how many times
+/// each correlated subquery runs, counted from the rows that reach the join
+/// step where the last block source it reads is joined. Each subquery comes
+/// with the block sources it reads, as positions, and the position of the
+/// first predicate it appears in: that predicate and the ones after it run
+/// after the subquery, so they cannot reduce its calls.
+pub(crate) fn hir_subquery_calls_for_plan(
+    plan: &JoinN,
+    access_methods: &[AccessMethod],
+    constraints: &[HirTableConstraints],
+    subqueries: &[(hir::QueryId, TableMask, Option<usize>)],
+    predicate_count: usize,
+    initial_input_cardinality: f64,
+    params: &CostModelParams,
+) -> Result<Vec<(hir::QueryId, f64)>> {
+    let mut calls = Vec::new();
+    if subqueries.is_empty() {
+        return Ok(calls);
+    }
+    let mut prior_sources = TableMask::default();
+    let mut input_cardinality = initial_input_cardinality;
+    for (source_position, access_method_index) in &plan.data {
+        let method = &access_methods[*access_method_index];
+        let mut source_mask = TableMask::default();
+        source_mask.set(*source_position)?;
+        let mut current_sources = prior_sources.clone();
+        current_sources.set(*source_position)?;
+        let rows_before_filters = input_cardinality * method.estimated_rows_per_outer_row;
+        for (query, required, first_predicate) in subqueries {
+            if required.is_empty()
+                || !current_sources.contains_all_set_bits_of(required)
+                || prior_sources.contains_all_set_bits_of(required)
+            {
+                continue;
+            }
+            let skipped: BitSet<usize> = match first_predicate {
+                Some(first) => (*first..predicate_count).try_collect()?,
+                None => Default::default(),
+            };
+            let multiplier = constraint_output_multipliers(
+                &constraints[*source_position],
+                &prior_sources,
+                source_mask.clone(),
+                &method.consumed_where_terms,
+                &skipped,
+                params,
+            );
+            calls.push((*query, (rows_before_filters * multiplier).max(1.0)));
+        }
+        input_cardinality = rows_after_join(
+            input_cardinality,
+            method,
+            &constraints[*source_position],
+            &prior_sources,
+            source_mask,
+            false,
+            params,
+        );
+        prior_sources.set(*source_position)?;
+    }
+    Ok(calls)
+}
+
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
 pub struct JoinN {
@@ -2537,6 +2600,7 @@ fn hir_join_step(
             source,
             query,
             join_info,
+            output_order,
         } => super::access_method::find_best_hir_access_method_for_subquery(
             document,
             *source,
@@ -2544,6 +2608,7 @@ fn hir_join_step(
             false,
             !hir_right_or_full_join(join_info.as_ref()),
             order_target,
+            output_order,
             &constraints[source_position],
             lhs_mask,
             source_position,
@@ -2558,6 +2623,7 @@ fn hir_join_step(
             query,
             materialization,
             join_info,
+            output_order,
             ..
         } => super::access_method::find_best_hir_access_method_for_subquery(
             document,
@@ -2569,6 +2635,7 @@ fn hir_join_step(
             ),
             !hir_right_or_full_join(join_info.as_ref()),
             order_target,
+            output_order,
             &constraints[source_position],
             lhs_mask,
             source_position,
