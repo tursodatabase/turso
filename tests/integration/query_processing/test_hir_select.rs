@@ -1277,6 +1277,54 @@ fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
     );
 }
 
+/// Like legacy, `x IS NULL` seeks an index on x, also through an expression
+/// index, but not on a table a LEFT JOIN may NULL-extend, where `IS NULL`
+/// is true on the added row. HIR also seeks for the `x ISNULL` spelling,
+/// which SQLite treats the same and legacy does not recognize.
+#[test]
+fn hir_is_null_seeks_an_index_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE INDEX items_extra_id ON items(extra, value)",
+        "CREATE INDEX items_lower_extra ON items(lower(extra))",
+        "INSERT INTO items VALUES (7, NULL, NULL), (8, 70, NULL)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM items WHERE extra IS NULL ORDER BY id",
+        "SELECT id FROM items WHERE extra IS NULL AND value IS NULL",
+        "SELECT id FROM items WHERE extra IS NULL AND value > 10 ORDER BY id",
+        "SELECT id FROM items WHERE lower(extra) IS NULL ORDER BY id",
+        "SELECT tags.tag, items.id FROM tags LEFT JOIN items ON items.id = tags.item_id \
+         WHERE items.extra IS NULL ORDER BY 1",
+        "SELECT tags.tag, items.id FROM tags LEFT JOIN items \
+         ON items.extra IS NULL AND items.id = tags.item_id ORDER BY 1",
+    ] {
+        assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        query_plan(&hir, "SELECT id FROM items WHERE extra IS NULL"),
+        ["SEARCH items USING COVERING INDEX items_extra_id (extra=?)"]
+    );
+    assert_eq!(
+        query_plan(&hir, "SELECT id FROM items WHERE extra ISNULL"),
+        ["SEARCH items USING COVERING INDEX items_extra_id (extra=?)"]
+    );
+    let sql = "SELECT id FROM items WHERE extra ISNULL ORDER BY id";
+    assert_eq!(
+        limbo_exec_rows(&hir, sql),
+        limbo_exec_rows(&legacy, sql),
+        "{sql}"
+    );
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]
