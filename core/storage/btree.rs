@@ -1129,43 +1129,78 @@ enum BlobSpan {
     },
 }
 
-/// Walk the serial types of a record header and locate `column`'s value. `header`
-/// must be exactly the header bytes (so a varint can never stray into the body) and
-/// `hpos0` the offset of the first serial type, i.e. the width of the header-size
-/// varint. Returns the value's payload-relative byte offset, its byte length, and
-/// its serial type, after checking the range lies inside `payload_size`.
+/// Locate `column`'s value with [`HeaderColumns`].
 fn blob_locate_column_in_header(
     header: &[u8],
     hpos0: usize,
     payload_size: usize,
     column: usize,
 ) -> Result<(usize, usize, u64)> {
-    let header_size = header.len();
-    let mut hpos = hpos0;
-    let mut body = header_size;
-    let mut col = 0usize;
-    loop {
-        if hpos >= header_size {
-            return Err(LimboError::InternalError(format!(
-                "blob column {column} out of range for row with {col} columns"
-            )));
+    let mut col = 0;
+    for located in HeaderColumns::new(header, hpos0, payload_size) {
+        let located = located?;
+        if col == column {
+            return Ok(located);
         }
-        let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&header[hpos..])?;
-        hpos += n;
+        col += 1;
+    }
+    Err(LimboError::InternalError(format!(
+        "blob column {column} out of range for row with {col} columns"
+    )))
+}
+
+/// The columns of a record header in order, each as its value's payload-relative
+/// byte offset, byte length and serial type, after checking that the value lies
+/// inside `payload_size`.
+pub(crate) struct HeaderColumns<'a> {
+    header: &'a [u8],
+    hpos: usize,
+    body: usize,
+    column: usize,
+    payload_size: usize,
+}
+
+impl<'a> HeaderColumns<'a> {
+    /// `header` must be exactly the header bytes (so a varint can never stray into
+    /// the body) and `hpos0` the offset of the first serial type, i.e. the width of
+    /// the header-size varint.
+    pub(crate) fn new(header: &'a [u8], hpos0: usize, payload_size: usize) -> Self {
+        Self {
+            header,
+            hpos: hpos0,
+            body: header.len(),
+            column: 0,
+            payload_size,
+        }
+    }
+}
+
+impl Iterator for HeaderColumns<'_> {
+    type Item = Result<(usize, usize, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.hpos < self.header.len()).then(|| self.read_column())
+    }
+}
+
+impl HeaderColumns<'_> {
+    fn read_column(&mut self) -> Result<(usize, usize, u64)> {
+        let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&self.header[self.hpos..])?;
+        self.hpos += n;
         let size = crate::types::get_serial_type_size(serial)?;
+        let body = self.body;
         let end = body
             .checked_add(size)
             .ok_or_else(|| LimboError::Corrupt("record body offsets overflow usize".to_string()))?;
-        if end > payload_size {
+        if end > self.payload_size {
             return Err(LimboError::Corrupt(format!(
-                "column {col} claims bytes {body}..{end} beyond payload size {payload_size}"
+                "column {} claims bytes {body}..{end} beyond payload size {}",
+                self.column, self.payload_size
             )));
         }
-        if col == column {
-            return Ok((body, size, serial));
-        }
-        body = end;
-        col += 1;
+        self.body = end;
+        self.column += 1;
+        Ok((body, size, serial))
     }
 }
 
