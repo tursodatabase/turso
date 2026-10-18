@@ -26,6 +26,78 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+fn hir_block_grouping(block: &hir::QueryBlock) -> Option<&hir::Grouping> {
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } => Some(grouping),
+        _ => None,
+    }
+}
+
+/// One GROUP BY key, in the order the GROUP BY sorter compares keys in.
+pub(crate) struct GroupKeyOrder {
+    pub(crate) key: usize,
+    pub(crate) order: turso_parser::ast::SortOrder,
+    pub(crate) nulls: Option<turso_parser::ast::NullsOrder>,
+}
+
+/// The order the GROUP BY sorter compares its keys in, when every ORDER BY
+/// term is a GROUP BY key with that key's collation: the keys the ORDER BY
+/// names, in its order and with its directions, then the others ascending.
+/// Groups then leave in ORDER BY order, so no second sort is needed. Like
+/// legacy's `compute_order_target`, which reorders its GROUP BY keys the
+/// same way. Which rows form a group does not depend on this order.
+pub(crate) fn group_key_order(
+    document: &HirDocument,
+    order_by: &[hir::OrderTerm],
+    grouping: &hir::Grouping,
+) -> Option<Vec<GroupKeyOrder>> {
+    use crate::translate::collate::CollationSeq;
+    if order_by.is_empty() {
+        return None;
+    }
+    let collation = |collation: Option<&hir::ResolvedCollation>| match collation
+        .map(|collation| *collation.value())
+    {
+        None | Some(CollationSeq::Unset) => CollationSeq::Binary,
+        Some(collation) => collation,
+    };
+    let mut order: Vec<GroupKeyOrder> = Vec::with_capacity(grouping.keys.len());
+    for term in order_by {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(output) = expression {
+            expression = &document.output(*output)?.expr;
+        }
+        let key = grouping
+            .keys
+            .iter()
+            .zip(&grouping.key_collations)
+            .position(|(key, key_collation)| {
+                expression.equivalent(key)
+                    && collation(term.collation.as_ref()) == collation(key_collation.as_ref())
+            })?;
+        if !order.iter().any(|known| known.key == key) {
+            order.push(GroupKeyOrder {
+                key,
+                order: term.order,
+                nulls: term.nulls,
+            });
+        }
+    }
+    for key in 0..grouping.keys.len() {
+        if !order.iter().any(|known| known.key == key) {
+            order.push(GroupKeyOrder {
+                key,
+                order: turso_parser::ast::SortOrder::Asc,
+                nulls: None,
+            });
+        }
+    }
+    Some(order)
+}
+
 /// Whether a query's result is the same whatever order its rows are read
 /// in: one ungrouped aggregate block whose aggregates are all count, sum,
 /// total, avg, min or max.
@@ -1524,10 +1596,13 @@ impl<'a> HirPlanContext<'a> {
         let min_max_terms = simple_min_max_term(block, &input)
             .into_iter()
             .collect::<Vec<_>>();
+        // Like legacy's `compute_order_target`: a grouped block aims for its
+        // GROUP BY order even when it has an ORDER BY, so an index can still
+        // replace the GROUP BY sorter.
         let order_target = if !min_max_terms.is_empty() {
             self.order_target(&min_max_terms, OrderTargetPurpose::Extremum)
-        } else if order_by.is_empty() {
-            self.grouping_target(block)
+        } else if order_by.is_empty() || hir_block_grouping(block).is_some() {
+            self.grouping_target(block, order_by)
         } else {
             self.order_target(
                 order_by,
@@ -2057,8 +2132,11 @@ impl<'a> HirPlanContext<'a> {
                 _ => Ok(false),
             }
         };
-        let group_sort_elided = sort_elided(EliminatesSortBy::Group)?;
-        let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
+        let group_and_order_sort_elided = sort_elided(EliminatesSortBy::GroupByAndOrder)?;
+        let group_sort_elided =
+            group_and_order_sort_elided || sort_elided(EliminatesSortBy::Group)?;
+        let order_sort_elided =
+            group_and_order_sort_elided || sort_elided(EliminatesSortBy::Order)?;
         let min_max_first_value = match order_target {
             Some(target) if target.is_extremum() => hir_plan_satisfies_order_target(
                 &result.best_plan,
@@ -2237,17 +2315,46 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
-    fn grouping_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
+    /// The order a grouped block wants its rows in, as legacy's
+    /// `compute_order_target` picks it. When every ORDER BY term is a GROUP BY
+    /// key, the keys in ORDER BY order and directions: rows in that order need
+    /// neither the GROUP BY nor the ORDER BY sorter. Otherwise the keys in
+    /// their own order, which only saves the GROUP BY sorter. Windows sort
+    /// the grouped rows again, so then only the GROUP BY order helps.
+    fn grouping_target<'term>(
+        &self,
+        block: &'term hir::QueryBlock,
+        order_by: &'term [hir::OrderTerm],
+    ) -> Option<HirOrderTarget<'term>>
     where
         'a: 'term,
     {
-        let hir::QueryBlockBody::Select {
-            grouping: Some(grouping),
-            ..
-        } = &block.body
-        else {
-            return None;
-        };
+        let grouping = hir_block_grouping(block)?;
+        let key_order = block
+            .windows
+            .is_empty()
+            .then(|| group_key_order(self.document, order_by, grouping))
+            .flatten();
+        if let Some(key_order) = key_order {
+            let columns = key_order
+                .iter()
+                .map(|key| {
+                    self.ordering_column(
+                        &grouping.keys[key.key],
+                        key.order,
+                        grouping.key_collations[key.key]
+                            .as_ref()
+                            .map(|collation| *collation.value())
+                            .unwrap_or_default(),
+                        key.nulls,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(OrderTarget {
+                columns,
+                purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
+            });
+        }
         let columns = grouping
             .keys
             .iter()

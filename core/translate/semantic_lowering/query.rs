@@ -1318,7 +1318,8 @@ pub(crate) fn emit_planned_query_body(
 /// Whether grouped rows already leave in ORDER BY order, as legacy and
 /// SQLite find: when every ORDER BY term is a GROUP BY key, the GROUP BY
 /// sorter orders groups by those keys first, in ORDER BY order and with each
-/// term's direction, so no second sorter is needed.
+/// term's direction, so no second sorter is needed. When the loops already
+/// return rows in that order, the planner skips both sorts.
 fn hir_group_rows_follow_order_by(
     document: &HirDocument,
     query: &hir::Query,
@@ -1328,53 +1329,21 @@ fn hir_group_rows_follow_order_by(
     let Some(grouping) = hir_grouping(block) else {
         return false;
     };
-    !block_plan.group_sort_elided
-        && block.windows.is_empty()
-        && hir_group_key_order(document, query, grouping).is_some()
+    if block_plan.group_sort_elided {
+        return block_plan.order_sort_elided;
+    }
+    block.windows.is_empty() && hir_group_key_order(document, query, grouping).is_some()
 }
 
-/// The order the GROUP BY sorter compares its keys in, when every ORDER BY
-/// term is a GROUP BY key with that key's collation: the keys the ORDER BY
-/// names, in its order, then the others. Like legacy, which reorders its
-/// GROUP BY keys the same way. Which rows form a group does not depend on
-/// this order.
+/// The keys in the order the GROUP BY sorter compares them in; see
+/// [`crate::translate::semantic_to_plan::group_key_order`].
 fn hir_group_key_order(
     document: &HirDocument,
     query: &hir::Query,
     grouping: &hir::Grouping,
 ) -> Option<Vec<usize>> {
-    if query.order_by.is_empty() {
-        return None;
-    }
-    let collation = |collation: Option<&hir::ResolvedCollation>| match collation
-        .map(|collation| *collation.value())
-    {
-        None | Some(CollationSeq::Unset) => CollationSeq::Binary,
-        Some(collation) => collation,
-    };
-    let mut order = Vec::with_capacity(grouping.keys.len());
-    for term in &query.order_by {
-        let mut expression = &term.expr;
-        while let hir::Expr::Output(output) = expression {
-            expression = &document.output(*output)?.expr;
-        }
-        let key = grouping
-            .keys
-            .iter()
-            .zip(&grouping.key_collations)
-            .position(|(key, key_collation)| {
-                expression.equivalent(key)
-                    && collation(term.collation.as_ref()) == collation(key_collation.as_ref())
-            })?;
-        if !order.contains(&key) {
-            order.push(key);
-        }
-    }
-    let rest = (0..grouping.keys.len())
-        .filter(|key| !order.contains(key))
-        .collect::<Vec<_>>();
-    order.extend(rest);
-    Some(order)
+    crate::translate::semantic_to_plan::group_key_order(document, &query.order_by, grouping)
+        .map(|keys| keys.into_iter().map(|key| key.key).collect())
 }
 
 /// Whether rows leave the block's windows already in ORDER BY order. The
@@ -9176,10 +9145,16 @@ pub(super) mod tests {
         };
         assert!(!emits_sorter("SELECT value FROM items ORDER BY value"));
         assert!(!emits_sorter("SELECT value FROM items ORDER BY value DESC"));
-        // The index has no `extra`, and grouping puts rows in key order.
+        // The index has no `extra`.
         assert!(emits_sorter("SELECT value FROM items ORDER BY extra"));
-        assert!(emits_sorter(
+        // Like legacy, reading the index backwards gives the groups in
+        // ORDER BY order, so neither GROUP BY nor ORDER BY sorts.
+        assert!(!emits_sorter(
             "SELECT value, count(*) FROM items GROUP BY value ORDER BY value DESC"
+        ));
+        // An aggregate ORDER BY still sorts the groups.
+        assert!(emits_sorter(
+            "SELECT value, count(*) FROM items GROUP BY value ORDER BY count(*)"
         ));
     }
 

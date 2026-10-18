@@ -1227,6 +1227,56 @@ fn hir_order_by_group_keys_sorts_once() {
     }
 }
 
+/// The detail column of each EXPLAIN QUERY PLAN row.
+fn query_plan(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
+    limbo_exec_rows(conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+        .into_iter()
+        .map(|row| match row.last() {
+            Some(rusqlite::types::Value::Text(detail)) => detail.clone(),
+            other => panic!("EXPLAIN QUERY PLAN detail is not text: {other:?}"),
+        })
+        .collect()
+}
+
+/// Like legacy's `compute_order_target`, a grouped query aims for its GROUP
+/// BY order even when it also has an ORDER BY, so an index on the keys
+/// replaces the GROUP BY sorter. When the ORDER BY names only GROUP BY keys,
+/// the index order in ORDER BY's directions replaces both sorters.
+#[test]
+fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    legacy
+        .execute("CREATE INDEX items_extra_value ON items(extra, value)")
+        .unwrap();
+    for sql in [
+        "SELECT extra, count(*) AS n FROM items GROUP BY extra ORDER BY n DESC",
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra, value",
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value \
+         ORDER BY extra DESC, value DESC",
+        "SELECT extra, value, count(*) FROM items GROUP BY value, extra ORDER BY extra",
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY value",
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value \
+         ORDER BY extra DESC NULLS FIRST, value",
+        "SELECT extra, max(value) FROM items GROUP BY extra ORDER BY extra",
+    ] {
+        let plan = query_plan(&hir, sql);
+        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        query_plan(
+            &hir,
+            "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra, value"
+        ),
+        ["SCAN items USING COVERING INDEX items_extra_value"]
+    );
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]
