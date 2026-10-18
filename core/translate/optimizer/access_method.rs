@@ -269,7 +269,7 @@ pub(super) fn choose_best_btree_candidate(
         has_valid_candidate = true;
 
         let index_info = match candidate.index.as_ref() {
-            Some(index) => IndexInfo {
+            Some(index) => Some(IndexInfo {
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
@@ -278,13 +278,14 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
-            },
-            None => IndexInfo {
+            }),
+            None if usable_constraint_refs.is_empty() => None,
+            None => Some(IndexInfo {
                 unique: true,
-                covering: !usable_constraint_refs.is_empty(),
+                covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
-            },
+            }),
         };
 
         let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
@@ -339,6 +340,10 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
+        if index_info.is_none() && !is_index_ordered {
+            continue;
+        }
+
         let analyze_ctx = AnalyzeCtx {
             rhs_table,
             index: candidate.index.as_ref(),
@@ -367,7 +372,7 @@ pub(super) fn choose_best_btree_candidate(
             None => base_row_count,
         };
         let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
+            index_info,
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
