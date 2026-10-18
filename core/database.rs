@@ -641,6 +641,12 @@ pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
 
+#[cfg(test)]
+pub(crate) fn remove_file_from_database_registry(path: &str) {
+    let file_id = io::get_file_id(path).unwrap();
+    DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
+}
+
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 ///
