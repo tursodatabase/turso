@@ -1,6 +1,7 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::type_complexity)]
 
+pub mod allocation_counter;
 pub mod generator;
 pub mod js_protocol_io;
 
