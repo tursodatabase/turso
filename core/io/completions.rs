@@ -400,13 +400,7 @@ impl Completion {
 
     pub fn succeeded(&self) -> bool {
         match &self.inner {
-            Some(inner) => match &inner.completion_type {
-                CompletionType::Group(g) => {
-                    g.inner.outstanding.load(Ordering::SeqCst) == 0
-                        && g.inner.result.get().is_some_and(|e| e.is_none())
-                }
-                _ => inner.result.get().is_some_and(|e| e.is_none()),
-            },
+            Some(inner) => inner.result.get().is_some_and(|e| e.is_none()),
             None => true,
         }
     }
@@ -420,16 +414,7 @@ impl Completion {
 
     pub fn get_error(&self) -> Option<CompletionError> {
         match &self.inner {
-            Some(inner) => {
-                match &inner.completion_type {
-                    CompletionType::Group(g) => {
-                        // For groups, check the group's cached result field
-                        // (set when the last completion finishes)
-                        g.inner.result.get().and_then(|res| *res)
-                    }
-                    _ => inner.result.get().and_then(|res| *res),
-                }
-            }
+            Some(inner) => inner.result.get().and_then(|res| *res),
             None => None,
         }
     }
@@ -437,10 +422,7 @@ impl Completion {
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
         match &self.inner {
-            Some(inner) => match &inner.completion_type {
-                CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
-                _ => inner.result.get().is_some(),
-            },
+            Some(inner) => inner.result.get().is_some(),
             None => true,
         }
     }
@@ -656,6 +638,41 @@ mod tests {
         let g = group.build();
         assert!(g.finished());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn group_stays_pending_until_its_callback_returns() {
+        use std::sync::{mpsc, Mutex};
+        for child_error in [None, Some(CompletionError::Aborted)] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let entered_tx = Mutex::new(entered_tx);
+            let release_rx = Mutex::new(release_rx);
+            let mut group = CompletionGroup::new(move |_| {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            });
+            let child = Completion::new_write(|_| {});
+            group.add(&child);
+            let group = group.build();
+
+            let child_clone = child.clone();
+            let completer = std::thread::spawn(move || match child_error {
+                Some(err) => child_clone.error(err),
+                None => child_clone.complete(0),
+            });
+            entered_rx.recv().unwrap();
+            assert!(!group.finished());
+            assert!(!group.succeeded());
+            assert!(!group.failed());
+            assert!(group.get_error().is_none());
+
+            release_tx.send(()).unwrap();
+            completer.join().unwrap();
+            assert!(group.finished());
+            assert_eq!(group.succeeded(), child_error.is_none());
+            assert_eq!(group.get_error(), child_error);
+        }
     }
 
     #[test]
