@@ -3190,6 +3190,13 @@ struct HirRightOuterJoin {
     materialized: Option<CursorID>,
 }
 
+/// Labels of one semi-join or anti-join loop.
+struct HirSemiAntiLabels {
+    /// Where an anti-join loop that found no match continues: the next loop,
+    /// or the rest of the block.
+    body: BranchOffset,
+}
+
 /// The joins of one FROM clause that loop lowering supports.
 #[derive(Default)]
 struct HirOuterJoins {
@@ -4246,6 +4253,28 @@ fn emit_join_loops(
         .transpose()?;
     let left_joins = prepare_hir_left_joins(program, loops_plan, &prepared_loops, &joins.owners)?;
     let right_outer = prepare_hir_right_outer_join(program, loops_plan, &prepared_loops, &joins)?;
+    let semi_anti = loops_plan
+        .loops
+        .iter()
+        .map(|planned_loop| {
+            from.and_then(|from| {
+                from.joins.iter().find_map(|join| {
+                    (join.right == planned_loop.source
+                        && matches!(join.kind, hir::JoinKind::Semi | hir::JoinKind::Anti))
+                    .then_some(join.kind)
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    // Like legacy, a semi-join or anti-join loop comes after every other
+    // loop: it only checks whether the rows before it have a match.
+    if let Some(first) = semi_anti.iter().position(Option::is_some) {
+        if first == 0 || semi_anti[first..].iter().any(Option::is_none) {
+            return Err(LimboError::InternalError(
+                "HIR semi-join or anti-join loop is not after every other loop".into(),
+            ));
+        }
+    }
 
     let nest = HirLoopNest {
         document,
@@ -4253,6 +4282,7 @@ fn emit_join_loops(
         prepared_loops: &prepared_loops,
         left_joins: &left_joins,
         right_outer: right_outer.as_ref(),
+        semi_anti: &semi_anti,
         body: &body,
         aggregate_captures: aggregate_captures.as_ref(),
     };
@@ -4289,6 +4319,9 @@ struct HirLoopNest<'n, 'a> {
     prepared_loops: &'n [PreparedHirLoop<'a>],
     left_joins: &'n [HirLeftJoin],
     right_outer: Option<&'n HirRightOuterJoin>,
+    /// For each loop, `Semi` or `Anti` when it reads the right source of a
+    /// semi-join or anti-join.
+    semi_anti: &'n [Option<hir::JoinKind>],
     body: &'n HirLoopBody<'n>,
     aggregate_captures: Option<&'n (usize, Vec<HirAggregateCapture>)>,
 }
@@ -4326,7 +4359,33 @@ impl HirLoopNest<'_, '_> {
             self.left_joins
         };
         let mut loops = Vec::with_capacity(self.prepared_loops.len() - first);
+        // Like legacy's `SemiAntiJoinMetadata`: where a semi-join or
+        // anti-join loop goes to try the next row of the loops before it,
+        // and where an anti-join loop that found no match continues.
+        let semi_anti_labels = (first..self.prepared_loops.len())
+            .map(|loop_index| {
+                self.semi_anti[loop_index].map(|_| HirSemiAntiLabels {
+                    body: program.allocate_label(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let semi_anti_next_outer = |loops: &[HirBtreeLoop], position: usize| {
+            (first..first + position)
+                .rev()
+                .find(|loop_index| self.semi_anti[*loop_index].is_none())
+                .map_or(outer_next, |loop_index| loops[loop_index - first].next)
+        };
         for loop_index in first..self.prepared_loops.len() {
+            // An anti-join loop before this one found no match: it goes on
+            // here, as legacy chains its anti-joins.
+            if let Some(labels) = loop_index
+                .checked_sub(1)
+                .filter(|previous| *previous >= first)
+                .filter(|previous| self.semi_anti[*previous] == Some(hir::JoinKind::Anti))
+                .and_then(|previous| semi_anti_labels[previous - first].as_ref())
+            {
+                program.preassign_label_to_next_insn(labels.body);
+            }
             let mut starting_left_joins = left_joins.iter().enumerate().filter(|(_, left_join)| {
                 left_join.null_extends && left_join.first_loop == loop_index
             });
@@ -4413,7 +4472,25 @@ impl HirLoopNest<'_, '_> {
                 },
                 left_joins,
             )?;
+            // A row of an anti-join loop that passes every check is a
+            // match, so the rows before it are rejected.
+            if self.semi_anti[loop_index] == Some(hir::JoinKind::Anti) {
+                let next_outer = semi_anti_next_outer(&loops, loop_index - first);
+                program.add_comment(program.offset(), "anti-join: match found, skip outer row");
+                program.emit_insn(Insn::Goto {
+                    target_pc: next_outer,
+                });
+            }
             loops.push(hir_loop);
+        }
+        if let Some(labels) = self
+            .semi_anti
+            .last()
+            .filter(|kind| **kind == Some(hir::JoinKind::Anti))
+            .and_then(|_| semi_anti_labels.last())
+            .and_then(Option::as_ref)
+        {
+            program.preassign_label_to_next_insn(labels.body);
         }
 
         let innermost_next = loops.last().map_or(outer_next, |hir_loop| hir_loop.next);
@@ -4471,7 +4548,45 @@ impl HirLoopNest<'_, '_> {
         }
 
         for (position, hir_loop) in loops.iter().enumerate().rev() {
+            let semi_anti = self.semi_anti[first + position];
+            let next_outer = semi_anti.map(|_| semi_anti_next_outer(&loops, position));
+            // After the rest of the block ran for one match, a semi-join is
+            // done with the rows before it; an anti-join gets here only
+            // when it found no match, and is done too.
+            if let (Some(kind), Some(next_outer)) = (semi_anti, next_outer) {
+                program.add_comment(
+                    program.offset(),
+                    if kind == hir::JoinKind::Semi {
+                        "semi-join: early out after first match"
+                    } else {
+                        "anti-join: exit body, next outer row"
+                    },
+                );
+                program.emit_insn(Insn::Goto {
+                    target_pc: next_outer,
+                });
+            }
             close_hir_btree_loop(program, hir_loop, left_joins);
+            // The loop ran out of rows without a match: a semi-join rejects
+            // the rows before it, and an anti-join keeps them.
+            match (semi_anti, next_outer) {
+                (Some(hir::JoinKind::Semi), Some(next_outer)) => {
+                    program.add_comment(program.offset(), "semi-join: no match, skip outer row");
+                    program.emit_insn(Insn::Goto {
+                        target_pc: next_outer,
+                    });
+                }
+                (Some(hir::JoinKind::Anti), _) => {
+                    let labels = semi_anti_labels[position]
+                        .as_ref()
+                        .expect("an anti-join loop has labels");
+                    program.add_comment(program.offset(), "anti-join: no match, emit outer row");
+                    program.emit_insn(Insn::Goto {
+                        target_pc: labels.body,
+                    });
+                }
+                _ => {}
+            }
             // A hash lookup's waiting rows run after the loop before it.
             if let (Some(PreparedHirLoop::Hash(prepared)), Some(hash_loop)) = (
                 self.prepared_loops.get(first + position + 1),
@@ -4785,6 +4900,11 @@ fn supported_btree_from(
                 }
                 joins.owners.push((join.right, true));
             }
+            hir::JoinKind::Semi | hir::JoinKind::Anti => {
+                if matches!(source.kind, hir::SourceKind::FromGroup(_)) {
+                    return false;
+                }
+            }
             hir::JoinKind::Right | hir::JoinKind::Full => {
                 if matches!(source.kind, hir::SourceKind::FromGroup(_)) {
                     return false;
@@ -4986,7 +5106,7 @@ fn emit_hir_block_explain(
         return Ok(());
     };
     for planned_loop in &block_plan.loops {
-        let detail = hir_loop_explain(document, Some(from), planned_loop)?;
+        let detail = hir_loop_explain(document, Some(from), &block_plan.inner_joins, planned_loop)?;
         program.emit_source_explain(planned_loop.source, detail);
     }
     Ok(())
@@ -4997,6 +5117,9 @@ fn emit_hir_block_explain(
 pub(super) fn hir_loop_explain(
     document: &HirDocument,
     from: Option<&hir::From>,
+    // LEFT JOINs the plan runs as inner joins, which legacy reports as
+    // inner joins.
+    inner_joins: &[SourceId],
     planned_loop: &HirPlannedLoop,
 ) -> Result<EqpDetail> {
     let source = document.source(planned_loop.source).ok_or_else(|| {
@@ -5022,7 +5145,15 @@ pub(super) fn hir_loop_explain(
             EqpTable { name, alias }
         }
     };
-    let join = from.and_then(|from| hir_loop_explain_join(document, from, source.id));
+    let join = from
+        .and_then(|from| hir_loop_explain_join(document, from, source.id))
+        .map(|join| {
+            if join == EqpJoin::Left && inner_joins.contains(&source.id) {
+                EqpJoin::Inner
+            } else {
+                join
+            }
+        });
     let exec = if from.is_some_and(|from| hir_loop_streams(document, from, planned_loop)) {
         EqpSubqueryExec::Coroutine
     } else {
@@ -5202,6 +5333,8 @@ fn hir_loop_explain_join(
                 hir::JoinKind::Cross => Some(EqpJoin::Cross),
                 hir::JoinKind::Left => Some(EqpJoin::Left),
                 hir::JoinKind::Full => Some(EqpJoin::Full),
+                hir::JoinKind::Semi => Some(EqpJoin::Semi),
+                hir::JoinKind::Anti => Some(EqpJoin::Anti),
             };
         }
         match document.source(join.right).map(|right| &right.kind) {

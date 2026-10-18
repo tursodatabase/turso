@@ -26,6 +26,30 @@ pub struct Query {
     pub output: Vec<OutputId>,
 }
 
+impl Query {
+    /// Whether planning moved this query's sources and terms into the query
+    /// block that ran it, leaving it empty: no expression runs it anymore.
+    /// Semantic analysis never makes a query without outputs.
+    pub(crate) fn is_detached(&self) -> bool {
+        self.output.is_empty()
+            && self.parent.is_none()
+            && self.captures.is_empty()
+            && matches!(
+                self.blocks.as_slice(),
+                [QueryBlock {
+                    from: None,
+                    body: QueryBlockBody::Select {
+                        filter: None,
+                        grouping: None,
+                        ..
+                    },
+                    ..
+                }]
+            )
+            && self.blocks[0].outputs.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompoundArm {
     pub operator: CompoundOperator,
@@ -152,7 +176,11 @@ impl From {
                 JoinKind::Left => source_position == right_position,
                 JoinKind::Right => source_position < right_position,
                 JoinKind::Full => source_position <= right_position,
-                JoinKind::Comma | JoinKind::Inner | JoinKind::Cross => false,
+                JoinKind::Comma
+                | JoinKind::Inner
+                | JoinKind::Cross
+                | JoinKind::Semi
+                | JoinKind::Anti => false,
             }
         })
     }
@@ -186,6 +214,14 @@ pub enum JoinKind {
     Left,
     Right,
     Full,
+    /// Keeps a row of the sources on its left when at least one row of its
+    /// right source matches. Never written in SQL: the planner makes it from
+    /// a correlated `EXISTS` or `IN`, like legacy's `optimizer/unnest.rs`.
+    /// Its right source comes after every other source of the FROM clause.
+    Semi,
+    /// Keeps a row of the sources on its left when no row of its right
+    /// source matches. The planner makes it from a correlated `NOT EXISTS`.
+    Anti,
 }
 
 #[derive(Clone, Debug)]

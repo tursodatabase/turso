@@ -1617,7 +1617,11 @@ fn join_kind_may_null_extend(
         hir::JoinKind::Left => right.contains(&source_position),
         hir::JoinKind::Right => (left_start..right.start).contains(&source_position),
         hir::JoinKind::Full => (left_start..right.end).contains(&source_position),
-        hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
+        hir::JoinKind::Comma
+        | hir::JoinKind::Inner
+        | hir::JoinKind::Cross
+        | hir::JoinKind::Semi
+        | hir::JoinKind::Anti => false,
     }
 }
 

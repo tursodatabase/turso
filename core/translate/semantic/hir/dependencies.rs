@@ -433,6 +433,19 @@ impl HirDocument {
         });
     }
 
+    /// Visit every expression written in `query`'s own clauses, without the
+    /// expressions of the queries it runs.
+    pub(crate) fn for_each_query_expression(&self, query: QueryId, visit: &mut impl FnMut(&Expr)) {
+        let Some(query) = self.query(query) else {
+            return;
+        };
+        visit_query_parts(self, query, &mut |part| {
+            if let QueryPart::Expression(expression) = part {
+                visit(expression);
+            }
+        });
+    }
+
     /// Recompute the exact external source set read directly by one query.
     /// Nested queries own their own capture summaries and are not traversed.
     pub(crate) fn direct_query_captures(&self, id: QueryId) -> Vec<SourceId> {

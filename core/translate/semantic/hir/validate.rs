@@ -210,10 +210,21 @@ impl<'document> HirValidator<'document> {
 
     fn validate_reachability(&self) -> ValidationResult {
         for (index, visited) in self.visited_queries.iter().enumerate() {
-            self.require(visited.get(), format!("query q{index} is unreachable"))?;
+            self.require(
+                visited.get() || self.document.queries[index].is_detached(),
+                format!("query q{index} is unreachable"),
+            )?;
         }
         for (index, visited) in self.visited_sources.iter().enumerate() {
-            self.require(visited.get(), format!("source s{index} is unreachable"))?;
+            // The sources of a detached query are no longer read.
+            let detached = matches!(
+                self.document.sources[index].owner,
+                SourceOwner::QueryBlock(block) if self.document.queries[block.query.index()].is_detached()
+            );
+            self.require(
+                visited.get() || detached,
+                format!("source s{index} is unreachable"),
+            )?;
         }
         for (index, visited) in self.visited_ctes.iter().enumerate() {
             self.require(visited.get(), format!("CTE c{index} is unreachable"))?;
@@ -1136,9 +1147,12 @@ impl<'document> HirValidator<'document> {
                     let expected_value = match join.kind {
                         JoinKind::Right => MergedColumnValue::Right,
                         JoinKind::Full => MergedColumnValue::Coalesce,
-                        JoinKind::Comma | JoinKind::Inner | JoinKind::Cross | JoinKind::Left => {
-                            MergedColumnValue::Left
-                        }
+                        JoinKind::Comma
+                        | JoinKind::Inner
+                        | JoinKind::Cross
+                        | JoinKind::Left
+                        | JoinKind::Semi
+                        | JoinKind::Anti => MergedColumnValue::Left,
                     };
                     for column in columns {
                         self.require(

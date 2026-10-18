@@ -133,7 +133,7 @@ pub(super) fn emit_delete(
 
     program.emit_source_explain(
         target.source.id,
-        hir_loop_explain(document, None, planned_loop)?,
+        hir_loop_explain(document, None, &[], planned_loop)?,
     );
     let returning = ReturningBuffer::open(program, target.table, delete.returning.as_ref());
     let done = program.allocate_label();

@@ -294,13 +294,13 @@ pub(super) fn emit_update(
     match single_loop {
         Some((planned_loop, _)) => program.emit_source_explain(
             target.source.id,
-            hir_loop_explain(document, None, planned_loop)?,
+            hir_loop_explain(document, None, &[], planned_loop)?,
         ),
         None => {
             for planned_loop in &access.loops {
                 program.emit_source_explain(
                     planned_loop.source,
-                    hir_loop_explain(document, update.from.as_ref(), planned_loop)?,
+                    hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
                 );
             }
         }

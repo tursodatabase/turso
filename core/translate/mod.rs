@@ -40,6 +40,7 @@ pub(crate) mod select;
 pub(crate) mod semantic;
 pub(crate) mod semantic_lowering;
 pub(crate) mod semantic_to_plan;
+pub(crate) mod semantic_unnest;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;

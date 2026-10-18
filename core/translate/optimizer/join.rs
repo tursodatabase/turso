@@ -286,6 +286,7 @@ pub(crate) fn hir_subquery_calls_for_plan(
     plan: &JoinN,
     access_methods: &[AccessMethod],
     constraints: &[HirTableConstraints],
+    sources: &[HirPlanSource],
     subqueries: &[(hir::QueryId, TableMask, Option<usize>)],
     predicate_count: usize,
     initial_input_cardinality: f64,
@@ -331,12 +332,24 @@ pub(crate) fn hir_subquery_calls_for_plan(
             &constraints[*source_position],
             &prior_sources,
             source_mask,
-            false,
+            hir_is_semi_or_anti(sources, *source_position),
             params,
         );
         prior_sources.set(*source_position)?;
     }
     Ok(calls)
+}
+
+/// Whether the source at `position` is the right side of a semi-join or
+/// anti-join, which passes on each row before it at most once.
+fn hir_is_semi_or_anti(sources: &[HirPlanSource], position: usize) -> bool {
+    sources[position].join_info().is_some_and(|join| {
+        matches!(
+            join.kind,
+            crate::translate::semantic::hir::JoinKind::Semi
+                | crate::translate::semantic::hir::JoinKind::Anti
+        )
+    })
 }
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
@@ -1248,6 +1261,8 @@ pub(crate) fn hir_join_ordering_restrictions(
                         | crate::translate::semantic::hir::JoinKind::Left
                         | crate::translate::semantic::hir::JoinKind::Right
                         | crate::translate::semantic::hir::JoinKind::Full
+                        | crate::translate::semantic::hir::JoinKind::Semi
+                        | crate::translate::semantic::hir::JoinKind::Anti
                 )
             ),
             full_outer: kind == Some(crate::translate::semantic::hir::JoinKind::Full),
@@ -2118,7 +2133,7 @@ pub(crate) fn compute_hir_join_order(
             &constraints[rhs],
             lhs_mask,
             rhs_mask,
-            false,
+            hir_is_semi_or_anti(sources, rhs),
             params,
         );
         let mut steps = lhs
@@ -2459,7 +2474,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 &constraints[position],
                 &joined_mask,
                 rhs_mask,
-                false,
+                hir_is_semi_or_anti(sources, position),
                 params,
             );
             if best

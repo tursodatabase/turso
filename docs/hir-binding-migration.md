@@ -236,8 +236,29 @@ it stays in WHERE and is checked again on each row (HIR has no per-branch
 filters like legacy's). It is used only in SELECT, not yet in DELETE or
 UPDATE loops, and never on the right side of an outer join.
 
-Legacy speeds up correlated subqueries and joins without an index by
-rewriting the plan. HIR gets the same speed without rewriting HIR:
+Like legacy's `optimizer/unnest.rs`, `semantic_unnest.rs` turns correlated
+subqueries into joins before planning. It rewrites HIR into HIR: the
+subquery's source keeps its identity and moves into the outer block's FROM
+clause, so no reference changes, and the empty subquery is left detached
+(`Query::is_detached`). For each block, innermost queries first, it plans the
+document with and without the rewrite and keeps the rewrite when the block's
+query costs no more, counting each remaining subquery's cost for the times it
+runs plus `cpu_cost_per_seek` per call, as legacy's `estimated_cost` does.
+With legacy's checks:
+
+- `EXISTS` and a whole-term `IN` become a semi-join and `NOT EXISTS` an
+  anti-join (`JoinKind::Semi`/`Anti`) when the subquery reads one source,
+  only filters it, and links to the outer row by `=` terms; their loops come
+  last and stop at the first match, as legacy's do. Not in a block with a
+  RIGHT or FULL join yet.
+- A one-value aggregate subquery becomes a FROM subquery grouped by its link
+  columns and LEFT JOINed on them (group-first). When computing a key no
+  outer row asks for could fail (`sum`, string aggregates, any function), a
+  direct WHERE comparison instead LEFT JOINs the inner table and groups by
+  the outer rowid (join-first). A copy of a rewritten subquery in the same
+  clause reads the same grouped table, as legacy's `same_query` does.
+
+What stays a subquery still runs fast:
 
 - A correlated subquery that only asks whether rows match (IN, EXISTS, or an
   order-insensitive aggregate) in a SELECT statement is planned for one run
@@ -245,15 +266,13 @@ rewriting the plan. HIR gets the same speed without rewriting HIR:
 - A correlated `x IN (SELECT y ...)` that is a whole WHERE term runs like
   `EXISTS (SELECT ... AND x = y)`: the planner adds `x = y` to the
   subquery's WHERE terms, so it stops at the first match and can seek `y`.
-  Legacy turns it into a semi-join. Neither is used when an expression of
-  the subquery or `x` can fail, since the probe stops early.
+  It is not used when an expression of the subquery or `x` can fail, since
+  the probe stops early.
 - A correlated ungrouped aggregate in a SELECT statement caches its result
   in an ephemeral index keyed by the outer values it reads (each with its
-  `typeof()`), so each key is computed once. Legacy groups the whole inner
-  table first; the cache never computes a key no outer row asks for, so it
-  is used for every built-in aggregate. It is not used when the subquery
-  reads an outer aggregate, calls a function that is not deterministic, or
-  reads a virtual table.
+  `typeof()`), so each key is computed once. Legacy has no such cache. It
+  is not used when the subquery reads an outer aggregate, calls a function
+  that is not deterministic, or reads a virtual table.
 - When every ORDER BY term is a GROUP BY key with the same collation, the
   group sorter orders its keys that way, and no second sorter runs for
   ORDER BY.
@@ -303,12 +322,15 @@ order checks where the code allows:
 - A block with windows aims for the innermost window's PARTITION BY and
   ORDER BY order, like legacy's window source subquery, so an index or an
   ordered CTE replaces that window's sorter.
+- A LEFT JOIN keeps the order of the loops before it for ORDER BY terms that
+  do not read its own columns (`plan_satisfies_order_target`).
+- When join orders cost the same, the FROM-order plan wins, and other plans
+  replace it only when strictly cheaper, in legacy's map order.
 
-Three legacy rewrites return wrong rows that HIR does not (see
-`hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN whose
-subquery joins two tables returns extra rows, and grouped tables for a
-subquery that reads an outer aggregate or joins two tables return wrong
-values.
+Three queries where legacy returns wrong rows return SQLite's rows in HIR
+(see `hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN
+whose subquery joins two tables, and grouped tables for a subquery that reads
+an outer aggregate or joins two tables.
 
 Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can

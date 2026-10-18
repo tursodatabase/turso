@@ -172,7 +172,7 @@ fn reads_a_row(expression: &hir::Expr) -> bool {
 /// LIKE, RAISE, JSON and array operators, custom types, casts and nested
 /// subqueries all count; plain columns, literals, parameters, arithmetic and
 /// comparisons do not.
-fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
+pub(crate) fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
     let mut can_fail = false;
     expression.for_each(&mut |expression| {
         can_fail |= match expression {
@@ -414,6 +414,18 @@ pub(crate) struct HirPlannedQuery {
 impl HirPlan {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build(
+        document: Arc<HirDocument>,
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> Result<Self> {
+        let document =
+            super::semantic_unnest::unnest_correlated_subqueries(document, schema, params)?;
+        Self::build_without_unnesting(document, schema, params)
+    }
+
+    /// Plan `document` as it is, without turning its correlated subqueries
+    /// into joins.
+    pub(crate) fn build_without_unnesting(
         document: Arc<HirDocument>,
         schema: &Schema,
         params: &CostModelParams,
@@ -1746,7 +1758,11 @@ impl<'a> HirPlanContext<'a> {
                 hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full => {
                     Some(join.right)
                 }
-                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => None,
+                hir::JoinKind::Comma
+                | hir::JoinKind::Inner
+                | hir::JoinKind::Cross
+                | hir::JoinKind::Semi
+                | hir::JoinKind::Anti => None,
             };
             let predicate_owner = local_outer_join.or(context.outer_join);
             self.append_from_item(
@@ -2169,11 +2185,19 @@ impl<'a> HirPlanContext<'a> {
             })
             .map(|join| join.right)
             .collect();
+        // Like legacy, a semi-join or anti-join never uses a hash table.
+        let semi_anti: Vec<SourceId> = from
+            .joins
+            .iter()
+            .filter(|join| matches!(join.kind, hir::JoinKind::Semi | hir::JoinKind::Anti))
+            .map(|join| join.right)
+            .collect();
         for position in 1..plan.loops.len() {
             // A waiting lookup goes back to its row of the previous loop by
             // rowid, which a NULL row does not have.
             let previous = &plan.loops[position - 1];
             if null_extended.contains(&previous.source)
+                || semi_anti.contains(&plan.loops[position].source)
                 || !self.reads_rowid_table_directly(previous, schema)
             {
                 continue;
@@ -2846,6 +2870,7 @@ impl<'a> HirPlanContext<'a> {
             plan,
             access_methods,
             constraints,
+            &input.sources,
             &subqueries,
             input.predicates.len(),
             initial_cardinality,

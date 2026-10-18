@@ -1254,7 +1254,9 @@ fn merged_column_value(kind: hir::JoinKind) -> hir::MergedColumnValue {
         hir::JoinKind::Comma
         | hir::JoinKind::Inner
         | hir::JoinKind::Cross
-        | hir::JoinKind::Left => hir::MergedColumnValue::Left,
+        | hir::JoinKind::Left
+        | hir::JoinKind::Semi
+        | hir::JoinKind::Anti => hir::MergedColumnValue::Left,
     }
 }
 

@@ -421,25 +421,38 @@ pub(crate) fn hir_plan_satisfies_order_target(
     order_target: &HirOrderTarget<'_>,
     schema: &Schema,
 ) -> Result<bool> {
-    // An outer join adds NULL-extended rows outside any loop's order.
-    let outer = |source: &HirPlanSource| {
-        source.join_info().is_some_and(|join| {
-            matches!(
-                join.kind,
-                hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
-            )
-        })
+    // A RIGHT or FULL join adds its unmatched rows after every loop ends.
+    let join_kind = |source_position: usize| {
+        sources
+            .get(source_position)
+            .and_then(|source| source.join_info())
+            .map(|join| join.kind)
     };
-    if plan
-        .data
-        .iter()
-        .any(|(source_position, _)| sources.get(*source_position).is_some_and(outer))
-    {
+    if plan.data.iter().any(|(source_position, _)| {
+        matches!(
+            join_kind(*source_position),
+            Some(hir::JoinKind::Right | hir::JoinKind::Full)
+        )
+    }) {
         return Ok(false);
     }
     let columns = order_target.columns.len();
     let mut consumed_columns = 0;
     for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
+        // Like legacy: a LEFT JOIN adds a NULL row after its scan or seek, so
+        // its order cannot give the terms that read its own columns. The
+        // terms before them keep the order of the loops before it.
+        if join_kind(*source_position) == Some(hir::JoinKind::Left)
+            && order_target.columns[consumed_columns..]
+                .iter()
+                .any(|column| {
+                    sources
+                        .get(*source_position)
+                        .is_some_and(|source| source.source() == column.source)
+                })
+        {
+            return Ok(false);
+        }
         let source = match sources.get(*source_position) {
             Some(HirPlanSource::BTree(source)) => source,
             // Like legacy, a FROM subquery or CTE that is scanned returns its

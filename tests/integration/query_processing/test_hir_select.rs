@@ -724,9 +724,31 @@ fn hir_correlated_subqueries_match_rows() {
     ] {
         hir.execute(statement).unwrap();
     }
-    // Like legacy, the first table of a correlated subquery gets no
-    // automatic index; legacy reaches i(k) through an index by turning such
-    // subqueries into joins, which HIR does not do yet.
+    // Like legacy, the EXISTS becomes a semi-join, which reaches i(k)
+    // through an automatic index, and the average is computed once per key
+    // of i in a grouped FROM subquery.
+    assert_eq!(
+        query_plan(
+            &hir,
+            "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)"
+        ),
+        [
+            "SCAN o",
+            "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k=?)"
+        ]
+    );
+    assert_eq!(
+        query_plan(
+            &hir,
+            "SELECT count(*) FROM o WHERE o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)"
+        ),
+        [
+            "SCAN o",
+            "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?)",
+            "SCAN i",
+            "USE SORTER FOR GROUP BY",
+        ]
+    );
     for (sql, expected) in [
         (
             "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)",
@@ -1712,8 +1734,11 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
     let db = setup();
     let [legacy, hir] = connections(&db);
     for sql in [
-        "SELECT count(*) FROM items i WHERE NOT EXISTS (SELECT 1 FROM tags t WHERE t.item_id = i.id)",
-        "SELECT i.id, (SELECT count(*) FROM tags t WHERE t.item_id = i.id) FROM items i ORDER BY 1",
+        // A link that is not `=` keeps NOT EXISTS a subquery.
+        "SELECT count(*) FROM items i WHERE NOT EXISTS \
+         (SELECT 1 FROM tags t WHERE t.item_id >= i.id AND t.item_id <= i.id)",
+        "SELECT i.id, (SELECT count(*) FROM tags t WHERE t.item_id >= i.id AND t.item_id <= i.id) \
+         FROM items i ORDER BY 1",
     ] {
         let program = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"));
         let opcode = |row: &Vec<rusqlite::types::Value>| match row.get(1) {
@@ -1728,7 +1753,11 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
             })
             .expect("the subquery opens tags");
         assert_eq!(opcode(&program[open - 1]), "Once", "{sql}: {program:?}");
-        assert_eq!(limbo_exec_rows(&hir, sql), limbo_exec_rows(&legacy, sql), "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
     }
 }
 
@@ -1991,6 +2020,310 @@ fn hir_equally_cheap_join_orders_resolve_like_legacy() {
             ],
             "{sql}"
         );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// Like legacy's `optimizer/unnest.rs`, a correlated EXISTS or IN becomes a
+/// semi-join and a correlated NOT EXISTS an anti-join, when that costs no
+/// more than running the subquery for every outer row.
+#[test]
+fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k1 INT, k2 INT, body TEXT)",
+        "CREATE TABLE i(k1 INT, v INT)",
+        "CREATE TABLE j(k2 INT)",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k INT)",
+        "CREATE INDEX p_k ON p(k)",
+        "INSERT INTO o VALUES (1,1,1,'apple'),(2,1,2,'pear'),(3,2,1,'apple pie'),\
+         (4,NULL,1,'fig'),(5,3,NULL,'apple')",
+        "INSERT INTO i VALUES (1,10),(1,11),(3,NULL),(NULL,5)",
+        "INSERT INTO j VALUES (1),(5),(NULL)",
+        "INSERT INTO p VALUES (1,1),(2,3)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    // The plans name automatic indexes after their table's position in the
+    // statement, which HIR and legacy count differently.
+    let plan = |conn, sql| {
+        query_plan(conn, sql)
+            .into_iter()
+            .map(|line| {
+                let mut words = line.split(' ').map(str::to_string).collect::<Vec<_>>();
+                for word in &mut words {
+                    if word.starts_with("ephemeral_") {
+                        let end = word.rfind('_').unwrap();
+                        word.truncate(end);
+                    }
+                }
+                words.join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    for (sql, expected) in [
+        (
+            "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) \
+             AND EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+            [
+                "SCAN o",
+                "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)",
+                "SEARCH j USING COVERING INDEX ephemeral_j (k2=?)",
+            ]
+            .as_slice(),
+        ),
+        (
+            "SELECT o.id FROM o WHERE o.body LIKE 'apple%' \
+             AND EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+            &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
+        ),
+        (
+            "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+            &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
+        ),
+        (
+            "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) \
+             AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+            &[
+                "SCAN o",
+                "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)",
+                "SEARCH j USING COVERING INDEX ephemeral_j (k2=?)",
+            ],
+        ),
+        (
+            "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) \
+             AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+            &[
+                "SCAN o",
+                "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)",
+                "SEARCH j USING COVERING INDEX ephemeral_j (k2=?)",
+            ],
+        ),
+        (
+            "SELECT o.id FROM o WHERE o.k2 IN (SELECT j.k2 FROM j WHERE j.k2 = o.k1)",
+            &["SCAN o", "SEARCH j USING COVERING INDEX ephemeral_j (k2=?)"],
+        ),
+        (
+            "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM p WHERE p.id = o.k1)",
+            &["SCAN o", "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"],
+        ),
+        (
+            "SELECT o.id, count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) \
+             GROUP BY o.id",
+            &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
+        ),
+    ] {
+        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
+        assert_eq!(plan(&hir, sql), expected, "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+    // These stay subqueries, as in legacy: a link to the NULL row of a LEFT
+    // JOIN, NOT IN, an OR, a term that is not an `=` with the outer row, and
+    // a NOT EXISTS term that does not read the inner table.
+    for sql in [
+        "SELECT o.id, p.id FROM o LEFT JOIN p ON p.k = o.k1 \
+         WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = p.id)",
+        "SELECT o.id FROM o WHERE o.k2 NOT IN (SELECT j.k2 FROM j WHERE j.k2 = o.k1)",
+        "SELECT o.id FROM o WHERE o.k1 = 2 OR EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 AND o.k2 = 1)",
+    ] {
+        let hir_plan = plan(&hir, sql);
+        assert_eq!(hir_plan, plan(&legacy, sql), "{sql}");
+        // A semi-join or anti-join would seek i or j through an automatic
+        // index; the subquery scans it.
+        assert!(
+            !hir_plan.iter().any(|line| line.contains("ephemeral")),
+            "{sql}: {hir_plan:?}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+    // Rows still match legacy when the moved source is a FROM subquery or
+    // CTE, when the subquery holds an uncorrelated subquery, when the
+    // outer block groups or reads a FROM subquery, and when the inner
+    // table is empty.
+    legacy.execute("CREATE TABLE e(k INT)").unwrap();
+    for sql in [
+        "SELECT o.id FROM o WHERE EXISTS \
+         (SELECT 1 FROM (SELECT k1 FROM i WHERE v > 5) d WHERE d.k1 = o.k1)",
+        "WITH c AS (SELECT k1 FROM i WHERE v IS NOT NULL) \
+         SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.k1 = o.k1)",
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 \
+         AND i.v IN (SELECT v FROM i WHERE v > 10))",
+        "SELECT o.body, count(*) FROM o WHERE o.k2 IN (SELECT j.k2 FROM j WHERE j.k2 = o.k2) \
+         GROUP BY o.body ORDER BY 1",
+        "SELECT x.id FROM (SELECT id, k1 FROM o WHERE id > 1) x \
+         WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = x.k1) ORDER BY 1",
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.k = o.k1) ORDER BY 1",
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM e WHERE e.k = o.k1)",
+        "SELECT o.id, p.id FROM o JOIN p ON p.k = o.k1 \
+         WHERE NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2) ORDER BY 1",
+        "SELECT (SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)), \
+         (SELECT group_concat(id) FROM o WHERE NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2))",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// Like legacy's group-first rewrite, a correlated one-value aggregate
+/// becomes a FROM subquery grouped by its link columns and LEFT JOINed on
+/// them. Like legacy, a LEFT JOIN after an ordered scan keeps the scan's
+/// order for ORDER BY terms that do not read its columns, and a LEFT JOIN
+/// the WHERE clause turns into an inner join is reported as one.
+#[test]
+fn hir_correlated_aggregates_group_first_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k1 INT, k2 INT, amount INT, t TEXT)",
+        "CREATE TABLE i(k1 INT, k2 INT, amount INT, t TEXT COLLATE NOCASE)",
+        "INSERT INTO o VALUES (1,1,10,5,'A'),(2,1,10,15,'a'),(3,2,20,7,'B'),(4,3,30,9,'C'),\
+         (5,NULL,40,4,NULL),(6,2,NULL,NULL,'b')",
+        "INSERT INTO i VALUES (1,10,10,'a'),(1,10,20,'A'),(1,99,100,'x'),(2,20,6,'b'),\
+         (2,20,NULL,'B'),(2,NULL,7,NULL),(NULL,40,99,NULL)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    let plan = |conn, sql| {
+        query_plan(conn, sql)
+            .into_iter()
+            .map(|line| {
+                // Legacy and HIR number subqueries and automatic indexes
+                // differently.
+                line.split(' ')
+                    .map(|word| match word.rfind('_') {
+                        Some(end)
+                            if word.starts_with("ephemeral_")
+                                || word.starts_with("scalar_subquery_") =>
+                        {
+                            &word[..end]
+                        }
+                        _ => word,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    for (sql, expected) in [
+        (
+            "SELECT id, (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY id",
+            [
+                "SCAN o",
+                "SEARCH scalar_subquery USING INDEX ephemeral_subquery (correlation_key_0=?) \
+                 LEFT-JOIN",
+                "SCAN i",
+                "USE SORTER FOR GROUP BY",
+            ]
+            .as_slice(),
+        ),
+        (
+            "SELECT o.id FROM o WHERE o.amount < (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1)",
+            &[
+                "SCAN o",
+                "SEARCH scalar_subquery USING INDEX ephemeral_subquery (correlation_key_0=?)",
+                "SCAN i",
+                "USE SORTER FOR GROUP BY",
+            ],
+        ),
+    ] {
+        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
+        assert_eq!(plan(&hir, sql), expected, "{sql}");
+    }
+    for sql in [
+        "SELECT id, (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY id",
+        "SELECT id, (SELECT count(*) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY id",
+        "SELECT id, (SELECT total(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY id",
+        "SELECT id, (SELECT min(i.amount) FROM i WHERE i.k1 = o.k1 AND i.k2 = o.k2) \
+         FROM o ORDER BY id",
+        "SELECT id, (SELECT max(i.amount) + 1 FROM i WHERE o.k1 = i.k1 AND i.amount > 6) \
+         FROM o ORDER BY id",
+        "SELECT o.id FROM o WHERE o.amount < (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1) \
+         ORDER BY 1",
+        "SELECT o.k1, count(*), (SELECT max(i.amount) FROM i WHERE i.k1 = o.k1) FROM o \
+         GROUP BY o.k1 ORDER BY 1",
+        "SELECT o.k1 FROM o GROUP BY o.k1 \
+         HAVING count(*) < (SELECT count(*) FROM i WHERE i.k1 = o.k1) ORDER BY 1",
+        "SELECT o.id FROM o ORDER BY (SELECT count(*) FROM i WHERE i.k1 = o.k1), o.id",
+        // An aggregate subquery read by IN or EXISTS stays a subquery.
+        "SELECT o.id FROM o WHERE o.amount IN (SELECT max(i.amount) FROM i WHERE i.k1 = o.k1) \
+         OR o.id = 1 ORDER BY 1",
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT count(*) FROM i WHERE i.k1 = o.k1) \
+         OR o.id = 2 ORDER BY 1",
+        // Different text orders keep the subquery correlated.
+        "SELECT o.id, (SELECT count(*) FROM i WHERE i.t = o.t) FROM o ORDER BY 1",
+        "SELECT o.id, (SELECT sum(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY 1",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
+/// Like legacy: when computing an aggregate for keys no outer row asks for
+/// could fail, as `sum` can overflow, a direct WHERE comparison joins the
+/// inner table first and groups by the outer rowid. A second copy of a
+/// rewritten subquery in the same clause reads the same grouped table.
+#[test]
+fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, max_sum INT, x REAL)",
+        "CREATE TABLE i(k INT, x INT, q REAL)",
+        "INSERT INTO o VALUES (1,1,11,0.5),(2,1,9,1.5),(3,2,1,7.0),(4,NULL,1,0.1),(5,3,1,2.0)",
+        "INSERT INTO i VALUES (1,5,1.0),(1,5,2.0),(2,NULL,8.0),\
+         (99,9223372036854775807,1.0),(99,9223372036854775807,1.0)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    let sum_sql = "SELECT o.id FROM o WHERE o.max_sum > (SELECT sum(i.x) FROM i WHERE i.k = o.k)";
+    let plan = query_plan(&hir, sum_sql);
+    assert!(
+        plan.iter()
+            .any(|line| line.starts_with("SEARCH i ") && line.ends_with("LEFT-JOIN")),
+        "{plan:?}"
+    );
+    let shared_sql = "SELECT count(*) FROM o WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) \
+                      AND o.x > (SELECT avg(i.q) FROM i WHERE i.k = o.k) - 100";
+    let plan = query_plan(&hir, shared_sql);
+    assert_eq!(
+        plan.iter()
+            .filter(|line| line.starts_with("SEARCH scalar_subquery_"))
+            .count(),
+        1,
+        "{plan:?}"
+    );
+    for sql in [
+        sum_sql,
+        "SELECT o.id FROM o WHERE (SELECT sum(i.x) FROM i WHERE i.k = o.k) < o.max_sum ORDER BY 1",
+        "SELECT o.id, o.max_sum FROM o WHERE o.max_sum >= \
+         (SELECT count(i.x) + sum(i.x) FROM i WHERE i.k = o.k AND i.x > 1) AND o.id > 0",
+        "SELECT o.id FROM o WHERE o.max_sum > (SELECT group_concat(i.x) FROM i WHERE i.k = o.k)",
+        shared_sql,
+        "SELECT o.id, (SELECT avg(i.q) FROM i WHERE i.k = o.k), \
+         (SELECT avg(i.q) FROM i WHERE i.k = o.k) FROM o \
+         WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) ORDER BY 1",
+    ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),
             limbo_exec_rows(&legacy, sql),
