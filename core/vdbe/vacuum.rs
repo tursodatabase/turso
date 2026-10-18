@@ -715,7 +715,22 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
-                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &sql)?;
+                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
+                // reserved name prefixes that translate_create_table rejects for
+                // user SQL. Temporarily mark the target connection as nested during
+                // prepare() so the reserved-name check is bypassed at compile
+                // time. The guard is only for prepare: keeping it during step()
+                // would make this CREATE TABLE look nested, so its Transaction
+                // opcode would skip write setup.
+                let is_system = crate::schema::is_system_table(&entry.name);
+                if is_system {
+                    state.target_conn.start_nested();
+                }
+                let target_stmt = state.target_conn.prepare(&sql);
+                if is_system {
+                    state.target_conn.end_nested();
+                }
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
