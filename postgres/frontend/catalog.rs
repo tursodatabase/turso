@@ -186,20 +186,20 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
         .tables
         .iter()
         .filter(|(name, table)| {
-            // Skip system tables
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
             // Skip virtual tables and subqueries
-            matches!(table.as_ref(), Table::BTree(_))
+            !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
         })
         .collect();
     tables.sort_by_key(|(name, _)| *name);
     tables
+}
+
+/// Whether `name` is a table that the engine or this frontend owns, rather
+/// than the user.
+fn is_system_table_name(name: &str) -> bool {
+    ["sqlite_", "pg_", "pragma_", "json_", "__turso_internal_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Map a SQLite type string to a PostgreSQL type OID.

@@ -595,6 +595,18 @@ test pg-tables-no-internal-tables {
 }
 expect {}
 
+test pg-tables-and-pg-class-hide-tables-of-sequences {
+    CREATE SEQUENCE s;
+    CREATE TABLE t (id serial);
+    SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+    UNION ALL
+    SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname <> 't';
+}
+expect {
+    t
+}
+
 test pg-type-builtin-oids {
     SELECT typname, oid FROM pg_type
     WHERE typname IN ('int4', 'text', 'bool', 'uuid') ORDER BY typname;
