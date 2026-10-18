@@ -148,3 +148,15 @@ test analyze-column-run-is-a-jump-table-2col {
 expect {
     4 4 2
 }
+
+test analyze-does-not-overwrite-last-insert-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    INSERT INTO t VALUES(7, 'a');
+    CREATE INDEX ti ON t(v);
+    ANALYZE;
+    SELECT last_insert_rowid();
+}
+expect {
+    7
+}
+
