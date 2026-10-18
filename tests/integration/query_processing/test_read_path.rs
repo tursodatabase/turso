@@ -1220,11 +1220,10 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
     }
 }
 
-/// Parameters in WHERE terms that the optimizer drops as always true or
-/// always false must still be counted, as SQLite counts every parameter in
-/// the SQL text.
+/// Parameters in expressions that produce no bytecode must still be counted,
+/// as SQLite counts every parameter in the SQL text.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x INTEGER);")]
-fn test_parameters_count_includes_dropped_constant_where_terms(tmp_db: TempDatabase) {
+fn test_parameters_count_includes_parameters_without_bytecode(tmp_db: TempDatabase) {
     let cases = [
         "SELECT x FROM t WHERE x = ?",
         "SELECT x FROM t WHERE 0 AND x = ?",
@@ -1240,13 +1239,24 @@ fn test_parameters_count_includes_dropped_constant_where_terms(tmp_db: TempDatab
         "SELECT x FROM t WHERE 0 AND x IN (SELECT ?)",
         "SELECT x FROM t WHERE 0 AND EXISTS (SELECT 1 FROM t WHERE x = ?)",
         "SELECT x FROM t UNION SELECT x FROM t WHERE 0 AND x = ?",
+        "WITH c AS (SELECT ?) SELECT 1",
+        "WITH c AS (SELECT ?) SELECT x FROM t WHERE x = ?",
+        "SELECT EXISTS (SELECT x FROM u ORDER BY ?)",
+        "SELECT x FROM t WHERE EXISTS (SELECT ? FROM t)",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) WHERE 0 AND ? DO NOTHING",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) DO UPDATE SET y = ? WHERE 0 AND ?",
+        "CREATE TABLE z AS SELECT 1 WHERE 0 AND ?",
     ];
 
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
     sqlite_conn
-        .execute("CREATE TABLE t (x INTEGER)", ())
+        .execute_batch(
+            "CREATE TABLE t (x INTEGER); CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE);",
+        )
         .unwrap();
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
     for sql in cases {
         let sqlite_stmt = sqlite_conn.prepare(sql).unwrap();
         let stmt = conn.prepare(sql).unwrap();

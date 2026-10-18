@@ -305,7 +305,6 @@ pub fn prepare_delete_plan(
         rowset_reg: None,
         non_from_clause_subqueries,
         safety,
-        phantom_params: vec![],
     };
 
     if delete_plan.safety.requires_stable_write_set() {
@@ -485,7 +484,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

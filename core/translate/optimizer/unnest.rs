@@ -126,7 +126,6 @@ use turso_parser::ast::{
 
 use crate::translate::plan::Plan;
 
-use super::collect_variables;
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -429,17 +428,6 @@ fn rewrite_as_semi_or_anti_join(
 
     for inner_subquery in inner_plan.non_from_clause_subqueries {
         plan.non_from_clause_subqueries.push(inner_subquery);
-    }
-
-    // EXISTS ignores its SELECT list. Keep any parameters from that list so
-    // callers can still bind them.
-    if matches!(
-        plan.non_from_clause_subqueries[subquery_index].query_type,
-        ast::SubqueryType::Exists { .. }
-    ) {
-        for result_column in &inner_plan.result_columns {
-            collect_variables(&result_column.expr, &mut plan.phantom_params);
-        }
     }
 
     replace_subquery_term_with_true(&mut plan.where_clause, where_term_index);

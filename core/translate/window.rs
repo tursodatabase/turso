@@ -240,7 +240,6 @@ fn prepare_window_subquery(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     prepare_window_subquery(

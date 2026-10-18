@@ -1602,6 +1602,143 @@ impl ViewColumnSchema {
     }
 }
 
+/// Walk all expressions in a statement, including subqueries.
+pub fn walk_stmt_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match stmt {
+        ast::Stmt::Select(select) => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                walk_select_expressions_inner(select, func)?;
+                let mut upsert = upsert.as_deref();
+                while let Some(clause) = upsert {
+                    if let Some(index) = &clause.index {
+                        for target in &index.targets {
+                            walk_expr_with_subqueries(&target.expr, func)?;
+                        }
+                        if let Some(where_clause) = &index.where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
+                        for set in sets {
+                            walk_expr_with_subqueries(&set.expr, func)?;
+                        }
+                        if let Some(where_clause) = where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    upsert = clause.next.as_deref();
+                }
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Update(update) => {
+            walk_with_expressions(update.with.as_ref(), func)?;
+            for set in &update.sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(from_clause) = &update.from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+            if let Some(where_clause) = &update.where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(&update.returning, func)?;
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Attach { expr, db_name, key } => {
+            walk_expr_with_subqueries(expr, func)?;
+            walk_expr_with_subqueries(db_name, func)?;
+            if let Some(key) = key {
+                walk_expr_with_subqueries(key, func)?;
+            }
+        }
+        ast::Stmt::Detach { name } => walk_expr_with_subqueries(name, func)?,
+        ast::Stmt::Vacuum { into, .. } => {
+            if let Some(into) = into {
+                walk_expr_with_subqueries(into, func)?;
+            }
+        }
+        ast::Stmt::Pragma { body, .. } => {
+            if let Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) = body {
+                walk_expr_with_subqueries(value, func)?;
+            }
+        }
+        ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::AsSelect(select),
+            ..
+        } => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::AlterTable(_)
+        | ast::Stmt::Analyze { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTable { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateView { .. }
+        | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. } => {}
+    }
+    Ok(())
+}
+
+fn walk_with_expressions<F>(with: Option<&ast::With>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        walk_select_expressions_inner(&cte.select, func)?;
+    }
+    Ok(())
+}
+
+fn walk_result_column_expressions<F>(columns: &[ast::ResultColumn], func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            walk_expr_with_subqueries(expr, func)?;
+        }
+    }
+    Ok(())
+}
+
 /// Walk all expressions in a SELECT statement, including subqueries.
 pub fn walk_select_expressions<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
@@ -1614,11 +1751,7 @@ fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Resul
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            walk_select_expressions_inner(&cte.select, func)?;
-        }
-    }
+    walk_with_expressions(select.with.as_ref(), func)?;
 
     walk_one_select_expressions(&select.body.select, func)?;
     for compound in &select.body.compounds {
@@ -1652,11 +1785,7 @@ where
             window_clause,
             ..
         } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr_with_subqueries(expr, func)?;
-                }
-            }
+            walk_result_column_expressions(columns, func)?;
 
             if let Some(from_clause) = from {
                 walk_from_clause_expressions(from_clause, func)?;
