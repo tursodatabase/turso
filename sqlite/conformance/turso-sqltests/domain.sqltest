@@ -1585,3 +1585,18 @@ setup domain_without_decode {
 snapshot domain_select_without_decode_has_no_null_check {
     SELECT x FROM t1;
 }
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-encoded-type-update-encodes-constant-once-per-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN money AS cents;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, m money) STRICT;
+    INSERT INTO t1(id) VALUES (1), (2), (3);
+    UPDATE t1 SET m = 8;
+    SELECT id, m FROM t1 ORDER BY id;
+}
+expect {
+    1|8
+    2|8
+    3|8
+}
