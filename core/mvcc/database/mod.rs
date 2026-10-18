@@ -6723,6 +6723,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
+        let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
@@ -6739,14 +6740,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .global_header
                 .read()
                 .expect("global_header initialized above");
+            // A schema change that already has its end_ts but has not published its schema
+            // cookie yet would be visible in our row snapshot but not in our header, so the
+            // statement would run its old schema against the new rows.
+            if self.exclusive_tx_has_unpublished_schema_cookie(header.schema_cookie.get()) {
+                schema_change_unpublished = true;
+                return;
+            }
             self.txs.insert(
                 tx_id,
                 Transaction::new(tx_id, ts, header, read_mark, schema_generation),
             );
         });
-        if schema_stale {
+        if schema_stale || schema_change_unpublished {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
+            }
+            if schema_change_unpublished {
+                return Err(LimboError::Busy);
             }
             return Err(LimboError::SchemaUpdated);
         }
@@ -7612,6 +7623,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     #[inline]
     fn has_exclusive_tx(&self) -> bool {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
+    }
+
+    /// Returns true if the exclusive transaction is committing a schema cookie other than
+    /// `global_schema_cookie`, and has already taken its commit timestamp.
+    fn exclusive_tx_has_unpublished_schema_cookie(&self, global_schema_cookie: u32) -> bool {
+        let Some(entry) = self.txs.get(&self.exclusive_tx.load(Ordering::Acquire)) else {
+            return false;
+        };
+        let tx = entry.value();
+        matches!(tx.state.load(), TransactionState::Preparing(_))
+            && tx.header_dirty.load(Ordering::Acquire)
+            && tx.header.read().schema_cookie.get() != global_schema_cookie
     }
 
     fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
