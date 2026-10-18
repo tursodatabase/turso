@@ -901,7 +901,7 @@ impl DatabaseReplaySession {
     }
 }
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
