@@ -44,7 +44,7 @@ pub fn emit_program_for_compound_select(
     let offset_owned = offset.clone();
     let right_most_ctx = Box::new(TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
     ));
@@ -281,7 +281,7 @@ fn emit_compound_select(
     }
     let mut right_most_ctx = Box::new(TranslateCtx::new(
         program,
-        resolver.fork(),
+        resolver.fork_with_expr_cache(),
         right_most.table_references.joined_tables().len(),
         false,
     ));

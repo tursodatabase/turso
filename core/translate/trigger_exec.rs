@@ -930,7 +930,6 @@ pub fn fire_trigger(
                     *plan,
                     &subquery.query_type,
                     true, // always re-evaluate: trigger WHEN is checked per-row
-                    false,
                 )?;
             }
 
