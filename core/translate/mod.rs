@@ -107,6 +107,10 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.flags.set_keep_array_results_as_blobs(matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+    ));
 
     program.prologue();
     let mut resolver = Resolver::new(
