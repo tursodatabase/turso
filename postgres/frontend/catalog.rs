@@ -146,6 +146,10 @@ impl Dialect for PostgresDialect {
         Ok(encode_pg_schema_sql(input))
     }
 
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        turso_core::dialect::sqlite::SqliteDialect.format_rewritten_table_sql(stmt)
+    }
+
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
         turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
     }
