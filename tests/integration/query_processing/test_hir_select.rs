@@ -1944,3 +1944,57 @@ fn hir_aggregate_arguments_follow_their_order_by() {
         assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
     }
 }
+
+/// Like legacy, the join search starts from the FROM-order plan and only a
+/// strictly cheaper order replaces it. Equally cheap orders resolve the same
+/// way as legacy, so both pick the same loops for these joins.
+#[test]
+fn hir_equally_cheap_join_orders_resolve_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE customers(customer_id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL)",
+        "CREATE TABLE products(product_id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL)",
+        "CREATE TABLE orders(order_id INTEGER PRIMARY KEY NOT NULL, \
+         customer_id INTEGER NOT NULL, order_date DATE NOT NULL)",
+        "CREATE TABLE order_items(item_id INTEGER PRIMARY KEY NOT NULL, \
+         order_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL)",
+        "CREATE INDEX idx_orders_customer_id ON orders(customer_id)",
+        "CREATE INDEX idx_order_items_order_id ON order_items(order_id)",
+        "CREATE INDEX idx_order_items_product_id ON order_items(product_id)",
+        "INSERT INTO customers VALUES (1,'ann'),(2,'bob')",
+        "INSERT INTO products VALUES (1,'pen'),(2,'cup')",
+        "INSERT INTO orders VALUES (1,1,'d1'),(2,2,'d2'),(3,1,'d3')",
+        "INSERT INTO order_items VALUES (1,1,1,3),(2,1,2,1),(3,2,2,5),(4,3,1,2)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT c.name, o.order_id, p.name, oi.quantity \
+         FROM customers c, orders o, order_items oi, products p \
+         WHERE c.customer_id = o.customer_id AND o.order_id = oi.order_id \
+         AND oi.product_id = p.product_id",
+        "SELECT c.name, o.order_id, p.name, oi.quantity FROM customers c \
+         JOIN orders o ON c.customer_id = o.customer_id \
+         JOIN order_items oi ON o.order_id = oi.order_id \
+         JOIN products p ON oi.product_id = p.product_id",
+    ] {
+        let plan = query_plan(&hir, sql);
+        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
+        assert_eq!(
+            plan,
+            [
+                "SCAN order_items AS oi",
+                "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH c USING INTEGER PRIMARY KEY (rowid=?)",
+            ],
+            "{sql}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

@@ -2087,7 +2087,82 @@ pub(crate) fn compute_hir_join_order(
         );
     }
 
+    // Add `rhs` after the tables of `lhs`.
+    let extend = |lhs: &HirPartialJoin,
+                  lhs_mask: &TableMask,
+                  rhs: usize|
+     -> Result<Option<HirPartialJoin>> {
+        let Some(next) = step(rhs, lhs_mask, lhs.output_cardinality)? else {
+            return Ok(None);
+        };
+        let mut method = next.access_method;
+        // Like legacy, a table nothing joins to the tables before it pays for
+        // the cross product.
+        let connected = predicate_work
+            .iter()
+            .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(lhs_mask));
+        if !connected {
+            let base_rows = base_table_rows
+                .get(rhs)
+                .copied()
+                .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+            let self_selectivity = build_self_constraint_selectivity(&constraints[rhs], rhs);
+            method.cost =
+                method.cost + Cost(lhs.output_cardinality * *base_rows * self_selectivity);
+        }
+        let mut rhs_mask = TableMask::default();
+        rhs_mask.set(rhs)?;
+        let output_cardinality = rows_after_join(
+            lhs.output_cardinality,
+            &method,
+            &constraints[rhs],
+            lhs_mask,
+            rhs_mask,
+            false,
+            params,
+        );
+        let mut steps = lhs
+            .steps
+            .iter()
+            .map(|(position, method)| (*position, method.clone()))
+            .collect::<Vec<_>>();
+        steps.push((rhs, method.clone()));
+        Ok(Some(HirPartialJoin {
+            steps,
+            output_cardinality,
+            cost: lhs.cost + method.cost,
+        }))
+    };
+
+    // Like legacy, the plan that joins the tables in FROM order goes first and
+    // only a strictly cheaper plan replaces it.
+    let mut from_order: Option<HirPartialJoin> = memo
+        .get(&{
+            let mut mask = TableMask::default();
+            mask.set(0)?;
+            mask
+        })
+        .and_then(|plans| plans.get(&0))
+        .map(|first| HirPartialJoin {
+            steps: first.steps.clone(),
+            output_cardinality: first.output_cardinality,
+            cost: first.cost,
+        });
+    let mut from_order_mask = TableMask::default();
+    from_order_mask.set(0)?;
+    for rhs in 1..sources.len() {
+        let Some(lhs) = from_order.take() else {
+            break;
+        };
+        if !allowed(rhs, &from_order_mask) {
+            break;
+        }
+        from_order = extend(&lhs, &from_order_mask, rhs)?;
+        from_order_mask.set(rhs)?;
+    }
+
     let mut complete: Vec<HirPartialJoin> = Vec::new();
+    complete.extend(from_order);
     for subset_size in 2..=sources.len() {
         for mask in generate_join_bitmasks(sources.len(), subset_size) {
             let mask = mask?;
@@ -2104,71 +2179,25 @@ pub(crate) fn compute_hir_join_order(
                 let Some(lhs_plans) = memo.get(&lhs_mask) else {
                     continue;
                 };
-                let connected = predicate_work
-                    .iter()
-                    .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(&lhs_mask));
                 let mut last_positions = lhs_plans.keys().copied().collect::<Vec<_>>();
                 last_positions.sort_unstable();
                 for last in last_positions {
-                    let lhs = &lhs_plans[&last];
-                    let Some(next) = step(rhs, &lhs_mask, lhs.output_cardinality)? else {
+                    let Some(plan) = extend(&lhs_plans[&last], &lhs_mask, rhs)? else {
                         continue;
                     };
-                    let mut method = next.access_method;
-                    // Like legacy, a table nothing joins to the tables before
-                    // it pays for the cross product.
-                    if !connected {
-                        let base_rows = base_table_rows
-                            .get(rhs)
-                            .copied()
-                            .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-                        let self_selectivity =
-                            build_self_constraint_selectivity(&constraints[rhs], rhs);
-                        method.cost = method.cost
-                            + Cost(lhs.output_cardinality * *base_rows * self_selectivity);
-                    }
-                    let mut rhs_mask = TableMask::default();
-                    rhs_mask.set(rhs)?;
-                    let output_cardinality = rows_after_join(
-                        lhs.output_cardinality,
-                        &method,
-                        &constraints[rhs],
-                        &lhs_mask,
-                        rhs_mask,
-                        false,
-                        params,
-                    );
-                    let cost = lhs.cost + method.cost;
                     if best_by_last
                         .get(&rhs)
-                        .is_some_and(|existing| existing.cost.0 <= cost.0)
+                        .is_some_and(|existing| existing.cost.0 <= plan.cost.0)
                     {
                         continue;
                     }
-                    let mut steps = lhs
-                        .steps
-                        .iter()
-                        .map(|(position, method)| (*position, method.clone()))
-                        .collect::<Vec<_>>();
-                    steps.push((rhs, method));
-                    best_by_last.insert(
-                        rhs,
-                        HirPartialJoin {
-                            steps,
-                            output_cardinality,
-                            cost,
-                        },
-                    );
+                    best_by_last.insert(rhs, plan);
                 }
             }
             if subset_size == sources.len() {
-                let mut lasts = best_by_last.keys().copied().collect::<Vec<_>>();
-                lasts.sort_unstable();
-                for last in lasts {
-                    if let Some(plan) = best_by_last.remove(&last) {
-                        complete.push(plan);
-                    }
-                }
+                // Visit the finished plans in the same map order as legacy so
+                // that equally cheap plans resolve the same way.
+                complete.extend(best_by_last.into_values());
             } else if !best_by_last.is_empty() {
                 memo.insert(mask, best_by_last);
             }
@@ -2187,20 +2216,12 @@ pub(crate) fn compute_hir_join_order(
         output_cardinality: plan.output_cardinality,
         cost: plan.cost,
     };
-    // Like legacy, a tie keeps the FROM clause's order, so rows of equally
-    // cheap plans come out in the same order as before.
-    let order_key = |plan: &HirPartialJoin| {
-        plan.steps
-            .iter()
-            .map(|(position, _)| *position)
-            .collect::<Vec<_>>()
-    };
-    let Some(best_position) = (0..complete.len()).min_by(|left, right| {
-        complete[*left]
-            .cost
-            .0
-            .total_cmp(&complete[*right].cost.0)
-            .then_with(|| order_key(&complete[*left]).cmp(&order_key(&complete[*right])))
+    let Some(best_position) = (0..complete.len()).reduce(|best, position| {
+        if complete[position].cost.0 < complete[best].cost.0 {
+            position
+        } else {
+            best
+        }
     }) else {
         return Err(LimboError::PlanningError(
             "No valid HIR join order found".to_string(),
