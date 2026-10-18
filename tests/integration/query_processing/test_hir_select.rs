@@ -1534,6 +1534,74 @@ fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
     );
 }
 
+/// Like legacy, whose window source subquery orders its rows by the window's
+/// PARTITION BY and ORDER BY, rows that the loops already return in that
+/// order, through an index or an ordered CTE, need no window sort.
+#[test]
+fn hir_window_uses_the_loop_order_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    legacy
+        .execute("CREATE INDEX items_extra_value ON items(extra, value)")
+        .unwrap();
+    let sorters = |sql: &str| {
+        limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
+            .into_iter()
+            .filter(|row| {
+                matches!(row.get(1), Some(rusqlite::types::Value::Text(opcode)) if opcode == "SorterOpen")
+            })
+            .count()
+    };
+    // Legacy shows its window source subquery as a scan of its own and its
+    // window sort as an ORDER BY sort; HIR shows neither, and the sorters
+    // are counted in the bytecode instead. None of these queries has an
+    // ORDER BY of its own.
+    let plan = |conn, sql| {
+        query_plan(conn, sql)
+            .into_iter()
+            .filter(|row| {
+                !row.starts_with("SCAN window_subquery_") && row != "USE SORTER FOR ORDER BY"
+            })
+            .collect::<Vec<_>>()
+    };
+    for (sql, expected_sorters) in [
+        (
+            "SELECT id, row_number() OVER (ORDER BY value DESC) FROM items",
+            0,
+        ),
+        (
+            "SELECT id, extra, sum(value) OVER (PARTITION BY extra ORDER BY value) FROM items",
+            0,
+        ),
+        (
+            "SELECT id, rank() OVER (PARTITION BY extra ORDER BY value DESC) FROM items",
+            1,
+        ),
+        (
+            "WITH o AS (SELECT id, value FROM items ORDER BY value) \
+             SELECT id, sum(value) OVER (ORDER BY value) FROM o",
+            0,
+        ),
+        (
+            "WITH o AS (SELECT id, extra FROM items NOT INDEXED ORDER BY extra) \
+             SELECT id, count(*) OVER (ORDER BY extra) FROM o",
+            1,
+        ),
+        (
+            "SELECT id, row_number() OVER (ORDER BY value) FROM items LIMIT 3",
+            0,
+        ),
+    ] {
+        assert_eq!(sorters(sql), expected_sorters, "{sql}");
+        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]

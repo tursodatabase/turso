@@ -8048,6 +8048,7 @@ impl<'a> HirWindowLayer<'a> {
         window: hir::WindowId,
         consumer: HirWindowConsumer<'_, 'a>,
         grouped_rows: bool,
+        sorted_input: bool,
     ) -> Result<Self> {
         let mut plan = super::window::plan_hir_window_buffer(query, block, window)?;
         let output_plan = match consumer {
@@ -8080,7 +8081,8 @@ impl<'a> HirWindowLayer<'a> {
         };
         // Like the legacy source subquery's ORDER BY, grouped rows carry a
         // sequence number so equal keys keep their group order.
-        let sorter = (!keys.is_empty())
+        // Rows that already arrive in key order go straight to the window.
+        let sorter = (!keys.is_empty() && !sorted_input)
             .then(|| open_hir_window_input_sorter(program, &plan, &keys, grouped_rows));
         Ok(Self {
             document,
@@ -8411,6 +8413,7 @@ fn emit_hir_window_block(
             window.id,
             consumer,
             innermost && hir_grouping(block).is_some(),
+            innermost && block_plan.window_sort_elided,
         )?;
         layers.push(layer);
     }
@@ -9925,7 +9928,8 @@ pub(super) mod tests {
     fn planned_window_drops_order_terms_equal_to_partition_terms() {
         let plan = analyze_plan(
             indexed_items_schema(),
-            "SELECT rank() OVER (PARTITION BY value ORDER BY value DESC) FROM items",
+            // NOT INDEXED: an index on value would give the order unsorted.
+            "SELECT rank() OVER (PARTITION BY value ORDER BY value DESC) FROM items NOT INDEXED",
         );
         let program = emit_planned_root(&plan);
 

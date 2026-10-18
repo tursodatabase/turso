@@ -470,6 +470,9 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order, so the query needs no sorter.
     pub(crate) order_sort_elided: bool,
+    /// The loops return rows in the order the innermost window layer sorts
+    /// them in, so that layer needs no sorter.
+    pub(crate) window_sort_elided: bool,
     /// An index method applies LIMIT and OFFSET while it scans.
     pub(crate) limit_applied: bool,
     /// The block is `SELECT min(x)` or `SELECT max(x)` and the loop reads x
@@ -1597,6 +1600,7 @@ impl<'a> HirPlanContext<'a> {
                 where_start: input.where_start,
                 group_sort_elided: false,
                 order_sort_elided: false,
+                window_sort_elided: false,
                 limit_applied: false,
                 min_max_first_value: false,
                 simple_count: false,
@@ -1638,8 +1642,17 @@ impl<'a> HirPlanContext<'a> {
         // Like legacy's `compute_order_target`: a grouped block aims for its
         // GROUP BY order even when it has an ORDER BY, so an index can still
         // replace the GROUP BY sorter.
+        // Like the ORDER BY of legacy's window source subquery: the rows of a
+        // block with windows are wanted in the innermost window's key order.
+        let window_target = (min_max_terms.is_empty()
+            && hir_block_grouping(block).is_none()
+            && block.aggregate_count == 0)
+            .then(|| self.window_target(block))
+            .flatten();
         let order_target = if !min_max_terms.is_empty() {
             self.order_target(&min_max_terms, OrderTargetPurpose::Extremum)
+        } else if window_target.is_some() {
+            window_target.clone()
         } else if order_by.is_empty() || hir_block_grouping(block).is_some() {
             self.grouping_target(block, order_by)
         } else {
@@ -1672,7 +1685,8 @@ impl<'a> HirPlanContext<'a> {
             predicates: access.predicates,
             where_start,
             group_sort_elided: access.group_sort_elided,
-            order_sort_elided: access.order_sort_elided,
+            order_sort_elided: access.order_sort_elided && window_target.is_none(),
+            window_sort_elided: access.order_sort_elided && window_target.is_some(),
             limit_applied: false,
             min_max_first_value: access.min_max_first_value,
             simple_count,
@@ -1716,6 +1730,7 @@ impl<'a> HirPlanContext<'a> {
         // after its waiting lookups ran; an automatic index serves it.
         if !matches!(&self.document.root, hir::HirRoot::Query(root) if root.query == block.id.query)
             || plan.order_sort_elided
+            || plan.window_sort_elided
             || plan.group_sort_elided
             || plan.min_max_first_value
             || plan.simple_count
@@ -1917,6 +1932,7 @@ impl<'a> HirPlanContext<'a> {
             where_start: input.where_start,
             group_sort_elided: false,
             order_sort_elided: matched.applies_order_by,
+            window_sort_elided: false,
             limit_applied: matched.applies_limit,
             min_max_first_value: false,
             simple_count: false,
@@ -2027,6 +2043,7 @@ impl<'a> HirPlanContext<'a> {
             where_start: input.where_start,
             group_sort_elided: false,
             order_sort_elided: false,
+            window_sort_elided: false,
             limit_applied: false,
             min_max_first_value: false,
             simple_count: false,
@@ -2425,6 +2442,62 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget {
             columns,
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+        })
+    }
+
+    /// The order the innermost window layer, which reads the block's rows,
+    /// sorts them in: PARTITION BY terms ascending, then ORDER BY terms, each
+    /// key once, like the ORDER BY of legacy's window source subquery. Rows
+    /// already in that order need no window sort. A key that a custom type
+    /// sorts by its stored value is left to the sorter.
+    fn window_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
+    where
+        'a: 'term,
+    {
+        let window = block.windows.last()?;
+        let collation = |collation: Option<&hir::ResolvedCollation>| {
+            collation
+                .map(|collation| *collation.value())
+                .unwrap_or_default()
+        };
+        let partition = window.partition_by.iter().map(|term| {
+            (
+                &term.expr,
+                &term.type_fact,
+                turso_parser::ast::SortOrder::Asc,
+                collation(term.collation.as_ref()),
+                None,
+            )
+        });
+        let order = window.order_by.iter().map(|term| {
+            (
+                &term.expr,
+                &term.type_fact,
+                term.order,
+                collation(term.collation.as_ref()),
+                term.nulls,
+            )
+        });
+        let mut keys: Vec<&'term hir::Expr> = Vec::new();
+        let mut columns = Vec::new();
+        for (expression, type_fact, order, collation, nulls) in partition.chain(order) {
+            if keys.iter().any(|key| key.equivalent(expression)) {
+                continue;
+            }
+            let encoded = type_fact
+                .declared
+                .as_ref()
+                .and_then(|declared| declared.custom())
+                .is_some_and(|custom| custom.value().decode().is_some());
+            if encoded {
+                return None;
+            }
+            keys.push(expression);
+            columns.push(self.ordering_column(expression, order, collation, nulls)?);
+        }
+        (!columns.is_empty()).then_some(OrderTarget {
+            columns,
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         })
     }
 
