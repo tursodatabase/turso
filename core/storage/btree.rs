@@ -803,6 +803,13 @@ pub trait CursorTrait: Any + Send + Sync {
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
+    /// Like `record_payload`, but when only columns `0..=last_column` are
+    /// needed. A b-tree cursor then returns just the part of the record
+    /// stored on the leaf page if those columns end there, so that reading
+    /// the leading columns of a row does not read its overflow pages.
+    fn record_payload_through_column(&mut self, _last_column: usize) -> IOResultOr<Option<&[u8]>> {
+        self.record_payload()
+    }
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult>;
     /// Seek using registers directly without serializing them into an ImmutableRecord first.
@@ -1133,22 +1140,21 @@ enum BlobSpan {
 /// must be exactly the header bytes (so a varint can never stray into the body) and
 /// `hpos0` the offset of the first serial type, i.e. the width of the header-size
 /// varint. Returns the value's payload-relative byte offset, its byte length, and
-/// its serial type, after checking the range lies inside `payload_size`.
-fn blob_locate_column_in_header(
+/// its serial type, after checking the range lies inside `payload_size`, or None
+/// when the record has no column `column`.
+fn locate_column_in_header(
     header: &[u8],
     hpos0: usize,
     payload_size: usize,
     column: usize,
-) -> Result<(usize, usize, u64)> {
+) -> Result<Option<(usize, usize, u64)>> {
     let header_size = header.len();
     let mut hpos = hpos0;
     let mut body = header_size;
     let mut col = 0usize;
     loop {
         if hpos >= header_size {
-            return Err(LimboError::InternalError(format!(
-                "blob column {column} out of range for row with {col} columns"
-            )));
+            return Ok(None);
         }
         let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&header[hpos..])?;
         hpos += n;
@@ -1162,7 +1168,7 @@ fn blob_locate_column_in_header(
             )));
         }
         if col == column {
-            return Ok((body, size, serial));
+            return Ok(Some((body, size, serial)));
         }
         body = end;
         col += 1;
@@ -5928,11 +5934,11 @@ impl BTreeCursor {
             ))
             .into());
         }
-        let (body_off, len, serial) = if header_size <= local_len {
+        let located = if header_size <= local_len {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             let local = &contents.as_ptr()[local_off..local_off + local_len];
-            blob_locate_column_in_header(&local[..header_size], hpos0, payload_size, column)?
+            locate_column_in_header(&local[..header_size], hpos0, payload_size, column)?
         } else {
             // Header spills into the overflow chain: materialize exactly the header
             // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
@@ -5943,7 +5949,13 @@ impl BTreeCursor {
                 crate::alloc::try_vec![0u8; header_size]
             )?;
             return_if_io!(self.blob_read_range(0, &mut header));
-            blob_locate_column_in_header(&header, hpos0, payload_size, column)?
+            locate_column_in_header(&header, hpos0, payload_size, column)?
+        };
+        let Some((body_off, len, serial)) = located else {
+            return Err(LimboError::InternalError(format!(
+                "blob column {column} out of range for row"
+            ))
+            .into());
         };
         let c = &mut self.blob_cache;
         c.col = column;
@@ -6882,45 +6894,12 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
-            return Ok(IOResult::Done(None));
-        }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
+        self.read_record_payload(None)
+    }
 
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+    #[inline(always)]
+    fn record_payload_through_column(&mut self, last_column: usize) -> IOResultOr<Option<&[u8]>> {
+        self.read_record_payload(Some(last_column))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7841,12 +7820,60 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// The record under the cursor, or only its part on the leaf page when
+    /// `last_column` is given and columns `0..=last_column` end there.
+    #[inline(always)]
+    fn read_record_payload(&mut self, last_column: Option<usize>) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return restore_record_payload(self, last_column);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(payload)));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
+        }
+        return self.record_payload_general(last_column);
+
+        #[inline(never)]
+        fn restore_record_payload(
+            cursor: &mut BTreeCursor,
+            last_column: Option<usize>,
+        ) -> IOResultOr<Option<&[u8]>> {
+            return_if_io!(cursor.restore_context());
+            cursor.read_record_payload(last_column)
+        }
+    }
+
     #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+    fn record_payload_general(&mut self, last_column: Option<usize>) -> IOResultOr<Option<&[u8]>> {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
-        let (payload, payload_start, _payload_size, first_overflow_page) =
+        let (payload, payload_start, payload_size, first_overflow_page) =
             contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
         if first_overflow_page.is_none() {
             self.noted_payload = NotedPayload {
@@ -7855,8 +7882,32 @@ impl BTreeCursor {
             };
             return Ok(IOResult::Done(Some(payload)));
         }
+        // Like SQLite's OP_Column, decode from the leaf page when the
+        // requested columns end there instead of reading the overflow chain.
+        if let Some(last_column) = last_column {
+            if Self::columns_end_on_page(payload, payload_size as usize, last_column)? {
+                return Ok(IOResult::Done(Some(payload)));
+            }
+        }
         let record = return_if_io!(self.record());
         Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+    }
+
+    /// True when the record header and the values of columns
+    /// `0..=last_column` all lie in `local`, the part of a record of
+    /// `payload_size` bytes that is stored on the leaf page.
+    fn columns_end_on_page(local: &[u8], payload_size: usize, last_column: usize) -> Result<bool> {
+        let (header_size, hpos0) = read_varint(local)?;
+        if header_size > local.len() as u64 {
+            return Ok(false);
+        }
+        let header = &local[..header_size as usize];
+        Ok(
+            match locate_column_in_header(header, hpos0, payload_size, last_column)? {
+                Some((offset, len, _)) => offset + len <= local.len(),
+                None => false,
+            },
+        )
     }
 
     /// True when the next cell is on the same leaf page and no resumable

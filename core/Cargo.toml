@@ -310,6 +310,10 @@ name = "scan_loop_benchmark"
 harness = false
 
 [[bench]]
+name = "overflow_scan_benchmark"
+harness = false
+
+[[bench]]
 name = "text_validate_benchmark"
 harness = false
 

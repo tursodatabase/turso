@@ -1312,3 +1312,116 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     assert_eq!(rows, expected);
     Ok(())
 }
+
+/// Like SQLite, reading the columns that come before a large value must not
+/// read the overflow pages that hold that value. Each query scans a table
+/// with a cold page cache and counts the pages it reads.
+#[test]
+fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 8;
+    // A 100KB value fills about 25 overflow pages of 4096 bytes.
+    const BIG_LEN: i64 = 100_000;
+    const OVERFLOW_PAGES_PER_ROW: usize = BIG_LEN as usize / 4096;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "columns-before-overflow-value.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute(
+            "CREATE TABLE revisions(doc_id TEXT, rev INTEGER, saved_at INTEGER, body TEXT, tail TEXT)",
+        )?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO revisions VALUES ('doc{i}', {i}, {}, printf('%0{BIG_LEN}d', {i}), 'tail{i}')",
+                    i * 100
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    // A fresh Database over the same backing file starts with a cold page
+    // cache, so every page the query needs is read again.
+    let scan = |sql: &str| -> anyhow::Result<(Vec<Vec<Value>>, usize)> {
+        let db = open(io.clone())?;
+        let conn = db.connect(ConnectOpts::new())?;
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        let mut page_reads = 0;
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                StepResult::IO | StepResult::Yield => {
+                    while let Some(event) = io.step_one()? {
+                        if event.kind == QueuedIoOpKind::Pread {
+                            page_reads += 1;
+                        }
+                    }
+                }
+                StepResult::Done => break,
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+        Ok((rows, page_reads))
+    };
+
+    // Three leading columns (a fused column range) and a single column.
+    for (sql, expected) in [
+        (
+            "SELECT doc_id, rev, saved_at FROM revisions",
+            (0..ROWS)
+                .map(|i| {
+                    vec![
+                        Value::build_text(format!("doc{i}")),
+                        Value::from_i64(i),
+                        Value::from_i64(i * 100),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "SELECT saved_at FROM revisions",
+            (0..ROWS).map(|i| vec![Value::from_i64(i * 100)]).collect(),
+        ),
+    ] {
+        let (rows, page_reads) = scan(sql)?;
+        assert_eq!(rows, expected, "{sql}");
+        assert!(
+            page_reads < OVERFLOW_PAGES_PER_ROW,
+            "{sql} read {page_reads} pages, more than one row's overflow pages"
+        );
+    }
+
+    // A column after the large value still needs the overflow pages.
+    let (rows, page_reads) = scan("SELECT rev, tail FROM revisions")?;
+    let expected: Vec<Vec<Value>> = (0..ROWS)
+        .map(|i| vec![Value::from_i64(i), Value::build_text(format!("tail{i}"))])
+        .collect();
+    assert_eq!(rows, expected);
+    assert!(
+        page_reads >= ROWS as usize * OVERFLOW_PAGES_PER_ROW,
+        "reading the column after the large value read only {page_reads} pages"
+    );
+    Ok(())
+}
