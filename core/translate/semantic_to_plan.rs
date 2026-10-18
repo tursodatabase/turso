@@ -539,12 +539,15 @@ pub(crate) enum HirSourceAccess {
         query: QueryId,
         seek: Option<crate::translate::optimizer::HirBtreeOperation>,
     },
-    /// A CTE reference; `seek` as for [`HirSourceAccess::Derived`].
+    /// A CTE reference; `seek` as for [`HirSourceAccess::Derived`]. A CTE
+    /// stored once (`Shared` or `Explicit`) may be read `Backwards`, from
+    /// its last row, to give an outer ORDER BY the opposite of its order.
     Cte {
         cte: hir::CteId,
         query: QueryId,
         materialization: HirCteMaterialization,
         seek: Option<crate::translate::optimizer::HirBtreeOperation>,
+        direction: crate::translate::plan::IterationDirection,
     },
     RecursiveCte {
         cte: hir::CteId,
@@ -2285,6 +2288,12 @@ impl<'a> HirPlanContext<'a> {
                     cte: *cte,
                     query: *query,
                     materialization: *materialization,
+                    direction: match access_methods[access_method_position].params {
+                        super::optimizer::access_method::AccessMethodParams::Subquery {
+                            iter_dir,
+                        } => iter_dir,
+                        _ => crate::translate::plan::IterationDirection::Forwards,
+                    },
                     seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
                         &constraints[source_position],
                         &mut input.predicates,

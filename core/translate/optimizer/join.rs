@@ -2543,6 +2543,7 @@ fn hir_join_step(
             *query,
             false,
             !hir_right_or_full_join(join_info.as_ref()),
+            order_target,
             &constraints[source_position],
             lhs_mask,
             source_position,
@@ -2567,6 +2568,7 @@ fn hir_join_step(
                 crate::translate::plan::HirCteMaterialization::PerReference
             ),
             !hir_right_or_full_join(join_info.as_ref()),
+            order_target,
             &constraints[source_position],
             lhs_mask,
             source_position,

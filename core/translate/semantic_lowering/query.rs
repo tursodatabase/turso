@@ -3021,6 +3021,9 @@ struct PreparedHirMaterializedLoop<'a> {
     source: &'a hir::Source,
     cursor: CursorID,
     table: Arc<BTreeTable>,
+    /// Backwards reads a stored CTE from its last row, for an outer ORDER BY
+    /// in the opposite direction of the CTE's own order.
+    direction: IterationDirection,
 }
 
 struct PreparedHirVirtualLoop<'a> {
@@ -5388,6 +5391,7 @@ fn prepare_hir_loop_unexplained<'a>(
             query,
             materialization: HirCteMaterialization::PerReference,
             seek,
+            ..
         } => {
             let materialized = prepare_hir_materialized_loop(
                 program,
@@ -5409,9 +5413,11 @@ fn prepare_hir_loop_unexplained<'a>(
             query,
             materialization: HirCteMaterialization::Shared | HirCteMaterialization::Explicit,
             seek,
+            direction,
         } => {
-            let materialized =
+            let mut materialized =
                 prepare_hir_shared_cte_loop(program, plan, planned_loop.source, *cte, *query)?;
+            materialized.direction = *direction;
             Ok(with_hir_materialized_seek(
                 program,
                 materialized,
@@ -6237,6 +6243,7 @@ fn prepare_hir_shared_cte_loop<'a>(
             source,
             cursor,
             table: shared.table,
+            direction: IterationDirection::Forwards,
         });
     }
 
@@ -6307,6 +6314,7 @@ fn prepare_hir_recursive_cte_loop<'a>(
             source,
             cursor,
             table: shared.table,
+            direction: IterationDirection::Forwards,
         });
     }
 
@@ -6355,6 +6363,7 @@ fn prepare_hir_recursive_cte_loop<'a>(
         source,
         cursor,
         table,
+        direction: IterationDirection::Forwards,
     })
 }
 
@@ -6549,6 +6558,7 @@ fn prepare_hir_materialized_loop<'a>(
         source,
         cursor,
         table,
+        direction: IterationDirection::Forwards,
     })
 }
 
@@ -6965,10 +6975,16 @@ fn start_hir_loop(
             let loop_start = program.allocate_label();
             let next = program.allocate_label();
             let exhausted = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: prepared.cursor,
-                pc_if_empty: exhausted,
-            });
+            match prepared.direction {
+                IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
+                    cursor_id: prepared.cursor,
+                    pc_if_empty: exhausted,
+                }),
+                IterationDirection::Backwards => program.emit_insn(Insn::Last {
+                    cursor_id: prepared.cursor,
+                    pc_if_empty: exhausted,
+                }),
+            }
             program.preassign_label_to_next_insn(loop_start);
             Ok(HirBtreeLoop {
                 cursor: Some(prepared.cursor),
@@ -6976,7 +6992,7 @@ fn start_hir_loop(
                 next,
                 exhausted,
                 advance: HirLoopAdvance::Cursor {
-                    direction: IterationDirection::Forwards,
+                    direction: prepared.direction,
                     fullscan: true,
                 },
                 left_join,

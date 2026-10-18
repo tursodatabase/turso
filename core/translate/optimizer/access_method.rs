@@ -2110,8 +2110,11 @@ fn find_best_access_method_for_subquery(
 /// side of a RIGHT or FULL JOIN (`may_seek` false), whose unmatched rows a
 /// second pass finds by scanning the stored table.
 ///
-/// Not ported yet: legacy also uses the order of the index, or of the
-/// subquery's own ORDER BY, to skip an outer sort.
+/// Without seek constraints, like legacy's `intrinsic_subquery_scan_direction`,
+/// the scan reads a stored CTE backwards when that gives `order_target`.
+///
+/// Not ported yet: legacy also uses the order of the temporary index to
+/// skip an outer sort.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_best_hir_access_method_for_subquery(
     document: &hir::HirDocument,
@@ -2119,6 +2122,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     query: hir::QueryId,
     table_materialization_required: bool,
     may_seek: bool,
+    order_target: Option<&super::order::HirOrderTarget<'_>>,
     constraints: &TableConstraints<hir::Expr, hir::SourceId>,
     lhs_mask: &TableMask,
     source_position: usize,
@@ -2194,7 +2198,29 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
         })
         .collect();
     if usable.is_empty() {
-        return Ok(scan(scan_cost));
+        // Reading forwards already gives the subquery's own order; only a
+        // stored CTE can be read backwards for the opposite one.
+        let backwards = table_materialization_required
+            && order_target.is_some_and(|target| {
+                let consumed = |direction| {
+                    super::order::hir_subquery_intrinsic_order_consumed(
+                        document,
+                        source,
+                        query,
+                        direction,
+                        &target.columns,
+                    )
+                };
+                consumed(IterationDirection::Forwards) != target.columns.len()
+                    && consumed(IterationDirection::Backwards) == target.columns.len()
+            });
+        let mut method = scan(scan_cost);
+        if backwards {
+            method.params = AccessMethodParams::Subquery {
+                iter_dir: IterationDirection::Backwards,
+            };
+        }
+        return Ok(method);
     }
     let usable_constraints: Vec<&Constraint<hir::Expr>> =
         usable.iter().map(|(_, constraint)| *constraint).collect();

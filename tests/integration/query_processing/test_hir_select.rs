@@ -1482,6 +1482,43 @@ fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
         ),
         ["SCAN o", "SCAN items", "USE SORTER FOR ORDER BY"]
     );
+    // Like legacy, a CTE stored once is read backwards for the opposite
+    // order. Legacy prints the CTE body before its scan, so compare sorts.
+    let sorts = |plan: Vec<String>| {
+        plan.iter()
+            .filter(|row| row.as_str() == "USE SORTER FOR ORDER BY")
+            .count()
+    };
+    for (sql, expected_sorts) in [
+        (
+            "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra DESC, value DESC) \
+             SELECT * FROM o ORDER BY extra, value",
+            1,
+        ),
+        (
+            "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra, value DESC) \
+             SELECT * FROM o ORDER BY extra DESC, value",
+            1,
+        ),
+        (
+            "WITH g AS MATERIALIZED (SELECT extra, sum(value) AS s FROM items GROUP BY extra) \
+             SELECT * FROM g ORDER BY extra DESC",
+            0,
+        ),
+        (
+            "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra, value DESC) \
+             SELECT * FROM o ORDER BY extra, value",
+            2,
+        ),
+    ] {
+        assert_eq!(sorts(query_plan(&hir, sql)), expected_sorts, "{sql}");
+        assert_eq!(sorts(query_plan(&legacy, sql)), expected_sorts, "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
     // The index gives the CTE its order. Legacy forgets the CTE's ORDER BY
     // once the index satisfies it, and sorts again; HIR keeps it.
     let sql =
