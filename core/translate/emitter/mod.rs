@@ -1226,8 +1226,6 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
-    // Temp tables exist only for this connection and are never synced, so their changes are
-    // not captured. Otherwise the sync engine would replay them into the main database.
     if database_id == crate::TEMP_DB_ID {
         return Ok(None);
     }
