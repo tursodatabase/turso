@@ -341,8 +341,8 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() {
             continue;
         }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-            if type_def.decode().is_some() {
+        if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
+            if resolved.chain.iter().any(|td| td.decode().is_some()) {
                 let src_reg = column_regs[i];
                 let tmp = program.alloc_register();
                 emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
@@ -567,31 +567,17 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
-            if let Some(type_def) = type_def {
-                if let Some(decode_expr) = type_def.decode() {
-                    let src = source_regs(i);
+            if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
+                if resolved.chain.iter().any(|td| td.decode().is_some()) {
                     let decoded_reg = program.alloc_register();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: src,
-                        dst_reg: decoded_reg,
-                        extra_amount: 0,
-                    });
-                    let skip_label = program.allocate_label();
-                    program.emit_insn(Insn::IsNull {
-                        reg: decoded_reg,
-                        target_pc: skip_label,
-                    });
-                    emit_type_expr(
+                    emit_user_facing_column_value(
                         program,
-                        decode_expr,
-                        decoded_reg,
+                        source_regs(i),
                         decoded_reg,
                         col,
-                        type_def,
+                        is_strict,
                         resolver,
                     )?;
-                    program.preassign_label_to_next_insn(skip_label);
                     return Ok(decoded_reg);
                 }
             }

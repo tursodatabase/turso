@@ -284,28 +284,14 @@ fn copy_cached_expr_reg(
                 if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
                 {
                     if let Some(col) = table.get_column_at(*column) {
-                        if let Some(type_def) = resolver
-                            .schema()
-                            .get_type_def(&col.ty_str, table.is_strict())
-                        {
-                            if let Some(decode_expr) = type_def.decode() {
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_register,
-                                    target_pc: skip_label,
-                                });
-                                emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    target_register,
-                                    target_register,
-                                    col,
-                                    type_def,
-                                    resolver,
-                                )?;
-                                program.preassign_label_to_next_insn(skip_label);
-                            }
-                        }
+                        emit_user_facing_column_value(
+                            program,
+                            target_register,
+                            target_register,
+                            col,
+                            table.is_strict(),
+                            resolver,
+                        )?;
                     }
                 }
             }
@@ -2642,11 +2628,11 @@ fn translate_column_expr(
                     // (ALTER TABLE ADD COLUMN) return NULL.  Use
                     // ColumnHasField to detect short records and compute
                     // ENCODE(DEFAULT) at runtime via bytecode.
-                    if let Some(type_def) = resolver
+                    if let Ok(Some(resolved)) = resolver
                         .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
+                        .resolve_type(&column.ty_str, table.is_strict())
                     {
-                        if type_def.encode().is_some() {
+                        if resolved.chain.iter().any(|td| td.encode().is_some()) {
                             if let Some(ref default_expr) = column.default {
                                 // Reconstruct the cursor id used for reading
                                 let read_cursor = if read_from_index {
@@ -2673,16 +2659,18 @@ fn translate_column_expr(
                                     resolver,
                                     NoConstantOptReason::RegisterReuse,
                                 )?;
-                                if let Some(encode_expr) = type_def.encode() {
-                                    emit_type_expr(
-                                        program,
-                                        encode_expr,
-                                        target_register,
-                                        target_register,
-                                        column,
-                                        type_def,
-                                        resolver,
-                                    )?;
+                                for td in &resolved.chain {
+                                    if let Some(encode_expr) = td.encode() {
+                                        emit_type_expr(
+                                            program,
+                                            encode_expr,
+                                            target_register,
+                                            target_register,
+                                            column,
+                                            td,
+                                            resolver,
+                                        )?;
+                                    }
                                 }
                                 program.preassign_label_to_next_insn(done_label);
                             }
