@@ -1449,6 +1449,54 @@ fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
     }
 }
 
+/// Like legacy, a FROM subquery or CTE returns its rows in the order of its
+/// own ORDER BY, of its GROUP BY keys, or of the one subquery it passes
+/// through, so an outer ORDER BY that asks for that order needs no sort.
+#[test]
+fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for sql in [
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value",
+        "WITH g AS (SELECT extra, count(*) AS n FROM items GROUP BY extra) \
+         SELECT * FROM g ORDER BY extra",
+        "WITH a AS (SELECT value, extra FROM items ORDER BY value), b AS (SELECT value, extra FROM a) \
+         SELECT * FROM b ORDER BY value",
+        "SELECT * FROM (SELECT value, extra FROM items ORDER BY value DESC NULLS FIRST) \
+         ORDER BY value DESC NULLS FIRST",
+        // These still sort: the direction or the terms differ.
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value DESC",
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value, extra",
+    ] {
+        assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        query_plan(
+            &hir,
+            "WITH o AS (SELECT value, extra FROM items ORDER BY extra) SELECT * FROM o ORDER BY extra",
+        ),
+        ["SCAN o", "SCAN items", "USE SORTER FOR ORDER BY"]
+    );
+    // The index gives the CTE its order. Legacy forgets the CTE's ORDER BY
+    // once the index satisfies it, and sorts again; HIR keeps it.
+    let sql =
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value LIMIT 3) SELECT * FROM o ORDER BY value";
+    assert_eq!(
+        query_plan(&hir, sql),
+        ["SCAN o", "SCAN items USING INDEX items_value"]
+    );
+    assert_eq!(
+        limbo_exec_rows(&hir, sql),
+        limbo_exec_rows(&legacy, sql),
+        "{sql}"
+    );
+}
+
 /// Like legacy, a correlated subquery opens its table cursors on its first
 /// run only, instead of once for every outer row, and gives the same rows.
 #[test]

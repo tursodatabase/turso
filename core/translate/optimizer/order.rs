@@ -440,8 +440,60 @@ pub(crate) fn hir_plan_satisfies_order_target(
     let columns = order_target.columns.len();
     let mut consumed_columns = 0;
     for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
-        let Some(HirPlanSource::BTree(source)) = sources.get(*source_position) else {
-            return Ok(false);
+        let source = match sources.get(*source_position) {
+            Some(HirPlanSource::BTree(source)) => source,
+            // Like legacy, a FROM subquery or CTE that is scanned returns its
+            // rows in its own order.
+            Some(
+                HirPlanSource::Derived {
+                    source: subquery_source,
+                    query,
+                    ..
+                }
+                | HirPlanSource::Cte {
+                    source: subquery_source,
+                    query,
+                    ..
+                },
+            ) => {
+                let Some(AccessMethod {
+                    params: AccessMethodParams::Subquery { iter_dir },
+                    ..
+                }) = access_methods.get(*access_method_position)
+                else {
+                    return Ok(false);
+                };
+                let consumed = hir_subquery_intrinsic_order_consumed(
+                    document,
+                    *subquery_source,
+                    *query,
+                    *iter_dir,
+                    &order_target.columns[consumed_columns..],
+                );
+                if consumed == 0 {
+                    return Ok(false);
+                }
+                consumed_columns += consumed;
+                if consumed_columns == columns {
+                    return Ok(true);
+                }
+                // The scan may repeat the values ordered so far.
+                let next_comes_from_later_loop = order_target
+                    .columns
+                    .get(consumed_columns)
+                    .is_some_and(|column| {
+                        plan.data[loop_position + 1..].iter().any(|(later, _)| {
+                            sources
+                                .get(*later)
+                                .is_some_and(|later| later.source() == column.source)
+                        })
+                    });
+                if next_comes_from_later_loop {
+                    return Ok(false);
+                }
+                continue;
+            }
+            _ => return Ok(false),
         };
         let Some(definition) = document.source(source.internal_id) else {
             return Err(LimboError::InternalError(format!(
@@ -611,6 +663,152 @@ pub fn subquery_intrinsic_order_consumed(
     finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
 }
 
+/// How many leading `target` columns a HIR FROM subquery or CTE returns its
+/// rows in when read in `iter_dir`, as legacy's
+/// [subquery_intrinsic_order_consumed] finds it: from the subquery's ORDER
+/// BY, else from its GROUP BY keys, which leave the GROUP BY sorter in key
+/// order, else from the subquery it reads, when it only passes that one
+/// subquery's rows through.
+///
+/// Not ported yet: legacy also derives the order of a plain scan of one
+/// table from that scan.
+pub(crate) fn hir_subquery_intrinsic_order_consumed(
+    document: &hir::HirDocument,
+    source: hir::SourceId,
+    query: hir::QueryId,
+    iter_dir: IterationDirection,
+    target: &[ColumnOrder<hir::SourceId, &hir::Expr>],
+) -> usize {
+    let Some(definition) = document.query(query) else {
+        return 0;
+    };
+    let [block] = definition.blocks.as_slice() else {
+        return 0;
+    };
+    let hir::QueryBlockBody::Select {
+        distinctness,
+        filter,
+        grouping,
+    } = &block.body
+    else {
+        return 0;
+    };
+    let output_position = |expression: &hir::Expr| match expression {
+        hir::Expr::Output(output) => definition.output.iter().position(|id| id == output),
+        expression => definition.output.iter().position(|id| {
+            document
+                .output(*id)
+                .is_some_and(|output| output.expr.equivalent(expression))
+        }),
+    };
+    let collation = |collation: Option<&hir::ResolvedCollation>| {
+        collation
+            .map(|collation| *collation.value())
+            .unwrap_or_default()
+    };
+    let same_column = |intrinsic: &ColumnOrder<hir::SourceId, ()>,
+                       target: &ColumnOrder<hir::SourceId, &hir::Expr>| {
+        intrinsic.source == target.source
+            && matches!(
+                (&intrinsic.target, &target.target),
+                (ColumnTarget::Column(a), ColumnTarget::Column(b)) if a == b
+            )
+    };
+    let intrinsic = |terms: &mut dyn Iterator<
+        Item = (&hir::Expr, SortOrder, CollationSeq, Option<ast::NullsOrder>),
+    >| {
+        let mut columns = Vec::new();
+        for (expression, order, collation, nulls_order) in terms {
+            let Some(position) = output_position(expression) else {
+                break;
+            };
+            columns.push(ColumnOrder {
+                source,
+                target: ColumnTarget::<()>::Column(position),
+                order,
+                collation,
+                nulls_order,
+            });
+        }
+        columns
+    };
+    if !definition.order_by.is_empty() {
+        let columns = intrinsic(&mut definition.order_by.iter().map(|term| {
+            (
+                &term.expr,
+                term.order,
+                collation(term.collation.as_ref()),
+                term.nulls,
+            )
+        }));
+        return match_intrinsic_order_by(&columns, iter_dir, target, same_column);
+    }
+    // Windows sort rows again after grouping.
+    if !block.windows.is_empty() {
+        return 0;
+    }
+    if let Some(grouping) = grouping {
+        let columns = intrinsic(&mut grouping.keys.iter().zip(&grouping.key_collations).map(
+            |(key, key_collation)| (key, SortOrder::Asc, collation(key_collation.as_ref()), None),
+        ));
+        return match_intrinsic_order_by(&columns, iter_dir, target, same_column);
+    }
+    // A query that only passes one FROM subquery's rows through returns them
+    // in that subquery's order.
+    let Some(from) = &block.from else {
+        return 0;
+    };
+    if !from.joins.is_empty()
+        || distinctness.is_some()
+        || filter.is_some()
+        || block.aggregate_count != 0
+        || definition.limit.is_some()
+    {
+        return 0;
+    }
+    let Some(inner) = document.source(from.first) else {
+        return 0;
+    };
+    let inner_query = match &inner.kind {
+        hir::SourceKind::Derived(query) => *query,
+        hir::SourceKind::Cte(cte) => match document.cte(*cte).map(|cte| &cte.body) {
+            Some(hir::CteBody::Query(query)) => *query,
+            _ => return 0,
+        },
+        _ => return 0,
+    };
+    let mut mapped = Vec::with_capacity(target.len());
+    for column in target {
+        let ColumnTarget::Column(position) = column.target else {
+            break;
+        };
+        if column.source != source {
+            break;
+        }
+        let Some(output) = definition
+            .output
+            .get(position)
+            .and_then(|id| document.output(*id))
+        else {
+            break;
+        };
+        let hir::Expr::Column(reference) = &output.expr else {
+            break;
+        };
+        if reference.source != inner.id {
+            break;
+        }
+        mapped.push(ColumnOrder {
+            source: inner.id,
+            target: ColumnTarget::Column(reference.column),
+            order: column.order,
+            collation: column.collation,
+            nulls_order: column.nulls_order,
+        });
+    }
+    hir_subquery_intrinsic_order_consumed(document, inner.id, inner_query, iter_dir, &mapped)
+}
+
 /// Build a `ColumnOrder` list from expressions and sort directions by mapping
 /// each expression to a result column position.
 fn build_intrinsic_order(
@@ -662,10 +860,23 @@ fn match_intrinsic_order(
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
 ) -> usize {
+    match_intrinsic_order_by(intrinsic, iter_dir, target, |intrinsic_col, target_col| {
+        intrinsic_col.source == target_col.source && intrinsic_col.target == target_col.target
+    })
+}
+
+/// [match_intrinsic_order] for any column representation: `same_column`
+/// decides whether an intrinsic column is the target column; direction,
+/// collation and NULLS order are compared the same way for every caller.
+fn match_intrinsic_order_by<I, E, J, F>(
+    intrinsic: &[ColumnOrder<J, F>],
+    iter_dir: IterationDirection,
+    target: &[ColumnOrder<I, E>],
+    same_column: impl Fn(&ColumnOrder<J, F>, &ColumnOrder<I, E>) -> bool,
+) -> usize {
     let target_len = target.len().min(intrinsic.len());
     for (intrinsic_col, target_col) in intrinsic.iter().zip(target.iter()).take(target_len) {
-        if intrinsic_col.source != target_col.source
-            || intrinsic_col.target != target_col.target
+        if !same_column(intrinsic_col, target_col)
             || intrinsic_col.collation != target_col.collation
         {
             return 0;
