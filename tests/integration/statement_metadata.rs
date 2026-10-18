@@ -374,6 +374,64 @@ mod tests {
         );
     }
 
+    /// CASE takes the common type of its branches, as do COALESCE, IFNULL and
+    /// the multi-argument MIN/MAX. NULLIF takes the type of its first argument
+    /// and ABS follows unary minus. NULL branches do not affect the result, and
+    /// branches with no common type give no result type.
+    #[test]
+    fn type_info_for_case_and_functions_that_return_their_argument_type() {
+        let db = fresh_db_with_custom_types("type_info_case_functions.db");
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, label TEXT, ratio REAL) STRICT",
+        )
+        .unwrap();
+
+        let cases: &[(&str, Option<&str>)] = &[
+            ("coalesce(x, 2)", Some("INTEGER")),
+            ("coalesce(x, 2) * coalesce(x, 3)", Some("INTEGER")),
+            ("ifnull(x, NULL)", Some("INTEGER")),
+            ("coalesce(x, ratio)", Some("REAL")),
+            ("coalesce(label, 'none')", Some("TEXT")),
+            ("coalesce(x, label)", None),
+            ("max(x, 1, 2)", Some("INTEGER")),
+            ("min(x, 1.5)", Some("REAL")),
+            ("nullif(x, 0)", Some("INTEGER")),
+            ("abs(x)", Some("INTEGER")),
+            ("abs(x) * 2", Some("INTEGER")),
+            ("abs(ratio)", Some("REAL")),
+            ("abs(label)", Some("NUMERIC")),
+            ("CASE WHEN x = 1 THEN x ELSE 0 END - 1", Some("INTEGER")),
+            ("CASE WHEN x = 1 THEN x END", Some("INTEGER")),
+            ("CASE x WHEN 1 THEN NULL ELSE ratio END", Some("REAL")),
+            ("CASE WHEN x = 1 THEN label ELSE 'other' END", Some("TEXT")),
+            ("CASE WHEN x = 1 THEN label ELSE 0 END", None),
+            ("CASE WHEN x = 1 THEN NULL END", None),
+            ("coalesce(x, randomblob(8))", None),
+        ];
+
+        let mut mismatches = Vec::new();
+        for (expr, expected) in cases {
+            let stmt = conn
+                .prepare(format!("SELECT {expr} FROM t"))
+                .unwrap_or_else(|e| panic!("failed to prepare `SELECT {expr} FROM t`: {e}"));
+            let actual = stmt
+                .get_column_type_info(0)
+                .unwrap()
+                .map(|info| info.declared_name);
+            if actual.as_deref() != *expected {
+                mismatches.push(format!(
+                    "  {expr:<44} expected {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "CASE and function result types are wrong:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
     /// Expressions whose primitive can't be determined statically — function
     /// calls without a declared return affinity, BLOB literals, NULL literals
     /// — yield `Ok(None)`. Callers fall through to their own default (TEXT
