@@ -6882,45 +6882,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
-            return Ok(IOResult::Done(None));
-        }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
-
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+        self.record_payload_up_to(None)
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7841,8 +7803,59 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// [`CursorTrait::record_payload`] for a caller that decodes only the
+    /// first `columns` columns, or the whole payload when `columns` is None.
+    /// When the cell spills into overflow pages but those columns end in
+    /// the part kept on the page, returns only that part, so the overflow
+    /// pages are not read, as SQLite's OP_Column does.
+    #[inline(always)]
+    pub fn record_payload_up_to(&mut self, columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return restore_record_payload(self, columns);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(payload)));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
+        }
+        return self.record_payload_general(columns);
+
+        #[inline(never)]
+        fn restore_record_payload(
+            cursor: &mut BTreeCursor,
+            columns: Option<usize>,
+        ) -> IOResultOr<Option<&[u8]>> {
+            return_if_io!(cursor.restore_context());
+            cursor.record_payload_up_to(columns)
+        }
+    }
+
     #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+    fn record_payload_general(&mut self, columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
@@ -7854,6 +7867,11 @@ impl BTreeCursor {
                 size: payload.len() as u32,
             };
             return Ok(IOResult::Done(Some(payload)));
+        }
+        if let Some(columns) = columns {
+            if columns_end_within(payload, columns)? {
+                return Ok(IOResult::Done(Some(payload)));
+            }
         }
         let record = return_if_io!(self.record());
         Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
@@ -7902,6 +7920,32 @@ impl BTreeCursor {
             || self.read_overflow_state.is_some()
             || self.iteration_pending_descent.is_some()
     }
+}
+
+/// Whether the values of the first `columns` columns of a record end within
+/// `local`, the leading part of its payload. When the record has fewer
+/// columns, all of them must end there.
+fn columns_end_within(local: &[u8], columns: usize) -> Result<bool> {
+    let (header_size, mut header_pos) = read_varint(local)?;
+    let Some(header) = usize::try_from(header_size)
+        .ok()
+        .and_then(|size| local.get(..size))
+    else {
+        return Ok(false);
+    };
+    let mut end = header.len();
+    for _ in 0..columns {
+        if header_pos >= header.len() {
+            break;
+        }
+        let (serial_type, n) = read_varint(&header[header_pos..])?;
+        header_pos += n;
+        end += crate::types::get_serial_type_size(serial_type)?;
+        if end > local.len() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]

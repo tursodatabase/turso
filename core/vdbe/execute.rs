@@ -2192,7 +2192,7 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some(payload) = return_if_io!(state, cursor.record_payload_up_to(Some(column + 1))) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
         state.registers[dest].set_null();
@@ -2406,7 +2406,10 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some(payload) = return_if_io!(
+        state,
+        cursor.record_payload_up_to(Some(start_column + count))
+    ) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }

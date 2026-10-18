@@ -2015,6 +2015,56 @@ fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
     assert_that!(blob.read(9000, &mut buf)).is_err();
 }
 
+/// Reading the columns stored before a value that spills into overflow pages
+/// must not read the overflow chain, as in SQLite. With a broken chain, those
+/// columns still read back and only reading the spilled value fails.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_columns_before_corrupt_overflow_chain_are_readable(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, data BLOB);")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 7, 'small', zeroblob(12000));")
+        .unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Same layout as above: page 3 is the first of two overflow pages.
+    // Zeroing its next-pointer truncates the chain a page early.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+        let mut page3 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page3).unwrap();
+        let next = u32::from_be_bytes([page3[0], page3[1], page3[2], page3[3]]);
+        assert!(
+            next != 0,
+            "expected page 3 to be an intermediate overflow page"
+        );
+        page3[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page3).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t");
+    assert_eq!(rows, vec![(7, "small".to_string())]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t");
+    assert_eq!(rows, vec![("small".to_string(),)]);
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM t");
+    assert_eq!(rows, vec![(1, 7)]);
+    let read_spilled_value = conn
+        .prepare("SELECT data FROM t")
+        .and_then(|mut stmt| stmt.run_ignore_rows());
+    assert_that!(read_spilled_value).is_err();
+}
+
 /// Companion to the test above for the *record header's* overflow chain. When a row
 /// has enough columns that its header (one serial-type byte per column) spills into
 /// overflow, locating a column streams header bytes across that chain. Truncating the
