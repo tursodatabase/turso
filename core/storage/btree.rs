@@ -945,13 +945,15 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: crate::alloc::Vec<u8>,
-    /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
-    /// layout, the overflow-page-number array (Turso's runtime reconstruction of
-    /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
-    /// so repeated byte accesses to the same row avoid re-parsing the cell and record
-    /// header and re-walking the overflow chain — turning each access into an O(1)
-    /// page lookup. Invalidated when the cursor moves to a different (page, cell). The
-    /// on-disk format is unchanged; this index lives only in RAM.
+    /// Per-cell access cache for reads of overflowing records and for incremental
+    /// blob I/O. Caches the cell's payload layout, the overflow-page-number array
+    /// (Turso's runtime reconstruction of SQLite's `aOverflow`), and, for blob I/O,
+    /// the byte range of the most recently accessed column, so repeated byte accesses
+    /// to the same row avoid re-parsing the cell and record header and re-walking the
+    /// overflow chain — turning each access into an O(1) page lookup. Marked
+    /// invalid on every cursor move, like SQLite's BTCF_ValidOvfl, and reset before
+    /// every write through the cursor and when its position is saved. The on-disk
+    /// format is unchanged; this index lives only in RAM.
     blob_cache: BlobCellCache,
     /// Rowid the incremental-blob machinery last addressed. Unlike `blob_cache` it
     /// survives position saves: it is what `note_external_row_write` compares against
@@ -1011,7 +1013,8 @@ enum IterationPendingDescent {
     Backwards(i64),
 }
 
-/// Cache backing the incremental-blob-I/O fast path (see [`BTreeCursor::blob_cache`]).
+/// Cache backing reads of overflowing records and incremental blob I/O (see
+/// [`BTreeCursor::blob_cache`]).
 /// `valid`/`col_valid` gate the two tiers: the cell payload layout and the parsed byte
 /// range of the last-accessed column. `overflow_pages[i]` is the i-th overflow page
 /// number (`overflow_pages[0]` == the value's first overflow page); it grows lazily as
@@ -1051,6 +1054,39 @@ struct BlobCellCache {
     /// Serial type of column `col`, kept so every access can re-assert the value is
     /// TEXT or BLOB (byte-addressable) without re-parsing the record header.
     col_serial: u64,
+    /// The record header, when it does not fit on the page, read for column reads.
+    kept_header: KeptPayloadRead,
+    /// The bytes of the column values a column read needs from the overflow pages.
+    kept_values: KeptPayloadRead,
+}
+
+/// Bytes of the record under the cursor, read from `offset` into a buffer the
+/// cursor keeps. A page read can yield for IO, which makes the instruction
+/// start again; the bytes read so far stay here, so the next read of the
+/// same range continues where it stopped instead of starting over.
+struct KeptPayloadRead {
+    valid: bool,
+    offset: usize,
+    len: usize,
+    bytes: crate::alloc::Vec<u8>,
+}
+
+impl Default for KeptPayloadRead {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            offset: 0,
+            len: 0,
+            bytes: crate::alloc::vec![],
+        }
+    }
+}
+
+/// Which of the cursor's [`KeptPayloadRead`] buffers a read uses.
+#[derive(Clone, Copy)]
+pub(crate) enum KeptRead {
+    Header,
+    Values,
 }
 
 impl Default for BlobCellCache {
@@ -1072,6 +1108,8 @@ impl Default for BlobCellCache {
             col_body_off: 0,
             col_len: 0,
             col_serial: 0,
+            kept_header: KeptPayloadRead::default(),
+            kept_values: KeptPayloadRead::default(),
         }
     }
 }
@@ -1082,10 +1120,25 @@ impl BlobCellCache {
     /// so no stale offset or page number can ever back a byte-level read or write.
     fn reset(&mut self) {
         self.valid = false;
-        self.col_valid = false;
+        self.forget_column_reads();
         self.first_overflow = None;
         self.overflow_pages.clear();
         self.release_pinned_overflow();
+    }
+
+    /// Forget what was read from the cell's record: the blob column's place and
+    /// the kept header and value bytes.
+    fn forget_column_reads(&mut self) {
+        self.col_valid = false;
+        self.kept_header.valid = false;
+        self.kept_values.valid = false;
+    }
+
+    fn kept_read_mut(&mut self, which: KeptRead) -> &mut KeptPayloadRead {
+        match which {
+            KeptRead::Header => &mut self.kept_header,
+            KeptRead::Values => &mut self.kept_values,
+        }
     }
 
     /// Pin `page` and remember it as the spatial-locality overflow page for `idx`,
@@ -1129,15 +1182,13 @@ enum BlobSpan {
     },
 }
 
-/// Locate `column`'s value with [`HeaderColumns`].
+/// Locate `column`'s value among `columns`.
 fn blob_locate_column_in_header(
-    header: &[u8],
-    hpos0: usize,
-    payload_size: usize,
+    columns: HeaderColumns<'_>,
     column: usize,
 ) -> Result<(usize, usize, u64)> {
     let mut col = 0;
-    for located in HeaderColumns::new(header, hpos0, payload_size) {
+    for located in columns {
         let located = located?;
         if col == column {
             return Ok(located);
@@ -1164,7 +1215,7 @@ impl<'a> HeaderColumns<'a> {
     /// `header` must be exactly the header bytes (so a varint can never stray into
     /// the body) and `hpos0` the offset of the first serial type, i.e. the width of
     /// the header-size varint.
-    pub(crate) fn new(header: &'a [u8], hpos0: usize, payload_size: usize) -> Self {
+    fn new(header: &'a [u8], hpos0: usize, payload_size: usize) -> Self {
         Self {
             header,
             hpos: hpos0,
@@ -5904,7 +5955,7 @@ impl BTreeCursor {
         c.valid = true;
         // Moving to a different cell: unpin the previous cell's cached overflow page.
         c.release_pinned_overflow();
-        c.col_valid = false;
+        c.forget_column_reads();
         Ok(())
     }
 
@@ -5947,44 +5998,8 @@ impl BTreeCursor {
         if self.blob_cache.col_valid && self.blob_cache.col == column {
             return Ok(IOResult::Done(()));
         }
-        let local_off = self.blob_cache.local_off;
-        let local_len = self.blob_cache.local_len;
-        let payload_size = self.blob_cache.payload_size;
-        // The header-size varint itself is always local: either the record fits
-        // entirely in the local payload, or SQLite's minimum-local formula keeps
-        // well over 9 bytes (one max-size varint) on the leaf. A truncated varint
-        // here therefore means a corrupt cell, and read_varint reports it as such.
-        let (header_size, hpos0) = {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let local = &contents.as_ptr()[local_off..local_off + local_len];
-            crate::storage::sqlite3_ondisk::read_varint(local)?
-        };
-        let header_size = usize::try_from(header_size)
-            .map_err(|_| LimboError::Corrupt("record header size does not fit".to_string()))?;
-        if header_size < hpos0 || header_size > payload_size || header_size > MAX_RECORD_HEADER_SIZE
-        {
-            return Err(LimboError::Corrupt(format!(
-                "record header size {header_size} out of bounds (payload {payload_size})"
-            ))
-            .into());
-        }
-        let (body_off, len, serial) = if header_size <= local_len {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let local = &contents.as_ptr()[local_off..local_off + local_len];
-            blob_locate_column_in_header(&local[..header_size], hpos0, payload_size, column)?
-        } else {
-            // Header spills into the overflow chain: materialize exactly the header
-            // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
-            // IO yield the whole function restarts; every step up to here is a pure
-            // cached read, so the restart is cheap and idempotent.
-            let mut header = crate::alloc::vec![];
-            crate::with_btree_allocation_site!(BlobRecordHeader, header.try_reserve(header_size))?;
-            return_if_io!(self
-                .copy_payload_range(0, header_size, |chunk| { header.extend_from_slice(chunk) }));
-            blob_locate_column_in_header(&header, hpos0, payload_size, column)?
-        };
+        let (columns, _) = return_if_io!(self.record_columns());
+        let (body_off, len, serial) = blob_locate_column_in_header(columns, column)?;
         let c = &mut self.blob_cache;
         c.col = column;
         c.col_body_off = body_off;
@@ -6930,51 +6945,23 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
+        let Some((local, payload_size)) = return_if_io!(self.fetch_payload_static()) else {
             return Ok(IOResult::Done(None));
+        };
+        if local.len() == payload_size {
+            return Ok(IOResult::Done(Some(local)));
         }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
-
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+        let record = return_if_io!(self.record());
+        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
+        // invalidateOverflowCache in sqlite3BtreeInsert and sqlite3BtreeDelete:
+        // the write may change the cells under the cursor.
+        self.blob_cache.reset();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -7000,6 +6987,7 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
         self.noted_payload = NotedPayload::NONE;
+        self.blob_cache.reset();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -7651,6 +7639,10 @@ impl CursorTrait for BTreeCursor {
     #[inline]
     fn invalidate_record(&mut self) {
         self.noted_payload = NotedPayload::NONE;
+        // SQLite clears BTCF_ValidOvfl on every cursor move: the next row
+        // read parses the cell again and drops the overflow page list and
+        // the kept bytes, which may belong to an earlier version of the row.
+        self.blob_cache.valid = false;
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
@@ -7889,22 +7881,156 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
-    #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
-        let page = self.stack.top_ref();
-        let contents = page.get_contents();
+    /// The bytes of the current record that are stored on the b-tree page,
+    /// and the size of the whole record. The two differ when the record
+    /// spills into overflow pages; `read_payload` reads any part of it.
+    /// Like SQLite's sqlite3BtreePayloadFetch and sqlite3BtreePayloadSize.
+    #[inline(always)]
+    pub(crate) fn payload_fetch(&mut self) -> IOResultOr<Option<(&[u8], usize)>> {
+        self.fetch_payload_static()
+    }
+
+    /// The columns of the current record's header, and the record bytes stored
+    /// on the b-tree page. Like SQLite's OP_Column, a header that does not fit
+    /// on the page is read on its own, and the page bytes then come back empty
+    /// so that every value is read through `read_payload`.
+    pub(crate) fn record_columns(&mut self) -> IOResultOr<(HeaderColumns<'_>, &[u8])> {
+        let Some((local, payload_size)) = return_if_io!(self.fetch_payload_static()) else {
+            return Err(LimboError::InternalError(
+                "reading a record header needs a row under the cursor".to_string(),
+            )
+            .into());
+        };
+        // The header-size varint itself is always local: either the record fits
+        // entirely in the local payload, or SQLite's minimum-local formula keeps
+        // well over 9 bytes (one max-size varint) on the leaf. A truncated varint
+        // here therefore means a corrupt cell, and read_varint reports it as such.
+        let (header_size, hpos0) = read_varint(local)?;
+        let header_size = usize::try_from(header_size)
+            .ok()
+            .filter(|&size| size >= hpos0 && size <= payload_size && size <= MAX_RECORD_HEADER_SIZE)
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "record header size {header_size} out of bounds (payload {payload_size})"
+                ))
+            })?;
+        if header_size <= local.len() {
+            let columns = HeaderColumns::new(&local[..header_size], hpos0, payload_size);
+            return Ok(IOResult::Done((columns, local)));
+        }
+        let header = return_if_io!(self.read_payload(KeptRead::Header, 0, header_size));
+        Ok(IOResult::Done((
+            HeaderColumns::new(header, hpos0, payload_size),
+            &[],
+        )))
+    }
+
+    /// The `len` bytes of the current record that start at byte `offset`, like
+    /// SQLite's sqlite3BtreePayload, read into the cursor's `which` buffer (see
+    /// [`KeptPayloadRead`]).
+    pub(crate) fn read_payload(
+        &mut self,
+        which: KeptRead,
+        offset: usize,
+        len: usize,
+    ) -> IOResultOr<&[u8]> {
+        self.ensure_payload_layout()?;
+        let mut kept = std::mem::take(self.blob_cache.kept_read_mut(which));
+        if !(kept.valid && kept.offset == offset && kept.len == len) {
+            kept.bytes.clear();
+            match which {
+                KeptRead::Header => crate::with_btree_allocation_site!(
+                    BlobRecordHeader,
+                    kept.bytes.try_reserve(len)
+                )?,
+                KeptRead::Values => {
+                    crate::with_btree_allocation_site!(OverflowRead, kept.bytes.try_reserve(len))?
+                }
+            }
+            kept.valid = true;
+            kept.offset = offset;
+            kept.len = len;
+        }
+        let read = kept.bytes.len();
+        let copied = self.copy_payload_range(offset + read, len - read, |chunk| {
+            kept.bytes.extend_from_slice(chunk)
+        });
+        *self.blob_cache.kept_read_mut(which) = kept;
+        return_if_io!(copied);
+        Ok(IOResult::Done(&self.blob_cache.kept_read_mut(which).bytes))
+    }
+
+    /// `payload_fetch` with the page bytes typed as `'static`. `record_payload`
+    /// needs that: it either returns these bytes or goes on to call
+    /// `self.record()`, and with the bytes borrowing `self` the borrow checker
+    /// rejects the second branch.
+    #[inline(always)]
+    fn fetch_payload_static(&mut self) -> IOResultOr<Option<(&'static [u8], usize)>> {
+        if self.needs_restore() {
+            return restore_and_fetch_payload(self);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some((payload, size))));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
         let cell_idx = self.stack.current_cell_index();
-        let (payload, payload_start, _payload_size, first_overflow_page) =
-            contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
-        if first_overflow_page.is_none() {
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
             self.noted_payload = NotedPayload {
-                start: payload_start as u32,
+                start: start as u32,
                 size: payload.len() as u32,
             };
-            return Ok(IOResult::Done(Some(payload)));
+            return Ok(IOResult::Done(Some((payload, payload.len()))));
         }
-        let record = return_if_io!(self.record());
-        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+        return self.fetch_payload_general();
+
+        #[inline(never)]
+        fn restore_and_fetch_payload(
+            cursor: &mut BTreeCursor,
+        ) -> IOResultOr<Option<(&'static [u8], usize)>> {
+            return_if_io!(cursor.restore_context());
+            cursor.fetch_payload_static()
+        }
+    }
+
+    /// Parses the cell once into `blob_cache`, so the further reads of an
+    /// overflowing row find its layout there, as SQLite keeps BtCursor.info.
+    #[inline(never)]
+    fn fetch_payload_general(&mut self) -> IOResultOr<Option<(&'static [u8], usize)>> {
+        self.ensure_payload_layout()?;
+        let c = &self.blob_cache;
+        let contents = self.stack.top_ref().get_contents();
+        let Some(payload) = contents.payload_on_page(c.local_off, c.local_len) else {
+            return Err(LimboError::Corrupt(format!(
+                "cell payload {}..{} is outside the page",
+                c.local_off,
+                c.local_off + c.local_len
+            ))
+            .into());
+        };
+        if c.first_overflow.is_none() {
+            self.noted_payload = NotedPayload {
+                start: c.local_off as u32,
+                size: c.local_len as u32,
+            };
+        }
+        Ok(IOResult::Done(Some((payload, c.payload_size))))
     }
 
     /// True when the next cell is on the same leaf page and no resumable

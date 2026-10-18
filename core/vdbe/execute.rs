@@ -18,7 +18,7 @@ use crate::schema::{
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState,
+    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
     PageCategory,
 };
 use crate::storage::database::DatabaseFile;
@@ -55,8 +55,8 @@ use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup, VacuumOpState,
+    decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -2192,12 +2192,21 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
         state.registers[dest].set_null();
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(
+            state,
+            cursor_id,
+            column,
+            dest,
+            std::slice::from_ref(default),
+        );
+    }
     match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
         Some(result) => result?,
         None => {
@@ -2406,12 +2415,15 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(state, cursor_id, start_column, dest, defaults);
+    }
     let filled = ValueIterator::new(payload)?
         .decode_into_registers_after(start_column, &mut state.registers[dest..dest + count])?;
     if filled < count {
@@ -2423,6 +2435,71 @@ fn op_column_range_fetch(
         {
             apply_column_default(default, reg)?;
         }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Column and ColumnRange for a record that spills into overflow pages: reads
+/// columns `start_column..` into the registers from `dest`, one per default,
+/// following SQLite's OP_Column (vdbe.c). Values on the b-tree page are
+/// decoded in place, and a value that reaches into overflow pages is read on
+/// its own, without the rest of the record. Kept out of line, as SQLite keeps
+/// vdbeColumnFromOverflow out of OP_Column, so the common case of a record on
+/// the page stays fast.
+#[cold]
+#[inline(never)]
+fn op_column_fetch_overflowing(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> InsnResult {
+    let Some(Cursor::BTree(cursor, ..)) = state.cursors[cursor_id].as_mut() else {
+        unreachable!("the caller read the record through a b-tree cursor");
+    };
+    let (mut columns, on_page) = return_if_io!(state, cursor.record_columns());
+    // (register index, offset in the record, serial type) of each value
+    // that does not end on the page.
+    let mut values_in_overflow: SmallVec<[(usize, usize, u64); 4]> = SmallVec::new();
+    let mut values_end = 0;
+    // Step over the columns before the requested ones one at a time, so a
+    // corrupt header there is reported instead of skipped.
+    for _ in 0..start_column {
+        if columns.next().transpose()?.is_none() {
+            break;
+        }
+    }
+    let regs = &mut state.registers[dest..dest + defaults.len()];
+    for (i, (reg, default)) in regs.iter_mut().zip(defaults).enumerate() {
+        match columns.next().transpose()? {
+            // The record has fewer columns, as rows written before an ADD COLUMN do.
+            None => apply_column_default(default, reg)?,
+            Some((offset, len, serial_type)) if offset + len <= on_page.len() => {
+                decode_serial_type_into_register(serial_type, &mut &on_page[offset..], reg)?;
+            }
+            Some((offset, len, serial_type)) => {
+                values_in_overflow.push((i, offset, serial_type));
+                values_end = offset + len;
+            }
+        }
+    }
+    // The columns are consecutive, so the values that do not end on the page
+    // are one run of bytes. Read just that run, as SQLite's
+    // vdbeColumnFromOverflow reads just the bytes of the value.
+    let Some(&(_, values_start, _)) = values_in_overflow.first() else {
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let bytes = return_if_io!(
+        state,
+        cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
+    );
+    for (i, offset, serial_type) in values_in_overflow {
+        decode_serial_type_into_register(
+            serial_type,
+            &mut &bytes[offset - values_start..],
+            &mut state.registers[dest + i],
+        )?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
