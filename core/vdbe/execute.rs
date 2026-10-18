@@ -14420,7 +14420,7 @@ pub fn op_sequence_compute_next(
     load_insn!(
         SequenceComputeNext {
             db,
-            seq_name_reg,
+            seq_name,
             in_value_reg,
             in_is_called_reg,
             was_empty_reg,
@@ -14429,27 +14429,9 @@ pub fn op_sequence_compute_next(
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceComputeNext: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
-
-    // Strip the schema-qualifier from the user's spelling when the
-    // register contains a qualified name like "aux.my_seq" — the
-    // schema's sequences map is keyed by the bare name. The opcode's
-    // `db` field already encodes the target database.
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
     let seq = program
         .connection
-        .with_schema(*db, |s| s.get_sequence(bare_seq_name).cloned())
+        .with_schema(*db, |s| s.get_sequence(seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         })?;
@@ -14577,21 +14559,12 @@ pub fn op_sequence_track_allocation(
     load_insn!(
         SequenceTrackAllocation {
             db,
-            seq_name_reg,
+            seq_name,
             value_reg,
         },
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -14601,26 +14574,20 @@ pub fn op_sequence_track_allocation(
             )
         })?;
 
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
-    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
-
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         let seq = program
             .connection
-            .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())
+            .with_schema(*db, |s| s.get_sequence(seq_name).cloned())
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+        mv_store.set_sequence_watermark(seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.register_sequence_allocation(tx_id, &normalized_seq_name, value)?;
+                mv_store.register_sequence_allocation(tx_id, seq_name, value)?;
             }
         }
     }
@@ -14656,7 +14623,7 @@ pub fn op_sequence_register_allocation(
     load_insn!(
         SequenceRegisterAllocation {
             db,
-            seq_name_reg,
+            seq_name,
             value_reg,
             saved_outer_reg,
         },
@@ -14676,15 +14643,6 @@ pub fn op_sequence_register_allocation(
         return Ok(InsnFunctionStepResult::Step);
     };
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -14694,15 +14652,9 @@ pub fn op_sequence_register_allocation(
             )
         })?;
 
-    let bare_seq_name = seq_name
-        .rsplit_once('.')
-        .map(|(_, n)| n)
-        .unwrap_or(&seq_name);
-    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
-
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
-            mv_store.register_sequence_allocation(outer_tx_id, &normalized_seq_name, value)?;
+            mv_store.register_sequence_allocation(outer_tx_id, seq_name, value)?;
         }
     }
 

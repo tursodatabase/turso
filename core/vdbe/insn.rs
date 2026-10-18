@@ -1630,7 +1630,7 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
         was_empty_reg: usize,
@@ -1648,7 +1648,7 @@ pub enum Insn {
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Register an in-flight sequence allocation against the *outer*
@@ -1660,7 +1660,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
