@@ -299,7 +299,7 @@ pub struct Stmt {
     /// The SQL statement to execute.
     pub sql: Option<String>,
     #[serde(default)]
-    /// The ID of the SQL statement (if it is a stored statement; see [`crate::connections_manager::StreamResource`]).
+    /// The ID of the SQL statement (if it is a stored statement; see `crate::connections_manager::StreamResource`).
     pub sql_id: Option<i32>,
     #[serde(default)]
     /// The positional arguments to the SQL statement.

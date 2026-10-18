@@ -24,6 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
@@ -168,7 +169,7 @@ pub struct EncryptionOpts {
 }
 
 /// Most of the options are aligned with better-sqlite API
-/// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
+/// (see <https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options>)
 #[napi(object)]
 #[derive(Clone)]
 pub struct DatabaseOpts {
@@ -347,10 +348,10 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 
-    // Use connect_with_encryption to properly set up encryption context
+    // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect_with_encryption(encryption_key)
+        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
         .map_err(|e| to_generic_error("failed to connect", e))?;
 
     if let Some(busy_timeout) = busy_timeout {

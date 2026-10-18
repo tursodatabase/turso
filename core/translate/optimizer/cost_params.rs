@@ -51,8 +51,9 @@ pub struct CostModelParams {
     pub in_subquery_rows: f64,
 
     // === Scan/Seek Cost Weights ===
-    /// Discount factor for repeated scans (cache benefit).
-    /// Range: [0, 1). Higher = more cache benefit assumed.
+    /// Cost multiplier for repeated page reads during scans and index searches.
+    /// Range: [0, 1). Lower values assume more cache reuse.
+    /// A value of 0.2 charges a repeated page read at 20% of its first-read cost.
     pub cache_reuse_factor: f64,
 
     /// CPU cost per row processed (relative to page IO = 1.0).

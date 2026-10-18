@@ -188,7 +188,7 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
-    use turso_core::{Connection, Database, LimboError, OpenOptions, SqliteDialect};
+    use turso_core::{ConnectOpts, Connection, Database, LimboError, OpenOptions, SqliteDialect};
 
     use super::SimulatorIO;
     use crate::runner::{FAULT_ERROR_MSG, SimIO, cli::IoBackend};
@@ -215,8 +215,8 @@ mod tests {
             db_path,
             OpenOptions::new(Arc::new(SqliteDialect)),
         )?;
-        let writer = db.connect()?;
-        let observer = db.connect()?;
+        let writer = db.connect(ConnectOpts::new())?;
+        let observer = db.connect(ConnectOpts::new())?;
 
         writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
         writer.execute("BEGIN")?;

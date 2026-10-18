@@ -75,3 +75,28 @@ test inner-join-populated-ungrouped-aggregate {
 expect {
     1|2
 }
+
+# An automatic index built over an empty table must stay empty. The build loop
+# used to jump into its own body when Rewind found no rows, so it inserted one
+# record of NULL columns. A seek on the NULL key from `k.w IS NULL` then found
+# that record and produced a row from the empty table.
+setup empty-autoindex-source {
+    CREATE TABLE p(id INT);
+    CREATE TABLE k(w, t);
+    INSERT INTO p VALUES (1);
+}
+
+@setup empty-autoindex-source
+test autoindex-over-empty-table-adds-no-rows {
+    SELECT 'row' FROM p JOIN k ON p.id IS NOT k.t WHERE k.w IS NULL;
+}
+expect {
+}
+
+@setup empty-autoindex-source
+test autoindex-over-empty-table-null-key-seek {
+    SELECT count(*) FROM p JOIN k ON p.id != k.t WHERE k.w IS NULL;
+}
+expect {
+    0
+}

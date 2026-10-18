@@ -7,7 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -362,7 +362,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // Simple column reference target: match by name and collation.
             let tname = &conflict_target.col_name;
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) || ic.expr.is_some() {
+                if matched.get(i) || ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
@@ -382,7 +382,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched.get(i) {
+                if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
@@ -713,35 +713,37 @@ pub fn emit_upsert(
         }
     }
 
-    // Recompute virtual columns for the new row after SET clauses have modified base columns.
-    // This must happen before CHECK constraints, triggers, and index updates.
-    if ctx.table.has_virtual_columns() {
-        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-        let dml_ctx =
-            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            ctx.table,
-        )?;
-    }
-
     if let Some(bt) = table.btree() {
         if bt.is_strict {
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
+            // We need to do this before regenerating virtual columns, because TypeCheck applies
+            // affinity in-place to its registers, which could affect virtual columns.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: layout.num_non_virtual_cols(),
-                check_generated: true,
+                check_generated: false,
                 table_reference: BTreeTable::input_type_check_table_ref(
                     &bt,
                     resolver.schema(),
                     None,
                 )?,
             });
+        }
+    }
 
+    // Recompute virtual columns for the new row after SET clauses have modified base columns.
+    // This must happen before CHECK constraints, triggers, and index updates.
+    compute_new_row_virtual_columns(
+        program,
+        ctx,
+        new_start,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+        &layout,
+        resolver,
+    )?;
+
+    if let Some(bt) = table.btree() {
+        if bt.is_strict {
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
             // and SET columns (user-facing values from expressions) need encoding
             // before being written to disk.
@@ -758,7 +760,7 @@ pub fn emit_upsert(
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
+                count: bt.columns().len(),
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
@@ -881,6 +883,52 @@ pub fn emit_upsert(
                 rowid_reg: ctx.conflict_rowid_reg,
                 target_pc: ctx.loop_labels.row_done,
             });
+
+            // The triggers may also have changed this row, so re-read it:
+            // index deletion must use the row as it is on disk now, or the
+            // trigger's index entries are left behind (#8744).
+            if let Some(before) = before_start {
+                for (i, column) in table.columns().iter().enumerate() {
+                    emit_table_column(
+                        program,
+                        ctx.cursor_id,
+                        table_ref_id,
+                        table_references,
+                        column,
+                        i,
+                        layout.to_register(before, i),
+                        resolver,
+                    )?;
+                }
+            }
+
+            // Same for the NEW image: like SQLite, columns not in the SET list
+            // must keep the values the triggers wrote, while SET columns keep
+            // their values computed from the pre-trigger row. Virtual columns
+            // are recomputed from the refreshed base columns.
+            for (i, column) in table.columns().iter().enumerate() {
+                if updated_positions.get(i) || column.is_virtual_generated() {
+                    continue;
+                }
+                emit_table_column(
+                    program,
+                    ctx.cursor_id,
+                    table_ref_id,
+                    table_references,
+                    column,
+                    i,
+                    layout.to_register(new_start, i),
+                    resolver,
+                )?;
+            }
+            compute_new_row_virtual_columns(
+                program,
+                ctx,
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                &layout,
+                resolver,
+            )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1241,7 +1289,7 @@ pub fn emit_upsert(
                 start_reg: del,
                 num_regs: k + 1,
                 cursor_id: pending.idx_cid,
-                raise_error_if_no_matching_entry: false,
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(label) = maybe_skip_del {
                 program.preassign_label_to_next_insn(label);
@@ -1496,16 +1544,14 @@ pub fn emit_upsert(
     }
 
     // Compute virtual columns for RETURNING (if any virtual columns exist)
-    if !returning.is_empty() && ctx.table.has_virtual_columns() {
-        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-        let dml_ctx =
-            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(
+    if !returning.is_empty() {
+        compute_new_row_virtual_columns(
             program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            ctx,
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            &layout,
             resolver,
-            ctx.table,
         )?;
     }
 
@@ -1527,6 +1573,28 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+fn compute_new_row_virtual_columns(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    new_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if !ctx.table.has_virtual_columns {
+        return Ok(());
+    }
+    let dml_ctx =
+        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+    compute_virtual_columns(
+        program,
+        &ctx.table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        ctx.table,
+    )
 }
 
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.

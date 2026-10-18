@@ -57,36 +57,7 @@ pub(super) fn translate_like_base(
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         ast::LikeOperator::Match => {
-            // Transform MATCH to fts_match():
-            // - `col MATCH 'query'` -> `fts_match(col, 'query')`
-            // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
-            let columns: Vec<&ast::Expr> = match lhs.as_ref() {
-                ast::Expr::Parenthesized(cols) => cols.iter().map(|c| c.as_ref()).collect(),
-                other => vec![other],
-            };
-            let arg_count = columns.len() + 1; // columns + query
-            let start_reg = program.alloc_registers(arg_count);
-
-            for (i, col) in columns.iter().enumerate() {
-                translate_expr(program, referenced_tables, col, start_reg + i, resolver)?;
-            }
-            translate_expr(
-                program,
-                referenced_tables,
-                rhs,
-                start_reg + columns.len(),
-                resolver,
-            )?;
-
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg,
-                dest: target_register,
-                func: FuncCtx {
-                    func: Func::Fts(FtsFunc::Match),
-                    arg_count,
-                },
-            });
+            crate::bail_parse_error!("MATCH requires an FTS index query")
         }
         #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
         ast::LikeOperator::Match => {

@@ -53,7 +53,7 @@ pub enum WeightProfile {
     Writes,
     /// SELECT-heavy workload with every supported correlated subquery rewrite.
     CorrelatedSubqueries,
-    /// SELECT-heavy workload with one to three inner or left equality joins.
+    /// SELECT-heavy workload with chained joins of every join type.
     Joins,
 }
 
@@ -96,11 +96,16 @@ impl WeightProfile {
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
             WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
-            WeightProfile::Joins => base(80, 8, 8, 4, 2, 1, 1, 2, 1, 1, 1, 1),
+            // Keep this profile on reads, inserts, and schema creation. Unrelated
+            // UPDATE or DELETE failures must not stop a fixed JOIN campaign.
+            // Use fewer inserts because each row can multiply a chained join.
+            WeightProfile::Joins => base(80, 4, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),
         }
     }
 
     fn configure_policy(self, policy: &mut Policy) {
+        policy.select_config.join_config.join_probability = 0.25;
+
         if self == WeightProfile::CorrelatedSubqueries {
             let config = &mut policy.select_config;
             config.subquery_correlation_probability = 1.0;
@@ -129,17 +134,24 @@ impl WeightProfile {
         }
 
         if self == WeightProfile::Joins {
+            // Multi-table joins multiply their input rows. Keep each insert
+            // small so one large result does not stop the join campaign.
+            policy.insert_config.max_rows = 1;
+            policy.max_tables = 4;
             let config = &mut policy.select_config;
             config.join_config.join_probability = 1.0;
             config.join_config.max_joins = 3;
-            config.join_config.join_type_weights.inner = 60;
-            config.join_config.join_type_weights.left = 40;
-            config.join_config.join_type_weights.cross = 0;
-            config.join_config.join_type_weights.natural = 0;
-            config.join_config.equi_join_probability = 1.0;
-            config.join_config.self_join_probability = 0.0;
-            config.cte_probability = 0.0;
-            config.compound_probability = 0.0;
+            config.join_config.join_type_weights.inner = 25;
+            config.join_config.join_type_weights.left = 25;
+            config.join_config.join_type_weights.right = 25;
+            config.join_config.join_type_weights.full = 25;
+            config.join_config.join_type_weights.cross = 5;
+            config.join_config.natural_join_probability = 0.2;
+            config.join_config.join_constraint_probability = 0.85;
+            config.join_config.using_probability = 0.35;
+            config.join_config.equi_join_probability = 0.5;
+            config.join_config.self_join_probability = 0.25;
+            config.join_config.parenthesized_group_probability = 0.3;
         }
     }
 }
@@ -205,7 +217,9 @@ impl SqlGenBackend {
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
             .with_function_config(
-                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+                sql_gen::FunctionConfig::deterministic()
+                    .disable(&["LIKELY", "UNLIKELY"])
+                    .without_order_dependent_aggregates(),
             );
         policy.select_config.require_order_by_with_limit = true;
         profile.configure_policy(&mut policy);
@@ -317,6 +331,12 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        profile
+            .generation
+            .expression
+            .base
+            .function_profile
+            .allow_order_dependent_aggregates = false;
         if recursive_cte_focus {
             profile = profile.read_only();
             profile.generation.expression = profile.generation.expression.clone().simple();
@@ -472,6 +492,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_that_depend_on_input_order_are_disabled() {
+        let sql_gen = SqlGenBackend::new(1);
+        assert!(
+            !sql_gen
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+
+        let prop = PropTestBackend::new([1; 32], false);
+        assert!(
+            !prop
+                .profile
+                .generation
+                .expression
+                .base
+                .function_profile
+                .allow_order_dependent_aggregates
+        );
+    }
+
+    #[test]
     fn disabling_alter_actions_leaves_add_column_enabled() {
         let mut policy = Policy::default();
         disable_alter_actions_that_revalidate_schema(&mut policy);
@@ -514,9 +556,8 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_can_read_and_write() {
-        // A profile that never selects, inserts, updates, or deletes would
-        // generate an empty or read-only workload and quietly cover nothing.
+    fn every_profile_can_select_and_insert() {
+        // SELECT exercises each theme. INSERT gives SELECT statements rows to read.
         for profile in [
             WeightProfile::Balanced,
             WeightProfile::Ddl,
@@ -528,6 +569,19 @@ mod tests {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
             assert!(w.insert > 0, "{profile:?} never inserts");
+        }
+    }
+
+    #[test]
+    fn general_profiles_can_update_and_delete() {
+        for profile in [
+            WeightProfile::Balanced,
+            WeightProfile::Ddl,
+            WeightProfile::Triggers,
+            WeightProfile::Writes,
+            WeightProfile::CorrelatedSubqueries,
+        ] {
+            let w = profile.stmt_weights();
             assert!(w.update > 0, "{profile:?} never updates");
             assert!(w.delete > 0, "{profile:?} never deletes");
         }
@@ -546,12 +600,45 @@ mod tests {
             "triggers profile should create triggers more often than balanced"
         );
 
-        let joins = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
-        assert_eq!(joins.policy.select_config.join_config.join_probability, 1.0);
-        assert_eq!(
-            joins.policy.select_config.join_config.equi_join_probability,
-            1.0
+        let mut balanced = Policy::default();
+        WeightProfile::Balanced.configure_policy(&mut balanced);
+        let mut joins = Policy::default();
+        WeightProfile::Joins.configure_policy(&mut joins);
+        let balanced_join_weights = &balanced.select_config.join_config.join_type_weights;
+        assert!(
+            balanced.select_config.join_config.join_probability > 0.0,
+            "balanced profile should generate joins"
         );
-        assert_eq!(joins.policy.select_config.join_config.max_joins, 3);
+        assert!(
+            balanced_join_weights.right > 0 && balanced_join_weights.full > 0,
+            "balanced profile should generate right and full joins"
+        );
+        assert!(
+            joins.select_config.join_config.join_probability
+                > balanced.select_config.join_config.join_probability,
+            "joins profile should generate joins more often than balanced"
+        );
+    }
+
+    #[test]
+    fn join_profile_disables_order_dependent_aggregates() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+        assert!(
+            !generator
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+    }
+
+    #[test]
+    fn join_profile_limits_table_growth() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+
+        assert_eq!(generator.policy.insert_config.max_rows, 1);
+        assert!(
+            WeightProfile::Joins.stmt_weights().insert
+                < WeightProfile::Balanced.stmt_weights().insert
+        );
     }
 }

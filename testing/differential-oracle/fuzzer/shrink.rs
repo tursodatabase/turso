@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use turso_core::{Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database, SqliteDialect};
 use turso_parser::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
@@ -78,7 +78,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect()?;
+        let turso = turso_db.connect(ConnectOpts::new())?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();
@@ -719,7 +719,7 @@ fn walk_select_table(table: &mut SelectTable, f: &mut dyn FnMut(&mut Expr) -> bo
             }
             false
         }
-        SelectTable::Select(select, _) => walk_select(select, f),
+        SelectTable::Select { select, .. } => walk_select(select, f),
         SelectTable::Sub(from, _) => walk_from(from, f),
     }
 }
@@ -834,13 +834,13 @@ fn walk_from_sites(
     from: &mut turso_parser::ast::FromClause,
     f: &mut dyn FnMut(&mut Site<'_>) -> bool,
 ) -> bool {
-    if let SelectTable::Select(select, _) = &mut *from.select {
+    if let SelectTable::Select { select, .. } = &mut *from.select {
         if walk_select_sites(select, f) {
             return true;
         }
     }
     for join in &mut from.joins {
-        if let SelectTable::Select(select, _) = &mut *join.table {
+        if let SelectTable::Select { select, .. } = &mut *join.table {
             if walk_select_sites(select, f) {
                 return true;
             }

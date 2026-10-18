@@ -992,3 +992,31 @@ test in-cross-table-column-ref {
 expect {
     1
 }
+
+test in-list-of-an-earlier-table-column-is-rebuilt-for-each-row {
+    CREATE TABLE tr(id INTEGER PRIMARY KEY, v INT);
+    CREATE INDEX tr_v ON tr(v);
+    INSERT INTO tr VALUES (5, 50), (6, 60), (7, 70);
+
+    SELECT b.id, c.id FROM tr AS b JOIN tr AS c WHERE c.id IN (b.id) ORDER BY 1, 2;
+    SELECT b.id, c.id FROM tr AS b JOIN tr AS c WHERE c.v IN (b.v, 70) ORDER BY 1, 2;
+    SELECT a.id, b.id, c.id
+      FROM tr AS a
+      FULL JOIN tr AS b ON 0
+      JOIN tr AS c
+     WHERE c.id IN (b.id) AND a.id IS NULL
+     ORDER BY 2;
+}
+expect {
+    5|5
+    6|6
+    7|7
+    5|5
+    5|7
+    6|6
+    6|7
+    7|7
+    |5|5
+    |6|6
+    |7|7
+}

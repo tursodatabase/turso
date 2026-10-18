@@ -3,15 +3,13 @@ use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
 };
 
-use turso_core::{Database, PlatformIO};
+use turso_core::{ConnectOpts, Database, PlatformIO};
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
 
@@ -41,7 +39,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, TPC_H_PATH, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect().unwrap();
+    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
 
     let queries = [
         tpc_query!(1),
@@ -146,14 +144,6 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     }
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_tpc_h_queries
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

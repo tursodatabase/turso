@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -347,6 +347,7 @@ pub(crate) fn emit_refill_index(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
             internal_id: table_ref,
@@ -553,6 +554,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                count: ClearBtreeCount::Nothing,
             });
         }
         program.emit_insn(Insn::OpenWrite {
@@ -703,16 +705,21 @@ fn resolve_reindex_targets(
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
-            ));
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
@@ -1179,18 +1186,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    ast::blob_literal_hex(&b)
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .try_collect()?,
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
@@ -1301,7 +1299,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // read type of table

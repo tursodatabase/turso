@@ -15,6 +15,7 @@ use crate::incremental::operator::{
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::IOResultOr;
+use crate::ConnectOpts;
 use crate::SqliteDialect;
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::numeric::Numeric;
@@ -1647,7 +1648,7 @@ impl DbspCompiler {
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let internal_conn = db.connect()?;
+        let internal_conn = db.connect(ConnectOpts::new())?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
 
@@ -2297,7 +2298,7 @@ mod tests {
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::SqliteDialect;
-    use crate::{Database, MemoryIO, Pager, IO};
+    use crate::{ConnectOpts, Database, MemoryIO, Pager, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -2584,7 +2585,7 @@ mod tests {
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
 
         let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
@@ -6180,12 +6181,12 @@ mod tests {
         use crate::sync::Arc;
         use crate::types::{SeekKey, SeekOp, SeekResult};
         use crate::util::IOExt;
-        use crate::{Connection, Database, MemoryIO, SqliteDialect, Value, IO};
+        use crate::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Value, IO};
 
         fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             let pager = conn.pager.load().clone();
             let _ = pager.io.block(|| pager.allocate_page1());
             let root = pager

@@ -1,0 +1,51 @@
+//tatp_tdf
+//
+// This is an example TDF file of TATP benchmark
+//
+
+[Session parameters]
+session_name = "TATP example session"
+author = "Anon" 
+throughput_resolution = 1  // seconds
+comments = "Trial session run"
+
+[Population parameters]
+subscribers = 10000
+commit_block_rows = 2000
+post_population_delay = 1 // delay after population in minutes
+check_targetdb = "yes"    // target db population and schema check; default:"no"
+
+[Test parameters]
+warm_up_duration = 1  // minutes
+run_duration = 3  // minutes
+//uniform = "yes"  // distribution of the generated search keys; default: "no"
+
+[Transaction mixes]
+tatp_mix_R80W20 = {
+   GET_SUBSCRIBER_DATA 35
+   GET_NEW_DESTINATION 10
+   GET_ACCESS_DATA 35
+   UPDATE_SUBSCRIBER_DATA 2
+   UPDATE_LOCATION 14
+   INSERT_CALL_FORWARDING 2
+   DELETE_CALL_FORWARDING 2
+}
+read_mix = {
+   GET_SUBSCRIBER_DATA 33
+   GET_NEW_DESTINATION 33
+   GET_ACCESS_DATA 34
+}
+
+[Database client distributions]
+
+local_only_dcd_4 = {
+   localhost 4 // number of database client threads
+}
+local_only_dcd_16 = {
+   localhost 16 // number of database client threads
+}
+
+[Test sequence]
+populate post_population_delay = 0 conditional
+
+run database_client_distribution="local_only_dcd_4" transaction_mix="tatp_mix_R80W20" name="Trial test run 1"

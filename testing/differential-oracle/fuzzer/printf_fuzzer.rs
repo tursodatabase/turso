@@ -16,7 +16,7 @@ use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use sql_gen_prop::SqlValue;
-use turso_core::{Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database, SqliteDialect};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -280,7 +280,7 @@ impl FuzzerState {
             out_dir.join("printf-test.db").to_str().unwrap(),
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect()?;
+        let turso_conn = turso_db.connect(ConnectOpts::new())?;
 
         let sqlite_conn =
             rusqlite::Connection::open_in_memory().context("Failed to open SQLite database")?;

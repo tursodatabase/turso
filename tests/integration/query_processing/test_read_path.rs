@@ -3,7 +3,7 @@ use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{ConnectOpts, LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -151,6 +151,58 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
         .err()
         .display_string()
         .contains("no such column: rowid");
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid_index.db");
+    let queries = [
+        "SELECT count(*) FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t0 RIGHT JOIN t1 ON NULL",
+        "SELECT NULL FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON NULL",
+        "SELECT NULL FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t2.c0 = t3.c0",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t3.c1 = t2.c0 + 1",
+        "SELECT c0, c1 FROM t3 ORDER BY c1",
+        "SELECT c0 FROM t3 WHERE c1 = 4",
+        "SELECT t2.c0, t3.c0 FROM t2 JOIN t3 ON t3.c1 = t2.c0 + 1 ORDER BY t2.c0",
+    ];
+
+    let sqlite_rows = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE t0(c0);
+            CREATE TABLE t1(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t1_i0 ON t1(c1);
+            CREATE TABLE t2(c0);
+            CREATE TABLE t3(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t3_i0 ON t3(c1);
+            INSERT INTO t2 VALUES (1), (3), (7);
+            INSERT INTO t3 VALUES (1, 2), (3, 4), (5, 6);
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        queries
+            .iter()
+            .map(|query| sqlite_exec_rows(&sqlite, query))
+            .collect::<Vec<_>>()
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    for (query, sqlite_rows) in queries.iter().zip(sqlite_rows) {
+        assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
+    }
+
+    assert_that!(conn.prepare("SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4"))
+        .err()
+        .display_string()
+        .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
 
     Ok(())
 }
@@ -722,6 +774,108 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(mvcc)]
+fn test_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    for (limit, expected) in [
+        (Value::from_i64(0), Value::Null),
+        (Value::build_text("0"), Value::Null),
+        (Value::from_i64(1), Value::from_i64(5)),
+        (Value::from_i64(2), Value::from_i64(5)),
+        (Value::from_i64(-1), Value::from_i64(5)),
+    ] {
+        let mut stmt = conn.prepare("SELECT (SELECT 5 LIMIT ?)")?;
+        assert_eq!(stmt.parameters().count(), 1);
+        stmt.bind_at(1.try_into()?, limit)?;
+
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            Ok(())
+        })?;
+
+        assert_eq!(rows, vec![vec![expected]]);
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_correlated_scalar_subquery_limit_offset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT o.a, (SELECT i.a FROM t i WHERE i.a >= o.a ORDER BY i.a LIMIT ? OFFSET ?) FROM t o ORDER BY o.a",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(2), Value::from_i64(3)],
+            vec![Value::from_i64(3), Value::Null],
+        ]
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE pf_job_queue (id INTEGER PRIMARY KEY, queue TEXT, available_at INTEGER, locked_until INTEGER, claim_receipt TEXT, job_attempts INTEGER, job_retry_limit INTEGER, _deleted INTEGER);"
+)]
+fn test_update_where_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "INSERT INTO pf_job_queue VALUES (1, 'q', 10, NULL, NULL, 0, 3, 0), (2, 'q', 5, NULL, NULL, 0, 3, 0)",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "UPDATE \"pf_job_queue\"
+         SET \"job_attempts\" = \"job_attempts\" + 1,
+             \"locked_until\" = ?,
+             \"claim_receipt\" = ?
+         WHERE \"id\" = (
+           SELECT \"id\"
+           FROM \"pf_job_queue\"
+           WHERE \"queue\" = ?
+             AND \"available_at\" <= ?
+             AND (\"locked_until\" IS NULL OR \"locked_until\" <= ?)
+             AND \"job_attempts\" < \"job_retry_limit\"
+             AND \"_deleted\" = 0
+           ORDER BY \"job_attempts\", \"available_at\", \"id\"
+           LIMIT ?
+         )
+         RETURNING \"id\"",
+    )?;
+    assert_eq!(stmt.parameters().count(), 6);
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.bind_at(2.try_into()?, Value::build_text("receipt"))?;
+    stmt.bind_at(3.try_into()?, Value::build_text("q"))?;
+    stmt.bind_at(4.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(5.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(6.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+    assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
+
+    Ok(())
+}
+
 #[turso_macros::test(
     mvcc,
     init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"
@@ -1097,7 +1251,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
         for i in 0..ROWS {
             conn.execute(
@@ -1114,7 +1268,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     // A fresh Database over the same backing file starts with a cold page
     // cache, so every record (and its overflow chain) must be read back.
     let db = open(io.clone())?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
     let mut io_yields = 0usize;
     let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();

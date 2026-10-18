@@ -212,6 +212,15 @@ pub(crate) fn agg_arg_collation(
         return CollationSeq::Binary;
     }
 
+    // A merged USING column compares with the collation of its first column
+    // (see ast::Expr::MergedColumn).
+    if let ast::Expr::MergedColumn(columns) = expr {
+        let first_column = columns
+            .first()
+            .expect("a merged column must have at least two source columns");
+        return agg_arg_collation(referenced_tables, first_column, resolver);
+    }
+
     // If no explicit collation, check if this is a column with table-defined collation
     if let ast::Expr::Column { table, column, .. } = expr {
         if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {

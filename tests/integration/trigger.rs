@@ -1,4 +1,4 @@
-use crate::common::{do_flush, ExecRows, TempDatabase};
+use crate::common::{do_flush, rusqlite_integrity_check, ExecRows, TempDatabase};
 use asserting::expectations::{any, StringContains};
 use asserting::prelude::*;
 
@@ -2087,4 +2087,79 @@ fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
 
     let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
     assert_eq!(total_changes, vec![(2,)]);
+}
+
+fn open_sqlite_created_database(sql: &str) -> (tempfile::TempDir, TempDatabase) {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+    let db = TempDatabase::new_with_existent(&db_path);
+    (tmp_dir, db)
+}
+
+#[test]
+fn test_update_with_before_trigger_keeps_real_column_real_in_index_key() {
+    let (_tmp_dir, db) = open_sqlite_created_database(
+        "CREATE TABLE t(a REAL, b);
+         INSERT INTO t VALUES (128.0, 1), (64.0, 1);
+         CREATE INDEX i ON t(typeof(a), b);
+         CREATE TRIGGER g BEFORE UPDATE ON t BEGIN SELECT 1; END;",
+    );
+    let conn = db.connect_limbo();
+
+    for sql in [
+        "UPDATE t SET b = 2 WHERE rowid = 1",
+        "UPDATE t SET b = 3 WHERE rowid = 1",
+        "INSERT INTO t(rowid, a, b) VALUES (2, 0, 0) ON CONFLICT DO UPDATE SET b = 2",
+        "INSERT INTO t(rowid, a, b) VALUES (2, 0, 0) ON CONFLICT DO UPDATE SET b = 3",
+    ] {
+        conn.execute(sql).unwrap();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)], "after {sql}");
+    }
+    let rows: Vec<(String, i64)> = conn.exec_rows("SELECT quote(a), b FROM t ORDER BY rowid");
+    assert_eq!(
+        rows,
+        vec![("128.0".to_string(), 3), ("64.0".to_string(), 3)]
+    );
+
+    drop(conn);
+    rusqlite_integrity_check(&db.path).unwrap();
+}
+
+#[test]
+fn test_old_values_and_returning_read_real_column_as_real() {
+    let (_tmp_dir, db) = open_sqlite_created_database(
+        "CREATE TABLE t(a REAL, b);
+         INSERT INTO t VALUES (128.0, 1), (64.0, 2);
+         CREATE TABLE log(x);
+         CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+           INSERT INTO log VALUES ('before update ' || typeof(OLD.a));
+         END;
+         CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+           INSERT INTO log VALUES ('after update ' || typeof(OLD.a));
+         END;
+         CREATE TRIGGER ad AFTER DELETE ON t BEGIN
+           INSERT INTO log VALUES ('after delete ' || typeof(OLD.a));
+         END;",
+    );
+    let conn = db.connect_limbo();
+
+    conn.execute("UPDATE t SET b = 3 WHERE b = 1").unwrap();
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("DELETE FROM t WHERE b = 2 RETURNING typeof(a), quote(a)");
+    assert_eq!(rows, vec![("real".to_string(), "64.0".to_string())]);
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT x FROM log ORDER BY rowid");
+    assert_eq!(
+        log,
+        vec![
+            ("before update real".to_string(),),
+            ("after update real".to_string(),),
+            ("after delete real".to_string(),),
+        ]
+    );
 }

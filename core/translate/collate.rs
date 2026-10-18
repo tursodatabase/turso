@@ -426,6 +426,26 @@ pub fn get_expr_collation_ctx_with_symbols(
                 }
                 return Ok(WalkControl::SkipChildren);
             }
+            Expr::MergedColumn(columns) => {
+                // A merged USING column takes the collation of its first column
+                // only. With t1.a BINARY and t2.a NOCASE, `t1 FULL JOIN t2 USING(a)`
+                // compares `a` as BINARY.
+                let first_column = columns
+                    .first()
+                    .expect("a merged column must have at least two source columns");
+                if let Some((collation, explicit)) = get_expr_collation_ctx_with_symbols(
+                    first_column,
+                    referenced_tables,
+                    symbol_table,
+                )? {
+                    if explicit && maybe_explicit_collseq.is_none() {
+                        maybe_explicit_collseq = Some(collation);
+                    } else if !explicit && maybe_column_collseq.is_none() {
+                        maybe_column_collseq = Some(collation);
+                    }
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
             Expr::Column { table, column, .. } => {
                 // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
                 // collation from their expression, so we skip them
@@ -504,6 +524,13 @@ fn comparison_operand_column_collseq(
                 expr = sub_expr.as_ref()
             }
             Expr::Cast { expr: sub_expr, .. } => expr = sub_expr.as_ref(),
+            // A merged USING column compares with the collation of its first
+            // column (see Expr::MergedColumn).
+            Expr::MergedColumn(columns) => {
+                expr = columns
+                    .first()
+                    .expect("a merged column must have at least two source columns")
+            }
             Expr::Column { table, column, .. } => {
                 if table.is_self_table() {
                     return Ok(None);
@@ -568,6 +595,27 @@ fn get_collseq_parts_from_expr_with_symbols(
                     maybe_column_collseq =
                         resolver.and_then(|resolver| resolver.self_table_collation(None));
                 }
+            }
+            Expr::MergedColumn(columns) => {
+                // A merged USING column takes the collation of its first column
+                // only, so a NOCASE later column is ignored even when the first
+                // column has no declared collation.
+                let first_column = columns
+                    .first()
+                    .expect("a merged column must have at least two source columns");
+                let (explicit, column) = get_collseq_parts_from_expr_with_symbols(
+                    first_column,
+                    referenced_tables,
+                    symbol_table,
+                    resolver,
+                )?;
+                if maybe_explicit_collseq.is_none() {
+                    maybe_explicit_collseq = explicit;
+                }
+                if maybe_column_collseq.is_none() {
+                    maybe_column_collseq = column;
+                }
+                return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
@@ -1018,6 +1066,7 @@ mod tests {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
@@ -1053,6 +1102,7 @@ mod tests {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
@@ -1089,6 +1139,7 @@ mod tests {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
@@ -1135,6 +1186,7 @@ mod tests {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),

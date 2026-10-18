@@ -423,6 +423,11 @@ pub enum FieldAccessResolution {
 }
 
 // https://sqlite.org/syntax/expr.html
+//
+// Large and rare parts, such as subqueries and window definitions, are boxed.
+// Every expression is as large as its largest variant, and the functions that
+// parse, clone, drop, and translate expressions recurse once per level of
+// nesting, holding expressions in their stack frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Expr {
@@ -463,7 +468,7 @@ pub enum Expr {
     /// schema-name.table-name.column-name
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
-    Exists(Select),
+    Exists(Box<Select>),
     /// Struct/union field access (produced by translator, not parser directly)
     FieldAccess {
         /// base expression (e.g., column reference)
@@ -495,6 +500,22 @@ pub enum Expr {
         /// `FILTER`
         filter_over: FunctionTail,
     },
+    /// The value of an unqualified USING column that more than one table can supply.
+    ///
+    /// In `SELECT a FROM t1 FULL JOIN t2 USING(a)`, a row can be missing from
+    /// either table, so `a` is `t1.a` when that is not NULL and `t2.a` otherwise.
+    /// This node holds the source columns in that order: `[t1.a, t2.a]`.
+    ///
+    /// The value is the same as `coalesce(t1.a, t2.a)`, but comparisons treat it
+    /// like the column `t1.a`: it takes the affinity and collation of its first
+    /// column. A user-written `coalesce()` has no affinity and can take its
+    /// collation from any argument. With `t1.a INTEGER` and a row only in `t2`
+    /// whose `a` is the text `'7'`, `a = 7` is true but `coalesce(t1.a, t2.a) = 7`
+    /// is false. SQLite gets the same effect by marking its internal coalesce
+    /// call with `SQLITE_AFF_DEFER`.
+    ///
+    /// The parser never creates this node. Name binding creates it.
+    MergedColumn(Vec<Box<Expr>>),
     /// Identifier
     Id(Name),
     /// Column
@@ -531,7 +552,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// subquery
-        rhs: Select,
+        rhs: Box<Select>,
     },
     /// `IN` table name / function
     InTable {
@@ -540,7 +561,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// table name
-        rhs: QualifiedName,
+        rhs: Box<QualifiedName>,
         /// table function arguments
         args: Vec<Box<Expr>>,
     },
@@ -572,7 +593,7 @@ pub enum Expr {
     /// `RAISE` function call
     Raise(ResolveType, Option<Box<Expr>>),
     /// Subquery expression
-    Subquery(Select),
+    Subquery(Box<Select>),
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
@@ -692,7 +713,7 @@ pub enum SubqueryType {
         num_regs: usize,
     },
     /// IN subquery; result is stored in an ephemeral index.
-    /// Example: x <NOT> IN (SELECT ...)
+    /// Example: `x <NOT> IN (SELECT ...)`
     In {
         cursor_id: usize,
         /// Affinity string used by the IN operator probe and ephemeral materialization.
@@ -731,7 +752,7 @@ impl Expr {
         Expr::InSelect {
             lhs: Box::new(lhs),
             not,
-            rhs: select,
+            rhs: Box::new(select),
         }
     }
 
@@ -817,6 +838,18 @@ pub fn blob_literal_hex(blob: &str) -> &str {
     debug_assert_eq!(blob.as_bytes()[1], b'\'');
     debug_assert_eq!(blob.as_bytes()[blob.len() - 1], b'\'');
     &blob[2..blob.len() - 1]
+}
+
+/// Decodes the hex digits of a blob literal such as `X'0102'` into the bytes
+/// they stand for. The parser has already checked that the literal is valid hex.
+pub fn blob_literal_bytes(blob: &str) -> impl Iterator<Item = u8> + '_ {
+    blob_literal_hex(blob)
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
+            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+        })
 }
 
 /// Textual comparison operator in an expression
@@ -1094,7 +1127,11 @@ pub enum SelectTable {
     /// table function call
     TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>),
     /// `SELECT` subquery
-    Select(Select, Option<As>),
+    Select {
+        select: Select,
+        alias: Option<As>,
+        lateral: bool,
+    },
     /// subquery
     Sub(FromClause, Option<As>),
 }
@@ -1297,7 +1334,12 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
+        let starts_with_digit = value.first().is_some_and(|c| c.is_ascii_digit());
+        if !value.is_empty()
+            && !starts_with_digit
+            && value.iter().all(safe_char)
+            && !is_quotable_keyword(value)
+        {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1306,7 +1348,7 @@ impl Name {
 
     /// Checks if a name represents a quoted string that should get fallback behavior
     /// Need to detect legacy conversion of double quoted keywords to string literals
-    /// (see https://sqlite.org/lang_keywords.html)
+    /// (see <https://sqlite.org/lang_keywords.html>)
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
@@ -1860,7 +1902,7 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
-    /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
+    /// set the busy_timeout (see <https://www.sqlite.org/pragma.html#pragma_busy_timeout>)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
@@ -1923,7 +1965,7 @@ pub enum PragmaName {
     SchemaVersion,
     /// Deprecated: control whether unaliased column names omit the table name prefix
     ShortColumnNames,
-    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    /// Alias for `require_where` pragma, as an homage to MySQL (<https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates>)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
     RequireWhere,
@@ -1954,6 +1996,8 @@ pub enum PragmaName {
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
+    /// Sets or queries the number of WAL frames after which a commit runs an automatic checkpoint.
+    WalAutocheckpoint,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
@@ -2216,8 +2260,9 @@ pub enum UpsertDo {
 pub struct FunctionTail {
     /// `FILTER` clause
     pub filter_clause: Option<Box<Expr>>,
-    /// `OVER` clause
-    pub over_clause: Option<Over>,
+    /// `OVER` clause. Boxed because it is large and rare: stored inline, it
+    /// would make every [Expr] as large as a window definition.
+    pub over_clause: Option<Box<Over>>,
 }
 
 /// Function call `OVER` clause

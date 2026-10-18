@@ -2,7 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -13,7 +13,7 @@ pub(super) struct HashBuildPayloadInfo {
     pub key_affinities: String,
     pub use_bloom_filter: bool,
     pub bloom_filter_cursor_id: CursorID,
-    pub allow_seek: bool,
+    pub requires_build_table: bool,
 }
 
 /// Static configuration for a fresh hash-table build.
@@ -25,8 +25,7 @@ struct HashBuildConfig {
     use_bloom_filter: bool,
     bloom_filter_cursor_id: CursorID,
     materialized_cursor_id: Option<CursorID>,
-    use_materialized_keys: bool,
-    allow_seek: bool,
+    uses_materialized_keys_and_payload: bool,
     signature: HashBuildSignature,
 }
 
@@ -134,7 +133,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
-        let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
+        let (payload_columns, payload_signature_columns, uses_materialized_keys_and_payload) =
             match materialized_input.map(|input| &input.mode) {
                 Some(MaterializedBuildInputMode::KeyPayload {
                     num_keys: payload_num_keys,
@@ -147,12 +146,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
                         .try_collect()?;
-                    (
-                        payload_columns.clone(),
-                        payload_signature_columns,
-                        true,
-                        false,
-                    )
+                    (payload_columns.clone(), payload_signature_columns, true)
                 }
                 _ => {
                     let payload_signature_columns: ColumnUsedMask =
@@ -171,11 +165,11 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                             }
                         })
                         .collect();
-                    (payload_columns, payload_signature_columns, false, true)
+                    (payload_columns, payload_signature_columns, false)
                 }
             };
 
-        let bloom_filter_cursor_id = if use_materialized_keys {
+        let bloom_filter_cursor_id = if uses_materialized_keys_and_payload {
             materialized_cursor_id.expect("materialized input cursor is required")
         } else {
             self.hash_build_cursor_id
@@ -193,12 +187,6 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             key_affinities: key_affinities.clone(),
             use_bloom_filter,
             materialized_input_cursor: materialized_cursor_id,
-            materialized_mode: materialized_input.as_ref().map(|input| match input.mode {
-                MaterializedBuildInputMode::RowidOnly => MaterializedBuildInputModeTag::RowidOnly,
-                MaterializedBuildInputMode::KeyPayload { .. } => {
-                    MaterializedBuildInputModeTag::Payload
-                }
-            }),
         };
 
         if self
@@ -210,7 +198,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 key_affinities,
                 use_bloom_filter,
                 bloom_filter_cursor_id,
-                allow_seek,
+                requires_build_table: !uses_materialized_keys_and_payload,
             }));
         }
         if self.program.has_hash_build_signature(self.hash_table_id) {
@@ -230,8 +218,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 use_bloom_filter,
                 bloom_filter_cursor_id,
                 materialized_cursor_id,
-                use_materialized_keys,
-                allow_seek,
+                uses_materialized_keys_and_payload,
                 signature,
             },
         })))
@@ -269,7 +256,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         }
 
         let (key_source_cursor_id, payload_source_cursor_id, hash_build_rowid_cursor_id) =
-            if config.use_materialized_keys {
+            if config.uses_materialized_keys_and_payload {
                 (
                     build_iter_cursor_id,
                     build_iter_cursor_id,
@@ -291,7 +278,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             target_pc_when_reentered: label_hash_build_end,
         });
 
-        if !config.use_materialized_keys {
+        if !config.uses_materialized_keys_and_payload {
             planner.program.emit_insn(Insn::OpenRead {
                 cursor_id: planner.hash_build_cursor_id,
                 root_page: btree.root_page,
@@ -304,10 +291,10 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             pc_if_empty: build_loop_end,
         });
 
-        if !config.use_materialized_keys {
+        if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .set_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
+                .set_table_cursor_override(build_table.internal_id, planner.hash_build_cursor_id);
         }
 
         planner
@@ -332,29 +319,19 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.table_references,
             planner.non_from_clause_subqueries,
             planner.hash_join_op,
-            config.use_materialized_keys,
+            config.uses_materialized_keys_and_payload,
         )? {
             let cond = &planner.predicates[cond_idx];
-            let jump_target_when_true = planner.program.allocate_label();
-            let condition_metadata = ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true,
-                jump_target_when_false: skip_to_next,
-                jump_target_when_null: skip_to_next,
-            };
-            translate_condition_expr(
+            super::conditions::emit_where_term(
                 planner.program,
                 planner.table_references,
-                &cond.expr,
-                condition_metadata,
+                cond,
+                skip_to_next,
                 &planner.t_ctx.resolver,
             )?;
-            planner
-                .program
-                .preassign_label_to_next_insn(jump_target_when_true);
         }
 
-        if config.use_materialized_keys {
+        if config.uses_materialized_keys_and_payload {
             for idx in 0..num_keys {
                 planner.program.emit_column_or_rowid(
                     key_source_cursor_id,
@@ -392,7 +369,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .get(col_idx)
                     .map(|c| c.generated_type())
                 {
-                    Some(GeneratedType::Virtual { expr, .. }) if !config.use_materialized_keys => {
+                    Some(GeneratedType::Virtual { expr, .. })
+                        if !config.uses_materialized_keys_and_payload =>
+                    {
                         planner.t_ctx.resolver.with_self_table_context(
                             planner.program,
                             Some(&SelfTableContext::ForSelect {
@@ -416,6 +395,23 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             build_table.columns()[col_idx].affinity(),
                         );
                     }
+                    Some(_) if !config.uses_materialized_keys_and_payload => {
+                        planner.program.emit_column_or_rowid(
+                            payload_source_cursor_id,
+                            col_idx,
+                            payload_reg + i,
+                        );
+                        let column = &build_table.columns()[col_idx];
+                        if planner
+                            .t_ctx
+                            .resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, build_table.table.is_strict())
+                            .is_none()
+                        {
+                            maybe_apply_affinity(column.ty(), payload_reg + i, planner.program);
+                        }
+                    }
                     _ => planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,
                         col_idx,
@@ -430,7 +426,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     key_affinities: config.key_affinities.clone(),
                     use_bloom_filter: false,
                     bloom_filter_cursor_id: config.bloom_filter_cursor_id,
-                    allow_seek: config.allow_seek,
+                    requires_build_table: !config.uses_materialized_keys_and_payload,
                 },
             )
         } else {
@@ -441,15 +437,15 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     key_affinities: config.key_affinities.clone(),
                     use_bloom_filter: false,
                     bloom_filter_cursor_id: config.bloom_filter_cursor_id,
-                    allow_seek: config.allow_seek,
+                    requires_build_table: !config.uses_materialized_keys_and_payload,
                 },
             )
         };
 
-        if !config.use_materialized_keys {
+        if !config.uses_materialized_keys_and_payload {
             planner
                 .program
-                .clear_cursor_override(build_table.internal_id);
+                .clear_table_cursor_override(build_table.internal_id);
         }
 
         planner.program.emit_insn(Insn::HashBuild {
@@ -508,7 +504,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
 /// unmatched, so they would be emitted as spurious null-extended rows.
 ///
 /// OUTER JOIN predicates stay on the right-table loop recorded in
-/// `from_outer_join`; applying them while building the hash table would drop
+/// `origin`; applying them while building the hash table would drop
 /// unmatched build rows before null-extension. Terms with outer-query
 /// references run where those references are in scope.
 pub(super) fn build_prefilter_where_terms(
@@ -516,15 +512,15 @@ pub(super) fn build_prefilter_where_terms(
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     hash_join_op: &HashJoinOp,
-    use_materialized_keys: bool,
+    uses_materialized_keys_and_payload: bool,
 ) -> Result<Vec<usize>> {
-    if use_materialized_keys || hash_join_op.join_type == HashJoinType::FullOuter {
+    if uses_materialized_keys_and_payload || hash_join_op.join_type == HashJoinType::FullOuter {
         return Ok(Vec::new());
     }
     let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
     let mut term_indices = Vec::new();
     for (cond_idx, cond) in predicates.iter().enumerate() {
-        if cond.from_outer_join.is_some() {
+        if cond.origin.is_outer_join() {
             continue;
         }
         let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;
@@ -533,7 +529,7 @@ pub(super) fn build_prefilter_where_terms(
         {
             continue;
         }
-        if expr_references_outer_query(&cond.expr, table_references) {
+        if expr_reads_an_outer_query(&cond.expr, table_references, subqueries)? {
             continue;
         }
         term_indices.push(cond_idx);
@@ -542,12 +538,12 @@ pub(super) fn build_prefilter_where_terms(
 }
 
 struct PreparedProbeBuild {
-    build_cursor_id: CursorID,
+    build_table_cursor_id: Option<CursorID>,
     payload_info: HashBuildPayloadInfo,
 }
 
 struct ProbeSetupState {
-    build_cursor_id: CursorID,
+    build_table_cursor_id: Option<CursorID>,
     payload_info: HashBuildPayloadInfo,
     payload_dest_reg: Option<usize>,
     match_reg: usize,
@@ -614,32 +610,13 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
     /// Ensure the build cursor exists and the hash table is ready for probing.
     fn prepare_build(&mut self) -> Result<PreparedProbeBuild> {
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
-        let (build_cursor_id, _) = build_table.resolve_cursors(self.program, self.mode.clone())?;
-        let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
-            cursor_id
-        } else {
-            let btree = build_table
-                .btree()
-                .expect("Hash join build table must be a BTree table");
-            let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
-                CursorKey::table(build_table.internal_id),
-                CursorType::BTreeTable(btree.clone()),
-            );
-            self.program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: btree.root_page,
-                db: build_table.database_id,
-            });
-            cursor_id
-        };
-
         let hash_table_id: usize = build_table.internal_id.into();
         let btree = build_table
             .btree()
             .expect("Hash join build table must be a BTree table");
         let hash_build_cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
             CursorKey::hash_build(build_table.internal_id),
-            CursorType::BTreeTable(btree),
+            CursorType::BTreeTable(btree.clone()),
         );
         let payload_info = match HashBuildPlanner::new(
             self.program,
@@ -656,9 +633,28 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             HashBuildPlan::Reuse(info) => Ok(info),
             HashBuildPlan::Build(prepared) => prepared.emit(),
         }?;
+        let build_table_cursor_id = if payload_info.requires_build_table {
+            let (cursor_id, _) = build_table.resolve_cursors(self.program, self.mode.clone())?;
+            Some(if let Some(cursor_id) = cursor_id {
+                cursor_id
+            } else {
+                let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::table(build_table.internal_id),
+                    CursorType::BTreeTable(btree.clone()),
+                );
+                self.program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: btree.root_page,
+                    db: build_table.database_id,
+                });
+                cursor_id
+            })
+        } else {
+            None
+        };
 
         Ok(PreparedProbeBuild {
-            build_cursor_id,
+            build_table_cursor_id,
             payload_info,
         })
     }
@@ -667,7 +663,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
     /// to the state needed to install the resulting `HashCtx`.
     fn emit_probe(&mut self, prepared: PreparedProbeBuild) -> Result<ProbeSetupState> {
         let PreparedProbeBuild {
-            build_cursor_id,
+            build_table_cursor_id,
             payload_info,
         } = prepared;
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
@@ -773,7 +769,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_next_label = self.program.allocate_label();
 
         Ok(ProbeSetupState {
-            build_cursor_id,
+            build_table_cursor_id,
             payload_info,
             payload_dest_reg,
             match_reg,
@@ -790,7 +786,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
     /// Install `HashCtx` and cache any payload-backed expressions for later reads.
     fn install_context(&mut self, state: ProbeSetupState) -> Result<()> {
         let ProbeSetupState {
-            build_cursor_id,
+            build_table_cursor_id,
             payload_info,
             payload_dest_reg,
             match_reg,
@@ -818,11 +814,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 match_reg,
                 payload_start_reg: payload_dest_reg,
                 payload_columns: payload_info.payload_columns,
-                build_cursor_id: if payload_info.allow_seek {
-                    Some(build_cursor_id)
-                } else {
-                    None
-                },
+                build_table_cursor_id,
                 join_type: self.hash_join_op.join_type,
                 inner_loop_gosub_reg: None,
                 probe_rowid_reg,
@@ -844,7 +836,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             )
         });
         let build_table_is_live = self.live_table_ids.contains(&build_table.internal_id);
-        if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
+        if build_table_cursor_id.is_some() && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
                 .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
@@ -894,9 +886,11 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                     );
                 }
             }
-        } else if payload_info.allow_seek && !build_table_is_live {
+        } else if let Some(build_table_cursor_id) =
+            build_table_cursor_id.filter(|_| !build_table_is_live)
+        {
             self.program.emit_insn(Insn::SeekRowid {
-                cursor_id: build_cursor_id,
+                cursor_id: build_table_cursor_id,
                 src_reg: match_reg,
                 target_pc: hash_next_label,
             });
@@ -1059,7 +1053,7 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                 decrement_by: 0,
             });
 
-            if let Some(cursor_id) = self.hash_ctx.build_cursor_id {
+            if let Some(cursor_id) = self.hash_ctx.build_table_cursor_id {
                 self.program.emit_insn(Insn::NullRow { cursor_id });
             }
 
@@ -1142,7 +1136,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     let match_reg = hash_ctx.match_reg;
     let payload_dest_reg = hash_ctx.payload_start_reg;
     let num_payload = hash_ctx.payload_columns.len();
-    let build_cursor_id = hash_ctx.build_cursor_id;
+    let build_table_cursor_id = hash_ctx.build_table_cursor_id;
     let done_unmatched = program.allocate_label();
 
     program.emit_insn(Insn::NullRow {
@@ -1161,7 +1155,7 @@ pub(super) fn emit_hash_join_unmatched_build_rows<'a>(
     let label_next_unmatched = program.allocate_label();
     program.preassign_label_to_next_insn(unmatched_loop);
 
-    if let Some(cursor_id) = build_cursor_id {
+    if let Some(cursor_id) = build_table_cursor_id {
         program.emit_insn(Insn::SeekRowid {
             cursor_id,
             src_reg: match_reg,
@@ -1357,7 +1351,7 @@ impl GraceHashLoop {
             }
 
             // Set build cursor to NULL row
-            if let Some(cursor_id) = hash_ctx.build_cursor_id {
+            if let Some(cursor_id) = hash_ctx.build_table_cursor_id {
                 program.emit_insn(Insn::NullRow { cursor_id });
             }
 
@@ -1419,7 +1413,7 @@ impl GraceHashLoop {
 
                 program.preassign_label_to_next_insn(grace_unmatched_loop);
 
-                if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                if let Some(cursor_id) = hash_ctx.build_table_cursor_id {
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id,
                         src_reg: match_reg,

@@ -17,6 +17,9 @@
 //! the same FTS index concurrently. In WAL mode the same format runs with
 //! degenerate concurrency: the pager write lock serializes writers.
 
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecInExt;
+use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -56,14 +59,14 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
     TantivyDocument, Term, TERMINATED,
 };
-use turso_parser::ast::{Select, SortOrder};
+use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
 mod format;
 mod rows;
 
-use directory::{BuildDirectory, SnapshotDirectory};
+use directory::{BuildDirectory, FileBytes, SnapshotDirectory};
 use format::{
     alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
     segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
@@ -159,22 +162,22 @@ const FTS_MAX_CACHED_SEARCHERS: usize = 4;
 /// storage I/O.
 const FTS_MAX_RETAINED_CACHE_BYTES: usize = 192 * 1024 * 1024;
 
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 crate::thread::thread_local! {
     static FTS_RETAINED_CACHE_BYTES_OVERRIDE: core::cell::Cell<Option<usize>> =
         const { core::cell::Cell::new(None) };
 }
 
-/// Override the retained-cache budget for tests on the current thread, so
-/// budget eviction is reachable without multi-hundred-MiB indexes.
+/// Set the byte limit for cache data kept between statements on the current thread.
+/// Tests can reach the limit without indexes that use hundreds of MiB.
 /// Pass `None` to restore the default.
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 pub fn set_fts_retained_cache_bytes_for_test(bytes: Option<usize>) {
     FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.set(bytes));
 }
 
 fn fts_max_retained_cache_bytes() -> usize {
-    #[cfg(feature = "test_helper")]
+    #[cfg(any(feature = "test_helper", feature = "simulator"))]
     if let Some(bytes) = FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.get()) {
         return bytes;
     }
@@ -287,43 +290,6 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
     })
 }
 
-/// Check if text matches a query by testing for any common terms.
-///
-/// Standalone function that can be used without an FTS index.
-/// It tokenizes both the query and text using Tantivy's default tokenizer,
-/// and returns true if any query terms appear in the text.
-pub fn fts_match(text: &str, query: &str) -> bool {
-    if text.is_empty() || query.is_empty() {
-        return false;
-    }
-
-    FTS_TOKENIZER.with(|tokenizer| {
-        let mut tokenizer = tokenizer.borrow_mut();
-
-        // Extract query terms (lowercased)
-        let query_terms: HashSet<String> = {
-            let mut terms = HashSet::default();
-            let mut query_stream = tokenizer.token_stream(query);
-            while let Some(token) = query_stream.next() {
-                terms.insert(token.text.to_string());
-            }
-            terms
-        };
-        if query_terms.is_empty() {
-            return false;
-        }
-
-        // Tokenize the text and check if any query terms appear
-        let mut text_stream = tokenizer.token_stream(text);
-        while let Some(token) = text_stream.next() {
-            if query_terms.contains(&token.text) {
-                return true;
-            }
-        }
-        false
-    })
-}
-
 /// Parse field weights from a string like "body=2.0,title=1.0"
 /// Returns a HashMap mapping column names to tantivy 'boost factors'
 fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
@@ -370,9 +336,9 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
                 "invalid weight value '{weight_str}' for column '{col_name}'. Expected a number (e.g., 2.0)",
             ))
         })?;
-        if weight <= 0.0 {
+        if !weight.is_finite() || weight <= 0.0 {
             return Err(LimboError::ParseError(format!(
-                "weight for column '{col_name}' must be positive, got {weight}",
+                "weight for column '{col_name}' must be finite and positive, got {weight}",
             )));
         }
 
@@ -448,6 +414,10 @@ impl SegmentByteCache {
     }
 
     fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
         let entry = self.entries.remove(position);
         let data = Arc::clone(&entry.1);
@@ -456,6 +426,10 @@ impl SegmentByteCache {
     }
 
     fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
+        if budget == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|(entry, _)| *entry != id);
         self.entries.push((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
@@ -494,6 +468,7 @@ struct SearcherCacheEntry {
     index: Index,
     reader: IndexReader,
     parser: Arc<tantivy::query::QueryParser>,
+    rowid_readers: Arc<[Column<i64>]>,
 }
 
 #[derive(Default)]
@@ -503,22 +478,22 @@ struct SearcherCache {
 }
 
 impl SearcherCache {
-    fn get(
-        &mut self,
-        key: &SearcherKey,
-    ) -> Option<(Index, IndexReader, Arc<tantivy::query::QueryParser>)> {
+    fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(position);
-        let checkout = (
-            entry.index.clone(),
-            entry.reader.clone(),
-            Arc::clone(&entry.parser),
-        );
         self.entries.push(entry);
-        Some(checkout)
+        self.entries.last()
     }
 
     fn put(&mut self, entry: SearcherCacheEntry) {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|existing| existing.key != entry.key);
         self.entries.push(entry);
         while self.entries.len() > FTS_MAX_CACHED_SEARCHERS {
@@ -840,6 +815,36 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(self)))
     }
+
+    fn backing_schema(&self) -> BackingSchema {
+        FtsStore::new(&self.cfg.index_name).schema
+    }
+
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        let mut result = crate::util::try_substitute_parameters(pattern, parameters)?;
+        let ast::Expr::FunctionCall { name, args, .. } = result.as_mut() else {
+            return Some(result);
+        };
+        if !name.as_str().eq_ignore_ascii_case("fts_score") {
+            return Some(result);
+        }
+        let ast::Expr::Literal(ast::Literal::String(fields)) =
+            parameters.get(&crate::util::FTS_FIELD_PARAMETER)?
+        else {
+            return None;
+        };
+        let mut selected = Vec::new();
+        for field in fields.trim_matches('\'').split(',') {
+            selected.push(args.get(field.parse::<usize>().ok()?)?.clone());
+        }
+        selected.push(args.last()?.clone());
+        *args = selected;
+        Some(result)
+    }
 }
 
 /// Pattern indices for FTS queries
@@ -848,8 +853,8 @@ const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
 const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
 const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
 const FTS_PATTERN_COMBINED: i64 = 4;
-const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
-const FTS_PATTERN_MATCH: i64 = 6;
+pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
+pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
 
 fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     let live_docs = usize::try_from(live_docs).unwrap_or(usize::MAX);
@@ -1011,6 +1016,7 @@ impl FtsHitStream {
 /// chunk rows through the ordinary (MVCC-aware) backing cursor. Insert-only
 /// statements never load the existing index at all.
 pub struct FtsCursor {
+    allocator: DynAllocator,
     schema: Schema,
     rowid_field: Field,
     identity_hi_field: Field,
@@ -1059,6 +1065,7 @@ pub struct FtsCursor {
     reader: Option<IndexReader>,
     searcher: Option<Searcher>,
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    rowid_readers: Arc<[Column<i64>]>,
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
@@ -1105,6 +1112,7 @@ impl FtsCursor {
             })
             .collect();
         Self {
+            allocator: DynAllocator::default(),
             schema: attachment.schema.clone(),
             rowid_field: attachment.rowid_field,
             identity_hi_field: attachment.identity_hi_field,
@@ -1133,6 +1141,7 @@ impl FtsCursor {
             reader: None,
             searcher: None,
             cached_parser: None,
+            rowid_readers: Arc::default(),
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
@@ -1270,15 +1279,16 @@ impl FtsCursor {
             .stats
             .read_cache_lookups
             .fetch_add(1, Ordering::Relaxed);
-        if let Some((index, reader, parser)) = self.shared.searchers.lock().get(&key) {
+        if let Some(entry) = self.shared.searchers.lock().get(&key) {
             self.shared
                 .stats
                 .read_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
-            self.searcher = Some(reader.searcher());
-            self.index = Some(index);
-            self.reader = Some(reader);
-            self.cached_parser = Some(parser);
+            self.searcher = Some(entry.reader.searcher());
+            self.index = Some(entry.index.clone());
+            self.reader = Some(entry.reader.clone());
+            self.cached_parser = Some(Arc::clone(&entry.parser));
+            self.rowid_readers = Arc::clone(&entry.rowid_readers);
             return Ok(());
         }
         self.shared
@@ -1286,7 +1296,7 @@ impl FtsCursor {
             .read_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut files: HashMap<PathBuf, Arc<[u8]>> = HashMap::default();
+        let mut files: HashMap<PathBuf, FileBytes> = HashMap::default();
         for segment in &self.segments {
             for (name, data) in &segment.data.files {
                 files.insert(PathBuf::from(name), Arc::clone(data));
@@ -1295,19 +1305,21 @@ impl FtsCursor {
                 // Serve the tombstone set as the segment's `.del` file so
                 // the alive filter is enforced at the SegmentReader level
                 // and every query path honors it.
+                let bytes = with_tantivy_footer(alive_bitset_bytes(
+                    segment.descriptor.max_doc,
+                    &segment.deleted,
+                    &self.allocator,
+                )?)?;
                 files.insert(
                     PathBuf::from(tombstone_del_file_name(&segment.id())),
-                    Arc::from(with_tantivy_footer(alive_bitset_bytes(
-                        segment.descriptor.max_doc,
-                        &segment.deleted,
-                    ))?),
+                    Arc::new(bytes),
                 );
             }
         }
         let scratch = self.shared.scratch_index(&self.schema)?;
         let specs: Vec<SegmentMetaSpec> =
             self.segments.iter().map(LoadedSegment::meta_spec).collect();
-        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs)?;
+        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs, &self.allocator)?;
         let directory = SnapshotDirectory::new(files, meta_json);
         let index = Index::open(directory)
             .map_err(|e| LimboError::InternalError(format!("FTS snapshot open: {e}")))?;
@@ -1320,18 +1332,31 @@ impl FtsCursor {
             .try_into()
             .map_err(|e: tantivy::TantivyError| LimboError::InternalError(e.to_string()))?;
         let parser = self.build_query_parser(&index);
+        let searcher = reader.searcher();
+        let rowid_readers: Arc<[Column<i64>]> = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                segment
+                    .fast_fields()
+                    .i64(ROWID_FIELD)
+                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))
+            })
+            .collect::<Result<_>>()?;
         if publish_to_cache {
             self.shared.searchers.lock().put(SearcherCacheEntry {
                 key,
                 index: index.clone(),
                 reader: IndexReader::clone(&reader),
                 parser: Arc::clone(&parser),
+                rowid_readers: Arc::clone(&rowid_readers),
             });
         }
-        self.searcher = Some(reader.searcher());
+        self.searcher = Some(searcher);
         self.index = Some(index);
         self.reader = Some(reader);
         self.cached_parser = Some(parser);
+        self.rowid_readers = rowid_readers;
         Ok(())
     }
 
@@ -1351,6 +1376,7 @@ impl FtsCursor {
         self.reader = None;
         self.searcher = None;
         self.cached_parser = None;
+        self.rowid_readers = Arc::default();
     }
 
     /// Make sure `self.searcher` reflects the current in-memory segment set.
@@ -1707,13 +1733,18 @@ impl FtsCursor {
                     }
                     if segment_done {
                         let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let files = assemble_segment_files(descriptor, std::mem::take(chunks))?;
+                        let files = assemble_segment_files(
+                            descriptor,
+                            std::mem::take(chunks),
+                            &self.allocator,
+                        )?;
                         let data = Arc::new(segment_data_from_files(
                             &self.shared,
                             &self.schema,
                             descriptor.segment_id,
                             descriptor.max_doc,
                             files,
+                            &self.allocator,
                         )?);
                         self.shared
                             .stats
@@ -1961,7 +1992,7 @@ impl FtsCursor {
     /// `.managed.json`, no lock file, no merge. Returns `None` when the
     /// buffer produced no documents.
     fn build_segment(&mut self) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
-        let build_dir = BuildDirectory::default();
+        let build_dir = BuildDirectory::new(self.allocator.clone());
         // `Index::create` writes the initial meta.json into the build
         // directory's in-memory slot; it never reaches the B-tree.
         let index = Index::create(
@@ -1969,14 +2000,14 @@ impl FtsCursor {
             self.schema.clone(),
             IndexSettings::default(),
         )
-        .map_err(|e| LimboError::InternalError(format!("FTS build index: {e}")))?;
+        .map_err(|e| build_dir.write_error(e, "FTS build index"))?;
         // The segment writer pulls tokenizers off `segment.index()`, so the
         // build index needs the same registrations as the read side.
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
         let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
-            .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS segment writer"))?;
         let identity_base = self.mint_identity_base();
         let mut added = 0u32;
         for buffered in self.doc_buffer.drain(..) {
@@ -1992,7 +2023,7 @@ impl FtsCursor {
                     opstamp: 0,
                     document,
                 })
-                .map_err(|e| LimboError::InternalError(format!("FTS add_document: {e}")))?;
+                .map_err(|e| build_dir.write_error(e, "FTS add_document"))?;
             added += 1;
         }
         let max_doc = writer.max_doc();
@@ -2005,7 +2036,7 @@ impl FtsCursor {
         }
         writer
             .finalize()
-            .map_err(|e| LimboError::InternalError(format!("FTS segment finalize: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS segment finalize"))?;
         self.shared
             .stats
             .segment_builds
@@ -2140,7 +2171,7 @@ impl FtsCursor {
             .filter(|meta| candidate_ids.contains(&meta.id()))
             .map(|meta| index.segment(meta.clone()))
             .collect();
-        let build_dir = BuildDirectory::default();
+        let build_dir = BuildDirectory::new(self.allocator.clone());
         let live_total: u64 = self
             .segments
             .iter()
@@ -2154,7 +2185,7 @@ impl FtsCursor {
                 vec![None; input_segments.len()],
                 build_dir.clone(),
             )
-            .map_err(|e| LimboError::InternalError(format!("FTS merge failed: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS merge failed"))?;
             let merged_metas = merged_index
                 .searchable_segment_metas()
                 .map_err(|e| LimboError::InternalError(format!("FTS merged metas: {e}")))?;
@@ -2176,6 +2207,7 @@ impl FtsCursor {
                 segment_id,
                 merged_meta.max_doc(),
                 captured.clone(),
+                &self.allocator,
             )?;
             let (segment, rows) =
                 segment_rows_from_files(segment_id, merged_meta.max_doc(), captured, identities)?;
@@ -2321,15 +2353,16 @@ impl FtsCursor {
             .searcher
             .as_ref()
             .expect("searcher built by ensure_searcher");
+        let segments_by_id: HashMap<_, _> = self
+            .segments
+            .iter()
+            .map(|segment| (segment.id(), segment))
+            .collect();
         let term = Term::from_field_i64(self.rowid_field, rowid);
         let mut hits = Vec::new();
         for segment_reader in searcher.segment_readers() {
             let segment_id = segment_reader.segment_id();
-            let Some(segment) = self
-                .segments
-                .iter()
-                .find(|segment| segment.id() == segment_id)
-            else {
+            let Some(segment) = segments_by_id.get(&segment_id) else {
                 continue;
             };
             let inverted = segment_reader
@@ -2426,7 +2459,8 @@ fn segment_data_from_files(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<String, Arc<[u8]>>,
+    files: HashMap<String, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentData> {
     let by_path = files
         .iter()
@@ -2438,6 +2472,7 @@ fn segment_data_from_files(
         segment_id,
         max_doc,
         by_path,
+        allocator,
     )?;
     Ok(SegmentData::new(files, identities))
 }
@@ -2451,11 +2486,13 @@ fn read_segment_identities(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
-    let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
-    let index = Index::open(SnapshotDirectory::new(files, meta_json))
+    let meta_json = synthesize_meta_json(scratch, schema, &[spec], allocator)?;
+    let directory = SnapshotDirectory::new(files, meta_json);
+    let index = Index::open(directory)
         .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
     let meta = index
         .searchable_segment_metas()
@@ -2498,8 +2535,9 @@ fn read_segment_identities(
 fn assemble_segment_files(
     descriptor: &SegmentDescriptor,
     mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<HashMap<String, Arc<[u8]>>> {
-    let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    allocator: &DynAllocator,
+) -> Result<HashMap<String, FileBytes>> {
+    let mut files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, entry) in descriptor.files.iter().enumerate() {
         let file_ord = file_ord as u32;
         let chunk_map = chunks.remove(&file_ord).ok_or_else(|| {
@@ -2517,7 +2555,7 @@ fn assemble_segment_files(
                 entry.num_chunks
             )));
         }
-        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map)?;
+        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map, allocator)?;
         if assembled.len() as u64 != entry.size {
             return Err(LimboError::Corrupt(format!(
                 "FTS segment file {} has {} bytes but the descriptor records {}",
@@ -2538,12 +2576,12 @@ fn assemble_segment_files(
 }
 
 /// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-///
-/// The chunks are written straight into the shared allocation: building a
-/// `Vec` first and converting it with `Arc::from` would copy every byte a
-/// second time and hold both copies at once. Each chunk is dropped as soon
-/// as it has been copied, so peak memory is the file plus one chunk.
-fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::AssembleBuffer)]
+fn assemble_chunks(
+    path: &std::path::Path,
+    mut chunks: HashMap<i64, Vec<u8>>,
+    allocator: &DynAllocator,
+) -> Result<FileBytes> {
     let max_chunk =
         chunks.keys().max().copied().ok_or_else(|| {
             LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
@@ -2554,10 +2592,12 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
             path.display()
         )));
     }
-    let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
-    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
-    let mut offset = 0;
+    let total = chunks.values().try_fold(0usize, |total, chunk| {
+        total
+            .checked_add(chunk.len())
+            .ok_or(LimboError::OutOfMemory)
+    })?;
+    let mut assembled = DynVec::try_with_capacity_in(total, allocator.clone())?;
     for chunk_no in 0..=max_chunk {
         let data = chunks.remove(&chunk_no).ok_or_else(|| {
             LimboError::Corrupt(format!(
@@ -2566,10 +2606,7 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
                 chunk_no
             ))
         })?;
-        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
-            slot.write(*byte);
-        }
-        offset += data.len();
+        assembled.try_extend(data)?;
     }
     if !chunks.is_empty() {
         // Keys outside `0..=max_chunk` (a negative chunk number next to
@@ -2581,14 +2618,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
         )));
     }
     turso_assert!(
-        offset == total,
+        assembled.len() == total,
         "FTS chunk assembly must write exactly the bytes it counted"
     );
-    // SAFETY: `total` is the sum of every chunk's length and every chunk was
-    // consumed by the loop above exactly once, writing `total` bytes
-    // contiguously from offset 0 (asserted), so every byte of the slice is
-    // initialized.
-    Ok(unsafe { assembled.assume_init() })
+    Ok(Arc::new(assembled))
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2597,10 +2630,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
 fn rename_segment_files(
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
     from: &SegmentId,
     to: &SegmentId,
-) -> Result<HashMap<PathBuf, Arc<[u8]>>> {
+) -> Result<HashMap<PathBuf, FileBytes>> {
     let from = from.uuid_string();
     let to = to.uuid_string();
     files
@@ -2623,7 +2656,7 @@ fn rename_segment_files(
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
-    captured: HashMap<PathBuf, Arc<[u8]>>,
+    captured: HashMap<PathBuf, FileBytes>,
     identities: SegmentIdentities,
 ) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
     let mut file_names: Vec<String> = captured
@@ -2634,7 +2667,7 @@ fn segment_rows_from_files(
     file_names.sort();
     let mut inserts = Vec::new();
     let mut entries = Vec::new();
-    let mut data_files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    let mut data_files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, name) in file_names.into_iter().enumerate() {
         let bytes = captured
             .get(std::path::Path::new(&name))
@@ -2779,6 +2812,7 @@ impl IndexMethodCursor for FtsCursor {
     fn create(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if self.is_publishing() {
@@ -2812,6 +2846,7 @@ impl IndexMethodCursor for FtsCursor {
     fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if let Some(op) = self.pending_store_op.as_mut() {
@@ -2856,6 +2891,7 @@ impl IndexMethodCursor for FtsCursor {
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if matches!(self.state, FtsState::Ready) {
@@ -2871,6 +2907,7 @@ impl IndexMethodCursor for FtsCursor {
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         self.opening_for_write = true;
@@ -3005,12 +3042,6 @@ impl IndexMethodCursor for FtsCursor {
         };
         self.current_pattern = pattern_idx;
 
-        // values[1] = query string
-        let query_str = match &values[1] {
-            Register::Value(Value::Text(t)) => t.as_str().to_string(),
-            _ => return Err(LimboError::InternalError("FTS query must be text".into()).into()),
-        };
-
         // Determine the optional SQL LIMIT captured by the selected pattern.
         let limit_raw = match pattern_idx {
             // Patterns without LIMIT fetch every live document that matches.
@@ -3058,10 +3089,51 @@ impl IndexMethodCursor for FtsCursor {
             }
         };
 
-        let parser = self
-            .cached_parser
-            .as_deref()
-            .expect("parser built with the searcher");
+        self.current_hits.clear();
+        self.streaming_hits = None;
+        self.hit_pos = 0;
+        let query_str = match values[1].get_value() {
+            Value::Null => return Ok(IOResult::Done(false)),
+            query => query.to_string(),
+        };
+
+        let fields = match values.last().map(Register::get_value) {
+            Some(Value::Text(fields)) => fields.as_str(),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "FTS query_start: missing indexed fields".into(),
+                )
+                .into())
+            }
+        };
+        let selected_fields = fields
+            .split(',')
+            .map(|field| {
+                field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.default_fields.get(i).copied())
+                    .ok_or_else(|| {
+                        LimboError::InternalError("FTS query_start: invalid field".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parser = if selected_fields.len() == self.default_fields.len() {
+            Arc::clone(
+                self.cached_parser
+                    .as_ref()
+                    .expect("parser built with the searcher"),
+            )
+        } else {
+            let mut parser = tantivy::query::QueryParser::for_index(
+                self.index.as_ref().expect("index built with the searcher"),
+                selected_fields,
+            );
+            for &(field, boost) in &self.field_boosts {
+                parser.set_field_boost(field, boost);
+            }
+            Arc::new(parser)
+        };
 
         // Bound the query string before it reaches Tantivy's recursive
         // parser: a few KiB of nested parentheses would otherwise burn
@@ -3101,9 +3173,6 @@ impl IndexMethodCursor for FtsCursor {
         // and prevents a huge SQL LIMIT from allocating beyond the largest
         // possible result set.
         let limit = bounded_query_limit(limit_raw, searcher.num_docs());
-        self.current_hits.clear();
-        self.streaming_hits = None;
-        self.hit_pos = 0;
         if limit == 0 {
             return Ok(IOResult::Done(false));
         }
@@ -3126,17 +3195,13 @@ impl IndexMethodCursor for FtsCursor {
                 .weight(scoring)
                 .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
             let mut segments = Vec::with_capacity(searcher.segment_readers().len());
-            for segment_reader in searcher.segment_readers() {
+            for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
                 let scorer = weight
                     .scorer(segment_reader, 1.0)
                     .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
                 segments.push(FtsStreamingSegment {
                     scorer,
-                    rowids,
+                    rowids: self.rowid_readers[segment_ord].clone(),
                     alive: segment_reader.alive_bitset().cloned(),
                 });
             }
@@ -3164,10 +3229,7 @@ impl IndexMethodCursor for FtsCursor {
                 let mut scorer = weight
                     .scorer(segment_reader, 1.0)
                     .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+                let rowids = &self.rowid_readers[segment_ord];
                 let alive = segment_reader.alive_bitset();
                 loop {
                     let doc_id = scorer.doc();
@@ -3214,11 +3276,7 @@ impl IndexMethodCursor for FtsCursor {
         // Process each segment's results with a single fast field reader.
         // Fast fields provide columnar O(1) access to rowids without loading full documents.
         for (segment_ord, hits) in by_segment {
-            let segment_reader = searcher.segment_reader(segment_ord);
-            let rowid_reader = segment_reader
-                .fast_fields()
-                .i64(ROWID_FIELD)
-                .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+            let rowid_reader = &self.rowid_readers[segment_ord as usize];
 
             for (score, doc_addr) in hits {
                 let rowid = rowid_reader.first(doc_addr.doc_id).ok_or_else(|| {
@@ -3249,9 +3307,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
-        // Column 0 = score for fts_score, or 1 (true) for fts_match
-        if idx != 0 {
-            return Err(LimboError::InternalError("FTS: only column 0 supported".into()).into());
+        // Column 0 is the score for score queries, or 1 (true) for match queries.
+        // Column 1 is the score for match queries.
+        if idx != 0
+            && !(idx == 1
+                && matches!(
+                    self.current_pattern,
+                    FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT
+                ))
+        {
+            return Err(LimboError::InternalError("FTS: column out of bounds".into()).into());
         }
 
         match self.current_pattern {
@@ -3267,8 +3332,15 @@ impl IndexMethodCursor for FtsCursor {
                     )
                     .into());
                 }
-                // For fts_match patterns, return 1 (true) - indicates this row matches
-                Ok(IOResult::Done(Value::from_i64(1)))
+                if idx == 0 {
+                    return Ok(IOResult::Done(Value::from_i64(1)));
+                }
+                let score = if let Some(stream) = &self.streaming_hits {
+                    stream.current.unwrap().0
+                } else {
+                    self.current_hits[self.hit_pos].0
+                };
+                Ok(IOResult::Done(Value::from_f64(score as f64)))
             }
             FTS_PATTERN_SCORE
             | FTS_PATTERN_COMBINED
@@ -3455,6 +3527,7 @@ impl IndexMethodCursor for FtsCursor {
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
 

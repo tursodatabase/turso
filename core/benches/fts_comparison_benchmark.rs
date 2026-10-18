@@ -24,8 +24,6 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -35,7 +33,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -175,7 +173,7 @@ fn open_turso() -> TursoDatabase {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     execute_turso(&db, &conn, "PRAGMA fts_merge_threshold = 0");
     execute_turso(
         &db,
@@ -415,15 +413,6 @@ fn bench_queries(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = fts_comparison_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_bulk_ingest, bench_queries
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_comparison_benches;
     config = Criterion::default();

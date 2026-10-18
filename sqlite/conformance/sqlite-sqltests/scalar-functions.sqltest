@@ -1,6 +1,93 @@
 @database :default:
 @database :default-no-rowidalias:
 
+test scalar-function-filter-rejected {
+    WITH t(a) AS (VALUES (-1), (2))
+    SELECT abs(a) FILTER (WHERE a > 0) FROM t;
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-in-where-rejected {
+    SELECT 1 WHERE abs(-1) FILTER (WHERE 0);
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-in-case-rejected {
+    SELECT CASE WHEN 0 THEN abs(-1) FILTER (WHERE 1) ELSE 2 END;
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-nested-rejected {
+    SELECT coalesce(abs(-1) FILTER (WHERE 1), 0);
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-zero-arguments-rejected {
+    SELECT random() FILTER (WHERE 1);
+}
+expect error {
+    FILTER may not be used with non-aggregate random()
+}
+
+test scalar-function-filter-star-rejected {
+    SELECT random(*) FILTER (WHERE 1);
+}
+expect error {
+    FILTER may not be used with non-aggregate random()
+}
+
+test scalar-function-over-in-where-rejected {
+    SELECT 1 WHERE abs(-1) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-in-case-rejected {
+    SELECT CASE WHEN 0 THEN abs(-1) OVER () ELSE 2 END;
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-nested-rejected {
+    SELECT coalesce(abs(-1) OVER (), 0);
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-star-in-where-rejected {
+    SELECT 1 WHERE random(*) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-filter-over-in-where-rejected {
+    SELECT 1 WHERE abs(-1) FILTER (WHERE 1) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-filter-aggregate-controls {
+    WITH t(a) AS (VALUES (-1), (2))
+    SELECT abs(min(a)), max(a) FILTER (WHERE a < 0),
+           min(a) FILTER (WHERE a > 0), count(*) FILTER (WHERE a > 0) FROM t;
+}
+expect {
+    1|-1|2|1
+}
+
 test abs-integer-boundaries {
     SELECT abs(-9223372036854775807), abs(9223372036854775807), abs(0), abs(NULL) IS NULL;
 }

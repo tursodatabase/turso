@@ -111,16 +111,6 @@ impl Text {
 /// values longer than the cutoff fall back to full simdutf8 validation —
 /// above the cutoff the scalar OR loop loses to real SIMD.
 ///
-/// Measured by `core/benches/text_validate_benchmark.rs` (varying slice
-/// alignment, ASCII content) on an Apple M2, macOS 15.7, vs
-/// `simdutf8::basic::from_utf8` alone:
-///
-///   1-128 B:  1.4-4x faster (peak 4.1x at 16 B)
-///   256-512 B: 1.1-1.2x faster
-///   1-2 KB:   parity
-///   4 KB:     ~25% slower without the cutoff; equal with it
-///   multibyte fallback: pays the wasted OR scan (~15% at 64 B)
-///   length branch: ~+0.1ns/call, visible only on 1-2 B values
 #[inline(always)]
 pub(crate) fn validate_utf8(data: &[u8]) -> Option<&str> {
     const ASCII_SCAN_CUTOFF: usize = 512;
@@ -131,30 +121,34 @@ pub(crate) fn validate_utf8(data: &[u8]) -> Option<&str> {
     simdutf8::basic::from_utf8(data).ok()
 }
 
-/// ORs the bytes together a word at a time: eight, then four, two and one
-/// for the rest, so a value of any length takes at most `len / 8 + 3`
-/// loads. The loads are unaligned, so the slice's position on the page
-/// does not matter.
 #[inline(always)]
 pub(crate) fn is_ascii(data: &[u8]) -> bool {
-    let mut acc = 0u64;
-    let mut rest = data;
-    while let Some((word, tail)) = rest.split_first_chunk::<8>() {
-        acc |= u64::from_ne_bytes(*word);
-        rest = tail;
+    const WORD_BYTES: usize = size_of::<usize>();
+    const HIGH_BITS: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
+    if data.len() > 2 * WORD_BYTES {
+        let mut folded = 0usize;
+        for bytes in data.chunks_exact(WORD_BYTES) {
+            folded |= usize::from_ne_bytes(bytes.try_into().unwrap());
+        }
+        folded |= usize::from_ne_bytes(data[data.len() - WORD_BYTES..].try_into().unwrap());
+        return folded & HIGH_BITS == 0;
     }
-    if let Some((word, tail)) = rest.split_first_chunk::<4>() {
-        acc |= u64::from(u32::from_ne_bytes(*word));
-        rest = tail;
+    if data.len() >= WORD_BYTES {
+        let first = usize::from_ne_bytes(data[..WORD_BYTES].try_into().unwrap());
+        let last = usize::from_ne_bytes(data[data.len() - WORD_BYTES..].try_into().unwrap());
+        return (first | last) & HIGH_BITS == 0;
     }
-    if let Some((word, tail)) = rest.split_first_chunk::<2>() {
-        acc |= u64::from(u16::from_ne_bytes(*word));
-        rest = tail;
+    if data.len() >= 4 {
+        let first = u32::from_ne_bytes(data[..4].try_into().unwrap());
+        let last = u32::from_ne_bytes(data[data.len() - 4..].try_into().unwrap());
+        return (first | last) & 0x8080_8080 == 0;
     }
-    if let Some(&byte) = rest.first() {
-        acc |= u64::from(byte);
+    if data.len() >= 2 {
+        let first = u16::from_ne_bytes(data[..2].try_into().unwrap());
+        let last = u16::from_ne_bytes(data[data.len() - 2..].try_into().unwrap());
+        return (first | last) & 0x8080 == 0;
     }
-    acc & 0x8080_8080_8080_8080 == 0
+    data.first().is_none_or(u8::is_ascii)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +217,110 @@ unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
             15 => std::ptr::copy_nonoverlapping(src, dst, 15),
             16 => std::ptr::copy_nonoverlapping(src, dst, 16),
             _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
+}
+
+/// Copies `src` to `dst` and returns every copied byte OR-ed together.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[inline(always)]
+unsafe fn copy_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+    unsafe {
+        if len >= 16 {
+            let mut byte_or = 0u64;
+            let mut offset = 0;
+            while offset + 8 <= len {
+                let word = src.add(offset).cast::<u64>().read_unaligned();
+                dst.add(offset).cast::<u64>().write_unaligned(word);
+                byte_or |= word;
+                offset += 8;
+            }
+            if offset < len {
+                let tail = len - 8;
+                let word = src.add(tail).cast::<u64>().read_unaligned();
+                dst.add(tail).cast::<u64>().write_unaligned(word);
+                byte_or |= word;
+            }
+            byte_or
+        } else if len >= 8 {
+            let head = src.cast::<u64>().read_unaligned();
+            let tail = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(len - 8).cast::<u64>().write_unaligned(tail);
+            head | tail
+        } else if len >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(len - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(len - 4).cast::<u32>().write_unaligned(tail);
+            u64::from(head | tail)
+        } else if len > 0 {
+            let head = *src;
+            let middle = *src.add(len / 2);
+            let tail = *src.add(len - 1);
+            *dst = head;
+            *dst.add(len / 2) = middle;
+            *dst.add(len - 1) = tail;
+            u64::from(head | middle | tail)
+        } else {
+            0
+        }
+    }
+}
+
+impl Text {
+    #[inline(always)]
+    pub(crate) fn replace_with_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        const FUSED_LIMIT: usize = 64;
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        let len = bytes.len();
+        let copied_ascii = if len <= FUSED_LIMIT {
+            fill_bytes(self, bytes, HIGH_BITS)
+        } else {
+            None
+        };
+        if let Some(is_ascii) = copied_ascii {
+            if !is_ascii {
+                simdutf8::basic::from_utf8(bytes).ok().ok_or_else(|| {
+                    mark_unlikely();
+                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                })?;
+            }
+            let Cow::Owned(string) = &mut self.value else {
+                unreachable!("record bytes were copied into an owned string")
+            };
+            // SAFETY: we now know that the `len` first bytes of the string are valid UTF-8.
+            unsafe { string.as_mut_vec().set_len(len) };
+            self.subtype = TextSubtype::Text;
+        } else {
+            let text = validate_utf8(bytes).ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+            })?;
+            self.do_extend(&text)?;
+        }
+        return Ok(());
+
+        #[inline(always)]
+        fn fill_bytes(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
+            let len = bytes.len();
+            let Cow::Owned(string) = &mut text.value else {
+                return None;
+            };
+            if string.capacity() < len {
+                return None;
+            }
+            // SAFETY: the capacity check gives `len` writable bytes, and record bytes do not overlap
+            // the buffer. Its zero length keeps invalid UTF-8 out of the String.
+            let folded = unsafe {
+                let buffer = string.as_mut_vec();
+                buffer.set_len(0);
+                copy_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+            };
+            Some(folded & high_bits == 0)
         }
     }
 }
@@ -957,41 +1055,19 @@ impl Default for SumAggState {
 /// Aggregate context for accumulating values during GROUP BY.
 /// Built-in aggregates use a flat payload representation for efficiency and
 /// to share code between register-based and hash-based aggregation (future enhancement).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum AggContext {
-    /// Built-in aggregates store state as a flat Vec<Value> payload.
+    /// Built-in aggregates store state as a flat `Vec<Value>` payload.
     /// The layout depends on the aggregate function (see init_agg_payload).
     Builtin(Vec<Value>),
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
-}
-
-impl TryClone for AggContext {
-    type Error = TryReserveError;
-
-    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
-    /// go through fallible reservation. External state holds only FFI
-    /// pointers and copies without allocating.
-    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        match self {
-            Self::Builtin(payload) => {
-                let mut values = Vec::try_with_capacity_ext(payload.len())?;
-                for value in payload {
-                    let mut copy = Value::Null;
-                    copy.try_clone_from(value)?;
-                    values.push(copy);
-                }
-                Ok(Self::Builtin(values))
-            }
-            Self::External(_) => Ok(self.clone()),
-        }
-    }
+    Native(crate::native_ext::AggregateState),
 }
 
 impl AggContext {
-    pub fn compute_external(&self) -> Result<Value> {
-        if let Self::External(ext_state) = self {
+    pub fn compute_external(self) -> Result<Value> {
+        if let Self::External(ext_state) = &self {
             let mut final_value =
                 unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
             let value = Value::from_ffi_ref(&final_value);
@@ -1013,7 +1089,9 @@ impl AggContext {
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1022,7 +1100,9 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_vec_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_vec_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1030,7 +1110,9 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload() called on extension aggregate")
+            }
         }
     }
 }
@@ -3093,7 +3175,7 @@ const I48_LOW: i64 = -140737488355328;
 const I48_HIGH: i64 = 140737488355327;
 
 /// Sqlite Serial Types
-/// https://www.sqlite.org/fileformat.html#record_format
+/// <https://www.sqlite.org/fileformat.html#record_format>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct SerialType(u64);
@@ -3382,10 +3464,10 @@ impl Record {
 
 pub enum Cursor {
     /// A b-tree cursor
-    BTree(Box<BTreeCursor>),
+    BTree(Box<BTreeCursor>, Option<Arc<IndexInfo>>),
     /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
     /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
-    Dyn(Box<dyn CursorTrait>),
+    Dyn(Box<dyn CursorTrait>, Option<Arc<IndexInfo>>),
     IndexMethod(Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
@@ -3415,12 +3497,14 @@ impl Cursor {
     pub fn new_btree(cursor: Box<BTreeCursor>) -> Self {
         // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
         cursor.register_with_pager();
-        Self::BTree(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::BTree(cursor, index_info)
     }
 
     pub fn new_btree_dyn(cursor: Box<dyn CursorTrait>) -> Self {
         cursor.register_with_pager();
-        Self::Dyn(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::Dyn(cursor, index_info)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -3439,13 +3523,36 @@ impl Cursor {
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
-            Self::BTree(cursor) => cursor.as_mut(),
-            Self::Dyn(cursor) => cursor.as_mut(),
+            Self::BTree(cursor, _) => cursor.as_mut(),
+            Self::Dyn(cursor, _) => cursor.as_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
             }
         }
+    }
+
+    pub fn as_index_cursor_mut(&mut self) -> (&mut dyn CursorTrait, &IndexInfo) {
+        let (cursor, index_info) = match self {
+            Self::BTree(cursor, index_info) => {
+                (cursor.as_mut() as &mut dyn CursorTrait, index_info)
+            }
+            Self::Dyn(cursor, index_info) => (cursor.as_mut(), index_info),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a btree cursor");
+            }
+        };
+        let index_info = index_info
+            .as_ref()
+            .expect("an index comparison needs a cursor opened on an index");
+        crate::turso_debug_assert!(
+            cursor
+                .index_info()
+                .is_some_and(|own| Arc::ptr_eq(own, index_info)),
+            "the cursor's index info is not the one stored beside it"
+        );
+        (cursor, index_info)
     }
 
     pub fn as_pseudo_mut(&mut self) -> &mut PseudoCursor {
@@ -3503,8 +3610,8 @@ impl Cursor {
     /// Move the cursor to a synthetic null row. See [Insn::NullRow]
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
-            Self::BTree(cursor) => cursor.set_null_flag(flag),
-            Self::Dyn(cursor) => cursor.set_null_flag(flag),
+            Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
+            Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
@@ -3522,6 +3629,20 @@ impl Cursor {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
             }
+        }
+    }
+
+    /// Whether the cursor is on a synthetic null row. See [Insn::NullRow]
+    pub fn get_null_flag(&self) -> bool {
+        match self {
+            Self::BTree(cursor, ..) => cursor.get_null_flag(),
+            Self::Dyn(cursor, ..) => cursor.get_null_flag(),
+            Self::Virtual(cursor) => cursor.get_null_flag(),
+            Self::NullRow => true,
+            Self::IndexMethod(_)
+            | Self::Pseudo(_)
+            | Self::Sorter(_)
+            | Self::MaterializedView(_) => false,
         }
     }
 }
@@ -3631,7 +3752,7 @@ impl<T> IOResult<T> {
     }
 }
 
-/// Evaluate a IOResultOr<T>, if IO return IO.
+/// Evaluate a [`IOResultOr<T>`], if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -3674,7 +3795,7 @@ pub enum SeekResult {
     /// In this case Seek can position cursor to the leaf page boundaries (before the start, after the end)
     /// (e.g. if leaf page holds rows with keys from range [1..10], key 10 is absent and [SeekOp] is >= 10)
     ///
-    /// turso-db has this extra [SeekResult] in order to make [BTreeCursor::seek] method to position cursor at
+    /// turso-db has this extra [SeekResult] in order to make `BTreeCursor::seek` method to position cursor at
     /// the leaf of potential insertion, but also communicate to caller the fact that current cursor position
     /// doesn't hold a matching entry
     /// (necessary for Seek{XX} VM op-codes, so these op-codes will try to advance cursor in order to move it to matching entry)
@@ -3796,24 +3917,32 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
+    use asserting::prelude::*;
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {
-        for len in 0..40 {
-            let mut ascii: Vec<u8> = vec![];
-            ascii.extend((0..len).map(|i| b'a' + (i % 26) as u8));
-            assert!(is_ascii(&ascii), "length {len}");
-            assert_eq!(validate_utf8(&ascii), std::str::from_utf8(&ascii).ok());
-            for position in 0..len {
-                let mut bytes = ascii.clone();
-                bytes[position] = 0xc3;
-                assert!(!is_ascii(&bytes), "length {len}, byte {position}");
-                assert_eq!(validate_utf8(&bytes), std::str::from_utf8(&bytes).ok());
+        for len in (0..=129).chain([255, 256, 257, 511, 512, 513, 528]) {
+            for offset in 0..64 {
+                let mut bytes = vec![b'a'; len + offset];
+                let ascii = &bytes[offset..];
+                assert_that!(is_ascii(ascii))
+                    .described_as(format!("length {len}, offset {offset}"))
+                    .is_true();
+                assert_that!(validate_utf8(ascii)).is_equal_to(std::str::from_utf8(ascii).ok());
+                for position in 0..len {
+                    bytes[offset + position] = 0xc3;
+                    let data = &bytes[offset..];
+                    assert_that!(is_ascii(data))
+                        .described_as(format!("length {len}, offset {offset}, byte {position}"))
+                        .is_false();
+                    assert_that!(validate_utf8(data)).is_equal_to(std::str::from_utf8(data).ok());
+                    bytes[offset + position] = b'a';
+                }
             }
         }
         let text = "héllo wörld, ünïcödé";
-        assert!(!is_ascii(text.as_bytes()));
-        assert_eq!(validate_utf8(text.as_bytes()), Some(text));
+        assert_that!(is_ascii(text.as_bytes())).is_false();
+        assert_that!(validate_utf8(text.as_bytes())).is_equal_to(Some(text));
     }
 
     fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])

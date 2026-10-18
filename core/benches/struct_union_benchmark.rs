@@ -8,8 +8,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -19,7 +17,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use turso_core::io::MemoryIO;
-use turso_core::{Database, DatabaseOpts, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -40,7 +38,7 @@ fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     (db, conn)
 }
 
@@ -368,54 +366,11 @@ fn bench_union_tag(criterion: &mut Criterion) {
 
 // ── criterion wiring ───────────────────────────────────────────────────
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_select_one;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_select_one_field
-}
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_select_two;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_select_two_fields
-}
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_where;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_where_filter
-}
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_insert;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_insert
-}
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_union_extract;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_union_extract
-}
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = grp_union_tag;
-    config = Criterion::default().with_profiler(PProfProfiler::new(1000, Output::Flamegraph(None)));
-    targets = bench_union_tag
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_select_one, bench_select_one_field);
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_select_two, bench_select_two_fields);
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_where, bench_where_filter);
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_insert, bench_insert);
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_union_extract, bench_union_extract);
-#[cfg(feature = "codspeed")]
 criterion_group!(grp_union_tag, bench_union_tag);
 
 criterion_main!(

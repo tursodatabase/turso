@@ -382,7 +382,7 @@ mod tests {
     use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::SqliteDialect;
-    use crate::{Connection, Database, OpenFlags};
+    use crate::{ConnectOpts, Connection, Database, OpenFlags};
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -410,7 +410,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, value INTEGER)")?;
@@ -1938,8 +1938,8 @@ mod tests {
                 Ok(IOResult::Done(false))
             }
 
-            fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
-                Ok(IOResult::Done(None))
+            fn clear_btree(&mut self) -> IOResultOr<u64> {
+                Ok(IOResult::Done(0))
             }
 
             fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
@@ -1968,8 +1968,8 @@ mod tests {
 
             fn set_has_record(&mut self, _has_record: bool) {}
 
-            fn get_index_info(&self) -> &Arc<IndexInfo> {
-                &self.index_info
+            fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+                Some(&self.index_info)
             }
 
             fn seek_end(&mut self) -> IOResultOr<()> {

@@ -79,6 +79,7 @@ pub(super) fn do_emit_table_column(
         }
         _ => {
             program.emit_column_or_rowid(cursor_id, column_index, target_register);
+            maybe_apply_affinity(column.ty(), target_register, program);
         }
     }
     Ok(())

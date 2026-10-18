@@ -313,6 +313,13 @@ impl TypeDef {
         }
     }
 
+    /// True when stored values are read back unchanged (no DECODE, or `DECODE value`).
+    pub fn decode_returns_value_unchanged(&self) -> bool {
+        self.decode().is_none_or(
+            |decode| matches!(decode, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")),
+        )
+    }
+
     /// Returns the base type name.
     pub fn base(&self) -> &str {
         match &self.kind {
@@ -784,7 +791,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -973,6 +980,40 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// Returns whether a domain in the column's type chain has NOT NULL, and the
+    /// domain CHECK constraints with `value` rewritten to the column name.
+    pub fn column_domain_constraints(
+        &self,
+        column: &Column,
+    ) -> Result<(bool, Vec<CheckConstraint>)> {
+        let mut not_null = false;
+        let mut checks = vec![];
+        let Ok(Some(resolved)) = self.resolve_type_unchecked(&column.ty_str) else {
+            return Ok((not_null, checks));
+        };
+        if !resolved.is_domain() {
+            return Ok((not_null, checks));
+        }
+        let col_name = column.name.as_deref().unwrap_or("").to_string();
+        for td in &resolved.chain {
+            not_null |= td.not_null;
+            for (i, dc) in td.domain_checks.iter().enumerate() {
+                let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                let name = dc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", td.name, i));
+                checks.try_push(CheckConstraint {
+                    name: Some(name),
+                    expr: *rewritten,
+                    source: None,
+                    column: Some(col_name.clone()),
+                })?;
+            }
+        }
+        Ok((not_null, checks))
+    }
+
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_name.to_lowercase());
     }
@@ -1057,7 +1098,9 @@ impl Schema {
     /// used by both initial database open and schema reparse.
     pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql)?;
+            self.add_type_from_sql(sql).map_err(|e| {
+                crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
+            })?;
         }
         self.resolve_all_custom_type_affinities()?;
         Ok(())
@@ -1281,7 +1324,7 @@ impl Schema {
         Ok(())
     }
 
-    /// Like [`remove_triggers_for_table`] but only removes triggers whose
+    /// Like [`Self::remove_triggers_for_table`] but only removes triggers whose
     /// `target_database_id` matches `target_db` (or is `None`, meaning
     /// "targets the parent schema's table of this name", which also
     /// applies). Used from `DROP TABLE main.t` to clean up temp triggers
@@ -1336,6 +1379,18 @@ impl Schema {
             .flatten()
             .find(|t| t.name == name)
             .cloned()
+    }
+
+    pub(crate) fn copy_table_valued_functions(&mut self, source: &Schema) {
+        for (name, table) in &source.tables {
+            if matches!(table.as_ref(), Table::Virtual(vtab)
+                if vtab.kind == turso_ext::VTabKind::TableValuedFunction)
+            {
+                self.tables
+                    .entry(name.clone())
+                    .or_insert_with(|| table.clone());
+            }
+        }
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
@@ -1456,6 +1511,31 @@ impl Schema {
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
+    }
+
+    pub fn get_unowned_backing_btrees(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.indexes
+            .get(&name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+            .filter(|i| i.is_backing_btree_index() && !self.backing_btree_has_owner(i))
+    }
+
+    fn backing_btree_has_owner(&self, backing_btree: &Index) -> bool {
+        self.indexes
+            .values()
+            .flatten()
+            .filter_map(|index| index.index_method.as_ref())
+            .filter(|method| !method.definition().backing_btree)
+            .any(|method| {
+                method.backing_schema().indexes.iter().any(|owned| {
+                    normalize_ident(&owned.name) == normalize_ident(&backing_btree.name)
+                })
+            })
     }
 
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -1943,7 +2023,7 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
+            let cols = incremental_view.column_schema.flat_columns()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
@@ -2285,7 +2365,7 @@ impl Schema {
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
+                            let mut final_columns = view_column_schema.flat_columns()?;
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     // as_str: Display would render the quoted form,
@@ -2706,6 +2786,7 @@ impl TryClone for FromClauseSubquery {
             name: self.name.clone(),
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
+            parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
             cte: self.cte,
@@ -3035,6 +3116,13 @@ impl Table {
                     .as_ref()
                     .is_some_and(|n| n.eq_ignore_ascii_case(name))
             }),
+        }
+    }
+
+    pub(crate) fn parenthesized_join_columns(&self) -> Option<&[ParenthesizedJoinColumn]> {
+        match self {
+            Self::FromClauseSubquery(subquery) => subquery.parenthesized_join_columns.as_deref(),
+            _ => None,
         }
     }
 
@@ -3370,23 +3458,18 @@ impl BTreeTable {
     }
 
     /// Create a table reference for TypeCheck where custom type columns have
-    /// their `ty_str` replaced with the base type name, and where virtual columns
-    /// are skipped. This ensures TypeCheck validates the encoded value against the
+    /// their `ty_str` replaced with the base type name.
+    /// This ensures TypeCheck validates the encoded value against the
     /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
     pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
-        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
-        if has_virtual {
-            modified.columns.retain(|c| !c.is_virtual_generated());
-            modified.has_virtual_columns = false;
-        }
         for col in &mut modified.columns {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
@@ -3409,41 +3492,16 @@ impl BTreeTable {
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
     ) -> Result<Arc<BTreeTable>> {
-        let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom {
             return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
-        let remapped_only_columns = if has_virtual {
-            let remapped = only_columns
-                .map(|only| {
-                    let mut new_set = ColumnMask::default();
-                    let mut physical = 0usize;
-                    for (orig, col) in modified.columns.iter().enumerate() {
-                        if col.is_virtual_generated() {
-                            continue;
-                        }
-                        if only.get(orig) {
-                            new_set.set(physical)?;
-                        }
-                        physical += 1;
-                    }
-                    Ok::<_, LimboError>(new_set)
-                })
-                .transpose()?;
-            modified.columns.retain(|c| !c.is_virtual_generated());
-            modified.has_virtual_columns = false;
-            remapped
-        } else {
-            None
-        };
-        let effective_only = remapped_only_columns.as_ref().or(only_columns);
         for (i, col) in modified.columns.iter_mut().enumerate() {
-            if let Some(only) = effective_only {
+            if let Some(only) = only_columns {
                 if !only.get(i) {
                     col.ty_str = "ANY".to_string();
                     col.override_affinity(Affinity::Blob);
@@ -3494,42 +3552,13 @@ impl BTreeTable {
         if !self.is_strict {
             return Ok(());
         }
-        // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = vec![];
-        let mut notnull_cols = vec![];
-
-        for (col_idx, col) in self.columns.iter().enumerate() {
-            let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
-                continue;
-            };
-            if !resolved.is_domain() {
-                continue;
+        for col in self.columns.iter_mut() {
+            let (not_null, checks) = schema.column_domain_constraints(col)?;
+            if not_null {
+                col.set_notnull(true);
             }
-            let col_name = col.name.as_deref().unwrap_or("").to_string();
-            for td in &resolved.chain {
-                if td.not_null {
-                    notnull_cols.try_push(col_idx)?;
-                }
-                for (i, dc) in td.domain_checks.iter().enumerate() {
-                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
-                    let name = dc
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.try_push(CheckConstraint {
-                        name: Some(name),
-                        expr: *rewritten,
-                        source: None,
-                        column: Some(col_name.clone()),
-                    })?;
-                }
-            }
+            self.check_constraints.try_extend(checks)?;
         }
-
-        for col_idx in notnull_cols {
-            self.columns[col_idx].set_notnull(true);
-        }
-        self.check_constraints.try_extend(new_checks)?;
         Ok(())
     }
 
@@ -3597,7 +3626,10 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
-        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        let needs_pk_inline = self.primary_key_columns.len() == 1
+            && self
+                .primary_key_constraint_collation(&self.primary_key_columns[0].0)
+                .is_none();
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -3610,6 +3642,16 @@ impl BTreeTable {
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                if !column.ty_params.is_empty() {
+                    sql.push('(');
+                    for (i, param) in column.ty_params.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&param.to_string());
+                    }
+                    sql.push(')');
+                }
                 if column.is_array() {
                     sql.push_str("[]");
                 }
@@ -3619,13 +3661,19 @@ impl BTreeTable {
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
                 sql.push_str(" NOT NULL");
+                push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
             }
 
             if column.unique() {
                 sql.push_str(" UNIQUE");
+                push_on_conflict_clause(&mut sql, self.inline_unique_conflict_clause(column_name));
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if !column.is_rowid_alias() && self.primary_key_columns[0].1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
+                push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
                 if self.has_autoincrement && column.is_rowid_alias() {
                     sql.push_str(" AUTOINCREMENT");
                 }
@@ -3636,21 +3684,7 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let Some(collation) = column.collation_opt() {
-                match collation {
-                    CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
-                    CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
-                    CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
-                    CollationSeq::Locale(_) => {
-                        sql.push_str(" COLLATE ");
-                        sql.push_str(&quote_ident(&collation.name()));
-                    }
-                    CollationSeq::Unset | CollationSeq::Custom(_) => {
-                        // Unset should not be reachable -- ignore it
-                        // Custom collation is not allowed in schema definitions
-                    }
-                };
-            }
+            push_collation(&mut sql, column.collation_opt());
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
                 if column.generated_always {
@@ -3683,9 +3717,14 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&col.0);
+                sql.push_str(&quote_ident(&col.0));
+                push_collation(&mut sql, self.primary_key_constraint_collation(&col.0));
+                if col.1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
+            push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
         }
 
         for fk in &self.foreign_keys {
@@ -3694,18 +3733,20 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(&quote_ident(col));
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
-            sql.push('(');
-            for (i, col) in fk.parent_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            sql.push_str(&quote_ident(&fk.parent_table));
+            if !fk.parent_columns.is_empty() {
+                sql.push('(');
+                for (i, col) in fk.parent_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&quote_ident(col));
                 }
-                sql.push_str(col);
+                sql.push(')');
             }
-            sql.push(')');
 
             // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
             if fk.on_delete != RefAct::NoAction {
@@ -3768,8 +3809,13 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&unique_column.name));
+                push_collation(&mut sql, unique_column.collation);
+                if unique_column.sort_order == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
+            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
         }
 
         sql.push(')');
@@ -3787,6 +3833,41 @@ impl BTreeTable {
         }
 
         sql
+    }
+
+    fn inline_unique_conflict_clause(&self, column_name: &str) -> Option<ResolveType> {
+        let is_single_column_set = |unique_set: &&UniqueSet| {
+            unique_set.columns.len() == 1
+                && unique_set.columns[0].name.eq_ignore_ascii_case(column_name)
+        };
+        self.unique_sets
+            .iter()
+            .filter(is_single_column_set)
+            .find(|unique_set| !unique_set.is_primary_key)
+            .or_else(|| self.unique_sets.iter().find(is_single_column_set))
+            .and_then(|unique_set| unique_set.conflict_clause)
+    }
+
+    fn primary_key_conflict_clause(&self) -> Option<ResolveType> {
+        self.unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .map_or(self.rowid_alias_conflict_clause, |unique_set| {
+                unique_set.conflict_clause
+            })
+    }
+
+    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<CollationSeq> {
+        self.unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .and_then(|unique_set| {
+                unique_set
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+            })
+            .and_then(|column| column.collation)
     }
 
     fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
@@ -3976,6 +4057,38 @@ impl BTreeTable {
     }
 }
 
+fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType>) {
+    let Some(conflict_clause) = conflict_clause else {
+        return;
+    };
+    sql.push_str(match conflict_clause {
+        ResolveType::Rollback => " ON CONFLICT ROLLBACK",
+        ResolveType::Abort => " ON CONFLICT ABORT",
+        ResolveType::Fail => " ON CONFLICT FAIL",
+        ResolveType::Ignore => " ON CONFLICT IGNORE",
+        ResolveType::Replace => " ON CONFLICT REPLACE",
+    });
+}
+
+fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
+    let Some(collation) = collation else {
+        return;
+    };
+    match collation {
+        CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
+        CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
+        CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+        CollationSeq::Locale(_) => {
+            sql.push_str(" COLLATE ");
+            sql.push_str(&quote_ident(&collation.name()));
+        }
+        CollationSeq::Unset | CollationSeq::Custom(_) => {
+            // Unset should not be reachable -- ignore it
+            // Custom collation is not allowed in schema definitions
+        }
+    };
+}
+
 /// Topologically sorted generated columns, yielding `(column_index, &Column)`.
 pub(crate) struct ColumnsTopologicalSort<'a> {
     columns: &'a [Column],
@@ -4018,6 +4131,13 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
+    /// Source names for a parenthesized join. SQLite stores these in
+    /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
+    ///
+    /// Turso keeps the same data here because outer name binding sees this
+    /// derived table, not the inner result expressions. Each item describes
+    /// the column at the same position in `columns`.
+    pub(crate) parenthesized_join_columns: Option<Vec<ParenthesizedJoinColumn>>,
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
@@ -4027,6 +4147,88 @@ pub struct FromClauseSubquery {
     /// CTE-specific materialization metadata, when this FROM-subquery is a CTE
     /// reference rather than an inline derived table.
     pub cte: Option<FromClauseSubqueryCteMetadata>,
+}
+
+/// Name data that an outer query can use through a parenthesized join.
+#[derive(Debug, Clone)]
+pub(crate) struct ParenthesizedJoinColumn {
+    /// The name that SQLite keeps for later name binding.
+    pub(crate) source: ParenthesizedJoinColumnSource,
+    /// The ways in which an outer query can use this column.
+    pub(crate) visibility: ParenthesizedJoinColumnVisibility,
+}
+
+/// This value tells how an outer query can read a column from a parenthesized join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParenthesizedJoinColumnVisibility {
+    /// Bare names, qualified names, and `*` can use this column.
+    Visible,
+    /// Only a qualified name can use this column.
+    QualifiedOnly,
+    /// Bare and qualified names can use this column, but `*` omits it.
+    HiddenFromStar,
+}
+
+/// The source name of a result column from a parenthesized join.
+#[derive(Debug, Clone)]
+pub(crate) enum ParenthesizedJoinColumnSource {
+    /// SQLite inserts one name that represents all copies merged by `USING`.
+    Using { column_name: String },
+    /// Turso keeps these names separate because quoted names can contain dots.
+    /// SQLite's dot-separated string cannot represent those names.
+    Table {
+        database_id: Option<usize>,
+        table_name: String,
+        column_name: String,
+    },
+    /// An implicit rowid keeps its table name but matches each rowid alias.
+    RowId {
+        database_id: Option<usize>,
+        table_name: String,
+    },
+}
+
+impl ParenthesizedJoinColumnSource {
+    pub(crate) fn matches_table(&self, database_id: Option<usize>, table_name: &str) -> bool {
+        match self {
+            Self::Using { .. } => false,
+            Self::Table {
+                database_id: saved_database,
+                table_name: saved_table,
+                ..
+            }
+            | Self::RowId {
+                database_id: saved_database,
+                table_name: saved_table,
+            } => {
+                database_id.is_none_or(|database| *saved_database == Some(database))
+                    && saved_table.eq_ignore_ascii_case(table_name)
+            }
+        }
+    }
+
+    pub(crate) fn matches_column_name(&self, column_name: &str) -> bool {
+        match self {
+            Self::Using {
+                column_name: saved_column,
+            }
+            | Self::Table {
+                column_name: saved_column,
+                ..
+            } => saved_column.eq_ignore_ascii_case(column_name),
+            Self::RowId { .. } => ROWID_STRS
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column_name)),
+        }
+    }
+
+    pub(crate) fn is_rowid(&self) -> bool {
+        matches!(self, Self::RowId { .. })
+    }
+
+    pub(crate) fn is_using(&self) -> bool {
+        matches!(self, Self::Using { .. })
+    }
 }
 
 /// The one-row table read by the recursive part of a recursive CTE.
@@ -5301,6 +5503,18 @@ impl Column {
         self.info.affinity()
     }
 
+    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
+        use crate::types::ValueType;
+        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
+            b"INTEGER" | b"INT" => Some(ValueType::Integer),
+            b"REAL" => Some(ValueType::Float),
+            b"BLOB" => Some(ValueType::Blob),
+            b"TEXT" => Some(ValueType::Text),
+            // ANY and custom types
+            _ => None,
+        })
+    }
+
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -6000,7 +6214,7 @@ impl Index {
     pub fn column_table_pos_to_index_pos(&self, table_pos: usize) -> Option<usize> {
         self.columns
             .iter()
-            .position(|c| c.pos_in_table == table_pos)
+            .position(|c| c.pos_in_table == table_pos && c.expr.is_none())
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.

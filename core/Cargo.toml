@@ -37,7 +37,7 @@ conn_raw_api = []
 aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs"]
 json = []
-uuid = ["dep:uuid"]
+uuid = []
 io_uring = ["dep:io-uring", "rustix/io_uring"]
 experimental_win_iocp = []
 time = []
@@ -56,7 +56,7 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
-fts = ["dep:tantivy", "dep:serde_json", "dep:crc32fast"]
+fts = ["dep:tantivy", "dep:tantivy-common", "dep:serde", "dep:serde_json", "dep:crc32fast"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
@@ -86,6 +86,7 @@ libc = { version = "0.2.172" }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
 tantivy = { version = "0.26.2", optional = true }
+tantivy-common = { version = "0.11.0", optional = true }
 crc32fast = { version = "1", optional = true }
 
 [dependencies]
@@ -124,7 +125,7 @@ bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 pastey = "0.2.1"
-uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
+uuid = { version = "1.11.0", features = ["v4", "v5", "v7"] }
 tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
@@ -158,7 +159,7 @@ simsimd = { version = "6.5.3", optional = true }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 # From  aes-gcm
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-uuid = { version = "1.11.0", features = ["js"], optional = true }
+uuid = { version = "1.11.0", features = ["js"] }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full"] }
@@ -181,10 +182,8 @@ aegis = { version = "0.9.8" }
 [build-dependencies]
 cfg_aliases = "0.2.1"
 
-[target.'cfg(not(target_family = "windows"))'.dev-dependencies]
-pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
-
 [dev-dependencies]
+asserting = { workspace = true }
 memory-stats = "1.2.0"
 serde_json = { workspace = true }
 criterion = { workspace = true, features = [
@@ -223,6 +222,10 @@ harness = false
 
 [[bench]]
 name = "mvcc_recovery_benchmark"
+harness = false
+
+[[bench]]
+name = "checkpoint_n_rows"
 harness = false
 
 [[bench]]

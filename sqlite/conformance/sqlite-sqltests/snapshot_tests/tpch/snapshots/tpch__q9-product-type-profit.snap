@@ -49,6 +49,5 @@ QUERY PLAN
 |  |--HASH JOIN lineitem
 |  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+|  `--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR GROUP BY

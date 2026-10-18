@@ -14,7 +14,8 @@ use crate::util::IOExt;
 use crate::vdbe::Row;
 use crate::Result;
 use crate::{
-    Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore, OpenFlags, SyncMode,
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore,
+    OpenFlags, SyncMode,
 };
 use turso_macros::{turso_assert, turso_assert_eq};
 
@@ -314,10 +315,10 @@ pub(crate) fn open_vacuum_temp_db(
         )?,
     };
     let conn = match page_codec {
-        Some(codec) => db.connect_with_page_codec(codec)?,
-        None => db.connect_with_encryption(encryption_key)?,
+        Some(codec) => db.connect(ConnectOpts::new().with_page_codec(codec))?,
+        None => db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?,
     };
-    conn.reset_page_size(page_size)?;
+    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 
@@ -348,13 +349,19 @@ fn finalize_vacuum_target_header(
 ) -> crate::types::IOResultOr<()> {
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
-        return mv_store
-            .with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())
-            .map(crate::IOResult::Done)
-            .map_err(Into::into);
+        mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
+        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+        return Ok(crate::IOResult::Done(()));
     }
     let pager = target_conn.pager.load();
     pager.with_header_mut(|header| header_meta.apply_to(header))
+}
+
+fn set_mvcc_schema_version_from_header_cookie(
+    target_conn: &Arc<Connection>,
+    schema_cookie: u32,
+) -> Result<()> {
+    target_conn.with_schema_mut(|schema| schema.schema_version = schema_cookie)
 }
 
 /// Finish a VACUUM INTO output database with durable on-disk state.
@@ -2420,8 +2427,8 @@ mod tests {
     use crate::vdbe::execute::TransactionYieldPoint;
     use crate::SqliteDialect;
     use crate::{
-        Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
-        WallClockInstant, IO,
+        Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
+        OpenFlags, WallClockInstant, IO,
     };
     use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
@@ -2760,7 +2767,7 @@ mod tests {
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -2796,7 +2803,7 @@ mod tests {
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -2850,7 +2857,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         // Source is uninitialized so its header reserved_space isn't usable.
         // Derive from the IOContext to keep reserved_space and the auto-
         // installed checksum context consistent under `feature = "checksum"`.
@@ -2921,7 +2928,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
         conn.wal_auto_actions_disable();
 
@@ -2969,7 +2976,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
         source_conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
         for id in 1..=8 {
@@ -2991,7 +2998,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let target_conn = target_db.connect()?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
         mirror_symbols(&source_conn, &target_conn);
 
         let config = VacuumTargetBuildConfig {
@@ -3054,7 +3061,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
 
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -3100,7 +3107,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
         conn.execute("INSERT INTO t VALUES (1, 'x')")?;
@@ -3143,7 +3150,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
         let mut source_header = DatabaseHeader::default();
@@ -3184,6 +3191,62 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.db");
+        let target_path = target_path.to_str().unwrap();
+        let target_db = Database::open_file_with_flags(
+            io,
+            target_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
+        target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        target_conn.wal_auto_actions_disable();
+
+        target_conn.execute("BEGIN IMMEDIATE")?;
+        target_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        target_conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+
+        let mut source_header = DatabaseHeader::default();
+        source_header.schema_cookie = 41.into();
+        source_header.user_version = 17.into();
+        source_header.application_id = 29.into();
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
+
+        match finalize_vacuum_target_header(&target_conn, &header_meta)? {
+            crate::IOResult::Done(()) => {}
+            crate::IOResult::IO(_) => panic!("MVCC header update should not need async I/O"),
+        }
+        target_conn.execute("COMMIT")?;
+        target_conn.checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+
+        let pager = target_conn.pager.load();
+        let on_disk = pager.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.schema_cookie.get(),
+                    header.user_version.get(),
+                    header.application_id.get(),
+                )
+            })
+        })?;
+        assert_eq!(on_disk, (42, 17, 29));
+
+        let schema_version = target_conn.pragma_query("schema_version")?;
+        assert_eq!(schema_version, vec![vec![crate::Value::from_i64(42)]]);
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn internal_vacuum_temp_db_uses_source_runtime_and_disables_auto_checkpoint() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -3197,7 +3260,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
 
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
@@ -3233,7 +3296,7 @@ mod tests {
             }),
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect_with_encryption(Some(key))?;
+        let source_conn = source_db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         let reserved_space = source_conn
             .get_reserved_bytes()
             .expect("encrypted source should have reserved bytes");
@@ -3266,7 +3329,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let target_conn = target_db.connect()?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("CREATE TABLE seed(x)")?;
 
         let mut context = VacuumTargetBuildContext::new(target_conn.clone());

@@ -1568,3 +1568,47 @@ test nocase-index-does-not-serve-binary-comparison {
 }
 expect {
 }
+
+@cross-check-integrity
+test group_concat_column_uses_binary_collation {
+    CREATE TABLE t(value TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('abc'), ('ABC'), ('Abc'), ('abc');
+    SELECT count(*) FROM t GROUP BY value ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') COLLATE NOCASE ORDER BY 1;
+}
+expect {
+    4
+    1
+    1
+    2
+    4
+}
+
+@cross-check-integrity
+test order_concat_column_uses_binary_collation {
+    CREATE TABLE t(id INTEGER, value TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc  '), (2, 'abc'), (3, 'abc '), (4, 'ABC');
+    SELECT id FROM t ORDER BY value, id;
+    SELECT id FROM t ORDER BY (value || ''), id;
+    SELECT id FROM t ORDER BY (value || ''), id LIMIT 4;
+    SELECT id FROM t ORDER BY value COLLATE NOCASE, id;
+}
+expect {
+    4
+    1
+    2
+    3
+    4
+    2
+    3
+    1
+    4
+    2
+    3
+    1
+    2
+    4
+    3
+    1
+}

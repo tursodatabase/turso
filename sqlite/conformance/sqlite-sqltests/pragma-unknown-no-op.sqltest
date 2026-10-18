@@ -31,3 +31,23 @@ test known-pragma-still-works {
 expect {
     0
 }
+
+test unknown-pragma-unknown-schema {
+    PRAGMA nosuch.concurrent_mode=ON;
+}
+expect error {
+}
+
+test unknown-pragma-known-schema {
+    PRAGMA main.concurrent_mode=ON;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test known-pragma-unknown-schema {
+    PRAGMA nosuch.user_version;
+}
+expect error {
+}

@@ -1013,6 +1013,13 @@ impl ToTokens for Expr {
                 filter_over.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::MergedColumn(columns) => {
+                // EXPLAIN shows a merged USING column as `coalesce(t1.a, t2.a)`, as SQLite does.
+                s.append(TK_ID, Some("coalesce"))?;
+                s.append(TK_LP, None)?;
+                comma(columns, s, context)?;
+                s.append(TK_RP, None)
+            }
             Self::Id(id) => id.to_tokens(s, context),
             Self::Column { table, column, .. } => {
                 let (tbl_name, col_name) = context.get_table_and_column_names(*table, *column);
@@ -1494,7 +1501,14 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::Select(select, alias) => {
+            Self::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    s.append(TK_LATERAL, None)?;
+                }
                 s.append(TK_LP, None)?;
                 select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;

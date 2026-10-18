@@ -1,6 +1,6 @@
 use crate::vdbe::{
     builder::CursorType,
-    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+    insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
@@ -201,6 +201,22 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("Set cursor {cursor_id} to a (pseudo) NULL row"),
+            ),
+            Insn::IfNullRow {
+                cursor_id,
+                target_pc,
+                dest,
+            } => (
+                "IfNullRow",
+                *cursor_id as i64,
+                target_pc.as_debug_int() as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if {cursor_id}.nullRow then r[{dest}]=NULL, goto {}",
+                    target_pc.as_debug_int()
+                ),
             ),
             Insn::NotNull { reg, target_pc } => (
                 "NotNull",
@@ -703,6 +719,15 @@ pub fn insn_to_row(
                     "if cursor {} record has field {} goto {}",
                     cursor_id, column, target_pc.as_debug_int()
                 ),
+            ),
+            Insn::IsType { reg, target_pc, value_type } => (
+                "IsType",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(value_type.to_string()),
+                0,
+                String::new(),
             ),
             Insn::TypeCheck {
                 start_reg,
@@ -1222,6 +1247,15 @@ pub fn insn_to_row(
                 "DeferredSeek",
                 *index_cursor_id as i64,
                 *table_cursor_id as i64,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
+            Insn::FinishSeek { cursor_id } => (
+                "FinishSeek",
+                *cursor_id as i64,
+                0,
                 0,
                 Value::build_text(""),
                 0,
@@ -1792,11 +1826,11 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::ClearBtree { db, root } => (
+            Insn::ClearBtree { db, root, count } => (
                 "ClearBtree",
                 *root,
                 *db as i64,
-                0,
+                i64::from(*count == ClearBtreeCount::ChangesAndRowsWritten),
                 Value::build_text(""),
                 0,
                 format!("root={root} iDb={db}"),

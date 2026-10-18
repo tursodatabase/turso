@@ -34,7 +34,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
    5    Ne               5   6  28  Binary           0  if r[5]!=r[6] goto 28
    6    Once            19   0   0                   0  goto 19
    7    OpenAutoindex    2   0   0                   0  cursor=2
-   8    Rewind           1   9   0                   0  Rewind table products
+   8    Rewind           1  19   0                   0  Rewind table products
    9      Column         1   2   8                   0  r[8]=products.category
   10      Ne             8   9  18  Binary           0  if r[8]!=r[9] goto 18
   11      Column         1   2  10                   0  r[10]=products.category

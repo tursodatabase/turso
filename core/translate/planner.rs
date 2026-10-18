@@ -5,9 +5,11 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        left_using_column_sources, merge_columns, query_output_columns, resolve_unqualified_column,
+        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType as PlanJoinType, JoinedTable, Operation,
+        OuterQueryReference, Plan, QueryDestination, ResolvedColumn, ResultSetColumn, Scan,
+        TableReferences, WhereTerm, WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -19,16 +21,20 @@ use crate::translate::{
         BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
+    subquery::outer_query_refs_for_correlated_subquery,
 };
 use crate::{
     ast::Limit,
     function::Func,
-    schema::Table,
+    schema::{
+        ParenthesizedJoinColumn, ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility,
+        Table,
+    },
     util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
 use crate::{
-    function::{AccumulatorFunc, AggFunc, ExtFunc, WindowFunc},
+    function::{AccumulatorFunc, AggFunc, WindowFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
@@ -109,9 +115,14 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
     Ok(definitions)
 }
 
-/// Collect all table names referenced in a SELECT's FROM clause.
-/// Used to determine which earlier CTEs a CTE directly depends on.
+/// Collect the table names that a SELECT, its subqueries, and its nested WITH
+/// clauses read in a FROM clause. Used to find the CTEs that a query reads.
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            collect_from_clause_table_refs(&cte.select, out);
+        }
+    }
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
@@ -270,7 +281,9 @@ impl RecursiveRefCounter<'_> {
                 }
                 count
             }
-            ast::SelectTable::Select(subselect, _) => self.count_select(subselect, scope),
+            ast::SelectTable::Select {
+                select: subselect, ..
+            } => self.count_select(subselect, scope),
             ast::SelectTable::Sub(from, _) => {
                 let mut count = self.count_from_table(&from.select, scope);
                 for join in &from.joins {
@@ -344,7 +357,7 @@ impl RecursiveRefCounter<'_> {
                             && !scope.iter().any(|(scope_name, _)| *scope_name == name),
                     )
                 }
-                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Select { .. } => 0,
                 ast::SelectTable::Sub(from, _) => {
                     count_direct_in_from_table(counter, &from.select, scope)
                         + from
@@ -389,7 +402,9 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
                 collect_subquery_table_refs_in_expr(arg, out);
             }
         }
-        ast::SelectTable::Select(subselect, _) => {
+        ast::SelectTable::Select {
+            select: subselect, ..
+        } => {
             collect_from_clause_table_refs(subselect, out);
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -429,6 +444,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
             columns,
             where_clause,
             group_by,
+            window_clause,
             ..
         } => {
             for column in columns {
@@ -447,6 +463,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
                     collect_subquery_table_refs_in_expr(having, out);
                 }
             }
+            collect_subquery_table_refs_in_window_clause(window_clause, out);
             if let ast::OneSelect::Select {
                 from: Some(from), ..
             } = one
@@ -468,7 +485,21 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+pub fn collect_subquery_table_refs_in_window_clause(
+    window_clause: &[ast::WindowDef],
+    out: &mut Vec<String>,
+) {
+    for window_def in window_clause {
+        for expr in &window_def.window.partition_by {
+            collect_subquery_table_refs_in_expr(expr, out);
+        }
+        for sorted in &window_def.window.order_by {
+            collect_subquery_table_refs_in_expr(&sorted.expr, out);
+        }
+    }
+}
+
+pub fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
             Expr::Exists(select) | Expr::Subquery(select) => {
@@ -611,7 +642,7 @@ pub fn resolve_window_and_aggregate_functions(
                             .resolve_function(name.as_str(), args_count)
                         {
                             let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                            if f.func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -638,14 +669,7 @@ pub fn resolve_window_and_aggregate_functions(
                             }
                         }
                     }
-                    _ => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-                    }
+                    _ => {}
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
@@ -693,13 +717,6 @@ pub fn resolve_window_and_aggregate_functions(
                         return Ok(WalkControl::SkipChildren);
                     }
                     Some(func) => {
-                        if filter_over.over_clause.is_some() {
-                            crate::bail_parse_error!(
-                                "{} may not be used as a window function",
-                                name.as_str()
-                            );
-                        }
-
                         // Check if the function supports (*) syntax using centralized logic
                         if func.supports_star_syntax() {
                             return Ok(WalkControl::Continue);
@@ -713,7 +730,7 @@ pub fn resolve_window_and_aggregate_functions(
                     None => {
                         if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
                             let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
+                            if f.func.is_aggregate() {
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -766,6 +783,15 @@ fn link_with_window(
 ) -> Result<()> {
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
+    }
+    if let AccumulatorFunc::Agg(AggFunc::External(_)) = &func {
+        let name = match expr {
+            Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => name.as_str(),
+            _ => "extension aggregate",
+        };
+        crate::bail_parse_error!(
+            "{name}() is an extension aggregate and cannot be used as a window function"
+        );
     }
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
@@ -879,8 +905,8 @@ fn resolve_effective_frame(
     func: &AccumulatorFunc,
     user_frame: Option<crate::translate::plan::Frame>,
 ) -> Result<crate::translate::plan::Frame> {
-    use crate::translate::plan::{Frame, FrameBoundary};
-    use turso_parser::ast::FrameMode;
+    use crate::translate::plan::Frame;
+    use turso_parser::ast::{FrameBound, FrameMode};
 
     // Built-ins with a coerced frame ignore the user clause entirely
     // (`Some(_)` from `coerced_frame()`). The rest honor it.
@@ -893,8 +919,8 @@ fn resolve_effective_frame(
     let Some(frame) = user_frame else {
         return Ok(Frame {
             mode: FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
             exclude: None,
         });
     };
@@ -935,10 +961,7 @@ fn resolve_effective_frame(
         );
     // Anything but an UNBOUNDED PRECEDING start makes the frame shrink
     // from the left, firing xInverse.
-    let moving_start = !matches!(
-        frame.start,
-        crate::translate::plan::FrameBoundary::UnboundedPreceding
-    );
+    let moving_start = !matches!(frame.start, FrameBound::UnboundedPreceding);
     if moving_start && frame.exclude.is_none() && !supports_sliding {
         crate::bail_parse_error!(
             "{}() does not yet support window frames with a moving start; \
@@ -1215,7 +1238,7 @@ fn plan_cte(
                 identifier: referenced_cte_table.identifier.clone(),
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
-                using_dedup_hidden_cols: referenced_cte_table.using_dedup_hidden_cols()?,
+                join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 cte_select: None,
                 cte_explicit_columns: vec![],
@@ -1225,6 +1248,7 @@ fn plan_cte(
                 // actually adds the table.
                 cte_definition_only: true,
                 rowid_referenced: false,
+                outer_join_may_null_extend: false,
                 scope_depth: 0,
             });
         }
@@ -1416,13 +1440,14 @@ fn prepare_recursive_cte_plan(
         identifier: cte_definition.name.clone(),
         internal_id: input_table.internal_id,
         table: input_table.table,
-        using_dedup_hidden_cols: ColumnMask::default(),
+        join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
         cte_explicit_columns: cte_definition.explicit_columns.clone(),
         cte_id: None,
         cte_definition_only: false,
         rowid_referenced: false,
+        outer_join_may_null_extend: false,
         scope_depth: 0,
     });
 
@@ -1522,6 +1547,7 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
 #[turso_macros::trace_stack]
 pub fn plan_ctes_as_outer_refs(
     with: Option<With>,
+    subquery_table_refs: &[String],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
@@ -1532,35 +1558,14 @@ pub fn plan_ctes_as_outer_refs(
     };
 
     let cte_definitions = collect_cte_definitions(with, program)?;
-
-    let base_outer_query_refs =
-        base_outer_refs_for_cte_planning(table_references.outer_query_refs(), &cte_definitions);
-    for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-        let joined_table = plan_cte(
-            cte_definition_index,
-            &cte_definitions,
-            &base_outer_query_refs,
-            resolver,
-            program,
-            connection,
-            false,
-        )?;
-        table_references.add_outer_query_reference(OuterQueryReference {
-            identifier: cte_definition.name.clone(),
-            internal_id: joined_table.internal_id,
-            table: joined_table.table,
-            using_dedup_hidden_cols: ColumnMask::default(),
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
-            cte_explicit_columns: cte_definition.explicit_columns.clone(),
-            cte_id: Some(cte_definition.cte_id),
-            cte_definition_only: true,
-            rowid_referenced: false,
-            scope_depth: 0,
-        });
-    }
-
-    Ok(())
+    add_ctes_read_by_subqueries_as_outer_refs(
+        &cte_definitions,
+        subquery_table_refs,
+        resolver,
+        program,
+        table_references,
+        connection,
+    )
 }
 
 fn parse_from_clause_table(
@@ -1585,18 +1590,35 @@ fn parse_from_clause_table(
             indexed,
             connection,
         ),
-        ast::SelectTable::Select(subselect, maybe_alias) => {
+        ast::SelectTable::Select {
+            select: subselect,
+            alias: maybe_alias,
+            lateral,
+        } => {
+            let lateral = lateral && !table_references.joined_tables().is_empty();
+            let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = if lateral {
+                outer_query_refs_for_correlated_subquery(table_references)?
+                    .into_iter()
+                    .collect()
+            } else {
+                table_references.outer_query_refs().to_vec()
+            };
             // Make the parent's CTEs visible while planning this inline subquery.
-            let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
                 table_references.outer_query_refs(),
                 cte_definitions,
             );
+            let mut subquery_table_refs = Vec::new();
+            collect_from_clause_table_refs(&subselect, &mut subquery_table_refs);
+            let ctes_read = ctes_read_by(cte_definitions, &subquery_table_refs);
             for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-                if outer_query_refs_for_subquery
+                if !ctes_read[cte_definition_index] {
+                    continue;
+                }
+                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
                     .iter()
-                    .any(|reference| reference.identifier == cte_definition.name)
-                {
+                    .any(|reference| reference.identifier == cte_definition.name);
+                if name_used_by_table_on_the_left && !lateral {
                     continue;
                 }
                 // This plan only makes the name visible. A later FROM lookup performs
@@ -1614,26 +1636,37 @@ fn parse_from_clause_table(
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
-                    using_dedup_hidden_cols: ColumnMask::default(),
+                    join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: (!cte_definition.references_itself)
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: false,
+                    cte_definition_only: name_used_by_table_on_the_left,
                     rowid_referenced: false,
+                    outer_join_may_null_extend: false,
                     scope_depth: 0,
                 });
             }
 
-            let subplan = prepare_select_plan(
-                subselect,
-                resolver,
-                program,
-                &outer_query_refs_for_subquery,
-                QueryDestination::placeholder_for_subquery(),
-                connection,
-            )?;
+            let subplan = if lateral {
+                prepare_lateral_subquery_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    connection,
+                )?
+            } else {
+                prepare_select_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    QueryDestination::placeholder_for_subquery(),
+                    connection,
+                )?
+            };
             match &subplan {
                 Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {}
                 Plan::Delete(_) | Plan::Update(_) => {
@@ -1669,10 +1702,266 @@ fn parse_from_clause_table(
             None, // table-valued functions don't support INDEXED BY
             connection,
         ),
-        ast::SelectTable::Sub(..) => {
-            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+        ast::SelectTable::Sub(from_clause, maybe_alias) if from_clause.joins.is_empty() => {
+            // SQLite unwraps a one-source group. An outer alias replaces the
+            // alias inside the parentheses, including when the outer alias is absent.
+            let table = replace_select_table_alias(*from_clause.select, maybe_alias);
+            parse_from_clause_table(
+                table,
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )
+        }
+        ast::SelectTable::Sub(from_clause, maybe_alias) => {
+            // SQLite represents a parenthesized join group as a SELECT * subquery.
+            // It names an unaliased group "(join-N)" in query plans.
+            let alias = maybe_alias.unwrap_or_else(|| {
+                ast::As::As(ast::Name::exact(format!(
+                    "(join-{})",
+                    table_references.joined_tables().len()
+                )))
+            });
+            let join_select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Star],
+                        from: Some(from_clause),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: Vec::new(),
+                    },
+                    compounds: Vec::new(),
+                },
+                order_by: Vec::new(),
+                limit: None,
+            };
+            parse_from_clause_table(
+                ast::SelectTable::Select {
+                    select: join_select,
+                    alias: Some(alias),
+                    lateral: false,
+                },
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )?;
+            let table = table_references
+                .joined_tables_mut()
+                .last_mut()
+                .expect("the nested SELECT added one table");
+            keep_parenthesized_join_columns(table)
         }
     }
+}
+
+/// Keep the source columns that SQLite stores for a parenthesized join.
+///
+/// A normal `SELECT *` removes duplicate `USING` columns and all rowids.
+/// SQLite keeps those values because an outer query can use qualified names.
+fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
+    let Table::FromClauseSubquery(subquery) = &mut table.table else {
+        unreachable!("a parenthesized join must produce a subquery table");
+    };
+    let subquery = Arc::make_mut(subquery);
+    let Plan::Select(plan) = subquery.plan.as_mut() else {
+        unreachable!("a parenthesized join must produce one SELECT plan");
+    };
+
+    let source_tables = plan.table_references.joined_tables();
+    let mut result_columns = Vec::new();
+    let mut join_columns = crate::alloc::vec![];
+    let mut used_columns = Vec::new();
+
+    for (table_index, source_table) in source_tables.iter().enumerate() {
+        let next_using = source_tables
+            .get(table_index + 1)
+            .and_then(|next| next.join_info.as_ref())
+            .map(|join| join.using.as_slice())
+            .unwrap_or_default();
+
+        // SQLite stores one canonical value before the source columns on both
+        // sides of `USING`. Outer unqualified names find this value first.
+        for using_name in next_using {
+            let column_name = using_name.as_str();
+            let resolved = resolve_unqualified_column(source_tables, column_name)?
+                .expect("USING already proved that the column exists");
+            used_columns.extend(resolved.source_columns);
+            result_columns.push(parenthesized_join_result_column(resolved.expr, column_name));
+            join_columns.push(ParenthesizedJoinColumn {
+                source: ParenthesizedJoinColumnSource::Using {
+                    column_name: column_name.to_string(),
+                },
+                visibility: ParenthesizedJoinColumnVisibility::Visible,
+            });
+        }
+
+        let hidden_by_using = |column_name: &str| {
+            source_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.merges_column(column_name))
+                || next_using
+                    .iter()
+                    .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+        };
+
+        let database_id = matches!(source_table.table, Table::BTree(_) | Table::Virtual(_))
+            .then_some(source_table.database_id);
+        let source_join_columns = source_table.table.parenthesized_join_columns();
+        for (column_index, column) in source_table.columns().iter().enumerate() {
+            let Some(column_name) = column.name.as_deref() else {
+                continue;
+            };
+            let mut join_column = match source_join_columns {
+                // SQLite does not copy rowid entries through a second join group.
+                Some(saved) if saved[column_index].source.is_rowid() => continue,
+                Some(saved) => saved[column_index].clone(),
+                None if column.hidden() => continue,
+                None => ParenthesizedJoinColumn {
+                    source: ParenthesizedJoinColumnSource::Table {
+                        database_id,
+                        table_name: source_table.identifier.clone(),
+                        column_name: column_name.to_string(),
+                    },
+                    visibility: ParenthesizedJoinColumnVisibility::Visible,
+                },
+            };
+            if hidden_by_using(column_name) {
+                join_column.visibility = ParenthesizedJoinColumnVisibility::QualifiedOnly;
+            }
+            result_columns.push(parenthesized_join_result_column(
+                Expr::Column {
+                    database: None,
+                    table: source_table.internal_id,
+                    column: column_index,
+                    is_rowid_alias: column.is_rowid_alias(),
+                },
+                column_name,
+            ));
+            join_columns.push(join_column);
+            used_columns.push((source_table.internal_id, column_index));
+        }
+
+        let has_rowid = match &source_table.table {
+            Table::BTree(btree) => btree.has_rowid,
+            Table::Virtual(_) => true,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_) => false,
+        };
+        if !has_rowid {
+            continue;
+        }
+        // SQLite uses the first rowid alias that is not a declared column.
+        if let Some(rowid_name) = ["_ROWID_", "ROWID", "OID"]
+            .into_iter()
+            .find(|name| source_table.table.get_column_by_name(name).is_none())
+        {
+            result_columns.push(parenthesized_join_result_column(
+                Expr::RowId {
+                    database: None,
+                    table: source_table.internal_id,
+                },
+                rowid_name,
+            ));
+            join_columns.push(ParenthesizedJoinColumn {
+                source: ParenthesizedJoinColumnSource::RowId {
+                    database_id,
+                    table_name: source_table.identifier.clone(),
+                },
+                visibility: ParenthesizedJoinColumnVisibility::Visible,
+            });
+        }
+    }
+
+    plan.result_columns = result_columns;
+    for (table_id, column_index) in used_columns {
+        plan.table_references
+            .mark_column_used(table_id, column_index);
+    }
+
+    subquery.columns = query_output_columns(&subquery.plan, None)?;
+    assert_eq!(subquery.columns.len(), join_columns.len());
+    for column_index in 0..subquery.columns.len() {
+        let original_name = subquery.columns[column_index]
+            .name
+            .clone()
+            .expect("each generated join column has an alias");
+        let mut column_name = original_name.clone();
+        let mut suffix = 0;
+        let base_name = original_name
+            .rsplit_once(':')
+            .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .map_or(original_name.as_str(), |(base, _)| base);
+        while let Some(previous_index) =
+            subquery.columns[..column_index].iter().position(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column_name))
+            })
+        {
+            // SQLite omits every later collision from `*`. It also hides a
+            // repeated merged value from bare-name lookup. An unrelated source
+            // column stays visible to lookup and makes the bare name ambiguous.
+            if join_columns[previous_index].source.is_using() {
+                let join_column = &mut join_columns[column_index];
+                if join_column.source.is_using() {
+                    join_column.visibility = ParenthesizedJoinColumnVisibility::QualifiedOnly;
+                } else if join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+                {
+                    join_column.visibility = ParenthesizedJoinColumnVisibility::HiddenFromStar;
+                }
+            }
+            suffix += 1;
+            column_name = format!("{base_name}:{suffix}");
+        }
+        subquery.columns[column_index].name = Some(column_name);
+    }
+    subquery.parenthesized_join_columns = Some(join_columns);
+    Ok(())
+}
+
+fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetColumn {
+    ResultSetColumn {
+        expr,
+        alias: Some(column_name.to_string()),
+        implicit_column_name: None,
+        contains_aggregates: false,
+    }
+}
+
+fn prepare_lateral_subquery_plan(
+    select: Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    outer_query_refs: &[OuterQueryReference],
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    resolver.begin_collecting_aggregates_from_subqueries();
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        outer_query_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+    );
+    let aggregates_of_the_enclosing_query = resolver.take_aggregates_from_subqueries();
+    let plan = plan?;
+    if !aggregates_of_the_enclosing_query.is_empty() {
+        crate::bail_parse_error!(
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        );
+    }
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1740,7 +2029,7 @@ fn parse_table(
 
         // A CTE can read another CTE defined by the surrounding WITH clause.
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
@@ -1814,6 +2103,7 @@ fn parse_table(
                 };
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_table),
+                    unmatched_right_rows_plan: None,
                     table: outer_table,
                     identifier: alias.unwrap_or(normalized_qualified_name),
                     internal_id,
@@ -1851,6 +2141,7 @@ fn parse_table(
         };
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
+            unmatched_right_rows_plan: None,
             table: tbl_ref,
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id,
@@ -1891,7 +2182,11 @@ fn parse_table(
 
         return program.with_view_expansion(database_id, &view.name, |program| {
             parse_from_clause_table(
-                ast::SelectTable::Select(*subselect, view_alias),
+                ast::SelectTable::Select {
+                    select: *subselect,
+                    alias: view_alias,
+                    lateral: false,
+                },
                 resolver,
                 program,
                 table_references,
@@ -1933,7 +2228,7 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
-        let columns = view_guard.column_schema.flat_columns();
+        let columns = view_guard.column_schema.flat_columns()?;
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),
@@ -1954,6 +2249,7 @@ fn parse_table(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(btree_table),
             identifier: alias.unwrap_or(normalized_qualified_name),
             internal_id: program.table_reference_counter.next(),
@@ -1974,11 +2270,12 @@ fn parse_table(
     // but it's not part of the join order.
     if qualified_name.db_name.is_none() {
         if let Some(outer_ref) =
-            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+            table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_ref.table),
+                    unmatched_right_rows_plan: None,
                     table: outer_ref.table.clone(),
                     identifier: outer_ref.identifier.clone(),
                     internal_id: program.table_reference_counter.next(),
@@ -2101,7 +2398,7 @@ pub fn parse_from(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     with: Option<With>,
-    preplan_ctes_for_non_from_subqueries: bool,
+    table_refs_outside_from: &[String],
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
@@ -2122,45 +2419,31 @@ pub fn parse_from(
             .collect::<Vec<_>>();
         shadowed_outer_ctes = program.mask_shadowed_ctes_being_defined(&shadowing_names);
 
-        if preplan_ctes_for_non_from_subqueries {
-            // Make these CTE names available to subqueries outside the FROM clause.
-            let base_outer_query_refs = base_outer_refs_for_cte_planning(
-                table_references.outer_query_refs(),
-                &cte_definitions,
-            );
-            for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-                let cte_table = plan_cte(
-                    cte_definition_index,
-                    &cte_definitions,
-                    &base_outer_query_refs,
-                    resolver,
-                    program,
-                    connection,
-                    false,
-                )?;
-                table_references.add_outer_query_reference(OuterQueryReference {
-                    identifier: cte_definition.name.clone(),
-                    internal_id: cte_table.internal_id,
-                    table: cte_table.table,
-                    using_dedup_hidden_cols: ColumnMask::default(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: (!cte_definition.references_itself)
-                        .then(|| cte_definition.select.clone()),
-                    cte_explicit_columns: cte_definition.explicit_columns.clone(),
-                    cte_id: Some(cte_definition.cte_id),
-                    // This entry only lets a nested FROM clause find the CTE name.
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                });
-            }
-        }
+        add_ctes_read_by_subqueries_as_outer_refs(
+            &cte_definitions,
+            table_refs_outside_from,
+            resolver,
+            program,
+            table_references,
+            connection,
+        )?;
     }
 
     // Process FROM clause if present
     if let Some(from_owned) = from {
-        let select_owned = from_owned.select;
-        let joins_owned = from_owned.joins;
+        let mut select_owned = from_owned.select;
+        let mut joins_owned = from_owned.joins;
+        // SQLite removes an unaliased group when it starts the FROM clause.
+        // Keep the inner joins before the joins that follow the group.
+        while let ast::SelectTable::Sub(inner, None) = *select_owned {
+            select_owned = inner.select;
+            joins_owned.splice(0..0, inner.joins);
+        }
+        // SQLite enables strict USING checks for the whole FROM list.
+        // A RIGHT or FULL JOIN can appear after the USING clause that needs the check.
+        let has_right_or_full_join = joins_owned
+            .iter()
+            .any(|join| PlanJoinType::from_join_operator(&join.operator).keeps_right_rows());
         parse_from_clause_table(
             *select_owned,
             resolver,
@@ -2181,12 +2464,96 @@ pub fn parse_from(
                 vtab_predicates,
                 table_references,
                 connection,
+                has_right_or_full_join,
             )?;
         }
     }
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
     Ok(())
+}
+
+/// Plans the CTEs that subqueries read and adds them as outer query references.
+/// Like SQLite, a CTE that nothing reads is never planned, so errors in its body
+/// are not reported.
+fn add_ctes_read_by_subqueries_as_outer_refs(
+    cte_definitions: &[CteDefinition],
+    subquery_table_refs: &[String],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let base_outer_query_refs =
+        base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
+    let ctes_read = ctes_read_by(cte_definitions, subquery_table_refs);
+    for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
+        if !ctes_read[cte_definition_index] {
+            continue;
+        }
+        let joined_table = plan_cte(
+            cte_definition_index,
+            cte_definitions,
+            &base_outer_query_refs,
+            resolver,
+            program,
+            connection,
+            false,
+        )?;
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: cte_definition.name.clone(),
+            internal_id: joined_table.internal_id,
+            table: joined_table.table,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),
+            cte_explicit_columns: cte_definition.explicit_columns.clone(),
+            cte_id: Some(cte_definition.cte_id),
+            // This entry only lets a nested FROM clause find the CTE name.
+            cte_definition_only: true,
+            rowid_referenced: false,
+            outer_join_may_null_extend: false,
+            scope_depth: 0,
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns, for each CTE, whether a query that reads the tables named in
+/// `table_refs` reads it, either directly or through another CTE.
+fn ctes_read_by(cte_definitions: &[CteDefinition], table_refs: &[String]) -> Vec<bool> {
+    let mut read = vec![false; cte_definitions.len()];
+    let mut pending: Vec<usize> = cte_definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, definition)| table_refs.contains(&definition.name))
+        .map(|(index, _)| index)
+        .collect();
+    while let Some(index) = pending.pop() {
+        if !read[index] {
+            read[index] = true;
+            pending.extend_from_slice(&cte_definitions[index].referenced_cte_indices);
+        }
+    }
+    read
+}
+
+fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {
+    match table {
+        ast::SelectTable::Table(name, _, indexed) => ast::SelectTable::Table(name, alias, indexed),
+        ast::SelectTable::TableCall(name, args, _) => {
+            ast::SelectTable::TableCall(name, args, alias)
+        }
+        ast::SelectTable::Select {
+            select, lateral, ..
+        } => ast::SelectTable::Select {
+            select,
+            alias,
+            lateral,
+        },
+        ast::SelectTable::Sub(from, _) => ast::SelectTable::Sub(from, alias),
+    }
 }
 
 #[turso_macros::trace_stack]
@@ -2201,6 +2568,7 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
+            rewrite_between_exprs(&mut expr.expr)?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2208,7 +2576,6 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
-            rewrite_between_exprs(&mut expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -2223,9 +2590,9 @@ pub fn parse_where(
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
                 break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve from_outer_join from the original term
+                // Preserve the source from the original term.
                 for new_term in new_terms.iter_mut() {
-                    new_term.from_outer_join = term.from_outer_join;
+                    new_term.origin = term.origin;
                 }
                 let count = new_terms.len();
                 for (j, new_term) in new_terms.into_iter().enumerate() {
@@ -2304,16 +2671,52 @@ pub fn determine_where_to_eval_term(
     subqueries: &[NonFromClauseSubquery],
     table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
-    if let Some(table_id) = term.from_outer_join {
-        return Ok(EvalAt::Loop(
-            join_order
+    let mut eval_at =
+        determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)?;
+    if let Some(origin) = term.origin.join_origin() {
+        // A materialized hash input can remove an inner join's right table.
+        // The ON term then runs when all of its remaining tables are ready.
+        if let Some(join_loop) =
+            loop_index_for_table_row(origin.right_table(), join_order, table_references)
+        {
+            eval_at = eval_at.max(EvalAt::Loop(join_loop));
+        } else if origin.is_outer() {
+            // If the outer join's right table is absent, do not schedule its ON term in this plan.
+            eval_at = eval_at.max(EvalAt::Loop(usize::MAX));
+        }
+    }
+    let Some(table_references) = table_references else {
+        return Ok(eval_at);
+    };
+    let referenced_tables = table_mask_from_expr(&term.expr, table_references, subqueries)?;
+
+    if term.origin.join_origin().is_none() {
+        // A WHERE condition that reads a table to the left of a RIGHT JOIN must
+        // run in that join's row body. The unmatched scan enters the same body
+        // with every table on the left set to NULL.
+        for (right_table_index, right_table) in table_references.joined_tables().iter().enumerate()
+        {
+            if !right_table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::keeps_right_rows)
+            {
+                continue;
+            }
+            let reads_left_table = referenced_tables
                 .iter()
-                .position(|t| t.table_id == table_id)
-                .unwrap_or(usize::MAX),
-        ));
+                .any(|table_index| table_index < right_table_index);
+            if reads_left_table {
+                let loop_index = join_order
+                    .iter()
+                    .position(|table| table.table_id == right_table.internal_id)
+                    .expect("right join table must be in the join order");
+                eval_at = eval_at.max(EvalAt::Loop(loop_index));
+            }
+        }
     }
 
-    determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)
+    Ok(eval_at)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -2420,6 +2823,45 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
+pub fn expr_reads_an_outer_query(
+    top_level_expr: &Expr,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let is_outer_query_table = |table_id: &TableInternalId| {
+        table_references
+            .find_outer_query_ref_by_internal_id(*table_id)
+            .is_some()
+    };
+    let mut reads_an_outer_query = false;
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                reads_an_outer_query |= is_outer_query_table(table);
+            }
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                reads_an_outer_query |= match &subquery.state {
+                    SubqueryState::Unevaluated { plan } => plan.as_ref().is_some_and(|plan| {
+                        plan.used_outer_query_ref_ids()
+                            .iter()
+                            .any(is_outer_query_table)
+                    }),
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        outer_ref_ids.iter().any(is_outer_query_table)
+                    }
+                };
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads_an_outer_query)
+}
+
 /// Determines the earliest loop where an expression can be safely evaluated.
 ///
 /// When a referenced table is not found in `join_order`, we check if it's a hash-join
@@ -2436,23 +2878,8 @@ pub fn determine_where_to_eval_expr(
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
-                    // Table not found in join_order. Check if it's a hash join build table.
-                    // If so, we need to evaluate the condition at the probe table's loop position.
-                    if let Some(tables) = table_references {
-                        for (probe_idx, member) in join_order.iter().enumerate() {
-                            let probe_table = &tables.joined_tables()[member.original_idx];
-                            if let Operation::HashJoin(ref hj) = probe_table.op {
-                                let build_table = &tables.joined_tables()[hj.build_table_idx];
-                                if build_table.internal_id == *table {
-                                    // This table is the build side of a hash join.
-                                    // Evaluate the condition at the probe table's loop position.
-                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
-                                    return Ok(WalkControl::Continue);
-                                }
-                            }
-                        }
-                    }
+                let Some(join_idx) = loop_index_for_table_row(*table, join_order, table_references)
+                else {
                     // Must be an outer query reference; in that case, the table is already in scope.
                     return Ok(WalkControl::Continue);
                 };
@@ -2483,6 +2910,29 @@ pub fn determine_where_to_eval_expr(
     Ok(eval_at)
 }
 
+/// Find the loop that makes a table row available.
+///
+/// A hash-build table has no loop. Its row becomes available when the probe reads the hash payload.
+fn loop_index_for_table_row(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    join_order
+        .iter()
+        .position(|table| table.table_id == table_id)
+        .or_else(|| {
+            let tables = table_references?;
+            join_order.iter().position(|member| {
+                let probe_table = &tables.joined_tables()[member.original_idx];
+                let Operation::HashJoin(hash_join) = &probe_table.op else {
+                    return false;
+                };
+                tables.joined_tables()[hash_join.build_table_idx].internal_id == table_id
+            })
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_join(
     join: ast::JoinedSelectTable,
@@ -2493,6 +2943,7 @@ fn parse_join(
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
+    has_right_or_full_join: bool,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -2509,41 +2960,32 @@ fn parse_join(
         cte_definitions,
         connection,
     )?;
+    let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
 
-    let (outer, natural, full_outer) = match join_operator {
-        ast::JoinOperator::TypedJoin(Some(join_type)) => {
-            let is_right = join_type.contains(JoinType::RIGHT);
-            let is_left = join_type.contains(JoinType::LEFT);
-            let is_outer = join_type.contains(JoinType::OUTER);
-            let is_natural = join_type.contains(JoinType::NATURAL);
-            // FULL OUTER: LEFT+RIGHT or bare OUTER
-            let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
-
-            if is_right && !is_left && !is_full {
-                // RIGHT JOIN: swap the last two tables, then treat as LEFT JOIN.
-                let len = table_references.joined_tables().len();
-                // Only valid for a two-table FROM clause; with prior joins the swap
-                // would break ON clause column references.
-                if len > 2 {
-                    crate::bail_parse_error!(
-                        "RIGHT JOIN following another join is not yet supported. \
-                         Try rewriting as LEFT JOIN or using a subquery."
-                    );
-                }
-                table_references.joined_tables_mut().swap(len - 2, len - 1);
-                table_references.set_right_join_swapped();
-                // outer flag goes on the originally-left table (now rightmost after swap).
-                (true, is_natural, false)
-            } else if is_full {
-                (true, is_natural, true)
-            } else {
-                (is_outer || is_left, is_natural, false)
-            }
-        }
-        _ => (false, false, false),
-    };
+    let plan_join_type = PlanJoinType::from_join_operator(&join_operator);
+    if let Some(table) = lateral_reference
+        .as_ref()
+        .filter(|_| plan_join_type.keeps_right_rows())
+    {
+        crate::bail_parse_error!(
+            "invalid reference to FROM-clause entry for table \"{table}\": \
+             the combining JOIN type must be INNER or LEFT for a LATERAL reference"
+        );
+    }
+    if lateral_reference.is_some() && has_right_or_full_join {
+        crate::bail_parse_error!(
+            "RIGHT and FULL joins are not supported in a FROM clause with a LATERAL subquery \
+             that reads a table on its left"
+        );
+    }
+    let natural = matches!(
+        join_operator,
+        ast::JoinOperator::TypedJoin(Some(join_type))
+            if join_type.contains(JoinType::NATURAL)
+    );
+    let outer = !matches!(plan_join_type, PlanJoinType::Inner);
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
@@ -2552,6 +2994,7 @@ fn parse_join(
     // SQLite allows duplicate table names/aliases in FROM clauses.
     // Ambiguity is detected later during column resolution.
     let rightmost_table = table_references.joined_tables().last().unwrap();
+    let join_origin = JoinOrigin::new(rightmost_table.internal_id, outer);
     let constraint = if natural {
         turso_assert_greater_than_or_equal!(table_references.joined_tables().len(), 2);
         // NATURAL JOIN is first transformed into a USING join with the common columns
@@ -2572,8 +3015,9 @@ fn parse_join(
                         .zip(right_col.name.as_deref())
                         .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
                     {
+                        // SQLite keeps the right column's spelling in the generated USING list.
                         distinct_names.push(ast::Name::exact(
-                            left_col.name.clone().expect("column name is None"),
+                            right_col.name.clone().expect("column name is None"),
                         ));
                         found_match = true;
                         break;
@@ -2601,11 +3045,7 @@ fn parse_join(
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer {
-                        Some(table_references.joined_tables().last().unwrap().internal_id)
-                    } else {
-                        None
-                    };
+                    predicate.origin = WhereTermOrigin::Join(join_origin);
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -2623,51 +3063,35 @@ fn parse_join(
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     turso_assert!(!left_tables.is_empty());
                     let right_table = table_references.joined_tables().last().unwrap();
-                    let mut left_col = None;
-                    for (left_table_offset, left_table) in left_tables.iter().enumerate() {
-                        left_col = left_table
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, col)| !natural || !col.hidden())
-                            .find(|(_, col)| {
-                                col.name
-                                    .as_deref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
-                            })
-                            .map(|(idx, col)| {
-                                (left_table_offset, left_table.internal_id, idx, col)
-                            });
-                        if left_col.is_some() {
-                            break;
-                        }
-                    }
-                    if left_col.is_none() {
+                    // SQLite checks the right side before it checks ambiguity on the left.
+                    // This order decides which error an invalid USING clause reports.
+                    let Some((right_col_idx, right_col)) =
+                        right_table.columns().iter().enumerate().find(|(_, col)| {
+                            col.name
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
+                        })
+                    else {
                         crate::bail_parse_error!(
                             "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
-                    }
-                    let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
-                        col.name
-                            .as_deref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
-                    });
-                    if right_col.is_none() {
+                    };
+                    // SQLite compares the new table with all earlier copies merged by USING.
+                    let Some(left_column) = find_left_using_column(
+                        left_tables,
+                        distinct_name.as_str(),
+                        natural,
+                        has_right_or_full_join,
+                    )?
+                    else {
                         crate::bail_parse_error!(
                             "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
-                    }
-                    let (left_table_idx, left_table_id, left_col_idx, left_col) = left_col.unwrap();
-                    let (right_col_idx, right_col) = right_col.unwrap();
+                    };
                     let expr = Expr::Binary(
-                        Box::new(Expr::Column {
-                            database: None,
-                            table: left_table_id,
-                            column: left_col_idx,
-                            is_rowid_alias: left_col.is_rowid_alias(),
-                        }),
+                        Box::new(left_column.expr),
                         ast::Operator::Equals,
                         Box::new(Expr::Column {
                             database: None,
@@ -2677,11 +3101,9 @@ fn parse_join(
                         }),
                     );
 
-                    let left_table: &mut JoinedTable = table_references
-                        .joined_tables_mut()
-                        .get_mut(left_table_idx)
-                        .unwrap();
-                    left_table.mark_column_used(left_col_idx);
+                    for (left_table_id, left_col_idx) in left_column.source_columns {
+                        table_references.mark_column_used(left_table_id, left_col_idx);
+                    }
                     let right_table: &mut JoinedTable = table_references
                         .joined_tables_mut()
                         .get_mut(cur_table_idx)
@@ -2689,11 +3111,7 @@ fn parse_join(
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
-                        from_outer_join: if outer {
-                            Some(right_table.internal_id)
-                        } else {
-                            None
-                        },
+                        origin: WhereTermOrigin::Join(join_origin),
                         consumed: false,
                     });
                 }
@@ -2708,20 +3126,67 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    let plan_join_type = if full_outer {
-        PlanJoinType::FullOuter
-    } else if outer {
-        PlanJoinType::LeftOuter
-    } else {
-        PlanJoinType::Inner
-    };
     rightmost_table.join_info = Some(JoinInfo {
         join_type: plan_join_type,
         using,
         no_reorder: is_cross,
+        lateral: lateral_reference.is_some(),
     });
 
     Ok(())
+}
+
+/// Find the left operand for one USING equality term.
+///
+/// SQLite merges all earlier copies when a RIGHT or FULL JOIN exists anywhere
+/// in the FROM list. It also rejects an unmerged duplicate in that mode.
+fn find_left_using_column(
+    tables: &[JoinedTable],
+    column_name: &str,
+    ignore_hidden_columns: bool,
+    has_right_or_full_join: bool,
+) -> Result<Option<ResolvedColumn>> {
+    let matches = left_using_column_sources(
+        tables,
+        column_name,
+        has_right_or_full_join,
+        |table| table.join_info.as_ref(),
+        |table| {
+            // NATURAL ignores hidden columns. An explicit USING clause can name one.
+            table.columns().iter().position(|column| {
+                (!ignore_hidden_columns || !column.hidden())
+                    && column
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+            })
+        },
+    )?;
+    if matches.is_empty() {
+        // The caller reports SQLite's "column not present in both tables" error.
+        return Ok(None);
+    }
+    Ok(Some(merge_columns(matches.into_iter().map(
+        |(table_index, column_index)| {
+            let table = &tables[table_index];
+            (table.internal_id, &table.table, column_index)
+        },
+    ))))
+}
+
+fn left_table_read_by_rightmost_table(table_references: &TableReferences) -> Option<&str> {
+    let (last_table, tables_on_its_left) = table_references
+        .joined_tables()
+        .split_last()
+        .expect("the joined table was just added");
+    let Table::FromClauseSubquery(subquery) = &last_table.table else {
+        return None;
+    };
+    let read_table_ids = subquery.plan.used_outer_query_ref_ids();
+    tables_on_its_left
+        .iter()
+        .find(|table| read_table_ids.contains(&table.internal_id))
+        .map(|table| table.identifier.as_str())
 }
 
 pub(crate) fn append_vtab_predicates_to_where_clause(
@@ -2740,37 +3205,40 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
             BindingBehavior::TryCanonicalColumnsFirst,
         )?;
 
-        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
-        // must be associated with the virtual table's outer join context if the table is
-        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
-        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
-            table_references
-                .find_joined_table_by_internal_id(table_id)
-                .and_then(|table_ref| {
-                    table_ref
-                        .join_info
-                        .as_ref()
-                        .and_then(|join_info| join_info.is_outer().then_some(table_id))
-                })
-        });
+        // SQLite treats a table-function argument as an ON term for that table.
+        // This keeps the term with the table when a later RIGHT JOIN adds NULL rows.
+        let table_function = vtab_predicate_table_id(&expr)
+            .expect("a table-function argument must constrain its hidden column");
+        let table_reference = table_references
+            .find_joined_table_by_internal_id(table_function)
+            .expect("a table-function argument must have a table reference");
+        let join = JoinOrigin::new(
+            table_function,
+            table_reference
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_outer),
+        );
         out_where_clause.push(WhereTerm {
             expr,
-            from_outer_join,
+            origin: WhereTermOrigin::TableFunction(join),
             consumed: false,
         });
     }
     Ok(())
 }
 
-/// Extract the table internal_id from a virtual table argument predicate.
-/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
+/// Get the source table from `hidden_column = +(argument)`.
 fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
     match expr {
-        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
-            Expr::Column { table, .. } => Some(*table),
-            _ => None,
-        },
+        Expr::Binary(lhs, ast::Operator::Equals, rhs)
+            if matches!(rhs.as_ref(), Expr::Unary(ast::UnaryOperator::Positive, _)) =>
+        {
+            match lhs.as_ref() {
+                Expr::Column { table, .. } => Some(*table),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

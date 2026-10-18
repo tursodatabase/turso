@@ -7,6 +7,7 @@
 //!
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
+use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
@@ -613,7 +614,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                     projection: None,
                 }))
             }
-            ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
+            ast::SelectTable::Select {
+                select: subquery,
+                lateral: false,
+                ..
+            } => self.build_select(subquery),
+            ast::SelectTable::Select { lateral: true, .. } => Err(LimboError::ParseError(
+                "LATERAL subqueries are not supported in logical plans".to_string(),
+            )),
             ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
                 "Table-valued functions are not supported in logical plans".to_string(),
             )),
@@ -1931,7 +1939,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::from_slice(ast::blob_literal_hex(b).as_bytes())?),
+            ast::Literal::Blob(b) => Ok(Value::Blob(ast::blob_literal_bytes(b).try_collect()?)),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(

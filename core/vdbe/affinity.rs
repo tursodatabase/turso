@@ -246,8 +246,15 @@ impl Affinity {
                     .then(|| apply_numeric_affinity(val, false))
                     .flatten();
 
-                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
-                    left = Some(ValueRef::from_f64(i as f64));
+                match left.unwrap_or(val) {
+                    ValueRef::Numeric(Numeric::Integer(i)) => {
+                        left = Some(ValueRef::from_f64(i as f64));
+                    }
+                    // SQLite stores a whole-number real as an integer, so -0.0 is read back as 0.0
+                    ValueRef::Numeric(Numeric::Float(f)) if f == 0.0 => {
+                        left = Some(ValueRef::from_f64(0.0));
+                    }
+                    _ => {}
                 }
 
                 left.map(Either::Left)
@@ -322,7 +329,7 @@ impl Affinity {
     /// is harmless.  A false positive, however, can result in the wrong
     /// answer.
     ///
-    /// reference https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000
+    /// reference <https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000>
     pub fn expr_needs_no_affinity_change(&self, expr: &Expr) -> bool {
         if matches!(self, Affinity::Blob | Affinity::None) {
             return true;

@@ -45,7 +45,7 @@ addr  opcode              p1  p2  p3  p4                                        
   19    HashProbe          1   7   1  r[12]=42 payload=r[8]..r[9]                0
   20    Once              29   0   0                                             0  goto 29
   21    OpenAutoindex      3   0   0                                             0  cursor=3
-  22    Rewind             2  23   0                                             0  Rewind table h_returns
+  22    Rewind             2  29   0                                             0  Rewind table h_returns
   23      ColumnRange      2   1  13  2                                          0  r[13..14]=h_returns.order_name..reason
   24      RowId            2  15   0                                             0  r[15]=h_returns.rowid
   25      MakeRecord      13   3  16                                             0  r[16]=mkrec(r[13..15]); for ephemeral_h_returns_t3

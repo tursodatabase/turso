@@ -28,6 +28,49 @@ public static class TursoBindings
         return OpenDatabase(path, cipher.ToRustString(), hexkey);
     }
 
+    /// <summary>
+    /// Opens a database without connecting to it, so it can be shared by several connections.
+    /// </summary>
+    public static TursoSharedDatabaseHandle OpenSharedDatabase(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+
+        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null);
+        return TursoSharedDatabaseHandle.FromPtr(databasePtr);
+    }
+
+    /// <summary>
+    /// Creates a new connection to a shared database.
+    /// </summary>
+    public static TursoDatabaseHandle Connect(TursoSharedDatabaseHandle database)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+
+        var databaseReferenceAdded = false;
+        database.DangerousAddRef(ref databaseReferenceAdded);
+        try
+        {
+            var status = TursoInterop.DatabaseConnect(database.DangerousGetHandle(), out var connectionPtr, out var errorPtr);
+            ThrowIfError(status, errorPtr);
+
+            try
+            {
+                return TursoDatabaseHandle.FromConnectionPtr(connectionPtr, database);
+            }
+            catch
+            {
+                TursoInterop.ConnectionDeinit(connectionPtr);
+                throw;
+            }
+        }
+        finally
+        {
+            // FromConnectionPtr takes its own reference for the lifetime of the connection.
+            if (databaseReferenceAdded)
+                database.DangerousRelease();
+        }
+    }
+
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
     {
         db.ThrowIfInvalid();
@@ -311,6 +354,26 @@ public static class TursoBindings
 
     private static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
     {
+        var databasePtr = NewOpenedDatabase(path, cipher, hexkey);
+        var connectionPtr = IntPtr.Zero;
+        try
+        {
+            var status = TursoInterop.DatabaseConnect(databasePtr, out connectionPtr, out var errorPtr);
+            ThrowIfError(status, errorPtr);
+
+            return TursoDatabaseHandle.FromPtrs(databasePtr, connectionPtr);
+        }
+        catch
+        {
+            if (connectionPtr != IntPtr.Zero)
+                TursoInterop.ConnectionDeinit(connectionPtr);
+            TursoInterop.DatabaseDeinit(databasePtr);
+            throw;
+        }
+    }
+
+    private static IntPtr NewOpenedDatabase(string path, string? cipher, string? hexkey)
+    {
         using var pathString = NativeUtf8String.From(path);
         using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
         using var cipherString = NativeUtf8String.From(cipher);
@@ -331,21 +394,14 @@ public static class TursoBindings
         var status = TursoInterop.DatabaseNew(ref config, out var databasePtr, out var errorPtr);
         ThrowIfError(status, errorPtr);
 
-        var connectionPtr = IntPtr.Zero;
         try
         {
             status = TursoInterop.DatabaseOpen(databasePtr, out errorPtr);
             ThrowIfError(status, errorPtr);
-
-            status = TursoInterop.DatabaseConnect(databasePtr, out connectionPtr, out errorPtr);
-            ThrowIfError(status, errorPtr);
-
-            return TursoDatabaseHandle.FromPtrs(databasePtr, connectionPtr);
+            return databasePtr;
         }
         catch
         {
-            if (connectionPtr != IntPtr.Zero)
-                TursoInterop.ConnectionDeinit(connectionPtr);
             if (databasePtr != IntPtr.Zero)
                 TursoInterop.DatabaseDeinit(databasePtr);
             throw;

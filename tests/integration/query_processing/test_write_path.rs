@@ -8,7 +8,9 @@ use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
+use turso_core::{
+    CheckpointMode, ConnectOpts, Connection, LimboError, Numeric, Row, Statement, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -865,7 +867,7 @@ fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
 #[turso_macros::test()]
 pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -880,7 +882,7 @@ pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn delete_eq_correct(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -896,7 +898,7 @@ pub fn delete_eq_correct(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn upsert_conflict(limbo: TempDatabase) {
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
         "INSERT INTO t VALUES (1, 2, 100);",
@@ -908,6 +910,36 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     assert_eq!(rows, vec![(1, 2, 42)]);
 }
 
+#[test]
+fn insert_continues_sqlite_created_mixed_case_autoincrement_sequence() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(
+        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO T1(a, b) VALUES(40, 0); DELETE FROM T1",
+    )?;
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO T1(b) VALUES(1)")?;
+    conn.execute("INSERT INTO T1(b) VALUES(2), (3)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM T1 ORDER BY a");
+    assert_eq!(rows, vec![(41,), (42,), (43,)]);
+    drop(conn);
+    drop(db);
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let sequences: Vec<(String, i64)> = sqlite
+        .prepare("SELECT name, seq FROM sqlite_sequence")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(sequences, vec![("T1".to_string(), 43)]);
+    sqlite.execute("INSERT INTO T1(b) VALUES(4)", [])?;
+    let last: i64 = sqlite.query_row("SELECT max(a) FROM T1", [], |row| row.get(0))?;
+    assert_eq!(last, 44);
+    Ok(())
+}
+
 #[turso_macros::test]
 pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // Regression: qualified column refs in RETURNING (e.g. "users"."id")
@@ -915,7 +947,7 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // quoted identifiers, because INSERT stored the joined-table identifier
     // via `Name::to_string` (which preserves quotes) instead of normalizing
     // it like DELETE/UPDATE do.
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
         .unwrap();
     assert_that!(limbo_exec_rows(
@@ -928,7 +960,7 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for _ in 0..COUNT {
@@ -978,7 +1010,7 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect().unwrap();
+    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for i in 0..COUNT {
@@ -1019,7 +1051,7 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
     conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
@@ -1049,7 +1081,7 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1091,7 +1123,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
 #[turso_macros::test]
 pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1175,8 +1207,8 @@ fn test_unique_complex_key() {
 #[turso_macros::test]
 pub fn test_conflict_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1195,8 +1227,8 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1217,8 +1249,8 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect().unwrap();
-    let conn2 = limbo.db.connect().unwrap();
+    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1251,8 +1283,8 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
     limbo: TempDatabase,
 ) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect()?;
-    let conn2 = limbo.db.connect()?;
+    let conn1 = limbo.db.connect(ConnectOpts::new())?;
+    let conn2 = limbo.db.connect(ConnectOpts::new())?;
 
     conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
     for i in 1..=8 {
@@ -1726,6 +1758,37 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
          Rows were lost during btree page splits.",
     );
 
+    Ok(())
+}
+
+#[turso_macros::test(views)]
+fn test_delete_all_updates_dependent_materialized_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, title TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT id, title FROM t",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "WITH RECURSIVE c(x) AS (
+            VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 300
+         ) INSERT INTO t SELECT x, printf('title-%d', x) FROM c",
+    )?;
+
+    common::run_query(&tmp_db, &conn, "DELETE FROM t")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM t")).is_empty();
+    assert_that!(limbo_exec_rows(&conn, "SELECT * FROM v")).is_empty();
+
+    common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES(301, 'after-clear')")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT id, title FROM v"))
+        .is_equal_to(vec![row![301, "after-clear"]]);
     Ok(())
 }
 

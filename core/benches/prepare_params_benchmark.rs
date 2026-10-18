@@ -22,7 +22,7 @@ use codspeed_criterion_compat::{
 };
 
 use std::sync::Arc;
-use turso_core::{Database, MemoryIO, StepResult};
+use turso_core::{ConnectOpts, Database, MemoryIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -42,7 +42,7 @@ fn run_to_completion(stmt: &mut turso_core::Statement, db: &Arc<Database>) {
 fn open_with_table() -> (Arc<Database>, Arc<turso_core::Connection>) {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let mut stmt = conn
         .query(
             "CREATE TABLE at_refs (source_dbt_doc_id, source_column_id, \

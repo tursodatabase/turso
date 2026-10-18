@@ -1,21 +1,25 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
-    select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
-    Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
+    expand_star, expand_table_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound,
+    NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
+    Window,
 };
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
-use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
+use crate::translate::optimizer::{optimize_plan, Optimizable};
+use crate::translate::plan::{
+    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+};
 use crate::translate::planner::{
-    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
+    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
+    collect_subquery_table_refs_in_expr, collect_subquery_table_refs_in_window_clause, parse_from,
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
@@ -314,22 +318,25 @@ fn prepare_one_select_plan(
             }
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let preplan_ctes_for_non_from_subqueries = with.is_some()
-                && select_has_non_from_subqueries(
+            let table_refs_outside_from = if with.is_some() {
+                collect_table_refs_outside_from(
                     &columns,
                     where_clause.as_deref(),
                     group_by.as_ref(),
                     &window_clause,
                     &order_by,
                     limit.as_ref(),
-                );
+                )
+            } else {
+                Vec::new()
+            };
             {
                 parse_from(
                     from,
                     resolver,
                     program,
                     with,
-                    preplan_ctes_for_non_from_subqueries,
+                    &table_refs_outside_from,
                     &mut where_predicates,
                     &mut vtab_predicates,
                     &mut table_references,
@@ -346,14 +353,14 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| table.columns_for_star().count())
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
+                            .map(|table| table.columns_for_star().count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -496,88 +503,20 @@ fn prepare_one_select_plan(
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {
-                            select_star(
-                                plan.table_references.joined_tables(),
+                            expand_star(
+                                &mut plan.table_references,
                                 &mut plan.result_columns,
-                                plan.table_references.right_join_swapped(),
                                 long_names,
+                                resolver,
                             )?;
-                            for table in plan.table_references.joined_tables_mut() {
-                                for idx in 0..table.columns().len() {
-                                    let column = &table.columns()[idx];
-                                    if column.hidden() {
-                                        continue;
-                                    }
-                                    table.mark_column_used(idx);
-                                }
-                            }
                         }
                         ResultColumn::TableStar(name) => {
-                            let name_normalized = normalize_ident(name.as_str());
-                            // If this table identifier appears more than once in the FROM
-                            // clause, `A.*` is ambiguous (matches SQLite behavior).
-                            let dup_count = plan
-                                .table_references
-                                .joined_tables()
-                                .iter()
-                                .filter(|t| t.identifier == name_normalized)
-                                .count();
-                            if dup_count > 1 {
-                                let first_tbl = plan
-                                    .table_references
-                                    .joined_tables()
-                                    .iter()
-                                    .find(|t| t.identifier == name_normalized)
-                                    .unwrap(); // safe: dup_count > 1 guarantees a match
-                                let col_name = first_tbl
-                                    .columns()
-                                    .iter()
-                                    .find(|c| !c.hidden())
-                                    .and_then(|c| c.name.as_ref())
-                                    .map(|n| n.as_str())
-                                    .unwrap_or("?");
-                                crate::bail_parse_error!(
-                                    "ambiguous column name: {}.{}",
-                                    name.as_str(),
-                                    col_name
-                                );
-                            }
-                            let referenced_table = plan
-                                .table_references
-                                .joined_tables_mut()
-                                .iter_mut()
-                                .find(|t| t.identifier == name_normalized);
-
-                            if referenced_table.is_none() {
-                                crate::bail_parse_error!("no such table: {}", name.as_str());
-                            }
-                            let table = referenced_table.unwrap();
-                            let num_columns = table.columns().len();
-                            for idx in 0..num_columns {
-                                let column = &table.columns()[idx];
-                                if column.hidden() {
-                                    continue;
-                                }
-                                let alias = column.name.as_ref().map(|col_name| {
-                                    if long_names {
-                                        format!("{}.{}", table.identifier, col_name)
-                                    } else {
-                                        col_name.clone()
-                                    }
-                                });
-                                plan.result_columns.push(ResultSetColumn {
-                                    expr: ast::Expr::Column {
-                                        database: None, // TODO: support different databases
-                                        table: table.internal_id,
-                                        column: idx,
-                                        is_rowid_alias: column.is_rowid_alias(),
-                                    },
-                                    alias,
-                                    implicit_column_name: None,
-                                    contains_aggregates: false,
-                                });
-                                table.mark_column_used(idx);
-                            }
+                            expand_table_star(
+                                &mut plan.table_references,
+                                &mut plan.result_columns,
+                                name.as_str(),
+                                long_names,
+                            )?;
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {
                             bind_and_rewrite_expr(
@@ -618,13 +557,6 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("too many columns in result set");
             }
 
-            // This step can only be performed at this point, because all table references are now available.
-            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
-            // so we must wait until the full set of references has been collected.
-            {
-                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
-            }
-
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
                 parse_where(
@@ -634,6 +566,15 @@ fn prepare_one_select_plan(
                     &mut plan.where_clause,
                     resolver,
                 )?;
+            }
+
+            // This step can only be performed at this point, because all table references are now available.
+            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
+            // so we must wait until the full set of references has been collected.
+            {
+                // SQLite adds table-function arguments after ON and WHERE terms.
+                // Some virtual tables select the last constraint for a hidden column.
+                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             {
@@ -669,12 +610,26 @@ fn prepare_one_select_plan(
                             )?;
                         }
 
+                        let exprs: Vec<ast::Expr> =
+                            group_by.exprs.into_iter().map(|expr| *expr).collect();
+                        let having = match having_predicates {
+                            Some(having) => Some(move_group_by_only_having_terms_to_where(
+                                having,
+                                &exprs,
+                                &aggregate_expressions,
+                                &plan.table_references,
+                                resolver,
+                                &mut plan.where_clause,
+                            )?)
+                            .filter(|having| !having.is_empty()),
+                            None => None,
+                        };
                         plan.group_by = Some(GroupBy {
                             sort_order: Vec::new(),
                             nulls_order: Vec::new(),
-                            exprs: group_by.exprs.into_iter().map(|expr| *expr).collect(),
+                            exprs,
                             sort_elided: false,
-                            having: having_predicates,
+                            having,
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
@@ -721,24 +676,66 @@ fn prepare_one_select_plan(
                 .as_ref()
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
+            for mut o in order_by {
+                replace_column_number_with_copy_of_column_expr(
+                    &mut o.expr,
+                    &plan.result_columns,
+                    "ORDER BY",
+                )?;
+
+                bind_and_rewrite_expr(
+                    &mut o.expr,
+                    Some(&mut plan.table_references),
+                    Some(&plan.result_columns),
+                    resolver,
+                    BindingBehavior::TryResultColumnsFirst,
+                )?;
+                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+            }
+            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
+            // Duplicates are semantically redundant.
+            let mut i = 0;
+            while i < key.len() {
+                if key[..i]
+                    .iter()
+                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
+                {
+                    key.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
+            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
+            // This means we truncate the ORDER BY to just the rowid column.
+            // We do this for SQLite compatibility - SQLite truncates before validating, so
+            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+            let mut terms_cut_after_rowid = Vec::new();
+            if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
+                let joined = &plan.table_references.joined_tables()[0];
+                let table_id = joined.internal_id;
+                let rowid_alias_col = joined
+                    .btree()
+                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                let first_is_rowid = match key[0].0.as_ref() {
+                    ast::Expr::Column { table, column, .. } => {
+                        *table == table_id && rowid_alias_col == Some(*column)
+                    }
+                    ast::Expr::RowId { table, .. } => *table == table_id,
+                    _ => false,
+                };
+                if first_is_rowid {
+                    terms_cut_after_rowid = key.split_off(1);
+                }
+            }
+
             {
                 trace_stack!("process_order_by");
-                for mut o in order_by {
-                    replace_column_number_with_copy_of_column_expr(
-                        &mut o.expr,
-                        &plan.result_columns,
-                        "ORDER BY",
-                    )?;
-
-                    bind_and_rewrite_expr(
-                        &mut o.expr,
-                        Some(&mut plan.table_references),
-                        Some(&plan.result_columns),
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
-                        &o.expr,
+                        expr,
                         resolver,
                         &mut plan.aggregates,
                         Some(&mut windows),
@@ -755,21 +752,26 @@ fn prepare_one_select_plan(
                         let agg = &plan.aggregates[agg_count_before_order_by];
                         crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
                     }
-
-                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
                 }
-            }
-            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
-            // Duplicates are semantically redundant.
-            let mut i = 0;
-            while i < key.len() {
-                if key[..i]
-                    .iter()
-                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
-                {
-                    key.remove(i);
-                } else {
-                    i += 1;
+                let mut cut_aggregates = plan.aggregates.clone();
+                let mut cut_windows = windows.clone();
+                let mut cut_named_windows = named_windows.clone();
+                for (expr, _, _) in terms_cut_after_rowid.iter() {
+                    resolve_window_and_aggregate_functions(
+                        expr,
+                        resolver,
+                        &mut cut_aggregates,
+                        Some(&mut cut_windows),
+                        &mut cut_named_windows,
+                    )?;
+                }
+                let is_aggregate_query = has_group_by || agg_count_before_order_by > 0;
+                if !cut_windows.is_empty() && !is_aggregate_query {
+                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                        if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
+                            crate::bail_parse_error!("misuse of aggregate: {}()", name);
+                        }
+                    }
                 }
             }
             plan.order_by = key;
@@ -783,30 +785,6 @@ fn prepare_one_select_plan(
                 && windows.is_empty();
             if is_single_row_aggregate {
                 plan.order_by.clear();
-            }
-
-            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
-            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
-            // This means we truncate the ORDER BY to just the rowid column.
-            // We do this for SQLite compatibility - SQLite truncates before validating, so
-            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
-            if plan.order_by.len() > 1 && plan.table_references.joined_tables().len() == 1 {
-                let joined = &plan.table_references.joined_tables()[0];
-                let table_id = joined.internal_id;
-                let rowid_alias_col = joined
-                    .btree()
-                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
-
-                let first_is_rowid = match plan.order_by[0].0.as_ref() {
-                    ast::Expr::Column { table, column, .. } => {
-                        *table == table_id && rowid_alias_col == Some(*column)
-                    }
-                    ast::Expr::RowId { table, .. } => *table == table_id,
-                    _ => false,
-                };
-                if first_is_rowid {
-                    plan.order_by.truncate(1);
-                }
             }
 
             if let Some(group_by) = &mut plan.group_by {
@@ -879,7 +857,18 @@ fn prepare_one_select_plan(
             let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
 
             // Plan CTEs from WITH clause so they're available for subqueries in VALUES
-            plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+            let mut subquery_table_refs = Vec::new();
+            for expr in values.iter().flatten() {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
+            plan_ctes_as_outer_refs(
+                with,
+                &subquery_table_refs,
+                resolver,
+                program,
+                &mut table_references,
+                connection,
+            )?;
 
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
@@ -937,6 +926,41 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+fn first_aggregate_without_over_clause<'a>(
+    expr: &'a ast::Expr,
+    resolver: &Resolver,
+) -> Result<Option<&'a str>> {
+    let mut found = None;
+    walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
+        let (name, args_count, filter_over) = match e {
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => (name, args.len(), filter_over),
+            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+            _ => return Ok(WalkControl::Continue),
+        };
+        if found.is_some() || filter_over.over_clause.is_some() {
+            return Ok(WalkControl::Continue);
+        }
+        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
+        {
+            Ok(Some(crate::function::Func::Agg(_))) => true,
+            _ => resolver
+                .symbol_table
+                .resolve_function(name.as_str(), args_count)
+                .is_some_and(|f| f.func.is_aggregate()),
+        };
+        if is_aggregate {
+            found = Some(name.as_str());
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 /// Validate that all expressions in the plan return the correct number of values;
@@ -1502,205 +1526,43 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
     20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
 }
 
-fn push_function_tail_exprs<'a>(stack: &mut Vec<&'a Expr>, tail: &'a ast::FunctionTail) {
-    if let Some(filter_expr) = tail.filter_clause.as_deref() {
-        stack.push(filter_expr);
-    }
-
-    let Some(ast::Over::Window(window)) = tail.over_clause.as_ref() else {
-        return;
-    };
-
-    if let Some(frame_clause) = window.frame_clause.as_ref() {
-        if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) =
-            &frame_clause.start
-        {
-            stack.push(expr.as_ref());
-        }
-        if let Some(ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr)) =
-            frame_clause.end.as_ref()
-        {
-            stack.push(expr.as_ref());
-        }
-    }
-
-    for sorted in window.order_by.iter().rev() {
-        stack.push(sorted.expr.as_ref());
-    }
-    for part_expr in window.partition_by.iter().rev() {
-        stack.push(part_expr.as_ref());
-    }
-}
-
-fn expr_contains_subquery(expr: &Expr) -> bool {
-    // Iterative traversal avoids stack overflows on deeply nested expression trees
-    // such as very large left-associative AND chains.
-    let mut stack = vec![expr];
-    while let Some(node) = stack.pop() {
-        match node {
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) => return true,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                stack.push(lhs.as_ref());
-                stack.push(start.as_ref());
-                stack.push(end.as_ref());
-            }
-            Expr::Binary(lhs, _, rhs) => {
-                stack.push(rhs.as_ref());
-                stack.push(lhs.as_ref());
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                if let Some(expr) = else_expr.as_deref() {
-                    stack.push(expr);
-                }
-                for (when_expr, then_expr) in when_then_pairs.iter().rev() {
-                    stack.push(then_expr.as_ref());
-                    stack.push(when_expr.as_ref());
-                }
-                if let Some(base_expr) = base.as_deref() {
-                    stack.push(base_expr);
-                }
-            }
-            Expr::Cast { expr, .. }
-            | Expr::Collate(expr, _)
-            | Expr::IsNull(expr)
-            | Expr::NotNull(expr)
-            | Expr::Unary(_, expr) => {
-                stack.push(expr.as_ref());
-            }
-            Expr::FunctionCall {
-                args,
-                order_by,
-                filter_over,
-                ..
-            } => {
-                push_function_tail_exprs(&mut stack, filter_over);
-                for sorted in order_by.iter().rev() {
-                    stack.push(sorted.expr.as_ref());
-                }
-                for arg in args.iter().rev() {
-                    stack.push(arg.as_ref());
-                }
-            }
-            Expr::FunctionCallStar { filter_over, .. } => {
-                push_function_tail_exprs(&mut stack, filter_over);
-            }
-            Expr::InList { lhs, rhs, .. } => {
-                for item in rhs.iter().rev() {
-                    stack.push(item.as_ref());
-                }
-                stack.push(lhs.as_ref());
-            }
-            Expr::InTable { lhs, args, .. } => {
-                for arg in args.iter().rev() {
-                    stack.push(arg.as_ref());
-                }
-                stack.push(lhs.as_ref());
-            }
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                if let Some(escape_expr) = escape.as_deref() {
-                    stack.push(escape_expr);
-                }
-                stack.push(rhs.as_ref());
-                stack.push(lhs.as_ref());
-            }
-            Expr::Parenthesized(exprs) => {
-                for expr in exprs.iter().rev() {
-                    stack.push(expr.as_ref());
-                }
-            }
-            Expr::Raise(_, raise_expr) => {
-                if let Some(expr) = raise_expr.as_deref() {
-                    stack.push(expr);
-                }
-            }
-            Expr::SubqueryResult { lhs, .. } => {
-                if let Some(expr) = lhs.as_deref() {
-                    stack.push(expr);
-                }
-            }
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
-            }
-            Expr::Column { .. }
-            | Expr::DoublyQualified(_, _, _)
-            | Expr::Id(_)
-            | Expr::Literal(_)
-            | Expr::Name(_)
-            | Expr::Qualified(_, _)
-            | Expr::FieldAccess { .. }
-            | Expr::Register(_)
-            | Expr::RowId { .. }
-            | Expr::Variable(_)
-            | Expr::Default => {}
-        }
-    }
-    false
-}
-
-fn select_has_non_from_subqueries(
+/// Collects the table names read by subqueries outside the FROM clause.
+fn collect_table_refs_outside_from(
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     group_by: Option<&ast::GroupBy>,
     window_clause: &[ast::WindowDef],
     order_by: &[ast::SortedColumn],
     limit: Option<&ast::Limit>,
-) -> bool {
-    if columns.iter().any(|column| match column {
-        ResultColumn::Expr(expr, _) => expr_contains_subquery(expr),
-        ResultColumn::Star | ResultColumn::TableStar(_) => false,
-    }) {
-        return true;
+) -> Vec<String> {
+    let mut table_refs = Vec::new();
+    for column in columns {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut table_refs);
+        }
     }
-
-    if where_clause.is_some_and(expr_contains_subquery) {
-        return true;
+    if let Some(where_clause) = where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut table_refs);
     }
-
     if let Some(group_by) = group_by {
-        if group_by.exprs.iter().any(|e| expr_contains_subquery(e))
-            || group_by
-                .having
-                .as_deref()
-                .is_some_and(expr_contains_subquery)
-        {
-            return true;
+        for expr in &group_by.exprs {
+            collect_subquery_table_refs_in_expr(expr, &mut table_refs);
+        }
+        if let Some(having) = &group_by.having {
+            collect_subquery_table_refs_in_expr(having, &mut table_refs);
         }
     }
-
-    if window_clause.iter().any(|w| {
-        w.window
-            .partition_by
-            .iter()
-            .any(|e| expr_contains_subquery(e))
-            || w.window
-                .order_by
-                .iter()
-                .any(|s| expr_contains_subquery(&s.expr))
-    }) {
-        return true;
+    collect_subquery_table_refs_in_window_clause(window_clause, &mut table_refs);
+    for sorted in order_by {
+        collect_subquery_table_refs_in_expr(&sorted.expr, &mut table_refs);
     }
-
-    if order_by.iter().any(|s| expr_contains_subquery(&s.expr)) {
-        return true;
-    }
-
     if let Some(limit) = limit {
-        if expr_contains_subquery(&limit.expr)
-            || limit.offset.as_deref().is_some_and(expr_contains_subquery)
-        {
-            return true;
+        collect_subquery_table_refs_in_expr(&limit.expr, &mut table_refs);
+        if let Some(offset) = &limit.offset {
+            collect_subquery_table_refs_in_expr(offset, &mut table_refs);
         }
     }
-
-    false
+    table_refs
 }
 
 /// Estimates jump labels needed to emit a query plan.
@@ -1923,6 +1785,99 @@ fn check_aliased_aggregate_misuse(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Moves each HAVING term that reads only constants and GROUP BY terms into WHERE,
+/// like SQLite's havingToWhere(). Such a term has the same value for every row of a
+/// group, so filtering the rows before grouping removes the same groups, and the
+/// aggregates of those groups are never computed. Like SQLite, a literal false term
+/// stays in HAVING.
+fn move_group_by_only_having_terms_to_where(
+    having: Vec<ast::Expr>,
+    group_by_exprs: &[ast::Expr],
+    aggregates: &[super::plan::Aggregate],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    where_clause: &mut Vec<WhereTerm>,
+) -> Result<Vec<ast::Expr>> {
+    let mut remaining = Vec::new();
+    for term in having {
+        if !is_literal_false(&term)
+            && is_constant_or_group_by(
+                &term,
+                group_by_exprs,
+                aggregates,
+                table_references,
+                resolver,
+            )?
+        {
+            where_clause.push(term.into());
+        } else {
+            remaining.push(term);
+        }
+    }
+    Ok(remaining)
+}
+
+/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): integer
+/// literal zero (decimal or hex, without `_` separators), `FALSE` and `x IN ()`.
+/// `Expr::is_always_false()` is not used because it also matches other constant false
+/// expressions such as `0.0`, `'0'` and `NOT 1`, which SQLite moves into WHERE.
+/// SQLite's parser also folds `X AND 0` into `0` when X has no function call, so it
+/// keeps `HAVING g = 2 AND 0` in HAVING, while here `g = 2` is moved.
+fn is_literal_false(expr: &ast::Expr) -> bool {
+    match expr {
+        Expr::Literal(ast::Literal::Numeric(n)) => {
+            match n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+                Some(hex_digits) => u64::from_str_radix(hex_digits, 16) == Ok(0),
+                None => n.parse::<i64>() == Ok(0),
+            }
+        }
+        Expr::Literal(ast::Literal::False) => true,
+        Expr::InList {
+            rhs, not: false, ..
+        } => rhs.is_empty(),
+        _ => false,
+    }
+}
+
+/// Checks that `term` has no aggregates and is constant once every GROUP BY term in
+/// it is replaced by NULL. Like SQLite's sqlite3ExprIsConstantOrGroupBy(), a GROUP BY
+/// term is only replaced when it groups with BINARY collation, because rows that
+/// another collation puts in one group can differ under BINARY.
+fn is_constant_or_group_by(
+    term: &ast::Expr,
+    group_by_exprs: &[ast::Expr],
+    aggregates: &[super::plan::Aggregate],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut term = term.clone();
+    let mut has_aggregate = false;
+    walk_expr_mut(&mut term, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, e))
+        {
+            has_aggregate = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        for group_by_expr in group_by_exprs {
+            if exprs_are_equivalent(e, group_by_expr)
+                && resolve_comparison_collseq_with_symbols(
+                    group_by_expr,
+                    group_by_expr,
+                    table_references,
+                    Some(resolver.symbol_table),
+                )? == CollationSeq::Binary
+            {
+                *e = Expr::Literal(ast::Literal::Null);
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(!has_aggregate && term.is_constant(resolver))
 }
 
 /// Check if an expression (inside an aggregate's arguments) contains an identifier

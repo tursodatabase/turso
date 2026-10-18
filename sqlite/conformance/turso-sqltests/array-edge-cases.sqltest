@@ -781,7 +781,7 @@ test negative-zero-float-equality {
     SELECT COUNT(DISTINCT vals) FROM nz3;
 }
 expect {
-    2
+    1
 }
 
 test negative-zero-in-mixed-array {

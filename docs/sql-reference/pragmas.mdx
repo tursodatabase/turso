@@ -378,6 +378,18 @@ PRAGMA wal_checkpoint;
 
 A checkpoint writes pages from the WAL file back to the database file.
 
+### wal_autocheckpoint
+
+Returns or sets how many pages the WAL can hold before a commit on this connection runs a checkpoint. The default is 1000 pages. Zero or a negative value turns automatic checkpoints off.
+
+```sql
+PRAGMA wal_autocheckpoint;
+PRAGMA wal_autocheckpoint = 1000;
+PRAGMA wal_autocheckpoint = 0;    -- turn automatic checkpoints off
+```
+
+The setting applies only to the connection that sets it. Closing the last connection to the database still checkpoints the WAL. In MVCC mode the setting has no effect; use `mvcc_checkpoint_threshold` instead.
+
 ## MVCC Tuning
 
 <Info>

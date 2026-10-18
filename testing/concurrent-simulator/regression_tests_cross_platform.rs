@@ -1,7 +1,7 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
 use turso_whopper::{IOFaultConfig, SimulatorIO};
 
 fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
@@ -42,7 +42,7 @@ fn test_concurrent_commit_no_yield_spin() {
     )
     .expect("open db");
 
-    let setup = db.connect().expect("setup conn");
+    let setup = db.connect(ConnectOpts::new()).expect("setup conn");
     setup
         .execute("PRAGMA journal_mode = 'mvcc'")
         .expect("enable mvcc");
@@ -51,8 +51,8 @@ fn test_concurrent_commit_no_yield_spin() {
         .expect("create table");
     setup.close().expect("close setup");
 
-    let conn1 = db.connect().expect("conn1");
-    let conn2 = db.connect().expect("conn2");
+    let conn1 = db.connect(ConnectOpts::new()).expect("conn1");
+    let conn2 = db.connect(ConnectOpts::new()).expect("conn2");
 
     let mut stmt = conn1.prepare("BEGIN CONCURRENT").expect("prepare");
     run_to_done(&mut stmt, &io);
@@ -107,7 +107,7 @@ fn test_concurrent_commit_no_yield_spin() {
     assert!(done1, "commit1 should have completed");
     assert!(done2, "commit2 should have completed");
 
-    let verify = db.connect().expect("verify conn");
+    let verify = db.connect(ConnectOpts::new()).expect("verify conn");
     let mut stmt = verify.prepare("SELECT COUNT(*) FROM t").expect("prepare");
     let mut count = 0i64;
     loop {
@@ -240,16 +240,16 @@ fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
     }
 }
 
-/// The FTS workloads must exercise the index, not `fts_match`'s scalar
-/// fallback, and a seeded run must replay: segment ids and index
-/// incarnations are drawn from the seeded IO, so two runs of one seed end
-/// with byte-identical database files. Before the fix the MVCC log of two
-/// same-seed runs differed in every `fts2/chunk/<uuid>` path.
+/// FTS workloads must use the index rather than scan the table.
+/// Two runs with the same seed must produce the same database file bytes.
+/// The simulator uses the seed to generate segment and index IDs.
+/// Before the fix, two runs with the same seed had different MVCC log paths
+/// for every `fts2/chunk/<uuid>` entry.
 #[test]
 fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     use turso_whopper::operations::Operation;
     use turso_whopper::properties::{
-        FtsSelfDifferentialProperty, IntegrityCheckProperty, Property,
+        FtsResultComparisonProperty, IntegrityCheckProperty, Property,
     };
     use turso_whopper::workloads::{
         BeginWorkload, CommitWorkload, FtsDeleteWorkload, FtsInsertWorkload, FtsMatchWorkload,
@@ -270,7 +270,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         ];
         let properties: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
-            Box::new(FtsSelfDifferentialProperty),
+            Box::new(FtsResultComparisonProperty),
         ];
         let opts = WhopperOpts {
             seed: Some(seed),
@@ -285,14 +285,14 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         let mut whopper = Whopper::new(opts).expect("create whopper");
         whopper
             .run()
-            .expect("FTS workloads must not violate a property");
+            .expect("FTS workloads failed a result comparison");
         (whopper.stats.clone(), whopper.db_file_bytes())
     }
 
     let (first_stats, first_files) = run(0xF75);
     assert!(
         first_stats.fts_checks > 0,
-        "no FTS differential completed, so the workloads tested nothing"
+        "no FTS result comparison completed"
     );
 
     let (second_stats, second_files) = run(0xF75);
@@ -303,13 +303,12 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         assert_eq!(name, other_name);
         assert!(
             first == second,
-            "{name} differs between two runs of one seed: something (FTS segment ids, index \
-             incarnations) is not drawn from the seeded IO, so seeds do not replay"
+            "{name} differs between two runs with the same seed. \
+             FTS segment and index IDs must come from the simulator's seeded random generator"
         );
     }
 
-    // The differential's `fts_match` side must be planned through the
-    // index method; the scalar fallback would make the comparison vacuous.
+    // The FTS search must use the index. Otherwise, both queries scan the table.
     let io = Arc::new(SimulatorIO::new(
         false,
         ChaCha8Rng::seed_from_u64(7),
@@ -327,16 +326,16 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         Arc::new(SqliteDialect),
     )
     .expect("open db");
-    let conn = db.connect().expect("connect");
+    let conn = db.connect(ConnectOpts::new()).expect("connect");
     for (_, sql) in fts_sim_schema() {
-        conn.execute(&sql).expect("bootstrap FTS schema");
+        conn.execute(&sql).expect("create the FTS table and index");
     }
-    let differential = Operation::FtsMatchDifferential {
-        token: "alpha".to_string(),
+    let comparison_sql = Operation::CompareFtsResults {
+        word: "alpha".to_string(),
     }
     .sql();
     let mut stmt = conn
-        .prepare(format!("EXPLAIN {differential}"))
+        .prepare(format!("EXPLAIN {comparison_sql}"))
         .expect("prepare explain");
     let mut opcodes = Vec::new();
     loop {
@@ -352,7 +351,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
     }
     assert!(
         opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
-        "the FTS differential is not planned through the index method: {opcodes:?}"
+        "the FTS search does not use the index: {opcodes:?}"
     );
 }
 

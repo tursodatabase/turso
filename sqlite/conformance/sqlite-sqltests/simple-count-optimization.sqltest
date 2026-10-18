@@ -142,3 +142,24 @@ test simple-count-regexp-invalid-pattern-correctness {
 expect {
     0
 }
+
+test simple-count-distinct {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    INSERT INTO t1 VALUES (1),(NULL),(3);
+    SELECT DISTINCT count(*) FROM t1;
+    SELECT DISTINCT count(*) FROM t2;
+    SELECT * FROM (SELECT DISTINCT count(*) FROM t1);
+    SELECT (SELECT DISTINCT count(*) FROM t1);
+    WITH c AS (SELECT DISTINCT count(*) AS n FROM t1) SELECT n FROM c;
+    SELECT DISTINCT count(*) FROM t1 LIMIT 1;
+    SELECT DISTINCT count(*) FROM t1 LIMIT 1 OFFSET 1;
+}
+expect {
+    3
+    0
+    3
+    3
+    3
+    3
+}

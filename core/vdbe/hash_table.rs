@@ -118,7 +118,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
 #[inline]
-const fn normalized_f64_bits(f: f64) -> u64 {
+pub(crate) const fn normalized_f64_bits(f: f64) -> u64 {
     if f == 0.0 {
         0.0f64.to_bits()
     } else {
@@ -987,7 +987,7 @@ pub struct HashTable {
     temp_store: crate::TempStore,
     /// Whether to track matched entries (for FULL OUTER JOIN).
     track_matched: bool,
-    /// Parallel to `buckets`: one Vec<bool> per bucket tracking which entries were matched.
+    /// Parallel to `buckets`: one `Vec<bool>` per bucket tracking which entries were matched.
     matched_bits: Vec<Vec<bool>>,
     /// Bucket index for iterating unmatched entries.
     unmatched_scan_bucket: usize,

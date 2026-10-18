@@ -31,6 +31,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
@@ -89,9 +90,9 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
-pub use function::Func;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
+pub use function::{ExternalFunc, Func};
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.
@@ -128,8 +129,9 @@ pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    Database, DatabaseOpts, EncryptionOpts, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
-    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
+    ConnectAsyncState, ConnectOpts, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
+    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
+    SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};

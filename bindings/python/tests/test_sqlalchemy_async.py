@@ -1,5 +1,9 @@
 """Tests for the async SQLAlchemy dialect."""
 
+import asyncio
+import logging
+import threading
+
 import pytest
 
 # Skip all tests if SQLAlchemy is not installed
@@ -12,6 +16,11 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column  # noqa: E402
 from turso.sqlalchemy import AioTursoDialect  # noqa: E402
+from turso.worker import Worker  # noqa: E402
+
+LONG_RUNNING_QUERY = (
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000) SELECT count(*) FROM c"
+)
 
 
 class Base(DeclarativeBase):
@@ -275,3 +284,90 @@ async def test_large_text_data():
         assert result.scalar() == large
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_file_database_connect_query_dispose(tmp_path):
+    """A file database engine connects, runs a query and stops its worker threads on dispose.
+
+    SQLAlchemy >= 2.0.46 reads has_stop from the DBAPI module when it creates the engine.
+    """
+    workers_before = _turso_worker_threads()
+    engine = create_async_engine(f"sqlite+aioturso:///{tmp_path / 'test.db'}")
+
+    async with engine.connect() as conn:
+        result = await conn.execute(text("SELECT 1"))
+        assert result.scalar() == 1
+
+    await engine.dispose()
+
+    assert _turso_worker_threads() - workers_before == set()
+
+
+@pytest.mark.asyncio
+async def test_invalidated_connection_is_closed(tmp_path, caplog):
+    """An invalidated connection is closed without pool errors, and the pool opens a new one.
+
+    The pool calls the dialect's do_terminate() for an invalidated connection.
+    """
+    caplog.set_level(logging.ERROR, logger="sqlalchemy.pool")
+    workers_before = _turso_worker_threads()
+    engine = create_async_engine(f"sqlite+aioturso:///{tmp_path / 'test.db'}")
+
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+        await conn.invalidate()
+
+    async with engine.connect() as conn:
+        result = await conn.execute(text("SELECT 1"))
+        assert result.scalar() == 1
+
+    await engine.dispose()
+
+    assert _pool_errors(caplog) == []
+    assert _turso_worker_threads() - workers_before == set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_query_connection_is_closed(tmp_path, caplog):
+    """Cancelling a running query closes its connection without pool errors, and the pool opens a new one.
+
+    SQLAlchemy invalidates the connection when a query is cancelled, so the pool calls do_terminate().
+    """
+    caplog.set_level(logging.ERROR, logger="sqlalchemy.pool")
+    workers_before = _turso_worker_threads()
+    engine = create_async_engine(f"sqlite+aioturso:///{tmp_path / 'test.db'}")
+    connected = asyncio.Event()
+
+    async def run_long_query():
+        async with engine.connect() as conn:
+            connected.set()
+            await conn.execute(text(LONG_RUNNING_QUERY))
+
+    task = asyncio.create_task(run_long_query())
+    await connected.wait()
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with engine.connect() as conn:
+        result = await conn.execute(text("SELECT 1"))
+        assert result.scalar() == 1
+
+    await engine.dispose()
+
+    assert _pool_errors(caplog) == []
+    assert _turso_worker_threads() - workers_before == set()
+
+
+def _turso_worker_threads():
+    return {thread for thread in threading.enumerate() if isinstance(thread, Worker)}
+
+
+def _pool_errors(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("sqlalchemy.pool") and record.levelno >= logging.ERROR
+    ]

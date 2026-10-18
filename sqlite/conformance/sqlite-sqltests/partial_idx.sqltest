@@ -1756,3 +1756,100 @@ expect {
     one
     two
 }
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is not in the
+# partial index p, so there is no p entry to delete.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-not-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 9);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|9
+    ok
+}
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is in the partial
+# index p and the updated row 2 is not, so the p entry of row 1 must go.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 9), (2, 'b', 1);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    SELECT count(*) FROM t WHERE c0 > 5;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|1
+    0
+    ok
+}
+
+# The query BETWEEN implies the index WHERE through its lower bound, but its
+# upper bound still reads column a, so the index cannot cover the query.
+test partial-index-between-implies-where-still-reads-column {
+    CREATE TABLE t(a INT, b);
+    CREATE INDEX i ON t(b) WHERE a >= 2;
+    INSERT INTO t VALUES (3, 'x'), (1, 'y'), (5, 'z');
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT b FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND NULL;
+}
+expect {
+    1
+    x
+    0
+}
+
+# The hash join build side reads t from the partial index, so the term
+# b > 1 must be skipped there too: the index does not store column b.
+test partial-index-hash-join-build-skips-index-where-term {
+    CREATE TABLE t(a, b);
+    CREATE TABLE u(x);
+    CREATE INDEX i ON t(a) WHERE b > 1;
+    INSERT INTO t VALUES (2, 3), (2, 0), (2, 5), (3, 9);
+    INSERT INTO u VALUES (2), (3), (2);
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t LEFT JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a + 0 WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a > 0 AND b > 1;
+}
+expect {
+    4
+    4
+    4
+    5
+}
+
+@cross-check-integrity
+test partial-index-rowid-where-update-through-covering-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b) WHERE id > 10;
+    INSERT INTO t VALUES (1, 1, 0);
+    UPDATE t SET b = 2 WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|1|2
+}
+
+@cross-check-integrity
+test partial-index-rowid-where-update-through-covering-index-after-earlier-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b) WHERE id > 1;
+    INSERT INTO t VALUES (2, 1, 0), (1, 2, 0);
+    UPDATE t SET b = 9 WHERE a > 0;
+    SELECT * FROM t;
+}
+expect {
+    1|2|9
+    2|1|9
+}

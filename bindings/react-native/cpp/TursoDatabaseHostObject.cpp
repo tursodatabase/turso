@@ -20,12 +20,13 @@ void TursoDatabaseHostObject::throwError(jsi::Runtime &rt, const char *error) {
 
 jsi::Value TursoDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "open") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->open(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->open(rt);
             }
         );
     }
@@ -33,8 +34,8 @@ jsi::Value TursoDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNameID 
     if (propName == "connect") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->connect(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->connect(rt);
             }
         );
     }
@@ -42,8 +43,8 @@ jsi::Value TursoDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNameID 
     if (propName == "close") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->close(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->close(rt);
             }
         );
     }

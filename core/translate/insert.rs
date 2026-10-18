@@ -1,5 +1,7 @@
 use crate::schema::ColumnLayout;
-use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
+use crate::translate::emitter::{
+    emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
+};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -29,7 +31,7 @@ use crate::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -285,6 +287,8 @@ pub fn translate_insert(
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),
@@ -339,6 +343,7 @@ pub fn translate_insert(
             identifier: normalize_ident(table_name.as_str()),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -351,8 +356,15 @@ pub fn translate_insert(
     );
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
+    let mut returning_table_refs = Vec::new();
+    for column in &returning {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+        }
+    }
     plan_ctes_as_outer_refs(
         with_for_returning,
+        &returning_table_refs,
         resolver,
         program,
         &mut table_references,
@@ -642,15 +654,18 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
-    if ctx.table.is_strict {
-        // Pre-encode TypeCheck: validate input types match the custom type's
-        // declared value type BEFORE encoding. This catches type mismatches
-        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
-        // be silently converted by the encode expression.
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let maybe_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
+            check_generated: false,
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
                 resolver.schema(),
@@ -661,13 +676,14 @@ pub fn translate_insert(
         // Encode values for columns with custom types.
         emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
-        // Post-encode TypeCheck: validate that encode produced the correct
-        // storage type (BASE).
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
-            check_generated: true,
-            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+            check_generated: false,
+            table_reference: Arc::clone(type_check_table),
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
@@ -799,6 +815,17 @@ pub fn translate_insert(
             resolver,
             &btree_table,
         )?;
+
+        if let Some(type_check_table) = maybe_type_check_table {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: ctx.table.columns().len(),
+                //TODO here we could eventually type-check only virtual columns and the stored
+                // columns that have NOT NULL REPLACE.
+                check_generated: true,
+                table_reference: type_check_table,
+            });
+        }
 
         emit_notnulls(program, &ctx, &insertion, resolver, true)?;
     }
@@ -977,14 +1004,6 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
-
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -1750,7 +1769,12 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: name_col_reg,
+        dst_reg: table_name_reg,
+        extra_amount: 0,
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
@@ -3417,7 +3441,7 @@ fn ensure_sequence_initialized(
         rhs: name_col_reg,
         target_pc: entry_exists_label,
         flags: Default::default(),
-        collation: None,
+        collation: Some(super::collate::CollationSeq::NoCase),
     });
 
     program.emit_insn(Insn::Next {
@@ -3840,34 +3864,28 @@ fn emit_replace_delete_conflicting_row(
         let index = resolver
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
-        let skip_delete_label = if index.where_clause.is_some() {
-            let where_copy = index
-                .bind_where_expr(Some(table_references), resolver)?
-                .expect("index.where_clause was checked to be Some above");
+        let table_internal_id = table_references.joined_tables()[0].internal_id;
+        let skip_delete_label = emit_partial_index_where_old_image(
+            program,
+            resolver,
+            table_references,
+            main_cursor_id,
+            table_internal_id,
+            &index,
+        )?
+        .map(|where_reg| {
             let skip_label = program.allocate_label();
-            let reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &where_copy,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
             program.emit_insn(Insn::IfNot {
-                reg,
+                reg: where_reg,
                 jump_if_null: true,
                 target_pc: skip_label,
             });
-            Some(skip_label)
-        } else {
-            None
-        };
+            skip_label
+        });
 
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
 
-        let table_internal_id = table_references.joined_tables()[0].internal_id;
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             emit_index_column_value_old_image(
                 program,
@@ -3888,7 +3906,7 @@ fn emit_replace_delete_conflicting_row(
             start_reg,
             num_regs,
             cursor_id: *index_cursor_id,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
 
         if let Some(label) = skip_delete_label {

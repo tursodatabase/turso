@@ -22,7 +22,10 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
-use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
+use super::planner::{
+    append_vtab_predicates_to_where_clause, collect_subquery_table_refs_in_expr, parse_from,
+    parse_where,
+};
 use super::subquery::{
     mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
     plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
@@ -281,6 +284,7 @@ fn prepare_update_plan(
         identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_plan: None,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
@@ -289,6 +293,18 @@ fn prepare_update_plan(
         indexed,
         plan_estimate: None,
     };
+    let mut table_refs_outside_from = Vec::new();
+    for set in &body.sets {
+        collect_subquery_table_refs_in_expr(&set.expr, &mut table_refs_outside_from);
+    }
+    if let Some(where_clause) = &body.where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut table_refs_outside_from);
+    }
+    for column in &body.returning {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut table_refs_outside_from);
+        }
+    }
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];
     let mut vtab_predicates = vec![];
@@ -297,7 +313,7 @@ fn prepare_update_plan(
         resolver,
         program,
         with,
-        true,
+        &table_refs_outside_from,
         &mut where_clause,
         &mut vtab_predicates,
         &mut from_tables,
@@ -347,9 +363,6 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
-    if from_tables.right_join_swapped() {
-        read_scope_tables.set_right_join_swapped();
-    }
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
@@ -405,17 +418,17 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
-    append_vtab_predicates_to_where_clause(
-        &mut vtab_predicates,
-        &mut read_scope_tables,
-        &result_columns,
-        &mut where_clause,
-        resolver,
-    )?;
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
         Some(&result_columns),
+        &mut where_clause,
+        resolver,
+    )?;
+    append_vtab_predicates_to_where_clause(
+        &mut vtab_predicates,
+        &mut read_scope_tables,
+        &result_columns,
         &mut where_clause,
         resolver,
     )?;

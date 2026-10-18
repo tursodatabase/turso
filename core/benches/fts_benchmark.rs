@@ -12,8 +12,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -23,7 +21,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -104,7 +102,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
     // Create table and FTS index
@@ -156,7 +154,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
 /// Setup an index with one FTS commit per row to exercise segment churn.
 fn setup_fts_churn_db(temp_dir: &TempDir, commit_count: usize) -> Arc<Database> {
     let db = setup_fts_db(temp_dir, 0);
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA fts_merge_threshold = 32").unwrap();
 
     for id in 0..commit_count {
@@ -194,7 +192,7 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         // Fresh connection = no cached directory
-                        let conn = db.connect().unwrap();
+                        let conn = db.connect(ConnectOpts::new()).unwrap();
                         let start = std::time::Instant::now();
                         let mut stmt = conn
                             .query(
@@ -227,7 +225,7 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
     for row_count in [1000, 5000, 10000] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Warm up: run one query to populate the directory cache
         let mut stmt = conn
@@ -274,7 +272,7 @@ fn bench_fts_connection_pool_query(criterion: &mut Criterion) {
 
     for connection_count in [1, 2, 4] {
         let connections = (0..connection_count)
-            .map(|_| db.connect().unwrap())
+            .map(|_| db.connect(ConnectOpts::new()).unwrap())
             .collect::<Vec<_>>();
         for conn in &connections {
             let mut stmt = conn
@@ -323,7 +321,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     let row_count = 10000;
     let temp_dir = tempfile::tempdir().unwrap();
     let db = setup_fts_db(&temp_dir, row_count);
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Warm up
     let mut stmt = conn
@@ -372,7 +370,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
     for row_count in [1000, 5000] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
         // Use a shared counter that persists across warmup + sampling invocations
@@ -433,7 +431,7 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
     for commit_count in [64, 256, 1024] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_churn_db(&temp_dir, commit_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let dense_sql = "SELECT fts_score(body, 'common') AS score, id \
                          FROM docs \
                          WHERE fts_match(body, 'common') \
@@ -508,7 +506,7 @@ fn bench_fts_single_row_commit_churn(criterion: &mut Criterion) {
                     for repetition in 0..iters {
                         let temp_dir = tempfile::tempdir().unwrap();
                         let db = setup_fts_db(&temp_dir, 0);
-                        let conn = db.connect().unwrap();
+                        let conn = db.connect(ConnectOpts::new()).unwrap();
                         conn.execute(format!("PRAGMA fts_merge_threshold = {merge_threshold}"))
                             .unwrap();
                         let start = std::time::Instant::now();
@@ -558,7 +556,7 @@ fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
         let setup = || {
             let temp_dir = tempfile::tempdir().unwrap();
             let db = setup_fts_db(&temp_dir, 0);
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.execute(format!("PRAGMA fts_merge_threshold = {merge_threshold}"))
                 .unwrap();
             (temp_dir, db, conn)
@@ -600,20 +598,266 @@ fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = fts_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_fragmented_delete(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Fragmented Delete");
+    group.sample_size(10);
+    let ids = (0..512)
+        .step_by(16)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("DELETE FROM docs WHERE id IN ({ids})");
+
+    for segment_count in [1, 32, 128, 512] {
+        let setup = || {
+            let (temp_dir, db, conn) = setup_fts_fragmented_db(segment_count);
+            let stmt = conn.query(&sql).unwrap().unwrap();
+            (temp_dir, db, conn, stmt)
+        };
+        {
+            let (_temp_dir, db, conn, mut stmt) = setup();
+            run_to_completion(&mut stmt, &db).unwrap();
+            let mut remaining = conn
+                .query("SELECT id FROM docs WHERE (title, body) MATCH 'common'")
+                .unwrap()
+                .unwrap();
+            assert_eq!(run_and_count_rows(&mut remaining, &db).unwrap(), 480);
+            let mut deleted = conn
+                .query(format!(
+                    "SELECT id FROM docs WHERE (title, body) MATCH 'common' AND id IN ({ids})"
+                ))
+                .unwrap()
+                .unwrap();
+            assert_eq!(run_and_count_rows(&mut deleted, &db).unwrap(), 0);
+        }
+        group.bench_function(BenchmarkId::new("delete_32_rows", segment_count), |b| {
+            b.iter_batched(
+                setup,
+                |(temp_dir, db, conn, mut stmt)| {
+                    run_to_completion(&mut stmt, &db).unwrap();
+                    (temp_dir, db, conn, stmt)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
 }
 
-#[cfg(feature = "codspeed")]
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_fragmented_registry_scan(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Fragmented Registry Scan");
+    group.sample_size(20);
+
+    for segment_count in [1, 32, 128, 512] {
+        let (_temp_dir, db, conn) = setup_fts_fragmented_db(segment_count);
+        group.bench_function(BenchmarkId::new("no_match", segment_count), |b| {
+            b.iter_batched(
+                || {
+                    conn.query("SELECT id FROM docs WHERE (title, body) MATCH 'absent'")
+                        .unwrap()
+                        .unwrap()
+                },
+                |mut stmt| {
+                    assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 0);
+                    stmt
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn setup_fts_fragmented_db(
+    segment_count: usize,
+) -> (TempDir, Arc<Database>, Arc<turso_core::Connection>) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db = setup_fts_db(&temp_dir, 0);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+    let rows_per_segment = 512 / segment_count;
+    assert_eq!(512 % segment_count, 0);
+    assert!(rows_per_segment <= turso_core::index_method::fts::BATCH_COMMIT_SIZE);
+    for first_id in (0..512).step_by(rows_per_segment) {
+        let values = (first_id..first_id + rows_per_segment)
+            .map(|id| format!("({id}, 'document {id}', 'common content {id}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(format!("INSERT INTO docs VALUES {values}"))
+            .unwrap();
+    }
+    let mut warm = conn
+        .query("SELECT id FROM docs WHERE (title, body) MATCH 'common'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_and_count_rows(&mut warm, &db).unwrap(), 512);
+    #[cfg(feature = "test_helper")]
+    {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT count(*) FROM docs").unwrap();
+        let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
+            &conn,
+            turso_core::MAIN_DB_ID,
+            "docs_fts",
+        )
+        .unwrap();
+        loop {
+            match dumper.step().unwrap() {
+                turso_core::IOResult::Done(()) => break,
+                turso_core::IOResult::IO(completions) => {
+                    while !completions.finished() {
+                        db.io.step().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            dumper
+                .rows
+                .iter()
+                .filter(|(path, _, _, _)| path.starts_with("fts2/seg/"))
+                .count(),
+            segment_count
+        );
+        drop(dumper);
+        conn.execute("ROLLBACK").unwrap();
+    }
+    (temp_dir, db, conn)
+}
+
+#[cfg(feature = "test_helper")]
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_searcher_cache(criterion: &mut Criterion) {
+    use turso_core::index_method::{
+        fts::set_fts_retained_cache_bytes_for_test, IndexMethodContext,
+    };
+    use turso_core::IOResult;
+
+    let mut group = criterion.benchmark_group("FTS Searcher Cache");
+    for budget in [1, 192 * 1024 * 1024] {
+        set_fts_retained_cache_bytes_for_test(Some(budget));
+        let temp_dir = tempfile::tempdir().unwrap();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            temp_dir.path().join("fts.db").to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        for segment in 0..3 {
+            let values = (0..1000)
+                .map(|offset| {
+                    let id = segment * 1000 + offset;
+                    let term = if offset == 0 { "needle" } else { "haystack" };
+                    format!("({id}, '{term} document {id} about database storage and indexing with additional searchable content')")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(format!("INSERT INTO docs VALUES {values}"))
+                .unwrap();
+        }
+        check_fts_searcher_cache_query(&conn, &db);
+        let attachment = conn
+            .with_schema_mut(|schema| {
+                schema
+                    .get_index("docs", "docs_fts")
+                    .unwrap()
+                    .index_method
+                    .clone()
+                    .unwrap()
+            })
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT count(*) FROM docs").unwrap();
+        let mut cursor = attachment.init().unwrap();
+        let context =
+            IndexMethodContext::for_test(&conn, turso_core::MAIN_DB_ID, attachment.as_ref())
+                .unwrap();
+        loop {
+            match cursor.open_read(&context).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(completions) => {
+                    while !completions.finished() {
+                        db.io.step().unwrap();
+                    }
+                }
+            }
+        }
+        let stats = cursor.test_stats().unwrap().unwrap();
+        assert_eq!(stats.segment_count, Some(3));
+        assert!(stats.cached_connection_count.unwrap() > 0);
+        if budget == 1 {
+            assert!(stats.full_snapshot_loads.unwrap() > 0);
+            assert!(stats.cached_bytes.unwrap() > budget);
+        }
+        drop(cursor);
+        conn.execute("COMMIT").unwrap();
+        let counters = attachment.init().unwrap();
+        let before = counters.test_stats().unwrap().unwrap();
+        for _ in 0..10 {
+            check_fts_searcher_cache_query(&conn, &db);
+        }
+        let after = counters.test_stats().unwrap().unwrap();
+        let loads = after.full_snapshot_loads.unwrap() - before.full_snapshot_loads.unwrap();
+        let hits = after.read_cache_hits.unwrap() - before.read_cache_hits.unwrap();
+        assert_eq!(hits, 10);
+        if budget > 1 {
+            assert_eq!(loads, 0);
+            assert!(after.cached_bytes.unwrap() < budget);
+        }
+        eprintln!("budget={budget} rows=3000 segments=3 retained_bytes={} queries=10 segment_loads={loads} searcher_hits={hits}", after.cached_bytes.unwrap());
+        group.bench_function(BenchmarkId::new("3000_rows_3_segments", budget), |b| {
+            b.iter(|| check_fts_searcher_cache_query(&conn, &db));
+        });
+        set_fts_retained_cache_bytes_for_test(None);
+    }
+    group.finish();
+}
+
+#[cfg(feature = "test_helper")]
+fn check_fts_searcher_cache_query(conn: &Arc<turso_core::Connection>, db: &Arc<Database>) {
+    let mut stmt = conn
+        .query("SELECT id FROM docs WHERE body MATCH 'needle' ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let mut count = 0;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                assert_eq!(stmt.row().unwrap().get::<i64>(0).unwrap(), count * 1000);
+                count += 1;
+            }
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            StepResult::Interrupt | StepResult::Busy => panic!("unexpected query interruption"),
+        }
+    }
+    assert_eq!(count, 3);
+}
+
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
 }
 
+#[cfg(feature = "test_helper")]
+criterion_group!(fts_searcher_cache, bench_fts_searcher_cache);
+
+#[cfg(feature = "test_helper")]
+criterion_main!(fts_benches, fts_searcher_cache);
+
+#[cfg(not(feature = "test_helper"))]
 criterion_main!(fts_benches);
