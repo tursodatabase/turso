@@ -803,6 +803,14 @@ pub trait CursorTrait: Any + Send + Sync {
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
+    /// `record_payload` for a caller that decodes only the first `columns`
+    /// columns, or the whole payload when `columns` is None. A b-tree cursor
+    /// whose cell spills into overflow pages returns only the part kept on
+    /// the page when those columns end there, so the overflow pages are not
+    /// read, as SQLite's OP_Column does. Default: `record_payload`.
+    fn record_payload_up_to(&mut self, _columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
+        self.record_payload()
+    }
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult>;
     /// Seek using registers directly without serializing them into an ImmutableRecord first.
@@ -6885,6 +6893,52 @@ impl CursorTrait for BTreeCursor {
         self.record_payload_up_to(None)
     }
 
+    #[inline(always)]
+    fn record_payload_up_to(&mut self, columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return restore_record_payload(self, columns);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(payload)));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
+        }
+        return self.record_payload_general(columns);
+
+        #[inline(never)]
+        fn restore_record_payload(
+            cursor: &mut BTreeCursor,
+            columns: Option<usize>,
+        ) -> IOResultOr<Option<&[u8]>> {
+            return_if_io!(cursor.restore_context());
+            cursor.record_payload_up_to(columns)
+        }
+    }
+
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
@@ -7803,57 +7857,6 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
-    /// [`CursorTrait::record_payload`] for a caller that decodes only the
-    /// first `columns` columns, or the whole payload when `columns` is None.
-    /// When the cell spills into overflow pages but those columns end in
-    /// the part kept on the page, returns only that part, so the overflow
-    /// pages are not read, as SQLite's OP_Column does.
-    #[inline(always)]
-    pub fn record_payload_up_to(&mut self, columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self, columns);
-        }
-        if self.null_flag || !self.has_record() {
-            return Ok(IOResult::Done(None));
-        }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general(columns);
-
-        #[inline(never)]
-        fn restore_record_payload(
-            cursor: &mut BTreeCursor,
-            columns: Option<usize>,
-        ) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload_up_to(columns)
-        }
-    }
-
     #[inline(never)]
     fn record_payload_general(&mut self, columns: Option<usize>) -> IOResultOr<Option<&[u8]>> {
         let page = self.stack.top_ref();
