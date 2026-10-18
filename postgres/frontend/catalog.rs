@@ -1037,7 +1037,7 @@ impl SnapshotRows for PgIndexesTable {
                     Value::Text(table_name.clone().into()),
                     Value::Text(idx.name.clone().into()),
                     Value::Null,
-                    Value::build_text(index_definition(table_name, idx)),
+                    Value::build_text(index_definition("public", table_name, &idx.name, idx)),
                 ]);
             }
         }
@@ -3410,7 +3410,7 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
                 continue;
             }
             if index_oid == target_oid {
-                return Some(index_definition(table_name, idx));
+                return Some(index_definition("public", table_name, &idx.name, idx));
             }
             index_oid += 1;
         }
@@ -3419,7 +3419,9 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
     None
 }
 
-fn index_definition(table_name: &str, idx: &Index) -> String {
+/// The CREATE INDEX statement of index `idx`, named `index_name` in its
+/// schema, of table `table_name` of schema `table_schema`.
+fn index_definition(table_schema: &str, table_name: &str, index_name: &str, idx: &Index) -> String {
     let unique = if idx.unique { "UNIQUE " } else { "" };
     let cols: Vec<String> = idx
         .columns
@@ -3433,8 +3435,7 @@ fn index_definition(table_name: &str, idx: &Index) -> String {
         })
         .collect();
     let mut def = format!(
-        "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-        idx.name,
+        "CREATE {unique}INDEX {index_name} ON {table_schema}.{table_name} USING btree ({})",
         cols.join(", ")
     );
     if let Some(where_clause) = &idx.where_clause {

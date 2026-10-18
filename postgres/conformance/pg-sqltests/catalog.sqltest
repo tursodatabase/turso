@@ -641,6 +641,18 @@ expect {
     public|items|items_price_idx||CREATE UNIQUE INDEX items_price_idx ON items USING btree (price) WHERE price > 0
 }
 
+test pg-indexes-and-pg-get-indexdef-name-the-schema-of-the-table {
+    CREATE TABLE items (id int, name text);
+    CREATE INDEX items_name_idx ON items (name);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'items_name_idx'
+    UNION ALL
+    SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'items_name_idx';
+}
+expect {
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
+}
+
 test pg-index-columns {
     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
     CREATE INDEX idx_items_name ON items(name);
