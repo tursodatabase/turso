@@ -244,6 +244,32 @@ expect {
     1|4|3
 }
 
+@setup comma_and_join
+test parenthesized-join-on-the-right-of-join-keeps-the-table-order {
+    SELECT * FROM ca JOIN (cb JOIN cc ON cb.y < cc.z) ON ca.x < cb.y;
+}
+expect {
+    1|2|3
+}
+
+setup outer_join_of_a_parenthesized_join {
+    CREATE TABLE pa (x int, y int);
+    CREATE TABLE pc (k int, v int);
+    INSERT INTO pa VALUES (1, 10), (2, 20);
+    INSERT INTO pc VALUES (1, 1), (3, 4);
+}
+
+@setup outer_join_of_a_parenthesized_join
+test left-join-of-a-parenthesized-join-gives-nulls-for-every-inner-table {
+    SELECT pc.k, pa.x, s.q
+    FROM pc LEFT JOIN (pa JOIN (SELECT 1 AS q) s ON true) ON pc.k = pa.x
+    ORDER BY 1, 2;
+}
+expect {
+    1|1|1
+    3||
+}
+
 setup outer_t1 {
     CREATE TABLE t1 (a int);
     INSERT INTO t1 VALUES (1), (2);
