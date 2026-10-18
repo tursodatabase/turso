@@ -1751,6 +1751,7 @@ dependencies = [
  "indexmap 2.11.1",
  "parking_lot",
  "proptest",
+ "query-result-oracle",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rusqlite",
@@ -4838,6 +4839,10 @@ dependencies = [
  "turso",
  "turso_macros",
 ]
+
+[[package]]
+name = "query-result-oracle"
+version = "0.9.0-pre.1"
 
 [[package]]
 name = "quick-error"
