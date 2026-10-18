@@ -3407,16 +3407,144 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
     db.err_code
 }
 
+#[derive(Clone, Copy)]
+enum CompleteState {
+    Invalid,
+    Start,
+    Normal,
+    Explain,
+    Create,
+    Trigger,
+    Semi,
+    End,
+}
+
+#[derive(Clone, Copy)]
+enum CompleteToken {
+    Semicolon,
+    Whitespace,
+    Other,
+    Explain,
+    Create,
+    Temp,
+    Trigger,
+    End,
+}
+
+fn complete_transition(state: CompleteState, token: CompleteToken) -> CompleteState {
+    use CompleteState as State;
+    use CompleteToken as Token;
+
+    match (state, token) {
+        (State::Invalid, Token::Semicolon) | (State::Start, Token::Semicolon) => State::Start,
+        (State::Invalid, Token::Whitespace) => State::Invalid,
+        (State::Invalid, Token::Explain) => State::Explain,
+        (State::Invalid, Token::Create) => State::Create,
+        (State::Invalid, _) => State::Normal,
+        (State::Start, Token::Whitespace) => State::Start,
+        (State::Start, Token::Explain) => State::Explain,
+        (State::Start, Token::Create) => State::Create,
+        (State::Start, _) => State::Normal,
+        (State::Normal, Token::Semicolon) => State::Start,
+        (State::Normal, _) => State::Normal,
+        (State::Explain, Token::Semicolon) => State::Start,
+        (State::Explain, Token::Whitespace | Token::Other) => State::Explain,
+        (State::Explain, Token::Create) => State::Create,
+        (State::Explain, _) => State::Normal,
+        (State::Create, Token::Semicolon) => State::Start,
+        (State::Create, Token::Whitespace | Token::Temp) => State::Create,
+        (State::Create, Token::Trigger) => State::Trigger,
+        (State::Create, _) => State::Normal,
+        (State::Trigger, Token::Semicolon) => State::Semi,
+        (State::Trigger, _) => State::Trigger,
+        (State::Semi, Token::Semicolon | Token::Whitespace) => State::Semi,
+        (State::Semi, Token::End) => State::End,
+        (State::Semi, _) => State::Trigger,
+        (State::End, Token::Semicolon) => State::Start,
+        (State::End, Token::Whitespace) => State::End,
+        (State::End, _) => State::Trigger,
+    }
+}
+
+fn sqlite3_complete_sql(sql: &[u8]) -> bool {
+    let mut state = CompleteState::Invalid;
+    let mut i = 0;
+    while i < sql.len() {
+        let token = match sql[i] {
+            b'\'' | b'"' | b'`' | b'[' => {
+                let end = if sql[i] == b'[' { b']' } else { sql[i] };
+                i += 1;
+                while i < sql.len() {
+                    if sql[i] == end {
+                        if i + 1 < sql.len() && sql[i + 1] == end && end != b']' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                CompleteToken::Other
+            }
+            b'-' if i + 1 < sql.len() && sql[i + 1] == b'-' => {
+                i += 2;
+                while i < sql.len() && !matches!(sql[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < sql.len() && sql[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < sql.len() && !(sql[i] == b'*' && sql[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(sql.len());
+                continue;
+            }
+            b';' => {
+                i += 1;
+                CompleteToken::Semicolon
+            }
+            byte if byte.is_ascii_whitespace() => {
+                i += 1;
+                CompleteToken::Whitespace
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = i;
+                i += 1;
+                while i < sql.len() && (sql[i].is_ascii_alphanumeric() || sql[i] == b'_') {
+                    i += 1;
+                }
+                match &sql[start..i] {
+                    word if word.eq_ignore_ascii_case(b"EXPLAIN") => CompleteToken::Explain,
+                    word if word.eq_ignore_ascii_case(b"CREATE") => CompleteToken::Create,
+                    word if word.eq_ignore_ascii_case(b"TEMP")
+                        || word.eq_ignore_ascii_case(b"TEMPORARY") =>
+                    {
+                        CompleteToken::Temp
+                    }
+                    word if word.eq_ignore_ascii_case(b"TRIGGER") => CompleteToken::Trigger,
+                    word if word.eq_ignore_ascii_case(b"END") => CompleteToken::End,
+                    _ => CompleteToken::Other,
+                }
+            }
+            _ => {
+                i += 1;
+                CompleteToken::Other
+            }
+        };
+        state = complete_transition(state, token);
+    }
+    matches!(state, CompleteState::Start)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int {
     if sql.is_null() {
         return 0;
     }
-    let s = CStr::from_ptr(sql).to_bytes();
-    s.iter()
-        .rev()
-        .find(|&&b| !b.is_ascii_whitespace())
-        .map_or(0, |&b| (b == b';') as ffi::c_int)
+    sqlite3_complete_sql(CStr::from_ptr(sql).to_bytes()) as ffi::c_int
 }
 
 #[no_mangle]
@@ -3921,6 +4049,35 @@ mod tests {
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_complete_skips_comments_and_waits_for_trigger_end() {
+        unsafe {
+            assert_eq!(sqlite3_complete(c"SELECT ';'".as_ptr()), 0);
+            assert_eq!(sqlite3_complete(c"SELECT ';';".as_ptr()), 1);
+            assert_eq!(
+                sqlite3_complete(c"SELECT 1; -- trailing comment".as_ptr()),
+                1
+            );
+            assert_eq!(
+                sqlite3_complete(c"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;".as_ptr()),
+                0
+            );
+            assert_eq!(
+                sqlite3_complete(
+                    c"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END; -- done".as_ptr()
+                ),
+                1
+            );
+            assert_eq!(
+                sqlite3_complete(
+                    c"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; -- comment\r END;"
+                        .as_ptr()
+                ),
+                1
+            );
         }
     }
 
