@@ -115,15 +115,164 @@ const MAX_CHECK_INTERVAL: u64 = 256;
 
 pub(crate) type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
-/// State machine for committing view deltas with I/O handling
-#[derive(Debug, Clone)]
-pub enum ViewDeltaCommitState {
+/// State machine for applying pending view deltas with I/O handling.
+///
+/// Each touched materialized view is maintained by stepping a compiled VDBE
+/// maintenance program to completion; the parked statement makes the state
+/// machine re-entrant across I/O yields.
+#[derive(Debug)]
+pub enum ViewDeltaApplyState {
     NotStarted,
     Processing {
-        views: Vec<String>, // view names (all materialized views have storage)
+        views: crate::alloc::Vec<String>, // view names (all materialized views have storage)
         current_index: usize,
+        /// The maintenance statement currently being stepped for
+        /// `views[current_index]`, parked across I/O yields.
+        stmt: Option<Box<crate::statement::Statement>>,
     },
     Done,
+}
+
+/// Advance one transaction change-log batch through every subscribed
+/// materialized view in dependency order.
+///
+/// This runner is independent of a parent [`ProgramState`] so both statement
+/// completion and a materialized-view cursor can use exactly the same
+/// maintenance programs. The latter matters when a write statement reads a
+/// view before reaching `Halt`: there must not be a second query evaluator for
+/// that read-your-writes path.
+#[instrument(skip_all, level = Level::DEBUG)]
+pub(crate) fn step_view_delta_batch(
+    connection: &Arc<Connection>,
+    state: &mut ViewDeltaApplyState,
+    rollback: bool,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    loop {
+        match state {
+            ViewDeltaApplyState::NotStarted => {
+                if connection.transaction_changes.is_empty() {
+                    return Ok(IOResult::Done(()));
+                }
+
+                if rollback {
+                    connection.transaction_changes.clear();
+                    return Ok(IOResult::Done(()));
+                }
+
+                let schema = connection.schema.read();
+                let views = schema.materialized_view_maintenance_order(
+                    connection.transaction_changes.get_view_names()?,
+                )?;
+                for view_name in &views {
+                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                        let view = view_mutex.lock();
+                        turso_assert_ne!(
+                            view.get_root_page(),
+                            0,
+                            "Materialized view should have a root page",
+                            { "view_name": view_name }
+                        );
+                    }
+                }
+
+                *state = ViewDeltaApplyState::Processing {
+                    views,
+                    current_index: 0,
+                    stmt: None,
+                };
+            }
+
+            ViewDeltaApplyState::Processing {
+                views,
+                current_index,
+                stmt,
+            } => {
+                if *current_index >= views.len() {
+                    connection.transaction_changes.clear();
+                    *state = ViewDeltaApplyState::Done;
+                    return Ok(IOResult::Done(()));
+                }
+
+                let view_name = &views[*current_index];
+                if stmt.is_none() {
+                    // Downstream views acquire their subscription while an
+                    // upstream maintenance program changes its input btree.
+                    let has_delta = connection
+                        .transaction_changes
+                        .get(view_name)
+                        .is_some_and(|tx_state| !tx_state.is_empty());
+                    if !has_delta {
+                        *current_index += 1;
+                        continue;
+                    }
+
+                    let schema = connection.schema.read();
+                    let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                        *current_index += 1;
+                        continue;
+                    };
+                    let (select, root_page, num_view_columns) = {
+                        let view = view_mutex.lock();
+                        (
+                            view.select_stmt.clone(),
+                            view.get_root_page(),
+                            view.column_schema.flat_columns()?.len(),
+                        )
+                    };
+                    let program =
+                        crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                            view_name,
+                            &select,
+                            root_page,
+                            num_view_columns,
+                            crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                            &schema,
+                            connection,
+                        )?;
+                    *stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                        program,
+                        pager.clone(),
+                        crate::QueryMode::Normal,
+                        0,
+                        crate::statement::StatementOrigin::Subprogram,
+                        false,
+                    )));
+                }
+
+                let statement = stmt.as_mut().expect("maintenance statement was just built");
+                match statement.step_subprogram()? {
+                    StepResult::Done => {
+                        *stmt = None;
+                        *current_index += 1;
+                    }
+                    StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                        let io = statement
+                            .take_io_completions()
+                            .unwrap_or_else(|| IOCompletions(crate::Completion::new_yield()));
+                        return Ok(IOResult::IO(io));
+                    }
+                    StepResult::Row => {
+                        return Err(LimboError::InternalError(
+                            "materialized view maintenance program produced a row".to_string(),
+                        ));
+                    }
+                    StepResult::Busy => return Err(LimboError::Busy),
+                    StepResult::Interrupt => return Err(LimboError::Interrupt),
+                }
+            }
+
+            ViewDeltaApplyState::Done => return Ok(IOResult::Done(())),
+        }
+    }
+}
+
+/// Parked state for materialized-view initial population
+/// (Insn::PopulateMaterializedViews).
+#[derive(Debug)]
+pub struct PopulateMatViewsState {
+    pub view_idx: usize,
+    pub stmt: Option<Box<crate::statement::Statement>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -729,6 +878,7 @@ impl ActiveOpStateSlot {
         OpDeleteState,
         OpDeleteState {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            route: None,
             deleted_record: None,
         }
     );
@@ -776,7 +926,7 @@ impl ActiveOpStateSlot {
         OpInsertState,
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         }
@@ -886,6 +1036,9 @@ pub struct ProgramState {
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Database id associated with each opened cursor. Ephemeral and pseudo
+    /// cursors have no database id.
+    cursor_databases: Vec<Option<usize>>,
     /// Immutable execution/storage context captured when each index-method
     /// cursor is first opened for this statement.
     pub(crate) index_method_contexts:
@@ -956,7 +1109,14 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
-    view_delta_state: ViewDeltaCommitState,
+    view_delta_state: ViewDeltaApplyState,
+    /// Parked state for Insn::PopulateMaterializedViews: the population
+    /// statement currently being stepped, re-entrant across I/O yields.
+    pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
+    /// Per-view delta capture marks taken at statement start; on statement
+    /// rollback, captures past the marks are rewound (they belong to the
+    /// aborted statement).
+    change_log_mark: Option<crate::incremental::view::ChangeLogMark>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -1049,6 +1209,7 @@ crate::assert::assert_send_sync!(ProgramState);
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_databases = vec![None; max_cursors];
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = (0..max_registers)
             .map(|_| Register::Value(Value::Null))
@@ -1061,6 +1222,7 @@ impl ProgramState {
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
+            cursor_databases,
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
@@ -1090,7 +1252,9 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
-            view_delta_state: ViewDeltaCommitState::NotStarted,
+            view_delta_state: ViewDeltaApplyState::NotStarted,
+            populate_matviews_state: None,
+            change_log_mark: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1176,6 +1340,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_databases.resize(max_cursors, None);
             self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
@@ -1189,6 +1354,7 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursor_databases.fill(None);
         for (cursor, context) in self
             .cursors
             .iter_mut()
@@ -1249,7 +1415,8 @@ impl ProgramState {
         // here only releases its references.
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
-        self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.view_delta_state = ViewDeltaApplyState::NotStarted;
+        self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
@@ -1558,6 +1725,12 @@ impl ProgramState {
 
         self.has_stmt_transaction = true;
 
+        // Record the shared change-log position so a statement rollback can
+        // rewind captures made by the aborted statement: change capture
+        // happens in op_insert/op_delete as rows are written, and the pager
+        // savepoint rollback does not undo it.
+        self.change_log_mark = Some(connection.transaction_changes.change_log_mark());
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -1596,6 +1769,21 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+
+        // Statement-scoped change-log captures: keep them on release, rewind
+        // them on rollback (the btree writes they mirror are being undone).
+        // A rewind error is reported only after the pager rollback below has
+        // run, so the statement's btree writes are undone either way.
+        let rewind_result = match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                self.change_log_mark = None;
+                Ok(())
+            }
+            EndStatement::RollbackSavepoint => match self.change_log_mark.take() {
+                Some(mark) => connection.transaction_changes.rewind_to_mark(mark),
+                None => Ok(()),
+            },
+        };
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1700,7 +1888,7 @@ impl ProgramState {
         for p in &attached_pagers {
             p.stop_use_subjournal();
         }
-        result
+        result.and(rewind_result)
     }
 
     /// Gets or creates a bloom filter for the given cursor ID.
@@ -2704,110 +2892,33 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn apply_view_deltas(
+    /// Apply and consume the transaction change log, resetting the resumable
+    /// state once the batch is complete.
+    ///
+    /// Successful top-level write statements call this before releasing their
+    /// statement savepoint. Consequently the view btree and every hidden
+    /// operator integral advance in the same transaction as the base-table
+    /// write. Commit calls it as well to consume any batch left by an unusual
+    /// execution path.
+    pub(crate) fn apply_pending_view_deltas(
         &self,
         state: &mut ProgramState,
         rollback: bool,
         pager: &Arc<Pager>,
-    ) -> IOResultOr<()> {
-        use crate::types::IOResult;
-
-        loop {
-            match &state.view_delta_state {
-                ViewDeltaCommitState::NotStarted => {
-                    if self.connection.view_transaction_states.is_empty() {
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    if rollback {
-                        // On rollback, just clear and done
-                        self.connection.view_transaction_states.clear();
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    // Not a rollback - proceed with processing
-                    let schema = self.connection.schema.read();
-
-                    // Collect materialized views - they should all have storage
-                    let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
-                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
-                            let view = view_mutex.lock();
-                            let root_page = view.get_root_page();
-
-                            // Materialized views should always have storage (root_page != 0)
-                            turso_assert_ne!(
-                                root_page, 0,
-                                "Materialized view should have a root page",
-                                { "view_name": view_name }
-                            );
-
-                            views.push(view_name);
-                        }
-                    }
-
-                    state.view_delta_state = ViewDeltaCommitState::Processing {
-                        views,
-                        current_index: 0,
-                    };
-                }
-
-                ViewDeltaCommitState::Processing {
-                    views,
-                    current_index,
-                } => {
-                    // At this point we know it's not a rollback
-                    if *current_index >= views.len() {
-                        // All done, clear the transaction states
-                        self.connection.view_transaction_states.clear();
-                        state.view_delta_state = ViewDeltaCommitState::Done;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    let view_name = &views[*current_index];
-
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
-
-                    let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock();
-
-                        // Create a DeltaSet from the per-table deltas
-                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
-                        for (table_name, delta) in table_deltas {
-                            delta_set.insert(table_name, delta);
-                        }
-
-                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
-                                // Move to next view
-                                state.view_delta_state = ViewDeltaCommitState::Processing {
-                                    views: views.clone(),
-                                    current_index: current_index + 1,
-                                };
-                            }
-                            IOResult::IO(io) => {
-                                // Return I/O, will resume at same index
-                                return Ok(IOResult::IO(io));
-                            }
-                        }
-                    }
-                }
-
-                ViewDeltaCommitState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
+    ) -> Result<IOResult<()>> {
+        match step_view_delta_batch(
+            &self.connection,
+            &mut state.view_delta_state,
+            rollback,
+            pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                state.view_delta_state = ViewDeltaApplyState::NotStarted;
+                Ok(IOResult::Done(()))
             }
         }
     }
-
     pub fn commit_txn(
         &self,
         pager: Arc<Pager>,
@@ -2825,14 +2936,11 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        // Apply any view deltas not already consumed at statement completion.
+        match self.apply_pending_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
             IOResult::Done(_) => {}
         }
-
-        // Reset state for next use
-        program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
         // Drop virtual table cursors before the `is_nested_stmt()` check
         // below: a pragma virtual table cursor owns a nested helper statement
         // whose guard would otherwise make this top-level statement classify
@@ -4363,7 +4471,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         };

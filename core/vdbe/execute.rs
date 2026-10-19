@@ -159,7 +159,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
     CommitState,
 };
@@ -1387,6 +1387,7 @@ pub fn op_open_read(
 
     let pager = pager_for_db(program, pager, *db)?;
     let mv_store = mv_store_for_db(program, state, *db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if mv_store.is_some() {
@@ -1424,6 +1425,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
         CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
+        CursorType::ViewDelta { table, .. } => table.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
 
@@ -1448,7 +1450,29 @@ pub fn op_open_read(
         };
 
     match cursor_type {
-        CursorType::MaterializedView(_, view_mutex) => {
+        CursorType::ViewDelta { view_name, table } => {
+            // In-memory cursor over the transaction's captured delta for one
+            // base table of a materialized view. Opened by maintenance
+            // programs when a pending batch is applied; the snapshot is taken
+            // here.
+            let delta_cursor = match program.connection.transaction_changes.get(view_name) {
+                Some(tx_state) => {
+                    let delta = tx_state.table_delta(table);
+                    crate::incremental::vdbe_maintenance::DeltaCursor::new(
+                        delta,
+                        table.columns().len(),
+                    )
+                }
+                None => {
+                    crate::incremental::vdbe_maintenance::DeltaCursor::empty(table.columns().len())
+                }
+            };
+            cursors
+                .get_mut(*cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(Cursor::new_delta(delta_cursor));
+        }
+        CursorType::MaterializedView(_, _) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
@@ -1460,19 +1484,12 @@ pub fn op_open_read(
             .into_boxed();
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
-            // Get the view name and look up or create its transaction state
-            let view_name = view_mutex.lock().name().to_string();
-            let tx_state = program
-                .connection
-                .view_transaction_states
-                .get_or_create(&view_name);
-
-            // Create materialized view cursor with this view's transaction state
+            // The cursor observes the transaction-wide change-log generation
+            // for read-your-own-writes.
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor.into_dyn(),
-                view_mutex.clone(),
                 pager,
-                tx_state,
+                program.connection.clone(),
             )?;
 
             cursors
@@ -1906,6 +1923,7 @@ pub fn op_open_pseudo(
         },
         insn
     );
+    state.cursor_databases[*cursor_id] = None;
     {
         let cursors = &mut state.cursors;
         let cursor = PseudoCursor::new(*content_reg);
@@ -1949,6 +1967,7 @@ pub fn op_rewind(
                 return_if_io!(state, mv_cursor.rewind());
                 !mv_cursor.is_valid()?
             }
+            Cursor::Delta(delta_cursor) => !return_if_io!(state, delta_cursor.rewind()),
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
@@ -2276,6 +2295,11 @@ fn op_column_fetch_other(
             state.registers[dest].set_null();
             return Ok(InsnFunctionStepResult::Step);
         }
+        if let Cursor::Delta(delta_cursor) = cursor {
+            let value = delta_cursor.column(column);
+            state.registers[dest].set_value(value);
+            return Ok(InsnFunctionStepResult::Step);
+        }
         // Fall back to normal handling
     }
 
@@ -2359,6 +2383,9 @@ fn op_column_fetch_other(
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+        CursorType::ViewDelta { .. } => {
+            unreachable!("Cursor::Delta columns are handled before cursor_type dispatch");
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -3641,6 +3668,7 @@ pub fn op_next(
                 CursorStep::IO(io) => Ok(IOResult::IO(io)),
             },
             Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
+            Cursor::Delta(delta_cursor) => delta_cursor.next().map_err(Into::into),
             Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
             _ => panic!("Next on non-btree/materialized-view cursor"),
         }
@@ -3870,6 +3898,18 @@ pub fn halt(
         // owns the statement savepoint and the final transaction outcome.
         return_if_io!(state, index_method_stage_statement_all(state));
         return Ok(InsnFunctionStepResult::Done);
+    }
+
+    // Maintain materialized views before releasing this write statement's
+    // savepoint. The maintenance program is the sole evaluator for committed
+    // and same-transaction state, and its writes roll back atomically with the
+    // base-table statement on error. Internal helper statements leave the
+    // enclosing root statement in control of this batch.
+    if state.is_active_write && !program.connection.is_nested_stmt() {
+        match program.apply_pending_view_deltas(state, false, pager)? {
+            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+            IOResult::Done(()) => {}
+        }
     }
 
     if auto_commit {
@@ -5487,6 +5527,7 @@ pub fn op_savepoint(
                     }
                 }
             }
+            let change_log_mark = conn.transaction_changes.change_log_mark();
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -5546,6 +5587,7 @@ pub fn op_savepoint(
                         name: name.clone(),
                         starts_transaction,
                         deferred_fk_violations,
+                        change_log_mark,
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
@@ -5675,6 +5717,8 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                conn.transaction_changes
+                    .rewind_to_mark(info.change_log_mark)?;
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
@@ -6239,6 +6283,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
                 Ok(IOResult::Done((rowid != 0).then_some(rowid)))
             }
             Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
+            Some(Cursor::Delta(delta_cursor)) => Ok(IOResult::Done(Some(delta_cursor.rowid()))),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
@@ -7784,6 +7829,289 @@ const SPARE_AGG_PAYLOADS: usize = 8;
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+pub fn op_agg_context_load(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AggContextLoad {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let mut payload = crate::alloc::vec![];
+    payload.try_reserve(width)?;
+    for j in 0..width {
+        payload.push(state.registers[*payload_start_reg + j].get_value().clone());
+    }
+    state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_agg_context_store(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AggContextStore {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let values: Vec<Value> = match &state.registers[*acc_reg] {
+        Register::Aggregate(AggContext::Builtin(payload)) => {
+            let payload_len = payload.len();
+            turso_assert!(
+                payload_len == width,
+                "aggregate state payload width {payload_len} does not match expected {width}"
+            );
+            payload.to_vec()
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "AggContextStore on an uninitialized accumulator".to_string(),
+            )
+            .into());
+        }
+    };
+    for (j, value) in values.into_iter().enumerate() {
+        state.registers[*payload_start_reg + j].set_value(value);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_ivm_sum_step(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IvmSumStep { data }, insn);
+    ivm_sum_apply(state, data)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Add one row's contribution, times its z-set weight, to a materialized
+/// view's SUM/TOTAL/AVG state. A positive weight adds the row that many
+/// times, a negative weight retracts it. See `IvmSumData` for the state
+/// layout; this is the whole of IVM's xStep/xInverse for these functions.
+fn ivm_sum_apply(state: &mut ProgramState, data: &crate::vdbe::insn::IvmSumData) -> Result<()> {
+    fn reg_int(state: &ProgramState, reg: usize, what: &str) -> Result<i64> {
+        state.registers[reg].get_value().as_int().ok_or_else(|| {
+            LimboError::InternalError(format!("IVM sum: {what} register is not an integer"))
+        })
+    }
+    // A count is a number of live rows, so a weight can never take it below
+    // zero: that would retract rows the state never held.
+    fn add_to_count(state: &mut ProgramState, reg: usize, weight: i64) -> Result<()> {
+        let count = reg_int(state, reg, "count")?
+            .checked_add(weight)
+            .or_overflow()?;
+        if count < 0 {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "IVM sum: a retraction removed more rows than the state holds".to_string(),
+            ));
+        }
+        state.registers[reg].set_int(count);
+        Ok(())
+    }
+
+    let weight = reg_int(state, data.weight_reg, "weight")?;
+    let arg = state.registers[data.arg_reg].get_value().clone();
+    match classify_numeric_arg(&arg) {
+        NumericArg::Null => {}
+        NumericArg::Integer(i) => {
+            let wrapped = reg_int(state, data.int_wrapped_reg, "int_wrapped")?;
+            let wrap_count = reg_int(state, data.int_wrap_count_reg, "int_wrap_count")?;
+            let (new_wrapped, new_wrap_count) =
+                ivm_sum_add_weighted_int(wrapped, wrap_count, i, weight)?;
+            state.registers[data.int_wrapped_reg].set_int(new_wrapped);
+            state.registers[data.int_wrap_count_reg].set_int(new_wrap_count);
+            add_to_count(state, data.non_null_count_reg, weight)?;
+        }
+        NumericArg::Float(f) => {
+            let mut acc = state.registers[data.float_sum_reg].get_value().clone();
+            let r_err = state.registers[data.float_err_reg]
+                .get_value()
+                .to_float_or_zero();
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            apply_kbn_step(&mut acc, f * weight as f64, &mut sum_state);
+            state.registers[data.float_sum_reg].set_value(acc);
+            state.registers[data.float_err_reg].set_value(Value::from_f64(sum_state.r_err));
+            add_to_count(state, data.non_null_count_reg, weight)?;
+            add_to_count(state, data.non_int_count_reg, weight)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add `weight * value` to the exact integer total `wrapped + wrap_count *
+/// 2^64`, returning the new `(wrapped, wrap_count)`.
+fn ivm_sum_add_weighted_int(
+    wrapped: i64,
+    wrap_count: i64,
+    value: i64,
+    weight: i64,
+) -> Result<(i64, i64)> {
+    // Split the exact product the same way as the total: `low` is its low
+    // 64 bits read as a signed number, `high` the number of 2^64 above that.
+    let product = i128::from(weight) * i128::from(value);
+    let low = product as i64;
+    let high = ((product - i128::from(low)) >> 64) as i64;
+    let (new_wrapped, overflowed) = wrapped.overflowing_add(low);
+    // Adding two i64 values overflows only in the direction the added value
+    // points: up for `low >= 0`, down otherwise.
+    let carry = match (overflowed, low >= 0) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => -1,
+    };
+    let new_wrap_count = wrap_count
+        .checked_add(high)
+        .and_then(|count| count.checked_add(carry))
+        .or_overflow()?;
+    Ok((new_wrapped, new_wrap_count))
+}
+
+pub fn op_ivm_sum_finalize(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IvmSumFinalize { data }, insn);
+    let int_of = |reg: usize, what: &str| -> Result<i64> {
+        state.registers[reg].get_value().as_int().ok_or_else(|| {
+            LimboError::InternalError(format!("IVM sum: {what} register is not an integer"))
+        })
+    };
+    let wrapped = int_of(data.int_wrapped_reg, "int_wrapped")?;
+    let wrap_count = int_of(data.int_wrap_count_reg, "int_wrap_count")?;
+    let float_sum = state.registers[data.float_sum_reg].get_value().clone();
+    let float_err = state.registers[data.float_err_reg]
+        .get_value()
+        .to_float_or_zero();
+    let non_int_count = int_of(data.non_int_count_reg, "non_int_count")?;
+    let non_null_count = int_of(data.non_null_count_reg, "non_null_count")?;
+
+    let result = finalize_ivm_sum(
+        data.kind,
+        wrapped,
+        wrap_count,
+        float_sum,
+        float_err,
+        non_int_count,
+        non_null_count,
+    )?;
+    state.registers[data.dest_reg].set_value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// `2^64`, used to convert an exact-integer total that overflowed i64
+/// (`wrapped + wrap_count * 2^64`) into an approximate REAL.
+const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+
+/// Compute SUM, TOTAL, or AVG's current result from IVM's linear state: an
+/// exact integer total, a floating-point total, and two row counts. Unlike
+/// the shared window-function/regular-aggregate implementation this mirrors,
+/// every field here is a pure function of the view's current rows, so the
+/// result always matches a fresh evaluation of the defining SELECT. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md for the one
+/// place this intentionally disagrees with sum()'s own (order-dependent)
+/// overflow reporting.
+fn finalize_ivm_sum(
+    kind: IvmSumKind,
+    wrapped: i64,
+    wrap_count: i64,
+    float_sum: Value,
+    float_err: f64,
+    non_int_count: i64,
+    non_null_count: i64,
+) -> Result<Value> {
+    if non_null_count == 0 {
+        return Ok(match kind {
+            IvmSumKind::Sum | IvmSumKind::Avg => Value::Null,
+            IvmSumKind::Total => Value::from_f64(0.0),
+        });
+    }
+    // A SUM over only exact-integer contributions stays an exact integer, or
+    // errors the same way sum() does if that exact total does not fit in i64.
+    if matches!(kind, IvmSumKind::Sum) && non_int_count == 0 {
+        if wrap_count != 0 {
+            mark_unlikely();
+            return Err(LimboError::IntegerOverflow);
+        }
+        return Ok(Value::from_i64(wrapped));
+    }
+    let mut acc = float_sum;
+    let mut sum_state = SumAggState {
+        r_err: float_err,
+        ..Default::default()
+    };
+    if wrap_count == 0 {
+        if wrapped != 0 {
+            apply_kbn_step_int(&mut acc, wrapped, &mut sum_state);
+        }
+    } else {
+        // The exact integer total overflowed i64, but a non-integer
+        // contribution already forces a REAL result, so approximate it
+        // instead of erroring (see the module doc comment above).
+        let approx = wrap_count as f64 * TWO_POW_64 + wrapped as f64;
+        apply_kbn_step(&mut acc, approx, &mut sum_state);
+    }
+    if matches!(acc, Value::Null) {
+        // A non-integer contribution produced NaN (e.g. +Infinity and
+        // -Infinity both appear): "the result is NULL", matching sum()'s
+        // documented NaN rule.
+        return Ok(Value::Null);
+    }
+    let total = acc.to_float_or_zero() + sum_state.r_err;
+    Ok(match kind {
+        IvmSumKind::Sum | IvmSumKind::Total => Value::from_f64(total),
+        IvmSumKind::Avg => Value::from_f64(total / non_null_count as f64),
+    })
+}
+
+/// Number of payload slots for aggregates whose state is a fixed-width value
+/// vector, i.e. the aggregates that can be persisted to a materialized view's
+/// state table and maintained incrementally. Returns None for aggregates with
+/// variable-size or non-invertible state.
+pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => Some(1),
+        AggFunc::Avg => Some(3),
+        AggFunc::Sum | AggFunc::Total => Some(5),
+        _ => None,
+    }
+}
+
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
@@ -12326,11 +12654,73 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    pub has_dependent_views: bool,
+    /// Change-log routing for the written table, resolved once per row in
+    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
+    /// re-acquiring the schema read lock and re-walking the dependent-view
+    /// list on every sub-state transition.
+    pub(crate) route: Option<ChangeLogRoute>,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
+}
+
+pub(crate) struct ChangeLogRoute {
+    table: Arc<crate::schema::BTreeTable>,
+    dependent_views: crate::alloc::Vec<String>,
+    is_materialized_view: bool,
+}
+
+/// Resolve change-log routing from the btree being written, never from the
+/// SQL spelling carried in the opcode for tracing/update hooks.
+fn change_log_route(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: usize,
+) -> Result<Option<ChangeLogRoute>> {
+    // Materialized views currently live in main. Writes to temp or attached
+    // databases must not be resolved through main's schema just because a
+    // table there happens to have the same name or root page.
+    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
+        return Ok(None);
+    }
+    let cursor_table = match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table)))
+        | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
+        _ => return Ok(None),
+    };
+    let schema = program.connection.schema.read();
+    // Check for dependent views before doing anything else: a plain write to
+    // a table with no materialized views is the overwhelmingly common case,
+    // and it must stay as cheap as it was before change-log routing existed,
+    // i.e. a single schema-map lookup rather than also resolving the
+    // schema-owned table descriptor and the is_materialized_view check below.
+    let dependent_views = schema.get_dependent_materialized_views(&cursor_table.name);
+    if dependent_views.is_empty() {
+        return Ok(None);
+    }
+    // Maintenance write cursors intentionally use a synthetic physical
+    // descriptor that includes the trailing weight column. Resolve the bound
+    // cursor back to the schema-owned descriptor so change capture always
+    // deals in the relation's logical row shape.
+    let Some(table) = schema.get_btree_table(&cursor_table.name) else {
+        return Ok(None);
+    };
+    // A zero root belongs to a cursor whose btree is assigned at runtime
+    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
+    // bound relation identity and must still match the current schema.
+    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
+        return Err(LimboError::InternalError(format!(
+            "changed btree {} has root {}, but the current schema binds it to root {}",
+            cursor_table.name, cursor_table.root_page, table.root_page
+        )));
+    }
+    let is_materialized_view = schema.is_materialized_view(&table.name);
+    Ok(Some(ChangeLogRoute {
+        table,
+        dependent_views,
+        is_materialized_view,
+    }))
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -12357,8 +12747,99 @@ pub enum OpInsertSubState {
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
     /// start inserting the same row multiple times.
     UpdateLastRowid,
-    /// If there are dependent incremental views, apply the change.
-    ApplyViewChange,
+    /// If the row being overwritten had dependent views, record its retraction.
+    ApplyRetraction,
+    /// Recording the retraction started a change-log spill; wait for it to
+    /// finish before recording anything else.
+    WaitForRetractionSpill,
+    /// Record the new row's contribution to any dependent views.
+    ApplyInsertion,
+    /// Recording the insertion started a change-log spill; wait for it to
+    /// finish before this opcode is done.
+    WaitForInsertionSpill,
+}
+
+fn materialized_view_record_change(
+    table_name: &str,
+    table: &crate::schema::BTreeTable,
+    mut physical_values: crate::alloc::Vec<Value>,
+    direction: isize,
+) -> Result<(crate::alloc::Vec<Value>, isize)> {
+    let logical_width = table.columns().len();
+    if physical_values.len() != logical_width + 1 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has {} fields, expected {} logical fields and one weight",
+            physical_values.len(),
+            logical_width
+        )));
+    }
+    let stored_weight = match physical_values.pop() {
+        Some(Value::Numeric(Numeric::Integer(weight))) => weight,
+        _ => {
+            return Err(LimboError::Corrupt(format!(
+                "materialized view {table_name} record has a non-integer weight"
+            )));
+        }
+    };
+    if stored_weight <= 0 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has non-positive weight {stored_weight}"
+        )));
+    }
+    let stored_weight = isize::try_from(stored_weight).map_err(|_| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} weight does not fit the maintenance weight type"
+        ))
+    })?;
+    let weight = stored_weight.checked_mul(direction).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} maintenance weight overflow"
+        ))
+    })?;
+    Ok((physical_values, weight))
+}
+
+fn normalize_table_change_record(
+    table: &crate::schema::BTreeTable,
+    rowid: i64,
+    mut values: crate::alloc::Vec<Value>,
+) -> Result<crate::alloc::Vec<Value>> {
+    if values.len() > table.columns().len() {
+        return Err(LimboError::Corrupt(format!(
+            "table {} record has {} fields, but the schema has {} columns",
+            table.name,
+            values.len(),
+            table.columns().len()
+        )));
+    }
+
+    values.try_reserve(table.columns().len() - values.len())?;
+    for column in table.columns().iter().skip(values.len()) {
+        let mut value = if column.is_rowid_alias() {
+            Value::from_i64(rowid)
+        } else if let Some(default) = column.default.as_deref() {
+            crate::translate::alter::eval_constant_default_value(default)?
+        } else {
+            Value::Null
+        };
+        if let Some(converted) = column.affinity().convert(&value) {
+            value = match converted {
+                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                Either::Left(_) => {
+                    unreachable!("affinity conversion returned an unexpected borrowed value")
+                }
+                Either::Right(value) => value,
+            };
+        }
+        values.push(value);
+    }
+
+    for (index, column) in table.columns().iter().enumerate() {
+        if column.is_rowid_alias() {
+            values[index] = Value::from_i64(rowid);
+        }
+    }
+    Ok(values)
 }
 
 pub fn op_insert(
@@ -12381,19 +12862,17 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
-                state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let route = change_log_route(program, state, *cursor_id)?;
+                let has_change_log_subscribers = route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                state.active_op_state.insert().route = route;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12429,9 +12908,14 @@ pub fn op_insert(
                 )? {
                     return Ok(state.suspend_on_io(io));
                 }
-                let has_dependent_views = state.active_op_state.insert().has_dependent_views;
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .insert()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12457,29 +12941,35 @@ pub fn op_insert(
                 let cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_btree_mut();
                 let maybe_key = return_if_io!(state, cursor.rowid());
-                let old_record = if let Some(key) = maybe_key {
-                    if key == insert_key {
-                        let maybe_record = return_if_io!(state, cursor.record());
-                        if let Some(record) = maybe_record {
-                            let mut values = record.get_values_owned()?;
-                            let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias() && i < values.len() {
-                                        values[i] = Value::from_i64(key);
-                                    }
-                                }
+                let old_record =
+                    if let Some(key) = maybe_key {
+                        if key == insert_key {
+                            let maybe_record = return_if_io!(state, cursor.record());
+                            if let Some(record) = maybe_record {
+                                let values = record.get_values_owned()?;
+                                let route =
+                                    state.active_op_state.insert().route.as_ref().ok_or_else(
+                                        || {
+                                            LimboError::InternalError(format!(
+                                        "changed btree for {table_name} missing from schema"
+                                    ))
+                                        },
+                                    )?;
+                                let values = if route.is_materialized_view {
+                                    values
+                                } else {
+                                    normalize_table_change_record(&route.table, key, values)?
+                                };
+                                Some((key, values))
+                            } else {
+                                None
                             }
-                            Some((key, values))
                         } else {
                             None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 state.active_op_state.insert().old_record = old_record;
                 state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 continue;
@@ -12621,22 +13111,85 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                if state.active_op_state.insert().has_dependent_views {
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .insert()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if has_change_log_subscribers {
                     if !has_rowid {
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
                                 .to_string(),
                         ).into());
                     }
-                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyViewChange;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyRetraction;
                     continue;
                 }
                 break;
             }
-            OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+            OpInsertSubState::ApplyRetraction => {
+                if state.active_op_state.insert().is_noop_update {
+                    state.active_op_state.insert().old_record = None;
+                    break;
+                }
+                let Some((key, values)) = state.active_op_state.insert().old_record.take() else {
+                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
+                    continue;
+                };
+                let insert_state = state.active_op_state.insert();
+                let route = insert_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
+
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        -1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.delete(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                state.active_op_state.insert().sub_state = if spill_started {
+                    OpInsertSubState::WaitForRetractionSpill
+                } else {
+                    OpInsertSubState::ApplyInsertion
+                };
+                continue;
+            }
+            OpInsertSubState::WaitForRetractionSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
+                state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
+                continue;
+            }
+            OpInsertSubState::ApplyInsertion => {
+                let insert_state = state.active_op_state.insert();
+                let route = insert_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
@@ -12657,39 +13210,49 @@ pub fn op_insert(
                     };
 
                     // Add insertion of new row to view deltas
-                    let mut new_values = record.get_values_owned()?;
-
-                    // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(table_name) {
-                        for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias() && i < new_values.len() {
-                                new_values[i] = Value::from_i64(key);
-                            }
-                        }
-                    }
+                    let new_values = record.get_values_owned()?;
+                    let new_values = if route.is_materialized_view {
+                        new_values
+                    } else {
+                        normalize_table_change_record(&route.table, key, new_values)?
+                    };
 
                     (key, new_values)
                 };
 
-                if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
-                    for view_name in dependent_views.iter() {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
-                    }
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.insert(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                if spill_started {
+                    state.active_op_state.insert().sub_state =
+                        OpInsertSubState::WaitForInsertionSpill;
+                    continue;
                 }
-                for view_name in dependent_views.iter() {
-                    let tx_state = program
-                        .connection
-                        .view_transaction_states
-                        .get_or_create(view_name);
-
-                    tx_state.insert(table_name, key, values.to_vec());
-                }
-
+                break;
+            }
+            OpInsertSubState::WaitForInsertionSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
                 break;
             }
         }
@@ -12722,6 +13285,11 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
+    /// Change-log routing for the deleted table, resolved once per row in
+    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
+    /// re-acquiring the schema read lock and re-walking the dependent-view
+    /// list on every sub-state transition.
+    pub(crate) route: Option<ChangeLogRoute>,
     pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
 }
 
@@ -12733,6 +13301,9 @@ pub enum OpDeleteSubState {
     Delete,
     /// Apply the change to the dependent views.
     ApplyViewChange,
+    /// Recording the change started a change-log spill; wait for it to
+    /// finish before this opcode is done.
+    WaitForSpill,
 }
 
 pub fn op_delete(
@@ -12753,9 +13324,13 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let route = change_log_route(program, state, *cursor_id)?;
+                let Some(route) = route else {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
+                    continue;
+                };
+                if route.dependent_views.is_empty() {
+                    state.active_op_state.delete().route = Some(route);
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -12771,22 +13346,19 @@ pub fn op_delete(
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(state, cursor.record());
                     if let Some(record) = maybe_record {
-                        let mut values = record.get_values_owned()?;
-
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
-                            for (i, col) in table.columns().iter().enumerate() {
-                                if col.is_rowid_alias() && i < values.len() {
-                                    values[i] = Value::from_i64(key);
-                                }
-                            }
-                        }
+                        let values = record.get_values_owned()?;
+                        let values = if route.is_materialized_view {
+                            values
+                        } else {
+                            normalize_table_change_record(&route.table, key, values)?
+                        };
                         Some((key, values))
                     } else {
                         None
                     }
                 };
                 state.active_op_state.delete().deleted_record = deleted_record;
+                state.active_op_state.delete().route = Some(route);
                 state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                 continue;
             }
@@ -12798,28 +13370,63 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let has_change_log_subscribers = state
+                    .active_op_state
+                    .delete()
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if !has_change_log_subscribers {
                     break;
                 }
                 state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
-                let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
-                if let Some((key, values)) = maybe_deleted_record {
-                    for view_name in dependent_views {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
-                    }
+                let Some((key, values)) = state.active_op_state.delete().deleted_record.take()
+                else {
+                    // No record existed at the delete position; nothing to publish.
+                    break;
+                };
+                let delete_state = state.active_op_state.delete();
+                let route = delete_state.route.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
+                let spill_started = if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        -1,
+                    )?;
+                    program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    )?
+                } else {
+                    program.connection.transaction_changes.delete(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    )?
+                };
+                if spill_started {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::WaitForSpill;
+                    continue;
                 }
+                break;
+            }
+            OpDeleteSubState::WaitForSpill => {
+                return_if_io!(state, program.connection.transaction_changes.finish_spill());
                 break;
             }
         }
@@ -13645,6 +14252,7 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if mv_store.is_some() {
@@ -14996,6 +15604,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
+    state.cursor_databases[*cursor_id] = None;
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
@@ -15252,16 +15861,14 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let res1 = schema.populate_indices(
+                let populate_result = schema.populate_materialized_views_then_indices(
                     &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
-                let res2 = schema.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
+                    from_sql_indexes,
+                    automatic_indices,
+                    mv_store.is_some(),
                 );
 
                 // Store the modified schema back
@@ -15290,7 +15897,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                let _ = (res1?, res2?);
+                populate_result?;
 
                 state.pc += 1;
                 state.active_op_state.clear();
@@ -15550,22 +16157,42 @@ pub fn op_populate_materialized_views(
 
     let conn = program.connection.clone();
 
-    // For each view, get its cursor and root page
-    let mut view_info = Vec::new();
-    {
-        let cursors_ref = &state.cursors;
-        for (view_name, cursor_id) in cursors {
-            // Get the cursor to find the root page
-            let cursor = cursors_ref
-                .get(*cursor_id)
-                .and_then(|c| c.as_ref())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("Cursor {cursor_id} not found"))
-                })?;
+    // Each view is populated by its maintenance program compiled with the
+    // base table as input (every row weight +1); the statement is parked in
+    // ProgramState across I/O yields. The write cursor opened by the CREATE
+    // program is only used to learn the view btree's root page — the
+    // population program opens its own cursor.
+    loop {
+        if state.populate_matviews_state.is_none() {
+            state.populate_matviews_state = Some(crate::vdbe::PopulateMatViewsState {
+                view_idx: 0,
+                stmt: None,
+            });
+        }
+        let view_idx = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state was just initialized")
+            .view_idx;
 
-            let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor, ..) => btree_cursor.root_page(),
-                crate::types::Cursor::Dyn(btree_cursor, ..) => btree_cursor.root_page(),
+        if view_idx >= cursors.len() {
+            state.populate_matviews_state = None;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        let (view_name, cursor_id) = &cursors[view_idx];
+
+        let needs_build = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state exists")
+            .stmt
+            .is_none();
+        if needs_build {
+            let root_page = match state.cursors.get(*cursor_id).and_then(|c| c.as_ref()) {
+                Some(crate::types::Cursor::BTree(btree_cursor, ..)) => btree_cursor.root_page(),
+                Some(crate::types::Cursor::Dyn(btree_cursor, ..)) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -15574,51 +16201,73 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            view_info.push((view_name.clone(), root_page, *cursor_id));
-        }
-    }
-
-    // Now populate the views (after releasing the schema borrow)
-    for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.read();
-        if let Some(view) = schema.get_materialized_view(&view_name) {
-            let mut view = view.lock();
-            // Drop the schema borrow before calling populate_from_table
-            drop(schema);
-
-            // Get the cursor for writing
-            // Get a mutable reference to the cursor
-            let cursors_ref = &mut state.cursors;
-            let cursor = cursors_ref
-                .get_mut(cursor_id)
-                .and_then(|c| c.as_mut())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "Cursor {cursor_id} not found for population"
-                    ))
-                })?;
-
-            // Extract the BTreeCursor
-            let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(..) | crate::types::Cursor::Dyn(..) => {
-                    cursor.as_btree_mut()
-                }
-                _ => {
-                    return Err(LimboError::InternalError(
-                        "Expected BTree cursor for materialized view population".into(),
-                    )
-                    .into());
-                }
+            let schema = conn.schema.read();
+            let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                return Err(LimboError::InternalError(format!(
+                    "materialized view {view_name} missing from schema during population"
+                ))
+                .into());
             };
+            let (select, num_view_columns) = {
+                let view = view_mutex.lock();
+                (
+                    view.select_stmt.clone(),
+                    view.column_schema.flat_columns()?.len(),
+                )
+            };
+            let populate_program =
+                crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                    view_name,
+                    &select,
+                    root_page,
+                    num_view_columns,
+                    crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
+                    &schema,
+                    &conn,
+                )?;
+            state
+                .populate_matviews_state
+                .as_mut()
+                .expect("populate state exists")
+                .stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                populate_program,
+                pager.clone(),
+                crate::QueryMode::Normal,
+                0,
+                crate::statement::StatementOrigin::Subprogram,
+                false,
+            )));
+        }
 
-            // Now populate it with the cursor for writing
-            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
+        let populate_state = state
+            .populate_matviews_state
+            .as_mut()
+            .expect("populate state exists");
+        let statement = populate_state
+            .stmt
+            .as_mut()
+            .expect("population statement was just built");
+        match statement.step_subprogram()? {
+            StepResult::Done => {
+                populate_state.stmt = None;
+                populate_state.view_idx += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                let io = statement
+                    .take_io_completions()
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                return Ok(state.suspend_on_io(io));
+            }
+            StepResult::Row => {
+                return Err(LimboError::InternalError(
+                    "materialized view population program produced a row".to_string(),
+                )
+                .into());
+            }
+            StepResult::Busy => return Err(LimboError::Busy.into()),
+            StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
         }
     }
-
-    // All views populated, advance to next instruction
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_read_cookie(
@@ -16032,6 +16681,7 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    state.cursor_databases[cursor_id] = None;
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -16199,6 +16849,9 @@ pub fn op_open_ephemeral(
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
                 }
+                CursorType::ViewDelta { .. } => {
+                    panic!("OpenEphemeral on view delta cursor");
+                }
             }
 
             state.pc += 1;
@@ -16222,6 +16875,7 @@ pub fn op_open_dup(
         },
         insn
     );
+    state.cursor_databases[*new_cursor_id] = state.cursor_databases[*original_cursor_id];
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);
@@ -19734,6 +20388,38 @@ mod tests {
     use crate::vdbe::BranchOffset;
     use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
+
+    /// A weighted step must leave the same exact total as the weighted sum
+    /// computed in 128-bit arithmetic, including when the i64 part wraps.
+    #[test]
+    fn ivm_sum_weighted_int_matches_exact_total() {
+        let exact =
+            |wrapped: i64, wrap_count: i64| i128::from(wrapped) + (i128::from(wrap_count) << 64);
+        let steps: &[(i64, i64)] = &[
+            (i64::MAX, 3),
+            (7, -2),
+            (i64::MIN, 5),
+            (i64::MIN, -5),
+            (-1, i64::MAX),
+            (i64::MAX, 1),
+            (12345, 1),
+            (i64::MAX, -3),
+        ];
+        let (mut wrapped, mut wrap_count) = (0i64, 0i64);
+        let mut expected = 0i128;
+        for &(value, weight) in steps {
+            (wrapped, wrap_count) =
+                ivm_sum_add_weighted_int(wrapped, wrap_count, value, weight).unwrap();
+            expected += i128::from(value) * i128::from(weight);
+            assert_eq!(
+                exact(wrapped, wrap_count),
+                expected,
+                "after {value} x {weight}"
+            );
+        }
+        // The steps cancel except for 12345 and -2 * 7.
+        assert_eq!((wrapped, wrap_count), (12345 - 14, 0));
+    }
 
     fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

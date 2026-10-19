@@ -9497,16 +9497,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_indices(
+        fresh.populate_materialized_views_then_indices(
             &syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-        fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
         )?;
 
         Ok(Arc::new(fresh))
@@ -10451,16 +10449,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_indices(
+        fresh.populate_materialized_views_then_indices(
             &syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-        fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
         )?;
 
         Ok(Arc::new(fresh))

@@ -3476,6 +3476,8 @@ pub enum Cursor {
     /// Permanently-null placeholder installed by `NullRow` on a
     /// never-opened cursor slot; all reads yield NULL.
     NullRow,
+    /// In-memory cursor over a transaction's captured materialized-view delta.
+    Delta(Box<crate::incremental::vdbe_maintenance::DeltaCursor>),
 }
 
 impl Debug for Cursor {
@@ -3489,6 +3491,7 @@ impl Debug for Cursor {
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
             Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
             Self::NullRow => f.debug_tuple("NullRow").finish(),
+            Self::Delta(..) => f.debug_tuple("Delta").finish(),
         }
     }
 }
@@ -3519,6 +3522,20 @@ impl Cursor {
         cursor: crate::incremental::cursor::MaterializedViewCursor,
     ) -> Self {
         Self::MaterializedView(Box::new(cursor))
+    }
+
+    pub fn new_delta(cursor: crate::incremental::vdbe_maintenance::DeltaCursor) -> Self {
+        Self::Delta(Box::new(cursor))
+    }
+
+    pub fn as_delta_mut(&mut self) -> &mut crate::incremental::vdbe_maintenance::DeltaCursor {
+        match self {
+            Self::Delta(cursor) => cursor,
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a delta cursor");
+            }
+        }
     }
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
@@ -3613,6 +3630,7 @@ impl Cursor {
             Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
             Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            Self::MaterializedView(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
             // column reads untouched: nullRow is the steady state for pseudo
@@ -3642,7 +3660,8 @@ impl Cursor {
             Self::IndexMethod(_)
             | Self::Pseudo(_)
             | Self::Sorter(_)
-            | Self::MaterializedView(_) => false,
+            | Self::MaterializedView(_)
+            | Self::Delta(_) => false,
         }
     }
 }

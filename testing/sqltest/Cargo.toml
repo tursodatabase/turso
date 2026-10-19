@@ -60,6 +60,7 @@ turso = { workspace = true, features = ["test_helper"] }
 
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }
+query-result-oracle = { path = "../query-result-oracle" }
 
 # Bundled SQLite: the in-process oracle matrix cases are verified against.
 # The bundled version is pinned by Cargo.lock; upgrading it is a deliberate,

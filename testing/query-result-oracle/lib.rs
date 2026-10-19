@@ -271,29 +271,120 @@ fn describe_side(
     }
 }
 
+/// A built-in SQL collation, for a column whose value a query chose among
+/// several values that compare equal under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChosenValueCollation {
+    Binary,
+    NoCase,
+    RTrim,
+}
+
+impl ChosenValueCollation {
+    /// Parse a built-in collation name, ignoring case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "BINARY" => Some(Self::Binary),
+            "NOCASE" => Some(Self::NoCase),
+            "RTRIM" => Some(Self::RTrim),
+            _ => None,
+        }
+    }
+
+    /// One fixed member of `value`'s class: values equal under this
+    /// collation map to the same member. As in SQLite comparisons, an integer
+    /// and a real are equal when they are the same number, and the collation
+    /// only applies to text: NOCASE folds ASCII letters, RTRIM ignores
+    /// trailing spaces.
+    fn class_member(self, value: &Value) -> Value {
+        match value {
+            Value::Real(real) => match real_as_exact_integer(*real) {
+                Some(integer) => Value::Integer(integer),
+                None => value.clone(),
+            },
+            Value::Text(text) => Value::Text(match self {
+                Self::Binary => text.clone(),
+                Self::NoCase => text.to_ascii_lowercase(),
+                Self::RTrim => text.trim_end_matches(' ').to_string(),
+            }),
+            Value::Null | Value::Integer(_) | Value::Blob(_) => value.clone(),
+        }
+    }
+}
+
+/// The integer equal to `real`, when one exists.
+fn real_as_exact_integer(real: f64) -> Option<i64> {
+    // i64::MAX is not a float; 2^63 is the first float above the range.
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    (real.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&real)).then_some(real as i64)
+}
+
 /// Compare two typed result sets as multisets.
 pub fn diff_result_sets(left: &ResultSet, right: &ResultSet) -> ResultSetDiff {
-    let mut counts = BTreeMap::<Row, i64>::new();
-    for row in left.rows() {
-        *counts.entry(row.clone()).or_default() += 1;
-    }
-    for row in right.rows() {
-        *counts.entry(row.clone()).or_default() -= 1;
+    diff_result_sets_with_chosen_values(left, right, &[])
+}
+
+/// Compare two typed result sets as multisets, where in each column `i` with
+/// `chosen[i] == Some(collation)` any two values equal under `collation`
+/// match. Such a column shows one value chosen from several that compare
+/// equal, and SQL leaves open which one (a GROUP BY key under NOCASE may show
+/// 'a' or 'A'). Every other column, and every column past `chosen.len()`,
+/// compares exactly.
+pub fn diff_result_sets_with_chosen_values(
+    left: &ResultSet,
+    right: &ResultSet,
+    chosen: &[Option<ChosenValueCollation>],
+) -> ResultSetDiff {
+    let class_row = |row: &Row| {
+        Row(row
+            .0
+            .iter()
+            .enumerate()
+            .map(
+                |(column, value)| match chosen.get(column).copied().flatten() {
+                    Some(collation) => collation.class_member(value),
+                    None => value.clone(),
+                },
+            )
+            .collect())
+    };
+    // Rows are counted per class row. For diagnostics, each class also keeps
+    // the first actual row each side had in it.
+    let mut counts = BTreeMap::<Row, (i64, [Option<&Row>; 2])>::new();
+    for (side, (rows, weight)) in [(left.rows(), 1), (right.rows(), -1)]
+        .into_iter()
+        .enumerate()
+    {
+        for row in rows {
+            let (count, examples) = counts.entry(class_row(row)).or_default();
+            *count += weight;
+            examples[side].get_or_insert(row);
+        }
     }
 
     let mut only_in_left = Vec::new();
     let mut only_in_right = Vec::new();
     let mut total_only_in_left = 0;
     let mut total_only_in_right = 0;
-    for (row, count) in counts {
+    for (count, [left_example, right_example]) in counts.into_values() {
         if count > 0 {
             let count = count as u64;
             total_only_in_left += count;
-            only_in_left.push(CountedRow { row, count });
+            only_in_left.push(CountedRow {
+                row: left_example
+                    .expect("a class with more left rows has a left row")
+                    .clone(),
+                count,
+            });
         } else if count < 0 {
             let count = count.unsigned_abs();
             total_only_in_right += count;
-            only_in_right.push(CountedRow { row, count });
+            only_in_right.push(CountedRow {
+                row: right_example
+                    .expect("a class with more right rows has a right row")
+                    .clone(),
+                count,
+            });
         }
     }
 
@@ -370,6 +461,58 @@ mod tests {
         assert_eq!(hash(&nan_a), hash(&nan_b));
 
         assert_ne!(Value::Real(1.0), Value::Real(1.0 + 5e-11));
+    }
+
+    #[test]
+    fn chosen_value_columns_match_only_values_equal_under_their_collation() {
+        let text = |value: &str| Value::Text(value.to_string());
+        let row = |chosen: Value, exact: Value| vec![chosen, exact];
+        let view = result(2, vec![row(text("a"), text("x"))]);
+        let nocase = [Some(ChosenValueCollation::NoCase)];
+        let rtrim = [Some(ChosenValueCollation::RTrim)];
+        let binary = [Some(ChosenValueCollation::Binary)];
+
+        let other_case = result(2, vec![row(text("A"), text("x"))]);
+        assert!(diff_result_sets_with_chosen_values(&view, &other_case, &nocase).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_case, &rtrim).is_empty());
+        assert!(!diff_result_sets(&view, &other_case).is_empty());
+
+        let other_exact_column = result(2, vec![row(text("a"), text("X"))]);
+        assert!(
+            !diff_result_sets_with_chosen_values(&view, &other_exact_column, &nocase).is_empty()
+        );
+
+        let trailing_space = result(2, vec![row(text("a  "), text("x"))]);
+        let leading_space = result(2, vec![row(text(" a"), text("x"))]);
+        assert!(diff_result_sets_with_chosen_values(&view, &trailing_space, &rtrim).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &leading_space, &rtrim).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &trailing_space, &nocase).is_empty());
+
+        let integer = result(2, vec![row(Value::Integer(2), text("x"))]);
+        let real = result(2, vec![row(Value::Real(2.0), text("x"))]);
+        let other_real = result(2, vec![row(Value::Real(2.5), text("x"))]);
+        assert!(diff_result_sets_with_chosen_values(&integer, &real, &binary).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&integer, &other_real, &binary).is_empty());
+        assert!(!diff_result_sets(&integer, &real).is_empty());
+    }
+
+    #[test]
+    fn chosen_value_columns_still_compare_multiplicity() {
+        let text = |value: &str| vec![Value::Text(value.to_string())];
+        let view = result(1, vec![text("a")]);
+        let fresh = result(1, vec![text("A"), text("a")]);
+        let diff = diff_result_sets_with_chosen_values(
+            &view,
+            &fresh,
+            &[Some(ChosenValueCollation::NoCase)],
+        );
+        assert_eq!(
+            diff.only_in_right,
+            vec![CountedRow {
+                row: Row(text("A")),
+                count: 1
+            }]
+        );
     }
 
     #[test]
