@@ -66,7 +66,7 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {

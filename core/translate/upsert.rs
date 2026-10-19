@@ -840,6 +840,7 @@ pub fn emit_upsert(
             TriggerTime::Before,
             Some(updated_positions.clone()),
             &btree_table,
+            connection,
         );
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
@@ -937,6 +938,7 @@ pub fn emit_upsert(
                 TriggerEvent::Update,
                 Some(&updated_positions),
                 &btree_table,
+                connection,
             );
             if has_relevant_after_triggers {
                 // Preserve OLD registers for AFTER triggers
@@ -964,6 +966,7 @@ pub fn emit_upsert(
                 TriggerEvent::Update,
                 Some(&updated_positions),
                 &btree_table,
+                connection,
             );
             if has_relevant_after_triggers {
                 Some(old_registers)
@@ -1515,6 +1518,7 @@ pub fn emit_upsert(
             TriggerTime::After,
             Some(updated_column_indices),
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);

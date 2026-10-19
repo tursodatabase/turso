@@ -617,12 +617,13 @@ pub fn optimize_plan(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, resolver, connection)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -1310,6 +1311,7 @@ fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let schema = resolver.schema();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
@@ -1371,7 +1373,7 @@ fn optimize_update_plan(
         .expect("UPDATE must optimize exactly one target table")
         .clone();
 
-    if let Some(reason) = update_write_set_reason(plan, resolver)? {
+    if let Some(reason) = update_write_set_reason(plan, resolver, connection)? {
         plan.safety.require(reason);
     }
 
@@ -1393,6 +1395,7 @@ fn optimize_update_plan(
 fn update_write_set_reason(
     plan: &UpdatePlan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<Option<DmlSafetyReason>> {
     let table_ref = &plan.target_table;
     let reason = 'requires: {
@@ -1433,6 +1436,7 @@ fn update_write_set_reason(
             TriggerEvent::Update,
             Some(&updated_cols),
             btree_table,
+            connection,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }

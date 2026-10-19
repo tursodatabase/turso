@@ -2163,3 +2163,101 @@ fn test_old_values_and_returning_read_real_column_as_real() {
         ]
     );
 }
+
+// `Connection::set_triggers_enabled`: the sync engine's row replay turns
+// triggers off so that a trigger's effect, already captured as its own CDC
+// row, is not also applied a second time by the target re-running it
+// (#10147). These tests cover the setting itself, not the replay: see
+// `sync/engine/src/database_tape.rs` for the replay-session tests.
+
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_skips_non_temp_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, Vec::<(String,)>::new());
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+// A TEMP trigger keeps firing even while non-TEMP triggers are off, matching
+// SQLite's SQLITE_DBCONFIG_ENABLE_TRIGGER=0 rule (trigger.c: triggersReallyExist
+// truncates the trigger list to TEMP triggers only, it does not empty it).
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_keeps_temp_trigger_firing(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('temp fired'); END",
+    )
+    .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("temp fired".to_string(),)]);
+}
+
+// Turning `triggers_enabled` back on makes an already-prepared statement fire
+// triggers again: the same `Statement` is reused (reset + stepped) across the
+// setting change, so this exercises `PrepareContext::matches_connection` /
+// `Statement::reprepare`, not just a fresh compile picking up the new setting.
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_reprepare_on_setting_change(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(false);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(true);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,), (1,), (1,)]);
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("fired".to_string(),), ("fired".to_string(),)]);
+}
+
+/// `has_triggers_including_temp` (used to decide whether an UPDATE needs the
+/// trigger-driven stable-write-set path) must agree with `get_triggers_including_temp`
+/// (used to actually fire triggers) about whether `triggers_enabled` is off: with it off,
+/// no AFTER UPDATE trigger fires, so the UPDATE must not take that path either.
+#[turso_macros::test]
+fn test_update_skips_stable_write_set_when_triggers_disabled(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    let rows = crate::common::limbo_exec_rows(&conn, "EXPLAIN UPDATE t SET x = 1");
+    let uses_stable_write_set = rows.iter().any(
+        |row| matches!(&row[1], rusqlite::types::Value::Text(op) if op.as_str() == "OpenEphemeral"),
+    );
+    assert!(
+        !uses_stable_write_set,
+        "with triggers disabled no trigger will fire, so the UPDATE must not \
+         materialize a stable write set for one; EXPLAIN rows: {rows:#?}"
+    );
+}
