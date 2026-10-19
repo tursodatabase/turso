@@ -6111,6 +6111,7 @@ dependencies = [
  "num_cpus",
  "owo-colors 4.2.3",
  "pretty_assertions",
+ "query-result-oracle",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "regex",

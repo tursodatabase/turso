@@ -28,9 +28,9 @@ use crate::{
     translate,
     translate::collate::CollationSeq,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
+    ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
     Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
     Trigger, Value, VirtualTable, WalAutoActions,
@@ -492,9 +492,12 @@ pub struct Connection {
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
-    /// Per-connection view transaction states for uncommitted changes. This represents
-    /// one entry per view that was touched in the transaction.
-    pub(crate) view_transaction_states: AllViewsTxState,
+    /// Ordered row changes captured once per connection transaction, with
+    /// consumer indexes for materialized-view maintenance.
+    pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
+    /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
+    pub(crate) maintenance_program_cache:
+        crate::incremental::vdbe_maintenance::MaintenanceProgramCache,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -2923,18 +2926,17 @@ impl Connection {
                 }
             }
 
-            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
-                Ok(()) => {}
-                Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
-                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
-                Err(e) => return Err(e),
-            }
-            match schema.populate_materialized_views(
+            match schema.populate_materialized_views_then_indices(
+                &syms,
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
+                from_sql_indexes,
+                automatic_indices,
+                false,
             ) {
                 Ok(()) => {}
+                Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
                 Err(e) => return Err(e),
             }
@@ -5297,6 +5299,10 @@ impl Connection {
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
+        // The entire transaction is being rolled back, so every materialized
+        // view delta captured within it is void. Leaving them behind would
+        // apply phantom changes to the views at the next successful commit.
+        self.transaction_changes.clear();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

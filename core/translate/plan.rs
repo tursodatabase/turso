@@ -3,7 +3,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
+        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
         ROWID_SENTINEL,
     },
     translate::{
@@ -3385,7 +3385,7 @@ impl JoinedTable {
         &self,
         program: &mut ProgramBuilder,
         mode: OperationMode,
-        schema: &Schema,
+        resolver: &Resolver,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         match &self.table {
@@ -3416,13 +3416,16 @@ impl JoinedTable {
                         },
                     ))
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
+                    // Check if this is a materialized view. Must look up the
+                    // schema of the table's own database: a table in an
+                    // attached database can share a name with a materialized
+                    // view in a different database.
+                    let cursor_type = match resolver
+                        .with_schema(self.database_id, |s| s.get_materialized_view(&btree.name))
+                    {
+                        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+                        None => CursorType::BTreeTable(btree.clone()),
+                    };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
                         cursor_type,

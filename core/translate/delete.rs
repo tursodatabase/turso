@@ -53,26 +53,28 @@ fn validate_delete(
         crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
     }
 
-    // Check if this is a materialized view
-    if resolver.schema().is_materialized_view(tbl_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(tbl_name)) {
         crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
     }
 
     // Check if this table has any incompatible dependent views
-    resolver.schema().with_incompatible_dependent_views(tbl_name, |views| {
+    resolver.with_schema(database_id, |s| s.with_incompatible_dependent_views(tbl_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot DELETE from table '{tbl_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
         );
     }
     // Pins the closure's error type: bail_parse_error! is polymorphic over
     // boxed and unboxed LimboError since the InsnResult migration.
     Ok::<(), crate::LimboError>(())
-    })?;
+    }))?;
     Ok(table)
 }
 

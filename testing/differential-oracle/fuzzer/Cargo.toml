@@ -26,7 +26,7 @@ path = "probe.rs"
 path = "lib.rs"
 
 [dependencies]
-turso_core = { workspace = true, features = ["simulator"] }
+turso_core = { workspace = true, features = ["simulator", "test_helper"] }
 turso_parser = { workspace = true }
 sql_gen_prop = { path = "../sql_gen_prop" }
 sql_gen = { path = "../sql_gen", features = ["serde"] }

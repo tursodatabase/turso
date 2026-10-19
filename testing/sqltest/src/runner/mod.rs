@@ -45,6 +45,8 @@ pub struct RunOptions {
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Path to binary used for cross-checking integrity (None = disabled)
     pub cross_check_binary: Option<PathBuf>,
+    /// Check every live materialized view after each successful statement.
+    pub verify_materialized_views: bool,
 }
 
 /// Trait for runnable test items (tests and snapshots)
@@ -545,7 +547,12 @@ async fn run_single<B: SqlBackend, R: Runnable>(
         let queries = test.queries_to_execute();
         let mut results = Vec::with_capacity(queries.len());
         for sql in queries {
-            match db.execute(&sql).await {
+            let execution = if options.verify_materialized_views {
+                db.execute_with_materialized_view_verification(&sql).await
+            } else {
+                db.execute(&sql).await
+            };
+            match execution {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     let _ = db.close().await;
@@ -1016,6 +1023,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    verify_materialized_views: test_file.verify_materialized_views
+                        && self.backend.supports_materialized_view_verification(),
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -1086,6 +1095,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_is_sqlite: self.backend.is_sqlite(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    verify_materialized_views: false,
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -1143,6 +1153,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         backend_is_sqlite: self.backend.is_sqlite(),
                         snapshot_update_mode: self.config.snapshot_update_mode,
                         cross_check_binary: self.config.cross_check_binary.clone(),
+                        verify_materialized_views: false,
                     };
 
                     futures.push(tokio::spawn(async move {
@@ -1503,6 +1514,7 @@ expect {
                 backend_is_sqlite: false,
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
+                verify_materialized_views: false,
             };
             let backend = Arc::new(OneRowBackend { backend_type });
             let result = run_single(backend, file.tests[0].clone(), options).await;

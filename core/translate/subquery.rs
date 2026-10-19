@@ -1719,7 +1719,7 @@ fn allocate_cursors_read_by_lateral_subquery(
             ),
             "a LATERAL subquery must come after the tables it reads in the join order"
         );
-        read_table.open_cursors(program, OperationMode::SELECT, t_ctx.resolver.schema())?;
+        read_table.open_cursors(program, OperationMode::SELECT, &t_ctx.resolver)?;
     }
     Ok(())
 }

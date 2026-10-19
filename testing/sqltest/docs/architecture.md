@@ -166,6 +166,9 @@ For each test case:
 
 2. **Execution Phase**
    - Execute test SQL
+   - For files using `@verify-materialized-views` on the native Rust backend,
+     split the block into statements and compare every live materialized view
+     with its stored defining SELECT after each successful statement
    - Capture result or error
 
 3. **Comparison Phase**

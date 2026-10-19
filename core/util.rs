@@ -307,16 +307,14 @@ pub fn parse_schema_rows(
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_indices(
+    schema.populate_materialized_views_then_indices(
         syms,
-        inner.from_sql_indexes,
-        inner.automatic_indices,
-        has_mv_store,
-    )?;
-    schema.populate_materialized_views(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        inner.from_sql_indexes,
+        inner.automatic_indices,
+        has_mv_store,
     )?;
 
     Ok(IOResult::Done(()))

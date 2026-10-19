@@ -479,6 +479,19 @@ impl Connection {
         Ok(())
     }
 
+    /// For each column of materialized view `view_name`, the collation under
+    /// which the view chose the value it shows among several values that
+    /// compare equal, or `None` when the value is exact. For test oracles that
+    /// compare a view with a fresh run of its definition.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_view_chosen_value_collations(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn.materialized_view_chosen_value_collations(view_name)?)
+    }
+
     pub fn is_autocommit(&self) -> Result<bool> {
         let conn = self.get_inner_connection()?;
         Ok(conn.get_auto_commit())

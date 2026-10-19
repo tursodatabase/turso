@@ -12,6 +12,7 @@ default = ["encryption", "pure-rust-crypto"]
 encryption = ["turso_core/encryption"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 fts = ["turso_core/fts"]
+test_helper = ["turso_core/test_helper"]
 
 [lib]
 doc = false

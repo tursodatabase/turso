@@ -692,6 +692,20 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
             }
         }
     }
+
+    // A materialized view created by an incompatible (older) storage version
+    // has no `Table::BTree` entry above: it is deliberately kept out of
+    // `schema.tables` so reads and writes still fail with the "DROP and
+    // recreate" error instead of touching storage this build cannot
+    // interpret. Its btree still owns a real page, though, so it must be
+    // counted here or the structural pass below reports it as orphaned.
+    for &root_page in schema.incompatible_materialized_view_roots.values() {
+        let view_root = resolve_root(root_page);
+        if view_root > 0 {
+            root_pages.push(view_root);
+        }
+    }
+
     root_pages
 }
 

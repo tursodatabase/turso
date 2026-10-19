@@ -1,13 +1,11 @@
+#[cfg(test)]
+use crate::alloc::TursoIteratorExt;
+#[cfg(test)]
+use crate::incremental::view::ViewChangeSubscription;
 use crate::numeric::Numeric;
 use crate::sync::Arc;
-use crate::sync::Mutex;
 use crate::types::IOResultOr;
 use crate::{
-    incremental::{
-        compiler::{DeltaSet, ExecuteState},
-        dbsp::{Delta, HashableRow, RowKeyZSet},
-        view::{IncrementalView, ViewTransactionState},
-    },
     return_if_io,
     storage::btree::CursorTrait,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
@@ -20,7 +18,7 @@ enum SeekState {
     /// Initial state before seeking
     Init,
 
-    /// Actively seeking with btree and uncommitted iterators
+    /// Actively seeking the view btree.
     Seek {
         /// The row we are trying to find
         target: i64,
@@ -28,8 +26,6 @@ enum SeekState {
 
     /// Btree seek returned TryAdvance, now advancing with next()/prev()
     Advancing {
-        /// The row we are trying to find
-        target: i64,
         /// The seek operation (determines direction of advance)
         op: SeekOp,
     },
@@ -38,34 +34,30 @@ enum SeekState {
     Done,
 }
 
-/// Cursor for reading materialized views that combines:
-/// 1. Persistent btree data (committed state)
-/// 2. Transaction-specific DBSP deltas (uncommitted changes)
-///
-/// Works like a regular table cursor - reads from disk on-demand
-/// and overlays transaction changes as needed.
+/// Cursor for a transactionally maintained materialized-view btree.
 pub struct MaterializedViewCursor {
     // Core components
     btree_cursor: Box<dyn CursorTrait>,
-    view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
+    connection: Arc<crate::Connection>,
 
-    // Current changes that are uncommitted
-    uncommitted: RowKeyZSet,
-
-    // Reference to shared transaction state for this specific view - shared with Connection
-    tx_state: Arc<ViewTransactionState>,
-
-    // The transaction state always grows. It never gets reduced. That is in the very nature of
-    // DBSP, because deletions are just appends with weight < 0. So we will use the length of the
-    // state to check if we have to recompute the transaction state
-    last_tx_state_len: usize,
+    // The transaction-wide change-log revision this cursor has applied.
+    // This must be global rather than the direct view subscription revision so
+    // reads through a chain of materialized views see base changes before
+    // commit scheduling has produced the downstream delta.
+    last_change_log_revision: u64,
 
     // Current row cache - only cache the current row we're looking at
     current_row: Option<(i64, Vec<Value>)>,
 
-    // Execution state for circuit processing
-    execute_state: ExecuteState,
+    // Synthetic null-row flag (see Insn::NullRow): while set, column reads
+    // return NULL even though the cursor may still sit on a stale row.
+    // Cleared by any repositioning, mirroring BTreeCursor.
+    null_flag: bool,
+
+    // In-progress maintenance batch, parked across I/O yields when a view is
+    // read before its enclosing write statement reaches Halt.
+    view_delta_state: crate::vdbe::ViewDeltaApplyState,
 
     // State machine for seek operations
     seek_state: SeekState,
@@ -74,75 +66,77 @@ pub struct MaterializedViewCursor {
 impl MaterializedViewCursor {
     pub fn new(
         btree_cursor: Box<dyn CursorTrait>,
-        view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
-        tx_state: Arc<ViewTransactionState>,
+        connection: Arc<crate::Connection>,
     ) -> Result<Self> {
+        // Opt the underlying btree cursor into the pager's cursor registry,
+        // mirroring what Cursor::new_btree/new_btree_dyn do for ordinary table
+        // cursors. Without this, a page split caused by maintenance writes on
+        // this same btree (e.g. from an INSERT into a base table, in the same
+        // connection, while this cursor's SELECT is still open) never saves
+        // and restores this cursor's position, so it can silently skip rows
+        // that moved to a new page.
+        btree_cursor.register_with_pager();
         Ok(Self {
             btree_cursor,
-            view,
             pager,
-            uncommitted: RowKeyZSet::new(),
-            tx_state,
-            last_tx_state_len: 0,
+            connection,
+            last_change_log_revision: 0,
             current_row: None,
-            execute_state: ExecuteState::Uninitialized,
+            null_flag: false,
+            view_delta_state: crate::vdbe::ViewDeltaApplyState::NotStarted,
             seek_state: SeekState::Init,
         })
     }
 
-    /// Compute transaction changes lazily on first access
+    /// Apply pending transaction changes before reading the view.
+    ///
+    /// This invokes the same dependency-ordered maintenance programs used at
+    /// statement completion and commit. It exists for reads reached from
+    /// inside a still-running write statement; ordinary later statements see
+    /// an already-maintained btree and take the fast path.
     fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
-        // Check if we've already processed the current state
-        let current_len = self.tx_state.len();
-        if current_len == self.last_tx_state_len {
+        let current_revision = self.connection.transaction_changes.change_revision();
+        if current_revision == self.last_change_log_revision {
             return Ok(IOResult::Done(()));
         }
 
-        // Get the view and the current transaction state
-        let mut view_guard = self.view.lock();
-        let table_deltas = self.tx_state.get_table_deltas();
-
-        // Process the deltas through the circuit to get materialized changes
-        let mut uncommitted = DeltaSet::new();
-        for (table_name, delta) in table_deltas {
-            uncommitted.insert(table_name, delta);
+        match crate::vdbe::step_view_delta_batch(
+            &self.connection,
+            &mut self.view_delta_state,
+            false,
+            &self.pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                self.view_delta_state = crate::vdbe::ViewDeltaApplyState::NotStarted;
+                self.last_change_log_revision =
+                    self.connection.transaction_changes.change_revision();
+                Ok(IOResult::Done(()))
+            }
         }
-
-        let processed_delta = return_if_io!(view_guard.execute_with_uncommitted(
-            uncommitted,
-            self.pager.clone(),
-            &mut self.execute_state
-        ));
-
-        self.uncommitted = RowKeyZSet::from_delta(&processed_delta);
-        self.last_tx_state_len = current_len;
-        Ok(IOResult::Done(()))
     }
 
-    // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
-        let btree_rowid = return_if_io!(self.btree_cursor.rowid());
-        let rowid = match btree_rowid {
-            None => return Ok(IOResult::Done(Vec::new())),
-            Some(rowid) => rowid,
+    /// Load the physical row under the btree cursor into the SQL-facing cache.
+    fn load_btree_row(&mut self) -> IOResultOr<bool> {
+        let Some(rowid) = return_if_io!(self.btree_cursor.rowid()) else {
+            self.current_row = None;
+            return Ok(IOResult::Done(false));
         };
 
-        let btree_record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
+        let record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
             crate::LimboError::InternalError(
                 "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
             )
         })?;
-        let mut btree_values = btree_record.get_values_owned()?;
+        let mut values = record.get_values_owned()?;
 
-        // The last column should be the weight
-        let weight_value = btree_values.pop().ok_or_else(|| {
+        let weight_value = values.pop().ok_or_else(|| {
             crate::LimboError::InternalError(
                 "Invalid data in materialized view: no weight column found".to_string(),
             )
         })?;
 
-        // Convert the Value to isize weight
         let weight = match weight_value {
             Value::Numeric(Numeric::Integer(w)) => w as isize,
             _ => {
@@ -159,73 +153,8 @@ impl MaterializedViewCursor {
             .into());
         }
 
-        // TODO: std boundary conversion; adjust once incremental uses the
-        // allocator with fallible allocations everywhere.
-        Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values.into_iter().collect()),
-            weight,
-        )]))
-    }
-
-    /// Process btree changes: merge with uncommitted, build zset, and determine result.
-    /// Returns the next state action: either Done with a result, or updates seek_state for another iteration.
-    fn process_btree_changes(
-        &mut self,
-        target: i64,
-        target_rowid: i64,
-        op: SeekOp,
-        changes: Vec<(HashableRow, isize)>,
-    ) -> IOResultOr<()> {
-        let mut btree_entries = Delta { changes };
-        let changes = self.uncommitted.seek(target, op);
-
-        let uncommitted_entries = Delta { changes };
-        btree_entries.merge(&uncommitted_entries);
-
-        // if empty pre-zset, means nothing was found. Empty post-zset can mean that
-        // we just canceled weights.
-        if btree_entries.is_empty() {
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let min_seen = btree_entries
-            .changes
-            .first()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-        let max_seen = btree_entries
-            .changes
-            .last()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-
-        let zset = RowKeyZSet::from_delta(&btree_entries);
-        let ret = zset.seek(target_rowid, op);
-
-        if !ret.is_empty() {
-            let (row, _) = &ret[0];
-            self.current_row = Some((row.rowid, row.values.clone()));
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let new_target = match op {
-            SeekOp::GT => Some(max_seen),
-            SeekOp::GE { eq_only: false } => Some(max_seen + 1),
-            SeekOp::LT => Some(min_seen),
-            SeekOp::LE { eq_only: false } => Some(min_seen - 1),
-            SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
-        };
-
-        if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
-        } else {
-            self.seek_state = SeekState::Done;
-        }
-        Ok(IOResult::Done(()))
+        self.current_row = Some((rowid, values.into_iter().collect()));
+        Ok(IOResult::Done(true))
     }
 
     /// Internal seek implementation that doesn't check preconditions
@@ -235,6 +164,7 @@ impl MaterializedViewCursor {
             match &mut self.seek_state {
                 SeekState::Init => {
                     self.current_row = None;
+                    self.null_flag = false;
                     self.seek_state = SeekState::Seek {
                         target: target_rowid,
                     };
@@ -244,33 +174,31 @@ impl MaterializedViewCursor {
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
-                    let changes = match btree_result {
-                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
+                    match btree_result {
+                        SeekResult::Found => {
+                            let found = return_if_io!(self.load_btree_row());
+                            self.seek_state = SeekState::Done;
+                            return Ok(IOResult::Done(if found {
+                                SeekResult::Found
+                            } else {
+                                SeekResult::NotFound
+                            }));
+                        }
                         SeekResult::TryAdvance => {
                             // Transition to Advancing state before calling next/prev.
                             // This ensures that if next/prev returns IO, we resume in
                             // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
+                            self.seek_state = SeekState::Advancing { op };
                             continue;
                         }
-                        SeekResult::NotFound => Vec::new(),
-                    };
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
+                        SeekResult::NotFound => {
+                            self.current_row = None;
+                            self.seek_state = SeekState::Done;
+                            return Ok(IOResult::Done(SeekResult::NotFound));
+                        }
                     }
-                    // Otherwise state is Seek with new target, loop continues
                 }
-                SeekState::Advancing { target, op } => {
-                    let target = *target;
+                SeekState::Advancing { op } => {
                     let op = *op;
 
                     // Cursor is positioned at the leaf but current entry doesn't match.
@@ -283,21 +211,13 @@ impl MaterializedViewCursor {
                             return_if_io!(self.btree_cursor.prev())
                         }
                     };
-                    // read_btree_delta_entry handles the case where cursor is at end
-                    let changes = return_if_io!(self.read_btree_delta_entry());
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
+                    let found = return_if_io!(self.load_btree_row());
+                    self.seek_state = SeekState::Done;
+                    return Ok(IOResult::Done(if found {
+                        SeekResult::Found
+                    } else {
+                        SeekResult::NotFound
+                    }));
                 }
                 SeekState::Done => {
                     // We always return before setting the state to done. Meaning if we got here,
@@ -350,6 +270,9 @@ impl MaterializedViewCursor {
     }
 
     pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
+        if self.null_flag {
+            return Ok(IOResult::Done(Value::Null));
+        }
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -357,6 +280,11 @@ impl MaterializedViewCursor {
         } else {
             Ok(IOResult::Done(Value::Null))
         }
+    }
+
+    /// Synthetic null-row flag; see [`crate::vdbe::insn::Insn::NullRow`].
+    pub fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
     }
 
     pub fn rowid(&self) -> IOResultOr<Option<i64>> {
@@ -426,14 +354,26 @@ mod tests {
         conn: &Arc<Connection>,
     ) -> Result<(
         MaterializedViewCursor,
-        Arc<ViewTransactionState>,
+        Arc<ViewChangeSubscription>,
+        Arc<Pager>,
+    )> {
+        create_view_cursor(conn, "test_view")
+    }
+
+    /// Helper to create a cursor for any materialized view over `test_table`
+    fn create_view_cursor(
+        conn: &Arc<Connection>,
+        view_name: &str,
+    ) -> Result<(
+        MaterializedViewCursor,
+        Arc<ViewChangeSubscription>,
         Arc<Pager>,
     )> {
         // Get the schema and view
         let view_mutex = conn
             .schema
             .read()
-            .get_materialized_view("test_view")
+            .get_materialized_view(view_name)
             .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page
@@ -452,15 +392,10 @@ mod tests {
         let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
-        let tx_state = conn.view_transaction_states.get_or_create("test_view");
+        let tx_state = conn.transaction_changes.view_subscription(view_name);
 
         // Create the materialized view cursor
-        let cursor = MaterializedViewCursor::new(
-            btree_cursor,
-            view_mutex.clone(),
-            pager.clone(),
-            tx_state.clone(),
-        )?;
+        let cursor = MaterializedViewCursor::new(btree_cursor, pager.clone(), conn.clone())?;
 
         Ok((cursor, tx_state, pager))
     }
@@ -474,12 +409,16 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to apply changes through ViewTransactionState
+    /// Helper to apply changes through a view's shared-log subscription.
     fn apply_changes_to_tx_state(
-        tx_state: &ViewTransactionState,
+        tx_state: &ViewChangeSubscription,
         changes: Vec<(i64, Vec<Value>, isize)>,
     ) {
         for (rowid, values, weight) in changes {
+            let values = values
+                .into_iter()
+                .try_collect()
+                .expect("test row allocation should succeed");
             if weight > 0 {
                 tx_state.insert("test_table", rowid, values);
             } else if weight < 0 {
@@ -757,7 +696,7 @@ mod tests {
         tx_state.insert(
             "test_table",
             2,
-            vec![Value::from_i64(2), Value::from_i64(20)],
+            crate::alloc::vec![Value::from_i64(2), Value::from_i64(20)],
         );
 
         // Now seek for row 2 finds it
@@ -1308,6 +1247,152 @@ mod tests {
         Ok(())
     }
 
+    /// An UPDATE of row 2 and an INSERT-then-DELETE of row 7, each captured
+    /// in the reverse of the order the engine records them.
+    fn reversed_capture_order_changes() -> Vec<(i64, Vec<Value>, isize)> {
+        vec![
+            (2, vec![Value::from_i64(2), Value::from_i64(25)], 1),
+            (2, vec![Value::from_i64(2), Value::from_i64(20)], -1),
+            (7, vec![Value::from_i64(7), Value::from_i64(70)], -1),
+            (7, vec![Value::from_i64(7), Value::from_i64(70)], 1),
+        ]
+    }
+
+    /// Read every row of a two-column view through its cursor.
+    fn read_two_column_rows(
+        cursor: &mut MaterializedViewCursor,
+        pager: &Arc<Pager>,
+    ) -> Result<Vec<(Value, Value)>> {
+        let mut rows = Vec::new();
+        pager.io.block(|| cursor.rewind())?;
+        while cursor.is_valid()? {
+            rows.push((
+                pager.io.block(|| cursor.column(0))?,
+                pager.io.block(|| cursor.column(1))?,
+            ));
+            pager.io.block(|| cursor.next())?;
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn test_view_rows_do_not_depend_on_delta_order() -> Result<()> {
+        let conn = create_test_connection()?;
+        populate_test_table(&conn, vec![(1, 10), (2, 20)])?;
+        let (mut cursor, tx_state, pager) = create_test_cursor(&conn)?;
+
+        apply_changes_to_tx_state(&tx_state, reversed_capture_order_changes());
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![
+                (Value::from_i64(1), Value::from_i64(10)),
+                (Value::from_i64(2), Value::from_i64(25)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_rows_do_not_depend_on_delta_order() -> Result<()> {
+        let conn = create_test_connection()?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW test_groups AS
+             SELECT value, count(*) FROM test_table GROUP BY value",
+        )?;
+        populate_test_table(&conn, vec![(1, 10), (2, 20)])?;
+        let (mut cursor, tx_state, pager) = create_view_cursor(&conn, "test_groups")?;
+
+        apply_changes_to_tx_state(&tx_state, reversed_capture_order_changes());
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![
+                (Value::from_i64(10), Value::from_i64(1)),
+                (Value::from_i64(25), Value::from_i64(1)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A consolidated delta only retracts rows its input holds. Retracting a
+    /// row that no state holds must fail instead of being dropped or stored
+    /// as a negative count.
+    #[test]
+    fn test_retracting_a_row_no_state_holds_is_an_error() -> Result<()> {
+        let views = [
+            ("test_view", None),
+            (
+                "unknown_group",
+                Some("SELECT value, count(*) FROM test_table GROUP BY value"),
+            ),
+            ("unknown_value", Some("SELECT max(value) FROM test_table")),
+            (
+                "unknown_content",
+                Some("SELECT value FROM test_table UNION SELECT id FROM test_table"),
+            ),
+            (
+                "unknown_arranged_row",
+                Some("SELECT id, value FROM test_table UNION ALL SELECT id, value FROM test_table"),
+            ),
+            (
+                "unknown_appended_row",
+                Some(
+                    "SELECT value FROM test_table UNION SELECT id FROM test_table
+                     UNION ALL SELECT value FROM test_table",
+                ),
+            ),
+        ];
+        let mut accepted = Vec::new();
+        for (view_name, select) in views {
+            let conn = create_test_connection()?;
+            if let Some(select) = select {
+                conn.execute(format!("CREATE MATERIALIZED VIEW {view_name} AS {select}"))?;
+            }
+            populate_test_table(&conn, vec![(1, 10)])?;
+            let (mut cursor, tx_state, pager) = create_view_cursor(&conn, view_name)?;
+
+            apply_changes_to_tx_state(
+                &tx_state,
+                vec![(9, vec![Value::from_i64(9), Value::from_i64(90)], -1)],
+            );
+
+            if pager.io.block(|| cursor.rewind()).is_ok() {
+                accepted.push(view_name);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "these views accepted a retraction of an unknown row: {accepted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_counts_a_summed_weight_in_full() -> Result<()> {
+        let conn = create_test_connection()?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW test_groups AS
+             SELECT value, count(*) FROM test_table GROUP BY value",
+        )?;
+        let (mut cursor, tx_state, pager) = create_view_cursor(&conn, "test_groups")?;
+
+        // Consolidation sums the two equal rows into one row of weight 2.
+        apply_changes_to_tx_state(
+            &tx_state,
+            vec![
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1),
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1),
+            ],
+        );
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![(Value::from_i64(50), Value::from_i64(2))]
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_next_only_uncommitted_large_gaps() -> Result<()> {
         let conn = create_test_connection()?;
@@ -1440,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_match_btree_uncommitted_same_rowid_different_values() -> Result<()> {
+    fn test_second_row_image_for_one_rowid_is_an_error() -> Result<()> {
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -1449,27 +1534,23 @@ mod tests {
         // Create cursor for testing
         let (mut cursor, tx_state, pager) = create_test_cursor(&conn)?;
 
-        // Add uncommitted row 3 with different value (not a delete+insert, just insert)
-        // This simulates a case where uncommitted has a new version of row 3
+        // Insert a second image for row 3 without retracting (3, 30). The view
+        // keeps one row per rowid, so it cannot hold both images.
         apply_changes_to_tx_state(
             &tx_state,
-            vec![
-                (3, vec![Value::from_i64(3), Value::from_i64(35)], 1), // New version with positive weight
-            ],
+            vec![(3, vec![Value::from_i64(3), Value::from_i64(35)], 1)],
         );
 
-        // Exact match seek for row 3 should find the uncommitted version (35)
-        // because when both exist with positive weight, uncommitted takes precedence
-        let result = pager
+        let error = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
-        assert_eq!(result, SeekResult::Found);
-        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-
-        // This test verifies which value we get when both btree and uncommitted
-        // have the same rowid with positive weights
-        // The expected behavior needs to be defined - typically uncommitted wins
-        // or they get merged based on the DBSP semantics
+            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))
+            .expect_err("a second image for one rowid must not be merged");
+        assert!(
+            error
+                .to_string()
+                .contains("received a row whose rowid already holds other values"),
+            "unexpected error: {error}"
+        );
 
         Ok(())
     }
@@ -2004,16 +2085,7 @@ mod tests {
         fn test_seek_not_repeated_after_io_during_try_advance() -> Result<()> {
             let conn = create_test_connection()?;
 
-            // Get the view for creating a cursor
-            let view_mutex = conn
-                .schema
-                .read()
-                .get_materialized_view("test_view")
-                .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
-
             let pager = conn.get_pager();
-            let tx_state = conn.view_transaction_states.get_or_create("test_view");
-
             // Create mock cursor that returns TryAdvance from seek and IO from next
             let mock_cursor = MockBTreeCursor::new();
             let mock_cursor_box: Box<dyn CursorTrait> = Box::new(mock_cursor);
@@ -2022,8 +2094,7 @@ mod tests {
             // We need to use Any::downcast to access the mock's methods
             let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
 
-            let mut cursor =
-                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state)?;
+            let mut cursor = MaterializedViewCursor::new(mock_cursor_box, pager, conn)?;
 
             // Use LE so that rowid=1 satisfies the condition (1 <= 5)
             let seek_op = SeekOp::LE { eq_only: false };

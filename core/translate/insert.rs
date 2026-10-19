@@ -68,7 +68,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     _table: &Table,
-    _database_id: usize,
+    database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -79,22 +79,24 @@ fn validate(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
-    // Check if this is a materialized view
-    if resolver.schema().is_materialized_view(table_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(table_name)) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
+    resolver.with_schema(database_id, |s| s.with_incompatible_dependent_views(table_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
-            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+            "Cannot INSERT into table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
         );
     }
     Ok(())
-    })
+    }))
 }
 
 pub struct TempTableCtx {
@@ -410,7 +412,7 @@ pub fn translate_insert(
         }
         if !resolver
             .schema()
-            .get_dependent_materialized_views(table_name.as_str())
+            .get_dependent_materialized_views(&btree_table.name)
             .is_empty()
         {
             crate::bail_parse_error!(
@@ -995,7 +997,9 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        // Runtime change attribution must use the resolved table identity,
+        // not the SQL token spelling (`"t"`, `[t]`, aliases, case, ...).
+        table_name: btree_table.name.clone(),
     });
 
     // Fire AFTER INSERT triggers
@@ -3517,7 +3521,7 @@ fn ensure_sequence_initialized(
         cursor: seq_cursor_id,
         key_reg: new_rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
@@ -3813,7 +3817,7 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Goto {
@@ -3825,13 +3829,24 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
 
     Ok(())
+}
+
+/// Flags for the engine's own AUTOINCREMENT write to sqlite_sequence. Like
+/// SQLite's autoIncrementEnd (insert.c, OP_Insert with only OPFLAG_APPEND,
+/// so neither OPFLAG_NCHANGE nor OPFLAG_LASTROWID), it changes neither
+/// changes(), total_changes() nor last_insert_rowid(). A user's INSERT into
+/// sqlite_sequence has none of these flags and counts as usual.
+pub(crate) fn autoincrement_bookkeeping_insert_flags() -> InsertFlags {
+    InsertFlags::new()
+        .skip_last_rowid()
+        .skip_all_change_counts()
 }
 
 fn emit_replace_delete_conflicting_row(

@@ -188,7 +188,7 @@ impl InitLoop {
                 }
             }
             let (table_cursor_id, index_cursor_id) =
-                table.open_cursors(program, mode.clone(), t_ctx.resolver.schema())?;
+                table.open_cursors(program, mode.clone(), &t_ctx.resolver)?;
             match &table.op {
                 Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                     (OperationMode::SELECT, Table::BTree(btree)) => {
