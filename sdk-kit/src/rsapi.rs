@@ -1075,18 +1075,19 @@ impl TursoDatabase {
             ));
         };
 
-        let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
-        } else {
-            // Parse encryption key if configured - needed at connect time
-            // which sets up encryption context before reading pages.
-            let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
+        let encryption_key = match (&self.config.page_codec, &self.config.encryption) {
+            (None, Some(encryption_opts)) => {
                 Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
-            } else {
-                None
-            };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            }
+            _ => None,
         };
+        let mut connect_opts = ConnectOpts::new()
+            .with_flags(self.config.open_flags)
+            .with_encryption_key(encryption_key);
+        if let Some(page_codec) = &self.config.page_codec {
+            connect_opts = connect_opts.with_page_codec(page_codec.clone());
+        }
+        let connection = db.connect(connect_opts)?;
 
         Ok(TursoConnection::new(&self.config, connection))
     }
