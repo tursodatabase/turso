@@ -16,10 +16,12 @@ fn test_commit_survives_view_delta_io_yield(tmp_db: TempDatabase) -> anyhow::Res
     conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
     conn.execute("INSERT INTO t VALUES (1, 10), (1, 5), (2, 20)")?;
     conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    let path = tmp_db.path.clone();
     drop(conn);
+    drop(tmp_db);
 
     let reopened = TempDatabase::builder()
-        .with_db_path(&tmp_db.path)
+        .with_db_path(&path)
         .with_views(true)
         .build();
     let conn = reopened.connect_limbo();
@@ -41,10 +43,11 @@ fn test_commit_survives_view_delta_io_yield(tmp_db: TempDatabase) -> anyhow::Res
         "committed row must survive the commit"
     );
     drop(conn);
+    drop(reopened);
 
     // ... and must still be on disk, with the view updated to match.
     let after = TempDatabase::builder()
-        .with_db_path(&tmp_db.path)
+        .with_db_path(&path)
         .with_views(true)
         .build();
     let conn = after.connect_limbo();
@@ -160,10 +163,12 @@ fn test_commit_after_reopen_with_plain_view(tmp_db: TempDatabase) -> anyhow::Res
     conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
     conn.execute("INSERT INTO t VALUES (1, 10)")?;
     conn.execute("CREATE VIEW ov AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    let path = tmp_db.path.clone();
     drop(conn);
+    drop(tmp_db);
 
     let reopened = TempDatabase::builder()
-        .with_db_path(&tmp_db.path)
+        .with_db_path(&path)
         .with_views(true)
         .build();
     let conn = reopened.connect_limbo();
@@ -200,10 +205,12 @@ fn create_index_on_materialized_view_is_rejected(tmp_db: TempDatabase) -> anyhow
         err.to_string().contains("views may not be indexed"),
         "{err}"
     );
+    let path = tmp_db.path.clone();
     drop(conn);
+    drop(tmp_db);
 
     let reopened = TempDatabase::builder()
-        .with_db_path(&tmp_db.path)
+        .with_db_path(&path)
         .with_views(true)
         .build();
     let conn = reopened.connect_limbo();
