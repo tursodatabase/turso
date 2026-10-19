@@ -3656,12 +3656,9 @@ impl Cursor {
             Self::BTree(cursor, ..) => cursor.get_null_flag(),
             Self::Dyn(cursor, ..) => cursor.get_null_flag(),
             Self::Virtual(cursor) => cursor.get_null_flag(),
+            Self::MaterializedView(cursor) => cursor.get_null_flag(),
             Self::NullRow => true,
-            Self::IndexMethod(_)
-            | Self::Pseudo(_)
-            | Self::Sorter(_)
-            | Self::MaterializedView(_)
-            | Self::Delta(_) => false,
+            Self::IndexMethod(_) | Self::Pseudo(_) | Self::Sorter(_) | Self::Delta(_) => false,
         }
     }
 }
