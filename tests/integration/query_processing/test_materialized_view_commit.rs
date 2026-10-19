@@ -989,6 +989,44 @@ fn mvcc_matview_reopen_without_checkpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DROP VIEW on a materialized view that was already checkpointed destroys
+/// its own btree plus its hidden state tables and their indexes directly
+/// (translate_drop_view), not through op_drop_table, so under MVCC those
+/// root pages must be tracked the same way op_drop_table tracks a dropped
+/// table's roots: integrity_check must not report them as "never used"
+/// freed pages, both right after the DROP and after a real reopen.
+#[test]
+fn mvcc_matview_drop_after_checkpoint_keeps_integrity_check_clean() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder()
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW mv AS SELECT a, min(b) AS mn, count(DISTINCT b) AS cnt FROM t GROUP BY a",
+    )?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("DROP VIEW mv")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&conn), "ok");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
 /// A trigger on a table with no materialized view can still write a table a
 /// materialized view depends on. The write must be rejected the same way a
 /// direct one would, and the statement that fired the trigger must leave no
