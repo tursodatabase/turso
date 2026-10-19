@@ -56,6 +56,29 @@ cargo run -p tursopg -- --server 127.0.0.1:5432 /tmp/regress.db &
 cargo run -p turso_pg_regress -- --dsn 'postgres://127.0.0.1:5432/regression'
 ```
 
+## Compare pg_dump files
+
+Install Python 3 and PostgreSQL clients that support `pg_dump --restrict-key`.
+Use Docker for a disposable PostgreSQL server, or set `PG_DSN` to a disposable server whose role can create databases.
+Run all fixtures, or select one SQL file:
+
+```bash
+make -C postgres/conformance test-pgdump
+make -C postgres/conformance test-pgdump FILE=pgdump/tables.sql
+```
+
+The runner loads each SQL file in `conformance/pgdump/` into fresh Turso and PostgreSQL databases.
+It uses the same `pg_dump` client for both databases and compares the output files byte for byte.
+The client uses a fixed restriction key, which replaces its random token.
+The runner does not remove headers, owner names, privileges, or other differences.
+Different server versions and row orders can therefore fail this comparison.
+
+Each run saves `postgres.sql`, `turso.sql`, command logs, and a `dump.diff` file for unequal dumps under `conformance/pgdump/results/`.
+Failed commands return a nonzero status and keep their logs and any partial dump files.
+The runner stops its Turso processes and drops only the PostgreSQL databases that it creates.
+It does not restore the dumps or treat known compatibility failures as passes.
+Add a `.sql` file to `conformance/pgdump/` to test another fixture.
+
 ## The corpus is pristine
 
 Everything under [`conformance/upstream/`](conformance/upstream/) is imported
