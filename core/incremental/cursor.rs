@@ -287,7 +287,14 @@ impl MaterializedViewCursor {
         self.null_flag = flag;
     }
 
+    pub fn get_null_flag(&self) -> bool {
+        self.null_flag
+    }
+
     pub fn rowid(&self) -> IOResultOr<Option<i64>> {
+        if self.null_flag {
+            return Ok(IOResult::Done(None));
+        }
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
