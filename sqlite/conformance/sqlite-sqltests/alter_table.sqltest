@@ -69,7 +69,6 @@ expect {
     a|x
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a, b FROM t;
@@ -80,7 +79,6 @@ expect {
     CREATE VIEW v AS SELECT a, c FROM t
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-qualified {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT t.a, t.b FROM t;
@@ -91,7 +89,6 @@ expect {
     CREATE VIEW v AS SELECT t.a, t.c FROM t
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-star {
     CREATE TABLE t (a INT, b TEXT);
     CREATE VIEW v AS SELECT * FROM t;
@@ -104,7 +101,6 @@ expect {
 }
 
 # SQLite does not rewrite dependent views (view-on-view) on RENAME COLUMN.
-@skip-if mvcc "views not supported in MVCC mode"
 @skip-if sqlite "sqlite does not rewrite dependent views on RENAME COLUMN"
 test alter-table-rename-column-view-on-view {
     CREATE TABLE t (a, b);
@@ -119,7 +115,6 @@ expect {
     CREATE VIEW v2 AS SELECT c FROM v1
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);
@@ -130,7 +125,6 @@ expect {
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.c = 1)
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-correlated-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.b = 1);
@@ -141,7 +135,6 @@ expect {
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 WHERE t.c = 1)
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-correlated-outer-shadow {
     CREATE TABLE t (a, b);
     CREATE TABLE u (b);
@@ -153,7 +146,6 @@ expect {
     CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-correlated-outer-shadow-nested {
     CREATE TABLE t (a, b);
     CREATE TABLE u (b);
@@ -165,7 +157,6 @@ expect {
     CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE c = 1))
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-select-branch {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 2);
@@ -177,7 +168,6 @@ expect {
     2
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-tablecall-branch {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 't');
@@ -189,7 +179,6 @@ expect {
     1
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-self-cycle {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT * FROM v;
@@ -198,7 +187,6 @@ test alter-table-rename-column-view-self-cycle {
 expect error {
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-mutual-cycle {
     CREATE TABLE t (a, b);
     CREATE VIEW v1 AS SELECT * FROM t;
@@ -619,7 +607,6 @@ test fail-alter-table-rename-to-existing-table {
 expect error {
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 @cross-check-integrity
 test fail-alter-table-rename-to-existing-view {
     CREATE TABLE x (a);
@@ -630,7 +617,6 @@ expect error {
     there is already another table or index with this name: y
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 @cross-check-integrity
 test fail-alter-table-rename-to-existing-view-different-case {
     CREATE TABLE x (a);

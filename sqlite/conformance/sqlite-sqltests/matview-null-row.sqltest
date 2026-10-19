@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "materialized views not supported in MVCC mode"
 @skip-file-if sqlite "materialized views are a turso-specific feature"
 @requires-file materialized_views "requires materialized view support"
 
