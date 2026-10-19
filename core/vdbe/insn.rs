@@ -1054,7 +1054,7 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
+        /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
@@ -1066,6 +1066,8 @@ pub enum Insn {
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Override the program's resolve_type for error handling.
+        on_error: Option<ResolveType>, // p2
     },
 
     /// Start a transaction.

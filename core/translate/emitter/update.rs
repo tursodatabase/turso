@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -601,6 +600,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
         _ => {
@@ -608,6 +608,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
     }
@@ -619,8 +620,8 @@ fn emit_notnull_constraint_check(
 /// read, and propagates a conflict-resolution override when one is in effect:
 /// a `trigger_conflict_override` pushed by an enclosing UPSERT `DO UPDATE`
 /// wins, otherwise the outer UPDATE's explicit `OR <conflict>` overrides the
-/// trigger's own conflict resolution (except for the default `ABORT`, which
-/// is left unset so the trigger's own resolution applies). `after` selects
+/// trigger's own conflict resolution. Without an OR clause the trigger's own
+/// resolution applies. `after` selects
 /// between the BEFORE and AFTER constructors.
 fn update_trigger_context(
     program: &ProgramBuilder,
@@ -630,9 +631,12 @@ fn update_trigger_context(
     or_conflict: ResolveType,
     timing: TriggerTime,
 ) -> TriggerContext {
-    let override_conflict = program
-        .trigger_conflict_override
-        .or_else(|| (!matches!(or_conflict, ResolveType::Abort)).then_some(or_conflict));
+    let override_conflict = program.trigger_conflict_override.or_else(|| {
+        program
+            .flags
+            .has_statement_conflict()
+            .then_some(or_conflict)
+    });
 
     let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
@@ -1702,15 +1706,10 @@ fn emit_update_insns<'a>(
                 } else {
                     String::from(table_name) + ".rowid"
                 };
-                let (description, on_error) = halt_desc_and_on_error(
-                    &raw_desc,
-                    effective_rowid_alias_conflict,
-                    program.flags.has_statement_conflict(),
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: raw_desc,
+                    on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
                     description_reg: None,
                 });
             }
@@ -2069,15 +2068,10 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.flags.has_statement_conflict(),
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: column_names,
+                        on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });
                 }

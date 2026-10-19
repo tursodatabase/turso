@@ -695,6 +695,7 @@ pub fn emit_upsert(
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                on_error: None,
             });
         }
         if col.is_rowid_alias() {

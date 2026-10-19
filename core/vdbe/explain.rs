@@ -3,7 +3,7 @@ use crate::vdbe::{
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -1021,19 +1021,11 @@ pub fn insn_to_row(
                 on_error,
                 description_reg,
             } => {
-                let p2 = match on_error {
-                    Some(ResolveType::Rollback) => 1,
-                    Some(ResolveType::Abort) => 2,
-                    Some(ResolveType::Fail) => 3,
-                    Some(ResolveType::Ignore) => 4,
-                    Some(ResolveType::Replace) => 5,
-                    None => 0,
-                };
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
-                    p2,
+                    on_error.map_or(0, |rt| rt.bit_value() as i64),
                     p3,
                     Value::build_text(description.clone()),
                     0,
@@ -1044,10 +1036,11 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
+                on_error,
             } => (
                 "HaltIfNull",
                 *err_code as i64,
-                0,
+                on_error.map_or(0, |rt| rt.bit_value() as i64),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
                 0,

@@ -885,6 +885,21 @@ impl ProgramBuilder {
         self.resolve_type = resolve_type;
     }
 
+    /// The resolve type a constraint Halt must carry for a constraint whose
+    /// effective conflict resolution is `effective`. A statement's own OR
+    /// clause is applied through the program's resolve_type, except in a
+    /// trigger: its program holds every trigger step, each with its own OR
+    /// clause, so each Halt carries its step's resolve type, as in SQLite.
+    pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
+        if self.flags.has_statement_conflict() && self.trigger.is_none() {
+            return None;
+        }
+        match effective {
+            ResolveType::Fail | ResolveType::Rollback => Some(effective),
+            _ => None,
+        }
+    }
+
     /// Set the trigger conflict override. When set, all triggers fired from this program
     /// should use this conflict resolution instead of their own OR clauses.
     pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
