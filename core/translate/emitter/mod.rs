@@ -2432,7 +2432,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: program.constraint_halt_on_error(or_conflict),
                     description_reg: None,
                 });
             }

@@ -600,9 +600,9 @@ pub fn translate_insert(
             .collect();
         // Determine the conflict resolution to propagate to triggers:
         // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
-        // 2. If the INSERT uses an explicit ON CONFLICT clause (not default ABORT),
-        //    propagate it to trigger statements (per SQLite semantics, the outer
-        //    statement's conflict resolution overrides the trigger body's)
+        // 2. If the INSERT uses an explicit ON CONFLICT clause, propagate it to
+        //    trigger statements (per SQLite semantics, the outer statement's
+        //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
         let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
             TriggerContext::new_with_override_conflict(
@@ -611,12 +611,12 @@ pub fn translate_insert(
                 None, // No OLD for INSERT
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
             TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 None, // No OLD for INSERT
-                ctx.on_conflict,
+                statement_on_conflict,
             )
         } else {
             TriggerContext::new(
@@ -1032,12 +1032,12 @@ pub fn translate_insert(
                 None,
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
             TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
-                ctx.on_conflict,
+                statement_on_conflict,
             )
         } else {
             TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
@@ -1932,6 +1932,7 @@ fn emit_notnulls(
                     );
                     description
                 },
+                on_error: program.constraint_halt_on_error(effective),
             });
         }
     }
@@ -2945,15 +2946,10 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3012,15 +3008,10 @@ fn emit_pk_uniqueness_check(
             break 'emit_halt;
         }
         let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-            on_error,
+            description: raw_desc,
+            on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
         });
     }
@@ -3181,15 +3172,10 @@ fn emit_unique_index_check(
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description,
-            on_error,
+            description: raw_desc,
+            on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
         });
 
@@ -3226,15 +3212,10 @@ fn emit_unique_index_check(
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3528,31 +3509,9 @@ fn ensure_sequence_initialized(
 
     Ok(())
 }
-#[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
 /// multi-column:  `t.(k, c1)`
-/// For constraint-level FAIL/ROLLBACK ON CONFLICT, pre-format the description
-/// and set on_error so the VM's halt() produces Raise(rt, msg) with correct semantics.
-/// `has_statement_conflict` should be true when the statement has its own OR clause
-/// (e.g. INSERT OR FAIL), in which case program.resolve_type already handles it.
-pub(crate) fn halt_desc_and_on_error(
-    raw_desc: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (raw_desc.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc}"),
-            Some(effective),
-        ),
-        _ => (raw_desc.to_string(), None),
-    }
-}
-
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     if index.columns.len() == 1 {
         let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());

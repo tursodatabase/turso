@@ -3726,36 +3726,16 @@ pub fn halt(
         vtab_rollback_all(&program.connection)?;
     }
 
-    // Handle RAISE errors - these carry their own resolve type
-    if let Some(resolve_type) = on_error {
-        // RAISE(IGNORE) signals the parent to skip the current row
-        if resolve_type == ResolveType::Ignore {
-            // RAISE(IGNORE) is not an error: the frame unwinds, but everything
-            // the trigger wrote before the RAISE is kept. Stage index-method
-            // writes now, exactly like the normal trigger-subprogram halt
-            // below, so the kept base rows keep their index entries too.
-            if program.is_trigger_subprogram() {
-                return_if_io!(state, index_method_stage_statement_all(state));
-            }
-            return Err(LimboError::RaiseIgnore.into());
+    // RAISE(IGNORE) signals the parent to skip the current row
+    if on_error == Some(ResolveType::Ignore) {
+        // RAISE(IGNORE) is not an error: the frame unwinds, but everything
+        // the trigger wrote before the RAISE is kept. Stage index-method
+        // writes now, exactly like the normal trigger-subprogram halt
+        // below, so the kept base rows keep their index entries too.
+        if program.is_trigger_subprogram() {
+            return_if_io!(state, index_method_stage_statement_all(state));
         }
-        if err_code > 0 {
-            let error = match resolve_type {
-                ResolveType::Abort | ResolveType::Rollback | ResolveType::Fail => {
-                    LimboError::Raise(resolve_type, description.to_string())
-                }
-                ResolveType::Ignore => unreachable!("handled above"),
-                ResolveType::Replace => unreachable!("Replace not valid for RAISE"),
-            };
-
-            // Trigger subprograms must not commit — just propagate the error.
-            // The parent program's abort() handles transaction state.
-            if program.is_trigger_subprogram() {
-                return Err(error.into());
-            }
-
-            return Err(error.into());
-        }
+        return Err(LimboError::RaiseIgnore.into());
     }
 
     // Determine the constraint error (if any) based on error code
@@ -3789,6 +3769,12 @@ pub fn halt(
 
     // Handle constraint errors
     if let Some(error) = constraint_error {
+        // The instruction's own resolve type (RAISE, a constraint-level ON
+        // CONFLICT clause, or a trigger step's OR clause) is embedded in the
+        // error, so whichever program aborts applies it instead of its own.
+        if let Some(resolve_type) = on_error {
+            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+        }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
@@ -3826,19 +3812,6 @@ pub fn halt(
                     state.pending_fail_error = Some(error);
                     return Ok(state.suspend_on_io(io));
                 }
-            }
-        }
-
-        // A FAIL resolution that cannot commit here because an outer statement
-        // is still running (this is a trigger subprogram fired mid-statement)
-        // must still tell the enclosing statement to keep the changes made
-        // before the error. Re-tag the constraint as a FAIL raise so the outer
-        // program's abort() preserves and commits them instead of rolling the
-        // statement back. FK errors do not respect ON CONFLICT, so leave them
-        // as-is.
-        if program.resolve_type == ResolveType::Fail {
-            if let LimboError::Constraint(msg) = error {
-                return Err(LimboError::Raise(ResolveType::Fail, msg).into());
             }
         }
 
@@ -4277,11 +4250,12 @@ pub fn op_halt_if_null(
             target_reg,
             err_code,
             description,
+            on_error,
         },
         insn
     );
     if matches!(state.registers[*target_reg].get_value(), Value::Null) {
-        halt(program, state, pager, *err_code, description, None)
+        halt(program, state, pager, *err_code, description, *on_error)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
