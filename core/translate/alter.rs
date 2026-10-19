@@ -363,7 +363,7 @@ fn emit_rename_sqlite_sequence_entry(
             cursor: seq_cursor_id,
             key_reg: rowid,
             record_reg,
-            flag: crate::vdbe::insn::InsertFlags(0),
+            flag: crate::translate::insert::autoincrement_bookkeeping_insert_flags(),
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 

@@ -3521,7 +3521,7 @@ fn ensure_sequence_initialized(
         cursor: seq_cursor_id,
         key_reg: new_rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
@@ -3817,7 +3817,7 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Goto {
@@ -3829,13 +3829,24 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
 
     Ok(())
+}
+
+/// Flags for the engine's own AUTOINCREMENT write to sqlite_sequence. Like
+/// SQLite's autoIncrementEnd (insert.c, OP_Insert with only OPFLAG_APPEND,
+/// so neither OPFLAG_NCHANGE nor OPFLAG_LASTROWID), it changes neither
+/// changes(), total_changes() nor last_insert_rowid(). A user's INSERT into
+/// sqlite_sequence has none of these flags and counts as usual.
+pub(crate) fn autoincrement_bookkeeping_insert_flags() -> InsertFlags {
+    InsertFlags::new()
+        .skip_last_rowid()
+        .skip_all_change_counts()
 }
 
 fn emit_replace_delete_conflicting_row(

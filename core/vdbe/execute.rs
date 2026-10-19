@@ -14,7 +14,7 @@ use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
+    SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -13073,14 +13073,11 @@ pub fn op_insert(
                 // instead of page 1.
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                if !is_schema_root
-                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
-                    && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
-                {
+                if !is_schema_root && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    // Schema table writes (sqlite_master, sqlite_sequence, ephemeral)
-                    // must not produce view deltas. The p4 table_name on these inserts
+                    // Schema table and ephemeral writes must not produce
+                    // view deltas. The p4 table_name on these inserts
                     // refers to the *target* table (for the update hook), not the table
                     // actually being written to. Tracking deltas here would feed the
                     // sqlite_master record into the DBSP circuit as if it were data
