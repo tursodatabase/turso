@@ -71,7 +71,6 @@ fn emit_correlated_subqueries(
             *subquery_plan,
             &subquery.query_type,
             true,
-            false,
         )?;
     }
     Ok(())

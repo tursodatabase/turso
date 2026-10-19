@@ -1172,7 +1172,6 @@ pub fn translate_insert(
                     *subquery_plan,
                     &subquery.query_type,
                     subquery.correlated || rerun_for_target_scan,
-                    true,
                 )?;
             }
             Ok(())

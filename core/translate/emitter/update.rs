@@ -1265,7 +1265,6 @@ fn emit_update_insns<'a>(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )?;
     }
 
@@ -2493,7 +2492,6 @@ fn emit_update_insns<'a>(
                             *subquery_plan,
                             &subquery.query_type,
                             subquery.correlated || rerun_for_target_scan,
-                            true,
                         )?;
                     }
                     Ok(())

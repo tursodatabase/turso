@@ -21,8 +21,7 @@ use crate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
-            emit_materialized_build_inputs, emit_program_for_select,
-            emit_program_for_select_with_resolver, emit_query,
+            emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
         },
         eqp::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
@@ -1800,7 +1799,7 @@ pub fn emit_from_clause_subquery(
                     limit_ctx: None,
                     reg_offset: None,
                     reg_limit_offset_sum: None,
-                    resolver: t_ctx.resolver.fork(),
+                    resolver: t_ctx.resolver.fork_with_expr_cache(),
                     non_aggregate_expressions: Vec::new(),
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
@@ -1817,7 +1816,7 @@ pub fn emit_from_clause_subquery(
                 emit_query(program, select_plan, &mut metadata)?
             }
             Plan::CompoundSelect { .. } => {
-                let resolver = t_ctx.resolver.fork();
+                let resolver = t_ctx.resolver.fork_with_expr_cache();
                 // emit_program_for_compound_select returns the result column start register
                 // for coroutine mode, which is needed by the outer query.
                 emit_program_for_compound_select(program, &resolver, plan)?
@@ -1900,7 +1899,7 @@ fn emit_indexed_materialized_subquery(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -1917,7 +1916,7 @@ fn emit_indexed_materialized_subquery(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(_) => {
@@ -2030,7 +2029,7 @@ fn emit_materialized_subquery_table(
                 limit_ctx: None,
                 reg_offset: None,
                 reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
+                resolver: t_ctx.resolver.fork_with_expr_cache(),
                 non_aggregate_expressions: Vec::new(),
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
@@ -2047,7 +2046,7 @@ fn emit_materialized_subquery_table(
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
+            let resolver = t_ctx.resolver.fork_with_expr_cache();
             emit_program_for_compound_select(program, &resolver, plan)?;
         }
         Plan::RecursiveCte(recursive_cte) => {
@@ -2094,7 +2093,6 @@ pub fn emit_non_from_clause_subquery(
     plan: Plan,
     query_type: &SubqueryType,
     is_correlated: bool,
-    preserve_outer_expr_cache: bool,
 ) -> Result<()> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
@@ -2136,23 +2134,16 @@ pub fn emit_non_from_clause_subquery(
         };
 
         // Helper closure to emit a select plan (simple or compound). The
-        // closure captures `resolver`, `plan`, and `preserve_outer_expr_cache`
-        // from the enclosing scope; only `program` is passed explicitly so
+        // closure captures `resolver` and `plan` from the enclosing scope; only `program` is passed explicitly so
         // that the outer scope can keep emitting instructions in between.
         // Called at most once, hence `FnOnce`.
         let emit_plan = move |program: &mut ProgramBuilder| -> Result<()> {
             match plan {
-                Plan::Select(select_plan) => {
-                    if preserve_outer_expr_cache {
-                        emit_program_for_select_with_resolver(
-                            program,
-                            resolver.fork_with_expr_cache(),
-                            *select_plan,
-                        )
-                    } else {
-                        emit_program_for_select(program, resolver, *select_plan)
-                    }
-                }
+                Plan::Select(select_plan) => emit_program_for_select_with_resolver(
+                    program,
+                    resolver.fork_with_expr_cache(),
+                    *select_plan,
+                ),
                 mut compound @ Plan::CompoundSelect { .. } => {
                     emit_program_for_compound_select(program, resolver, &mut compound)?;
                     Ok(())
@@ -2263,10 +2254,6 @@ pub fn emit_non_from_clause_subqueries_for_phase(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            !matches!(
-                phase,
-                SubqueryEvalPhase::BeforeLoop | SubqueryEvalPhase::Loop(_)
-            ),
         )?;
     }
 
