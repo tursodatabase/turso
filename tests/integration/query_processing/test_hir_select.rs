@@ -2820,6 +2820,38 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
              JOIN e ON e.id = b.id + d.id",
             false,
         ),
+        // A LEFT JOIN among the loops that fill the build input.
+        (
+            "SELECT count(*), sum(b.id), count(e.id), sum(c.id), sum(d.id) FROM b \
+             LEFT JOIN e ON e.id = b.id * 7, c JOIN d ON d.k = c.k \
+             WHERE c.id % 5 = coalesce(e.v, 0) % 5 AND b.id % 3 = c.id % 3",
+            true,
+        ),
+        // A LEFT JOIN probe, whose unmatched build rows come from the
+        // temporary table, and one with a WHERE term on its NULL row.
+        (
+            "SELECT count(*), count(d.id), sum(b.id), sum(c.id) FROM b JOIN c ON b.k = c.k \
+             LEFT JOIN d ON d.k = c.k AND d.id % 2 = 0",
+            true,
+        ),
+        (
+            "SELECT d.k, count(*), sum(b.id) FROM b JOIN c ON b.k = c.k \
+             LEFT JOIN d ON d.k = c.k WHERE d.id IS NULL OR b.id % 7 = 0 \
+             GROUP BY d.k ORDER BY d.k LIMIT 5",
+            true,
+        ),
+        // A LEFT JOIN after the probe reads the hash row.
+        (
+            "SELECT count(*), sum(b.id), sum(c.id), sum(d.id), count(e.id) FROM b \
+             JOIN c ON b.k = c.k JOIN d ON d.k = c.k LEFT JOIN e ON e.id = b.id + d.id",
+            true,
+        ),
+        // A FULL JOIN probe.
+        (
+            "SELECT count(*), count(b.id), count(d.id), sum(b.id), sum(c.id), sum(d.id) \
+             FROM b JOIN c ON b.k = c.k FULL JOIN d ON d.k = c.k",
+            true,
+        ),
     ] {
         let hir_plan = plan_without_ids(query_plan(&hir, sql));
         assert_eq!(

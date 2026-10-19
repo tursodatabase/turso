@@ -3249,28 +3249,21 @@ fn hir_hash_join_candidate(
         unreachable!("a hash join access method");
     };
     // HIR runs the unmatched rows of one RIGHT, FULL or outer hash join per
-    // block after its loops, and those rows NULL-fill every loop before the
-    // join's right side, which a hash lookup cannot do. So a block with a
-    // RIGHT or FULL join that is not this one does not hash.
+    // block after its loops: it NULL-fills every loop before the join's
+    // right side and runs the loops after it again. So, in a block with a
+    // RIGHT or FULL join that is not this one, only an inner hash join of
+    // tables on that join's left side hashes.
+    let AccessMethodParams::HashJoin { join_type, .. } = &method.params else {
+        unreachable!("a hash join access method");
+    };
     let other_outer = sources.iter().enumerate().any(|(position, source)| {
         position != rhs
             && source
                 .join_info()
                 .is_some_and(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+            && (*join_type != HashJoinType::Inner || position < rhs || position < build)
     });
     if other_outer {
-        return Ok(None);
-    }
-    // Under earlier loops, an outer hash join runs its unmatched build rows
-    // after each pass of the probe loop, with the earlier loops' rows. That
-    // is right for LEFT, whose build rows pair with those rows, but not for
-    // the probe rows FULL adds, which no row of the earlier loops may match
-    // and must come out once (legacy repeats them).
-    if lhs_steps.len() > 1
-        && sources[rhs]
-            .join_info()
-            .is_some_and(|join| join.kind == JoinKind::Full)
-    {
         return Ok(None);
     }
     let needs_materialization = build_has_uncovered_prior_constraints(
@@ -3305,6 +3298,20 @@ fn hir_hash_join_candidate(
     if !build_is_eligible
         || (needs_materialization && !build_has_rowid)
         || materialization_too_large
+    {
+        return Ok(None);
+    }
+    // Under earlier loops, an outer hash join runs its unmatched build rows
+    // after each pass of the probe loop, with the earlier loops' rows. That
+    // is right for LEFT, whose build rows pair with those rows, but not for
+    // the probe rows FULL adds, which no row of the earlier loops may match
+    // and must come out once (legacy repeats them). A build input folds the
+    // earlier loops into the hash table, so the probe loop runs once.
+    if lhs_steps.len() > 1
+        && !should_materialize
+        && sources[rhs]
+            .join_info()
+            .is_some_and(|join| join.kind == JoinKind::Full)
     {
         return Ok(None);
     }

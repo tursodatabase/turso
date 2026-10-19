@@ -399,6 +399,10 @@ pub(super) struct HirLoopsPlan<'a> {
     where_start: usize,
     /// LEFT JOINs the plan runs as inner joins.
     inner_joins: &'a [SourceId],
+    /// These loops fill a hash lookup's build input: they are the loops
+    /// before that lookup's probe, so the outer joins of later loops are
+    /// not theirs.
+    build_input: bool,
 }
 
 impl<'a> HirLoopsPlan<'a> {
@@ -409,6 +413,7 @@ impl<'a> HirLoopsPlan<'a> {
             predicates: &plan.predicates,
             where_start: plan.where_start,
             inner_joins: &plan.inner_joins,
+            build_input: false,
         }
     }
 
@@ -419,6 +424,7 @@ impl<'a> HirLoopsPlan<'a> {
             predicates: &plan.predicates,
             where_start: plan.where_start,
             inner_joins: &[],
+            build_input: false,
         }
     }
 }
@@ -3127,6 +3133,7 @@ struct PreparedHirHashLoop<'a> {
 /// lookup writes it to the registers each supplied source is bound to.
 struct PreparedHirHashBuildInput<'a> {
     input: &'a HirHashBuildInput,
+    table: Arc<BTreeTable>,
     cursor: CursorID,
     /// Contiguous registers the loops fill with one row: the keys, then
     /// the payload.
@@ -3216,9 +3223,13 @@ struct HirRightOuterJoin {
     loop_index: usize,
     matched: CursorID,
     empty_record: usize,
-    /// The ephemeral table of a materialized right subquery. Its rowids key
-    /// the matched set, and the unmatched pass scans it again.
+    /// The ephemeral table of a materialized right subquery, or of a hash
+    /// lookup's build input. Its rowids key the matched set, and the
+    /// unmatched pass scans it again.
     materialized: Option<CursorID>,
+    /// The register a hash lookup over a build input returns the matched
+    /// row's temporary-table rowid in.
+    matched_rowid: Option<usize>,
     /// The probe loop of an outer hash join that runs under earlier loops.
     /// Like legacy, each pass of the probe loop starts with an empty
     /// matched set and ends with its own unmatched pass, which NULL-fills
@@ -4300,6 +4311,29 @@ fn emit_join_loops(
         joins
             .owners
             .retain(|(owner, _)| !loops_plan.inner_joins.contains(owner));
+        // The loops that fill a hash lookup's build input run the outer
+        // joins among them; the block's loops leave those to them, and a
+        // build input leaves the outer joins of later loops to the block.
+        let supplied_by_input = loops_plan
+            .loops
+            .iter()
+            .filter_map(|planned_loop| match &planned_loop.access {
+                HirSourceAccess::Hash(lookup) => lookup.build_input.as_deref(),
+                _ => None,
+            })
+            .flat_map(|input| input.sources.iter().copied())
+            .collect::<Vec<_>>();
+        let handled_here = |source: SourceId| {
+            loops_plan
+                .loops
+                .iter()
+                .any(|planned_loop| planned_loop.source == source)
+                || (!loops_plan.build_input && !supplied_by_input.contains(&source))
+        };
+        joins.owners.retain(|(owner, _)| handled_here(*owner));
+        joins
+            .right_outer
+            .retain(|(source, _)| handled_here(*source));
         if let Some(hash_outer) = &hash_outer {
             for (owner, null_extends) in &mut joins.owners {
                 if *owner == hash_outer.probe {
@@ -4313,9 +4347,10 @@ fn emit_join_loops(
         }
     }
     if loops_plan.predicates.iter().any(|predicate| {
-        predicate
-            .from_outer_join
-            .is_some_and(|source| !joins.owners.iter().any(|(owner, _)| *owner == source))
+        !predicate.consumed
+            && predicate
+                .from_outer_join
+                .is_some_and(|source| !joins.owners.iter().any(|(owner, _)| *owner == source))
     }) {
         return Err(LimboError::InternalError(
             "HIR FROM clause contains an unsupported outer-join predicate owner".into(),
@@ -4332,24 +4367,14 @@ fn emit_join_loops(
         })
         .collect::<Result<Vec<_>>>()?;
     // Like legacy, the build inputs of hash lookups are filled before the
-    // loops. An outer hash join rescans its build table for the rows
-    // nothing matched, which a build input has no table for.
-    for (loop_index, prepared) in prepared_loops.iter().enumerate() {
+    // loops.
+    for prepared in &prepared_loops {
         let PreparedHirLoop::Hash(prepared) = prepared else {
             continue;
         };
-        let Some(input) = &prepared.build_input else {
-            continue;
-        };
-        if hash_outer
-            .as_ref()
-            .is_some_and(|hash_outer| hash_outer.build_loop == loop_index)
-        {
-            return Err(LimboError::InternalError(
-                "HIR outer hash join cannot build from a materialized build input".into(),
-            ));
+        if let Some(input) = &prepared.build_input {
+            emit_hir_hash_build_input(program, plan, from, loops_plan, prepared, input)?;
         }
-        emit_hir_hash_build_input(program, plan, from, loops_plan, prepared, input)?;
     }
     let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(..))
         .then(|| {
@@ -4789,10 +4814,16 @@ impl HirLoopNest<'_, '_> {
                     );
                     register_bindings.push((registers.source.id, original));
                 }
+                // A hash lookup's row lives in registers.
+                PreparedHirLoop::Hash(prepared) => emit_hir_hash_null_row(
+                    program,
+                    prepared.payload,
+                    prepared.payload_width,
+                    prepared.rowid,
+                ),
                 PreparedHirLoop::Virtual(_)
                 | PreparedHirLoop::IndexMethod(_)
-                | PreparedHirLoop::Coroutine(_)
-                | PreparedHirLoop::Hash(_) => {
+                | PreparedHirLoop::Coroutine(_) => {
                     return Err(LimboError::InternalError(
                         "HIR RIGHT or FULL JOIN left side cannot be NULL-extended".into(),
                     ));
@@ -4804,8 +4835,13 @@ impl HirLoopNest<'_, '_> {
         }
         // A materialized subquery is scanned again through its own cursor.
         // A table gets a new cursor, since its loop may have read an index.
+        let mut hash_input = None;
         let (scan, original) = match (&self.prepared_loops[right], right_outer.materialized) {
             (PreparedHirLoop::Materialized(_), Some(cursor)) => (cursor, None),
+            (PreparedHirLoop::Hash(prepared), Some(cursor)) if prepared.build_input.is_some() => {
+                hash_input = Some(prepared);
+                (cursor, None)
+            }
             (PreparedHirLoop::BTree(prepared), None) => {
                 let hir::SourceKind::Table(table) = &prepared.source.kind else {
                     unreachable!("B-tree loops read table sources")
@@ -4878,6 +4914,9 @@ impl HirLoopNest<'_, '_> {
         });
         program.emit_insn(Insn::Goto { target_pc: next });
         program.preassign_label_to_next_insn(unmatched);
+        if let Some(prepared) = hash_input {
+            emit_hir_hash_input_payload(program, prepared);
+        }
         // Like SQLite, the unmatched pass checks WHERE terms only. ON terms,
         // including those of inner joins left of the RIGHT JOIN, would reject
         // every row whose left side is NULL.
@@ -4951,6 +4990,7 @@ fn prepare_hir_right_outer_join(
                 "HIR RIGHT or FULL JOIN source {source} has no loop"
             ))
         })?;
+    let mut matched_rowid = None;
     let (table, materialized) = match &prepared_loops[loop_index] {
         PreparedHirLoop::BTree(prepared) => {
             let rowid_table = match &prepared.source.kind {
@@ -4966,11 +5006,14 @@ fn prepare_hir_right_outer_join(
             (table, None)
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
-        PreparedHirLoop::Hash(prepared) if prepared.build_input.is_none() => {
-            (prepared.table.clone(), None)
-        }
-        PreparedHirLoop::Hash(_)
-        | PreparedHirLoop::Virtual(_)
+        PreparedHirLoop::Hash(prepared) => match &prepared.build_input {
+            Some(input) => {
+                matched_rowid = Some(prepared.rowid);
+                (input.table.clone(), Some(input.cursor))
+            }
+            None => (prepared.table.clone(), None),
+        },
+        PreparedHirLoop::Virtual(_)
         | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::OrUnion(_)
         | PreparedHirLoop::Registers(_)
@@ -5012,6 +5055,7 @@ fn prepare_hir_right_outer_join(
         matched,
         empty_record,
         materialized,
+        matched_rowid,
         probe_pass,
     }))
 }
@@ -5024,7 +5068,13 @@ impl HirRightOuterJoin {
         document: &HirDocument,
     ) -> Result<()> {
         let rowid = program.alloc_register();
-        if let Some(cursor) = self.materialized {
+        if let Some(register) = self.matched_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: register,
+                dst_reg: rowid,
+                extra_amount: 0,
+            });
+        } else if let Some(cursor) = self.materialized {
             program.emit_insn(Insn::RowId {
                 cursor_id: cursor,
                 dest: rowid,
@@ -6030,11 +6080,36 @@ fn prepare_hir_hash_build_input<'a>(
         width,
         PreparedHirHashBuildInput {
             input,
-            cursor: program.alloc_cursor_id(CursorType::BTreeTable(table)),
+            cursor: program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
+            table,
             record: program.alloc_registers(keys + width),
             sources,
         },
     ))
+}
+
+/// Read the kept columns and rowids of the build input's current row into
+/// the payload registers of the sources it supplies.
+fn emit_hir_hash_input_payload(program: &mut ProgramBuilder, prepared: &PreparedHirHashLoop<'_>) {
+    let input = prepared
+        .build_input
+        .as_ref()
+        .expect("a hash lookup with a build input");
+    let keys = prepared.lookup.keys.len();
+    for source in &input.sources {
+        for register in source
+            .columns
+            .iter()
+            .map(|column| source.start + column)
+            .chain(source.rowid)
+        {
+            program.emit_column_or_rowid(
+                input.cursor,
+                keys + (register - prepared.payload),
+                register,
+            );
+        }
+    }
 }
 
 /// Fill a hash lookup's build input once: run its loops, storing each
@@ -6125,6 +6200,7 @@ fn emit_hir_hash_build_input(
             predicates: &input.input.predicates,
             where_start: loops_plan.where_start,
             inner_joins: loops_plan.inner_joins,
+            build_input: true,
         },
         HirLoopBody::Dml(&store),
     )?;
@@ -6223,22 +6299,7 @@ fn start_hir_hash_loop(
         affinities: affinities.clone(),
     });
     match &prepared.build_input {
-        Some(input) => {
-            for source in &input.sources {
-                for register in source
-                    .columns
-                    .iter()
-                    .map(|column| source.start + column)
-                    .chain(source.rowid)
-                {
-                    program.emit_column_or_rowid(
-                        input.cursor,
-                        keys.len() + (register - prepared.payload),
-                        register,
-                    );
-                }
-            }
-        }
+        Some(_) => emit_hir_hash_input_payload(program, prepared),
         None => {
             for column in &prepared.columns {
                 super::expr::translate_expr_no_constant_opt(

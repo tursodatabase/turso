@@ -2210,24 +2210,8 @@ impl<'a> HirPlanContext<'a> {
             allowed: self.hash_joins_allowed(&input),
             // A materialized build input is filled once per statement, so
             // the block must not read an outer row (legacy fills it once
-            // for every outer row, which is wrong), and HIR fills it with
-            // plain inner joins only (LEFT JOINs a WHERE term made inner
-            // included); legacy also allows outer joins there. A semi-join
-            // or anti-join comes after every other loop, so it never feeds
-            // a build input.
-            materialize: !self.document.reads_outer_sources(block.id.query)
-                && input.sources.iter().all(|source| {
-                    source.join_info().is_none_or(|join| {
-                        matches!(
-                            join.kind,
-                            hir::JoinKind::Comma
-                                | hir::JoinKind::Inner
-                                | hir::JoinKind::Cross
-                                | hir::JoinKind::Semi
-                                | hir::JoinKind::Anti
-                        )
-                    })
-                }),
+            // for every outer row, which is wrong).
+            materialize: !self.document.reads_outer_sources(block.id.query),
             subquery_reads: &subquery_reads,
         };
         let access = self
@@ -2804,13 +2788,16 @@ impl<'a> HirPlanContext<'a> {
                         .flat_map(HirPlannedLoop::sources)
                         .collect::<Vec<_>>();
                     // The prefix checks the terms that read only its
-                    // sources, and the block checks them no more.
+                    // sources, and the block checks them no more. An outer
+                    // join's ON term goes with that join.
                     let mut predicates = input.predicates.clone();
                     for (prefix_term, term) in predicates.iter_mut().zip(&mut input.predicates) {
                         if term.consumed {
                             continue;
                         }
-                        let mut outside = false;
+                        let mut outside = term
+                            .from_outer_join
+                            .is_some_and(|owner| !sources.contains(&owner));
                         self.document.visit_expr_sources(&term.expr, &mut |source| {
                             outside |= !sources.contains(&source);
                         });

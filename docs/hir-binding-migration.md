@@ -329,10 +329,11 @@ What stays a subquery still runs fast:
   for <table>`; legacy then lists those tables once more after the loops,
   which HIR does not (they are not read again), and nests a chain's
   inputs inside each other where legacy lists them one after another.
-  Unlike legacy, HIR does not materialize in a block with an outer join
-  (the unmatched-row pass rescans the build table, which the input has no
-  table for), or in a block that reads an outer row: legacy fills the
-  input once and reuses it for every outer row, which returns wrong rows.
+  The loops that fill it run their own LEFT JOINs, and a LEFT JOIN probe
+  over such a hash table gets its unmatched build rows from the temporary
+  table, keyed by its rowids. Unlike legacy, HIR does not materialize in a
+  block that reads an outer row: legacy fills the input once and reuses
+  it for every outer row, which returns wrong rows.
 
 These planning rules are ports of legacy's, sharing its cost formulas and
 order checks where the code allows:
