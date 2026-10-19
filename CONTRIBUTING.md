@@ -296,6 +296,15 @@ $env:VCPKG_ROOT = "C:\path\to\vcpkg"
 vcpkg install sqlite3:x64-windows-static-md
 ```
 
+3. uv is needed because `make test` uses it to install and run the Python test packages (`uv sync` and `uv run`). You can install it using `brew` on macOS/Linux:
+```console
+brew install uv
+```
+Or using `pipx`:
+```console
+pipx install uv
+```
+
 ### Running the tests
 To run the test suite with Turso, simply run:
 
