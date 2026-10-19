@@ -660,7 +660,11 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
 /// `SqlGenBackend::new_with_options`) or wasn't bootstrapped.
 fn collation_view(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
     schema.get_table(COLLATION_PROBE_TABLE)?;
-    let collation = if rng.random_bool(0.5) { "NOCASE" } else { "RTRIM" };
+    let collation = if rng.random_bool(0.5) {
+        "NOCASE"
+    } else {
+        "RTRIM"
+    };
     let key = if rng.random_bool(0.5) {
         match collation {
             "NOCASE" => "\"nocase_key\"".to_string(),
@@ -692,9 +696,7 @@ fn total_avg_view(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
     let table = quoted(COLLATION_PROBE_TABLE);
     let col = "\"mix_num\"";
     Some(if rng.random_bool(0.4) {
-        format!(
-            "SELECT TOTAL({col}) AS tot, AVG({col}) AS avg_val, COUNT(*) AS cnt FROM {table}"
-        )
+        format!("SELECT TOTAL({col}) AS tot, AVG({col}) AS avg_val, COUNT(*) AS cnt FROM {table}")
     } else {
         format!(
             "SELECT \"nocase_key\" AS k, TOTAL({col}) AS tot, AVG({col}) AS avg_val \
