@@ -484,7 +484,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

@@ -430,26 +430,6 @@ fn rewrite_as_semi_or_anti_join(
         plan.non_from_clause_subqueries.push(inner_subquery);
     }
 
-    // EXISTS ignores its SELECT list. Keep any parameters from that list so
-    // callers can still bind them.
-    if matches!(
-        plan.non_from_clause_subqueries[subquery_index].query_type,
-        ast::SubqueryType::Exists { .. }
-    ) {
-        for result_column in &inner_plan.result_columns {
-            walk_expr(
-                &result_column.expr,
-                &mut |expr: &Expr| -> Result<WalkControl> {
-                    if let Expr::Variable(variable) = expr {
-                        plan.phantom_params.push(variable.clone());
-                    }
-                    Ok(WalkControl::Continue)
-                },
-            )
-            .expect("walking a result expression cannot fail");
-        }
-    }
-
     replace_subquery_term_with_true(&mut plan.where_clause, where_term_index);
 
     plan.non_from_clause_subqueries.remove(subquery_index);

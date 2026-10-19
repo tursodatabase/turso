@@ -1220,6 +1220,59 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
     }
 }
 
+/// Parameters in expressions that produce no bytecode must still be counted,
+/// as SQLite counts every parameter in the SQL text.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x INTEGER);")]
+fn test_parameters_count_includes_parameters_without_bytecode(tmp_db: TempDatabase) {
+    let cases = [
+        "SELECT x FROM t WHERE x = ?",
+        "SELECT x FROM t WHERE 0 AND x = ?",
+        "SELECT x FROM t WHERE 1 OR x = ?",
+        "SELECT x FROM t WHERE x = ? AND 0 AND x = ?",
+        "SELECT x FROM t WHERE 0 AND x = :a AND x = ?",
+        "DELETE FROM t WHERE 0 AND x = ?",
+        "DELETE FROM t WHERE 1 OR x = ?",
+        "UPDATE t SET x = 1 WHERE 0 AND x = ?",
+        "UPDATE t SET x = ? WHERE 1 OR x = ?",
+        "UPDATE t SET x = t2.x FROM t AS t2 WHERE 0 AND t2.x = ?",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE 0 AND x = ?)",
+        "SELECT x FROM t WHERE 0 AND x IN (SELECT ?)",
+        "SELECT x FROM t WHERE 0 AND EXISTS (SELECT 1 FROM t WHERE x = ?)",
+        "SELECT x FROM t UNION SELECT x FROM t WHERE 0 AND x = ?",
+        "WITH c AS (SELECT ?) SELECT 1",
+        "WITH c AS (SELECT ?) SELECT x FROM t WHERE x = ?",
+        "SELECT EXISTS (SELECT x FROM u ORDER BY ?)",
+        "SELECT x FROM t WHERE EXISTS (SELECT ? FROM t)",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) WHERE 0 AND ? DO NOTHING",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) DO UPDATE SET y = ? WHERE 0 AND ?",
+        "CREATE TABLE z AS SELECT 1 WHERE 0 AND ?",
+    ];
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite_conn
+        .execute_batch(
+            "CREATE TABLE t (x INTEGER); CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE);",
+        )
+        .unwrap();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
+    for sql in cases {
+        let sqlite_stmt = sqlite_conn.prepare(sql).unwrap();
+        let stmt = conn.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.parameters_count(),
+            sqlite_stmt.parameter_count(),
+            "{sql}"
+        );
+        assert_eq!(
+            stmt.parameter_index(":a").map(|index| index.get()),
+            sqlite_stmt.parameter_index(":a").unwrap(),
+            "{sql}"
+        );
+    }
+}
+
 /// A fused column-range read (Insn::ColumnRange) must stay correct when
 /// `cursor.record()` yields IO mid-instruction. Records spanning many
 /// overflow pages are scanned through a reopened database whose IO only

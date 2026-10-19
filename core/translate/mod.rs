@@ -55,6 +55,8 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::WalkControl;
+use crate::util::walk_stmt_expressions;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -129,6 +131,13 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+
+    walk_stmt_expressions(&stmt, &mut |expr| {
+        if let ast::Expr::Variable(variable) = expr {
+            program.register_variable(variable);
+        }
+        Ok(WalkControl::Continue)
+    })?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

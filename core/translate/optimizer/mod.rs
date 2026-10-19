@@ -1688,7 +1688,6 @@ fn build_update_write_set_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
