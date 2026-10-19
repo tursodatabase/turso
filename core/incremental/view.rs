@@ -462,7 +462,7 @@ impl IncrementalView {
         let qualified_name = if let Some(ref db) = name.db_name {
             format!("{db}.{table_name}")
         } else {
-            table_name.to_string()
+            format!("main.{table_name}")
         };
 
         // Skip CTEs - they're not real tables
@@ -1787,7 +1787,7 @@ mod tests {
 
         assert_eq!(queries.len(), 1);
         // customers has id as rowid alias, so no need for explicit rowid
-        assert_eq!(queries[0], "SELECT * FROM customers");
+        assert_eq!(queries[0], "SELECT * FROM main.customers");
     }
 
     #[test]
@@ -1817,7 +1817,7 @@ mod tests {
 
         assert_eq!(queries.len(), 1);
         // For single-table queries, we should get the full WHERE clause
-        assert_eq!(queries[0], "SELECT * FROM customers WHERE id > 10");
+        assert_eq!(queries[0], "SELECT * FROM main.customers WHERE id > 10");
     }
 
     #[test]
@@ -1856,10 +1856,10 @@ mod tests {
         // - orders table gets: o.total > 100
         assert!(queries
             .iter()
-            .any(|q| q == "SELECT * FROM customers WHERE id > 10"));
+            .any(|q| q == "SELECT * FROM main.customers WHERE id > 10"));
         assert!(queries
             .iter()
-            .any(|q| q == "SELECT * FROM orders WHERE total > 100"));
+            .any(|q| q == "SELECT * FROM main.orders WHERE total > 100"));
     }
 
     #[test]
@@ -1901,9 +1901,10 @@ mod tests {
         // so it cannot be extracted to either table individually
         // Check both queries exist (order doesn't matter)
         assert!(queries
-            .contains(&"SELECT * FROM customers WHERE id > 10 AND name = 'John'".to_string()));
-        assert!(queries
-            .contains(&"SELECT * FROM orders WHERE total > 100 AND customer_id = 5".to_string()));
+            .contains(&"SELECT * FROM main.customers WHERE id > 10 AND name = 'John'".to_string()));
+        assert!(queries.contains(
+            &"SELECT * FROM main.orders WHERE total > 100 AND customer_id = 5".to_string()
+        ));
     }
 
     #[test]
@@ -1932,7 +1933,7 @@ mod tests {
 
         assert_eq!(queries.len(), 1);
         // logs table has no rowid alias, so we need to explicitly select rowid
-        assert_eq!(queries[0], "SELECT *, rowid FROM logs WHERE level > 2");
+        assert_eq!(queries[0], "SELECT *, rowid FROM main.logs WHERE level > 2");
     }
 
     #[test]
@@ -1966,8 +1967,8 @@ mod tests {
 
         assert_eq!(queries.len(), 2);
         // customers has rowid alias (id), logs doesn't
-        assert!(queries.contains(&"SELECT * FROM customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT *, rowid FROM logs WHERE level > 2".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
+        assert!(queries.contains(&"SELECT *, rowid FROM main.logs WHERE level > 2".to_string()));
     }
 
     #[test]
@@ -2084,9 +2085,9 @@ mod tests {
         // Verify the exact queries generated for each table
         // The order might vary, so check all possibilities
         let expected_queries = vec![
-            "SELECT * FROM customers WHERE id > 10",
-            "SELECT * FROM orders WHERE total > 100",
-            "SELECT * FROM products WHERE price > 50",
+            "SELECT * FROM main.customers WHERE id > 10",
+            "SELECT * FROM main.orders WHERE total > 100",
+            "SELECT * FROM main.products WHERE price > 50",
         ];
 
         for expected in &expected_queries {
@@ -2124,7 +2125,7 @@ mod tests {
         assert_eq!(queries.len(), 1);
         // Since customers table has an INTEGER PRIMARY KEY (id), we should get SELECT *
         // without rowid and without WHERE clause (all conditions are complex)
-        assert_eq!(queries[0], "SELECT * FROM customers");
+        assert_eq!(queries[0], "SELECT * FROM main.customers");
     }
 
     #[test]
@@ -2159,8 +2160,8 @@ mod tests {
         assert_eq!(queries.len(), 2);
 
         // 'total' is unambiguous (only in orders), so it should be extracted
-        assert!(queries.contains(&"SELECT * FROM customers".to_string()));
-        assert!(queries.contains(&"SELECT * FROM orders WHERE total > 100".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.customers".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.orders WHERE total > 100".to_string()));
     }
 
     #[test]
@@ -2226,11 +2227,7 @@ mod tests {
 
         // Check that qualified names are preserved where specified
         assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
-        // Unqualified tables should not have an entry (or have the bare name)
-        assert!(
-            !qualified_names.contains_key("orders")
-                || qualified_names.get("orders").unwrap() == "orders"
-        );
+        assert_eq!(qualified_names.get("orders").unwrap(), "main.orders");
 
         let view = IncrementalView::new(
             "test_view".to_string(),
@@ -2253,7 +2250,7 @@ mod tests {
 
         // The FROM clause should preserve qualification where specified
         assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT * FROM orders WHERE total < 1000".to_string()));
+        assert!(queries.contains(&"SELECT * FROM main.orders WHERE total < 1000".to_string()));
     }
 
     #[test]
@@ -2349,7 +2346,7 @@ mod tests {
         // When the same table appears with and without WHERE conditions in a UNION,
         // we must fetch ALL rows (no WHERE clause) because the conditions are incompatible
         assert_eq!(
-            queries[0], "SELECT * FROM customers",
+            queries[0], "SELECT * FROM main.customers",
             "UNION with mixed conditions (some with WHERE, some without) should fetch ALL rows"
         );
     }
@@ -2450,7 +2447,7 @@ mod tests {
         // Conditions are combined with OR
         assert_eq!(
             queries[0],
-            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
+            "SELECT * FROM main.orders WHERE (total > 1000) OR (total < 100)"
         );
     }
 
@@ -2487,7 +2484,7 @@ mod tests {
         // Multiple conditions on the same table are combined with OR
         assert_eq!(
             queries[0],
-            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
+            "SELECT * FROM main.orders WHERE (total > 1000) OR (total < 100)"
         );
     }
 
@@ -2523,9 +2520,12 @@ mod tests {
         // Check that each table gets its appropriate WHERE clause
         let customers_query = queries
             .iter()
-            .find(|q| q.contains("FROM customers"))
+            .find(|q| q.contains("FROM main.customers"))
             .unwrap();
-        let orders_query = queries.iter().find(|q| q.contains("FROM orders")).unwrap();
+        let orders_query = queries
+            .iter()
+            .find(|q| q.contains("FROM main.orders"))
+            .unwrap();
 
         assert!(customers_query.contains("WHERE id > 10"));
         assert!(orders_query.contains("WHERE total > 500"));
@@ -2651,7 +2651,7 @@ mod tests {
 
         // Expected query - assuming customers table has INTEGER PRIMARY KEY
         // so we don't need to select rowid separately
-        let expected = "SELECT * FROM customers WHERE (id < 5) OR (id > 10)";
+        let expected = "SELECT * FROM main.customers WHERE (id < 5) OR (id > 10)";
 
         assert_eq!(
             queries.len(),

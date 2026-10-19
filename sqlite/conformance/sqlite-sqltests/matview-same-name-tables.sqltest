@@ -1,0 +1,75 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test matview-ignores-writes-to-shadowing-temp-table {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TEMP TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (9, 'A');
+    CREATE MATERIALIZED VIEW v AS SELECT b, count(*) c FROM t GROUP BY b;
+    SELECT count(*) FROM v;
+    INSERT INTO t VALUES (10, 'B');
+    SELECT count(*) FROM v;
+    DELETE FROM t WHERE a = 9;
+    SELECT count(*) FROM v;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+    SELECT count(*) FROM v;
+}
+expect {
+    0
+    0
+    0
+    0
+    0
+}
+
+test matview-over-main-table-ignores-every-write-to-temp-table {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO main.t VALUES (1, 'M');
+    CREATE TEMP TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO temp.t VALUES (1, 'M'), (2, 'T');
+    CREATE MATERIALIZED VIEW v AS SELECT b, count(*) c FROM main.t GROUP BY b;
+    INSERT INTO temp.t VALUES (3, 'T');
+    INSERT OR REPLACE INTO temp.t VALUES (1, 'R');
+    UPDATE temp.t SET b = 'U' WHERE a = 2;
+    UPDATE temp.t SET a = 20 WHERE a = 3;
+    DELETE FROM temp.t WHERE a = 2;
+    SELECT * FROM v;
+    DELETE FROM temp.t WHERE a IS NOT NULL;
+    SELECT * FROM v;
+    INSERT INTO temp.t VALUES (1, 'M');
+    DELETE FROM temp.t;
+    SELECT * FROM v;
+    INSERT INTO main.t VALUES (2, 'N');
+    UPDATE main.t SET b = 'X' WHERE a = 1;
+    SELECT * FROM v ORDER BY b;
+    DELETE FROM main.t;
+    SELECT count(*) FROM v;
+}
+expect {
+    M|1
+    M|1
+    M|1
+    N|1
+    X|1
+    0
+}
+
+test matview-over-main-table-ignores-writes-to-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE aux.t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO main.t VALUES (1, 'M');
+    INSERT INTO aux.t VALUES (1, 'M');
+    CREATE MATERIALIZED VIEW v AS SELECT b, count(*) c FROM t GROUP BY b;
+    INSERT INTO aux.t VALUES (2, 'A');
+    UPDATE aux.t SET b = 'U';
+    DELETE FROM aux.t WHERE a = 2;
+    DELETE FROM aux.t;
+    SELECT * FROM v;
+}
+expect {
+    M|1
+}

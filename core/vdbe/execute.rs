@@ -12381,12 +12381,9 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_dependent_views =
+                    !dependent_materialized_views(program, state, *cursor_id, table_name)
+                        .is_empty();
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
@@ -12753,12 +12750,13 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views =
+                    dependent_materialized_views(program, state, *cursor_id, table_name);
                 if dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
+                let schema = program.connection.schema.read();
 
                 let deleted_record = {
                     let cursor = state.get_cursor(*cursor_id);
@@ -12798,9 +12796,7 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                if dependent_materialized_views(program, state, *cursor_id, table_name).is_empty() {
                     break;
                 }
                 state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
@@ -12833,6 +12829,30 @@ pub fn op_delete(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Materialized views live in the main database and only read main tables, so a write to
+/// a TEMP or attached table with the same name must not reach them.
+fn dependent_materialized_views(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    table_name: &str,
+) -> Vec<String> {
+    let dependent_views = program
+        .connection
+        .schema
+        .read()
+        .get_dependent_materialized_views(table_name);
+    if dependent_views.is_empty() {
+        return dependent_views;
+    }
+    let cursor_pager = state.get_cursor(cursor_id).as_btree_mut().get_pager();
+    if Arc::ptr_eq(&cursor_pager, &program.connection.pager.load()) {
+        dependent_views
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Debug)]
