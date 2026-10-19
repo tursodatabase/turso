@@ -3262,6 +3262,27 @@ impl JoinedTable {
         })
     }
 
+    pub(super) fn from_cte_reference(
+        reference: &OuterQueryReference,
+        internal_id: TableInternalId,
+    ) -> Self {
+        crate::turso_assert!(reference.is_cte_name_in_scope());
+        Self {
+            op: Operation::default_scan_for(&reference.table),
+            unmatched_right_rows_plan: None,
+            table: reference.table.clone(),
+            identifier: reference.identifier.clone(),
+            internal_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: None,
+            plan_estimate: None,
+        }
+    }
+
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
     }

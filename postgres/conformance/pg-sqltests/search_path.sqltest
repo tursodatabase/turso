@@ -67,3 +67,61 @@ test public-schema-qualified-column-reference {
 expect {
     b
 }
+
+setup cte_search_path {
+    CREATE TABLE t1 (a int);
+    INSERT INTO t1 VALUES (99);
+}
+
+@setup cte_search_path
+test search-path-empty-still-finds-ctes {
+    SET search_path TO '';
+    WITH t1 AS (SELECT 17 AS a) SELECT a FROM t1;
+    WITH t1 AS (SELECT 23 AS a) SELECT (SELECT a FROM t1);
+    WITH RECURSIVE n(a) AS (
+        SELECT 31
+        UNION ALL
+        SELECT a + 2 FROM n WHERE a < 35
+    ) SELECT a FROM n ORDER BY a;
+    WITH t1 AS (SELECT 17 AS a) SELECT a FROM public.t1;
+}
+expect {
+    17
+    23
+    31
+    33
+    35
+    99
+}
+
+@setup cte_search_path
+test search-path-empty-does-not-find-stored-tables {
+    SET search_path TO '';
+    SELECT a FROM t1;
+}
+expect error {}
+
+@setup cte_search_path
+test search-path-ctes-precede-stored-tables {
+    SET search_path TO public;
+    WITH t1 AS (SELECT 17 AS a) SELECT a FROM t1 AS local_t1;
+    WITH t1 AS (SELECT 23 AS a) SELECT (SELECT a FROM t1 AS outer_t1);
+    WITH t1 AS (SELECT 17 AS a)
+    SELECT (WITH t1 AS (SELECT 29 AS a) SELECT a FROM t1);
+    WITH t1 AS (SELECT 17 AS a) SELECT a FROM public.t1;
+}
+expect {
+    17
+    23
+    29
+    99
+}
+
+@setup cte_search_path
+test search-path-invalid-cte-does-not-use-stored-table {
+    SET search_path TO public;
+    WITH t1 AS (SELECT missing_column AS a FROM public.t1) SELECT a FROM t1;
+}
+expect error {
+    missing_column
+}
