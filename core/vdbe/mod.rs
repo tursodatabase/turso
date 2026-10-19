@@ -1113,10 +1113,6 @@ pub struct ProgramState {
     /// Parked state for Insn::PopulateMaterializedViews: the population
     /// statement currently being stepped, re-entrant across I/O yields.
     pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
-    /// Per-view delta capture marks taken at statement start; on statement
-    /// rollback, captures past the marks are rewound (they belong to the
-    /// aborted statement).
-    change_log_mark: Option<crate::incremental::view::ChangeLogMark>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -1133,9 +1129,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
-    /// FAIL can escape a trigger before the parent reaches its Halt opcode.
-    /// Keep the error here while index-method writes from earlier rows finish
-    /// through the normal resumable I/O path.
+    /// A FAIL-mode error ends the statement without reaching the normal
+    /// Halt completion, but keeps the rows written before it. Keep the error
+    /// here while those rows reach the materialized views and their
+    /// index-method writes finish, through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
@@ -1254,7 +1251,6 @@ impl ProgramState {
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
             populate_matviews_state: None,
-            change_log_mark: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1725,12 +1721,6 @@ impl ProgramState {
 
         self.has_stmt_transaction = true;
 
-        // Record the shared change-log position so a statement rollback can
-        // rewind captures made by the aborted statement: change capture
-        // happens in op_insert/op_delete as rows are written, and the pager
-        // savepoint rollback does not undo it.
-        self.change_log_mark = Some(connection.transaction_changes.change_log_mark());
-
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -1756,6 +1746,7 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        let ends_write_statement = self.is_active_write;
         if self.is_active_write {
             let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
@@ -1764,26 +1755,34 @@ impl ProgramState {
             );
             self.is_active_write = false;
         }
+        // A write statement that keeps its changes must have applied them to
+        // the materialized views first (see
+        // `Program::maintain_views_for_kept_changes`). Everything left in the
+        // transaction change log after this point would be applied later,
+        // by some other statement. Debug-only, so statements without
+        // materialized views pay nothing for the check.
+        if ends_write_statement && end_statement == EndStatement::ReleaseSavepoint {
+            turso_debug_assert!(
+                connection.transaction_changes.is_empty(),
+                "write statement kept changes that never reached its materialized views"
+            );
+        }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
             return Ok(());
         }
         self.has_stmt_transaction = false;
 
-        // Statement-scoped change-log captures: keep them on release, rewind
-        // them on rollback (the btree writes they mirror are being undone).
-        // A rewind error is reported only after the pager rollback below has
-        // run, so the statement's btree writes are undone either way.
-        let rewind_result = match end_statement {
-            EndStatement::ReleaseSavepoint => {
-                self.change_log_mark = None;
-                Ok(())
-            }
-            EndStatement::RollbackSavepoint => match self.change_log_mark.take() {
-                Some(mark) => connection.transaction_changes.rewind_to_mark(mark),
-                None => Ok(()),
-            },
-        };
+        // The change log was empty when this write statement started (see
+        // `Program::maintain_views_for_kept_changes`), so everything in it now
+        // was captured by this statement. Rolling the statement back therefore
+        // discards the whole log, together with the btree writes it mirrors.
+        if ends_write_statement
+            && end_statement == EndStatement::RollbackSavepoint
+            && !connection.transaction_changes.is_empty()
+        {
+            connection.transaction_changes.clear();
+        }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1888,7 +1887,7 @@ impl ProgramState {
         for p in &attached_pagers {
             p.stop_use_subjournal();
         }
-        result.and(rewind_result)
+        result
     }
 
     /// Gets or creates a bloom filter for the given cursor ID.
@@ -2693,11 +2692,12 @@ impl Program {
         None
     }
 
-    /// A trigger returned FAIL before the parent program reached Halt. FAIL
-    /// keeps changes made by earlier rows, so their index-method writes must
-    /// finish before abort() releases the statement savepoint and commits
-    /// those partial changes. None means the staging finished its IO inline
-    /// and the loop starts over.
+    /// A FAIL-mode error (ON CONFLICT FAIL, or RAISE(FAIL) in a trigger)
+    /// ended the statement before the normal Halt completion. FAIL keeps
+    /// changes made by earlier rows, so they must reach the materialized
+    /// views and their index-method writes must finish before abort()
+    /// releases the statement savepoint and commits those partial changes.
+    /// None means this work finished its IO inline and the loop starts over.
     #[cold]
     #[inline(never)]
     fn prepare_pending_fail(
@@ -2710,7 +2710,12 @@ impl Program {
             .pending_fail_prepare_error
             .take()
             .expect("the caller checked the pending error");
-        match execute::index_method_stage_statement_all(state) {
+        let prepared = match self.maintain_views_for_kept_changes(state, pager) {
+            Ok(IOResult::Done(())) => execute::index_method_stage_statement_all(state),
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Err(err) => Err(Box::new(err)),
+        };
+        match prepared {
             Ok(IOResult::Done(())) => {
                 if let Err(abort_err) = self.abort(pager, Some(&fail_error), state, true) {
                     tracing::error!("Abort failed after preparing FAIL index methods: {abort_err}");
@@ -2732,11 +2737,13 @@ impl Program {
             }
             Err(prepare_error) => {
                 // FAIL may keep earlier base-table rows only when every
+                // dependent materialized view was maintained and every
                 // matching index-method write was staged successfully.
-                // Once preparation fails, committing those rows would
-                // leave the table and index out of sync, so roll back the
-                // whole transaction while returning the real preparation
-                // error to the caller.
+                // Once either fails, committing those rows would leave the
+                // table out of sync with its views or indexes. A FAIL
+                // statement usually has no statement journal to undo just
+                // its own rows, so roll back the whole transaction while
+                // returning the real preparation error to the caller.
                 let rollback_error =
                     LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
@@ -2895,8 +2902,9 @@ impl Program {
     /// Apply and consume the transaction change log, resetting the resumable
     /// state once the batch is complete.
     ///
-    /// Successful top-level write statements call this before releasing their
-    /// statement savepoint. Consequently the view btree and every hidden
+    /// Write statements that keep their changes call this (through
+    /// `maintain_views_for_kept_changes`) before releasing their statement
+    /// savepoint. Consequently the view btree and every hidden
     /// operator integral advance in the same transaction as the base-table
     /// write. Commit calls it as well to consume any batch left by an unusual
     /// execution path.
@@ -2919,6 +2927,29 @@ impl Program {
             }
         }
     }
+
+    /// Apply the changes a finishing write statement keeps to the
+    /// materialized views, before its statement savepoint is released.
+    ///
+    /// Every path on which a write statement ends and keeps its changes runs
+    /// this first: the normal Halt, and a FAIL-mode error (ON CONFLICT FAIL
+    /// or RAISE(FAIL)), which keeps the rows written before the error. So the
+    /// transaction change log is empty whenever no write statement is
+    /// running. That lets a statement rollback discard the whole log, and
+    /// lets a named savepoint ignore it. Statements that captured nothing
+    /// (no materialized view reads what they wrote) stop at the emptiness
+    /// check.
+    pub(crate) fn maintain_views_for_kept_changes(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        if !state.is_active_write || self.connection.transaction_changes.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+        self.apply_pending_view_deltas(state, false, pager)
+    }
+
     pub fn commit_txn(
         &self,
         pager: Arc<Pager>,
@@ -3546,6 +3577,13 @@ impl Program {
                 // statement, we cannot pretend COMMIT is still safe: there is
                 // no statement savepoint to undo only the partial UPDATE.
                 self.connection.mark_tx_poisoned();
+                // The transaction can no longer commit. Drop the unfinished
+                // writer's view changes too, so the change log stays empty
+                // while no write statement runs (see
+                // `maintain_views_for_kept_changes`).
+                if !self.connection.transaction_changes.is_empty() {
+                    self.connection.transaction_changes.clear();
+                }
             }
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);

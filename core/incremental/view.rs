@@ -157,7 +157,7 @@ pub(crate) struct SpillSegment {
     /// identities spill with their row images; only this segment-level routing
     /// index stays resident.
     pub(crate) table_ids: Arc<HashSet<TableChangeId>>,
-    /// Logical event prefix visible after savepoint rewinds.
+    /// Number of events in this segment.
     pub(crate) rows: usize,
 }
 
@@ -204,8 +204,8 @@ struct SharedChangeLog {
     changes: Mutex<ChangeBuffer>,
     subscriptions: Mutex<HashMap<String, HashSet<TableChangeId>>>,
     /// Monotonic content revision for read-your-own-writes cursors.
-    /// A row count is insufficient: rewind followed by different changes can
-    /// produce the same length with different contents.
+    /// A row count is insufficient: maintenance empties the log, and later
+    /// different changes can produce the same length with different contents.
     revision: Mutex<u64>,
     io: Arc<dyn IO>,
     temp_file: Mutex<Option<TempFile>>,
@@ -522,10 +522,6 @@ impl ViewChangeSubscription {
     }
 }
 
-/// Global event position recorded at a statement or named-savepoint boundary.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ChangeLogMark(usize);
-
 /// Connection-scoped transaction change stream and its consumer subscriptions.
 #[derive(Debug, Clone)]
 pub struct TransactionChanges {
@@ -662,71 +658,6 @@ impl TransactionChanges {
     /// must not record another change until this returns `Done`.
     pub fn finish_spill(&self) -> Result<IOResult<()>> {
         self.change_log.finish_pending_spill()
-    }
-
-    /// Snapshot the global event position at statement start.
-    ///
-    /// Delta capture happens inside `op_insert`/`op_delete` as rows are
-    /// written, so when a statement subtransaction rolls back, captures made
-    /// by the aborted statement must be rewound or they would be applied to
-    /// the views as phantom changes.
-    pub fn change_log_mark(&self) -> ChangeLogMark {
-        let changes = self.change_log.changes.lock();
-        ChangeLogMark(
-            changes
-                .spilled
-                .iter()
-                .map(|segment| segment.rows)
-                .sum::<usize>()
-                + changes.tail.len(),
-        )
-    }
-
-    /// Rewind the ordered event stream to a statement or savepoint boundary.
-    pub fn rewind_to_mark(&self, mark: ChangeLogMark) -> Result<()> {
-        // A spill's rows leave the in-memory tail only when the spill is
-        // collected, so the tail still holds them. Dropping the pending spill
-        // leaves its bytes unused in the temp file, and the rewind below works
-        // on the tail alone.
-        self.change_log.pending_spill.lock().take();
-        let mut changes = self.change_log.changes.lock();
-        let spilled_rows = changes
-            .spilled
-            .iter()
-            .map(|segment| segment.rows)
-            .sum::<usize>();
-        let current_len = spilled_rows + changes.tail.len();
-        if mark.0 > current_len {
-            return Err(LimboError::InternalError(format!(
-                "transaction change-log mark {} is ahead of current length {current_len}",
-                mark.0
-            )));
-        }
-        if mark.0 >= spilled_rows {
-            Arc::make_mut(&mut changes.tail).truncate(mark.0 - spilled_rows);
-        } else {
-            let mut remaining = mark.0;
-            changes.spilled.retain_mut(|segment| {
-                if remaining == 0 {
-                    return false;
-                }
-                if segment.rows <= remaining {
-                    remaining -= segment.rows;
-                    true
-                } else {
-                    // Spill bytes are immutable. Restrict the segment to its
-                    // logical prefix and reclaim the unreachable suffix when
-                    // the transaction log is cleared.
-                    segment.rows = remaining;
-                    remaining = 0;
-                    true
-                }
-            });
-            Arc::make_mut(&mut changes.tail).clear();
-        }
-        changes.in_memory_bytes = serialize_change_events(&changes.tail)?.len();
-        self.change_log.bump_revision();
-        Ok(())
     }
 }
 
@@ -967,25 +898,6 @@ mod tests {
             Arc::ptr_eq(&first.tail, &second.tail),
             "subscribers must share the in-memory transaction-log tail"
         );
-
-        let mark = states.change_log_mark();
-        let result = states.delete(
-            &table,
-            &views,
-            7,
-            vec![Value::from_i64(7), Value::build_text("Ada")],
-            TempStore::Memory,
-        );
-        assert!(matches!(result, Ok(false)));
-        states.rewind_to_mark(mark).unwrap();
-        assert_eq!(
-            states.get("first").unwrap().table_delta(&table).tail.len(),
-            1
-        );
-        assert_eq!(
-            states.get("second").unwrap().table_delta(&table).tail.len(),
-            1
-        );
     }
 
     #[test]
@@ -1107,74 +1019,6 @@ mod tests {
         assert!(matches!(customers_cursor.next(), Ok(IOResult::Done(false))));
     }
 
-    #[test]
-    fn spilled_change_log_rewinds_to_a_logical_segment_prefix() {
-        let schema = create_test_schema();
-        let table = schema.get_btree_table("customers").unwrap();
-        let orders = schema.get_btree_table("orders").unwrap();
-        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
-        let states = TransactionChanges::with_io(io.clone());
-        let views = vec!["customers_view".to_string()];
-
-        let first = vec![Value::from_i64(1), Value::build_text("kept")];
-        assert!(matches!(
-            states.insert(&table, &views, 1, first.clone(), TempStore::Memory),
-            Ok(false)
-        ));
-        let mark = states.change_log_mark();
-
-        let large = vec![
-            Value::from_i64(2),
-            Value::from_i64(1),
-            Value::Blob(vec![b'x'; CHANGE_LOG_SPILL_THRESHOLD]),
-        ];
-        let spill_started = states
-            .insert(&orders, &views, 2, large, TempStore::Memory)
-            .unwrap();
-        assert!(spill_started, "large capture did not start a spill");
-        loop {
-            match states.finish_spill().unwrap() {
-                IOResult::Done(()) => break,
-                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
-            }
-        }
-
-        states.rewind_to_mark(mark).unwrap();
-        let captured = states.get("customers_view").unwrap().table_delta(&table);
-        assert_eq!(captured.spilled.len(), 1);
-        assert_eq!(captured.spilled[0].rows, 1);
-        let orders_captured = states.get("customers_view").unwrap().table_delta(&orders);
-        let mut orders_cursor = crate::incremental::vdbe_maintenance::DeltaCursor::new(
-            orders_captured,
-            orders.columns().len(),
-        );
-        loop {
-            match orders_cursor.rewind().unwrap() {
-                IOResult::Done(has_row) => {
-                    assert!(!has_row);
-                    break;
-                }
-                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
-            }
-        }
-
-        let mut cursor =
-            crate::incremental::vdbe_maintenance::DeltaCursor::new(captured, table.columns().len());
-        loop {
-            match cursor.rewind().unwrap() {
-                IOResult::Done(has_row) => {
-                    assert!(has_row);
-                    break;
-                }
-                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
-            }
-        }
-        assert_eq!(cursor.rowid(), 1);
-        assert_eq!(cursor.column(1), first[1]);
-        assert_eq!(cursor.column(table.columns().len()), Value::from_i64(1));
-        assert!(matches!(cursor.next(), Ok(IOResult::Done(false))));
-    }
-
     /// An UPDATE records its old row as a delete and its new row as an
     /// insert. Both halves must be able to start their own spill: once the
     /// delete half's spill is fully collected via `finish_spill`, recording
@@ -1233,23 +1077,22 @@ mod tests {
     }
 
     /// A spill that is still in flight when the owning statement fails must
-    /// not become a recorded segment: `rewind_to_mark` drops it, leaving the
-    /// triggering row in the tail (where the mark-based truncation removes
-    /// it) and leaving no spill in flight for the next change to record.
+    /// not become a recorded segment: the statement rollback clears the log,
+    /// which drops the spill and leaves no spill in flight for the next
+    /// change to record.
     #[test]
-    fn rewind_drops_a_spill_still_in_flight() {
+    fn clear_drops_a_spill_still_in_flight() {
         let schema = create_test_schema();
         let table = schema.get_btree_table("customers").unwrap();
         let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
         let states = TransactionChanges::with_io(io.clone());
         let views = vec!["v".to_string()];
 
-        let kept = vec![Value::from_i64(1), Value::build_text("kept")];
+        let first = vec![Value::from_i64(1), Value::build_text("first")];
         assert!(matches!(
-            states.insert(&table, &views, 1, kept, TempStore::Memory),
+            states.insert(&table, &views, 1, first, TempStore::Memory),
             Ok(false)
         ));
-        let mark = states.change_log_mark();
 
         let large = vec![
             Value::from_i64(2),
@@ -1260,18 +1103,18 @@ mod tests {
             .unwrap();
         assert!(spill_started, "large capture did not start a spill");
 
-        // The statement that captured row 2 fails before the spill is ever
-        // collected.
-        states.rewind_to_mark(mark).unwrap();
+        // The statement that captured both rows fails before the spill is
+        // ever collected.
+        states.clear();
 
         let changes = states.change_log.changes.lock();
         assert!(
             changes.spilled.is_empty(),
             "an uncollected spill must not become a recorded segment"
         );
-        assert_eq!(changes.tail.len(), 1, "only the pre-mark row remains");
-        assert_eq!(changes.tail[0].rowid, 1);
+        assert!(changes.tail.is_empty());
         drop(changes);
+        assert!(states.is_empty());
 
         // No spill is in flight any more, so a later change may start its own.
         let spill_started = states

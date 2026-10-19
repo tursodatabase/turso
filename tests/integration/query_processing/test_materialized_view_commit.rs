@@ -496,6 +496,178 @@ fn failed_statement_after_change_log_spill_is_rolled_back(
     Ok(())
 }
 
+/// Assert that both the base table `t(id, u)` and its row-for-row
+/// materialized view `v` hold exactly `expected`, and that the database is
+/// structurally sound.
+fn assert_table_and_view(conn: &std::sync::Arc<turso_core::Connection>, expected: &[(i64, i64)]) {
+    let base: Vec<(i64, i64)> = conn.exec_rows("SELECT id, u FROM t ORDER BY id");
+    assert_eq!(base, expected, "base table");
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT id, u FROM v ORDER BY id");
+    assert_eq!(view, expected, "materialized view");
+    assert_eq!(run_integrity_check(conn), "ok");
+}
+
+/// INSERT OR FAIL keeps the rows it wrote before the conflict. Those rows
+/// must reach the view when the statement ends, like a successful statement.
+/// The FAIL statement used to end without maintaining the view, so its
+/// captured row stayed in the change log. The SAVEPOINT then recorded a
+/// change-log position past it, the next INSERT maintained the view and
+/// emptied the log, and ROLLBACK TO failed with "change-log mark 1 is ahead
+/// of current length 0", which threw away the whole transaction.
+#[turso_macros::test(views)]
+fn insert_or_fail_rows_reach_view_before_savepoint_rollback(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, u FROM t")?;
+    conn.execute("INSERT INTO t VALUES (100, 100)")?;
+
+    conn.execute("BEGIN")?;
+    let err = conn
+        .execute("INSERT OR FAIL INTO t VALUES (1, 1), (2, 100)")
+        .expect_err("the second row conflicts on u");
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+    conn.execute("SAVEPOINT a")?;
+    conn.execute("INSERT INTO t VALUES (3, 3)")?;
+    conn.execute("ROLLBACK TO a")?;
+    conn.execute("COMMIT")?;
+
+    assert_table_and_view(&conn, &[(1, 1), (100, 100)]);
+    Ok(())
+}
+
+/// Same as above for UPDATE OR FAIL: the rows it updated before the conflict
+/// are kept, and the view must show them after a later savepoint rollback.
+#[turso_macros::test(views)]
+fn update_or_fail_rows_reach_view_before_savepoint_rollback(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, u FROM t")?;
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 2), (100, 100)")?;
+
+    conn.execute("BEGIN")?;
+    // Rows are visited in rowid order: id=1 becomes 11, id=2 conflicts.
+    let err = conn
+        .execute("UPDATE OR FAIL t SET u = CASE id WHEN 1 THEN 11 ELSE 100 END WHERE id < 100")
+        .expect_err("the second row conflicts on u");
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+    conn.execute("SAVEPOINT a")?;
+    conn.execute("INSERT INTO t VALUES (3, 3)")?;
+    conn.execute("ROLLBACK TO a")?;
+    conn.execute("COMMIT")?;
+
+    assert_table_and_view(&conn, &[(1, 11), (2, 2), (100, 100)]);
+    Ok(())
+}
+
+/// The kept INSERT OR FAIL row must reach the view even when the next
+/// statement reads the view partway through (here from a trigger) and then
+/// aborts. The mid-statement read maintained the view and emptied the change
+/// log, including the FAIL statement's row, so rolling back the aborted
+/// statement could not restore the log: the view kept the aborted
+/// statement's rows and lost the FAIL row.
+#[turso_macros::test(views)]
+fn insert_or_fail_rows_survive_next_statement_abort_after_view_read(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE)")?;
+    conn.execute("CREATE TABLE lg(x)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, u FROM t")?;
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t WHEN new.id = 3 \
+         BEGIN INSERT INTO lg SELECT count(*) FROM v; END",
+    )?;
+    conn.execute("INSERT INTO t VALUES (100, 100)")?;
+
+    conn.execute("BEGIN")?;
+    let err = conn
+        .execute("INSERT OR FAIL INTO t VALUES (1, 1), (2, 100)")
+        .expect_err("the second row conflicts on u");
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+    let err = conn
+        .execute("INSERT INTO t VALUES (3, 3), (4, 4), (5, 100)")
+        .expect_err("the third row conflicts on u");
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+    conn.execute("COMMIT")?;
+
+    assert_table_and_view(&conn, &[(1, 1), (100, 100)]);
+    let lg: Vec<(i64,)> = conn.exec_rows("SELECT x FROM lg");
+    assert!(
+        lg.is_empty(),
+        "the aborted statement's trigger write: {lg:?}"
+    );
+    Ok(())
+}
+
+/// RAISE(FAIL) in a trigger keeps the rows written before it, like INSERT OR
+/// FAIL. Those rows must reach the view when the statement ends, so a later
+/// statement that reads the view and then aborts cannot lose them.
+#[turso_macros::test(views)]
+fn raise_fail_rows_survive_next_statement_abort_after_view_read(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT)")?;
+    conn.execute("CREATE TABLE lg(x)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, u FROM t")?;
+    conn.execute(
+        "CREATE TRIGGER f BEFORE INSERT ON t WHEN new.u < 0 BEGIN \
+         SELECT RAISE(FAIL, 'neg') WHERE new.u = -1; \
+         SELECT RAISE(ABORT, 'abort') WHERE new.u = -5; END",
+    )?;
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t WHEN new.id = 3 \
+         BEGIN INSERT INTO lg SELECT count(*) FROM v; END",
+    )?;
+
+    conn.execute("BEGIN")?;
+    let err = conn
+        .execute("INSERT INTO t VALUES (1, 1), (2, -1)")
+        .expect_err("RAISE(FAIL) on the second row");
+    assert!(err.to_string().contains("neg"), "{err}");
+    let err = conn
+        .execute("INSERT INTO t VALUES (3, 3), (4, 4), (5, -5)")
+        .expect_err("RAISE(ABORT) on the third row");
+    assert!(err.to_string().contains("abort"), "{err}");
+    conn.execute("COMMIT")?;
+
+    assert_table_and_view(&conn, &[(1, 1)]);
+    let lg: Vec<(i64,)> = conn.exec_rows("SELECT x FROM lg");
+    assert!(
+        lg.is_empty(),
+        "the aborted statement's trigger write: {lg:?}"
+    );
+    Ok(())
+}
+
+/// A write statement that reads a pragma table-valued function still has
+/// that function's helper statement open when it reaches Halt, so the
+/// connection looked like it was running a nested statement and Halt skipped
+/// view maintenance. The rows stayed in the change log, and a later ROLLBACK
+/// TO failed with "change-log mark 2 is ahead of current length 0".
+#[turso_macros::test(views)]
+fn insert_from_pragma_function_reaches_view_before_savepoint_rollback(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u INT)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, u FROM t")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t SELECT cid + 10, cid FROM pragma_table_info('t')")?;
+    conn.execute("SAVEPOINT a")?;
+    conn.execute("INSERT INTO t VALUES (3, 3)")?;
+    conn.execute("ROLLBACK TO a")?;
+    conn.execute("COMMIT")?;
+
+    assert_table_and_view(&conn, &[(10, 0), (11, 1)]);
+    Ok(())
+}
+
 /// Run PRAGMA integrity_check and join every result row into one string
 /// ("ok" on a healthy database, or the newline-joined list of problems).
 fn run_integrity_check(conn: &std::sync::Arc<turso_core::Connection>) -> String {

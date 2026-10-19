@@ -3831,14 +3831,16 @@ pub fn halt(
                 .into());
             }
 
-            // Stage every custom index before releasing the statement
-            // savepoint, then commit the partial FAIL changes. Yielding for
+            // Maintain materialized views with the kept rows and stage every
+            // custom index before releasing the statement savepoint, then
+            // commit the partial FAIL changes. Yielding for
             // I/O here is safe because Halt is re-entrant: the whole opcode
             // runs again on resume, recomputes the same outcome from the same
             // registers, and `pending_fail_error` carries the decided error
             // across resumes further down. `halt_in_progress` keeps
             // interrupt, deadline, and progress-handler requests from
             // replacing the outcome while the staged work is in flight.
+            return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
             vtab_commit_all(&program.connection)?;
             return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
@@ -3903,14 +3905,10 @@ pub fn halt(
     // Maintain materialized views before releasing this write statement's
     // savepoint. The maintenance program is the sole evaluator for committed
     // and same-transaction state, and its writes roll back atomically with the
-    // base-table statement on error. Internal helper statements leave the
-    // enclosing root statement in control of this batch.
-    if state.is_active_write && !program.connection.is_nested_stmt() {
-        match program.apply_pending_view_deltas(state, false, pager)? {
-            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
-            IOResult::Done(()) => {}
-        }
-    }
+    // base-table statement on error. Internal helper statements are never
+    // the active writer, so they leave the enclosing root statement in
+    // control of this batch.
+    return_if_io!(state, program.maintain_views_for_kept_changes(state, pager));
 
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
@@ -5207,6 +5205,10 @@ pub fn op_transaction_inner(
                             previous == 0,
                             "starting a writer while {previous} writer(s) are already active"
                         );
+                        turso_debug_assert!(
+                            program.connection.transaction_changes.is_empty(),
+                            "write statement started with view changes left by an earlier statement"
+                        );
                         state.is_active_write = true;
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
@@ -5503,6 +5505,14 @@ pub fn op_savepoint(
         })
         .into());
     }
+    // With no write statement running, every kept change has already reached
+    // the materialized views, so a named savepoint needs no position in the
+    // transaction change log: ROLLBACK TO undoes the view btrees together
+    // with the base tables.
+    turso_debug_assert!(
+        conn.is_nested_stmt() || conn.transaction_changes.is_empty(),
+        "savepoint operation with view changes no statement applied"
+    );
 
     match *op {
         SavepointOp::Begin => {
@@ -5527,7 +5537,6 @@ pub fn op_savepoint(
                     }
                 }
             }
-            let change_log_mark = conn.transaction_changes.change_log_mark();
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -5587,7 +5596,6 @@ pub fn op_savepoint(
                         name: name.clone(),
                         starts_transaction,
                         deferred_fk_violations,
-                        change_log_mark,
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
@@ -5717,8 +5725,6 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
-                conn.transaction_changes
-                    .rewind_to_mark(info.change_log_mark)?;
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {

@@ -131,9 +131,6 @@ pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
-    /// Global change-log position at SAVEPOINT begin. Named savepoints are
-    /// independent of statement subtransaction marks.
-    pub(crate) change_log_mark: crate::incremental::view::ChangeLogMark,
     /// Snapshot of `conn.schema` taken at SAVEPOINT begin. Used by
     /// ROLLBACK TO to restore the in-memory main schema without re-
     /// reading sqlite_schema from disk — disk reparse from inside a
@@ -162,7 +159,6 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
-    pub(crate) change_log_mark: crate::incremental::view::ChangeLogMark,
 }
 
 struct SchemaReparseGuard {
@@ -5166,7 +5162,6 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
-            change_log_mark: frame.change_log_mark,
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
