@@ -1244,12 +1244,11 @@ class Statement {
     let stmt = await this.stmt.resolve();
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    stmt.setQueryTimeout(queryOptions);
-    bindParams(stmt, toBindArgs(params));
-
-    const totalChangesBefore = this.db.totalChanges();
     await this.execLock.acquire();
     try {
+      stmt.setQueryTimeout(queryOptions);
+      bindParams(stmt, toBindArgs(params));
+      const totalChangesBefore = this.db.totalChanges();
       while (true) {
         const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
@@ -1288,12 +1287,11 @@ class Statement {
     let stmt = await this.stmt.resolve();
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    stmt.setQueryTimeout(queryOptions);
-    bindParams(stmt, toBindArgs(params));
-
     await this.execLock.acquire();
     let row = undefined;
     try {
+      stmt.setQueryTimeout(queryOptions);
+      bindParams(stmt, toBindArgs(params));
       while (true) {
         const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
@@ -1328,11 +1326,10 @@ class Statement {
     let stmt = await this.stmt.resolve();
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    stmt.setQueryTimeout(queryOptions);
-    bindParams(stmt, toBindArgs(params));
-
     await this.execLock.acquire();
     try {
+      stmt.setQueryTimeout(queryOptions);
+      bindParams(stmt, toBindArgs(params));
       while (true) {
         const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
@@ -1365,12 +1362,12 @@ class Statement {
     let stmt = await this.stmt.resolve();
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
-    stmt.setQueryTimeout(queryOptions);
-    bindParams(stmt, toBindArgs(params));
     const rows: any[] = [];
 
     await this.execLock.acquire();
     try {
+      stmt.setQueryTimeout(queryOptions);
+      bindParams(stmt, toBindArgs(params));
       while (true) {
         const [stepResult, sleepMs] = await stmt.stepSync();
         if (stepResult === STEP_IO) {
