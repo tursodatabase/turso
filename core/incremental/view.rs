@@ -1,6 +1,7 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
 use crate::schema::{BTreeTable, Schema};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -207,6 +208,11 @@ struct SharedChangeLog {
     /// A row count is insufficient: maintenance empties the log, and later
     /// different changes can produce the same length with different contents.
     revision: Mutex<u64>,
+    /// Number of events in the log (tail plus spilled segments). Every
+    /// write statement asks whether the log is empty when it ends, and
+    /// almost always it is, so this answers without taking `changes`. It
+    /// changes only together with `changes`, under that lock.
+    event_count: AtomicUsize,
     io: Arc<dyn IO>,
     temp_file: Mutex<Option<TempFile>>,
     next_spill_offset: Mutex<u64>,
@@ -223,6 +229,7 @@ impl SharedChangeLog {
             }),
             subscriptions: Mutex::new(HashMap::default()),
             revision: Mutex::new(0),
+            event_count: AtomicUsize::new(0),
             io,
             temp_file: Mutex::new(None),
             next_spill_offset: Mutex::new(0),
@@ -240,9 +247,16 @@ impl SharedChangeLog {
         }
     }
 
-    fn bump_revision(&self) {
+    /// Account for one event just pushed to the tail. The caller still
+    /// holds the `changes` lock.
+    fn event_appended(&self) {
+        self.event_count.fetch_add(1, Ordering::Release);
         let mut revision = self.revision.lock();
         *revision = revision.wrapping_add(1);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.event_count.load(Ordering::Acquire) == 0
     }
 
     fn record_insert(
@@ -293,7 +307,7 @@ impl SharedChangeLog {
                 weight,
             });
             changes.in_memory_bytes = changes.in_memory_bytes.saturating_add(record_bytes);
-            self.bump_revision();
+            self.event_appended();
             if changes.in_memory_bytes < CHANGE_LOG_SPILL_THRESHOLD {
                 return Ok(false);
             }
@@ -473,7 +487,7 @@ impl ViewChangeSubscription {
             values,
             weight: 1,
         });
-        self.change_log.bump_revision();
+        self.change_log.event_appended();
     }
 
     #[cfg(test)]
@@ -488,7 +502,7 @@ impl ViewChangeSubscription {
             values,
             weight: -1,
         });
-        self.change_log.bump_revision();
+        self.change_log.event_appended();
     }
 
     /// Clone only the requested table's stream, rather than every delta
@@ -564,6 +578,7 @@ impl TransactionChanges {
         changes.tail = Arc::new(Vec::new());
         changes.in_memory_bytes = 0;
         changes.spilled.clear();
+        self.change_log.event_count.store(0, Ordering::Release);
         drop(changes);
         self.change_log.subscriptions.lock().clear();
         self.change_log.pending_spill.lock().take();
@@ -574,8 +589,7 @@ impl TransactionChanges {
 
     /// Check if the shared transaction log has no captured changes.
     pub fn is_empty(&self) -> bool {
-        let changes = self.change_log.changes.lock();
-        changes.spilled.iter().all(|segment| segment.rows == 0) && changes.tail.is_empty()
+        self.change_log.is_empty()
     }
 
     /// Monotonic revision of the transaction-wide logical change log.
@@ -1073,6 +1087,11 @@ mod tests {
         assert!(
             changes.tail.is_empty(),
             "both rows were collected into spill segments"
+        );
+        drop(changes);
+        assert!(
+            !states.is_empty(),
+            "spilled rows still count as captured changes"
         );
     }
 
