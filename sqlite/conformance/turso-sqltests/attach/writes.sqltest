@@ -1006,7 +1006,6 @@ expect {
 # CREATE/DROP VIEW on attached database
 # =============================================================================
 
-@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-create-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
@@ -1019,7 +1018,6 @@ expect {
     bob|20
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test attach-write-drop-view {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, name TEXT);

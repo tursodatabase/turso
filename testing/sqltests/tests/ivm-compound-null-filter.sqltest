@@ -1,5 +1,4 @@
 @database :memory:
-@skip-file-if mvcc "materialized views not supported in MVCC mode"
 @requires materialized_views "requires materialized view support"
 
 test ivm-null-where-compound-and-incremental {

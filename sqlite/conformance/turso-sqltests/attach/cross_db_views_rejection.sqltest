@@ -76,7 +76,6 @@ expect error {
 }
 
 @requires materialized_views "materialized views are experimental"
-@skip-if mvcc "materialized views not supported in MVCC mode"
 test cross-db-materialized-view-rejected {
     CREATE TABLE inventory (id INTEGER, stock INTEGER);
     ATTACH ':memory:' AS aux;
@@ -90,7 +89,6 @@ expect error {
     view cannot reference table in attached database: aux.suppliers
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test same-db-view-works-main {
     CREATE TABLE users (id INTEGER, name TEXT);
     CREATE TABLE orders (id INTEGER, user_id INTEGER, total INTEGER);
@@ -104,7 +102,6 @@ expect {
     Bob|200
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test same-db-view-works-main-qualified {
     CREATE TABLE users (id INTEGER, name TEXT);
     INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
@@ -116,7 +113,6 @@ expect {
     2|Bob
 }
 
-@skip-if mvcc "views not supported in MVCC mode"
 test same-db-view-works-attached {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.products (id INTEGER, name TEXT, price REAL);
