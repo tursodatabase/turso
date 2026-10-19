@@ -2180,20 +2180,29 @@ fn parse_table(
             .cloned()
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
-        return program.with_view_expansion(database_id, &view.name, |program| {
-            parse_from_clause_table(
-                ast::SelectTable::Select {
-                    select: *subselect,
-                    alias: view_alias,
-                    lateral: false,
-                },
-                resolver,
-                program,
-                table_references,
-                vtab_predicates,
-                &[],
-                connection,
-            )
+        // A persistent view's unqualified table names resolve within the
+        // view's own database (`database_id`, where `get_view` found it
+        // above), never through a TEMP table that happens to share a source
+        // table's name - matching SQLite's view schema fixer (`fix.c`,
+        // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
+        // fixed to the database it was created in, not resolved TEMP-first
+        // like an ordinary top-level query.
+        return resolver.with_view_scope(database_id, view.name.clone(), || {
+            program.with_view_expansion(database_id, &view.name, |program| {
+                parse_from_clause_table(
+                    ast::SelectTable::Select {
+                        select: *subselect,
+                        alias: view_alias,
+                        lateral: false,
+                    },
+                    resolver,
+                    program,
+                    table_references,
+                    vtab_predicates,
+                    &[],
+                    connection,
+                )
+            })
         });
     }
 
