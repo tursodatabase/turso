@@ -14854,7 +14854,38 @@ pub fn op_drop_view(
 ) -> InsnResult {
     load_insn!(DropView { db, view_name }, insn);
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
+        // Track every root page this view owns (its own storage plus its
+        // hidden state tables and their indexes), the same way op_drop_table
+        // tracks a dropped table's roots, so integrity_check knows about them.
+        if is_mvcc {
+            let mut owned_table_names = schema
+                .tables
+                .keys()
+                .filter(|table_name| {
+                    crate::incremental::view::state_table_belongs_to_view(table_name, view_name)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            owned_table_names.push(view_name.clone());
+            for table_name in &owned_table_names {
+                if let Some(btree) = schema.get_table(table_name).and_then(|t| t.btree()) {
+                    if btree.root_page > 0 {
+                        schema.dropped_root_pages.insert(btree.root_page);
+                    }
+                }
+                let index_root_pages = schema
+                    .get_indices(table_name)
+                    .map(|index| index.root_page)
+                    .collect::<Vec<_>>();
+                for root_page in index_root_pages {
+                    if root_page > 0 {
+                        schema.dropped_root_pages.insert(root_page);
+                    }
+                }
+            }
+        }
         schema.remove_view(view_name).ok();
         schema.broken_views.remove(view_name);
     })?;

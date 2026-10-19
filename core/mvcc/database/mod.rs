@@ -10213,7 +10213,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 let (
                                     ValueRef::Text(row_type),
                                     ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
+                                    sql,
+                                ) = record.get_three_values(0, 3, 4)?
                                 else {
                                     return Err(LimboError::Corrupt(
                                         "sqlite_schema type and root_page must be text and integer"
@@ -10221,7 +10222,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     ));
                                 };
                                 let row_type = row_type.as_str();
-                                if (row_type == "table" || row_type == "index") && root_page > 0 {
+                                let is_materialized_view = row_type == "view"
+                                    && matches!(sql, ValueRef::Text(sql) if crate::util::sql_is_create_materialized_view(sql.as_str()));
+                                if (row_type == "table"
+                                    || row_type == "index"
+                                    || is_materialized_view)
+                                    && root_page > 0
+                                {
                                     dropped_root_pages.insert(root_page);
                                 }
                                 schema_rows.remove(&rowid_int);
